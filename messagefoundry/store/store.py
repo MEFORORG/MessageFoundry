@@ -1677,6 +1677,20 @@ class MessageSearchResult:
     truncated: bool
 
 
+class DiskFreeStatus(StrEnum):
+    """Whether :attr:`DbStatus.disk_free_bytes` is a reading, and if not, why (BACKLOG #1563).
+
+    The backend STATES this, so no reader has to infer it from which store answered. Only
+    ``OBSERVED`` carries a figure, and a figure of ``0`` is a measured empty drive that must alarm.
+    ``NOT_APPLICABLE`` is a server backend whose disk this process never looks at: it claims nothing
+    about the drive. ``UNOBSERVABLE`` is a measurement this process should have been able to take
+    and could not, such as a failed ``disk_usage`` on the SQLite store's own directory."""
+
+    OBSERVED = "observed"
+    NOT_APPLICABLE = "not_applicable"
+    UNOBSERVABLE = "unobservable"
+
+
 @dataclass(frozen=True)
 class DbStatus:
     """Database health snapshot for the Engine Status page."""
@@ -1688,6 +1702,9 @@ class DbStatus:
     # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
     # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
     disk_free_bytes: int | None
+    # Which reading disk_free_bytes is, stated by the backend (BACKLOG #1563). Checked against
+    # disk_free_bytes in __post_init__, so the pair cannot contradict itself.
+    disk_free_status: DiskFreeStatus
     journal_mode: str
     messages: int
     events: int
@@ -1698,6 +1715,18 @@ class DbStatus:
     # server backends, where it is not a SQLite-style knob (SQL Server recovery model / Postgres WAL
     # durability is reported through journal_mode instead).
     synchronous: str | None = None
+
+    def __post_init__(self) -> None:
+        # Coerced, so a store passing the plain string gets the member every reader expects; an
+        # unknown string raises ValueError here, where it was built.
+        object.__setattr__(self, "disk_free_status", DiskFreeStatus(self.disk_free_status))
+        # A figure exactly when OBSERVED: a status claiming a reading over a None, or a None status
+        # over a figure, would let a reader trust the wrong half.
+        if (self.disk_free_status is DiskFreeStatus.OBSERVED) != (self.disk_free_bytes is not None):
+            raise ValueError(
+                f"disk_free_status={self.disk_free_status!r} contradicts"
+                f" disk_free_bytes={self.disk_free_bytes!r}"
+            )
 
 
 #: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
@@ -2185,23 +2214,52 @@ class WebAuthnCredential:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
-        transports = d.get("transports")
-        return cls(
-            credential_id_hash=d["credential_id_hash"],
-            credential_id=d["credential_id"],
-            user_id=d["user_id"],
-            rp_id=d["rp_id"],
-            public_key=d["public_key"],
-            sign_count=int(d["sign_count"]),
-            transports=[str(t) for t in json.loads(transports)] if transports else None,
-            device_type=d["device_type"],
-            backed_up=bool(d["backed_up"]),
-            label=d["label"],
-            aaguid=d.get("aaguid"),
-            created_at=float(d["created_at"]),
-            last_used_at=_opt_float(d.get("last_used_at")),
-            discoverable=bool(d.get("discoverable", False)),
-        )
+        """The passkey ``d`` holds, or :class:`PasskeyRowMalformed` for a row that does not parse,
+        so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
+        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it. A
+        ``transports`` value that is JSON but not a list does not parse either."""
+        try:
+            raw = d.get("transports")
+            transports = json.loads(raw) if raw else None
+            if raw and not isinstance(transports, list):  # ``null`` included
+                raise TypeError("transports is not a list")
+            cred = cls(
+                credential_id_hash=d["credential_id_hash"],
+                credential_id=d["credential_id"],
+                user_id=d["user_id"],
+                rp_id=d["rp_id"],
+                public_key=d["public_key"],
+                sign_count=int(d["sign_count"]),
+                transports=None if transports is None else [str(t) for t in transports],
+                device_type=d["device_type"],
+                backed_up=bool(d["backed_up"]),
+                label=d["label"],
+                aaguid=d.get("aaguid"),
+                created_at=float(d["created_at"]),
+                last_used_at=_opt_float(d.get("last_used_at")),
+                discoverable=bool(d.get("discoverable", False)),
+            )
+        # OverflowError (int() of an infinite REAL) and RecursionError (deeply nested JSON) are
+        # parse failures too, as they are for the other JSON columns this module reads.
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
+            # Keep only the class name, and raise once the handler has ended. The caught error can
+            # quote the row's value (``JSONDecodeError.doc`` holds the whole ``transports`` text,
+            # ``int()`` and ``float()`` quote theirs), and ``from None`` would only set
+            # ``__suppress_context__``: ``__context__`` would still hold it. Raised here, the caught
+            # error is on neither chain (tests/test_from_none_is_not_redaction.py). Two things this
+            # does not do: a caller that calls this inside its own handler still gets ITS error on
+            # ``__context__``, and the traceback's frame still holds ``d``, the whole row.
+            failure = type(exc).__name__
+        else:
+            return cred
+        raise PasskeyRowMalformed(failure)
+
+
+class PasskeyRowMalformed(Exception):
+    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`.
+    Not a ``ValueError``: the routes answer a ``ValueError`` as the client's fault, and a row the
+    store did not write is the server's. The argument is the underlying error's class name, never
+    the row's content."""
 
 
 # --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
@@ -2420,6 +2478,39 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
                 continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def session_owes_unproven_factor(
+    sealer: RowSealer | None,
+    session: SessionRecord | None,
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+) -> bool:
+    """Whether binding a new factor for ``record``'s account from ``session`` must be refused,
+    because the account holds a second factor this session has not proven (BACKLOG #3014, #3690).
+
+    The store-side twin of ``AuthService._factor_binding_is_blocked``, asked inside the write's own
+    transaction so a factor bound on another session after the service asked is still seen. It is
+    session-relative: a session stamped MFA-verified binds beside the factors it proved, and an
+    account with no factor at all binds its first one from a pending session. So it encodes "no
+    unproven factor", never "zero factors". Each factor term can only add a factor, as
+    ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
+
+    Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
+    unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
+    to handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.user_id != record.row.id
+        or session.user_epoch != record.row.session_epoch
+        or not session_seal_ok(sealer, session)
+        or not user_seal_ok(sealer, record)
+    ):
+        return True
+    if session.mfa_verified_at is not None:
+        return False
+    return record.row.totp_enabled or record.row.cred_digest != "" or bool(passkeys)
 
 
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
@@ -2680,17 +2771,37 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
         return False
 
 
+#: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
+#: the auth service narrows :func:`passkey_is_way_past` to the relying party the configuration
+#: names, since the sign-in accepts only a passkey under the request's. ``None`` is
+#: :func:`passkey_is_way_past` alone.
+PasskeyCounts = Callable[[WebAuthnCredential], bool]
+
+
+def passkey_is_way_past_under(cred: WebAuthnCredential, rp_id: str | None) -> bool:
+    """:func:`passkey_is_way_past`, narrowed to a passkey minted under ``rp_id``, the relying
+    party the configuration names (BACKLOG #3937). ``None``, no configured one, counts no passkey:
+    the factor-drop gates and the census that ask this then keep TOTP rather than trust a passkey
+    the sign-in might not accept."""
+    return rp_id is not None and cred.rp_id == rp_id and passkey_is_way_past(cred)
+
+
 def discoverable_way_past(
-    passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
+    passkeys: Sequence[WebAuthnCredential],
+    cred_digest: str,
+    *,
+    sealed: bool,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
-    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
-    half of
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`, or
+    ``passkey_counts`` where the caller narrows it), the passkey half of
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
     if sealed and passkey_digest(passkeys) != cred_digest:
         return False
-    return any(passkey_is_way_past(c) for c in passkeys)
+    counts = passkey_counts or passkey_is_way_past
+    return any(counts(c) for c in passkeys)
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
@@ -2805,19 +2916,80 @@ async def escalation_verdict(
     if counter != "sign_in":
         return None
     pre = await get_user(user_id)
-    if (
-        pre is None
-        or pre.auth_provider != "local"
-        or not pre.totp_enabled
-        or pre.password_generated
-        or pre.sign_in_locked(now)
-    ):
-        return None
-    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
-    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
-    if reaches < threshold or pre.lock_cycles < 1:
+    if pre is None or not pre.totp_enabled or not sets_a_later_sign_in_lock(pre, threshold, now):
         return None
     return await judge_totp(opener, totp_usable, pre)
+
+
+def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: float) -> bool:
+    """Whether one more SIGN-IN failure on ``row`` sets a lock whose length an escalation can
+    change: a local account whose lock can arm (:func:`lockout_arms`) and is not live, a count that
+    reaches ``threshold`` as :func:`next_lockout_state` computes it (a lapsed lock restarts it), on
+    a later cycle, since a first lock has the base length either way. The gate both halves of the
+    escalation ask before paying for their input: the TOTP judgement (:func:`escalation_verdict`)
+    and the passkey read (:func:`escalation_passkeys`)."""
+    if row.auth_provider != "local" or not lockout_arms(
+        "sign_in", password_generated=row.password_generated
+    ):
+        return False
+    if row.locked_until is not None and now < row.locked_until:
+        return False  # a live lock is never re-escalated (next_lockout_state)
+    reaches = (0 if row.locked_until is not None else row.failed_attempts) + 1
+    return reaches >= threshold and row.lock_cycles >= 1
+
+
+#: The prefix of the ``sqlite3.OperationalError`` the stdlib raises for a TEXT cell it cannot
+#: decode while fetching a row (CPython ``Modules/_sqlite/cursor.c``). The rest of the message
+#: quotes the cell, so it is matched and never logged.
+_SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
+
+
+async def escalation_passkeys(
+    counter: LockoutCounter,
+    *,
+    passkey_escalates: PasskeyCounts | None,
+    threshold: int,
+    now: float,
+    read_record: Callable[[], Awaitable[UserAuthzRecord | None]],
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+) -> list[WebAuthnCredential] | None:
+    """The passkey set a SIGN-IN failure's escalation reads (BACKLOG #3937 item 8), or ``None``
+    where it cannot matter. Every backend calls it inside the increment's own transaction:
+    ``read_record`` locks the account row there (the writer lock on SQLite, ``FOR UPDATE``,
+    ``UPDLOCK``), and only where :func:`sets_a_later_sign_in_lock` holds on THAT row does
+    ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
+    and a wrong password below the threshold costs no passkey read.
+
+    A set that cannot be read answers ``None``, logged: the failure still counts, and the lock keeps
+    the fixed length. That is a row that does not parse (:class:`PasskeyRowMalformed`), or a cell
+    the driver cannot decode while fetching, before any row is parsed: sqlite3 raises an
+    ``OperationalError`` told apart only by its message, and pyodbc a ``UnicodeDecodeError``
+    (asyncpg is expected to raise the same; no test plants the cell there, since a UTF8 database
+    refuses it at write time). Raising here would roll the count back, and the account would then
+    never lock. It does not escalate either: ADR 0197 escalates only where the owner has a way
+    past, and a passkey that cannot be read signs nobody in, so a doubling lock would only arm a
+    username-only attacker against the owner. Any other error is raised, and rolls the write back
+    as it would anywhere else."""
+    if counter != "sign_in" or passkey_escalates is None:
+        return None
+    record = await read_record()
+    if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
+        return None
+    try:
+        return await read_passkeys()
+    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+        failure = type(exc).__name__
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+            raise
+        failure = type(exc).__name__
+    # The class name only: a decode error's message and arguments quote the cell.
+    log.warning(
+        "the passkeys of user %s could not be read (%s); its sign-in lock keeps its fixed length",
+        record.row.id,
+        failure,
+    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -2857,15 +3029,18 @@ def holds_way_past(
     *,
     sealed: bool,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
     a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
-    discoverable (wave 2).
+    discoverable (wave 2) that ``passkey_counts`` counts.
     ``passkeys`` is the account's set, read in the same transaction as the write that asks
     (:func:`discoverable_way_past` says how it is trusted)."""
     if _totp_is_way_past(record, totp_counts):
         return True
-    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
+    return discoverable_way_past(
+        passkeys, record.row.cred_digest, sealed=sealed, passkey_counts=passkey_counts
+    )
 
 
 def removal_keeps_way_past(
@@ -2876,18 +3051,20 @@ def removal_keeps_way_past(
     drop_totp: bool = False,
     drop_passkey: str | None = None,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
     passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
     ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
     trusts it, so a set that fails its digest leaves nothing. TOTP counts as
-    :func:`_totp_is_way_past` says."""
+    :func:`_totp_is_way_past` says, a passkey as ``passkey_counts`` does."""
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
-    return trusted and any(passkey_is_way_past(c) for c in remaining)
+    counts = passkey_counts or passkey_is_way_past
+    return trusted and any(counts(c) for c in remaining)
 
 
 def totp_removal(
@@ -2897,6 +3074,7 @@ def totp_removal(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
     when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
@@ -2911,7 +3089,7 @@ def totp_removal(
             if isinstance(totp_counts, TotpJudgement) and totp_counts.moved(r):
                 return None
             if _totp_is_way_past(r, totp_counts) and not removal_keeps_way_past(
-                r, passkeys, sealed=sealed, drop_totp=True
+                r, passkeys, sealed=sealed, drop_totp=True, passkey_counts=passkey_counts
             ):
                 return None
         return totp_disable(r, now)
@@ -2929,6 +3107,7 @@ def password_change(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2953,7 +3132,7 @@ def password_change(
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if require_way_past and not holds_way_past(
-            r, passkeys, sealed=sealed, totp_counts=totp_counts
+            r, passkeys, sealed=sealed, totp_counts=totp_counts, passkey_counts=passkey_counts
         ):
             return None
         claimed = r.row.password_claimed_at
@@ -2985,14 +3164,33 @@ def lockout_increment(
     now: float,
     out: list[LockoutIncrement],
     totp_counts: TotpCounts | None = None,
+    passkeys: Sequence[WebAuthnCredential] | None = None,
+    sealed: bool = False,
+    passkey_escalates: PasskeyCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
     (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates as
     the plain ``totp_enabled`` rule says on the locked row, EXCEPT where ``totp_counts`` holds a
     KNOWN refusal of that exact cell (BACKLOG #3422): an enrolment this release refuses gives the
     owner no way past, so its lock keeps the fixed length. An unknown verdict, a cell that moved,
-    and no verdict at all leave the plain rule standing."""
+    and no verdict at all leave the plain rule standing.
+
+    It also escalates where ``passkeys``, the account's set read in the same transaction as the
+    write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
+    where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
+    backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
+    ``None`` otherwise, a set it could not read included; ``None`` for either counts no passkey,
+    the fixed length callers had before."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+
+    def passkey_way_past(r: UserAuthzRecord) -> bool:
+        return (
+            passkeys is not None
+            and passkey_escalates is not None
+            and discoverable_way_past(
+                passkeys, r.row.cred_digest, sealed=sealed, passkey_counts=passkey_escalates
+            )
+        )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
         state = next_lockout_state(
@@ -3012,6 +3210,7 @@ def lockout_increment(
                     and isinstance(totp_counts, TotpJudgement)
                     and totp_counts.refuses(r)
                 ),
+                passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
@@ -4026,20 +4225,23 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
 #: past this is not an anchor file and the excess must never be read, let alone quoted back.
 #:
-#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. Every refusal below interpolates the
-#: offending text with ``{text!r}``, and both callers log that refusal. A path typo'd onto
-#: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
-#: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
-#: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
+#: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
+#: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
+#: BACKLOG #2612); only the first line ever reaches the parser, and this bound keeps even that read
+#: small. A caller that printed ``str(exc)`` for a path typo'd onto ``messagefoundry.toml``, a key
+#: file, or a captured HL7 message would put that line into the service log at WARNING -- which is
+#: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
 
 
 class AuditAnchorError(ValueError):
     """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
 
-    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify``
-    needs: they typed the path, the refusal lands on their own terminal, and seeing the bad value is
-    how they fix it. ``reason`` says what was wrong and **never includes the text**.
+    ``str(exc)`` quotes the offending text back, which is what an operator running ``audit-verify
+    --expected-anchor`` needs: they typed the value, the refusal lands on their own terminal, and
+    seeing it is how they fix it. ``reason`` says what was wrong and **never includes the text**,
+    nor any value parsed from it. Every caller that read the text from a FILE prints ``reason``
+    only, ``audit-verify --expected-anchor-file`` included (vault BACKLOG #2612).
 
     THE SPLIT EXISTS BECAUSE THE TWO CONSUMERS HAVE DIFFERENT EXPOSURE, not because one is tidier. The
     engine's startup check logs to a persistent service log that NSSM captures to disk, so quoting the
@@ -4073,19 +4275,39 @@ def read_audit_anchor_file(path: str | Path) -> str:
     same reason :func:`parse_audit_anchor` is one parser: the encoding handling, the byte bound and the
     first-line rule are each a place a later hardening would otherwise reach one caller and miss the
     other. Only the first line is returned, bounded by :data:`AUDIT_ANCHOR_MAX_BYTES`."""
+    lines = read_bounded_utf8_lines(
+        path,
+        AUDIT_ANCHOR_MAX_BYTES,
+        too_large=f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an "
+        "anchor (an anchor is one short COUNT:HEAD line)",
+    )
+    # The first line only: a file whose SECOND line is something else is a refusal either way. Both
+    # callers print only the refusal's content-free ``reason`` for a file (vault BACKLOG #2612).
+    return lines[0] if lines else ""
+
+
+def read_bounded_utf8_lines(path: str | Path, max_bytes: int, *, too_large: str) -> list[str]:
+    """The lines of a UTF-8 text file of at most ``max_bytes``, for the anchor file and the
+    ``audit-verify --expected-rows-file`` pair file (vault BACKLOG #2612): one reader, so a later
+    hardening of the encoding or the bound reaches both. Raises ``OSError`` carrying ``too_large``
+    for a bigger file, and ``UnicodeDecodeError`` for one that is not UTF-8 (a ``ValueError``, so a
+    caller catching only ``OSError`` lets it escape). ``utf-8-sig`` absorbs the BOM PowerShell 5.1's
+    ``Set-Content -Encoding utf8`` writes."""
     with Path(path).open("rb") as fh:
         # Read one byte past the bound so an oversized file is DETECTED rather than silently truncated
-        # into a parse failure that blames the operator's anchor for the reader's cap.
-        data = fh.read(AUDIT_ANCHOR_MAX_BYTES + 1)
-    if len(data) > AUDIT_ANCHOR_MAX_BYTES:
-        raise OSError(
-            f"anchor file is larger than {AUDIT_ANCHOR_MAX_BYTES} bytes, so it is not an anchor "
-            f"(an anchor is one short COUNT:HEAD line)"
-        )
-    # The first line only: a file whose SECOND line is something else is a refusal either way, and
-    # taking one line keeps whatever follows out of the refusal message that quotes this back.
-    lines = data.decode("utf-8-sig").splitlines()
-    return lines[0] if lines else ""
+        # into a parse failure that blames the operator's input for the reader's cap.
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise OSError(too_large)
+    # Universal newlines only (CRLF, CR, LF): ``str.splitlines`` also breaks on form feed, NEL,
+    # U+2028 and more, so a stray one shifted every line number a refusal names. So a line can
+    # carry those characters, and an MLLP capture's first line starts with its 0x0B frame byte.
+    # Neither caller quotes a file's line back: each refusal names a line number and a reason that
+    # quotes nothing, which is the control, not this split.
+    lines = re.split(r"\r\n|\r|\n", data.decode("utf-8-sig"))
+    if lines and not lines[-1]:
+        lines.pop()  # the final newline ends the last line; it does not start another
+    return lines
 
 
 def parse_audit_anchor(text: str) -> tuple[int, str]:
@@ -4137,31 +4359,92 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
         # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
         raise AuditAnchorError("the row count is not an integer", text) from None
     if count < 0:
-        raise AuditAnchorError(f"the row count {count} is negative", text)
+        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
+        # the count is that file's content (vault BACKLOG #2612).
+        raise AuditAnchorError("the row count is negative", text)
     head = head.strip()
     if not head:
         if count != 0:
             raise AuditAnchorError(
-                "an empty head is only producible from an EMPTY log, so it cannot carry a row count "
-                f"of {count}",
+                "an empty head is only producible from an EMPTY log, so it cannot carry a nonzero "
+                "row count",
                 text,
             )
         return count, head
-    if all(c in _AUDIT_ANCHOR_HEX for c in head):
+    refusal, head = _audit_head_shape(head)
+    if refusal is not None:
+        raise AuditAnchorError(refusal, text)
+    return count, head
+
+
+def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
+    """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
+    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
+    head. ``noun`` names the value in the reason."""
+    if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
-            raise AuditAnchorError(
-                f"the head is {len(head)} hex characters, not a full "
-                f"{AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
-                text,
+            return (
+                f"{noun} is hex but not a full {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character digest",
+                head,
             )
-        return count, head.lower()
+        return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return count, head  # opaque by construction; never normalise what we do not define
-    raise AuditAnchorError(
-        f"the head is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
+        return None, head  # opaque by construction; never normalise what we do not define
+    return (
+        f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
-        text,
+        head,
     )
+
+
+#: The operator-facing shape of a row pair, quoted into every :class:`AuditRowPairError`.
+AUDIT_ROW_PAIR_FORM = (
+    "expected SEQ:ROW_HASH, a row's sequence number (1 or more) and its full row_hash, as the "
+    "off-box audit record carries them as 'seq' and 'row_hash' (never the row id)"
+)
+
+
+class AuditRowPairError(ValueError):
+    """A ``SEQ:ROW_HASH`` pair :func:`parse_audit_row_pair` refuses. As :class:`AuditAnchorError`,
+    ``str(exc)`` quotes the text and ``reason`` never includes any of it, so a caller reading pairs
+    from a file can name the line without putting the file's content on its output."""
+
+    def __init__(self, reason: str, text: str) -> None:
+        self.reason = reason
+        self.text = text
+        super().__init__(f"malformed audit row pair {text!r}: {reason} — {AUDIT_ROW_PAIR_FORM}")
+
+
+def parse_audit_row_pair(text: str) -> tuple[int, str]:
+    """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
+    ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
+
+    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
+    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
+    ROW, so its sequence number is at least 1 and its head is never empty."""
+    seq_text, sep, head = text.strip().partition(":")
+    if not sep:
+        raise AuditRowPairError("no ':' separator", text)
+    seq_text = seq_text.strip()  # space either side of the ':' reads alike
+    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
+    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
+    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+        raise AuditRowPairError(
+            "the sequence number is not a plain decimal of up to 19 digits", text
+        )
+    seq = int(seq_text)
+    if not 1 <= seq <= _AUDIT_SEQ_MAX:
+        raise AuditRowPairError(
+            "the sequence number is outside 1 to 2**63-1, so it names no row", text
+        )
+    head = head.strip()
+    if not head:
+        raise AuditRowPairError("the row_hash is empty", text)
+    refusal, head = _audit_head_shape(head, "the row_hash")
+    if refusal is not None:
+        raise AuditRowPairError(refusal, text)
+    return seq, head
 
 
 def audit_mac_bytes(value: object) -> bytes:
@@ -4775,6 +5058,7 @@ def verify_audit_rows(
     capable: bool,
     expected_anchor: tuple[int, str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
+    expected_rows: Sequence[tuple[int, str]] | None = None,
 ) -> AuditVerdict:
     """Recompute the audit chain over ``rows`` (all of ``audit_log``, in ``seq`` order) -- the ONE
     walk all three backends' ``verify_audit_chain`` run, so the rule cannot drift between them.
@@ -4806,6 +5090,14 @@ def verify_audit_rows(
     ``expected_anchor`` or ``expected_prefix``. An anchor is ``(seq, head)`` -- the newest row's
     sequence number and hash -- which is what the off-box tee forwards for every row.
 
+    ``expected_rows`` is a set of ``(seq, row_hash)`` pairs, such as the ones read back from the
+    off-box copy the tee forwards (vault BACKLOG #2612). Each is checked as ``expected_prefix`` checks
+    its one pair: the row at that ``seq`` must still be there and carry that hash. Every row hash
+    chains in the one before it, so a matching pair also vouches for every row below it. **All the
+    pairs are checked in this one walk**, never one walk each: under ``vault_transit`` each row MAC is
+    a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
+    coordinate, never on the row id, which can skip numbers.
+
     **Constant-time, full-walk (ASVS 11.2.4)**, as before: every row MAC is compared with
     :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
     the first divergent position is reported after it. A structural break is reported at its own
@@ -4830,9 +5122,21 @@ def verify_audit_rows(
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
-    #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
-    #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
-    prefix_head: str | None = None
+    # The prefix (BACKLOG #328) and the expected rows (vault BACKLOG #2612) are one mechanism: a set
+    # of (seq, head) witnesses, each head captured AT its position in this same walk. A repeated pair
+    # is checked once. A position the walk never reaches stays absent from `witness_heads`, which is
+    # the truncation case and must FAIL rather than pass vacuously.
+    # Unpacked into tuples, so a pair given as a list (a decoded JSON record) is hashable too.
+    row_pairs = {(seq, head) for seq, head in expected_rows or ()}
+    if any(seq < 1 for seq, _ in row_pairs):
+        # A pair names a ROW. Below 1 it can name none, and would read as a truncation: refuse the
+        # input rather than raise a false tamper alarm on an intact chain (parse_audit_row_pair).
+        raise ValueError("an expected audit row's sequence number is below 1")
+    prefix_pair = None if expected_prefix is None else (expected_prefix[0], expected_prefix[1])
+    witness_positions = frozenset(
+        [seq for seq, _ in row_pairs] + ([] if prefix_pair is None else [prefix_pair[0]])
+    )
+    witness_heads: dict[int, str] = {}
     # The range being walked: its key, its first position and that row's id, and its digest.
     range_key: str | None = None
     range_from, range_from_id = 1, None
@@ -4928,13 +5232,13 @@ def verify_audit_rows(
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
         # row, instead of cascading a false break onto every successor.
         prev = r["row_hash"] or ""
-        # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
-        # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
-        # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row. On a chain
+        # BACKLOG #328, vault #2612: remember the head AT each witness position, in this same pass.
+        # A POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
+        # the walk deliberately avoids (ASVS 11.2.4) and costs one set lookup per row. On a chain
         # with no break the position IS the row's sequence number, so the anchor's number, the tee's
         # and the walk's are one coordinate.
-        if expected_prefix is not None and pos == expected_prefix[0]:
-            prefix_head = prev
+        if pos in witness_positions:
+            witness_heads[pos] = prev
     if (
         capable
         and genesis_key is not None
@@ -4990,6 +5294,10 @@ def verify_audit_rows(
             f"audit chain broken at seq={first_pos}, row id={first_id}"
             + (f" ({reason})" if reason else ""),
         )
+    # Past a chain break, which returned above, every comparator below runs before any verdict is
+    # returned and each failing one is reported. A break still hides them, as it always hid the
+    # prefix: the break is reported first, at its own row.
+    failures: list[str] = []
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
         # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
@@ -4997,29 +5305,56 @@ def verify_audit_rows(
         # the row count.
         head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
         if count < exp_count or not head_ok:
-            return AuditVerdict(
-                False,
+            failures.append(
                 f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
-                f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
+                f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten"
             )
-    if expected_prefix is not None:
-        ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
-        if not ok:
-            return AuditVerdict(False, msg)
+    if prefix_pair is not None:
+        ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
+        if not ok:  # its own message: the engine routes on its marker (#328)
+            failures.append(msg or f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
+    missing = 0
+    first: tuple[int, str] | None = None
+    for pair in row_pairs:
+        # The prefix comparator answers the same question for one row: is this head the chain's head
+        # at that position? It compares in constant time once the position was reached.
+        if not audit_prefix_verdict(pair, witness_heads.get(pair[0]), count)[0]:
+            missing += 1
+            first = pair if first is None else min(first, pair)
+    if first is not None:
+        seq, head = first
+        have = witness_heads.get(seq)
+        failures.append(
+            f"{missing} of {len(row_pairs)} distinct expected audit row(s) are not in the chain "
+            f"as it stands (have {count} row(s)); the first by seq: row {seq} "
+            + (
+                "is past the chain's end"
+                if have is None
+                else f"carries {have[:12]!r}, expected {head[:12]!r}"
+            )
+            + " — truncated or rewritten"
+        )
+    if failures:
+        return AuditVerdict(False, "; ".join(failures))
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".
+        checked = [
+            "the sequence numbers",
+            "that each row hash is non-empty text",
+            "any key-range digests",
+        ]
+        if expected_anchor is not None or expected_prefix is not None:
+            checked.append("the expected anchor")
+        if row_pairs:
+            checked.append("the expected rows")
         return AuditVerdict(
             False,
             "audit chain not checked: its first row names a store key, and no store "
             "encryption key/MAC is available in this process, so no row MAC was recomputed. Only "
-            f"checks that need no key ran over its {count} row(s) (at least the sequence numbers, "
-            "that each row hash is non-empty text, and any key-range digests"
-            + (
-                ", and the expected anchor"
-                if expected_anchor is not None or expected_prefix is not None
-                else ""
-            )
+            f"checks that need no key ran over its {count} row(s) (at least "
+            + ", ".join(checked[:-1])
+            + f", and {checked[-1]}"
             + "), and they found no break. That is not a pass: the first row may have been "
             "changed to name a key, and any row's content may have been changed, which only the "
             "key shows. Re-run with the settings and key the engine runs with",
@@ -6919,7 +7254,13 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
 _MAX_ESCALATION_EXPONENT = 64
 
 
-def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabled: bool) -> bool:
+def lockout_escalates(
+    counter: LockoutCounter,
+    *,
+    auth_provider: str,
+    totp_enabled: bool,
+    passkey_way_past: bool = False,
+) -> bool:
     """Whether ``counter``'s lock doubles per cycle on this account (ADR 0197 Decision item 5).
 
     Escalate only where the owner has a way past the lock, so a longer lock costs the owner little:
@@ -6928,21 +7269,23 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with a TOTP enrolled, because that owner can use
-      the combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
-      account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
-      account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
-      too, and still keeps the fixed length: escalating would need the passkey set inside this
-      atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
+    * the SIGN-IN lock on a local account with a TOTP enrolled, or with a discoverable passkey
+      (``passkey_way_past``; ADR 0197 Amendment A, wave 2), because that owner can use the combined
+      sign-in or the combined passkey sign-in to pass it. Every other sign-in lock keeps the fixed
+      length, a directory account with TOTP enrolled included: it has no combined sign-in to get
+      past its lock.
 
     Read by every backend inside its atomic increment, from ``auth_provider`` on the row it locked.
     For the SIGN-IN lock ``totp_enabled`` is the row's flag, cleared only by a KNOWN refusal of the
     TOTP (BACKLOG #3422) judged before the lock on a cell the locked row still holds
     (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
-    all leave the flag standing, as before that rule. The count itself stays atomic."""
+    all leave the flag standing, as before that rule. ``passkey_way_past`` is asked of the passkey
+    set read in the same transaction as the write (:func:`lockout_increment`, BACKLOG #3937 item
+    8); a set that cannot be read there counts no passkey, so the failure counts at the fixed
+    length (:func:`escalation_passkeys`). The count itself stays atomic."""
     if auth_provider != "local":
         return False
-    return counter == "second_step" or totp_enabled
+    return counter == "second_step" or totp_enabled or passkey_way_past
 
 
 def lockout_arms(counter: LockoutCounter, *, password_generated: bool) -> bool:
@@ -15271,6 +15614,7 @@ class MessageStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``.
 
@@ -15300,6 +15644,7 @@ class MessageStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     async def has_prior_backup_history(self) -> bool:
@@ -15423,10 +15768,12 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        rows = await self._db.execute(
+        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # does not decode, and an open statement would hold back a WAL checkpoint until GC.
+        async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
-        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+        ) as rows:
+            return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
 
     async def _write_passkeys(
         self,
@@ -15612,6 +15959,7 @@ class MessageStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -15633,6 +15981,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15796,6 +16145,7 @@ class MessageStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
         ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
@@ -15818,6 +16168,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15860,16 +16211,45 @@ class MessageStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
         ``(user_id, label)``, a credential id already held and an account that does not exist; the
         caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
         (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
-        same transaction (BACKLOG #2592)."""
-        async with _writer_guard(self._db, self._lock):
+        same transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: here the check and the insert share one ``BEGIN``, under the writer lock,
+        so no writer of this process runs between them, and a writer in another process that
+        commits between them fails this transaction's write rather than going unseen."""
+        if for_session is None:
+            async with _writer_guard(self._db, self._lock):
+                await self._write_passkeys(
+                    cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred)
+                )
+                await self._commit()
+            return True
+        async with _writer_txn(self._db, self._lock):
+            record = await self._read_user_record(cred.user_id)
+            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
+            if record is not None and session_owes_unproven_factor(
+                self._row_sealer,
+                await self._read_session_row(for_session),
+                record,
+                await self._account_passkeys(cred.user_id),
+            ):
+                await self._db.rollback()  # only read; this closes the transaction
+                return False
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
+        return True
+
+    async def _read_session_row(self, token_hash: str) -> SessionRecord | None:
+        """The session row, read on the writer connection inside the caller's transaction."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -15912,6 +16292,7 @@ class MessageStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -15933,6 +16314,7 @@ class MessageStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(
@@ -16175,6 +16557,7 @@ class MessageStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -16187,30 +16570,45 @@ class MessageStore:
         from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
         TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
-        BACKLOG #3422). The count itself stays atomic.
+        BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
+        (BACKLOG #3937 item 8). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with _writer_guard(self._db, self._lock):
+            # The passkey set the escalation reads is read under the same writer lock as the write
+            # (BACKLOG #3937 item 8), so a passkey added or removed meanwhile cannot slip between.
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(user_id),
+                read_passkeys=lambda: self._account_passkeys(user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(user_id, change)
             await self._commit()
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
@@ -17014,10 +17412,23 @@ class MessageStore:
             cur = await db.execute("PRAGMA journal_mode")
             row = await cur.fetchone()
             journal = str(row[0]) if row else ""
+            # Off the loop: stat and disk_usage block, and longest on the failing mount that
+            # UNOBSERVABLE exists to report (an SMB or NFS share that stopped answering).
+            size = await asyncio.to_thread(self._db_size_bytes)
+            if self.path == ":memory:":
+                # No file, so no drive: any figure would be the working directory's, not the DB's.
+                free, disk_status = None, DiskFreeStatus.NOT_APPLICABLE
+            else:
+                free = await asyncio.to_thread(self._disk_free_bytes)
+                # The engine stats this drive itself, so a None is a failed probe, never N/A.
+                disk_status = (
+                    DiskFreeStatus.OBSERVED if free is not None else DiskFreeStatus.UNOBSERVABLE
+                )
             return DbStatus(
                 path=self.path,
-                size_bytes=self._db_size_bytes(),
-                disk_free_bytes=self._disk_free_bytes(),
+                size_bytes=size,
+                disk_free_bytes=free,
+                disk_free_status=disk_status,
                 journal_mode=journal,
                 messages=await self._count(db, "messages"),
                 events=await self._count(db, "message_events"),

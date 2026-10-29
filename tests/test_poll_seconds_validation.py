@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,7 +35,10 @@ def _file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any) -> Any:
 
 
 def _remote(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any) -> Any:
-    monkeypatch.setattr(remotefile, "_make_client", lambda settings, **_: object())
+    # An SFTP client builds no TLS context, so the stand-in has none: the FTPS revocation guard
+    # (BACKLOG #2193) reads it at construction.
+    client = SimpleNamespace(tls_context=None)
+    monkeypatch.setattr(remotefile, "_make_client", lambda settings, **_: client)
     settings = dict(Sftp(host="sftp.example.com", remote_dir="/in").settings)
     settings.pop("poll_seconds")
     if value is not _ABSENT:

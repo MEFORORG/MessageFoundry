@@ -188,6 +188,7 @@ async def _db_info(settings: ServiceSettings) -> Any:
         path=_redact_store_path(db.path, settings.store.backend),
         size_bytes=db.size_bytes,
         disk_free_bytes=db.disk_free_bytes,
+        disk_free_status=db.disk_free_status.value,
         journal_mode=db.journal_mode,
         messages=db.messages,
         events=db.events,

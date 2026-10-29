@@ -62,6 +62,13 @@
   characters of any one key or value, and of the list of unknown keys. **This changes none of the
   §2 ratified choices:** the overlay still only maps a field to an existing kind.
   [PHI.md](../PHI.md) §9 is the long form for the retarget.
+- **AMENDED 2026-10-27 (vault BACKLOG #3000, #3493): a retarget is refused now, unless the overlay
+  lists it.** This reverses the amendment above on one point: the loader refuses a retarget of a
+  default path to a different kind, other than `drop` or `freetext`, unless the overlay also
+  names that path in a new `[hl7]` list, `retarget_acknowledged`. A listed retarget loads and is
+  warned about. **This changes none of the §2 ratified choices:** the new key selects nothing and
+  maps nothing, and the overlay still only maps a field to an existing kind.
+  [PHI.md](../PHI.md) §9 is the long form.
 - **AMENDMENT PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF (BACKLOG #1192,
   [ADR 0201](0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
   section 5 and slice 5): the package's home moves out of the engine.** ADR 0201 was accepted on

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 from messagefoundry.auth.trust_anchors import LaneAnchorCheck
+from messagefoundry.config.environments import SnapshotEnvValuesProvider
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -45,7 +46,9 @@ from messagefoundry.config.settings import (
     ShadowSettings,
     StoreSettings,
     UpdateCheckSettings,
+    engine_owned_dirs,
 )
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
@@ -54,8 +57,10 @@ from messagefoundry.config.wiring import (
     WiringError,
     connector_secret_env_values,
     load_config,
+    read_trusted_snapshot,
 )
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.engine_secrets import SecretsDirectoryError
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -128,6 +133,7 @@ __all__ = [
     "ClusteredConfigWrite",
     "ConfigDigestMismatch",
     "ConfigDigestUnavailable",
+    "ConfigRefusedBeforeApprovalCheck",
     "ConfigReloadDenied",
     "Engine",
     "ReloadOutcome",
@@ -232,6 +238,19 @@ class ConfigDigestUnavailable(Exception):
             "the config's digest could not be taken"
             + ("" if approved is None else " to check it against its approval")
         )
+        self.approved = approved
+
+
+class ConfigRefusedBeforeApprovalCheck(WiringError):
+    """A released reload refused as a ``WiringError`` before its snapshot's digest was checked
+    against its approval (vault BACKLOG #2596): at least by the settings preflight, or by the
+    config source's trust check, which stats paths and reads no contents. It keeps the refusal's
+    message, cause and traceback, so it is audited with the reason that refusal gets. ``approved``
+    is the digest the hold captured, or ``None``, so the audit row can name the approval the
+    refusal stopped."""
+
+    def __init__(self, refusal: WiringError, approved: str | None) -> None:
+        super().__init__(str(refusal))
         self.approved = approved
 
 
@@ -564,8 +583,13 @@ class Engine:
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         lane_anchor_check: LaneAnchorCheck | None = None,
+        owned_settings: Sequence[object] = (),
     ) -> None:
         self.store = store
+        # Settings models this engine is not otherwise handed ([auth], [security], [tls], ...), read
+        # only for the directories they name, which the `.processed` archive sweep must never reach
+        # (BACKLOG #1188, engine_owned_dirs).
+        self._owned_settings = tuple(owned_settings)
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
         # SandboxSettings defaults (mode=off, byte-identical). Rendered into a SandboxPolicy passed to
         # every runner this engine builds; read ONCE here (a /config/reload does NOT re-read it —
@@ -917,6 +941,32 @@ class Engine:
             Callable[[Exception, int, set[str]], Awaitable[None]] | None
         ) = None
         self._convergence_failures: tuple[int, set[str]] | None = None
+
+    def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+        """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
+        #1188), from every settings model this engine holds plus the paths it was handed directly."""
+        return engine_owned_dirs(
+            (
+                *self._owned_settings,
+                self._retention_settings,
+                self._cert_monitor_settings,
+                self._secret_rotation_settings,
+                self._update_check_settings,
+                self._backup_settings,
+                self._store_settings,
+                self._dr_settings,
+                self._sandbox_settings,
+                self._reference_settings,
+                self._shadow_settings,
+            ),
+            dirs=(self.config_dir,),
+            trees=(self._log_dir,),
+            files=(
+                self._api_tls_cert_file,
+                self._audit_anchor_file,
+                *self._api_tls_client_cert_files,
+            ),
+        )
 
     @classmethod
     async def create(
@@ -1528,13 +1578,15 @@ class Engine:
             self._secret_rotation_settings, self._secret_rotation_stamps
         )
 
-    def _expiry_enforced_held_ids(self) -> frozenset[str]:
+    async def _expiry_enforced_held_ids(self) -> frozenset[str]:
         """The secret-class ids the engine holds AND fingerprints right now, for the opt-in non-DEK
         expiry refusal (BACKLOG #1932). Empty without an opt-in, off ENFORCE, or on a store that cannot
         fingerprint (keyless), where a missing stamp is the ordinary state. Ids only; the values read to
         find them are dropped here and never persisted or logged. Called OUTSIDE the reconcile's
         blanket handler, so a failure here refuses the start: that is the fail-closed direction, and it
-        can only happen for an operator who opted in."""
+        can only happen for an operator who opted in. A secrets directory that cannot be read raises
+        its own ``SecretsDirectoryError`` here, which refuses the start naming the file (vault
+        BACKLOG #2595); the read runs in a worker thread, off the event loop."""
         settings = self._secret_rotation_settings
         if settings is None or not settings.enforce_secret_expiry_classes:
             return frozenset()
@@ -1558,7 +1610,8 @@ class Engine:
                 "for them on this store"
             )
             return frozenset()
-        return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
+        held = await asyncio.to_thread(held_env_secret_values)
+        return frozenset(held) | frozenset(self._connector_secret_env_values())
 
     def _connector_secret_env_values(self) -> dict[str, str]:
         """The per-Connection ``env()`` credential VALUES the wired graph holds right now, keyed by their
@@ -2008,6 +2061,7 @@ class Engine:
         # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
         # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
         if self._retention_settings is not None:
+            engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(
                 self.store,
                 self._retention_settings,
@@ -2021,6 +2075,25 @@ class Engine:
                 ),
                 # [logging].log_dir for application-log-file retention (#120); None → sweep no-ops.
                 log_dir=self._log_dir,
+                # The bound File inbounds whose `.processed` archive processed_archive_days ages out
+                # (BACKLOG #1188), read live each pass for the same reason as registry_source.
+                archive_source=lambda: (
+                    self._registry_runner.processed_archives()
+                    if self._registry_runner is not None
+                    else ()
+                ),
+                # Every inbound's watch and `.error` directories on every engine shard, and every
+                # File outbound's target directory, bound or not, which that sweep must never reach
+                # (BACKLOG #1188).
+                guard_source=lambda: (
+                    self._registry_runner.archive_guard_dirs()
+                    if self._registry_runner is not None
+                    else ()
+                ),
+                # And the engine's own directories and trees (store, keys, TLS pair, config, backup
+                # destination, log directory), read once from the settings (BACKLOG #1188).
+                engine_dirs=engine_dirs,
+                engine_trees=engine_trees,
             )
             self._retention_runner.start()
         # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of
@@ -2086,7 +2159,8 @@ class Engine:
         # process's own, so a standby reports its own too, and names itself in the alert key as
         # the intake monitor does. Of the commands, only `serve` builds an engine. The count moves
         # only where the guard is in the process: wherever `messagefoundry.__main__` is imported,
-        # or install_remote_debug_guard is called (docs/SECURITY-LOOSENING.md).
+        # the API's create_app runs, or install_remote_debug_guard is called
+        # (docs/SECURITY-LOOSENING.md).
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity
@@ -2127,6 +2201,12 @@ class Engine:
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
                     )
+                except SecretsDirectoryError:
+                    # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
+                    # engine must not use. Refused as what it is, naming the file: logged and stepped
+                    # over by the arm below, it would leave the stamps empty and resurface as an
+                    # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
+                    raise
                 except Exception:
                     # A reconcile failure must never take the engine down — the runner still works off the
                     # operator-configured dates (empty stamps). Logged, not raised.
@@ -2161,7 +2241,7 @@ class Engine:
                     self._secret_rotation_settings,
                     self._secret_rotation_stamps,
                     enforcement=self._security_enforcement,
-                    held=self._expiry_enforced_held_ids(),
+                    held=await self._expiry_enforced_held_ids(),
                     alert_sink=self._alert_sink,
                 )
             self._secret_rotation_runner = SecretRotationRunner(
@@ -2982,18 +3062,25 @@ class Engine:
         A DR activation does not reload it: it re-applies the running graph."""
         return self.last_reload_dir or self.config_dir
 
-    async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:
+    async def fingerprint_bundle(
+        self, path: Path, snapshot: ConfigSnapshot | None = None
+    ) -> tuple[dict[str, object] | None, str | None]:
         """The ADR 0041 D1 content fingerprint of ``path``, or ``(None, reason)`` when it cannot be read.
+
+        With ``snapshot``, the digest is of that snapshot, the bytes a load read and ran, and
+        ``path`` is read only for the advisory VCS head (vault BACKLOG #2596).
 
         The one best-effort rule for every load: the start, an applied reload and a dry run all call
         it, so a bundle one of them tolerates cannot make another refuse (vault BACKLOG #2597).
         OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
         (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
         raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        if snapshot is not None:
+            return await asyncio.to_thread(self.fingerprint_bundle_blocking, path, snapshot)
         return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
 
     def fingerprint_bundle_blocking(
-        self, path: Path
+        self, path: Path, snapshot: ConfigSnapshot | None = None
     ) -> tuple[dict[str, object] | None, str | None]:
         """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
 
@@ -3004,6 +3091,8 @@ class Engine:
         try:
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
             # keeps the hash on its record.
+            if snapshot is not None:
+                return config_fingerprint_detail(path, snapshot=snapshot), None
             return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
@@ -3057,6 +3146,35 @@ class Engine:
             # py/log-injection as the reload refusal logs scrub theirs.
             log.warning(
                 "config content digest failed for %s: %s",
+                scrub_log_argument(str(path)),
+                safe_exc(exc),
+            )
+            return None
+
+    async def _reload_snapshot(self, path: Path) -> ConfigSnapshot | None:
+        """The one read of ``path`` a reload runs, after the load's trust check, read strictly so
+        its digest covers every file the fingerprint names (vault BACKLOG #2596). ``None`` when a
+        file or folder cannot be read, logged at WARNING as :meth:`_content_digest` logs it. A
+        missing directory raises :class:`ConfigDirMissing`, and a refused source ``WiringError``."""
+        return await asyncio.to_thread(self._reload_snapshot_blocking, path)
+
+    @staticmethod
+    def _reload_snapshot_blocking(path: Path) -> ConfigSnapshot | None:
+        from messagefoundry.config.snapshot import ConfigDirMissing
+
+        try:
+            return read_trusted_snapshot(path, strict=True)
+        except ConfigDirMissing:
+            raise
+        except OSError as exc:
+            # The path can come from a client's config_dir, so it is scrubbed for CodeQL
+            # py/log-injection as the reload refusal logs scrub theirs.
+            log.warning(
+                "config content digest failed for %s: %s. The reload's snapshot could not be "
+                "read whole, so a released reload is refused. Any other reload reads the "
+                "directory again and refuses any file the load reads that it cannot read, every "
+                "*.py module and helper included; only the environments folder and its files "
+                "are left out",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )
@@ -3216,19 +3334,24 @@ class Engine:
         single-node (``is_clustered()`` False) never bumps. The initiator advances its OWN applied
         version right after bumping, so its convergence loop sees no change and does not re-reload.
 
+        **The directory is read once** (vault BACKLOG #2596, step 1): :meth:`_reload_snapshot`
+        reads it, after the load's trust check, into a snapshot; ``load_config`` compiles and
+        parses those bytes and nothing else, so no ``__pycache__`` file runs; and the audit digest
+        is the digest of the same snapshot. An edit on disk after that read changes nothing this
+        reload runs or records.
+
         ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
-        #2596, step 3; :meth:`reload_target_digest` took it at request time). The bundle's digest is
-        checked against it before ``load_config`` runs any config module. After a load that
-        succeeds it is checked again, before any check that can refuse the graph as invalid: the
-        fail-closed digest, then the digest the audit row records when one was taken. After a load
-        that fails, the fail-closed digest is checked once more, so an edit that breaks the graph
-        is refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
-        :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped. The
-        digest fails closed (:meth:`_content_digest`): a file or folder it cannot read gives
-        :class:`ConfigDigestUnavailable`, and a directory gone since the resolve, when a digest
-        lists it, gives :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a
-        convergence reload and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
-        and no more.
+        #2596, step 3; :meth:`reload_target_digest` took it at request time). The snapshot's digest
+        is checked against it before ``load_config`` runs any config module, and the load then runs
+        that snapshot, so the bytes checked are the bytes that run. A miss raises
+        :class:`ConfigDigestMismatch`, or :class:`ConfigDigestUnavailable` when a file or folder
+        cannot be read, with nothing swapped; a directory gone since the resolve gives
+        :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
+        and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
+        hashes and no more. A :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`
+        reads a value file in the snapshot's ``environments/`` folder from the snapshot too; after
+        any other read of the values from disk, a released reload takes the digest again and
+        refuses a change the same way.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``ConfigDirMissing``
         (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
@@ -3250,24 +3373,46 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
-        if not dry_run:
-            # First, so every reload route refuses a bad settings anchor at the point the reload
-            # route used to, before anything is read or swapped (BACKLOG #2034).
-            restart_required = await self.preflight_settings()
-        path = await self._existing_reload_target(config_dir)
+        try:
+            if not dry_run:
+                # First, so every reload route refuses a bad settings anchor at the point the
+                # reload route used to, before anything is read or swapped (BACKLOG #2034).
+                restart_required = await self.preflight_settings()
+            path = await self._existing_reload_target(config_dir)
+            # The one read of the directory this reload runs (vault BACKLOG #2596): load_config
+            # compiles and parses these bytes and nothing else, the audit digest is theirs, and an
+            # approval is checked against them before any of them runs. None when a file cannot be
+            # read, which is logged; an ungated reload then lets load_config read and refuse it.
+            snapshot = await self._reload_snapshot(path)
+        except WiringError as exc:
+            if approval is None:
+                raise
+            # A released reload refused before its digest check: marked, so its audit row can say
+            # the check was not reached rather than read as a refusal of the approved bytes. The
+            # cause is kept, so a trust-anchor or store refusal is audited as it was.
+            raise ConfigRefusedBeforeApprovalCheck(exc, approval.fingerprint).with_traceback(
+                exc.__traceback__
+            ) from exc.__cause__
         if approval is not None:
             # Before load_config, which runs every config module's top-level code, so bytes
-            # changed since the request are refused before they run (vault BACKLOG #2596). This
-            # samples the files: an edit landing between here and the load still runs its module
-            # code, and the check after the load then refuses it.
-            _require_approved(await self._content_digest(path), approval)
+            # changed since the request are refused before they run. An edit after this read
+            # changes nothing: the load runs this snapshot.
+            from messagefoundry.config.fingerprint import snapshot_fingerprint
+
+            digest = (
+                await asyncio.to_thread(snapshot_fingerprint, snapshot)
+                if snapshot is not None
+                else None
+            )
+            _require_approved(digest, approval)
         # The values this reload resolves env() against. A real reload applies them only at the
         # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
         env_values = self._env_values
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
-        if self._env_values_provider is not None:
+        provider = self._env_values_provider
+        if provider is not None:
             # Guard the provider. On the CLI path it is tomllib.load over environments/<env>.toml, and
             # for an embedder it is arbitrary caller code, so an unreadable value file raised straight
             # out of the reload: TOMLDecodeError is a ValueError, not a WiringError, so POST
@@ -3279,11 +3424,22 @@ class Engine:
             # dual-control release executor, the cluster convergence loop). A DR activation does not
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
+            # Vault BACKLOG #2596: the approval digest covers environments/*.toml under the config
+            # directory, so a SnapshotEnvValuesProvider is handed the snapshot and parses the bytes
+            # the digest names. Where it cannot, and for any other provider, the values are read
+            # from disk after the digest check, and a released reload checks the digest again.
+            read: Mapping[str, Any] | None = None
+            reads_snapshot = False
             try:
                 # Off the event loop: the CLI provider reads the value file and, before that, its
                 # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
-                env_values = dict(await asyncio.to_thread(self._env_values_provider))
+                if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
+                    read = await asyncio.to_thread(provider.from_snapshot, snapshot)
+                reads_snapshot = read is not None
+                if read is None:  # no snapshot, or one that cannot vouch for the value file
+                    read = await asyncio.to_thread(provider)
+                env_values = dict(read)
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
@@ -3311,31 +3467,18 @@ class Engine:
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {refusal}"
                 )
-        load_error: WiringError | None = None
-        try:
-            # Off the event loop: load_config executes user config modules (arbitrary, potentially
-            # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
-            registry = await asyncio.to_thread(load_config, path)  # WiringError on a bad config
-        except WiringError as exc:
-            if approval is None:
-                raise
-            load_error = exc
-        if load_error is not None and approval is not None:
-            # An edit after the first check can also break the load. Name the edit, so a tamper is
-            # audited as one and not as a bad config (vault BACKLOG #2596). Checked AFTER the
-            # handler, so a digest refusal does not carry the load error on __context__, where a
-            # TOMLDecodeError would keep a whole value file (BACKLOG #2307).
-            try:
+            if approval is not None and not reads_snapshot:
+                # A provider not handed the snapshot may have read a value file the digest covers
+                # from disk after the check, so the release checks the directory again now, and
+                # refuses an edit made in between rather than apply values nobody approved.
                 _require_approved(await self._content_digest(path), approval)
-            except (ConfigDigestMismatch, ConfigDigestUnavailable, FileNotFoundError):
-                # The refusal names the digest or the missing directory, so the load error would
-                # otherwise go unlogged.
-                log.warning(
-                    "a released config reload also failed to load: %s",
-                    scrub_log_argument(safe_exc(load_error)),
-                )
-                raise
-            raise load_error
+        # Off the event loop: load_config executes user config modules (arbitrary, potentially
+        # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
+        # WiringError on a bad config. With a snapshot, a released reload's load failure is a
+        # failure of the approved bytes themselves, so it is a bad config and not an edit.
+        # With no snapshot (one could not be read strictly), load_config reads its own and refuses
+        # a file it needs but cannot read.
+        registry = await asyncio.to_thread(load_config, path, snapshot=snapshot)
         fingerprint: dict[str, object] | None = None
         if not dry_run:
             # ADR 0041 D1 (config provenance, item C): fingerprint the bundle right after the load
@@ -3347,19 +3490,14 @@ class Engine:
             # the swap. Still best-effort: an unreadable bundle leaves provenance unknown rather
             # than refusing an otherwise-applicable config, and is recorded as a step failure so the
             # caller is not told the reload was clean when GET /config/provenance reports nothing.
-            fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+            # The digest of the snapshot the load ran (vault BACKLOG #2596), so a released
+            # reload's row names the approved digest by construction, and the row names the bytes
+            # that ran rather than a later read of the directory.
+            fingerprint, fingerprint_failure = await self.fingerprint_bundle(
+                path, registry.config_snapshot
+            )
             if fingerprint_failure is not None:
                 failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
-        if approval is not None:
-            # Again, on the digest the audit row records, so a released reload's row names the
-            # approved digest. Before every check that can refuse the graph as invalid, so a tamper
-            # is audited as one and those checks read only approved bytes. An edit that lands and
-            # is reverted inside the load is not seen. The fail-closed digest first: the recorded
-            # one skips a file it cannot read, so on its own it could match with a file unbound.
-            _require_approved(await self._content_digest(path), approval)
-            taken = fingerprint.get("fingerprint") if fingerprint is not None else None
-            if isinstance(taken, str):
-                _require_approved(taken, approval)
         # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
         # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
         self.guard_registry(registry)

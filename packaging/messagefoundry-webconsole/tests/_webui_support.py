@@ -118,6 +118,7 @@ def _sysinfo(
     failed_count: int | None = None,
     uptime: float = 1.0,
     journal_mode: str = "wal",
+    disk_free_status: str | None = None,
 ):
     """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter.
 
@@ -137,9 +138,10 @@ def _sysinfo(
     = configured but the probe failed, an int = a measured figure. ``disk_free=None`` is the DB
     drive's unmeasurable case. A ``0`` anywhere here is a real measured zero that must still alarm.
 
-    ``journal_mode`` is the BACKEND, because what ``disk_free=None`` means depends on it: it
-    defaults to SQLite's ``"wal"``, where a null can only be a failed local probe, and callers pass
-    ``"postgres"`` or a SQL Server recovery model for the disk the engine cannot see at all.
+    ``disk_free_status`` is what the backend STATES about that figure (BACKLOG #1563). It defaults
+    to the engine's own probe: ``"observed"`` over a figure and ``"unobservable"`` over ``None``,
+    the SQLite shapes. A server backend passes ``"not_applicable"``. ``journal_mode`` is carried
+    only for display now; the rollup no longer reads it.
     """
     from messagefoundry.api.models import (
         DbInfo,
@@ -175,6 +177,8 @@ def _sysinfo(
             path="db",
             size_bytes=1,
             disk_free_bytes=disk_free,
+            disk_free_status=disk_free_status
+            or ("observed" if disk_free is not None else "unobservable"),
             journal_mode=journal_mode,
             messages=0,
             events=0,

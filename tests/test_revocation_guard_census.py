@@ -107,10 +107,12 @@ _GUARD_ROOTS = frozenset(
 _GUARDS = _GUARD_ROOTS | frozenset(
     {
         "refuse_unrevoked_verified_hop",
+        "_guard_ftps_revocation",  # transports/remotefile.py, both FTPS directions (BACKLOG #2193)
         "_refuse_store_revocation",
         "_refuse_forward_revocation",
         "_refuse_idp_revocation",
         "idp_revocation_guards",
+        "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
         # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
         "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
         "mount_strict_reply_adapter",
@@ -162,6 +164,15 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/service.py::AuthService.__init__": Guarded(
         note="the OIDC token and JWKS legs, through _refuse_idp_revocation"
     ),
+    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Guarded(
+        note="the LDAPS AD bind, through _refuse_ad_revocation on the finished NarrowedTls "
+        "(BACKLOG #2193). Every engine build passes it a posture: "
+        "tests/test_ldaps_revocation_guard.py pins that"
+    ),
+    "messagefoundry/auth/ldap.py::_refuse_ad_revocation": Guarded(
+        note="the LDAPS guard itself, which takes the finished NarrowedTls and reads a context "
+        "its factory builds (BACKLOG #2193)"
+    ),
     "messagefoundry/logging_setup.py::_build_syslog_handler": Guarded(
         by="messagefoundry/logging_setup.py::_build_tls_context",
         note="the builder runs _refuse_forward_revocation on the context it returns",
@@ -183,7 +194,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/transports/mllp.py::MLLPDestination.__init__": Guarded(),
     "messagefoundry/transports/remotefile.py::_FtpClient.__init__": Guarded(
         by="messagefoundry/transports/remotefile.py::RemoteFileDestination.__init__",
-        note="the FTPS upload. The inbound FTPS poll builds the same client and is " + _UNGATED,
+        note="the FTPS upload. The inbound FTPS poll builds the same client, and "
+        "RemoteFileSource.__init__ calls the same _guard_ftps_revocation (BACKLOG #2193); Guarded "
+        "names one caller, so the poll's call is pinned by the behaviour tests",
     ),
     "messagefoundry/transports/rest.py::RestDestination.__init__": Guarded(),
     "messagefoundry/transports/smart.py::_TokenEndpointProvider._open_token_hop": Guarded(
@@ -197,7 +210,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note=f"the Vault Transit key provider hop, which the Transit cipher shares, {_VAULT_GUARD}"
     ),
     # --- exempt: ungated verifying hops ------------------------------------------------------------
-    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Exempt(f"LDAPS: {_UNGATED}"),
     "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Exempt(
         f"the webhook alert sink: {_UNGATED}"
     ),

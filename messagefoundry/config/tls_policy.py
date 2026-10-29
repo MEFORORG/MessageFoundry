@@ -560,19 +560,10 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
         )
 
 
-#: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` is not
-#: here: its words are :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal
-#: uses too, so the two cannot drift apart (vault BACKLOG #3506).
-_UNCONFIRMED_SIGNATURE = {
-    "unproven": (
-        "a listed CA has that name, ASCII letter case aside, and its key does not "
-        "verify the CRL, but the CRL does not "
-        "name that CA's key, so a renewed CA key could explain it"
-    ),
-    "uncheckable": "the engine cannot check its signature with the listed CA's key",
-}
-#: How many CRLs that warning describes before it only counts the rest.
+#: How many CRLs the warning :func:`_check_crl_signatures` logs describes before it only counts
+#: the rest. Its words for each are :data:`~messagefoundry.pki.UNCONFIRMED_SIGNATURE` and
+#: :data:`~messagefoundry.pki.UNLISTED_SIGNATURE`, which the reload's refusal uses too, so the two
+#: cannot drift apart (vault BACKLOG #3506).
 _UNCONFIRMED_SHOWN = 3
 
 
@@ -590,8 +581,10 @@ def _check_crl_signatures(
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
     no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
-    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
-    the CRL, so it must not log per hop. The warning is one line for the file, and
+    key is the one the CRL names or, where it names no listed CA's key, that of any listed CA
+    that fits it, one with no Subject Key Identifier included. A CRL matched to no listed CA is
+    the usual case in a two-tier PKI, where the peer sends the intermediate that issued the CRL,
+    so it must not log per hop. The warning is one line for the file, and
     :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
     logged. That function is asked only when there is a line to log. So it holds the last file
     version that logged one, and an earlier version is logged again only when it returns after
@@ -614,7 +607,13 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
-    from messagefoundry.pki import UNLISTED_SIGNATURE, CrlSignature, judge_crl_signatures
+    from messagefoundry.pki import (
+        PROVEN_BAD_SIGNATURE,
+        UNCONFIRMED_SIGNATURE,
+        UNLISTED_SIGNATURE,
+        CrlSignature,
+        judge_crl_signatures,
+    )
 
     fingerprint = crl_fingerprint(pem)
     judged: list[CrlSignature] = []
@@ -640,16 +639,14 @@ def _check_crl_signatures(
             )
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
-            f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
-            "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
-            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
-            "remove this CRL if a good one from that issuer is already in the file"
+            f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
+            "signed, or remove this CRL if a good one from that issuer is already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
         return
-    words = {**_UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
+    words = {**UNCONFIRMED_SIGNATURE, "unlisted": UNLISTED_SIGNATURE}
     shown = "; ".join(
         f"{signature.where}: {words[signature.state]}"
         for signature in unconfirmed[:_UNCONFIRMED_SHOWN]
@@ -737,7 +734,7 @@ def judge_crl_bytes(
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
-    :func:`~messagefoundry.pki.crl_signature_refusal`. The two do not refuse the same files."""
+    :func:`~messagefoundry.pki.crl_signature_finding`. The two do not refuse the same files."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
@@ -830,7 +827,8 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
 
     Reads ``VERIFY_CRL_CHECK_LEAF`` off the context itself rather than trusting that some setting was
     configured somewhere. That distinction is the whole point: ``[tls].crl_file`` is instance-wide, but
-    the hops it reaches are not — the LDAPS context loads no CRL, and a ``truststore`` context is
+    the hops it reaches are not — the LDAPS context loads its own ``[auth].ad_tls_crl_file`` and
+    never that one (BACKLOG #2193; it loaded none before), and a ``truststore`` context is
     built by a library that never sees the policy, so a setting-shaped test would report "revocation
     is checked" for a handshake that checks nothing. Asking the object that performs the handshake cannot make that mistake.
 
@@ -1782,8 +1780,12 @@ def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> 
 
 
 def assert_ldap3_tls_suites(
-    *, validate: ssl.VerifyMode, ca_certs_data: str | None, connector: str
-) -> Callable[[], ssl.SSLContext]:
+    *,
+    validate: ssl.VerifyMode,
+    ca_certs_data: str | None,
+    connector: str,
+    crl_file: str | None = None,
+) -> Ldap3ContextFactory:
     """Build and assert the LDAPS hop's TLS context; return the factory that builds it.
 
     The LDAPS sibling of :func:`assert_hvac_tls_suites`, and the same shape since BACKLOG #2494.
@@ -1810,6 +1812,15 @@ def assert_ldap3_tls_suites(
     asserts it, and :func:`_hold_to_approved_list` holds it to the approved list. This runs the
     factory once before returning, so a narrowing that stopped working fails at construction.
     Raises :class:`ValueError`, like every other assertion site.
+
+    ``crl_file`` is ``[auth].ad_tls_crl_file`` (BACKLOG #2193). On a verifying context it is loaded
+    by :func:`harden_crl_check` after the trust store is final, so the hop's revocation guard reads
+    ``VERIFY_CRL_CHECK_LEAF`` off a context that really holds it. The factory builds a fresh
+    context for every connection and loads the file again each time, so a replaced CRL reaches the
+    next bind, and nothing records a held copy (``record_held_copy=False``, as for the Postgres
+    store). A file that cannot be loaded refuses, at construction and at any later bind: ldap3
+    turns the refusal raised inside ``wrap_socket`` into ``LDAPSocketOpenError``, so that bind
+    fails rather than handshaking unchecked.
     """
 
     def narrowed_context() -> ssl.SSLContext:
@@ -1819,14 +1830,35 @@ def assert_ldap3_tls_suites(
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if validate != ssl.CERT_NONE:
             harden_verify_flags(ctx)
+            if crl_file:
+                harden_crl_check(
+                    ctx, crl_file, setting="[auth].ad_tls_crl_file", record_held_copy=False
+                )
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         _narrow_library_context(ctx, connector=connector, hop="the LDAPS TLS context")
         harden_cipher_suites(ctx, connector=connector)
         _hold_to_approved_list(ctx, connector=connector, hop="the LDAPS TLS context")
         return ctx
 
-    narrowed_context()  # fail at construction, not on the first bind
-    return narrowed_context
+    return Ldap3ContextFactory(narrowed_context)
+
+
+class Ldap3ContextFactory:
+    """The LDAPS context factory :func:`assert_ldap3_tls_suites` returns: call it for a fresh
+    context, as every bind does.
+
+    Building it runs the recipe once, so a context that cannot be built fails at construction, not
+    on the first bind. That first context is kept as :attr:`constructed` rather than thrown away,
+    and no bind handshakes on it: the LDAPS revocation guard (BACKLOG #2193) reads it, so the guard
+    judges the recipe without a second build at start."""
+
+    def __init__(self, build: Callable[[], ssl.SSLContext]) -> None:
+        self._build = build
+        #: The context built at construction, for a reader that must not handshake on it.
+        self.constructed = build()
+
+    def __call__(self) -> ssl.SSLContext:
+        return self._build()
 
 
 #: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` admits UNCONDITIONALLY.
@@ -2482,9 +2514,12 @@ def revocation_hop_disposition(
 HOP_ATTESTATION_LEVER = "tls_hop_attested=true with a tls_hop_attested_reason"
 
 #: The remedy the credential-bearing token-endpoint refusals share (OAuth2, HTTP Digest, SMART).
+#: It offered the hop attestation and a ``cleartext_accepted`` declaration as well until vault
+#: BACKLOG #3533 item 4 (owner ruling 2026-10-26): neither lets a credential cross cleartext http
+#: off this machine now, so the refusal names the one lever that does.
 CREDENTIAL_HOP_WAYS_ACROSS = (
-    f"use https, attest the hop as secure with {HOP_ATTESTATION_LEVER}, "
-    "or declare cleartext_accepted with a cleartext_reason"
+    "use https; neither tls_hop_attested nor cleartext_accepted lets a credential cross "
+    "cleartext http off this machine"
 )
 
 
@@ -3030,8 +3065,8 @@ def vault_client_verify_kwargs(
     except ValueError:
         # A malformed bracketed host, or an address that names no host (BACKLOG #2207). Not
         # raised here: the client build refuses a given address it cannot read as one URL, with
-        # fixed text and the provider's own error type (BACKLOG #2317). An unset address lands
-        # here too: hvac then picks its own, which this function cannot see. NOT "":
+        # fixed text and the provider's own error type (BACKLOG #2317). An unset address does
+        # not reach here from a provider, which refuses it first (BACKLOG #2851). NOT "":
         # is_loopback_hop_host("") is True, and a host this function cannot read must not count
         # as on-box.
         host = "(unreadable host)"

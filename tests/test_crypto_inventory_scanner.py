@@ -1119,6 +1119,28 @@ def test_a_ciphers_value_is_in_its_token(line: str, token: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        # BACKLOG #300: a number is the value, so lowering the floor changes the token.
+        ("x = { minDHSize: 2048 };", "tls_context:minDHSize[2048]"),
+        ("x = { minDHSize: 1024 };", "tls_context:minDHSize[1024]"),
+        # A name is a reference, kept apart from a literal.
+        ("x = { minDHSize: FLOOR };", "tls_context:minDHSize[=FLOOR]"),
+    ],
+)
+def test_a_min_dh_size_value_is_in_its_token(line: str, token: str) -> None:
+    assert token in _gate().non_python_operation_tokens_in(line + "\n")
+
+
+@pytest.mark.parametrize("value", ["2048 / 2", "2048 >> 1", "2048 - 1024"])
+def test_a_min_dh_size_expression_is_not_read_as_its_leading_number(value: str) -> None:
+    # The leading 2048 must not pass for the documented literal while the value is lower.
+    tokens = _gate().non_python_operation_tokens_in(f"x = {{ minDHSize: {value} }};\n")
+    assert "tls_context:minDHSize" in tokens
+    assert "tls_context:minDHSize[2048]" not in tokens
+
+
+@pytest.mark.parametrize(
     ("literal", "suites"),
     [
         ('"ECDHE-ECDSA-AES256-GCM-SHA384"', {"ECDHE-ECDSA-AES256-GCM-SHA384"}),
@@ -1227,7 +1249,8 @@ def _ide_client_plant(
 
 
 _LAST_SUITE = '  "DHE-RSA-AES256-GCM-SHA384",\n'
-_PIN = "ciphers: TLS_CIPHERS }"
+_PIN = "ciphers: TLS_CIPHERS,"
+_DH_FLOOR = "minDHSize: 2048,"
 
 
 def test_control_the_real_ide_suite_list_is_clean_against_its_row(
@@ -1238,6 +1261,7 @@ def test_control_the_real_ide_suite_list_is_clean_against_its_row(
     gate = _gate()
     assert _ide_client_plant(tmp_path, monkeypatch, gate, _LAST_SUITE, _LAST_SUITE) == []
     assert _ide_client_plant(tmp_path, monkeypatch, gate, _PIN, _PIN) == []
+    assert _ide_client_plant(tmp_path, monkeypatch, gate, _DH_FLOOR, _DH_FLOOR) == []
 
 
 @pytest.mark.parametrize(
@@ -1257,7 +1281,11 @@ def test_control_the_real_ide_suite_list_is_clean_against_its_row(
         # Add a bare key-exchange selector, which pulls in every ECDHE suite, CBC ones included.
         (_LAST_SUITE, _LAST_SUITE + '  "ECDHE",\n', "undocumented", "cipher_string[ECDHE]"),
         # Point the pin at a different constant, with every suite literal left alone.
-        (_PIN, "ciphers: OTHER_CIPHERS }", "undocumented", "ciphers[=OTHER_CIPHERS]"),
+        (_PIN, "ciphers: OTHER_CIPHERS,", "undocumented", "ciphers[=OTHER_CIPHERS]"),
+        # Lower the DHE group floor to Node's own default (BACKLOG #300).
+        (_DH_FLOOR, "minDHSize: 1024,", "undocumented", "minDHSize[1024]"),
+        # Drop the DHE group floor: its row token is left unbacked.
+        (_DH_FLOOR, "", "inventory lists", "minDHSize[2048]"),
     ],
 )
 def test_a_planted_weaker_ide_suite_pin_reds_the_inventory_gate(
@@ -1282,10 +1310,11 @@ def test_the_plant_is_invisible_to_the_pre_2020_scanner(
     """The pre-#2020 scanner, reconstructed: the old ``ciphers`` pattern, no ``suite`` or
     ``cipher_string`` pattern, and the old row. The same dropped suite, and the same added
     ``DEFAULT``, are both clean. This is the blindness the fix closes, and it shows the plant test
-    above reds on the new tokens and nothing else."""
+    above reds on the new tokens and nothing else. The later ``minDHSize`` pattern (BACKLOG #300)
+    is removed too, since the old row predates it."""
     gate = _gate()
     patterns = dict(gate.NON_PYTHON_OPERATION_PATTERNS)
-    del patterns["suite"], patterns["cipher_string"]
+    del patterns["suite"], patterns["cipher_string"], patterns["minDHSize"]
     patterns["ciphers"] = (re.compile(gate._B + r"ciphers\s*:" + gate._LIT), "tls_context")
     monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_PATTERNS", patterns)
     rel = "ide/src/engineClient.ts"

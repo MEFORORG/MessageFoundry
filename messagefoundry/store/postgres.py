@@ -226,6 +226,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    DiskFreeStatus,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -240,6 +241,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -279,6 +281,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -325,6 +328,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -8833,6 +8837,7 @@ class PostgresStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
@@ -8851,6 +8856,7 @@ class PostgresStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------
@@ -9136,6 +9142,7 @@ class PostgresStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -9159,6 +9166,7 @@ class PostgresStore:
                 passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9240,6 +9248,7 @@ class PostgresStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -9261,6 +9270,7 @@ class PostgresStore:
                 passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9336,18 +9346,39 @@ class PostgresStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from the store cipher). asyncpg raises
         UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
         and ForeignKeyViolationError for an account that does not exist; the caller tells them
         apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
         BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
-        transaction (BACKLOG #2592)."""
+        transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: the account row is taken ``FOR UPDATE`` before the check, as every
+        factor write here takes it, so a factor bound elsewhere either committed before the check
+        reads it or waits until this transaction ends. The session row is taken ``FOR UPDATE``
+        after it, in the users-then-sessions order ``revoke_user_sessions`` keeps, so a revoke of
+        that session cannot land between the check and the commit either."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if for_session is not None:
+                record = await self._read_user_record(conn, cred.user_id)  # FOR UPDATE
+                session = await conn.fetchrow(
+                    "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", for_session
+                )
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    None if session is None else SessionRecord.from_mapping(dict(session)),
+                    record,
+                    await self._account_passkeys(conn, cred.user_id),
+                ):
+                    return False
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)
             )
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -9382,6 +9413,7 @@ class PostgresStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -9402,6 +9434,7 @@ class PostgresStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(
@@ -9636,6 +9669,7 @@ class PostgresStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -9648,28 +9682,43 @@ class PostgresStore:
         ``auth_provider`` that decides the escalation (ADR 0197), and for the SIGN-IN lock the
         TOTP's refusal is judged by ``totp_usable`` before the lock, only for a failure that would
         set a later-cycle lock, on a cell the locked row must still hold
-        (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an
+        (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the escalation is
+        ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns ``(0, False, 0)`` for an
         unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with self._timed_acquire() as conn, conn.transaction():
+            # The passkey set the escalation reads is read in the write's own transaction, after
+            # the account row is locked, so a concurrent passkey write waits (BACKLOG #3937 item 8).
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(conn, user_id),
+                read_passkeys=lambda: self._account_passkeys(conn, user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(conn, user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
@@ -10644,6 +10693,7 @@ class PostgresStore:
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
             disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
+            disk_free_status=DiskFreeStatus.NOT_APPLICABLE,
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

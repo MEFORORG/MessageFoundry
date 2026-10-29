@@ -401,8 +401,10 @@ and its equivalence test are gone.
 - **Referrals.** When ldap3 follows a referral, it builds a plain `ldap3.Tls` for the referred
   server from a few attributes of this one. That copy carries no `ca_certs_data` and none of the
   narrowing. This amendment does not change that path, and neither did the ones before it.
-- **Revocation.** The LDAPS context loads no CRL. It is still among the hops the DEPLOYMENT guide
-  lists as delegated.
+- **Revocation.** Not this amendment's subject. Since BACKLOG #2193 the LDAPS context loads the
+  optional `[auth].ad_tls_crl_file` and the bind takes the revocation-hop guard; ADR 0173 section
+  7.1 grades it. *(CORRECTED 2026-10-28: this read "The LDAPS context loads no CRL. It is still
+  among the hops the DEPLOYMENT guide lists as delegated.")*
 - **Client certificates, a pinned protocol version, `ssl_options` and SNI.** The engine passes
   none, and `NarrowedTls` accepts none.
 - **The other TLS 1.3 residuals.** The 2026-09-26 amendment's 3.14 gap stands on every hop, LDAPS

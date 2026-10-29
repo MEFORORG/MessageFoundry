@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import (
     _CONFIG_SOURCE_LEAD,
     WiringError,
@@ -88,7 +89,7 @@ def test_importer_serves_only_underscore_helpers(tmp_path: Path) -> None:
     (tmp_path / "os.py").write_text("SHADOWED = True\n", encoding="utf-8")
     (tmp_path / "shared.py").write_text("VALUE = 1\n", encoding="utf-8")
     (tmp_path / "_h.py").write_text("VALUE = 1\n", encoding="utf-8")
-    importer = _HelperImporter(tmp_path)
+    importer = _HelperImporter(read_config_snapshot(tmp_path, strict=True))
     do_import = importer.builtins["__import__"]
     # A real-module name (not '_'-prefixed) goes to the normal import even though os.py exists.
     assert do_import("os") is os

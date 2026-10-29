@@ -23,6 +23,7 @@ import ast
 import inspect
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import ldap3
@@ -247,11 +248,17 @@ def test_a_failed_service_unbind_does_not_change_the_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The block has answered by then, so an unbind failure is suppressed, as
-    ``read_bind_account``'s is."""
+    ``read_bind_account``'s is, and the socket the failed send left open is closed (BACKLOG
+    #3848)."""
     _install_fakes(monkeypatch)
     base = ldap3.Connection
+    closed: list[str | None] = []
 
     class FailingServiceUnbind(base):  # type: ignore[misc, valid-type]
+        def __init__(self, server: Any = None, **kwargs: Any) -> None:
+            super().__init__(server, **kwargs)
+            self.strategy = SimpleNamespace(close=lambda: closed.append(self._bind_dn))
+
         def unbind(self) -> None:
             if self._bind_dn == _SERVICE_DN:
                 raise ldap3.core.exceptions.LDAPSocketSendError("synthetic")
@@ -260,6 +267,7 @@ def test_a_failed_service_unbind_does_not_change_the_answer(
     monkeypatch.setattr(ldap3, "Connection", FailingServiceUnbind)
     probe = LdapAuthenticator(_ad_settings()).probe_principal("alice")
     assert probe.answer is DirectoryAnswer.FOUND
+    assert closed == [_SERVICE_DN]
 
 
 # --- (f) a refused service-account bind, through a real ldap3 stack -----------------------------

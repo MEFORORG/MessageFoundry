@@ -61,6 +61,7 @@ def _sys(forwarder: LogForwarderInfo | None) -> SystemStatus:
             path="db",
             size_bytes=1,
             disk_free_bytes=100 * 1024**3,
+            disk_free_status="observed",
             journal_mode="wal",
             messages=0,
             events=0,

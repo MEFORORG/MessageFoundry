@@ -33,7 +33,8 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
 
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import json_loads_or_refusal
@@ -95,6 +96,16 @@ _COSE_KEY_SHAPE_FOR_ALG: dict[int, tuple[int, int]] = {-8: (1, 6), -7: (2, 1)}
 _INSTALL_HINT = (
     "WebAuthn support requires the [webauthn] extra: pip install messagefoundry[webauthn]"
 )
+
+
+def configured_rp_id(public_origin: str | None) -> str | None:
+    """The relying-party id the configuration names: ``[api].public_origin``'s host, or ``None``
+    when it is unset or names no host. The console's ``webauthn_rp`` takes the same host for each
+    ceremony while it is set; unset, the rp_id comes from each request, so no single one is
+    configured (BACKLOG #3937)."""
+    if not public_origin:
+        return None
+    return urlsplit(public_origin).hostname or None
 
 
 def available() -> bool:
@@ -391,6 +402,10 @@ class ChallengeCache:
         return len(moved)
 
 
+#: A sign-in limiter hit: the limiter key and the monotonic stamp ``allow_stamped`` returned.
+LoginCharge = tuple[str, float]
+
+
 class PreAuthChallengePool:
     """Bounded, TTL'd, process-local staging for the usernameless sign-in's challenges (ADR 0197
     Amendment A, wave 2).
@@ -420,35 +435,38 @@ class PreAuthChallengePool:
         self._ttl = ttl_seconds
         self._cap = cap
         self._clock = clock
-        self._entries: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
+        # key -> (challenge, deadline, the begin leg's sign-in limiter charge or None).
+        self._entries: OrderedDict[str, tuple[bytes, float, LoginCharge | None]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def _prune(self, now: float) -> None:
         while self._entries:
-            key, (_challenge, deadline) = next(iter(self._entries.items()))
+            key, (_challenge, deadline, _charge) = next(iter(self._entries.items()))
             if deadline > now:
                 return
             del self._entries[key]
 
-    def put(self, key: str, challenge: bytes) -> None:
-        """Stage ``challenge`` under ``key`` (a handle hash), evicting the oldest entry when full."""
+    def put(self, key: str, challenge: bytes, charge: LoginCharge | None = None) -> None:
+        """Stage ``challenge`` under ``key`` (a handle hash), evicting the oldest entry when full.
+        ``charge`` is the begin leg's sign-in limiter hit, which the sign-in renews (BACKLOG #3937)."""
         now = self._clock()
         self._prune(now)
         self._entries.pop(key, None)
         while len(self._entries) >= self._cap:
             self._entries.popitem(last=False)
-        self._entries[key] = (challenge, now + self._ttl)
+        self._entries[key] = (challenge, now + self._ttl, charge)
 
-    def pop(self, key: str) -> bytes | None:
-        """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired."""
+    def pop(self, key: str) -> tuple[bytes, LoginCharge | None] | None:
+        """Consume the challenge staged under ``key``: single use, ``None`` if absent or expired.
+        Returns the challenge and the charge :meth:`put` stored with it."""
         # A dict lookup, discharged for ASVS 11.2.4 for the reason ChallengeCache.put gives: the
         # key is the SHA-256 of the caller's own handle.
         entry = self._entries.pop(key, None)
         if entry is None or entry[1] <= self._clock():
             return None
-        return entry[0]
+        return entry[0], entry[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,7 +612,7 @@ def assertion_options(
 
 def verify_assertion(
     *,
-    response_json: str,
+    response_json: str | dict[str, Any],
     challenge: bytes,
     rp_id: str,
     origin: str,
@@ -617,6 +635,9 @@ def verify_assertion(
     That refusal is raised as :class:`StoredKeyRefusedError`, so the service can tell it from a bad
     signature (BACKLOG #1963). Only :class:`WebAuthnVerificationError` is narrowed: a fault in our
     own check still escapes as itself.
+
+    ``response_json`` may be the object :func:`parse_response` already returned, so a caller that
+    read fields from it first does not parse the same untrusted text again (BACKLOG #3937).
     """
     _require_webauthn()
     from webauthn import verify_authentication_response
@@ -644,8 +665,31 @@ def verify_assertion(
     return verified.new_sign_count
 
 
-def credential_id_from_response(response_json: str) -> bytes:
+def parse_response(response_json: str) -> dict[str, Any]:
+    """Parse a ceremony response ONCE, for a caller that reads several fields of it and then
+    verifies it (BACKLOG #3937): the result goes to :func:`credential_id_from_response`,
+    :func:`user_handle_from_response` and :func:`verify_assertion` in place of the text.
+
+    Raises :class:`WebAuthnVerificationError` for anything that is not a JSON object, raised
+    outside a handler so it chains no decode error, which holds the whole response (BACKLOG
+    #2085). json's RecursionError is a refusal here too."""
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
+        raise WebAuthnVerificationError("malformed ceremony response")
+    return parsed
+
+
+def _parsed_or_refusal(response_json: str | Mapping[str, Any]) -> tuple[object, object]:
+    """The text parsed with :func:`json_loads_or_refusal`, or an object :func:`parse_response`
+    already returned, taken as it is: the one entry rule for the readers below."""
+    if isinstance(response_json, str):
+        return json_loads_or_refusal(response_json)
+    return response_json, None
+
+
+def credential_id_from_response(response_json: str | Mapping[str, Any]) -> bytes:
     """Extract the raw credential id from a ceremony response (for the service's hash lookup).
+    ``response_json`` is the text, or the object :func:`parse_response` returned for it.
 
     Raises :class:`WebAuthnVerificationError` on malformed input — the caller treats it exactly
     like a failed verification (invalid input, audited, never a 500).
@@ -655,10 +699,10 @@ def credential_id_from_response(response_json: str) -> bytes:
 
     # Every refusal is raised outside a handler, so none chains the decode error, which holds the
     # whole ceremony response (BACKLOG #2085). json's RecursionError is a refusal here too.
-    parsed, refused = json_loads_or_refusal(response_json)
-    if refused is not None or (isinstance(parsed, dict) and "rawId" not in parsed):
+    parsed, refused = _parsed_or_refusal(response_json)
+    if refused is not None or (isinstance(parsed, Mapping) and "rawId" not in parsed):
         raise WebAuthnVerificationError("malformed ceremony response")
-    raw_id = parsed["rawId"] if isinstance(parsed, dict) else None
+    raw_id = parsed["rawId"] if isinstance(parsed, Mapping) else None
     if not isinstance(raw_id, str) or not raw_id:
         raise WebAuthnVerificationError("ceremony response has no rawId")
     with contextlib.suppress(ValueError, TypeError):
@@ -666,9 +710,10 @@ def credential_id_from_response(response_json: str) -> bytes:
     raise WebAuthnVerificationError("malformed ceremony response")
 
 
-def user_handle_from_response(response_json: str) -> bytes | None:
+def user_handle_from_response(response_json: str | Mapping[str, Any]) -> bytes | None:
     """The ``response.userHandle`` of an assertion, decoded, or ``None`` when it carries none or
-    it is malformed (ADR 0197 Amendment A, wave 2).
+    it is malformed (ADR 0197 Amendment A, wave 2). ``response_json`` is the text, or the object
+    :func:`parse_response` returned for it.
 
     The usernameless sign-in names the account in the form and the credential in the assertion, so
     the service compares this to the named account's id: a discoverable credential always returns
@@ -678,8 +723,8 @@ def user_handle_from_response(response_json: str) -> bytes | None:
     _require_webauthn()
     from webauthn.helpers import base64url_to_bytes
 
-    parsed, refused = json_loads_or_refusal(response_json)
-    if refused is not None or not isinstance(parsed, dict):
+    parsed, refused = _parsed_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, Mapping):
         return None
     response = parsed.get("response")
     handle = response.get("userHandle") if isinstance(response, dict) else None

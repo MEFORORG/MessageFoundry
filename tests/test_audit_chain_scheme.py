@@ -288,5 +288,5 @@ def test_the_anchor_width_is_the_width_of_every_hex_head_the_chain_can_produce()
     assert len(keyless) == len(keyed) == AUDIT_ANCHOR_DIGEST_HEX_LEN
     assert 2 * hmac.new(b"k", b"", hashlib.sha256).digest_size == AUDIT_ANCHOR_DIGEST_HEX_LEN
     assert parse_audit_anchor(f"1:{keyed}") == (1, keyed)
-    with pytest.raises(ValueError, match="hex characters"):
+    with pytest.raises(ValueError, match="not a full 64-character digest"):
         parse_audit_anchor(f"1:{keyed[:-2]}")

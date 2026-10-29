@@ -75,6 +75,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_text
@@ -221,6 +222,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    DiskFreeStatus,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -235,6 +237,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -278,6 +281,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -324,6 +328,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -2742,20 +2747,15 @@ def _schema_hash() -> str:
     return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
 
 
-def _odbc_brace(value: str) -> str:
-    """ODBC-quote a value in braces, doubling any internal ``}`` — neutralizes ``; { } =`` inside it
-    so an attacker-influenced value (e.g. a password) can't inject extra connection keywords."""
-    return "{" + value.replace("}", "}}") + "}"
-
-
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
     """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
     the setting. A no-op when the store sends no pin.
 
-    Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
-    host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
+    Vault BACKLOG #2223: the pinned file is the connection's only trust anchor, because of what a
+    pin match does under ``Encrypt=strict``. The ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``
+    states that once, with the build and platform it was tested on. So:
 
     * it takes the trust-anchor ACL and path checks with their own rules and messages
       (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
@@ -2833,10 +2833,8 @@ def check_pinned_certificate(
 def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
-    Free-text values are brace-quoted to prevent connection-string injection (STORE-5), and the
-    ``Encrypt``/``TrustServerCertificate`` security flags are emitted **last** so — ODBC being
-    last-wins on duplicate keywords — nothing earlier can downgrade TLS. Identity fields are also
-    validated up front (see ``StoreSettings._no_odbc_injection``).
+    Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (STORE-5, BACKLOG #3714). Identity
+    fields are also validated up front (see ``StoreSettings._no_odbc_injection``).
 
     ``posture`` is the deriving instance's :class:`HopPosture` (threaded from ``open_store`` by the
     serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
@@ -2865,42 +2863,37 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     parts = [
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
-        f"DATABASE={_odbc_brace(settings.database or '')}",
+        f"DATABASE={odbc_brace(settings.database or '')}",
         # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
         # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
         # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
         # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
         # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
-        f"APP={_odbc_brace(settings.application_name)}",
+        f"APP={odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
-        parts.append(f"UID={_odbc_brace(settings.username or '')}")
-        parts.append(f"PWD={_odbc_brace(settings.password or '')}")
+        parts.append(f"UID={odbc_brace(settings.username or '')}")
+        parts.append(f"PWD={odbc_brace(settings.password or '')}")
     elif settings.auth is SqlAuth.INTEGRATED:
         parts.append("Trusted_Connection=yes")
     elif settings.auth is SqlAuth.ENTRA:
         parts.append("Authentication=ActiveDirectoryDefault")
-    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes before the
-    # Encrypt/TrustServerCertificate tail and cannot disturb the last-wins TLS posture.
+    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes in the head,
+    # before the TLS tail (messagefoundry.odbc_dsn).
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
-    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
-    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
-    # Encrypt=strict: on the Driver 18.7 build tested on Windows, the pin was enforced with strict and
-    # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
-    # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
-    # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
-    # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
-    # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
-    # keywords stay inside the last-wins tail.
-    pin = settings.sqlserver_pin_path()
-    if pin:
-        parts.append(f"ServerCertificate={_odbc_brace(pin)}")
-    encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
-    parts.append(f"Encrypt={encrypt}")
-    parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
-    return ";".join(parts) + ";"
+    # Driver 18.1+ `ServerCertificate` keyword, only on the SECURE posture (encrypt on, verify on; the
+    # weakened branch above already refused or escaped). The pin goes out with Encrypt=strict, and the
+    # engine checks the pinned certificate itself at store open (check_pinned_certificate). Why strict,
+    # what it needs of the server, and what it was tested on: the `ssl_root_cert` row of
+    # docs/CONFIGURATION.md (vault BACKLOG #2223). Not a revocation control.
+    return odbc_connection_string(
+        parts,
+        encrypt=settings.encrypt,
+        trust_server_certificate=settings.trust_server_certificate,
+        pin=settings.sqlserver_pin_path(),
+    )
 
 
 def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) -> ThreadPoolExecutor:
@@ -9083,7 +9076,8 @@ class SqlServerStore:
         # ASVS 14.2.7. Whole-row DELETE — the criteria IS the payload and the row backs no count.
         # `updated_at`/`last_used_at` are FLOAT epochs here (as on SQLite/PG), so the comparison needs no
         # date handling. #306: key on the LATER of last-edited and last-used. T-SQL's GREATEST is SQL
-        # Server 2022+ and this backend's floor is 2016 SP1 (see _SCHEMA's CREATE OR ALTER guard), so the
+        # Server 2022+, newer than the 2016 SP1 that _SCHEMA's CREATE OR ALTER guard checks for, so this
+        # statement does not use it (the supported floor is docs/SYSTEM-REQUIREMENTS.md's). The
         # null-safe greatest-of-two is spelled as the equivalent PREDICATE pair — `MAX(a,b) < cutoff` is
         # exactly `a < cutoff AND (b IS NULL OR b < cutoff)`, and the NULL arm is what keeps a pre-#306
         # row (never recall-stamped) purging on `updated_at` alone. `older_than` is bound TWICE.
@@ -12755,6 +12749,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
@@ -12776,6 +12771,7 @@ class SqlServerStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------
@@ -13539,6 +13535,7 @@ class SqlServerStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -13566,6 +13563,7 @@ class SqlServerStore:
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13670,6 +13668,7 @@ class SqlServerStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -13692,6 +13691,7 @@ class SqlServerStore:
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13726,17 +13726,51 @@ class SqlServerStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
         for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
         already held (the primary key) and an account that does not exist
         (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
         re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
-        over its new passkey digest in the same transaction (BACKLOG #2592)."""
-        await self._write_passkeys_txn(
-            cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
-        )
+        over its new passkey digest in the same transaction (BACKLOG #2592). See
+        :meth:`AuthStore.add_webauthn_credential` for ``for_session``: the account row is taken
+        under ``UPDLOCK, ROWLOCK`` before the check, as every factor write here takes it, so a
+        factor bound elsewhere either committed before the check reads it or waits until this
+        transaction ends. The session row is taken the same way after it, users then sessions, so
+        a revoke of that session cannot land between the check and the commit either."""
+        if for_session is None:
+            await self._write_passkeys_txn(
+                cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+            )
+            return True
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                record = await self._read_user_record(cur, cred.user_id)  # UPDLOCK, ROWLOCK
+                await cur.execute(
+                    "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?",
+                    (for_session,),
+                )
+                session = await self._fetch_dicts(cur)
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    SessionRecord.from_mapping(session[0]) if session else None,
+                    record,
+                    await self._account_passkeys(cur, cred.user_id),
+                ):
+                    await conn.rollback()  # only read; this releases the lock
+                    return False
+                await self._write_passkeys(
+                    cur, cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -13772,6 +13806,7 @@ class SqlServerStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
@@ -13798,6 +13833,7 @@ class SqlServerStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     await conn.rollback()
                     return False
@@ -14120,6 +14156,7 @@ class SqlServerStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -14131,27 +14168,50 @@ class SqlServerStore:
         than three; the same locked read carries the ``auth_provider`` that decides the escalation
         (ADR 0197), and for the SIGN-IN lock the TOTP's refusal is judged by ``totp_usable`` before
         the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
-        must still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an unknown user."""
+        must still hold (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the
+        escalation is ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
-        written = await self._write_user_txn(user_id, change)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # The account row first, under UPDLOCK, so a concurrent passkey write waits; then
+                # the passkey set the escalation reads, in the write's own transaction (BACKLOG
+                # #3937 item 8).
+                passkeys = await escalation_passkeys(
+                    counter,
+                    passkey_escalates=passkey_escalates,
+                    threshold=threshold,
+                    now=now,
+                    read_record=lambda: self._read_user_record(cur, user_id),
+                    read_passkeys=lambda: self._account_passkeys(cur, user_id),
+                )
+                change = lockout_increment(
+                    counter,
+                    threshold=threshold,
+                    lockout_seconds=lockout_seconds,
+                    max_lockout_seconds=max_lockout_seconds,
+                    now=now,
+                    out=out,
+                    totp_counts=totp_counts,
+                    passkeys=passkeys,
+                    sealed=self._row_sealer is not None,
+                    passkey_escalates=passkey_escalates,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(
@@ -14993,6 +15053,7 @@ class SqlServerStore:
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
             disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
+            disk_free_status=DiskFreeStatus.NOT_APPLICABLE,
             journal_mode=str(recovery["m"]) if recovery and recovery["m"] else "",
             messages=await self._count("messages"),
             events=await self._count("message_events"),
