@@ -188,21 +188,24 @@ async def _assert_budget_edges(store: Any, uploader_id: str) -> None:
             )
         )
 
-    # Another uploader's rows count toward nothing here.
-    assert await store.reserve_upload_quota(
-        other, f"{other}-x", size_bytes=25, max_files=1, max_total_bytes=25
-    )
-    assert await _reserve("a", 10)  # over no rows of this uploader
-    assert not await _reserve("over_bytes", 21)  # 10 + 21 > 30, with a file slot to spare
-    assert await store.upload_quota_in_flight(uploader_id) == (1, 10)
-    assert await _reserve("b", 20)  # 10 + 20 == 30 and 1 + 1 == 2: an exact fit on both limbs
-    assert not await _reserve("over_files", 0, total=1000)  # 2 + 1 > 2, with bytes to spare
-    assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
-    for name in ("a", "b"):
-        await store.release_upload_quota(
-            uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+    try:
+        # Another uploader's rows count toward nothing here.
+        assert await store.reserve_upload_quota(
+            other, f"{other}-x", size_bytes=25, max_files=1, max_total_bytes=25
         )
-    await store.release_upload_quota(uploader_id=other, reservation_id=f"{other}-x")
+        assert await _reserve("a", 10)  # over no rows of this uploader
+        assert not await _reserve("over_bytes", 21)  # 10 + 21 > 30, with a file slot to spare
+        assert await store.upload_quota_in_flight(uploader_id) == (1, 10)
+        assert await _reserve("b", 20)  # 10 + 20 == 30 and 1 + 1 == 2: exact on both limbs
+        assert not await _reserve("over_files", 0, total=1000)  # 2 + 1 > 2, bytes to spare
+        assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
+    finally:
+        # Released on a failure too, so a server-backend run leaves nothing in flight behind it.
+        for name in ("a", "b", "over_bytes", "over_files"):
+            await store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+            )
+        await store.release_upload_quota(uploader_id=other, reservation_id=f"{other}-x")
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
     assert await store.upload_quota_in_flight(other) == (0, 0)
 

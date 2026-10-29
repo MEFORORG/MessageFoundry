@@ -12526,13 +12526,15 @@ class SqlServerStore:
         sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
         hold row locks at once, because each holds no row lock when it asks for the applock.
 
-        The caller names the uploader, so the applock is taken with no read of the row, whether or
-        not the row exists (vault BACKLOG #3740 item 10). A reserve of this uploader that holds
-        the applock is waited out through the applock itself, including one that took the lock but
-        had not yet inserted, which a read for the row would have missed. The cost is on a release
-        with no row to delete: it can wait for a sibling's reserve of the same uploader, bounded by
-        the applock timeout and the caller's ledger wait. The delete matches the uploader too, so a
-        row of another uploader, whose lock this release does not hold, is left alone."""
+        The caller names the uploader, so nothing is read to learn whose lock to take, and the
+        applock is taken whether or not the row exists (vault BACKLOG #3740 item 10). The opener
+        still reads the uploader's index, without a lock; a hint that locks there would break the
+        argument above. A reserve of this uploader that holds the applock is waited out through the
+        applock itself, including one that took the lock but had not yet inserted, which a read for
+        the row would have missed. The cost is on a release with no row to delete: it can wait for
+        a sibling's reserve of the same uploader, for at most the applock timeout, which
+        ``command_timeout = 0`` removes. The delete matches the uploader too, so a row stored under
+        another uploader id is left alone."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
