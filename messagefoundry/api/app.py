@@ -429,9 +429,12 @@ from messagefoundry.pipeline import (
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
-    configured_alert_transport_names,
     notifier_from_settings,
 )
+
+# Vault BACKLOG #3849: moved to pipeline/alert_sinks.py for provision-admin; the lifespan and its
+# tests keep the old name.
+from messagefoundry.pipeline.alert_sinks import alerts_without_email as _alerts_without_email
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -11246,54 +11249,6 @@ def _chain_registry_preflights(
             await preflight(registry, env_values)
 
     return chained
-
-
-def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
-    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
-    (BACKLOG #3470). A refused CA must never suppress an alert.
-
-    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
-      transport it lacks, and the other transports would go with it.
-    * A rule or tier that named only email now names every transport left. An empty list means
-      suppress, and the operator never asked for that. ``None`` would not do for a tier: it keeps
-      its rule's transports, which may be an empty list. An explicit empty list stays one.
-    * With no transport left there is no notifier, and the engine's logging sink logs each
-      alert. Only a rule that names a transport is kept then. The notifier refuses it, and the
-      lifespan logs that refusal. The rest route only the notifier, and kept they would log
-      advice to configure the email that is configured.
-    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
-      not built. A secret store that is down cannot abort the start before the CA refusal."""
-    left = sorted(configured_alert_transport_names(alerts) - {"email"})
-
-    def _no_email(transports: list[str] | None) -> list[str] | None:
-        if transports is None:
-            return None
-        kept = [t for t in transports if t != "email"]
-        if transports and not kept:
-            return list(left)
-        return kept
-
-    rules = [
-        rule.model_copy(
-            update={
-                "transports": _no_email(rule.transports),
-                "escalate": [
-                    tier.model_copy(update={"transports": _no_email(tier.transports)})
-                    for tier in rule.escalate
-                ],
-            }
-        )
-        for rule in alerts.rules
-    ]
-    if not left:
-        rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
-    return alerts.model_copy(
-        update={
-            "email_to": [],
-            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
-            "rules": rules,
-        }
-    )
 
 
 def create_managed_app(

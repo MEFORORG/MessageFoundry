@@ -32,7 +32,7 @@ from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER, MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
@@ -1168,7 +1168,7 @@ async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_rep
         await store.close()
 
 
-@pytest.mark.parametrize("client", ["10.1.1.1", service_module._LOGIN_ADDRESS_RESET_MARKER])
+@pytest.mark.parametrize("client", ["10.1.1.1", LOGIN_ADDRESS_RESET_MARKER])
 @pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
 async def test_an_admin_reset_clears_the_known_address_record(reset: str, client: str) -> None:
     """vault BACKLOG #2946, owner ruling 2026-10-16: a password or MFA reset empties the record, so
@@ -1183,7 +1183,7 @@ async def test_an_admin_reset_clears_the_known_address_record(reset: str, client
         issued = await getattr(service, reset)(uid, actor="boss")
         assert issued is not None
         assert await store.list_known_login_addresses(uid, since=0.0) == [
-            service_module._LOGIN_ADDRESS_RESET_MARKER
+            LOGIN_ADDRESS_RESET_MARKER
         ]
         out = await service.login("oper", issued.password, client=client)
         assert out.ok and not await _seeded(store, out.token)
@@ -1211,7 +1211,7 @@ async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -
         assert await store.list_known_login_addresses("id-dir", since=0.0) == ["10.1.1.1"]
         assert await service.admin_reset_mfa("id-dir", actor="boss") is None
         assert await store.list_known_login_addresses("id-dir", since=0.0) == [
-            service_module._LOGIN_ADDRESS_RESET_MARKER
+            LOGIN_ADDRESS_RESET_MARKER
         ]
     finally:
         await store.close()
@@ -1291,7 +1291,7 @@ async def test_the_next_real_write_keeps_the_reset_marker() -> None:
             )
         ).ok
         assert set(await store.list_known_login_addresses(uid, since=0.0)) == {
-            service_module._LOGIN_ADDRESS_RESET_MARKER,
+            LOGIN_ADDRESS_RESET_MARKER,
             "10.1.1.1",
         }
         assert await store.list_known_login_addresses(uid, since=1.0) == ["10.1.1.1"]
@@ -1316,7 +1316,7 @@ async def test_a_prune_that_races_the_reset_leaves_a_baseline() -> None:
             uid, before=now - service_module._LOGIN_ADDRESS_LOOKBACK_SECONDS
         )
         assert await store.list_known_login_addresses(uid, since=0.0) == [
-            service_module._LOGIN_ADDRESS_RESET_MARKER
+            LOGIN_ADDRESS_RESET_MARKER
         ]
         user = await store.get_user(uid)
         assert user is not None and user.last_login_at is None
@@ -1364,12 +1364,6 @@ async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
         await store.close()
 
 
-def test_the_store_contract_uses_the_service_reset_values() -> None:
-    from tests import _login_address_store_contract as contract
-
-    assert contract._RESET_MARKER == service_module._LOGIN_ADDRESS_RESET_MARKER
-
-
 async def test_a_client_naming_the_marker_is_never_written() -> None:
     """A forwarded header can carry any text; a client equal to the marker is not recorded, so the
     marker never enters the lookback (vault BACKLOG #2946)."""
@@ -1377,7 +1371,7 @@ async def test_a_client_naming_the_marker_is_never_written() -> None:
     try:
         service = await _service(store, _FakeNotifier())
         uid = await _operator(service)
-        marker = service_module._LOGIN_ADDRESS_RESET_MARKER
+        marker = LOGIN_ADDRESS_RESET_MARKER
         await service.admin_reset_password(uid, actor="boss")
         await service._mark_login_address_known(uid, marker)
         assert await store.list_known_login_addresses(uid, since=1.0) == []

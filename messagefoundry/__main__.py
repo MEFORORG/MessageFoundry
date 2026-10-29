@@ -8030,7 +8030,9 @@ def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> 
 
 
 #: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
-PROVISION_ADMIN_GRANT_VIA = "provision_admin"
+_PROVISION_ADMIN_GRANT_VIA = "provision_admin"
+#: How long ``provision-admin`` waits for the alert's open-instance write before it closes the store.
+_OFFLINE_ALERT_DRAIN_SECONDS = 10.0
 
 
 def _offline_alert_notifier(
@@ -8047,7 +8049,7 @@ def _offline_alert_notifier(
     the grant it reports has already been written, and a recovery command must not die on its page.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
-    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+    from messagefoundry.pipeline.alert_sinks import alerts_without_email, notifier_from_settings
 
     alerts = settings.alerts
     try:
@@ -8055,9 +8057,7 @@ def _offline_alert_notifier(
             _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
             and _offline_smtp_relay_ca_accepted(settings, what="alert email")
         ):
-            from messagefoundry.api.app import _alerts_without_email
-
-            alerts = _alerts_without_email(alerts)
+            alerts = alerts_without_email(alerts)
         return notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
@@ -8092,39 +8092,29 @@ async def _raise_offline_administrator_granted(
 
     The notifier is the one ``serve`` wires, with the opened store set, so the alert also lands
     as an open alert instance the web console lists once the engine runs (ADR 0044). Started, fed
-    and drained here, because the loop ends with the command. Best effort, and it never raises:
-    the grant is written and audited, and the page is the smaller loss."""
-    from messagefoundry.pipeline.alerts import LoggingAlertSink
+    and drained here, because the loop ends with the command. No suspend window is primed: a
+    muted key would page anyway, the safe direction for one alert. Best effort, and it never
+    raises: the grant is written and audited, and the page is the smaller loss."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
 
-    key = f"user:{username}"
     notifier = _offline_alert_notifier(settings, posture)
+    # `administrator_granted_alert` builds the key and swallows a sink fault, as the reconciler's.
+    raise_alert = administrator_granted_alert(notifier or LoggingAlertSink(), granted_by=granted_by)
     if notifier is None:
-        try:
-            LoggingAlertSink().administrator_granted(
-                key, via=PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
-            )
-        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
-            logging.getLogger(__name__).exception("the administrator_granted alert failed to emit")
+        raise_alert(username, _PROVISION_ADMIN_GRANT_VIA)
         return False
     try:
         notifier.set_store(store)
         notifier.start()
         try:
-            await notifier.prime_suspensions()
-            notifier.administrator_granted(
-                key, via=PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
-            )
+            raise_alert(username, _PROVISION_ADMIN_GRANT_VIA)
         finally:
             await notifier.drain_state(timeout=_OFFLINE_ALERT_DRAIN_SECONDS)
             await notifier.aclose()
-    except Exception:  # noqa: BLE001 - as `alert_administrator_granted` in the API; the caller
-        # still has recovery codes to show, so nothing here may raise past it.
-        logging.getLogger(__name__).exception("the administrator_granted alert failed to emit")
+    except Exception:  # noqa: BLE001 - the caller still has recovery codes to show, so nothing
+        # here may raise past it.
+        logging.getLogger(__name__).exception("the administrator_granted alert failed to drain")
     return True
-
-
-#: How long ``provision-admin`` waits for the alert's open-instance write before it closes the store.
-_OFFLINE_ALERT_DRAIN_SECONDS = 10.0
 
 
 class _ProvisionStore:
@@ -8576,8 +8566,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
             # notice, so this command wires the same notifier `serve` does, from the same settings.
             # Started and drained here, because the loop ends when this command does. Built only when
-            # a row with the name exists, so a fresh install resolves no SMTP secret and prints
-            # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
+            # a row with the name exists, so a fresh install prints nothing about a notice it does
+            # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
+            # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
             security_notifier = (
                 _offline_security_notifier(settings, posture) if existing is not None else None

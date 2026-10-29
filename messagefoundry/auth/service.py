@@ -504,14 +504,6 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
-# The one row an administrator's password or MFA reset, or a provision-admin takeover, leaves in the
-# account's known-address record (vault BACKLOG #2946, #3849). It is the baseline for an account that
-# has never stamped ``last_login_at``, so the next sign-in after the reset is judged NEW rather than
-# failed open as no-baseline. It is never a match: it is stamped at the epoch, outside every
-# lookback, and ``_mark_login_address_known`` never writes a client whose text equals it. The store
-# owns it since vault BACKLOG #3849 B4: its prune never removes it, so it stays until the account
-# is deleted or reset again.
-_LOGIN_ADDRESS_RESET_MARKER = LOGIN_ADDRESS_RESET_MARKER
 
 
 class _LoginAddress(Enum):
@@ -12564,7 +12556,7 @@ class AuthService:
             # A client text equal to the reset marker (a forged forwarded header can carry any
             # text) is not written, or the upsert would move the marker into the lookback.
             if (
-                key == _LOGIN_ADDRESS_RESET_MARKER
+                key == LOGIN_ADDRESS_RESET_MARKER
                 or len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX
             ):
                 return
@@ -12602,7 +12594,8 @@ class AuthService:
         session does not call this, because revoking is routine. A ``provision-admin`` takeover
         calls it too (vault BACKLOG #3849 B2): the addresses are the earlier holder's.
 
-        It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
+        It leaves one row, the store's ``LOGIN_ADDRESS_RESET_MARKER`` (vault BACKLOG #2946,
+        #3849), stamped at the epoch so the lookback
         read never returns it. An account that never stamped ``last_login_at`` would otherwise read
         as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
         rather than be judged NEW. The store's prune never removes it, so it stays until
