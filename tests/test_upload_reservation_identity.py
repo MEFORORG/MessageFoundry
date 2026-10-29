@@ -240,6 +240,86 @@ async def test_a_cancelled_save_removes_its_pair_before_another_save_scans(
     assert [m.filename for m in await store.list_files()] == ["b.txt"]
 
 
+async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
+    tmp_path: Path,
+    ledger_db: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3740 item 4: the removal of a cancelled save's landed pair waited under
+    ``_quota_lock`` with no bound, so one hung unlink queued every upload in the process. Past
+    ``_CANCELLED_REMOVAL_WAIT_SECONDS`` the cancelled save drops the lock with the removal still
+    running, names the file at ERROR, and the next upload reserves and lands; the pair goes once
+    the unlink returns. Red before: B never reached its reserve while A's unlink hung."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
+    reserved: list[str] = []
+
+    class _Recording(_PassThrough):
+        async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+            reserved.append(args[1])
+            return await super().reserve_upload_quota(*args, **kwargs)
+
+    store = _uploads(tmp_path, _Recording(ledger_db))
+    landed, finish = _hold_after_the_sidecar_lands(monkeypatch)
+    unhang, removed = threading.Event(), threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> None:
+        unhang.wait(30)  # bounded, so a red run cannot hang the suite
+        real_discard(file_id)
+        removed.set()
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
+    a = asyncio.create_task(
+        store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
+    )
+    try:
+        try:
+            assert await asyncio.to_thread(landed.wait, 10), "A's sidecar never landed"
+            b = asyncio.create_task(
+                store.save(data=b"second\n", filename="b.txt", uploader="op", uploader_id="u-op")
+            )
+            await asyncio.sleep(0.05)  # B is queued on the lock
+            assert len(reserved) == 1, "the control: B has not reserved while A holds the lock"
+            a.cancel()
+        finally:
+            finish.set()
+        done, _ = await asyncio.wait({a, b}, timeout=5)
+        assert b in done, "B waited on the lock for A's hung unlink"
+        assert isinstance(b.result(), UploadedFileMeta)
+        assert len(reserved) == 2
+        assert a in done and a.cancelled()
+        assert "has no upload.create audit row; its removal did not finish" in caplog.text
+        assert len(await store.list_files()) == 2, "the control: A's pair is still on disk"
+    finally:
+        unhang.set()
+    assert await asyncio.to_thread(removed.wait, 10), "A's removal never finished"
+    assert [m.filename for m in await store.list_files()] == ["b.txt"]
+    assert await _settled(store), "a ledger call was left running"
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    withdrawn = "its removal finished after the quota lock was released"
+    for _ in range(50):  # the done callback runs one loop pass after the thread returns
+        if withdrawn in caplog.text:
+            break
+        await asyncio.sleep(0.02)
+    assert withdrawn in caplog.text, caplog.text
+
+
+async def test_the_drain_reads_its_default_waits_when_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 12: the drain's default waits were bound when the method was
+    defined, so a changed module default never reached a caller that passed none."""
+    monkeypatch.setattr(uploads_mod, "_STRAGGLER_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(uploads_mod, "_STRAGGLER_CANCEL_GRACE_SECONDS", 0.05)
+    store = _uploads(tmp_path, None)
+    stalled = asyncio.ensure_future(asyncio.Event().wait())
+    store._hold(stalled)
+    await asyncio.wait_for(store.drain_stragglers(), 1.0)
+    assert stalled.cancelled()
+
+
 async def test_the_managed_teardown_drains_the_upload_stragglers_before_the_engine_stops(
     tmp_path: Path,
 ) -> None:

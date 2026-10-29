@@ -7898,8 +7898,8 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN
 -- FLIGHT: reserved but not yet landed in `uploads_dir`, and therefore invisible to the sidecar scan
 -- that counts everything already on disk. The scan is uncached and so already fleet-visible; these
--- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: a shard's upload in
--- flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
+-- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: an engine shard's upload
+-- in flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
 -- (BACKLOG #1941). `reservation_id` is the save's own id, so a release pays back only its own slot
 -- (vault BACKLOG #3180). `since` is that reservation's last activity: its reserve or a live save's
 -- heartbeat (BACKLOG #2648). A reservation idle that long is a leak, from a killed process or a
