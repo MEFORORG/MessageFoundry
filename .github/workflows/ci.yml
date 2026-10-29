@@ -1106,11 +1106,9 @@ jobs:
         # tests/test_tooling_partition.py, which also pins the two halves of this wiring.
         #
         # `and not timing_quarantine` DESELECTS the timing-dependent tests listed in
-        # tests/timing_quarantine.txt, applied by the same conftest hook. Owner ruling 2026-10-29,
-        # verbatim: "Go on fix 1: make the Step margin guard advisory in merge_group until #3515
-        # re-measures the cap, and quarantine the recurring timing tests under #4773." They still run,
-        # in the `timing-quarantine` job, which does not gate a merge. tests/test_timing_quarantine.py
-        # pins this expression.
+        # tests/timing_quarantine.txt, applied by the same conftest hook, under the owner ruling of
+        # 2026-10-29 quoted in that file (BACKLOG #4773). They still run, in the `timing-quarantine`
+        # job, which does not gate a merge. tests/test_timing_quarantine.py pins this expression.
         # BACKLOG #1260: WRAPPED SO A NATIVE CRASH IS NOT REPORTED AS A TEST FAILURE. A segfault kills
         # the interpreter, so pytest returns 139/134 with no verdict and THREE layers of naming then
         # say "tests failed" -- the check name, the step name, and `steps.tests.outcome`, which is what
@@ -1176,7 +1174,11 @@ jobs:
       # cap, and quarantine the recurring timing tests under #4773." Over the engine merge_group runs
       # of 2026-10-27 16Z to 10-29 15Z, 14 of the 34 failed jobs were this step with every test
       # passed. A pull_request run still gates before the entry is enqueued, so the margin is still
-      # enforced once per change; the queue entry only re-runs the same tree on a busier runner.
+      # enforced once per change, against that PR's own base. WHAT THIS GIVES UP, stated so it is not
+      # mistaken for free: a queue entry tests the PR merged onto the queue head, a tree no
+      # pull_request run saw. Two PRs that each pass alone can together breach the margin, and only
+      # the queue run sees that sum; while this is advisory it lands, and the next pull_request run
+      # is the first blocking check to red, on a change that did not cause it.
       # `continue-on-error` keeps the job, and so the required `test` context, green; the step's own
       # outcome stays `failure`, and the run body below adds a warning annotation and a summary line,
       # so the miss stays visible. `ci-gate` does not need `test` at all: each `test` leg is its own
@@ -2450,34 +2452,40 @@ jobs:
           path: tooling-junit.xml
           if-no-files-found: ignore
 
-  # THE TIMING QUARANTINE (BACKLOG #4773). Owner ruling 2026-10-29, verbatim: "Go on fix 1: make the
-  # Step margin guard advisory in merge_group until #3515 re-measures the cap, and quarantine the
-  # recurring timing tests under #4773." Membership, the selection rule and the exit rule are in
-  # tests/timing_quarantine.txt; tests/conftest.py applies the marker, the `test` legs deselect it with
-  # `and not timing_quarantine`, and this job is where those tests still run and report.
+  # THE TIMING QUARANTINE (BACKLOG #4773), under the owner ruling of 2026-10-29, quoted in
+  # tests/timing_quarantine.txt with the list's selection and exit rules. tests/conftest.py applies the
+  # marker, the `test` legs deselect it with `and not timing_quarantine`, and this job is where those
+  # tests still run and report.
   #
   # NOT A REQUIRED CONTEXT, AND ci-gate DOES NOT `needs:` IT, ON PURPOSE. Gating a merge on these tests
   # is exactly what the ruling took away: they failed in the merge queue on unrelated PRs with nothing
-  # wrong in the change. Requiring this job, or rolling it into ci-gate, would put that back. So a red
-  # here wedges nothing, the same as the `ide` job. tests/test_timing_quarantine.py asserts it stays
-  # out of both. Do not add it to `.github/required-contexts.txt`.
+  # wrong in the change. Requiring this job, or rolling it into ci-gate, would put that back.
+  # tests/test_timing_quarantine.py asserts it stays out of both. Do not add it to
+  # `.github/required-contexts.txt`.
   #
-  # The job `if:` is the `Tests (pytest)` step's own condition, so it runs wherever the engine suite
-  # would have run these tests, the merge queue included, and keeps reporting their timing there.
+  # AND ITS RED IS A WARNING, NOT A FAILED JOB. A failed job, required or not, fails the whole CI run,
+  # and failure-signal.yml keys on the RUN's conclusion: it would label the PR `ci-red` as if a
+  # required check went red, and on merge_group post that the queue ejected a PR the queue in fact
+  # merged. So the test step is `continue-on-error: true` and says what failed in a warning annotation,
+  # the step summary and the uploaded junit.
   #
-  # SERIAL, NOT `-n`. The list is a handful of tests, and xdist would only add worker start-up. The
-  # per-test `--timeout` and faulthandler values are the engine matrix's own, per OS (60/90 ubuntu,
-  # 120/150 Windows), so no timeout is raised for a quarantined test.
+  # THE MATRIX IS THE `test` JOB'S OWN, read from `changes`, so these tests run on every leg the engine
+  # suite would have run them on (ubuntu-latest, windows-2022 and windows-2025 here; ubuntu only on a
+  # fork), and the per-test `--timeout` and faulthandler values are that leg's own `pytest_timeout`
+  # and `fault_timeout`. No timeout is raised for a quarantined test. The job `if:` is the
+  # `Tests (pytest)` step's own condition, so it runs in the merge queue too and keeps reporting there.
+  #
+  # SERIAL, NOT `-n`, AND ONLY THE LISTED FILES ARE COLLECTED. The list is a handful of tests; xdist
+  # would only add worker start-up, and collecting all of `testpaths` to select them took 87s locally.
   timing-quarantine:
     name: timing quarantine (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.hosted }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-2025]
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     defaults:
       run:
         shell: bash
@@ -2489,8 +2497,8 @@ jobs:
         with:
           python-version-file: ci/python-version
 
-      # Collection imports every module under `testpaths` before `-m` filters, so the Qt libraries are
-      # needed here for the same reason the `tooling` job records on its own copy of this step.
+      # Two listed files are harness tests, and the harness may import PySide6, so the Qt libraries are
+      # installed for the reason the `tooling` job records on its own copy of this step.
       - name: Install Qt offscreen system libraries
         if: runner.os == 'Linux'
         timeout-minutes: 8
@@ -2516,23 +2524,45 @@ jobs:
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
 
-      # pytest exits 5 when `-m timing_quarantine` selects nothing, which reds this step: a dead marker
-      # or a broken conftest hook must not read as a green run. An EMPTY LIST is the one legitimate
-      # zero, once every entry has left under its row, so it is told apart by counting the entries.
+      # The file list is read from the entry lines here; tests/_timing_quarantine.py's own rules keep a
+      # path free of spaces and quotes, so the unquoted expansion below splits only between paths. An
+      # EMPTY list must not reach pytest, which would then collect all of `testpaths`; the change that
+      # empties it retires this job, and tests/test_timing_quarantine.py reds until it does. Anything
+      # else that selects nothing makes pytest exit 5, which this step reports like a failure.
       - name: Quarantined timing tests (pytest)
+        continue-on-error: true
         timeout-minutes: 20
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
-          FAULT_TIMEOUT: "${{ runner.os == 'Windows' && '150' || '90' }}"
-          PYTEST_TIMEOUT: "${{ runner.os == 'Windows' && '120' || '60' }}"
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+          LEG: ${{ matrix.os }}
         run: |
-          entries="$(grep -cvE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt || true)"
-          if [ "$entries" = "0" ]; then
+          files="$(grep -vE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt | cut -d: -f1 | sort -u || true)"
+          if [ -z "$files" ]; then
             echo "::notice::tests/timing_quarantine.txt lists no tests; nothing to run."
             exit 0
           fi
-          pytest -q -m timing_quarantine --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=20
+          rc=0
+          # shellcheck disable=SC2086
+          pytest -q -m timing_quarantine $files -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --junitxml=timing-quarantine-junit.xml --durations=20 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            msg="Quarantined timing tests exited $rc on $LEG. ADVISORY: this job gates no merge (BACKLOG #4773); read the junit artifact for which test failed."
+            echo "::warning title=Timing quarantine (advisory)::$msg"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '\n**WARNING:** %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          exit $rc
+
+      - name: Upload the quarantine junit
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timing-quarantine-junit-${{ matrix.os }}
+          path: timing-quarantine-junit.xml
+          if-no-files-found: ignore
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise

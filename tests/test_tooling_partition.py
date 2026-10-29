@@ -589,7 +589,10 @@ def test_marker_is_registered() -> None:
     ("needle", "why"),
     [
         (
-            "-m 'not tooling'",
+            # The whole engine expression since the timing quarantine (BACKLOG #4773) joined it.
+            # The bare `-m 'not tooling'` now appears only in comments, so it would match nothing
+            # that runs. Back to the bare form when the quarantine is retired.
+            "-m 'not tooling and not timing_quarantine'",
             "the engine legs must DESELECT the harness tier -- without it the partition buys nothing",
         ),
         (

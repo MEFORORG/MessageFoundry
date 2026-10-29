@@ -6,9 +6,10 @@
 #
 # WHAT IT DOES. tests/conftest.py marks each test below `timing_quarantine`. ci.yml's engine legs
 # run `-m 'not tooling and not timing_quarantine'`, so these tests no longer gate a merge. The
-# `timing-quarantine` job runs `-m timing_quarantine` on ubuntu and windows-2025, so they still run
-# and report. That job is not a required context and is not in ci-gate's `needs:`. Each test's
-# assertions and timeouts are unchanged; only where it runs moved.
+# `timing-quarantine` job runs `-m timing_quarantine` on every leg the engine `test` job runs, so
+# they still run and report. That job is not a required context, is not in ci-gate's `needs:`, and
+# reports a failure as a warning. Each test's assertions and timeouts are unchanged; only where it
+# runs moved.
 #
 # THE SELECTION RULE. A test enters only if it failed in the engine merge queue on at least two
 # unrelated PRs in the window of 2026-10-27 16Z to 2026-10-29 15Z (200 merge_group runs, 33 failed),
@@ -20,7 +21,9 @@
 #
 # FORMAT. One entry per line: the node id (`tests/<file>.py::<test>`, no parameter suffix), then
 # whitespace, then a one-line reason that names its row as `#<n>`. tests/_timing_quarantine.py is the
-# only reader. tests/test_timing_quarantine.py checks that every node id resolves.
+# only Python reader; the ci.yml job also cuts the file paths out of the entry lines in shell.
+# tests/test_timing_quarantine.py checks that every node id resolves. When the last entry leaves,
+# retire the mechanism (this file, the marker, the job and its tests) in the same change.
 tests/test_uploads.py::test_a_timed_out_stop_keeps_the_row_of_every_pair_already_removed  merge-queue timing failure on unrelated PRs; row #3943, also #3184
 tests/test_approval_repeat_request.py::test_repeats_racing_from_two_processes_file_one_request  merge-queue timing failure on unrelated PRs; row #3909
 tests/test_harness_scenarios.py::test_a_scenario_expecting_the_wrong_disposition_fails  merge-queue timing failure on unrelated PRs; row #3933

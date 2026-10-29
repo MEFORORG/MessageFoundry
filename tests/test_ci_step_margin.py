@@ -782,6 +782,11 @@ def _job(name: str) -> dict:
     return jobs[name]  # type: ignore[no-any-return]
 
 
+def _margin_check(job_name: str) -> dict:
+    steps = _job(job_name)["steps"]
+    return next(s for s in steps if "--since" in str(s.get("run", "")))  # type: ignore[no-any-return]
+
+
 def _matrix_legs() -> list[dict]:
     """The `test` job's per-leg matrix entries, parsed out of the shell that BUILDS them in `changes`.
 
@@ -887,7 +892,7 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         assert ids.get(gated), (
             f"{gated!r} in {job_name} carries no `id:`, so its own outcome cannot be referenced"
         )
-        check = next(s for s in steps if "--since" in str(s.get("run", "")))
+        check = _margin_check(job_name)
         env = check.get("env") or {}
         referenced = {str(v) for v in env.values()}
         expected = "${{ steps." + str(ids[gated]) + ".outcome }}"
@@ -898,15 +903,9 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         assert "job.status" not in joined and "job.conclusion" not in joined
 
 
-#: The one spelling that makes the engine check advisory in the queue and nowhere else. Owner ruling
-#: 2026-10-29: "Go on fix 1: make the Step margin guard advisory in merge_group until #3515
-#: re-measures the cap, and quarantine the recurring timing tests under #4773."
+#: The one spelling that makes the engine check advisory in the queue and nowhere else, under the
+#: owner ruling of 2026-10-29 quoted beside the step in ci.yml.
 _MERGE_GROUP_ONLY = "${{ github.event_name == 'merge_group' }}"
-
-
-def _margin_check(job_name: str) -> dict:
-    steps = _job(job_name)["steps"]
-    return next(s for s in steps if "--since" in str(s.get("run", "")))  # type: ignore[no-any-return]
 
 
 def test_the_engine_margin_check_is_advisory_in_merge_group_and_blocking_on_pull_request() -> None:
@@ -1071,7 +1070,7 @@ def _cap_knob(job_name: str) -> str:
     what the workflow actually feeds the gate. `${{ }}` cannot appear in a `run:` body here (zizmor),
     so the value always arrives as an env var and the hop is always there to follow.
     """
-    check = next(s for s in _job(job_name)["steps"] if "--since" in str(s.get("run", "")))
+    check = _margin_check(job_name)
     run = str(check.get("run", ""))
     var = re.search(r'--cap-minutes\s+"?\$\{?(\w+)\}?"?', run)
     assert var, f"{job_name}'s margin check does not pass --cap-minutes at all: {run!r}"

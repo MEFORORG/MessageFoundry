@@ -907,25 +907,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             "`tests` was imported from another checkout, so its list would mark this one's tests"
         )
     names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
-    quarantined = timing_quarantine.node_ids()  # raises the same way, for the same reason
     for item in items:
         path = getattr(item, "path", None)
-        if path is None or path.parent != _TESTS_DIR:
-            continue
-        if path.name in names:
+        if path is not None and path.parent == _TESTS_DIR and path.name in names:
             item.add_marker(pytest.mark.tooling)
-        if _quarantine_key(path, item.nodeid) in quarantined:
-            item.add_marker(pytest.mark.timing_quarantine)
-
-
-def _quarantine_key(path: Path, nodeid: str) -> str:
-    """``tests/<file>.py::<test>`` for an item in tests/, parameter suffix dropped.
-
-    Built from the file name rather than taken from ``nodeid`` whole, so the key does not depend on
-    the rootdir pytest chose. Owner ruling 2026-10-29 and the list's rules: tests/timing_quarantine.txt.
-    """
-    _, _, inner = nodeid.partition("::")
-    return f"tests/{path.name}::{inner.partition('[')[0]}"
+    # BACKLOG #4773: the timing quarantine, from tests/timing_quarantine.txt, which states its rules.
+    timing_quarantine.mark_quarantined(items, _TESTS_DIR)
 
 
 @pytest.fixture(autouse=True)

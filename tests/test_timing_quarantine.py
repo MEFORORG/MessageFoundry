@@ -2,55 +2,55 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin the timing quarantine against the tree and against ci.yml (BACKLOG #4773).
 
-Owner ruling 2026-10-29, verbatim: "Go on fix 1: make the Step margin guard advisory in merge_group
-until #3515 re-measures the cap, and quarantine the recurring timing tests under #4773."
+The owner ruling of 2026-10-29 that authorises it is quoted in tests/timing_quarantine.txt.
 
 ``tests/timing_quarantine.txt`` takes tests off the engine legs, so it can fail in the two ways the
 tooling manifest can, plus one of its own:
 
-* an entry that names no collected test quarantines nothing, while the list reads as if it did;
+* an entry that names no test in the tree quarantines nothing, while the list reads as if it did;
 * a marker the engine legs do not deselect, or a job that does not select it, is half a partition:
   the tests either still gate the merge or run nowhere;
-* the quarantine job becoming a required context, or a need of ci-gate, would put back the merge
-  gate the ruling removed.
+* the quarantine job becoming a required context, a need of ci-gate, or a failed job, would put
+  back the merge gate the ruling removed, or a false red signal on the PR.
 
-This file stays on the engine legs (see ``_STAYS_WITHOUT_IMPORTING`` in
-tests/test_tooling_partition.py), because an edit to the list alone does not trip the tooling job's
-path gate.
+Every check here runs in-process and reads files, with no child pytest: this file runs on the
+engine legs (see ``_STAYS_WITHOUT_IMPORTING`` in tests/test_tooling_partition.py), because an edit
+to the list alone does not trip the tooling job's path gate, and a guard there must not be a timing
+risk of its own.
 """
 
 from __future__ import annotations
 
 import ast
 import re
-import subprocess
-import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from tests import _timing_quarantine as timing_quarantine
 from tests import _tooling_manifest as tooling_manifest
+from tests._workflow_contexts import jobs_of, needs_of, required_contexts, resolve
 
 _ROOT = Path(__file__).resolve().parents[1]
-_CI = _ROOT / ".github" / "workflows" / "ci.yml"
-_REQUIRED = _ROOT / ".github" / "required-contexts.txt"
+_TESTS = _ROOT / "tests"
 _JOB = "timing-quarantine"
 _ENGINE_EXPRESSION = "not tooling and not timing_quarantine"
+_RETIRE = (
+    "tests/timing_quarantine.txt lists nothing. Its exit rule says to retire the mechanism in the "
+    "change that empties it: the file, the marker, the ci.yml job and this test file"
+)
 
 
-def _jobs() -> dict[str, Any]:
-    yaml = pytest.importorskip("yaml")
-    doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    jobs: dict[str, Any] = doc["jobs"]
-    return jobs
+def _ci_jobs() -> dict[str, dict[str, Any]]:
+    return jobs_of("ci.yml")
 
 
 def _engine_marker_expression() -> str:
     """The `-m` expression on the engine `Tests (pytest)` step's run line."""
-    step = next(s for s in _jobs()["test"]["steps"] if s.get("name") == "Tests (pytest)")
+    step = next(s for s in _ci_jobs()["test"]["steps"] if s.get("name") == "Tests (pytest)")
     found = re.findall(r"-m '([^']*)'", str(step.get("run", "")))
     assert len(found) == 1, f"expected one quoted -m expression on the engine step, found {found}"
     return found[0]
@@ -70,15 +70,15 @@ def _defines(path: Path, qualname: tuple[str, ...]) -> bool:
     )
 
 
-def test_the_list_is_not_empty_and_every_entry_resolves() -> None:
+def test_every_entry_resolves() -> None:
     """An entry naming a test that does not exist quarantines nothing.
 
-    Read by AST, not by a collection run, so this stays cheap enough for the engine legs.
+    Read by AST, not by a collection run, so it stays cheap and untimed on the engine legs.
     Falsified by renaming one entry's function: RED, naming it. Restored.
     """
     entries = timing_quarantine.entries()
     print(f"[timing-quarantine] entries scanned: {len(entries)}")
-    assert entries, "tests/timing_quarantine.txt lists nothing, so this scan proves nothing"
+    assert entries, _RETIRE
     missing = [
         e.node_id
         for e in entries
@@ -87,40 +87,63 @@ def test_the_list_is_not_empty_and_every_entry_resolves() -> None:
     assert not missing, f"these quarantine entries name no test in the tree: {missing}"
 
 
-def test_the_marker_selects_the_list_and_the_engine_expression_leaves_it_out() -> None:
-    """The hook, end to end: collect the listed files with the job's `-m` and the engine legs' `-m`.
+class _Item(SimpleNamespace):
+    """The three attributes the conftest hook reads off a collected item."""
 
-    The engine expression is read out of ci.yml rather than restated, so a ci.yml edit that drops
-    the deselection reds here. The control is that the engine expression still collects the other
-    tests of those files, so an empty collection cannot pass for a correct one.
+    def add_marker(self, marker: pytest.MarkDecorator) -> None:
+        self.marks.append(marker.name)
+
+
+def _item(path: Path, nodeid: str) -> _Item:
+    return _Item(path=path, nodeid=nodeid, marks=[])
+
+
+def test_the_marking_function_marks_exactly_the_listed_tests() -> None:
+    """The function the conftest hook calls, driven over one stand-in item per entry plus controls.
+
+    The controls are a sibling test in a listed file (unmarked), a parametrized case of a listed
+    test (marked: the suffix is dropped), and a same-named file outside tests/ (unmarked: the hook
+    is scoped to files directly in tests/, as the tooling partition is).
+
+    Falsified by deleting the `add_marker(pytest.mark.timing_quarantine)` line: RED. Restored.
     """
-    ids = timing_quarantine.node_ids()
-    files = sorted({node.split("::", 1)[0] for node in ids})
+    entries = timing_quarantine.entries()
+    assert entries, _RETIRE
+    listed = [_item(_ROOT / e.path, e.node_id) for e in entries]
+    first = entries[0]
+    sibling = _item(_ROOT / first.path, f"{first.path}::not_{first.qualname[-1]}")
+    param = _item(_ROOT / first.path, f"{first.node_id}[case-1]")
+    elsewhere = _item(_ROOT / "packaging" / Path(first.path).name, first.node_id)
+    timing_quarantine.mark_quarantined([*listed, sibling, param, elsewhere], _TESTS)
+    unmarked = [i.nodeid for i in listed if "timing_quarantine" not in i.marks]
+    assert not unmarked, f"the hook left these listed tests unmarked: {unmarked}"
+    assert "timing_quarantine" not in sibling.marks, "the hook marked an unlisted sibling test"
+    assert "timing_quarantine" in param.marks, "a parametrized case of a listed test went unmarked"
+    assert "timing_quarantine" not in elsewhere.marks, "the hook marked a file outside tests/"
 
-    def collect(expression: str) -> set[str]:
-        done = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"]
-            + ["-m", expression, *files],
-            cwd=_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-        assert done.returncode in (0, 5), done.stdout[-2000:] + done.stderr[-2000:]
-        # Only the node-id lines: the warnings summary also prints `Test: tests/...::...` lines.
-        lines = done.stdout.splitlines()
-        return {line.partition("[")[0] for line in lines if line.startswith("tests/")}
 
-    selected = collect("timing_quarantine")
-    engine = collect(_engine_marker_expression())
-    print(f"[timing-quarantine] -m timing_quarantine: {len(selected)}; engine: {len(engine)}")
-    assert selected == ids, f"selected {sorted(selected ^ ids)} differently from the list"
-    assert not (engine & ids), f"the engine legs still collect {sorted(engine & ids)}"
-    assert engine, "the engine expression collected nothing from these files: the control failed"
+def test_the_conftest_hook_calls_the_marking_function() -> None:
+    """Read by AST: importing tests/conftest.py a second time has side effects (see
+    tests/test_conftest_name_collision_guard.py). Falsified by deleting the call: RED. Restored."""
+    tree = ast.parse((_TESTS / "conftest.py").read_text(encoding="utf-8"))
+    hook = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "pytest_collection_modifyitems"
+    )
+    calls = [
+        n.func.attr
+        for n in ast.walk(hook)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "timing_quarantine"
+    ]
+    assert calls == ["mark_quarantined"], calls
 
 
 def test_the_engine_legs_deselect_the_marker() -> None:
+    """Read off the run line, not the whole file, so a YAML comment cannot satisfy it."""
     assert _engine_marker_expression() == _ENGINE_EXPRESSION
 
 
@@ -130,34 +153,39 @@ def test_the_marker_is_registered() -> None:
     assert any(m.startswith("timing_quarantine:") for m in markers)
 
 
-def test_the_quarantine_job_selects_the_marker_on_ubuntu_and_windows_2025() -> None:
-    job = _jobs()[_JOB]
-    oses = set(job["strategy"]["matrix"]["os"])
-    assert {"ubuntu-latest", "windows-2025"} <= oses, oses
-    runs = " ".join(str(s.get("run", "")) for s in job["steps"])
-    assert "-m timing_quarantine " in runs, "the quarantine job no longer selects the marker"
+def test_the_quarantine_job_runs_the_marker_on_the_engine_legs_own_matrix() -> None:
+    """The `test` job's matrix carries ubuntu-latest and windows-2025 (and windows-2022) here, so
+    reading the same output runs the list wherever the engine legs ran it, with the same per-test
+    caps. tests/test_ci_step_margin.py pins what those legs are."""
+    jobs = _ci_jobs()
+    job = jobs[_JOB]
+    assert job["strategy"]["matrix"] == jobs["test"]["strategy"]["matrix"]
+    assert job["runs-on"] == jobs["test"]["runs-on"]
+    step = next(s for s in job["steps"] if "-m timing_quarantine " in str(s.get("run", "")))
+    env = step.get("env") or {}
+    assert env.get("PYTEST_TIMEOUT") == "${{ matrix.pytest_timeout }}", env
+    assert env.get("FAULT_TIMEOUT") == "${{ matrix.fault_timeout }}", env
 
 
-def test_the_quarantine_job_gates_no_merge() -> None:
+def test_the_quarantine_job_gates_no_merge_and_cannot_fail_the_run() -> None:
     """The ruling removed these tests from the merge gate; this keeps the job from putting it back.
 
-    Falsified by adding the job to ci-gate's needs, and separately by appending its check name to
-    a copy of required-contexts.txt: RED both times. Restored.
+    A failed job fails the whole CI run, and failure-signal.yml keys on the run's conclusion, so the
+    pytest step must be `continue-on-error` and report through a warning instead.
+
+    Falsified by adding the job to ci-gate's needs, and separately by dropping `continue-on-error`:
+    RED both times. Restored.
     """
-    jobs = _jobs()
-    needs = jobs["ci-gate"]["needs"]
-    assert _JOB not in needs, "ci-gate must not need the quarantine job"
-    check_name = str(jobs[_JOB]["name"]).split("(", 1)[0].strip()
-    required = [
-        line.strip()
-        for line in _REQUIRED.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    jobs = _ci_jobs()
+    assert _JOB not in needs_of(jobs["ci-gate"]), "ci-gate must not need the quarantine job"
+    required = required_contexts()
     print(f"[timing-quarantine] required contexts scanned: {len(required)}")
     assert required, "required-contexts.txt parsed to nothing, so this check proves nothing"
-    assert not [c for c in required if c.startswith(check_name)], (
-        f"{check_name!r} is a required context; the ruling keeps it advisory"
-    )
+    reporting = [c for c in required if resolve(c) == ("ci.yml", _JOB)]
+    assert not reporting, f"{reporting} resolve to the quarantine job; the ruling keeps it advisory"
+    step = next(s for s in jobs[_JOB]["steps"] if "-m timing_quarantine " in str(s.get("run", "")))
+    assert step.get("continue-on-error") is True
+    assert "::warning" in str(step["run"]) and "GITHUB_STEP_SUMMARY" in str(step["run"])
 
 
 def test_no_quarantined_test_is_in_the_tooling_tier() -> None:
@@ -182,8 +210,8 @@ def test_the_reader_refuses_a_malformed_list(text: str, complaint: str) -> None:
         timing_quarantine.entries_from(text)
 
 
-def test_the_reader_keeps_a_class_method_and_drops_comments() -> None:
-    text = "# header\n\ntests/test_x.py::TestA::test_b  timing; row #12\r\n"
+def test_the_reader_keeps_a_class_method_and_tolerates_a_bom_and_crlf() -> None:
+    text = "﻿# header\r\n\r\ntests/test_x.py::TestA::test_b  timing; row #12\r\n"
     [entry] = timing_quarantine.entries_from(text)
     assert entry.path == "tests/test_x.py"
     assert entry.qualname == ("TestA", "test_b")

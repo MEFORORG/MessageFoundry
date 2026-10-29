@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The one reader of ``tests/timing_quarantine.txt``.
+"""The one Python reader of ``tests/timing_quarantine.txt`` (ci.yml's job also reads it in shell).
 
 ``tests/conftest.py`` applies the ``timing_quarantine`` marker from it, and
 ``tests/test_timing_quarantine.py`` pins it against the tree and against ci.yml. Both import this
@@ -19,8 +19,12 @@ looking right while the quarantine job selects zero tests.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 QUARANTINE = Path(__file__).resolve().parent / "timing_quarantine.txt"
 
@@ -58,7 +62,9 @@ def entries_from(text: str) -> list[Entry]:
     kept: list[Entry] = []
     seen: set[str] = set()
     for number, physical in enumerate(text.split("\n"), start=1):
-        line = physical.removesuffix("\r").strip()
+        # A byte-order mark an editor put in front of the first line is not part of it.
+        line = physical.removeprefix("\ufeff") if number == 1 else physical
+        line = line.removesuffix("\r").strip()
         if not line or line.startswith("#"):
             continue
         found = _LINE.fullmatch(line)
@@ -82,9 +88,40 @@ def entries_from(text: str) -> list[Entry]:
 
 def entries() -> list[Entry]:
     """``entries_from`` over the real file."""
-    return entries_from(QUARANTINE.read_text(encoding="utf-8"))
+    return entries_from(QUARANTINE.read_text(encoding="utf-8", newline=""))
 
 
 def node_ids() -> frozenset[str]:
-    """The quarantined node ids, as the conftest hook keys on them."""
+    """The quarantined node ids, as :func:`mark_quarantined` keys on them."""
     return frozenset(entry.node_id for entry in entries())
+
+
+def key_of(path: Path, nodeid: str) -> str:
+    """``tests/<file>.py::<test>`` for an item, parameter suffix dropped.
+
+    Built from the file name rather than taken from ``nodeid`` whole, so the key does not depend on
+    the rootdir pytest chose.
+    """
+    _, _, inner = nodeid.partition("::")
+    return f"tests/{path.name}::{inner.partition('[')[0]}"
+
+
+def mark_quarantined(items: Iterable[Any], tests_dir: Path) -> None:
+    """Add the ``timing_quarantine`` marker to every listed item in ``tests_dir`` itself.
+
+    Called from ``pytest_collection_modifyitems`` in tests/conftest.py. It lives here, not there,
+    because tests/conftest.py must not be imported a second time (see
+    tests/test_conftest_name_collision_guard.py), and the test of this hook needs to drive it.
+    Scoped to files directly in ``tests_dir``, as the tooling partition is.
+    """
+    quarantined = (
+        node_ids()
+    )  # raises if the list is absent or malformed -- see the module docstring
+    for item in items:
+        path = getattr(item, "path", None)
+        if (
+            path is not None
+            and path.parent == tests_dir
+            and key_of(path, item.nodeid) in quarantined
+        ):
+            item.add_marker(pytest.mark.timing_quarantine)
