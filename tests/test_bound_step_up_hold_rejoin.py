@@ -289,6 +289,44 @@ async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
         assert json.loads(str(stored["params"]))["requester"] == "op2"
 
 
+async def test_an_exact_purge_repeat_past_the_proof_never_joins_a_hold_settled_since(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: the core's rejoin takes only a renamed requester's repeat. An exact
+    repeat that has spent its proof keeps the guard's serialized step, which never joins a request
+    settled since. A rejoin reads first and answers after, so a reject in between would point a
+    proof-spent repeat at the rejected hold. The stale read here stands in for that window."""
+    await _quiesced_outbound(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", ["operator"])
+    await _add(service, "admin", ["administrator"])
+    action = STEP_UP_ACTION_CONNECTION_PURGE
+    async with _client(engine, service) as c:
+        admin = await _login(c, "admin")
+        token = await _reauth(c, await _login(c, "op"), action)
+        first = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert first.status_code == 202, first.text
+        held = str(first.json()["approval_id"])
+
+        store = engine.store
+        before = await store.list_pending_approvals(now=0.0)
+        assert [str(r["id"]) for r in before] == [held]
+        rejected = await c.post(f"/approvals/{held}/reject", headers=_auth(admin))
+        assert rejected.status_code == 200, rejected.text
+
+        async def _read_before_the_reject(*_args: object, **_kwargs: object) -> object:
+            return before
+
+        monkeypatch.setattr(store, "list_pending_approvals", _read_before_the_reject)
+        monkeypatch.setattr(app_module, "step_up_window_live", _never)
+        token = await _reauth(c, token, action)
+        again = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert again.status_code == 202, again.text
+        # Before the fix: the rejected hold's id, and nothing held for this proof-spent request.
+        assert again.json()["approval_id"] != held
+        assert await store.list_audit(action="approval.request_repeated") == []
+
+
 async def test_a_repeated_reload_rejoins_its_hold_without_a_new_proof(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "deployer", ["administrator"])

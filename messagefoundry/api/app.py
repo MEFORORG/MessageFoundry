@@ -1074,7 +1074,7 @@ def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
 
     ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
     to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
-    only these params. Both purge rejoins pass ``any_requester_name``, so a renamed requester's
+    only these params. Both purge rejoins pass ``requester_name``, so a renamed requester's
     repeat joins the hold they already have (BACKLOG #3740 item 9). The replay and reload holds do
     not, so a rename still gives those a second hold."""
     return {"name": name, "scope": scope, "requester": requester}
@@ -5427,7 +5427,7 @@ def create_app(
         params: dict[str, Any],
         identity: Identity,
         *,
-        any_requester_name: bool = False,
+        requester_name: Literal["same", "any", "renamed"] = "same",
     ) -> str | None:
         """The caller's open hold for this request, answered with no proof, or ``None``.
 
@@ -5435,7 +5435,7 @@ def create_app(
         so it spends no proof, even one the request brought. It does need a live session window,
         as the org opt-out asks of every request, so a session whose window has lapsed goes to the
         proof instead. ``None`` sends the route on to its spend and its guard.
-        ``any_requester_name`` is :meth:`ApprovalGate.rejoin`'s."""
+        ``requester_name`` is :meth:`ApprovalGate.rejoin`'s."""
         if gate is None or not await step_up_window_live(request):
             return None
         return await gate.rejoin(
@@ -5444,7 +5444,7 @@ def create_app(
             requester=identity.username,
             requester_user_id=identity.user_id,
             client=client_ip(request),
-            any_requester_name=any_requester_name,
+            requester_name=requester_name,
         )
 
     @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
@@ -5478,7 +5478,7 @@ def create_app(
                 "connection_purge",
                 _purge_hold_params(name, scope, identity.username),
                 identity,
-                any_requester_name=True,
+                requester_name="any",
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -5523,15 +5523,16 @@ def create_app(
             params = _purge_hold_params(name, scope, identity.username)
             # BACKLOG #3740 item 9: the guard matches the params text, which carries the display
             # name, so a renamed requester's repeat is joined here first, on the immutable id.
-            # Nothing is filed here, so a hold settled in between gets a new one from the guard,
-            # under the current name.
+            # Only a renamed one: an exact repeat goes to the guard, whose serialized step never
+            # joins a request settled since. Nothing is filed here, so a hold settled before this
+            # read gets a new one from the guard, under the current name.
             pending = await gate.rejoin(
                 "connection_purge",
                 params,
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
-                any_requester_name=True,
+                requester_name="renamed",
             ) or await gate.guard(
                 "connection_purge",
                 params,

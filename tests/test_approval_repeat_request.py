@@ -113,6 +113,38 @@ async def test_a_repeat_returns_the_open_request_and_files_nothing(store: Messag
     assert json.loads(str(repeated[0]["detail"])) == {"approval_id": first, "operation": _OP}
 
 
+async def test_a_cancelled_rejoin_still_writes_its_repeat_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: a rejoin's ``approval.request_repeated`` write outlives a cancelled
+    caller, as the guard's write does (vault BACKLOG #3193), and ``drain`` waits for it. The purge
+    core now rejoins a renamed requester's repeat after its proof, where a request deadline or a
+    shutdown can cancel it."""
+    gate = _gate(store)
+    held = await _guard(gate)
+    started, release = asyncio.Event(), asyncio.Event()
+    write = store.record_audit
+
+    async def _slow_write(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return await write(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", _slow_write)
+    call = asyncio.ensure_future(
+        gate.rejoin(_OP, {"channel_id": "IB_A"}, requester="maker", requester_user_id=_REQUESTER_ID)
+    )
+    await started.wait()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    release.set()
+    assert await gate.drain() == []
+    repeated = await store.list_audit(action="approval.request_repeated")
+    # Before the fix: [], because the cancel reached the write itself.
+    assert [json.loads(str(r["detail"]))["approval_id"] for r in repeated] == [held]
+
+
 async def test_concurrent_repeats_file_one_request(store: MessageStore) -> None:
     """The race the IDE and the console could both reach: several identical calls in flight."""
     gate = _gate(store)

@@ -135,7 +135,7 @@ DEFAULT_CLAIM_OWNER = "engine"
 #: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
 #: whose own repeat rule still joins it; only the proof-free path is lost. A renamed requester's
-#: repeat matched only through ``any_requester_name`` is not joined there, and files a second request.
+#: repeat matched only through ``requester_name`` is not joined there, and files a second request.
 REJOIN_SCAN_LIMIT = 1000
 
 #: Faults :meth:`ApprovalGate._read` raises as they are, because they name a defect in the read
@@ -276,6 +276,21 @@ def _log_orphaned_request(task: asyncio.Future[Any], approval_id: str) -> None:
             "approval %s: a request was filed or joined after its caller was cancelled, so that "
             "call got no 202. A repeat by the same requester joins this request",
             task.result(),
+        )
+
+
+def _log_orphaned_repeat(task: asyncio.Future[Any], approval_id: str) -> None:
+    """Log a rejoin's ``approval.request_repeated`` write whose caller was cancelled (BACKLOG #3740
+    item 9). :meth:`ApprovalGate._record_repeat` logs and pages its own failure, so a failure is
+    only read here, which marks it retrieved."""
+    if task.cancelled():
+        log.error("approval %s: a repeat's audit write was cancelled", approval_id)
+        return
+    if task.exception() is None:
+        log.warning(
+            "approval %s: a repeat's audit row was written after its caller was cancelled, so "
+            "that call got no 202",
+            approval_id,
         )
 
 
@@ -678,7 +693,8 @@ class ApprovalGate:
         cases. The routes skip the rejoin when the session window has lapsed, and for a purge that
         would now be refused. The console's purge and reload demand a proof on every request. A
         repeat can also race the first request's commit. The purge core calls :meth:`rejoin` before
-        this, so most purge repeats past the proof are joined there (BACKLOG #3740 item 9).
+        this for a renamed requester's repeat only, so an exact repeat still reaches here (BACKLOG
+        #3740 item 9).
 
         **A different requester gets their own request.** The requester of record is the person
         whose authority :meth:`approve` re-checks (ASVS 8.3.2), and the executors attribute their
@@ -862,40 +878,45 @@ class ApprovalGate:
         requester: str,
         requester_user_id: str,
         client: str | None = None,
-        any_requester_name: bool = False,
+        requester_name: Literal["same", "any", "renamed"] = "same",
     ) -> str | None:
         """Point a repeat at the requester's OPEN request, filing nothing (vault BACKLOG #2625).
 
-        Returns the id :meth:`guard` would join this request to, after writing the same
-        ``approval.request_repeated`` row, or ``None`` when there is no such request, or dual
-        control does not gate ``operation``. ``None`` means the caller goes on to its step-up proof
-        and then :meth:`guard`. The match is :meth:`guard`'s: same operation, same captured params,
-        same ``requester_user_id``, pending and unexpired, oldest first. ``any_requester_name``
-        widens it, as below.
+        Returns the id of the open request this repeat matches, after writing the same
+        ``approval.request_repeated`` row :meth:`guard` writes, or ``None`` when there is no such
+        request, or dual control does not gate ``operation``. ``None`` means the caller goes on to
+        :meth:`guard`, after its step-up proof where it takes one. With ``requester_name="same"``
+        the match is :meth:`guard`'s: same operation, same captured params, same
+        ``requester_user_id``, pending and unexpired, oldest first. ``requester_name`` changes it,
+        as below.
 
-        It exists so a route can answer a repeat BEFORE it demands an action-bound proof. Returning
-        an id here never runs anything and never holds anything new, so a caller who already has an
-        open request needs no new proof to be told its id again. Its permissions, pacing, MFA and
-        the rest of its gate still apply. A first request still needs the proof, because this finds
-        nothing for it.
+        It exists so a ``proof_in_route`` route (vault BACKLOG #2625) can answer a repeat BEFORE it
+        demands an action-bound proof. Returning an id here never runs anything and never holds
+        anything new, so a caller who already has an open request needs no new proof to be told its
+        id again. Its permissions, pacing, MFA and the rest of its gate still apply. A first request
+        still needs the proof, because this finds nothing for it.
 
         **The read and the audit row are two steps, not one.** A request approved, rejected or
         expired between them is still named in the 202. Nothing new runs or is held because of it.
         The read also covers only the newest :data:`REJOIN_SCAN_LIMIT` open requests; past that, the
-        repeat needs a proof, and :meth:`guard` then joins it.
+        repeat needs a proof, and :meth:`guard` then joins it. The row's write outlives a cancelled
+        caller, as :meth:`guard`'s does, and :meth:`drain` waits for it.
 
-        **``any_requester_name`` also matches a request whose params differ only in the
-        ``requester`` display name** (BACKLOG #3740 item 9). An operation whose params carry that
-        name, as the executors need, would otherwise give a renamed requester a second request for
-        the same action, because :meth:`guard` matches the params text. The match is still keyed on
-        ``requester_user_id``, so a new holder of a freed name never joins the old holder's request,
-        and only a request whose params name a requester counts. The rest is compared as canonical
-        JSON text, as :meth:`guard` compares it. An exact match wins over a renamed one. The joined
-        request keeps the name it was filed under, which is what the approver sees and what its
-        executor records. A caller that runs this before :meth:`guard` files nothing under an
-        earlier name: a request settled before this read is not found, and :meth:`guard` then files
-        one under the current name. Past the scan limit a renamed repeat is not found here, and
-        :meth:`guard` files a second request."""
+        **``requester_name`` decides whether the ``requester`` display name must match** (BACKLOG
+        #3740 item 9). An operation whose params carry that name, as the executors need, would
+        otherwise give a renamed requester a second request for the same action, because
+        :meth:`guard` matches the params text. ``"any"`` also matches a request whose params differ
+        only in that name; ``"renamed"`` matches only such a request, and answers ``None`` when an
+        exact match is open, so an exact repeat keeps :meth:`guard`'s serialized step. The match is
+        still keyed on ``requester_user_id``, so a new holder of a freed name never joins the old
+        holder's request, and only a request whose params name a requester counts. The rest is
+        compared as canonical JSON text, as :meth:`guard` compares it. An exact match wins over a
+        renamed one. The joined request keeps the name it was filed under, which is what the
+        approver sees and what its executor records. A caller that runs this before :meth:`guard`
+        files nothing under an earlier name: a request settled before this read is not found, and
+        :meth:`guard` then files one under the current name. One settled after this read is still
+        named, as above. Past the scan limit a renamed repeat is not found here, and :meth:`guard`
+        files a second request."""
         if not self.gates(operation) or not requester_user_id:
             return None
 
@@ -909,7 +930,7 @@ class ApprovalGate:
         def _same(raw: Any) -> bool:
             if str(raw) == wanted:
                 return True
-            if not any_requester_name:
+            if requester_name == "same":
                 return False
             # Parsed silently: a row that is not a JSON object matches nothing, and the queue is
             # where an unreadable row is reported.
@@ -934,7 +955,28 @@ class ApprovalGate:
         )
         if not matches:
             return None
-        held = min(matches, key=lambda r: (r.params != wanted, r.requested_at)).id
+        best = min(matches, key=lambda r: (r.params != wanted, r.requested_at))
+        if requester_name == "renamed" and best.params == wanted:
+            return None  # an exact repeat: guard joins it in its serialized step
+        held = best.id
+        await self._shielded(
+            self._record_repeat(held, operation, requester, client),
+            held,
+            orphaned=_log_orphaned_repeat,
+        )
+        log.info(
+            "approval %s: a repeat %s request by %s rejoined it; nothing new is held",
+            held,
+            operation,
+            scrub_log_argument(requester),
+        )
+        return held
+
+    async def _record_repeat(
+        self, held: str, operation: str, requester: str, client: str | None
+    ) -> None:
+        """The ``approval.request_repeated`` row :meth:`rejoin` writes, logged and paged when it
+        fails. Run through :meth:`_shielded`, so a cancelled caller does not lose it."""
         try:
             await self._store.record_audit(
                 "approval.request_repeated",
@@ -952,13 +994,6 @@ class ApprovalGate:
             )
             self._alert_lost_audit(held, "approval.request_repeated")
             raise
-        log.info(
-            "approval %s: a repeat %s request by %s rejoined it; nothing new is held",
-            held,
-            operation,
-            scrub_log_argument(requester),
-        )
-        return held
 
     async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks
