@@ -14290,7 +14290,7 @@ class SqlServerStore:
                             )
                         if written is not None:
                             appended = await append_rename_audits(
-                                self._append_audits(cur, audits, now=now)
+                                lambda: self._append_audits(cur, audits, now=now)
                             )
                         await self._commit(conn)
                 except Exception:

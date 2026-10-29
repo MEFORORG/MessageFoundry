@@ -441,6 +441,59 @@ async def test_the_username_refresh_contract_on_sqlite() -> None:
         await store.close()
 
 
+class _ConnectionClosed(Exception):
+    """Stands in for asyncpg's error when a rollback runs on a connection that is gone."""
+
+
+async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append() -> None:
+    """BACKLOG #3018 step 7. On PostgreSQL an append that fails because the connection dropped is
+    followed by a rollback that fails too, and that error replaces the append's. The store raises
+    the append's ``UsernameAuditAppendError`` anyway, so the reconciler reads a refused row and
+    goes on, rather than a store fault that ends its pass. Driven against the real method with its
+    I/O seams replaced, because the live leg cannot drop a connection on cue."""
+    from contextlib import asynccontextmanager
+
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import UsernameAuditAppendError
+
+    dropped = ConnectionResetError("synthetic: the server closed the connection")
+
+    class _Transaction:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            if exc is not None:
+                raise _ConnectionClosed("synthetic: cannot roll back, the connection is closed")
+
+    class _Conn:
+        async def fetchrow(self, *_a: object) -> None:
+            return None  # nobody holds the name
+
+        def transaction(self) -> _Transaction:
+            return _Transaction()
+
+    @asynccontextmanager
+    async def _acquire(*, record: bool = True) -> Any:
+        yield _Conn()
+
+    async def _write_user(*_a: object) -> object:
+        return object()  # the write landed
+
+    async def _append_audits(*_a: object, **_kw: object) -> list[object]:
+        raise dropped
+
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._timed_acquire = _acquire
+    store._write_user = _write_user
+    store._append_audits = _append_audits
+    with pytest.raises(UsernameAuditAppendError) as refused:
+        await store.set_user_username(
+            "u1", "jdoe-new", expected_username="jdoe", audits=(AuditAppend("x", actor="a"),)
+        )
+    assert refused.value.cause is dropped
+
+
 async def test_the_username_comparison_is_byte_exact_on_sqlite() -> None:
     """SQLite's guard is case-sensitive, so a name differing only in case is NOT a collision.
 

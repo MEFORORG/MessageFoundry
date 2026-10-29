@@ -4,5 +4,4 @@
   now commits in the rename's own transaction on all three store backends, and only when the rename
   lands. If the row is refused, the rename rolls back. On a sign-in that refusal still fails the
   sign-in. On a reconciler pass it is logged at ERROR and the pass goes on, and a later pass that
-  probes the account applies the rename, its row and its notice. A refused row is no longer read
-  as a clash over the new name, which would have audited a conflict and warned of a lockout.
+  probes the account applies the rename, its row and its notice.

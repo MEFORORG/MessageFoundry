@@ -6638,12 +6638,13 @@ class UsernameAuditAppendError(Exception):
 
 
 async def append_rename_audits(
-    appending: Awaitable[list[AppendedAuditRow]],
+    append: Callable[[], Awaitable[list[AppendedAuditRow]]],
 ) -> list[AppendedAuditRow]:
-    """Await a rename's audit appends, raising :class:`UsernameAuditAppendError` if they fail.
-    Called inside the rename's transaction, so the raise rolls the rename back too."""
+    """Run a rename's audit appends, raising :class:`UsernameAuditAppendError` if they fail.
+    Called inside the rename's transaction, so the raise rolls the rename back too. A callable,
+    so an error raised while building the awaitable is wrapped as well."""
     try:
-        return await appending
+        return await append()
     except Exception as exc:
         raise UsernameAuditAppendError(exc) from exc
 
@@ -15820,7 +15821,7 @@ class MessageStore:
                     ),
                 )
             if written is not None:
-                appended = await append_rename_audits(self._append_audits(audits, now=now))
+                appended = await append_rename_audits(lambda: self._append_audits(audits, now=now))
             await self._commit()
         if written is None:
             return False

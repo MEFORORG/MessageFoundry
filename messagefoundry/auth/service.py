@@ -8935,6 +8935,7 @@ class AuthService:
             detail=_json({"user_id": user_id, "source": "directory"}),
             client=client,
         )
+        refused: Exception | None = None
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.
@@ -8945,33 +8946,10 @@ class AuthService:
             # The rename wrote, then its row failed to append, so the store rolled both back: the
             # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, because the
             # append can raise its driver's integrity class, which that arm would read as a lost
-            # race and audit as a conflict with a false lockout warning.
-            #
-            # A sign-in raises the append's own error, as a refused row always failed it. The
-            # reconciler (``audit_soft``) logs a store refusal at ERROR and goes on, as
-            # ``_audit_reconciler_row`` does for its rows: a raise here would end the pass and skip
-            # every later account's revocation (BACKLOG #3018 step 1). The row still holds the old
-            # name, so a later pass that probes the account, or its next sign-in, renames it again
-            # and writes the row and the notice then. A defect still raises. The sort is
-            # ``write_audit_soft``'s, with ``_audit_reconciler_row``'s sets, so the two cannot drift.
-            cause = exc.cause
-            if not audit_soft:
-                raise cause from None
-
-            async def _refused() -> None:
-                raise cause
-
-            await write_audit_soft(
-                _refused,
-                log=_log,
-                message="directory reconcile: the auth.ad_username_refreshed audit row for %s "
-                "could not be written, so its rename was rolled back and nobody was told; a later "
-                "pass that probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
-                args=lambda: (scrub_log_argument(new_username),),
-                errors=audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
-            )
-            return
+            # race and audit as a conflict with a false lockout warning. Handled after this block,
+            # so the append's own error is raised or logged with its own chain, not this wrapper's.
+            refused = exc.cause
+            written = False
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
             # (see this method's docstring and the measured note in `store/postgres.py`).
@@ -9018,6 +8996,32 @@ class AuthService:
             # audit row naming the holder is what makes the collision actionable.
             winner = await self._load_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race", before.username)
+            return
+        if refused is not None:
+            # A sign-in raises the append's own error, as a refused row always failed it. The
+            # reconciler (``audit_soft``) logs a store refusal at ERROR and goes on, as
+            # ``_audit_reconciler_row`` does for its rows: a raise here would end the pass and skip
+            # every later account's revocation (BACKLOG #3018 step 1). The row still holds the old
+            # name, so a later pass that probes the account, or its next sign-in, renames it again
+            # and writes the row and the notice then. A defect still raises. The sort is
+            # ``write_audit_soft``'s, with ``_audit_reconciler_row``'s sets, so the two cannot drift.
+            if not audit_soft:
+                raise refused
+            cause = refused
+
+            async def _refused() -> None:
+                raise cause
+
+            await write_audit_soft(
+                _refused,
+                log=_log,
+                message="directory reconcile: the auth.ad_username_refreshed audit row for %s "
+                "could not be written, so its rename was rolled back and nobody was told; a later "
+                "pass that probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
+                args=lambda: (scrub_log_argument(new_username),),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
             return
         # The success row was appended only if the UPDATE wrote (the store's contract, BACKLOG #3018
         # step 7): an UPDATE can match zero rows and raise nothing, and a row for a rename that did

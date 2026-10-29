@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     TotpUsable,
     UserAuthzRecord,
     UserChange,
+    UsernameAuditAppendError,
     UserRecord,
     UserRow,
     WebAuthnCredential,
@@ -9037,24 +9038,44 @@ class PostgresStore:
         # takes the audit advisory lock while the write holds the account's row lock, the order
         # ``_execute_with_audits`` uses.
         now = time.time() if now is None else now
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            taken = await conn.fetchrow(
-                "SELECT 1 FROM users WHERE username=$1 AND id<>$2", username, user_id
+        lost: UsernameAuditAppendError | None = None
+        try:
+            async with self._timed_acquire(record=False) as conn, conn.transaction():
+                taken = await conn.fetchrow(
+                    "SELECT 1 FROM users WHERE username=$1 AND id<>$2", username, user_id
+                )
+                if taken is not None:
+                    return False
+                written = await self._write_user(
+                    conn,
+                    user_id,
+                    lambda r: (
+                        r.changed(username=username, updated_at=float(now))
+                        if r.row.username == expected_username
+                        else None
+                    ),
+                )
+                if written is None:
+                    return False
+                appended = await append_rename_audits(
+                    lambda: self._append_audits(conn, audits, now=now)
+                )
+        except Exception as exc:
+            # An append that failed because the connection dropped leaves a rollback that fails
+            # too, and the rollback's error replaces the append's. The server ends the transaction
+            # with the session, so the rename did not commit, and the caller is owed the append's
+            # error: read as a plain store fault, it would end a reconciler pass.
+            if isinstance(exc, UsernameAuditAppendError) or not isinstance(
+                exc.__context__, UsernameAuditAppendError
+            ):
+                raise
+            log.warning(
+                "postgres: the rollback after a failed rename audit append failed too (%s)",
+                type(exc).__name__,
             )
-            if taken is not None:
-                return False
-            written = await self._write_user(
-                conn,
-                user_id,
-                lambda r: (
-                    r.changed(username=username, updated_at=float(now))
-                    if r.row.username == expected_username
-                    else None
-                ),
-            )
-            if written is None:
-                return False
-            appended = await append_rename_audits(self._append_audits(conn, audits, now=now))
+            lost = exc.__context__
+        if lost is not None:
+            raise lost
         tee_audits(audits, appended, ts=now)
         return True
 
