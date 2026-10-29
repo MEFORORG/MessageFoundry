@@ -16,7 +16,8 @@ cite is still in section 7.
 **Every match is flagged, whatever marker surrounds it.** A correction note that must quote the old
 claim verbatim adds its own entry to :data:`_ALLOWED` in the same change, so a reviewer sees the
 exemption beside the quote. An entry is a path and the exact quoted text, folded the way the scan
-folds it. An entry whose text is no longer in its file, or holds no claim, fails
+folds it, and it exempts only a claim wholly inside that text where the text appears exactly once
+in its file. An entry that exempts no claim in its file fails
 :func:`test_no_allowlist_entry_is_stale`. A marker-reading exemption was tried first and failed open
 in at least seven shapes (PR 2595), which :func:`test_a_claim_is_flagged_whatever_marker_surrounds_it`
 pins.
@@ -60,15 +61,17 @@ def _folded(text: str) -> str:
 def _claims(
     text: str, path: str = "", allowed: tuple[tuple[str, str], ...] = _ALLOWED
 ) -> list[str]:
-    """Every claim in ``text``, less those wholly inside an allowlisted quote for ``path``."""
+    """Every claim in ``text``, less those wholly inside an allowlisted quote for ``path``.
+
+    A quote that appears more than once exempts nothing, so a second copy pasted elsewhere in the
+    file as a fresh claim is flagged rather than riding on the retraction's entry."""
     if not _MAYBE.search(text):
         return []
     folded = _folded(text)
     spans = [
-        (start, start + len(quote))
+        (folded.index(quote), folded.index(quote) + len(quote))
         for entry_path, quote in allowed
-        if entry_path == path
-        for start in (m.start() for m in re.finditer(re.escape(quote), folded))
+        if entry_path == path and quote and folded.count(quote) == 1
     ]
     return [
         m.group(0)
@@ -78,13 +81,14 @@ def _claims(
 
 
 def _stale(root: Path, allowed: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]:
-    """The entries whose quote is not in their file any more, or holds no claim to exempt."""
+    """The entries that exempt no claim in their file: the file or the quote is gone, the quote
+    holds no whole claim, or it appears more than once there."""
     stale = []
-    for path, quote in allowed:
-        target = root / path
-        folded = _folded(target.read_text(encoding="utf-8")) if target.is_file() else ""
-        if quote not in folded or not _CLAIM.search(quote):
-            stale.append((path, quote))
+    for entry in allowed:
+        target = root / entry[0]
+        text = target.read_text(encoding="utf-8") if target.is_file() else ""
+        if len(_claims(text, entry[0], (entry,))) == len(_claims(text, entry[0], ())):
+            stale.append(entry)
     return stale
 
 
@@ -121,8 +125,9 @@ _MARKER_SHAPES = {
     "CORRECTED-by-design": 'CORRECTED-by-design: this read "the convention above remains the '
     'control for both".',
     "CORRECTEDLY": 'CORRECTEDLY: this read "the convention above remains the control for both".',
-    "a curly close, then a later quote": '**CORRECTED 2026-10-28:** this read "per route”. The '
-    'convention above remains the control for both; see "Who binds".',
+    "a curly close, then a later quote": '**CORRECTED 2026-10-28:** this read "per route'
+    "\N{RIGHT DOUBLE QUOTATION MARK}. The convention above remains the control for both; see "
+    '"Who binds".',
 }
 
 
@@ -156,14 +161,26 @@ def test_an_allowlisted_quote_passes_only_at_its_own_path() -> None:
     assert _claims(_RETRACTION, "docs/EXAMPLE.md", ())  # control: no entry, flagged
     # a second claim in the same file, outside the quote, is still flagged
     assert _claims(_RETRACTION + " The convention above remains the control.", _ENTRY[0], (_ENTRY,))
+    # a second copy of the quoted text: neither copy is exempt
+    assert len(_claims(_RETRACTION + "\n" + _RETRACTION, _ENTRY[0], (_ENTRY,))) == 2
+    # an entry covering only the head, or only the tail, of a claim exempts nothing
+    head = (_ENTRY[0], 'this read "the convention above remains the')
+    assert _claims(_RETRACTION, _ENTRY[0], (head,))
+    tail = (_ENTRY[0], 'above remains the control for both"')
+    assert _claims(_RETRACTION, _ENTRY[0], (tail,))
 
 
 def test_an_allowlist_entry_gone_from_its_file_is_stale(tmp_path: Path) -> None:
     docs = tmp_path / "docs"
     docs.mkdir()
-    (docs / "EXAMPLE.md").write_text(_RETRACTION + "\n", encoding="utf-8")
+    example = docs / "EXAMPLE.md"
+    example.write_text(_RETRACTION + "\n", encoding="utf-8")
     assert _stale(tmp_path, (_ENTRY,)) == []  # control: present and holding a claim
-    (docs / "EXAMPLE.md").write_text("reworded, no quote left\n", encoding="utf-8")
+    partial = (_ENTRY[0], 'this read "the convention above remains the')
+    assert _stale(tmp_path, (partial,)) == [partial]  # present, but no whole claim inside
+    example.write_text(_RETRACTION + "\n" + _RETRACTION + "\n", encoding="utf-8")
+    assert _stale(tmp_path, (_ENTRY,)) == [_ENTRY]  # present twice, so it exempts neither
+    example.write_text("reworded, no quote left\n", encoding="utf-8")
     assert _stale(tmp_path, (_ENTRY,)) == [_ENTRY]
     assert _stale(tmp_path, (("docs/GONE.md", _ENTRY[1]),)) == [("docs/GONE.md", _ENTRY[1])]
     no_claim = ("docs/EXAMPLE.md", "reworded")
