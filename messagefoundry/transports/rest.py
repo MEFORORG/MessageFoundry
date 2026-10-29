@@ -1022,8 +1022,10 @@ def refuse_cleartext_credentials(
     such as ``Authorization`` or an API key in any letter case, or by a credential-shaped value),
     and a credential-looking query parameter (vault BACKLOG #3533 item 4). It is the credential half
     of what the ``verify_tls = false`` rule counts, without that rule's name allowlist: a static
-    header with a neutral name and value, such as ``Prefer``, still crosses a declared cleartext hop.
-    Whether the allowlist should apply here too is an open owner question. A static
+    header with a neutral name, such as ``X-Session``, still crosses a declared cleartext hop, and
+    so does a secret in it that is not credential-shaped. That is an accepted limit (owner ruling
+    2026-10-28); ``docs/SECURITY-LOOSENING.md``, *Accepted limit: a neutral header crosses plain
+    http off this machine*, says why and defines which values are credential-shaped. A static
     ``Proxy-Authorization``, in any spelling, is left out when the request goes to a proxy
     (:func:`hop_reaches_a_proxy`), since the send-time proxy rule judges it then; on a hop that
     goes direct it counts. An ``Authorization`` header in the built ``headers``,
@@ -1113,7 +1115,8 @@ def _header_held(name: str, value: object, *, allowlist: bool) -> str | None:
     With ``allowlist``, on a ``verify_tls = false`` hop, any other name off
     :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, is refused for its name alone.
     An off-box cleartext hop passes ``allowlist=False``: the owner's 2026-10-26 ruling on item 4
-    refuses its credentials, and whether its neutral headers meet the list is an open question."""
+    refuses its credentials. Its neutral headers do not meet the list, an accepted limit (owner
+    ruling 2026-10-28); ``docs/SECURITY-LOOSENING.md`` says why."""
     # Lazy: config.wiring is not otherwise loaded by this module.
     from messagefoundry.config.wiring import _is_secret_header
 
@@ -1195,7 +1198,8 @@ def http_credentials_sent(
 
     ``cleartext=True`` is the off-box cleartext rule's reading, which differs in two ways. It
     counts credentials only, so a static header is not refused for its name alone (vault BACKLOG
-    #3533 item 4; whether the allowlist should apply there is an open owner question). And when
+    #3533 item 4; an accepted limit by owner ruling 2026-10-28, which
+    ``docs/SECURITY-LOOSENING.md`` explains). And when
     ``proxied`` says the request goes to a web proxy, it leaves out a static header that
     :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name` reads as
     ``Proxy-Authorization``, in any spelling. That header is then the proxy's, and the send-time

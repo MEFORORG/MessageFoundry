@@ -619,7 +619,8 @@ def test_soap_ws_username_cleartext_refused_on_prod(monkeypatch: pytest.MonkeyPa
 def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
     declared: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #3533 item 4: no declaration lets a credential cross cleartext http off-box."""
+    """Vault BACKLOG #3533 item 4: no declaration lets a recognized credential cross cleartext http
+    off-box."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with (
         active_hop_posture(_PROD),
@@ -635,9 +636,9 @@ def test_soap_ws_username_cleartext_refused_whatever_the_declaration(
         )
 
 
-# --- vault BACKLOG #3533 item 4: no declaration carries a credential across cleartext http ------
+# --- vault BACKLOG #3533 item 4: no declaration carries a recognized credential across plain http
 #
-# Owner ruling 2026-10-26: a credential is refused across an off-box cleartext hop that
+# Owner ruling 2026-10-26: a recognized credential is refused across an off-box cleartext hop that
 # tls_hop_attested or cleartext_accepted would otherwise let through, and the credential test
 # counts the credentials the verify_tls=false rule counts, header names in any case. It does not
 # take that rule's name allowlist: the ruling names credentials only.
@@ -676,8 +677,10 @@ def test_a_declared_cleartext_hop_carries_a_neutral_static_header(
     cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The verify-off header allowlist does not apply to a declared cleartext hop: the owner's
-    ruling on item 4 refuses credentials only, so a header with a neutral name and value crosses.
-    Whether the allowlist should apply here too is an open owner question."""
+    ruling on item 4 refuses recognized credentials only, so a header with a neutral name crosses.
+    So does a secret in it that is not credential-shaped. That is an accepted limit (owner ruling
+    2026-10-28); docs/SECURITY-LOOSENING.md, "Accepted limit: a neutral header crosses plain http
+    off this machine", says why and defines which values are credential-shaped."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         dest = _build(

@@ -39,8 +39,10 @@ section reference.
 
 On the hops in the table below, the engine will not send a credential to a peer whose identity it
 has not checked. The rule does not yet reach every hop or every kind of credential: at least the
-cases in *The rule does not reach every hop yet*, below, still cross. This section is the one
-statement of that rule; other pages link here.
+cases in *The rule does not reach every hop yet*, below, still cross. So does a secret that is not
+credential-shaped under a neutral header name, over plain `http` off this machine. That is an
+[accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine), at the end
+of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
@@ -104,14 +106,10 @@ engine has not verified, when the lever named beside each is set:
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
   like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
-- an HTTP-family static or per-message header with a neutral name, such as `X-Session`, over
-  plain `http`, under that hop's own levers. The header allowlist applies on `verify_tls = false`
-  hops only. Whether it should also apply to plain `http` off this machine awaits an owner
-  ruling: the 2026-10-26 ruling on cleartext hops named credentials only (vault BACKLOG #3533
-  item 4);
-- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
-  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
-  knows only auth-scheme prefixes and JWTs;
+- a secret that is not
+  [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
+  an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
+  hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
@@ -126,6 +124,50 @@ connection declares `cleartext_accepted` with a reason. The engine also lets it 
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
+
+### Accepted limit: a neutral header crosses plain `http` off this machine
+
+Over plain `http` to a host off this machine, an HTTP-family header with a neutral name, such as
+`X-Session`, still crosses. That holds for a static header and for one a Handler stamps per
+message. It crosses even when its value is a secret, if that secret is not credential-shaped, as
+defined below. On that hop the no-escape rule refuses only the credentials it
+recognizes, described above (vault BACKLOG #3533 item 4). A credential-shaped value is refused
+under any name. The header allowlist applies on `verify_tls = false` hops only. The hop itself
+crosses only under its own levers, such as `cleartext_accepted` or `tls_hop_attested`.
+
+**Credential-shaped** means the engine's value test recognizes the value, whatever the header is
+called. That test is `_looks_like_a_credential_value` in `messagefoundry/config/wiring.py`. It
+trims surrounding whitespace, then recognizes two shapes only:
+
+- a value that starts, in any letter case, with `Bearer `, `Basic `, `Digest ` or `Negotiate `
+  (each with its trailing space), or with `AWS4-HMAC`, as in `AWS4-HMAC-SHA256`;
+- a JWT: the whole value matches `^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+$`,
+  three base64url segments joined by dots, the first starting `eyJ`.
+
+Any other scheme word is not recognized. A value such as `Token abc123`, `SSWS abc123`,
+`SharedAccessSignature sr=...` or `OAuth abc123` is not credential-shaped. Under a neutral name,
+it crosses.
+
+This limit is accepted, with no fix planned (owner ruling 2026-10-28). The owner was asked whether
+the allowlist should also apply to declared plain-`http` hops. The answer was *"No, keep it as
+decided"*. That confirmed decision `d20261027T133708514-b8b2ed`, made on 2026-10-27 under the
+owner's delegation ([record](https://github.com/MEFORORG/MessageFoundry/pull/2576#issuecomment-6443284239)).
+
+The reason differs by declaration.
+
+- Under `cleartext_accepted`, the declaration says the hop is not secure.
+  [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+  decision 2 accepts that declaration. The hop's body and headers are then readable on the path,
+  by the operator's own choice. Refusing neutral headers would not protect the body, which that
+  declaration already exposes.
+- Under `tls_hop_attested`, the declaration says the hop is secure by means the engine cannot see
+  (the table in ADR 0153 decision 2). The engine trusts that declaration for the body and the
+  headers, except a credential the refusal recognizes. The owner's ruling of 2026-10-26 refuses
+  that credential whatever the hop declares. A secret that is not credential-shaped, under a
+  neutral name, rests on the declaration alone. If the declaration is false, that secret crosses
+  in the clear.
+
+Earlier versions of this guide called this an open owner question. The 2026-10-28 ruling answers it.
 
 ---
 
@@ -1337,9 +1379,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the payload — and any credential that connection carries — crosses that hop
   **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
   partial protection here: it is plaintext PHI on the wire for that connection. The exception is an
-  HTTP-family credential to a host off this machine, which is refused whatever this says (vault
-  BACKLOG #3533 item 4). A forward-proxy login is not in that exception: it crosses its cleartext
-  leg under this declaration, as the
+  HTTP-family credential the refusal recognizes, to a host off this machine. It is refused whatever
+  this says (vault BACKLOG #3533 item 4). A secret that is not credential-shaped, under a neutral
+  header name, still crosses: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine). A forward-proxy login is
+  not in that exception: it crosses its cleartext leg under this declaration, as the
   [credential rule](#no-escape-sends-a-credential-to-an-unverified-peer) says.
 - **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
   transport with no TLS support at all. For `Tcp()` and `X12()` the declaration is **permanent and
@@ -1396,8 +1440,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
-  credential, other than a forward-proxy login, over cleartext `http` to a host off this machine:
-  it stays refused, attested or not (vault BACKLOG #3533 item 4).
+  credential the refusal recognizes, other than a forward-proxy login, over cleartext `http` to a
+  host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
+  that is not credential-shaped, under a neutral header name, rests on the attestation alone: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
   sidecar in front of the connection is the usual case. An isolated, point-to-point segment with its
   own link-layer encryption is the other.
