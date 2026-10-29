@@ -1124,7 +1124,7 @@ class SandboxSession:
         stdin = proc.stdin
         failure: list[BaseException] = []
         fault: list[BaseException] = []
-        for key in [key for key, done in self._stale_lookups.items() if done.is_set()]:
+        for key in [key for key, ended in self._stale_lookups.items() if ended.is_set()]:
             del self._stale_lookups[key]
         done = threading.Event()
 
@@ -1157,8 +1157,13 @@ class SandboxSession:
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
-            if not done.is_set():
-                self._stale_lookups[(lookup.kind, lookup.connection)] = done
+            key = (lookup.kind, lookup.connection)
+            earlier = self._stale_lookups.get(key)
+            # Never replace a record whose lookup still runs: a helper the cap cut off while it was
+            # still waiting on that record has not called the runner, and replacing it would let the
+            # next dispatch start a second call beside the one that is actually hung.
+            if not done.is_set() and (earlier is None or earlier.is_set()):
+                self._stale_lookups[key] = done
             return False
         if fault:
             self._kill(proc)
@@ -1216,7 +1221,8 @@ class SandboxSession:
 
         **One lookup at a time per connection.** While a lookup the cap cut off on this connection
         is still waiting on its runner, a new one waits for it, for at most the rest of its own
-        dispatch's cap less a small margin, and is refused if it is still waiting then. So a hung
+        dispatch's cap less a quarter of the cap (at most 2 s), and is refused if it is still waiting
+        then. The quarter is what the Handler has left to handle the refusal before the cap. So a hung
         backend holds one broker call per connection and session, not one per message, and a
         transient stall does not turn the backlog into instant refusals."""
         is_db = lookup.kind == codec.LOOKUP_DB
@@ -1226,7 +1232,7 @@ class SandboxSession:
             return False, None, refusal
         stale = self._stale_lookups.get((lookup.kind, lookup.connection)) if available else None
         if stale is not None:
-            margin = min(0.5, self.policy.wall_seconds / 10)
+            margin = min(2.0, self.policy.wall_seconds / 4)
             if not stale.wait(max(0.0, deadline - margin - time.monotonic())):
                 return False, None, self._busy_refusal(lookup)
         try:

@@ -1288,8 +1288,9 @@ It differs from `subprocess` in at least these ways:
   spends serving its lookups, so raise it for a feed whose lookups are slow. When the cap runs out
   during a lookup, the call fails at once and its worker is recycled; the lookup itself runs on to
   its own timeout in the engine, and its result is discarded. Until it ends, a later lookup on the
-  same connection from that inbound waits for it, for at most the rest of its own call's cap, and is
-  refused if it is still waiting then. That bounds what the engine's broker waits on, not the
+  same connection from that inbound waits for it, until a quarter of its own call's cap (at most 2
+  seconds) is left, and is refused if it is still waiting then, leaving that quarter for the Handler
+  to handle the refusal. That bounds what the engine's broker waits on, not the
   database: a `db_lookup` its runner gave up on can still be running there, and a reload starts with
   no record of a lookup still running.
 - **It needs a config directory.** A graph built in code with none cannot start a worker. Under

@@ -859,7 +859,7 @@ def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(
     session = SandboxSession(
         SandboxPolicy(
             mode=SandboxMode.ISOLATED,
-            wall_seconds=2.0,
+            wall_seconds=4.0,
             lookup_allowed_db=("db",),
             lookup_allowed_http=("fhir",),
         ),
@@ -872,7 +872,8 @@ def test_a_lookup_the_cap_cut_off_is_the_only_one_outstanding(
         with db_lookup_mod.activated(hung):
             with pytest.raises(SandboxError, match="wall cap"):
                 _bodies(registry, "h_db", session)
-            # The next dispatch is refused its lookup at once rather than start a second one.
+            # The next dispatch waits for the stalled lookup, then is refused its own rather than
+            # start a second one beside it.
             started = time.monotonic()
             with pytest.raises(SandboxError, match="still running"):
                 _bodies(registry, "h_db", session)
@@ -972,3 +973,42 @@ def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
     assert "FAULT-SENTINEL-7f3a" not in str(raised.value)
     assert not [r for r in caplog.records if "FAULT-SENTINEL-7f3a" in r.getMessage()]
     assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+
+
+def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dispatch B's helper is still building its refusal when B's cap fires. Its record must not
+    # replace the hung lookup's, or dispatch C would start a second call on the hung connection.
+    release = threading.Event()
+    calls: list[str] = []
+
+    def hung(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        calls.append(statement)
+        release.wait(60)
+        return [{"v": "late", "d": Decimal(0)}]
+
+    real_refusal = SandboxSession._busy_refusal
+
+    def slow_refusal(lookup: codec.LookupRequest) -> str:
+        time.sleep(2.0)  # past the 1 s margin at wall_seconds=4
+        return real_refusal(lookup)
+
+    monkeypatch.setattr(SandboxSession, "_busy_refusal", staticmethod(slow_refusal))
+    registry, config_dir = graph
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.ISOLATED, wall_seconds=4.0, lookup_allowed_db=("db",)),
+        inbound="IB_I",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+    try:
+        with db_lookup_mod.activated(hung):
+            for _ in range(3):  # A hangs; B and C each find the connection busy
+                with pytest.raises(SandboxError):
+                    _bodies(registry, "h_db", session)
+        assert len(calls) == 1
+    finally:
+        release.set()
+        session.close()

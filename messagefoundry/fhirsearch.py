@@ -142,9 +142,9 @@ class FhirRaw:
 class ForeignSearchValue:
     """A search value of a kind :func:`fhir_lookup` does not take, carried by its type NAME only.
 
-    Not a kind an author writes, and not in ``__all__``: it is the sandbox codec's carrier. The ``mode=isolated`` sandbox (ADR 0147) sends a Handler's
-    ``params`` to the engine, and a value of any other type cannot cross the pipe, so it crosses as
-    this. :func:`resolve_search_pairs` refuses it with the words it gives the original value, in the
+    Not a kind an author writes, and not in ``__all__``: it is the sandbox codec's carrier. The
+    ``mode=isolated`` sandbox (ADR 0147) sends a Handler's ``params`` to the engine, and a value of
+    any other type cannot cross the pipe, so it crosses as this. :func:`resolve_search_pairs` refuses it with the words it gives the original value, in the
     engine and after the engine's own checks, so the Handler sees what ``mode=off`` shows it."""
 
     type_name: str
