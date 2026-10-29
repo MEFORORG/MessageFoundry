@@ -204,7 +204,8 @@ def test_the_check_agrees_with_requests_own_reads(form: str) -> None:
     own reads, or gets as far as the dial and gets a ``ConnectionError``. Not every shape agrees: a
     URL with no host fails requests' host check, whose error is fixed text, and passes the check.
     Mutation: drop the Latin-1 encode from the check; red on the last unsendable row. Drop the raw
-    ``urlparse``; red on the first. Read on requests 2.34.2; a requests that reads these URLs
+    ``urlsplit``; red on the first. requests reads that URL with the params-splitting parser,
+    so this row is also what pins that the two raise alike. Read on requests 2.34.2; a requests that reads these URLs
     differently goes red here rather than leaving the check out of step."""
     import requests
 

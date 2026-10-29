@@ -1040,11 +1040,15 @@ def _proxy_url_requests_cannot_send(proxy: str) -> bool:
       password from the prepended URL with ``requests.utils.get_auth_from_url`` and, when there is
       a user name, encodes both as Latin-1. The ``UnicodeEncodeError`` keeps the whole string it
       was encoding in its ``object`` attribute.
-    * ``HTTPAdapter.request_url``, last, reads the RAW URL with ``urllib.parse.urlparse``, whose
-      ``ValueError`` for a network location that NFKC normalization changes quotes all of it. The
-      prepend percent-encodes such a character, so only the raw read meets it.
+    * ``HTTPAdapter.request_url``, last, reads the RAW URL with the standard library's
+      params-splitting parser, whose ``ValueError`` for a network location that NFKC
+      normalization changes quotes all of it. The prepend percent-encodes such a character, so
+      only the raw read meets it.
 
-    The same reads are made here, and any failure answers ``True``. Order does not change the
+    The same reads are made here, and any failure answers ``True``. The raw read is made with
+    ``urllib.parse.urlsplit``, the one URL parser ``tests/test_security_static.py`` allows. The
+    params-splitting parser calls ``urlsplit`` and then only slices the path on ``;``, which
+    cannot raise, so it raises exactly when ``urlsplit`` does (read on CPython 3.14). Order does not change the
     answer. So a URL this refuses is one requests' send fails on before it dials.
     ``tests/test_vault_hop_proxy_parse.py`` pins that agreement, both ways, on the shapes it lists.
     It does not hold for every shape: a URL with no host fails requests' own host check, whose
@@ -1054,7 +1058,7 @@ def _proxy_url_requests_cannot_send(proxy: str) -> bool:
     it would keep a refused or retired password after nothing else does. So each send pays these
     parses again, up to three times, once per hook that checks."""
     try:
-        urllib.parse.urlparse(proxy)
+        urllib.parse.urlsplit(proxy)
         prepended = requests.utils.prepend_scheme_if_needed(proxy, "http")
         urllib3.util.parse_url(prepended)
         username, password = requests.utils.get_auth_from_url(prepended)
