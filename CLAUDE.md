@@ -439,6 +439,17 @@ nobody checked it. A Manager seat added, the same day, that spawning should be r
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
 
+**The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
+(decided by the Lander under the owner's delegation of 2026-10-29, decision
+d20261029T165610526-c13ae6). All of these must hold: 4 hours with no author comment or commit since
+the hold; the Lander mailed the author's seat-record worktree path and had no reply; the author's
+claim and seat record show no live session; the PR is not queued; the hold names one determinate
+fix, not a question of intent, of an owner ruling or of behaviour; and the PR is not ASVS record
+content, which stays a Manager's. The Builder fetches before it pushes, never force-pushes, and
+stops if the head moved. One repair per PR; a second hold goes to a spawned Manager. The Lander
+merges only once a fresh code-review fork at `xhigh`, its tag read with `review_tag.py`, covers the
+repair head. That independent review is what keeps authoring apart from landing.
+
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
 invoking either (plan section 5.1, owner approvals 2026-10-21 and 2026-10-22). The decision
@@ -628,8 +639,11 @@ Manager's watch reached the cloud session 29 seconds after its question.
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
   reads what the review found. **The Lander may merge when the open findings are filed as rows and
-  none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A finding
-  that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
+  none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A factual
+  error in prose is a filed row, except a false statement in a security or assurance record about
+  what a control does, a score or an anchor: that weakens a control, so it blocks the merge. A
+  finding the Lander cannot classify goes to the owner (decision d20261029T165623191-578690). A
+  finding that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
   finding that names a defect the merge would ship goes back to the owner for a ruling."* The
   ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
   changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
@@ -692,7 +706,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   a NEW correctness defect. **Name the skill, not "a review":** the looser word lets an ad-hoc
   read of the diff pass as compliance. `code-review` is a skill and not an agent type, so call it by
   the skill name. Cap repair at **two rounds**, then
-  ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
+  ship with the critic notes in your exit report. If the last repair round produced a fix commit,
+  run one more review-only round on the pushed head, fix nothing it finds, ship its findings, and
+  write the QA line as `Rounds: 2 + final review-only` (decision d20261029T165623191-578690).
+  korus `roles/BUILDER.md` section 4c is the source
   of record for the reasoning and the traps; do not restate them here.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
