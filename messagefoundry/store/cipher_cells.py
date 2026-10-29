@@ -276,11 +276,15 @@ def _sealed_test(column: str) -> tuple[str, tuple[object, ...]]:
     case_sensitive_like`` makes it skip ``MFENC:``. A value it skipped would never be read at all.
 
     Every BLOB is called sealed, by its type, ``x''`` included. At least the store's own writer,
-    ``_enc``, binds text, so a BLOB in a cipher-covered column is not a value the store's reader can
-    open, and :func:`_open` fails it without a decrypt, under any cipher: the walk fails closed on
-    a BLOB on every build."""
+    ``_enc``, binds text, so under a keyed cipher a BLOB in a cipher-covered column is not a value
+    the store's reader can open, and :func:`_open` fails it without a decrypt: a keyed walk fails
+    closed on a BLOB on every build. A keyless walk reports a BLOB as it reports text, by whether
+    it carries the marker (see :func:`read_cipher_cells`)."""
     sql = f"(typeof({column}) = 'blob' OR lower(substr({column}, 1, ?)) = ?)"
     return sql, (len(MARKER_PREFIX), MARKER_PREFIX.lower())
+
+
+_MARKER_BYTES = MARKER_PREFIX.encode("ascii")
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -359,11 +363,16 @@ def read_cipher_cells(
                 where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
                 if not sealed:
                     readings.append(CellReading(spec, unsealed_kind, where))
-                elif keyless and isinstance(stored, str):
-                    # The sealed test ignores case; the marker does not. A keyless store's plaintext
-                    # that only resembles it is not a sealed cell. A BLOB goes on to `_open`, which
-                    # fails it under any cipher: no key would open it, so the keyring is not blamed.
-                    if cipher.is_encrypted(stored):
+                elif keyless:
+                    # The sealed test ignores case and takes any BLOB; the marker does neither. A
+                    # keyless reader returns either as it is, so only a value that carries the
+                    # marker, as text or as the BLOB's leading bytes, is a sealed cell no key opened;
+                    # the rest is passed over, as that reader passes it.
+                    if (
+                        cipher.is_encrypted(stored)
+                        if isinstance(stored, str)
+                        else isinstance(stored, bytes) and stored.startswith(_MARKER_BYTES)
+                    ):
                         readings.append(CellReading(spec, "keyless", where))
                 else:
                     reading = _open(spec, cipher, stored, key, where)
