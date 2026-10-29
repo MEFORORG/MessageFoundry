@@ -13489,7 +13489,7 @@ class SqlServerStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
-        expected_secret_digest: str,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -13499,19 +13499,16 @@ class SqlServerStore:
 
         Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
         #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
-        compare-and-set is ``totp_replace``'s, null-safe in Python, on the stamp and the opened seed
-        (BACKLOG #3778). Same lock order as ``record_audit``: the in-process gate, then the
-        connection."""
+        compare-and-set is ``totp_replace``'s, null-safe in Python. Same lock order as
+        ``record_audit``: the in-process gate, then the connection. The secret is sealed through
+        ``_enc``, as on the twins, so an empty one reaches ``totp_replace``'s refusal unsealed."""
         now = time.time() if now is None else now
-        aad = cell_aad("users", "totp_secret", user_id)
         change = totp_replace(
-            secret=secret,
-            seal_secret=lambda plain: self._cipher.encrypt(plain, aad=aad),
-            open_secret=partial(self.open_totp_secret, user_id),
+            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
-            expected_secret_digest=expected_secret_digest,
+            expected_secret_cell=expected_secret_cell,
             now=now,
         )
         async with self._audit_lock:  # noqa: SIM117

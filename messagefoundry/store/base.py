@@ -2350,10 +2350,10 @@ class AuthStore(Protocol):
     # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
     # account never passes through zero factors. The same transaction ends the account's sessions
     # and appends `audit`, so the swap is never live unrecorded. Conditional on TOTP being on, on
-    # `totp_enrolled_at` still being `expected_enrolled_at`, and on the opened seed's
-    # `totp_secret_digest` still being `expected_secret_digest` (compare-and-set against the
-    # caller's read; the seed tells apart two enrolments sharing a stamp, BACKLOG #3778). Returns
-    # the sessions ended, or None when nothing was written; a caller must refuse on None.
+    # `totp_enrolled_at` still being `expected_enrolled_at`, and on the stored `totp_secret` cell
+    # still being `expected_secret_cell`, byte for byte (compare-and-set against the caller's read;
+    # store.totp_replace says why both, BACKLOG #3778). An empty `secret` raises ValueError.
+    # Returns the sessions ended, or None when nothing was written; a caller must refuse on None.
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -2362,7 +2362,7 @@ class AuthStore(Protocol):
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
-        expected_secret_digest: str,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None: ...

@@ -8946,7 +8946,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.auth.notifications import MFA_ENABLED, SecurityEvent
     from messagefoundry.auth.passwords import hash_password
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -8956,7 +8958,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.row_seal import RowSealError
-    from messagefoundry.store.store import AuditAppend, totp_secret_digest
+    from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -9047,6 +9049,18 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
         return None
 
+    def seed_pin(store: Store, user: UserRecord) -> tuple[str, str] | None:
+        """``user``'s stored seed cell and the digest of the seed it opens to, or ``None`` with no
+        seed. Both come from the record that gave the stamp, so they name one enrolment even when
+        a second shares its stamp (BACKLOG #3778). The digest is the pin held across the prompt: a
+        store-key rotation re-encrypts the cell and leaves the seed, so a rotation during the
+        prompt refuses nothing. The cell, read again just before the write, is what the write
+        compares. A cell that does not open raises ``CipherError``, a refusal with nothing
+        written."""
+        cell = None if user.row is None else user.row.totp_secret
+        held = store.open_totp_secret(user.id, cell)
+        return None if cell is None or held is None else (cell, hash_token(held))
+
     async def check() -> _ResetTarget | str:
         """The account to replace, pinned, or why not. Read before any key is shown."""
         store = await opened()
@@ -9058,19 +9072,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             if refusal is not None:
                 return refusal
             _refuse_an_unauditable_write(store)  # before the key is shown, not after the write
-            # The seed from the record that gave the stamp, so the pin names one enrolment even
-            # when a second one shares its stamp (BACKLOG #3778).
-            held = store.open_totp_secret(
-                user.id, None if user.row is None else user.row.totp_secret
-            )
-            if held is None:
+            pin = seed_pin(store, user)
+            if pin is None:
                 return (
                     f"the authenticator of {user.username!r} changed while it was read; nothing "
                     "was written. Run the command again"
                 )
-            return _ResetTarget(
-                user.id, user.username, user.totp_enrolled_at, totp_secret_digest(held)
-            )
+            return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin[1])
         finally:
             await store.close()
 
@@ -9158,6 +9166,14 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             again = await refusal_for(store, user)
             if again is not None:
                 return _sentence(again) + unused_entry
+            moved = (
+                f"the authenticator of {user.username!r} was removed or enrolled again while this "
+                "command ran, so nothing was replaced; nothing was written. Stop the engine and "
+                "run the command again." + unused_entry
+            )
+            pin = seed_pin(store, user)
+            if pin is None or not constant_time_equal(pin[1], target.secret_digest):
+                return moved
             _refuse_an_unauditable_write(store)
             report: dict[str, Any] = {
                 "recovery_codes_issued": len(plain_codes),
@@ -9174,7 +9190,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     recovery_code_hashes=code_hashes,
                     step=step,
                     expected_enrolled_at=target.enrolled_at,
-                    expected_secret_digest=target.secret_digest,
+                    expected_secret_cell=pin[0],
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
             except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
@@ -9207,11 +9223,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     unknown.append(user)
                 raise
             if ended is None:
-                return (
-                    f"the authenticator of {user.username!r} was removed or enrolled again while "
-                    "this command ran, so nothing was replaced; nothing was written. Stop the "
-                    "engine and run the command again." + unused_entry
-                )
+                return moved
             swapped.append((user, {**report, "sessions_ended": ended}))
             return None
         finally:

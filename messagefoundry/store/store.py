@@ -1982,8 +1982,10 @@ class UserRecord:
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
     #: Every column of the row as it was read, for the integrity seal (BACKLOG #2592). Carries the
-    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared, and nothing
-    #: but the seal check and the store's write helper reads it. ``None`` on a record built by hand.
+    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared as a whole.
+    #: Beyond the seal check and the store's write helper, at least the TOTP cell is read from it
+    #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
+    #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
 
     def sign_in_locked(self, now: float) -> bool:
@@ -3336,63 +3338,36 @@ def totp_disable(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
     )
 
 
-def totp_secret_digest(secret: str) -> str:
-    """The digest an opened TOTP secret is compared by in ``replace_totp_enrolment``'s
-    compare-and-set (BACKLOG #3778), so a caller pins the enrolment without holding its seed. It IS
-    ``hash_token``, the digest the service's own enrolment check takes (BACKLOG #3068), so the two
-    cannot drift apart."""
-    # Lazy, as passkey_is_way_past imports it: a stdlib-only leaf of the auth package.
-    from messagefoundry.auth.tokens import hash_token
-
-    return hash_token(secret)
-
-
 def totp_replace(
     *,
-    secret: str,
-    seal_secret: Callable[[str], str | None],
-    open_secret: Callable[[str], str | None],
+    sealed_secret: str | None,
     recovery_code_hashes: Sequence[str],
     step: int,
     expected_enrolled_at: float | None,
-    expected_secret_digest: str,
+    expected_secret_cell: str | None,
     now: float,
 ) -> UserChange:
-    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, with a
-    seed, and still the enrolment the caller read. The session epoch is raised in the same write,
-    since the caller ends every session with it.
+    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, still
+    enrolled at ``expected_enrolled_at``, and still holding the stored cell
+    ``expected_secret_cell``, byte for byte, the compare :func:`totp_enable` makes. The session
+    epoch is raised in the same write, since the caller ends every session with it.
 
-    THE ENROLMENT IS KEYED ON ITS OPENED SEED, NOT ONLY ITS STAMP (BACKLOG #3778).
-    ``totp_enrolled_at`` is a clock reading, so a removal and a re-enrolment inside one reading
-    leave a row this compare could not tell from the one the caller read. Every writer of a seed
-    draws a fresh random one (the enrolment begin, ``provision-admin``, ``admin-reset-totp``), so
-    the opened seed differs between any two enrolments, and this refuses a seed equal to the one it
-    replaces, so its own write is never that exception. The compare opens the cell rather than
-    comparing it: a store-key rotation re-encrypts the cell and leaves the seed alone, so a rotation
-    refuses nothing. A cell that does not open matches nothing, which fails closed, and is logged.
-    The stamp is compared too, the pair the service compares for the same purpose."""
-    if hmac.compare_digest(totp_secret_digest(secret), expected_secret_digest):
-        raise ValueError("the replacement TOTP secret is the secret it replaces")
-    sealed_secret = seal_secret(secret)
+    The cell is what tells apart two enrolments sharing a stamp (BACKLOG #3778). On a keyed store
+    every write of it draws a fresh nonce; on a keyless one it is the seed, drawn at random by at
+    least every enrolment path built today. A store-key rotation re-encrypts it, so one landing
+    between the caller's read and this write makes this write nothing, which fails closed. A
+    caller that must hold an enrolment across a long wait pins the opened seed instead and reads
+    the cell again just before calling, as ``admin-reset-totp`` does. ``None`` matches nothing.
+    An empty secret raises, as :func:`totp_stage` refuses one."""
+    if not sealed_secret:
+        raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if not r.row.totp_enabled or r.row.totp_secret is None:
+        if not r.row.totp_enabled or expected_secret_cell is None:
+            return None
+        if r.row.totp_secret != expected_secret_cell:
             return None
         if r.row.totp_enrolled_at != _opt_float(expected_enrolled_at):
-            return None
-        try:
-            held = open_secret(r.row.totp_secret)
-        except CipherError:
-            # Never the cell or the error text: the class says what failed.
-            log.warning(
-                "replace_totp_enrolment: the TOTP secret of account %s did not open; "
-                "nothing was replaced",
-                r.row.id,
-            )
-            return None
-        if held is None or not hmac.compare_digest(
-            totp_secret_digest(held), expected_secret_digest
-        ):
             return None
         return r.bump_epoch().changed(
             totp_secret=sealed_secret,
@@ -16007,7 +15982,7 @@ class MessageStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
-        expected_secret_digest: str,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -16018,23 +15993,19 @@ class MessageStore:
         The secret, the recovery codes and the step high-water mark change together, and TOTP stays
         on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
         the code that proved the new secret, so that code is spent. The write matches only a row
-        where TOTP is on, with a seed, still enrolled at ``expected_enrolled_at`` and still holding
-        the seed whose :func:`totp_secret_digest` is ``expected_secret_digest`` (BACKLOG #3778): a
+        where TOTP is on, still enrolled at ``expected_enrolled_at`` and still holding the stored
+        cell ``expected_secret_cell`` (:func:`totp_replace` says why both, BACKLOG #3778): a
         removal or a re-enrolment that landed after the caller read the row is never overwritten,
-        even one stamped with the same instant, and TOTP can never be turned on for an account that
-        did not have it. A ``secret`` equal to the seed it replaces raises ``ValueError``. The audit
-        row and the session sweep commit or roll back with the swap, so a refused audit append
-        leaves the old seed in place."""
+        and TOTP can never be turned on for an account that did not have it. The audit row and the
+        session sweep commit or roll back with the swap, so a refused audit append leaves the old
+        seed in place."""
         now = time.time() if now is None else now
-        aad = cell_aad("users", "totp_secret", user_id)
         change = totp_replace(
-            secret=secret,
-            seal_secret=lambda plain: self._enc(plain, aad=aad),
-            open_secret=functools.partial(self.open_totp_secret, user_id),
+            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
-            expected_secret_digest=expected_secret_digest,
+            expected_secret_cell=expected_secret_cell,
             now=now,
         )
         async with _writer_txn(self._db, self._lock):

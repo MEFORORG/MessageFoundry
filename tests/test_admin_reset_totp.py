@@ -31,14 +31,7 @@ from messagefoundry.auth.passwords import verify_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import CipherError
-from messagefoundry.store.store import (
-    MessageStore,
-    UserAuthzRecord,
-    UserChange,
-    new_user_record,
-    totp_replace,
-    totp_secret_digest,
-)
+from messagefoundry.store.store import MessageStore
 from tests._admin_account import PROVISION_TOTP_SECRET, provision_admin
 from tests.test_provision_first_administrator import _PASSWORD
 
@@ -941,74 +934,81 @@ def test_a_store_key_that_cannot_be_resolved_exits_2(
     assert "Nothing was written" in _error(capsys)
 
 
-# --- the store's compare-and-set, unit level (BACKLOG #3778) ------------------------------------
+# --- the pin across the prompt is the opened seed (BACKLOG #3778) ------------------------------
+
+_ROTATED = "rotated:"
 
 
-def _enrolled_record(cell: str, *, enrolled_at: float = 5.0) -> UserAuthzRecord:
-    """An account with TOTP on whose seed cell is ``cell``, enrolled at ``enrolled_at``."""
-    return new_user_record(
-        user_id="u-cas",
-        username="cas",
-        auth_provider="local",
-        display_name=None,
-        email=None,
-        notify_email=None,
-        password_hash=None,
-        must_change_password=False,
-        password_generated=False,
-        directory_object_id=None,
-        now=1.0,
-    ).changed(totp_enabled=True, totp_secret=cell, totp_enrolled_at=enrolled_at)
+def _rotate_during_the_prompt(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """While the operator types, stand in for a store-key rotation: the account's cell is rewritten
+    to a different value that opens to the same seed, as a re-encryption under a new key does. The
+    store here is keyless, so the rewrite is a plain UPDATE and the opener strips the marker."""
+    real_open = MessageStore.open_totp_secret
+
+    def open_rotated(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        if cell is not None and cell.startswith(_ROTATED):
+            cell = cell.removeprefix(_ROTATED)
+        return real_open(self, user_id, cell)
+
+    def enrol(**_k: object) -> tuple[str, str, float]:
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "UPDATE users SET totp_secret = ? || totp_secret WHERE username = ?",
+                (_ROTATED, _ADMIN),
+            )
+        at = time.time()
+        return _NEW_SECRET, totp.totp(_NEW_SECRET, now=at), at
+
+    monkeypatch.setattr(MessageStore, "open_totp_secret", open_rotated)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
 
 
-def _replace_against(opened: dict[str, str], *, held: str) -> UserChange:
-    """``totp_replace`` pinned to ``held`` at stamp 5.0, opening a cell through ``opened``. A cell
-    not in it raises the store's ``CipherError``, as one sealed under an unheld key does."""
-
-    def open_secret(cell: str) -> str | None:
-        if cell not in opened:
-            raise CipherError("probe: this cell does not open")
-        return opened[cell]
-
-    return totp_replace(
-        secret=_NEW_SECRET,
-        seal_secret=lambda plain: f"sealed:{plain}",
-        open_secret=open_secret,
-        recovery_code_hashes=["n1"],
-        step=7,
-        expected_enrolled_at=5.0,
-        expected_secret_digest=totp_secret_digest(held),
-        now=9.0,
-    )
-
-
-def test_the_compare_opens_the_cell_so_a_store_key_rotation_refuses_nothing() -> None:
-    """A rotation re-encrypts the cell and leaves the seed, so the compare must be on the opened
-    seed: the same enrolment under a new ciphertext still matches, and another seed does not."""
-    old = PROVISION_TOTP_SECRET
-    change = _replace_against(
-        {"cell-before": old, "cell-rotated": old, "other": "X" * 16}, held=old
-    )
-    for cell in ("cell-before", "cell-rotated"):
-        written = change(_enrolled_record(cell))
-        assert written is not None, cell
-        assert written.row.totp_secret == f"sealed:{_NEW_SECRET}"
-    assert change(_enrolled_record("other")) is None
-    assert change(_enrolled_record("cell-before", enrolled_at=6.0)) is None
-
-
-def test_a_cell_that_does_not_open_matches_nothing_and_is_logged(
-    caplog: pytest.LogCaptureFixture,
+def test_a_store_key_rotation_during_the_prompt_refuses_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Fails closed: a cell the process cannot open is never read as the pinned seed."""
-    change = _replace_against({}, held=PROVISION_TOTP_SECRET)
-    with caplog.at_level("WARNING", logger="messagefoundry.store.store"):
-        assert change(_enrolled_record("unopenable")) is None
-    assert "did not open" in caplog.text and "u-cas" in caplog.text
-    assert "unopenable" not in caplog.text  # never the cell
+    """The cell changes under a rotation and the seed does not. The command pins the seed before
+    the prompt and reads the cell again just before the write, so the swap still lands."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "rotated.db"
+    _seed(db)
+    shown = _live_terminal(monkeypatch)
+    _rotate_during_the_prompt(db, monkeypatch)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 0
+    assert _state(db)["secret"] == _NEW_SECRET
+    assert len(_audit_rows(db)) == 1
+    assert shown, "the new recovery codes were not shown"
 
 
-def test_a_replacement_equal_to_the_pinned_seed_is_refused_before_any_write() -> None:
-    """The swap's own output always differs from the enrolment it matched."""
-    with pytest.raises(ValueError, match="the secret it replaces"):
-        _replace_against({}, held=_NEW_SECRET)
+def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cell that stops opening after the prompt (a store key or cipher fault) is reported as
+    the store failure it is, with nothing written, never as a re-enrolment the operator must go
+    looking for."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unopenable.db"
+    _seed(db)
+    before = _state(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open = MessageStore.open_totp_secret
+    real_enrol = cli._enrol_totp_at_terminal
+
+    def open_or_fail(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        if prompted:
+            raise CipherError("probe: the cipher service did not answer")
+        return real_open(self, user_id, cell)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(MessageStore, "open_totp_secret", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "Nothing was written" in error and "delete it" in error
+    assert "enrolled again" not in error
+    monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
+    assert _state(db) == before
+    assert _audit_rows(db) == []

@@ -1048,9 +1048,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
-            # BACKLOG #3778: admin-reset-totp pins the account's TOTP seed by its SHA-256 digest
-            # (store.store.totp_secret_digest) for replace_totp_enrolment's compare-and-set.
-            "hash:via messagefoundry.store.store",
+            # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
+            # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
+            "hash:via messagefoundry.auth.tokens",
+            "compare:via messagefoundry.credential",
             "kdf:via messagefoundry.pki",
             "key_cert:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.logging_setup",
@@ -1586,9 +1587,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
-            # BACKLOG #3778: totp_secret_digest is auth.tokens.hash_token (SHA-256), the digest
-            # replace_totp_enrolment's compare-and-set pins an opened TOTP seed by.
-            "hash:via messagefoundry.auth.tokens",
             "mac:hmac.new[sha256]",
             # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
             "sign_verify:.verify()",
