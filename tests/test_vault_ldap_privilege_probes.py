@@ -66,6 +66,7 @@ from messagefoundry.store import crypto_transit, keyprovider_vault
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.privilege import StorePrivilegeReport
+from tests.test_revocation_guard_remaining_hops import bare_crl as bare_crl  # noqa: F401  (fixture)
 
 #: Synthetic, never a real credential. The assertions check none of them reaches the output.
 _TOKEN = "hvs.synthetic-not-a-token-305"
@@ -1157,7 +1158,10 @@ def test_cli_exits_0_on_a_least_privilege_token(
 
 
 def test_cli_probes_the_ldap_bind_when_ad_is_on(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    bare_crl: str,  # noqa: F811  (the imported fixture)
 ) -> None:
     _clear_env(monkeypatch)
     _sqlite_probe(monkeypatch)
@@ -1173,7 +1177,10 @@ def test_cli_probes_the_ldap_bind_when_ad_is_on(
     toml.write_text(
         '[auth]\nad_enabled = true\nad_server = "ldaps://dc.example.com"\n'
         'ad_domain = "example.com"\nad_user_search_base = "OU=Users,DC=example,DC=com"\n'
-        'ad_bind_dn = "CN=svc,OU=Svc,DC=example,DC=com"\n',
+        'ad_bind_dn = "CN=svc,OU=Svc,DC=example,DC=com"\n'
+        # The command holds the enforcing posture, so an off-box bind with no CRL is refused
+        # before the probe as serve would refuse it (BACKLOG #2193). A CRL on the hop admits it.
+        f"ad_tls_crl_file = {json.dumps(bare_crl)}\n",
         encoding="utf-8",
     )
     assert main(["check-privileges", "--service-config", str(toml), "--json"]) == 3

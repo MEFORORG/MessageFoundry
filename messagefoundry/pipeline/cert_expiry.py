@@ -190,7 +190,8 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     These are the instance-wide CRL knobs that no connection carries, so :func:`certs_from_registry`
     cannot see them. All but one are outbound: ``[tls].crl_file`` (the outbound hops whose context
     the engine builds from the resolved ``[tls]`` trust anchor), ``[logging].forward_tls_crl_file``,
-    ``[auth].oidc_tls_crl_file`` and ``[store].ssl_crl_file``. ``[api].tls_client_crl_file`` is the
+    ``[auth].oidc_tls_crl_file``, ``[auth].ad_tls_crl_file`` (the LDAPS bind, BACKLOG #2193) and
+    ``[store].ssl_crl_file``. ``[api].tls_client_crl_file`` is the
     API listener's inbound CRL. Each is read when its hop builds a TLS context. Past ``nextUpdate``
     it fails every handshake it verifies. Before this, an outbound CRL going stale raised nothing
     until a handshake or a context build failed on it.
@@ -210,6 +211,7 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
         ("tls.crl_file", settings.tls.crl_file),
         ("logging.forward_tls_crl_file", settings.logging.forward_tls_crl_file),
         ("auth.oidc_tls_crl_file", settings.auth.oidc_tls_crl_file),
+        ("auth.ad_tls_crl_file", settings.auth.ad_tls_crl_file),
         ("store.ssl_crl_file", settings.store.ssl_crl_file),
         ("api.tls_client_crl_file", settings.api.tls_client_crl_file),
     )
