@@ -124,6 +124,9 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "Private-key passphrase wraps": "a check on the wrap of keys other rows already scope (TLS "
     "private keys, outbound signing, the SMART client assertion, DIRECT); it reads a wrap and "
     "decides, and holds no key of its own (BACKLOG #1352, #1171)",
+    "AppContainer spike signing key": "a P-256 key a CI spike makes on a throwaway runner for one "
+    "run, signs a synthetic constant with and deletes; the engine never holds it, and it protects "
+    "nothing (vault BACKLOG #3411)",
     "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
     "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
     "not a key and it protects nothing",

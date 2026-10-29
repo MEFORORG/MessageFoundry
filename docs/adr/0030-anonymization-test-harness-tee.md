@@ -62,6 +62,39 @@
   characters of any one key or value, and of the list of unknown keys. **This changes none of the
   §2 ratified choices:** the overlay still only maps a field to an existing kind.
   [PHI.md](../PHI.md) §9 is the long form for the retarget.
+- **AMENDED 2026-10-27 (vault BACKLOG #3000, #3493): a retarget is refused now, unless the overlay
+  lists it.** This reverses the amendment above on one point: the loader refuses a retarget of a
+  default path to a different kind, other than `drop` or `freetext`, unless the overlay also
+  names that path in a new `[hl7]` list, `retarget_acknowledged`. A listed retarget loads and is
+  warned about. **This changes none of the §2 ratified choices:** the new key selects nothing and
+  maps nothing, and the overlay still only maps a field to an existing kind.
+  [PHI.md](../PHI.md) §9 is the long form.
+- **AMENDMENT PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF (BACKLOG #1192,
+  [ADR 0201](0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
+  section 5 and slice 5): the package's home moves out of the engine.** ADR 0201 was accepted on
+  2026-09-29 and designs this amendment. Its section 5 also says that changing this ADR's ratified
+  home needs the owner's sign-off on its own, in its own pull request. So the four items below are
+  proposed, not ratified, until that sign-off is recorded in this bullet. This builds nothing either
+  way: the package is still at `messagefoundry/anon/`, and every path in this ADR describes the
+  tree until ADR 0201 slice 6 moves it. That slice re-points the guards and tests that pin the
+  path, in the same change.
+  1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
+     distribution rather than the engine wheel. This replaces the §1 *"engine-owned"* home *"sitting
+     beside `parsing/`"*, one of the forks ratified before the build.
+  2. **The rule table stays the single authority, and the tee still vendors a copy at
+     `tee/anon/`.** ADR 0201 section 5 calls it a byte-identical copy, as §1 does. Not every file
+     is: [`tests/test_anon_parity.py`](../../tests/test_anon_parity.py) records which are.
+  3. **The parity check re-points to the new path**, in slice 6.
+  4. **The carve-out extension is withdrawn.** The Related line and §1 say acceptance extends the
+     CLAUDE.md §4 pure-library carve-out from `parsing/` to `anon/`, and §8 and *To resolve on
+     acceptance* list that as a doc flip. That flip never landed: CLAUDE.md §4 names `parsing/`
+     alone. Once `anon/` is not an engine package there is nothing for the carve-out to cover, so
+     the flip is withdrawn rather than left pending. Each of those four places carries a marker.
+
+  What the package does, its rules, its fail-closed behaviour and its limits are unchanged.
+  **One correction here needs no sign-off**, because it records what the tree and an owner ruling
+  already say: §1 claimed the harness imports the package, and none does. The correction stands
+  where that sentence stood, with markers on the two other places that read as permission.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -78,8 +111,8 @@
   [PHI.md](../PHI.md) §9 (de-identification `[ROADMAP]` — on landing this *would be* the first concrete
   slice that flips it) / §7 (redaction is *not* de-id); [CLAUDE.md](../../CLAUDE.md) §9 (de-id planned-not-
   built, centralize the rules) / §8 (read separators from MSH, never string-slice, parse defensively) / §4
-  (`parsing/` is the one pure carve-out lib; this ADR extends that carve-out to `anon/` on acceptance —
-  dependency direction one-way) / §12 (don't drift to declarative *logic*).
+  (`parsing/` is the one pure carve-out lib; this ADR extends that carve-out to `anon/` on acceptance
+  (*withdrawal proposed 2026-10-27, see the status banner*) — dependency direction one-way) / §12 (don't drift to declarative *logic*).
 
 ## Context
 
@@ -102,6 +135,8 @@ verbatim is *"conservative redaction, **not** de-identification."* This ADR must
 The constraint that shapes everything is a **dependency-split asymmetry**:
 - The **harness** freely imports the engine (`messagefoundry.parsing`, `.generators`, …) — it already
   imports engine packages directly, so a new `messagefoundry.anon` is an ordinary import for it.
+  *(Corrected 2026-10-27: no harness file imports this package; see the correction under §1's
+  vendored-copy paragraph.)*
 - The **tee** is **deliberately `messagefoundry`-free** (verified: zero `from messagefoundry` imports). It
   **vendors** [`tee/hl7_fields.py`](../../tee/hl7_fields.py) and `tee/mllp.py` precisely so the cutover
   relay can sit on the Epic/Corepoint boundary without dragging in the engine or its attack surface.
@@ -122,7 +157,10 @@ The anonymizer ships as **`messagefoundry/anon/`**: a small, **pure-stdlib** pac
 `parsing/` it is a pure, side-effect-free library, but the §4 carve-out is **verbatim scoped to `parsing/`**
 and does **not** automatically extend to a new sibling. Accepting this ADR **amends CLAUDE.md §4** to add
 `anon/` to the console carve-out (listed in *To resolve on acceptance*); until then the console may not import
-it. The harness is unaffected — it imports engine packages freely. Files:
+it. *(Withdrawal proposed 2026-10-27: the flip never landed, and ADR 0201 moves `anon/` out of the
+engine; see the status banner.)* The harness is unaffected — it imports engine packages freely.
+*(Corrected 2026-10-27: not this package; see the correction under the vendored-copy paragraph
+below.)* Files:
 
 - `anon/rules.py` — the **default field-selection map** (data; §2): `FieldRule(path, SurrogateKind)` rows
   naming *which* HL7 field gets *which kind* of surrogate. No transform expressions — just a field→kind map.
@@ -165,9 +203,19 @@ SURROGATES: dict[SurrogateKind, Callable[[str, DatasetContext], str]] = { ... }
 
 **The tee vendors a byte-identical copy** at `tee/anon/` (mirroring how `tee/hl7_fields.py`/`tee/mllp.py`
 were vendored), kept in sync by a CI parity check — the same discipline the tee already lives by. The
-**harness imports `messagefoundry.anon` directly** (it already imports `parsing`/`generators`). This is the
-**asymmetric resolution**: both sides run the *same rules*, the harness by import, the tee by a
-parity-pinned vendor copy.
+harness's [`CaptureSink`](../../harness/reconcile/capture.py) anonymizes only when its caller passes it
+an anonymizer function, and no harness file imports the package. The shipped
+`python -m harness.reconcile capture` passes none, so it writes the bodies it receives as they
+arrive. The tee runs the rules by a parity-pinned vendor copy.
+
+**CORRECTED 2026-10-27 (BACKLOG #1192; see the 2026-10-27 status-banner bullet):** the paragraph
+read, after its first sentence, *"The **harness imports `messagefoundry.anon` directly** (it already
+imports `parsing`/`generators`). This is the **asymmetric resolution**: both sides run the *same
+rules*, the harness by import, the tee by a parity-pinned vendor copy."* No harness file imports the
+package. The owner ruled on 2026-10-12 (BACKLOG #3006 part 3) that such an import gives way to the
+record's claim that no file outside the package imports it, and an author who needs the package
+waits for its move. `tests/test_dependency_boundaries.py` refuses an import of it from the source
+trees it walks, the harness among them.
 
 ### 2. The rule model: field-*selection* is data, surrogate *production* is code (the load-bearing call)
 
@@ -366,8 +414,8 @@ re-identification/linkage tooling.
 
 On landing, this **would become** the de-id framework's **first bounded slice** — a *test-data* anonymizer,
 not the full enterprise pipeline. **While this ADR is Proposed nothing is built**, so it does **not** yet flip
-[PHI.md](../PHI.md) §9 from `[ROADMAP]` to built — that flip, and the lockstep CLAUDE.md §9 / §4 (carve-out)
-and PHI.md §12/§13 edits, happen **only when the code lands**, never on acceptance (CLAUDE.md §9: "don't
+[PHI.md](../PHI.md) §9 from `[ROADMAP]` to built — that flip, and the lockstep CLAUDE.md §9 / §4 (carve-out;
+*withdrawal proposed 2026-10-27, see the status banner*) and PHI.md §12/§13 edits, happen **only when the code lands**, never on acceptance (CLAUDE.md §9: "don't
 reference a framework that doesn't exist"). The rule table is **designed to be reusable** as the future
 AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on landing).
 
@@ -455,7 +503,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
       `tee export`; requires `--capture-bodies`; errors when no captures exist; no raw bodies to stdout/CI),
       harness `CaptureSink._write` hook, and the file-backed corpus source.
 - [ ] Approve the **doc lockstep, gated on code landing (not acceptance):** add `anon/` to the CLAUDE.md §4
-      console carve-out; flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
+      console carve-out (*withdrawal proposed 2026-10-27, see the status banner*); flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
 
 ---
 

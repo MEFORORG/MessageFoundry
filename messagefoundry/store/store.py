@@ -1677,6 +1677,20 @@ class MessageSearchResult:
     truncated: bool
 
 
+class DiskFreeStatus(StrEnum):
+    """Whether :attr:`DbStatus.disk_free_bytes` is a reading, and if not, why (BACKLOG #1563).
+
+    The backend STATES this, so no reader has to infer it from which store answered. Only
+    ``OBSERVED`` carries a figure, and a figure of ``0`` is a measured empty drive that must alarm.
+    ``NOT_APPLICABLE`` is a server backend whose disk this process never looks at: it claims nothing
+    about the drive. ``UNOBSERVABLE`` is a measurement this process should have been able to take
+    and could not, such as a failed ``disk_usage`` on the SQLite store's own directory."""
+
+    OBSERVED = "observed"
+    NOT_APPLICABLE = "not_applicable"
+    UNOBSERVABLE = "unobservable"
+
+
 @dataclass(frozen=True)
 class DbStatus:
     """Database health snapshot for the Engine Status page."""
@@ -1688,6 +1702,9 @@ class DbStatus:
     # different facts and must stay so: 0 is a MEASURED empty drive and has to keep raising the
     # operator-health alarm, while None carries no claim about the drive at all (BACKLOG #1563).
     disk_free_bytes: int | None
+    # Which reading disk_free_bytes is, stated by the backend (BACKLOG #1563). Checked against
+    # disk_free_bytes in __post_init__, so the pair cannot contradict itself.
+    disk_free_status: DiskFreeStatus
     journal_mode: str
     messages: int
     events: int
@@ -1698,6 +1715,18 @@ class DbStatus:
     # server backends, where it is not a SQLite-style knob (SQL Server recovery model / Postgres WAL
     # durability is reported through journal_mode instead).
     synchronous: str | None = None
+
+    def __post_init__(self) -> None:
+        # Coerced, so a store passing the plain string gets the member every reader expects; an
+        # unknown string raises ValueError here, where it was built.
+        object.__setattr__(self, "disk_free_status", DiskFreeStatus(self.disk_free_status))
+        # A figure exactly when OBSERVED: a status claiming a reading over a None, or a None status
+        # over a figure, would let a reader trust the wrong half.
+        if (self.disk_free_status is DiskFreeStatus.OBSERVED) != (self.disk_free_bytes is not None):
+            raise ValueError(
+                f"disk_free_status={self.disk_free_status!r} contradicts"
+                f" disk_free_bytes={self.disk_free_bytes!r}"
+            )
 
 
 #: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
@@ -2185,23 +2214,52 @@ class WebAuthnCredential:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
-        transports = d.get("transports")
-        return cls(
-            credential_id_hash=d["credential_id_hash"],
-            credential_id=d["credential_id"],
-            user_id=d["user_id"],
-            rp_id=d["rp_id"],
-            public_key=d["public_key"],
-            sign_count=int(d["sign_count"]),
-            transports=[str(t) for t in json.loads(transports)] if transports else None,
-            device_type=d["device_type"],
-            backed_up=bool(d["backed_up"]),
-            label=d["label"],
-            aaguid=d.get("aaguid"),
-            created_at=float(d["created_at"]),
-            last_used_at=_opt_float(d.get("last_used_at")),
-            discoverable=bool(d.get("discoverable", False)),
-        )
+        """The passkey ``d`` holds, or :class:`PasskeyRowMalformed` for a row that does not parse,
+        so a caller that must survive one (the sign-in lock's escalation and its notice, BACKLOG
+        #3937) catches that alone and not every ``TypeError`` or ``KeyError`` beside it. A
+        ``transports`` value that is JSON but not a list does not parse either."""
+        try:
+            raw = d.get("transports")
+            transports = json.loads(raw) if raw else None
+            if raw and not isinstance(transports, list):  # ``null`` included
+                raise TypeError("transports is not a list")
+            cred = cls(
+                credential_id_hash=d["credential_id_hash"],
+                credential_id=d["credential_id"],
+                user_id=d["user_id"],
+                rp_id=d["rp_id"],
+                public_key=d["public_key"],
+                sign_count=int(d["sign_count"]),
+                transports=None if transports is None else [str(t) for t in transports],
+                device_type=d["device_type"],
+                backed_up=bool(d["backed_up"]),
+                label=d["label"],
+                aaguid=d.get("aaguid"),
+                created_at=float(d["created_at"]),
+                last_used_at=_opt_float(d.get("last_used_at")),
+                discoverable=bool(d.get("discoverable", False)),
+            )
+        # OverflowError (int() of an infinite REAL) and RecursionError (deeply nested JSON) are
+        # parse failures too, as they are for the other JSON columns this module reads.
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
+            # Keep only the class name, and raise once the handler has ended. The caught error can
+            # quote the row's value (``JSONDecodeError.doc`` holds the whole ``transports`` text,
+            # ``int()`` and ``float()`` quote theirs), and ``from None`` would only set
+            # ``__suppress_context__``: ``__context__`` would still hold it. Raised here, the caught
+            # error is on neither chain (tests/test_from_none_is_not_redaction.py). Two things this
+            # does not do: a caller that calls this inside its own handler still gets ITS error on
+            # ``__context__``, and the traceback's frame still holds ``d``, the whole row.
+            failure = type(exc).__name__
+        else:
+            return cred
+        raise PasskeyRowMalformed(failure)
+
+
+class PasskeyRowMalformed(Exception):
+    """A ``webauthn_credentials`` row that does not parse into a :class:`WebAuthnCredential`.
+    Not a ``ValueError``: the routes answer a ``ValueError`` as the client's fault, and a row the
+    store did not write is the server's. The argument is the underlying error's class name, never
+    the row's content."""
 
 
 # --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
@@ -2420,6 +2478,39 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
                 continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def session_owes_unproven_factor(
+    sealer: RowSealer | None,
+    session: SessionRecord | None,
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+) -> bool:
+    """Whether binding a new factor for ``record``'s account from ``session`` must be refused,
+    because the account holds a second factor this session has not proven (BACKLOG #3014, #3690).
+
+    The store-side twin of ``AuthService._factor_binding_is_blocked``, asked inside the write's own
+    transaction so a factor bound on another session after the service asked is still seen. It is
+    session-relative: a session stamped MFA-verified binds beside the factors it proved, and an
+    account with no factor at all binds its first one from a pending session. So it encodes "no
+    unproven factor", never "zero factors". Each factor term can only add a factor, as
+    ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
+
+    Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
+    unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
+    to handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.user_id != record.row.id
+        or session.user_epoch != record.row.session_epoch
+        or not session_seal_ok(sealer, session)
+        or not user_seal_ok(sealer, record)
+    ):
+        return True
+    if session.mfa_verified_at is not None:
+        return False
+    return record.row.totp_enabled or record.row.cred_digest != "" or bool(passkeys)
 
 
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
@@ -2680,17 +2771,37 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
         return False
 
 
+#: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
+#: the auth service narrows :func:`passkey_is_way_past` to the relying party the configuration
+#: names, since the sign-in accepts only a passkey under the request's. ``None`` is
+#: :func:`passkey_is_way_past` alone.
+PasskeyCounts = Callable[[WebAuthnCredential], bool]
+
+
+def passkey_is_way_past_under(cred: WebAuthnCredential, rp_id: str | None) -> bool:
+    """:func:`passkey_is_way_past`, narrowed to a passkey minted under ``rp_id``, the relying
+    party the configuration names (BACKLOG #3937). ``None``, no configured one, counts no passkey:
+    the factor-drop gates and the census that ask this then keep TOTP rather than trust a passkey
+    the sign-in might not accept."""
+    return rp_id is not None and cred.rp_id == rp_id and passkey_is_way_past(cred)
+
+
 def discoverable_way_past(
-    passkeys: Sequence[WebAuthnCredential], cred_digest: str, *, sealed: bool
+    passkeys: Sequence[WebAuthnCredential],
+    cred_digest: str,
+    *,
+    sealed: bool,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
-    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`), the passkey
-    half of
+    """Whether ``passkeys`` hold one that is a way past (:func:`passkey_is_way_past`, or
+    ``passkey_counts`` where the caller narrows it), the passkey half of
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
     if sealed and passkey_digest(passkeys) != cred_digest:
         return False
-    return any(passkey_is_way_past(c) for c in passkeys)
+    counts = passkey_counts or passkey_is_way_past
+    return any(counts(c) for c in passkeys)
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
@@ -2805,19 +2916,80 @@ async def escalation_verdict(
     if counter != "sign_in":
         return None
     pre = await get_user(user_id)
-    if (
-        pre is None
-        or pre.auth_provider != "local"
-        or not pre.totp_enabled
-        or pre.password_generated
-        or pre.sign_in_locked(now)
-    ):
-        return None
-    # The count this failure would reach, as next_lockout_state computes it: a lapsed lock restarts it.
-    reaches = (0 if pre.locked_until is not None else pre.failed_attempts) + 1
-    if reaches < threshold or pre.lock_cycles < 1:
+    if pre is None or not pre.totp_enabled or not sets_a_later_sign_in_lock(pre, threshold, now):
         return None
     return await judge_totp(opener, totp_usable, pre)
+
+
+def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: float) -> bool:
+    """Whether one more SIGN-IN failure on ``row`` sets a lock whose length an escalation can
+    change: a local account whose lock can arm (:func:`lockout_arms`) and is not live, a count that
+    reaches ``threshold`` as :func:`next_lockout_state` computes it (a lapsed lock restarts it), on
+    a later cycle, since a first lock has the base length either way. The gate both halves of the
+    escalation ask before paying for their input: the TOTP judgement (:func:`escalation_verdict`)
+    and the passkey read (:func:`escalation_passkeys`)."""
+    if row.auth_provider != "local" or not lockout_arms(
+        "sign_in", password_generated=row.password_generated
+    ):
+        return False
+    if row.locked_until is not None and now < row.locked_until:
+        return False  # a live lock is never re-escalated (next_lockout_state)
+    reaches = (0 if row.locked_until is not None else row.failed_attempts) + 1
+    return reaches >= threshold and row.lock_cycles >= 1
+
+
+#: The prefix of the ``sqlite3.OperationalError`` the stdlib raises for a TEXT cell it cannot
+#: decode while fetching a row (CPython ``Modules/_sqlite/cursor.c``). The rest of the message
+#: quotes the cell, so it is matched and never logged.
+_SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
+
+
+async def escalation_passkeys(
+    counter: LockoutCounter,
+    *,
+    passkey_escalates: PasskeyCounts | None,
+    threshold: int,
+    now: float,
+    read_record: Callable[[], Awaitable[UserAuthzRecord | None]],
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+) -> list[WebAuthnCredential] | None:
+    """The passkey set a SIGN-IN failure's escalation reads (BACKLOG #3937 item 8), or ``None``
+    where it cannot matter. Every backend calls it inside the increment's own transaction:
+    ``read_record`` locks the account row there (the writer lock on SQLite, ``FOR UPDATE``,
+    ``UPDLOCK``), and only where :func:`sets_a_later_sign_in_lock` holds on THAT row does
+    ``read_passkeys`` run, so a racing failure cannot make the gate stale, a passkey write waits,
+    and a wrong password below the threshold costs no passkey read.
+
+    A set that cannot be read answers ``None``, logged: the failure still counts, and the lock keeps
+    the fixed length. That is a row that does not parse (:class:`PasskeyRowMalformed`), or a cell
+    the driver cannot decode while fetching, before any row is parsed: sqlite3 raises an
+    ``OperationalError`` told apart only by its message, and pyodbc a ``UnicodeDecodeError``
+    (asyncpg is expected to raise the same; no test plants the cell there, since a UTF8 database
+    refuses it at write time). Raising here would roll the count back, and the account would then
+    never lock. It does not escalate either: ADR 0197 escalates only where the owner has a way
+    past, and a passkey that cannot be read signs nobody in, so a doubling lock would only arm a
+    username-only attacker against the owner. Any other error is raised, and rolls the write back
+    as it would anywhere else."""
+    if counter != "sign_in" or passkey_escalates is None:
+        return None
+    record = await read_record()
+    if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
+        return None
+    try:
+        return await read_passkeys()
+    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+        failure = type(exc).__name__
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+            raise
+        failure = type(exc).__name__
+    # The class name only: a decode error's message and arguments quote the cell.
+    log.warning(
+        "the passkeys of user %s could not be read (%s); its sign-in lock keeps its fixed length",
+        record.row.id,
+        failure,
+    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -2857,15 +3029,18 @@ def holds_way_past(
     *,
     sealed: bool,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` holds a factor with a way past the sign-in lock (ADR 0197 Amendment A):
     a TOTP not known to be refused (:func:`_totp_is_way_past`), or a passkey recorded as
-    discoverable (wave 2).
+    discoverable (wave 2) that ``passkey_counts`` counts.
     ``passkeys`` is the account's set, read in the same transaction as the write that asks
     (:func:`discoverable_way_past` says how it is trusted)."""
     if _totp_is_way_past(record, totp_counts):
         return True
-    return discoverable_way_past(passkeys, record.row.cred_digest, sealed=sealed)
+    return discoverable_way_past(
+        passkeys, record.row.cred_digest, sealed=sealed, passkey_counts=passkey_counts
+    )
 
 
 def removal_keeps_way_past(
@@ -2876,18 +3051,20 @@ def removal_keeps_way_past(
     drop_totp: bool = False,
     drop_passkey: str | None = None,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> bool:
     """Whether ``record`` still holds a way past the sign-in lock once TOTP (``drop_totp``) or the
     passkey with id hash ``drop_passkey`` is removed (ADR 0197 Amendment A, AC-A3a, wave 2).
     ``passkeys`` is the whole set before the removal, trusted as :func:`discoverable_way_past`
     trusts it, so a set that fails its digest leaves nothing. TOTP counts as
-    :func:`_totp_is_way_past` says."""
+    :func:`_totp_is_way_past` says, a passkey as ``passkey_counts`` does."""
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
     remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
-    return trusted and any(passkey_is_way_past(c) for c in remaining)
+    counts = passkey_counts or passkey_is_way_past
+    return trusted and any(counts(c) for c in remaining)
 
 
 def totp_removal(
@@ -2897,6 +3074,7 @@ def totp_removal(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``disable_totp`` writes (:func:`totp_disable`). With ``require_way_past`` it is declined
     when the TOTP on the row AT WRITE TIME is a way past (``totp_counts``: usable, or UNKNOWN, as the
@@ -2911,7 +3089,7 @@ def totp_removal(
             if isinstance(totp_counts, TotpJudgement) and totp_counts.moved(r):
                 return None
             if _totp_is_way_past(r, totp_counts) and not removal_keeps_way_past(
-                r, passkeys, sealed=sealed, drop_totp=True
+                r, passkeys, sealed=sealed, drop_totp=True, passkey_counts=passkey_counts
             ):
                 return None
         return totp_disable(r, now)
@@ -2929,6 +3107,7 @@ def password_change(
     passkeys: Sequence[WebAuthnCredential] = (),
     sealed: bool = False,
     totp_counts: TotpCounts | None = None,
+    passkey_counts: PasskeyCounts | None = None,
 ) -> UserChange:
     """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
 
@@ -2953,7 +3132,7 @@ def password_change(
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if require_way_past and not holds_way_past(
-            r, passkeys, sealed=sealed, totp_counts=totp_counts
+            r, passkeys, sealed=sealed, totp_counts=totp_counts, passkey_counts=passkey_counts
         ):
             return None
         claimed = r.row.password_claimed_at
@@ -2985,14 +3164,33 @@ def lockout_increment(
     now: float,
     out: list[LockoutIncrement],
     totp_counts: TotpCounts | None = None,
+    passkeys: Sequence[WebAuthnCredential] | None = None,
+    sealed: bool = False,
+    passkey_escalates: PasskeyCounts | None = None,
 ) -> UserChange:
     """One failed credential attempt on ``counter``, with the lockout policy applied
     (:func:`next_lockout_state`). The answer is appended to ``out``. The SIGN-IN lock escalates as
     the plain ``totp_enabled`` rule says on the locked row, EXCEPT where ``totp_counts`` holds a
     KNOWN refusal of that exact cell (BACKLOG #3422): an enrolment this release refuses gives the
     owner no way past, so its lock keeps the fixed length. An unknown verdict, a cell that moved,
-    and no verdict at all leave the plain rule standing."""
+    and no verdict at all leave the plain rule standing.
+
+    It also escalates where ``passkeys``, the account's set read in the same transaction as the
+    write, hold one that ``passkey_escalates`` counts (:func:`discoverable_way_past`, trusted only
+    where it matches the locked row's digest on a ``sealed`` store; BACKLOG #3937 item 8). The
+    backend reads the set only where :func:`escalation_passkeys` says it can matter, and passes
+    ``None`` otherwise, a set it could not read included; ``None`` for either counts no passkey,
+    the fixed length callers had before."""
     attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+
+    def passkey_way_past(r: UserAuthzRecord) -> bool:
+        return (
+            passkeys is not None
+            and passkey_escalates is not None
+            and discoverable_way_past(
+                passkeys, r.row.cred_digest, sealed=sealed, passkey_counts=passkey_escalates
+            )
+        )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
         state = next_lockout_state(
@@ -3012,6 +3210,7 @@ def lockout_increment(
                     and isinstance(totp_counts, TotpJudgement)
                     and totp_counts.refuses(r)
                 ),
+                passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
@@ -6919,7 +7118,13 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
 _MAX_ESCALATION_EXPONENT = 64
 
 
-def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabled: bool) -> bool:
+def lockout_escalates(
+    counter: LockoutCounter,
+    *,
+    auth_provider: str,
+    totp_enabled: bool,
+    passkey_way_past: bool = False,
+) -> bool:
     """Whether ``counter``'s lock doubles per cycle on this account (ADR 0197 Decision item 5).
 
     Escalate only where the owner has a way past the lock, so a longer lock costs the owner little:
@@ -6928,21 +7133,23 @@ def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabl
       device, so one of the owner's two factors is already lost. On a directory account the first
       step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
       browser holds, so it keeps the fixed length there;
-    * the SIGN-IN lock on a local account with a TOTP enrolled, because that owner can use
-      the combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
-      account with TOTP enrolled included: it has no combined sign-in to get past its lock. A local
-      account whose way past is a discoverable passkey (ADR 0197 Amendment A, wave 2) can pass it
-      too, and still keeps the fixed length: escalating would need the passkey set inside this
-      atomic increment. ADR 0197 names that as a residual (about 480 password guesses a day).
+    * the SIGN-IN lock on a local account with a TOTP enrolled, or with a discoverable passkey
+      (``passkey_way_past``; ADR 0197 Amendment A, wave 2), because that owner can use the combined
+      sign-in or the combined passkey sign-in to pass it. Every other sign-in lock keeps the fixed
+      length, a directory account with TOTP enrolled included: it has no combined sign-in to get
+      past its lock.
 
     Read by every backend inside its atomic increment, from ``auth_provider`` on the row it locked.
     For the SIGN-IN lock ``totp_enabled`` is the row's flag, cleared only by a KNOWN refusal of the
     TOTP (BACKLOG #3422) judged before the lock on a cell the locked row still holds
     (:func:`escalation_verdict`); an unknown verdict, a cell that moved meanwhile, or no verdict at
-    all leave the flag standing, as before that rule. The count itself stays atomic."""
+    all leave the flag standing, as before that rule. ``passkey_way_past`` is asked of the passkey
+    set read in the same transaction as the write (:func:`lockout_increment`, BACKLOG #3937 item
+    8); a set that cannot be read there counts no passkey, so the failure counts at the fixed
+    length (:func:`escalation_passkeys`). The count itself stays atomic."""
     if auth_provider != "local":
         return False
-    return counter == "second_step" or totp_enabled
+    return counter == "second_step" or totp_enabled or passkey_way_past
 
 
 def lockout_arms(counter: LockoutCounter, *, password_generated: bool) -> bool:
@@ -15405,10 +15612,12 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        rows = await self._db.execute(
+        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # does not decode, and an open statement would hold back a WAL checkpoint until GC.
+        async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
-        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+        ) as rows:
+            return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
 
     async def _write_passkeys(
         self,
@@ -15594,6 +15803,7 @@ class MessageStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -15615,6 +15825,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15778,6 +15989,7 @@ class MessageStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
         ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
@@ -15800,6 +16012,7 @@ class MessageStore:
                 passkeys=await self._account_passkeys(user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             written = await self._write_user(user_id, change)
             await self._commit()
@@ -15842,16 +16055,45 @@ class MessageStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
         ``(user_id, label)``, a credential id already held and an account that does not exist; the
         caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
         (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
-        same transaction (BACKLOG #2592)."""
-        async with _writer_guard(self._db, self._lock):
+        same transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: here the check and the insert share one ``BEGIN``, under the writer lock,
+        so no writer of this process runs between them, and a writer in another process that
+        commits between them fails this transaction's write rather than going unseen."""
+        if for_session is None:
+            async with _writer_guard(self._db, self._lock):
+                await self._write_passkeys(
+                    cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred)
+                )
+                await self._commit()
+            return True
+        async with _writer_txn(self._db, self._lock):
+            record = await self._read_user_record(cred.user_id)
+            # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
+            if record is not None and session_owes_unproven_factor(
+                self._row_sealer,
+                await self._read_session_row(for_session),
+                record,
+                await self._account_passkeys(cred.user_id),
+            ):
+                await self._db.rollback()  # only read; this closes the transaction
+                return False
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
+        return True
+
+    async def _read_session_row(self, token_hash: str) -> SessionRecord | None:
+        """The session row, read on the writer connection inside the caller's transaction."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -15894,6 +16136,7 @@ class MessageStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -15915,6 +16158,7 @@ class MessageStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(
@@ -16157,6 +16401,7 @@ class MessageStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -16169,30 +16414,45 @@ class MessageStore:
         from ``auth_provider`` read in the SAME locked ``SELECT``; for the SIGN-IN lock a refused
         TOTP is judged by ``totp_usable`` before the lock, only for a failure that would set a
         later-cycle lock, on a cell the locked row must still hold (:func:`escalation_verdict`,
-        BACKLOG #3422). The count itself stays atomic.
+        BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
+        (BACKLOG #3937 item 8). The count itself stays atomic.
 
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with _writer_guard(self._db, self._lock):
+            # The passkey set the escalation reads is read under the same writer lock as the write
+            # (BACKLOG #3937 item 8), so a passkey added or removed meanwhile cannot slip between.
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(user_id),
+                read_passkeys=lambda: self._account_passkeys(user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(user_id, change)
             await self._commit()
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
@@ -16996,10 +17256,23 @@ class MessageStore:
             cur = await db.execute("PRAGMA journal_mode")
             row = await cur.fetchone()
             journal = str(row[0]) if row else ""
+            # Off the loop: stat and disk_usage block, and longest on the failing mount that
+            # UNOBSERVABLE exists to report (an SMB or NFS share that stopped answering).
+            size = await asyncio.to_thread(self._db_size_bytes)
+            if self.path == ":memory:":
+                # No file, so no drive: any figure would be the working directory's, not the DB's.
+                free, disk_status = None, DiskFreeStatus.NOT_APPLICABLE
+            else:
+                free = await asyncio.to_thread(self._disk_free_bytes)
+                # The engine stats this drive itself, so a None is a failed probe, never N/A.
+                disk_status = (
+                    DiskFreeStatus.OBSERVED if free is not None else DiskFreeStatus.UNOBSERVABLE
+                )
             return DbStatus(
                 path=self.path,
-                size_bytes=self._db_size_bytes(),
-                disk_free_bytes=self._disk_free_bytes(),
+                size_bytes=size,
+                disk_free_bytes=free,
+                disk_free_status=disk_status,
                 journal_mode=journal,
                 messages=await self._count(db, "messages"),
                 events=await self._count(db, "message_events"),

@@ -183,7 +183,8 @@ _INBOUND_KEYS = frozenset(
         # the factory's schema would accept. Under [settings] it is refused.
         "tls_hop_attested",
         "tls_hop_attested_reason",
-        # ADR 0173: the per-connection revocation attestation for an mTLS listener. TOP-LEVEL for the
+        # ADR 0173: the per-connection revocation attestation for an mTLS listener, or for an FTPS
+        # poller, which dials out (BACKLOG #2193). TOP-LEVEL for the
         # same reason as the outbound cleartext pair below: a hop-policy declaration, not a transport
         # setting the factory's schema would accept.
         "tls_revocation_attested",
@@ -239,9 +240,24 @@ def load_connections_file(path: Path, registry: Registry) -> None:
     declared in a ``*.py`` module) surfaces as the registry's ``duplicate ... name`` error, so the two
     authoring surfaces can't silently shadow each other."""
     try:
-        with open(path, "rb") as handle:
-            data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
+        unreadable = f"cannot read {path.name}: {codec_safe_str(exc)}"
+    else:
+        load_connections_data(raw, path, registry)
+        return
+    raise WiringError(unreadable)
+
+
+def load_connections_data(raw: bytes, path: Path, registry: Registry) -> None:
+    """Decode ``raw``, the bytes of ``path``, and add its connections to ``registry`` (in place).
+
+    :func:`load_connections_file` once the file is read. A config load hands it the bytes of its
+    snapshot, so the connections it declares are the bytes it hashed (vault BACKLOG #2596).
+    ``path`` names the file in a refusal and as each connection's source; it is not read."""
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         unreadable: str | None = f"cannot read {path.name}: {codec_safe_str(exc)}"
     else:
         unreadable = None

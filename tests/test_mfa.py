@@ -663,6 +663,7 @@ async def test_parallel_store_increments_each_land_and_lock_once() -> None:
                         max_lockout_seconds=86_400.0,
                         now=now,
                         totp_usable=_opened_totp_state,
+                        passkey_escalates=None,
                     )
                     for _ in range(burst)
                 )
@@ -1224,6 +1225,7 @@ async def _set_second_step_lock(store: MessageStore, user_id: str) -> None:
             max_lockout_seconds=86_400.0,
             now=time.time(),
             totp_usable=_opened_totp_state,
+            passkey_escalates=None,
         )
 
 
@@ -2229,6 +2231,7 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
             max_lockout_seconds=86_400.0,
             now=clock.now,
             totp_usable=_opened_totp_state,
+            passkey_escalates=None,
         )
         assert result.just_locked
         await service._record_lock(user, "second_step", result, client=None, factor="password")
@@ -2335,6 +2338,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             max_lockout_seconds=86_400.0,
             now=clock.now,
             totp_usable=_opened_totp_state,
+            passkey_escalates=None,
         )
         await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
         notice = (await _lock_notices(service, notifier))[-1]
@@ -2403,6 +2407,7 @@ async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failu
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
                 totp_usable=_opened_totp_state,
+                passkey_escalates=None,
             )
         assert (await service.reauth(out.identity, password, token=out.token)).ok
         flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]

@@ -6,6 +6,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
+  engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
+  other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
+  its name is listed in the new `[dr].pass_environment`, so a hook that reads a cloud profile, a
+  proxy or a credential of its own needs that name listed. The `pass_environment` row of the
+  `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
+  setting refuses. (`BACKLOG #2587`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own
@@ -1366,8 +1375,8 @@ ledger, so it has no public page.
   `messagefoundry.anon` and `tee.anon`. (`BACKLOG #3003`)
 - **An `anon.toml` overlay that points a default field at a different surrogate kind now warns.**
   The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn` rewrite the first
-  component only, so `"PID-5" = "id"` left the given name in the dataset, and `"PID-7" = "date"`
-  left the birth year. Nothing said so. The leak check counts such a field as scrubbed and does
+  component only, so `"PID-5" = "id"` would leave the given name in the dataset, and
+  `"PID-7" = "date"` the birth year. Nothing said so. The leak check counts such a field as scrubbed and does
   not scan what is left; that is unchanged, so a clean `anonymize_checked` return does not clear
   a retargeted field. `load_rules` now logs each such retarget at WARNING, naming the field, the default kind and the
   new kind, and never a value. A retarget to the same kind and a `drop` do not warn. The new

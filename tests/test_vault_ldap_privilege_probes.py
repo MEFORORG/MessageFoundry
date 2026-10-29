@@ -66,6 +66,7 @@ from messagefoundry.store import crypto_transit, keyprovider_vault
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.privilege import StorePrivilegeReport
+from tests.test_revocation_guard_remaining_hops import bare_crl as bare_crl  # noqa: F401  (fixture)
 
 #: Synthetic, never a real credential. The assertions check none of them reaches the output.
 _TOKEN = "hvs.synthetic-not-a-token-305"
@@ -390,13 +391,37 @@ def test_a_kv_mount_named_like_keys_is_not_read_as_a_transit_key() -> None:
     )
 
 
-def test_a_value_error_keeps_its_own_text_and_a_subclass_does_not() -> None:
+def test_a_value_error_keeps_its_own_text_and_a_subclass_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from messagefoundry.privilege_probes import _why
 
-    assert _why(ValueError("lookup-self returned no data")) == (
-        "ValueError: lookup-self returned no data"
-    )
+    # The probe's own shape check, raised where the probe raises it: a lookup with no "data".
+    vault = _FakeVault(caps=_least_caps())
+    monkeypatch.setattr(vault.auth.token, "lookup_self", dict)
+    reading = _reading(vault)
+    assert "token lookup-self failed: ValueError: lookup-self returned no data" in reading.problems
     assert _why(json.JSONDecodeError("server body here", "doc", 0)) == "JSONDecodeError"
+
+
+def test_a_value_error_a_library_raised_keeps_only_its_type_name() -> None:
+    """Vault BACKLOG #3454: ``_why`` kept the text of every plain ``ValueError`` as the engine's
+    own, and a URL parser's quotes the whole network location it refused. RED before the change.
+    An exception never raised has no frame to read, so it keeps only its name too."""
+    import urllib.parse
+
+    from messagefoundry.privilege_probes import _why
+
+    try:
+        urllib.parse.urlsplit("https://:synthetic-pw\u2100x@proxy.synthetic.test")
+    except ValueError as exc:
+        # The premise: exactly the type the old rule trusted, quoting the password.
+        assert type(exc) is ValueError
+        assert "synthetic-pw" in str(exc)
+        assert _why(exc) == "ValueError"
+    else:
+        pytest.fail("the parser accepted the URL")
+    assert _why(ValueError("synthetic-pw")) == "ValueError"
 
 
 def test_a_missing_capability_is_noted_and_is_not_an_over_grant() -> None:
@@ -1157,7 +1182,10 @@ def test_cli_exits_0_on_a_least_privilege_token(
 
 
 def test_cli_probes_the_ldap_bind_when_ad_is_on(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    bare_crl: str,  # noqa: F811  (the imported fixture)
 ) -> None:
     _clear_env(monkeypatch)
     _sqlite_probe(monkeypatch)
@@ -1173,7 +1201,10 @@ def test_cli_probes_the_ldap_bind_when_ad_is_on(
     toml.write_text(
         '[auth]\nad_enabled = true\nad_server = "ldaps://dc.example.com"\n'
         'ad_domain = "example.com"\nad_user_search_base = "OU=Users,DC=example,DC=com"\n'
-        'ad_bind_dn = "CN=svc,OU=Svc,DC=example,DC=com"\n',
+        'ad_bind_dn = "CN=svc,OU=Svc,DC=example,DC=com"\n'
+        # The command holds the enforcing posture, so an off-box bind with no CRL is refused
+        # before the probe as serve would refuse it (BACKLOG #2193). A CRL on the hop admits it.
+        f"ad_tls_crl_file = {json.dumps(bare_crl)}\n",
         encoding="utf-8",
     )
     assert main(["check-privileges", "--service-config", str(toml), "--json"]) == 3
