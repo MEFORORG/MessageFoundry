@@ -237,18 +237,20 @@ class AlertSink(Protocol):
         inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
         :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
         bare inbound name, so it never resolves a prefixed stand-in instance. Only two doors raise
-        it: an operator's start or restart of the inbound, and an alert rule's ``restart_inbound``.
-        An engine door's start never does, at least the engine's own ``start()``, a committed
-        reload, a reload's rollback and the scheduler: a fresh process cannot see an earlier run's
-        causes, so an open stop keeps its instance, ack, suspend and escalation count across them.
-        On those two doors, at least these starts never raise it: an outbound's own start; a start where the runner cannot see every
-        cause (on a clustered node, or on an engine shard that does not own the outbound
-        namesake); a start while the outbound namesake is under an operator-style pause, which a
-        log-write halt's pause looks like; and the start inside a ``restart_inbound`` that a
-        ``connection_stopped`` rule dispatched for its own inbound's halt (not its start failure),
-        so a rule-driven crash loop keeps one open instance. A park the engine or the calendar made
-        of the outbound namesake does not hold it back. ``RegistryRunner._emit_inbound_started`` holds the
-        checks. ``name`` is the connection label only (no PHI)."""
+        it: an operator's start or restart of the inbound, and the ``restart_inbound`` a
+        ``connection_stopped`` rule dispatches for its own inbound's start failure (a failed restart
+        raises no new alert, so it is no loop). Every other start never does, at least the engine's
+        own ``start()``, a committed reload, a reload's rollback, the scheduler and every other
+        alert rule restart, a rule's restart after its own inbound's halt and two rules restarting
+        each other's inbound among them. A fresh process cannot see an earlier run's causes, and a
+        rule-driven loop must keep counting, so an open stop keeps its instance, ack, suspend and
+        escalation count across them. On those two doors, at least these starts never raise it: an
+        outbound's own start; a start where the runner cannot see every cause (on a clustered node,
+        or on an engine shard that does not own the outbound namesake); and a start while the
+        outbound namesake is under an operator-style pause, which a log-write halt's pause looks
+        like. A park the engine or the calendar made of the outbound namesake does not hold it back.
+        ``RegistryRunner._emit_inbound_started`` holds the checks. ``name`` is the connection label
+        only (no PHI)."""
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:

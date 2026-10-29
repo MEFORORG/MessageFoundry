@@ -887,7 +887,7 @@ async def _alert_control_action(
     target: str,
     *,
     default_target: bool,
-    self_restart: bool = False,
+    resolve_stop: bool = False,
 ) -> None:
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
@@ -905,8 +905,9 @@ async def _alert_control_action(
     ``control_target``. A config-load refusal cannot do this, because a rule does not know the
     graph and a reload can change it.
 
-    ``self_restart`` says a ``connection_stopped`` rule is restarting its own inbound, so that
-    restart's own start resolves nothing (BACKLOG #1741, :meth:`RegistryRunner.restart_inbound`)."""
+    ``resolve_stop`` says the restart answers its own inbound's start failure, so its start may
+    resolve that alert; every other rule restart resolves nothing (BACKLOG #1741,
+    :meth:`RegistryRunner.restart_inbound`)."""
     rr = engine.registry_runner
     if rr is None:
         return
@@ -942,7 +943,7 @@ async def _alert_control_action(
                 target,
             )
             return
-        await rr.restart_inbound(target, resolve_stop=not self_restart)
+        await rr.restart_inbound(target, resolve_stop=resolve_stop)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -11804,14 +11805,14 @@ def create_managed_app(
             if notifier is not None:
 
                 async def _alert_control(
-                    action: str, target: str, *, default_target: bool, self_restart: bool = False
+                    action: str, target: str, *, default_target: bool, resolve_stop: bool = False
                 ) -> None:
                     await _alert_control_action(
                         engine,
                         action,
                         target,
                         default_target=default_target,
-                        self_restart=self_restart,
+                        resolve_stop=resolve_stop,
                     )
 
                 notifier.set_control_callback(_alert_control)

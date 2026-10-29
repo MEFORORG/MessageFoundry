@@ -386,11 +386,11 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     restarts: list[str] = []
 
     async def _control(
-        action: str, target: str, *, default_target: bool, self_restart: bool = False
+        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
     ) -> None:
-        assert action == "restart_inbound" and self_restart
+        assert action == "restart_inbound" and not resolve_stop
         restarts.append(target)
-        await runner.restart_inbound(target, resolve_stop=not self_restart)
+        await runner.restart_inbound(target, resolve_stop=resolve_stop)
 
     async def _cycle() -> int:
         await asyncio.sleep(0.01)
@@ -439,11 +439,11 @@ async def test_a_restart_driven_crash_loop_still_reaches_its_escalation_tier(
     assert [e["severity"] for e in pages.events] == ["warning", "warning", "critical", "critical"]
 
 
-async def test_only_the_rules_own_restart_is_flagged_a_self_restart() -> None:
+async def test_only_the_rules_restart_after_its_own_start_failure_resolves() -> None:
     # The sink-level contract: only the restart_inbound a connection_stopped of the same inbound
-    # dispatched carries self_restart=True. A restart another alert type drove does not. The sink
-    # itself resolves every connection_started it sees; the skip is the runner's, scoped to the
-    # start it makes under its reload lock (test_a_start_another_door_... pins that).
+    # dispatched for that inbound's start failure carries resolve_stop=True. A restart after a halt,
+    # or one another alert type drove, does not. The sink itself resolves every connection_started
+    # it sees; whether a start raises one is the runner's (RegistryRunner.restart_inbound).
     resolved: list[tuple[object, object]] = []
 
     class _Resolve:
@@ -462,22 +462,22 @@ async def test_only_the_rules_own_restart_is_flagged_a_self_restart() -> None:
     flags: list[bool] = []
 
     async def _control(
-        action: str, target: str, *, default_target: bool, self_restart: bool = False
+        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
     ) -> None:
-        flags.append(self_restart)
+        flags.append(resolve_stop)
 
     sink.set_control_callback(_control)
     sink.connection_stopped("IB", detail="router halted")
     sink.queue_buildup("IB", depth=10, oldest_age_seconds=1.0)
     await _settle(sink, sink._control_tasks)
-    assert flags == [True, False]
+    assert flags == [False, False]
     # A start failure is no crash loop: the restart that recovers it resolves. A fresh sink, so
     # the cooldown on the first connection_stopped does not swallow this one.
     other = NotifierAlertSink([], rules=rules)
     other.set_control_callback(_control)
     other.connection_stopped("IB", detail=f"{START_FAILURE_DETAIL} port in use")
     await _settle(other, other._control_tasks)
-    assert flags == [True, False, False]
+    assert flags == [False, False, True]
 
     # A connection_started reaching the sink always resolves, dropping the count (ADR 0133 D1).
     sink.connection_started("IB")
@@ -537,12 +537,13 @@ async def test_restart_inbound_with_resolve_stop_off_raises_no_start(
         await runner.stop()
 
 
-@pytest.mark.parametrize(("control_target", "resolves"), [("IB", False), ("OTHER", True)])
-async def test_a_rule_naming_its_own_inbound_is_a_self_restart_too(
+@pytest.mark.parametrize(("control_target", "resolves"), [("IB", True), ("OTHER", False)])
+async def test_a_rule_naming_its_own_inbound_resolves_its_start_failure_too(
     control_target: str, resolves: bool
 ) -> None:
-    # A rule that names its own inbound as control_target is the same self-restart; one that names
-    # another connection is not.
+    # A rule that names its own inbound as control_target answers that inbound's start failure as
+    # the default target does; one that names another connection resolves nothing, so two rules
+    # restarting each other's inbound keep counting.
     rule = AlertRule(
         event_type="connection_stopped",
         connection="IB",
@@ -553,15 +554,15 @@ async def test_a_rule_naming_its_own_inbound_is_a_self_restart_too(
     calls: list[tuple[str, bool]] = []
 
     async def _control(
-        action: str, target: str, *, default_target: bool, self_restart: bool = False
+        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
     ) -> None:
         assert default_target is False
-        calls.append((target, self_restart))
+        calls.append((target, resolve_stop))
 
     sink.set_control_callback(_control)
-    sink.connection_stopped("IB", detail="router halted")
+    sink.connection_stopped("IB", detail=f"{START_FAILURE_DETAIL} port in use")
     await _settle(sink, sink._control_tasks)
-    assert calls == [(control_target, not resolves)]
+    assert calls == [(control_target, resolves)]
 
 
 async def test_an_operator_start_while_the_rules_restart_waits_resolves(
@@ -657,7 +658,7 @@ async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown(
     restarts: list[str] = []
 
     async def _control(
-        action: str, target: str, *, default_target: bool, self_restart: bool = False
+        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
     ) -> None:
         restarts.append(target)
 
@@ -681,10 +682,11 @@ async def test_a_stop_after_an_auto_resolve_pages_and_acts_inside_the_cooldown(
 async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
     store: MessageStore,
 ) -> None:
-    # Two connection_stopped rules that restart each other's inbound. Neither restart is a
-    # self-restart, so the start each makes raises connection_started for its target, as the runner
-    # does inside restart_inbound. A start an alert control action makes must not end a cooldown,
-    # or the pair would page and restart at the halt cadence (ADR 0128 section 4).
+    # Two connection_stopped rules that restart each other's inbound. Neither restart resolves, so
+    # the runner raises no connection_started for it; this pins the sink's second guard, for a
+    # connection_started that arrives while such a restart is in flight, as an operator's start
+    # can. It must not end a cooldown, or the pair would page and restart at the halt cadence (ADR
+    # 0128 section 4).
     rules = [
         AlertRule(
             event_type="connection_stopped",
@@ -699,9 +701,9 @@ async def test_rules_restarting_each_others_inbound_keep_the_cooldown(
     restarts: list[str] = []
 
     async def _control(
-        action: str, target: str, *, default_target: bool, self_restart: bool = False
+        action: str, target: str, *, default_target: bool, resolve_stop: bool = False
     ) -> None:
-        assert not self_restart
+        assert not resolve_stop
         restarts.append(target)
         sink.connection_started(target)
 

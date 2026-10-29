@@ -256,20 +256,16 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   (`connection_restored`/`connection_started`) and which (`queue_buildup`/`storage_threshold`/`message_stall`)
   rely on the deferred staleness sweep or manual resolve until it lands. *Resolved 2026-10-27 (BACKLOG
   #1741):* the runner now raises `connection_started` when an operator starts or restarts an
-  inbound, or an alert rule restarts it, and it genuinely comes up with no open cause on it or on an
-  outbound of the same name, so an inbound's bind-failure `connection_stopped` resolves itself on
-  that recovery. An engine door's start resolves nothing: at least the engine's own start, a
-  committed reload, a reload's rollback and the scheduler. A fresh process cannot see an earlier
-  run's causes, so an open stop keeps its instance, ack, suspend and count across a service
-  restart or a reload, as before this item. A start inside the `restart_inbound` that a
-  `connection_stopped` rule dispatched for its own inbound's halt resolves nothing either, so a
-  rule-driven crash loop keeps one open, escalating instance until an operator, or a rule
-  restart that is not that self-restart, brings the inbound up. The skip covers only the start
-  that restart makes under the reload lock.
+  inbound, or a `connection_stopped` rule restarts its own inbound after that inbound's start
+  failure, and the inbound genuinely comes up with no open cause on it or on an outbound of the
+  same name. So an inbound's bind-failure `connection_stopped` resolves itself on that recovery.
+  Every other start resolves nothing, at least an engine start, a committed reload, the scheduler
+  and every other alert rule restart, so an open stop keeps its instance, ack, suspend and count
+  across a service restart, a reload or a rule-driven crash loop, as before this item.
   At least these still need a manual resolve: an outbound's start failure, a halt whose name has no
-  inbound, an inbound that no operator or rule starts again, an inbound whose outbound namesake
-  still has an open cause, and any alert raised in a cluster or under an engine shard that does not own the
-  namesake outbound. `AlertSink.connection_started` states the contract.
+  inbound, a halt no operator restarts, an inbound whose outbound namesake still has an open cause,
+  and any alert raised in a cluster or under an engine shard that does not own the namesake
+  outbound. `AlertSink.connection_started` states the contract.
 - [ ] **Resolved-instance retention window.** Confirm the prune window for resolved instances (a
   `connection_event_retention_hours` analog) and that it rides the **existing** `RetentionRunner.run_once`
   pass + one audit row (never an open/acknowledged instance).

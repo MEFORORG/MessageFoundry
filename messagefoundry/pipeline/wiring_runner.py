@@ -1661,8 +1661,8 @@ class RegistryRunner:
         # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
-        # BACKLOG #1741: inbounds inside an operator's start or restart, or an alert rule's restart
-        # that resolves, the only starts that raise connection_started (AlertSink.connection_started
+        # BACKLOG #1741: inbounds inside an operator's start or restart, or the alert rule's restart
+        # that answers a start failure, the only starts that raise connection_started (AlertSink.connection_started
         # says why). Held only under the reload lock, so no other door's start sees it.
         self._resolving_starts: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
@@ -3310,10 +3310,10 @@ class RegistryRunner:
         """Stop then start one inbound under one reload-lock span.
 
         Its start raises ``connection_started`` only for an ``operator`` restart or with
-        ``resolve_stop=True``, which an alert rule's restart passes unless a ``connection_stopped``
-        rule dispatched it for this same inbound's halt: that self-restart keeps one open, escalating
-        instance through a rule-driven crash loop (BACKLOG #1741). The mark is scoped to the start
-        made inside the lock."""
+        ``resolve_stop=True``, which an alert rule's restart passes only when a
+        ``connection_stopped`` rule answers this same inbound's start failure. Every other rule
+        restart resolves nothing, so a rule-driven crash loop keeps one open, escalating instance
+        (BACKLOG #1741). The mark is scoped to the start made inside the lock."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
@@ -4418,9 +4418,9 @@ class RegistryRunner:
 
     def _note_inbound_started(self, name: str) -> None:
         """An inbound came up on a door that re-armed its internal stages: emit ``connection_started``
-        only when that door is an operator's start or restart, or an alert rule's restart that
-        resolves (BACKLOG #1741). :meth:`AlertSink.connection_started` says why an engine door's
-        start resolves nothing."""
+        only when that door is an operator's start or restart, or the alert rule's restart that
+        answers a start failure (BACKLOG #1741). :meth:`AlertSink.connection_started` says why every
+        other start resolves nothing."""
         if name in self._resolving_starts:
             self._emit_inbound_started(name)
 
