@@ -521,6 +521,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
+    UploadError,
     UploadNotFoundError,
     UploadPathError,
     UploadQuotaError,
@@ -964,6 +965,12 @@ async def _alert_control_action(
             )
 
 
+def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:
+    """The file and owner fields of a row the system writes for an upload it removed: the prune's,
+    and the removal's after a failed creation row. Shared so the two rows cannot drift apart."""
+    return {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
+
+
 async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     """Write the ``upload.prune`` row for one pruned upload. The retention runner and the
     save-time sweep both call this, so their rows cannot drift apart.
@@ -973,13 +980,7 @@ async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     uploader, and carries no ``client``. The owner is DATA in ``detail``. Both the display name and
     the IMMUTABLE ``uploader_id`` are recorded: the file is gone, and a username is reassignable
     (BACKLOG #1225), so a row read later could otherwise name a different person than it meant."""
-    await store.record_audit(
-        "upload.prune",
-        actor="system",
-        detail=json.dumps(
-            {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
-        ),
-    )
+    await store.record_audit("upload.prune", actor="system", detail=json.dumps(_upload_owner(meta)))
 
 
 async def _record_upload_create(
@@ -991,10 +992,13 @@ async def _record_upload_create(
     short. A row that still fails, by an error or the shutdown drain's cancellation, removes the
     pair, so a failed row does not leave a stored file with no row saying who created it. At
     least two cases still can: a removal the filesystem refuses, which is logged and keeps the
-    pair, and a process that dies between the save and the row. The other way round is possible
-    too: a row that committed and then raised, such as a cancellation while the store releases
-    its connection, removes a file its row names. The file name is not in the row (vault BACKLOG
-    #2619)."""
+    pair, and a process that dies between the save and the row.
+
+    A failed call cannot tell a row that never landed from one that committed and then raised,
+    such as by a cancellation while the store releases its connection. So the removal writes an
+    ``upload.delete`` row of its own (:func:`_discard_and_record`, vault BACKLOG #3740 item 2), so
+    a file a committed row names is not left removed with no row saying so, unless that row fails
+    too, which is logged at ERROR. The file name is in neither row (vault BACKLOG #2619)."""
     try:
         await store.record_audit(
             "upload.create",
@@ -1005,8 +1009,52 @@ async def _record_upload_create(
             client=client,
         )
     except BaseException:
-        await us.discard(meta.file_id)
+        await _discard_and_record(store, us, meta)
         raise
+
+
+#: Why :func:`_discard_and_record` removed a file, in its ``upload.delete`` row.
+_UPLOAD_CREATE_ROW_FAILED: Final = "upload.create row failed"
+
+
+async def _discard_and_record(store: Store, us: UploadStore, meta: UploadedFileMeta) -> None:
+    """Remove a stored file whose ``upload.create`` call failed, and write its ``upload.delete``
+    row (vault BACKLOG #3740 item 2). No operator asked for the removal, so, like
+    :func:`_record_upload_prune`'s row, the row is the system's, with no ``client``, and its owner
+    and :data:`_UPLOAD_CREATE_ROW_FAILED` are data in ``detail``. A removal the filesystem
+    refused, or whose answer was not read, writes no row, since the row says the file is gone.
+
+    It runs in the failed call's handler, often during the shutdown drain's cancellation. So the
+    removal and its row run as one task through :func:`_write_through_cancel`, as a delete's do:
+    the cancel waits for both only as long as that allows, and the task goes on past it and
+    writes the row once the removal lands. A row that fails, or a task that ends before the
+    removal answered, is logged at ERROR with its ``file_id``, and the line says which.
+    ``defects=()``, because a raise here would replace the failure being handled."""
+    detail = json.dumps(
+        {**_upload_owner(meta), "size": meta.size, "reason": _UPLOAD_CREATE_ROW_FAILED}
+    )
+    removed = False
+
+    def lost() -> str:
+        shown = _lost_row("upload.delete", "system", detail)
+        if removed:
+            return shown
+        return f"{shown}; the removal had not answered, so the file may still be stored"
+
+    async def remove_then_row() -> None:
+        nonlocal removed
+        removed = await us.discard(meta.file_id)
+        if removed:
+            await store.record_audit("upload.delete", actor="system", detail=detail)
+
+    await write_audit_soft(
+        lambda: _write_through_cancel(remove_then_row(), lost),
+        log=_log,
+        message="upload %s: its upload.create row failed, and the upload.delete row for its "
+        "removal was not written. Lost row: %s",
+        args=lambda: (scrub_log_argument(meta.file_id), lost()),
+        defects=(),
+    )
 
 
 def _dead_letter_replay_audit(
@@ -2054,10 +2102,9 @@ _ROW_UNWIND_MARGIN_SECONDS: Final = 0.1
 _UNLANDED_ROW_WRITES: set[asyncio.Future[Any]] = set()
 
 
-async def _write_through_cancel(
-    write: Coroutine[Any, Any, object], lost: Callable[[], str]
-) -> None:
-    """Await an audit row's ``write`` so that a cancel cannot cut it short (BACKLOG #3157 item 4).
+async def _write_through_cancel[T](write: Coroutine[Any, Any, T], lost: Callable[[], str]) -> T:
+    """Await an audit row's ``write`` so that a cancel cannot cut it short (BACKLOG #3157 item 4),
+    and return what it returns.
 
     At least :meth:`OutlivingOperations.drain` cancels a reload still running at shutdown, and the
     cancel can land while the reload's own outcome row is being written. Cancelling that write
@@ -2076,9 +2123,8 @@ async def _write_through_cancel(
     from messagefoundry.uploads import _wait_to_completion
 
     task = asyncio.ensure_future(write)
-    write_cancelled = False
     try:
-        await _wait_to_completion(task, cancel_bound=_row_cancel_wait)
+        return await _wait_to_completion(task, cancel_bound=_row_cancel_wait)
     except asyncio.CancelledError:
         current = asyncio.current_task()
         if not (task.cancelled() and (current is None or current.cancelling() == 0)):
@@ -2090,11 +2136,9 @@ async def _write_through_cancel(
         # Nobody cancelled the caller: the write itself was cancelled, as by a store that closed
         # under it. That is a failed write for the caller's fail-soft handler to log, not a
         # cancellation to pass on.
-        write_cancelled = True
-    if write_cancelled:
-        # Raised after the handler, so the caught cancellation rides neither __cause__ nor
-        # __context__.
-        raise RuntimeError("the audit row's write was cancelled")
+    # Reached only when the write itself was cancelled. Raised after the handler, so the caught
+    # cancellation rides neither __cause__ nor __context__.
+    raise RuntimeError("the audit row's write was cancelled")
 
 
 def _row_cancel_wait() -> float:
@@ -8556,20 +8600,41 @@ def create_app(
         except _UploadSidecarRefused:
             refused = True
         client = client_ip(request)
+        actor = identity.username
 
         async def _delete_and_record() -> UploadedFileMeta:
-            removed = await us.delete(file_id, sidecar_refused=refused)
-            await engine.store.record_audit(
-                "upload.delete",
-                actor=identity.username,
-                detail=json.dumps({"file_id": removed.file_id, "size": removed.size}),
-                client=client,
-            )
-            return removed
+            detail: str | None = None
+
+            async def _unlink_then_row() -> UploadedFileMeta | UploadError:
+                nonlocal detail
+                try:
+                    removed = await us.delete(file_id, sidecar_refused=refused)
+                except (UploadPathError, UploadNotFoundError, UploadUnreadableError) as exc:
+                    # Each is raised before any unlink, so no row is owed, and a cancel landing
+                    # meanwhile must not log one as lost. Returned, so the route still answers it.
+                    return exc
+                detail = json.dumps({"file_id": removed.file_id, "size": removed.size})
+                await engine.store.record_audit(
+                    "upload.delete", actor=actor, detail=detail, client=client
+                )
+                return removed
+
+            def _lost() -> str:
+                if detail is not None:
+                    return _lost_row("upload.delete", actor, detail)
+                shown = _lost_row("upload.delete", actor, json.dumps({"file_id": file_id}))
+                return f"{shown}; the delete had not returned, so the file may still be stored"
+
+            # Vault BACKLOG #3740 item 1: the shutdown drain's cancel waits a bounded time for the
+            # unlink and its row, and a row that does not land is logged at ERROR by file_id.
+            outcome = await _write_through_cancel(_unlink_then_row(), _lost)
+            if isinstance(outcome, UploadError):
+                raise outcome
+            return outcome
 
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
-        # row. The shutdown drain can still cancel it, as it can any outliving operation.
+        # row.
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
