@@ -1026,7 +1026,7 @@ hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the h
 are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
 this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
-**Note 2026-10-28: the inbound FTPS poll is guarded (BACKLOG #2193 slice (a)).** The remotefile row of the table above says how. One fact it does not: a `tls_allow_expired` FTPS hop, either direction, hands the guard no context, so a CRL cannot relax it, as on REST (BACKLOG #2188). The counts paragraph above names FTPS as one of its seven hops; both directions of it are now guarded. Of the seven, at least LDAPS, the AI broker, the alert and security-notice SMTP hop and the alert webhook stay open on #2193. This note does not re-check the paragraph's other counts.
+**Note 2026-10-28: the inbound FTPS poll is guarded (BACKLOG #2193 slice (a)).** The remotefile row of the table above says how. One fact it does not: a `tls_allow_expired` FTPS hop, either direction, hands the guard no context, so a CRL cannot relax it, as on REST (BACKLOG #2188). The counts paragraph above names FTPS as one of its seven hops; both directions of it are now guarded. Of the seven, at least the AI broker, the alert and security-notice SMTP hop and the alert webhook stay open on #2193; LDAPS is guarded too, as the note above says. This note does not re-check the paragraph's other counts.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
