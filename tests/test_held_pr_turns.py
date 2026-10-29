@@ -306,6 +306,138 @@ def test_classification_keys_on_body_not_login(
     assert _turn(rows[13]) == ("LANDER", ["no-hold"])
 
 
+SEAT = "Lander (lander-1028), 2026-10-29. "
+
+
+def _ack(
+    at: str, sha: str, prose: str = "Batch 453 Manager: hold received, fixing."
+) -> dict[str, Any]:
+    return _comment(f"<!-- hold-ack head={sha} -->\n{prose}", at)
+
+
+def test_a_seat_signed_lander_comment_is_a_lander_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Lander signs ``Lander (<seat id>)`` as well as ``Lander (session <id>)``. A marker hold
+    so signed is a hold, and an unmarked comment so signed is a non-hold Lander event, not a reply."""
+    signed = f"<!-- lander-hold head={_sha(101)} -->\n{SEAT}**Held, back to the author.**"
+    assert hpt.hold_head(signed) == _sha(101)
+    assert hpt.Event(NOW, SEAT + "looking now.", bot=False, trusted=True).lander
+    hold = _pr(101, comments=[_comment(signed, "2026-10-28T12:00:00Z")])
+    note = _pr(
+        102,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(102)),
+            _comment(SEAT + "**Held** pending the flake rerun.", "2026-10-28T13:00:00Z"),
+        ],
+    )
+    rows = _engine_rows(tmp_path, capsys, hold, note)
+    assert _turn(rows[101]) == ("AUTHOR", ["held"])
+    # Still the Lander's turn, but as its own newer comment, not as an author reply.
+    assert _turn(rows[102]) == ("LANDER", ["no-hold"])
+
+
+def test_an_author_text_starting_lander_paren_never_moves_toward_author(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Manager addressing the Lander writes ``Lander (8a04c9f3): ...``. It now reads as a Lander
+    event, and every placement of it relative to the hold still leaves the turn the Lander's."""
+    ask = "Lander (8a04c9f3): flip #3844 on merge."
+    after = _pr(
+        103,
+        comments=[_hold("2026-10-28T12:00:00Z", _sha(103)), _comment(ask, "2026-10-28T13:00:00Z")],
+    )
+    tie = _pr(
+        104,
+        comments=[_hold("2026-10-28T12:00:00Z", _sha(104)), _comment(ask, "2026-10-28T12:00:00Z")],
+    )
+    older = _comment(ask, "2026-10-28T11:00:00Z")
+    older["lastEditedAt"] = "2026-10-28T13:00:00Z"
+    edited = _pr(105, comments=[older, _hold("2026-10-28T12:00:00Z", _sha(105))])
+    rows = _engine_rows(tmp_path, capsys, after, tie, edited)
+    assert _turn(rows[103]) == ("LANDER", ["no-hold"])
+    assert _turn(rows[104]) == ("LANDER", ["no-hold"])
+    assert _turn(rows[105]) == ("LANDER", ["edited", "no-new-commit"])
+
+
+# ---- the ack contract ----------------------------------------------------------------------------
+
+
+def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hold = _hold("2026-10-28T12:00:00Z", _sha(110))
+    full = _pr(110, comments=[hold, _ack("2026-10-28T13:00:00Z", _sha(110))])
+    # A short, upper-cased SHA, in the hold's own second, posted as a review.
+    short = _pr(
+        111,
+        comments=[_hold("2026-10-28T12:00:00Z", _sha(111))],
+        reviews=[
+            _review(
+                f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing", "2026-10-28T12:00:00Z"
+            )
+        ],
+    )
+    rows = _engine_rows(tmp_path, capsys, full, short)
+    assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
+    assert _turn(rows[111]) == ("AUTHOR", ["held", "acked"])
+
+
+def test_anything_but_a_valid_ack_still_hands_the_turn_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def held(n: int, *extra: dict[str, Any], head: str | None = None) -> dict[str, Any]:
+        return _pr(n, comments=[_hold("2026-10-28T12:00:00Z", _sha(n)), *extra], head=head)
+
+    prose = _comment(
+        "Batch 453 Manager: hold received. Fixing the findings.", "2026-10-28T13:00:00Z"
+    )
+    outsider = _ack("2026-10-28T13:00:00Z", _sha(123))
+    outsider["authorAssociation"] = "NONE"
+    hidden = _ack("2026-10-28T13:00:00Z", _sha(124))
+    hidden["isMinimized"] = True
+    edited = _ack("2026-10-28T13:00:00Z", _sha(125))
+    edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    dismissed = _review(f"<!-- hold-ack head={_sha(126)} -->\nfixing", "2026-10-28T13:00:00Z")
+    dismissed["state"] = "DISMISSED"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        held(120, prose),
+        held(121, _ack("2026-10-28T13:00:00Z", "f4f4dd470")),
+        held(
+            122,
+            _ack("2026-10-28T13:00:00Z", _sha(122)),
+            _comment("Manager: done.", "2026-10-28T14:00:00Z"),
+        ),
+        held(123, outsider),
+        held(124, hidden),
+        held(125, edited),
+        _pr(126, comments=[_hold("2026-10-28T12:00:00Z", _sha(126))], reviews=[dismissed]),
+        held(127, _ack("2026-10-28T13:00:00Z", _sha(127)), head=_sha(999)),
+    )
+    for n in (120, 121, 122, 123, 124, 126):
+        assert _turn(rows[n]) == ("LANDER", ["replied", "no-new-commit"]), n
+    assert _turn(rows[125]) == ("LANDER", ["edited", "no-new-commit"])
+    # The ack named the held head, but a push followed it: the Lander's turn.
+    assert _turn(rows[127]) == ("LANDER", ["new-commit", "replied"])
+
+
+def test_the_ack_marker_must_be_the_whole_first_line() -> None:
+    marker = "<!-- hold-ack head=abcdef1 -->"
+    assert hpt.ack_head(marker + "\nfixing") == "abcdef1"
+    assert hpt.ack_head(" " + marker) is None
+    assert hpt.ack_head("\n" + marker) is None
+    assert hpt.ack_head("> " + marker) is None
+    assert hpt.ack_head("Manager: " + marker) is None
+    assert hpt.ack_head(marker + " ok") is None
+    assert hpt.ack_head("<!-- hold-ack head=abcdef -->") is None
+    assert hpt.ack_head("<!-- hold-ack head=abcdefg -->") is None
+    # An ack is not a hold, and a hold is not an ack.
+    assert hpt.hold_head(marker + "\n" + SESSION + "**Held.**") is None
+    assert hpt.ack_head(_marker_body("abcdef1")) is None
+
+
 # ---- the hold contract ---------------------------------------------------------------------------
 
 
