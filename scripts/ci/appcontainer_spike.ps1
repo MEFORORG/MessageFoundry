@@ -32,7 +32,9 @@
   ALL APPLICATION PACKAGES; and modify, for the same group, on the folders a container writes. No
   integrity label is set: a container ran at low integrity and still wrote an unlabelled folder
   that grants the group (measured on Windows 11 build 26300, as an interactive user). The blob
-  file the third question is about gets none of these grants.
+  file the third question is about gets none of these grants. One more grant is the launcher's,
+  in the worker, since only the service can name its own window station: the one package SID on
+  that window station and its desktop (grant_window_station_and_desktop says why).
 
   Runs under Windows PowerShell 5.1, as the windows-service-smoke install step runs the installer.
 #>
@@ -226,6 +228,15 @@ try {
     & $PythonExe @judgeArgs
     $judged = $LASTEXITCODE
     if ($null -eq $judged) { throw "the judge did not run" }
+    # A container that wrote no report says why only in its log, so the summary carries it whole.
+    $containerLog = Join-Path $SharedDir "container.log"
+    if ($Summary -and -not (Test-Path -LiteralPath (Join-Path $SharedDir "container.json")) -and
+            (Test-Path -LiteralPath $containerLog)) {
+        $fence = '```'
+        $logText = [string](Get-Content -LiteralPath $containerLog -Raw) -replace $fence, "'''"
+        [IO.File]::AppendAllText($Summary,
+            ("The service's container wrote no report. Its output, {0}:`n`n{1}`n{2}`n{1}`n" -f $containerLog, $fence, $logText.TrimEnd()))
+    }
 } finally {
     # Tidy, though the runner is thrown away after the job. The SCM removes the service; no nssm.
     if (Get-Service -Name $Service -ErrorAction SilentlyContinue) {
