@@ -112,7 +112,8 @@ the *notification*** (`transports = []`) — the dashboard still shows the open 
 not to be paged about. (To-resolve, below: whether a suppressed event records an instance or is fully muted.)
 
 Auto-resolution closes the loop without a human: a `connection_restored` / `connection_started` transition
-(the inverse of the firing event) **resolves** the matching open instance. The MVP keys auto-resolution off
+(the inverse of the firing event) **resolves** the matching open instance. (`connection_started` is raised
+only by an operator's start or restart since BACKLOG #1741; see the checklist below.) The MVP keys auto-resolution off
 the existing inverse signals the engine already emits (the `connection_event` lifecycle kinds); a generic
 "hasn't re-fired in N cooldowns ⇒ stale" sweep is **deferred** (it needs a timer and a policy — out of scope
 here, like ADR 0014's deferred durable cross-node dedup).
@@ -262,7 +263,8 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   reload, the scheduler and every alert rule's restart, so an open stop keeps its instance, ack
   and suspend across a service restart or a reload, and its cooldown and count across a
   rule-driven crash loop, as before this item.
-  At least these still need a manual resolve: an outbound's start failure, a halt whose name has no
+  At least these still need a manual resolve: an outbound's start failure while it is still
+  recorded, a halt whose name has no
   inbound, a halt no operator restarts, an inbound whose outbound namesake still has an open cause,
   and any alert raised in a cluster or under an engine shard that does not own the namesake
   outbound. `AlertSink.connection_started` states the contract, and its exclusions bind here too.

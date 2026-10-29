@@ -524,7 +524,7 @@ async def test_a_rule_restart_after_a_start_failure_keeps_the_instance_open_and_
     # A start failure a connection_stopped rule answers with restart_inbound: the restart brings
     # the inbound up and resolves nothing, so a flapping bind keeps ONE open instance whose count
     # climbs to its after_count tier, and inside the cooldown a recurrence stays throttled on that
-    # same instance, as on main. On f3dbb7bedb the restart resolved, so the count reset to 1 every
+    # same instance, as on main. When a rule's restart could resolve, the count reset to 1 every
     # cycle and a throttled recurrence opened a fresh instance that was never paged.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
@@ -576,7 +576,7 @@ async def test_an_operator_restart_during_a_rule_restart_ends_the_cooldown(
 ) -> None:
     # A rule's restart is in flight when an operator restarts the inbound. The operator's resolve
     # fully resets the instance, cooldown included, so the next stop is a new incident that pages.
-    # On f3dbb7bedb the in-flight rule restart kept the cooldown, so that stop was never paged.
+    # When an in-flight rule restart kept the cooldown, that stop was never paged.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])
@@ -623,7 +623,7 @@ async def test_an_operator_restart_during_a_rule_restart_ends_the_cooldown(
 async def test_an_operator_start_of_a_listening_inbound_resolves(store: MessageStore) -> None:
     # An open connection_stopped whose cause is gone while the inbound is still listening: the
     # operator's Start finds it up and resolves it. An engine door's start of it does not. On
-    # f3dbb7bedb the Start returned before the emit, so nothing could clear the instance there.
+    # an earlier cut the Start returned before the emit, so nothing could clear the instance.
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
     reg.add_router("r", lambda m: [])

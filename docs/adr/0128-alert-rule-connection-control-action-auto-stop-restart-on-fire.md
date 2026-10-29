@@ -102,7 +102,8 @@ wired, an operator's start or restart that finds an inbound up raises a `connect
 resolves the open `connection_stopped` instance and ends that key's window, even while a rule's restart
 is in flight, so a later stop is a new incident that pages and acts at once. No rule's `restart_inbound`
 raises it, so a loop of rule restarts, including two rules restarting each other's inbound, keeps the
-bound above. An operator's resolve by hand does not end the window.
+bound above. An operator's resolve by hand does not end the window. `AlertSink.connection_started`
+lists the operator starts that still raise nothing, so leave the window standing.
 
 ## Options considered
 
