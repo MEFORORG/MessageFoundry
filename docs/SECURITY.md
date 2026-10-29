@@ -426,18 +426,21 @@ The command can now add an Administrator beside directory ones that still sign i
 `auth.first_administrator_provisioned` audit row lists, in `administrators_at_check`, every
 enabled Administrator the run found. Every run that grants the role also raises the
 `administrator_granted` alert, keyed `user:<username>`, with `via` set to `provision_admin` and
-`granted_by` set to `cli:<OS user>` (vault BACKLOG #3849). The command builds the `[alerts]`
-notifier as `serve` does, so the alert also shows as an open alert in the web console once the
-engine runs. With no `[alerts]` transport configured, or one this shell cannot build, the alert
-goes to the command's log output only. The command then says so: as a WARNING naming the other
+`granted_by` set to `cli:<OS user>` (vault BACKLOG #3849). It is raised after the recovery codes
+are shown. The command builds the `[alerts]` notifier as `serve` does, and also tries to record
+the alert as an open alert the web console lists once the engine runs; that record is best
+effort. The notifier gets 15 seconds to finish. With no `[alerts]` transport configured, one this
+shell cannot build, or one that fails or does not finish in time, the alert also goes to the
+command's log output. The command then says so: as a WARNING naming the other
 enabled Administrators when there are any, as a plain note on a first install, and under `--json`
 as `administrator_granted_alerted` set to false.
 **CORRECTED 2026-10-29:** this read "No alert goes to them, so read that row."
 
 A local Administrator that is locked out, or must change its password, still blocks the command,
 as long as its password would still be accepted at sign-in. A lockout does not take the password
-away, and `admin-unlock` at the host clears it. Only a must-change password past its deadline,
-an account with no password, a disabled account or a directory account does not block it.
+away, and `admin-unlock` at the host clears it. At least these do not block it: a must-change
+password past its deadline, an account with no password, a disabled account, a directory account,
+and an account whose record fails its integrity seal.
 
 - Keep at least one enabled local Administrator with a password, held by someone who can reach the
   host during an outage.

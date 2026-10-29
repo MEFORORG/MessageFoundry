@@ -2149,7 +2149,8 @@ def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
     out = capsys.readouterr().out
     # Beside another Administrator, so it is a WARNING that names who to tell; a first install's
     # plain run is pinned to print no WARNING by test_cli_provisions_and_names_the_store_it_wrote_to.
-    assert "WARNING: no [alerts] notifier was available" in out and "'dir-a'" in out
+    assert "WARNING: no [alerts] notifier took the administrator_granted alert" in out
+    assert "'dir-a'" in out
     assert any(
         "ALERT administrator_granted" in r.getMessage() and "provision_admin" in r.getMessage()
         for r in caplog.records
@@ -2212,7 +2213,10 @@ def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
     built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
     assert built is not None
     assert [t.name for t in built._transports] == ["webhook"]
-    assert "sends no alert email" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "tries again without the email transport" in err
+    # The class only: a provider's error text can carry its address or a reference.
+    assert "synthetic unresolved SMTP secret" not in err and "ValueError" in err
 
 
 def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webhook(

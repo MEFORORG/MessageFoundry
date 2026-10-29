@@ -4247,6 +4247,9 @@ class AuthService:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
+                # And its address clear (vault BACKLOG #3849 B2): the store may have written the
+                # role, and a re-run then refuses the row, so nothing else would clear it.
+                await self._clear_login_addresses(user_id, username=username)
             raise FirstAdministratorRefused(
                 await self._unexpected_grant_refusal(
                     username, user_id, enrolled=totp_secret is not None

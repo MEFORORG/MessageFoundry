@@ -837,10 +837,10 @@ async function chooseToProvision(): Promise<"provision" | "skip" | undefined> {
   const provision = "Provision administrator";
   const skip = "Start without one";
   const pick = await vscode.window.showWarningMessage(
-    "This engine's store has no enabled local administrator that signs in with a password. Either " +
-      "it has no administrator at all, or every administrator signs in through Active Directory or " +
-      "an identity provider and cannot manage the engine while that service is down. Provision a " +
-      "local one now? With no administrator at all, the engine refuses to start at the shipped " +
+    "This engine's store has no enabled local administrator that can sign in with a password. It " +
+      "may have no administrator at all. Or its administrators may all sign in through Active " +
+      "Directory or an identity provider, or be local ones whose password has expired or was never " +
+      "set. Provision a local one now? With no administrator at all, the engine refuses to start at the shipped " +
       "settings. That check lets it start under [security].enforcement = warn, or with the " +
       "security-notice requirement waived. Other checks under enforce may still refuse the start. " +
       "If it starts with no administrator, it routes HL7, but no account can manage users or roles " +
