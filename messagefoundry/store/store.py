@@ -6628,7 +6628,9 @@ class UsernameAuditAppendError(Exception):
 
     A class of its own because the append's error can share a class with the UPDATE's. Each
     backend's append can raise its driver's integrity error, and the caller reads that class as a
-    lost race for the name, then audits a conflict and warns of a lockout nobody faces. What keeps
+    lost race for the name. After the rollback its re-read finds no holder of the new name, so it
+    would audit a ``write_race`` conflict that never happened and log that the write lost to another
+    writer. What keeps
     it apart is that ``AuthService._refresh_cached_username`` catches this class before its
     integrity arm. Only ``set_user_username`` raises it."""
 

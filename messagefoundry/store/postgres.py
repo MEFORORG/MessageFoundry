@@ -9057,23 +9057,27 @@ class PostgresStore:
                 )
                 if written is None:
                     return False
-                appended = await append_rename_audits(
-                    lambda: self._append_audits(conn, audits, now=now)
-                )
+                try:
+                    appended = await append_rename_audits(
+                        lambda: self._append_audits(conn, audits, now=now)
+                    )
+                except UsernameAuditAppendError as exc:
+                    lost = exc
+                    raise
         except Exception as exc:
             # An append that failed because the connection dropped leaves a rollback that fails
-            # too, and the rollback's error replaces the append's. The server ends the transaction
-            # with the session, so the rename did not commit, and the caller is owed the append's
-            # error: read as a plain store fault, it would end a reconciler pass.
-            if isinstance(exc, UsernameAuditAppendError) or not isinstance(
-                exc.__context__, UsernameAuditAppendError
-            ):
+            # too, and the pool's release after it can fail as well; whichever fails last replaces
+            # the append's error. The server ends the transaction with the session, so the rename
+            # did not commit, and the caller is owed the append's error: read as a plain store
+            # fault, it would end a reconciler pass. Recorded at the append, never read off the
+            # exception chain, so it holds however many errors follow it.
+            if lost is None or exc is lost:
                 raise
             log.warning(
-                "postgres: the rollback after a failed rename audit append failed too (%s)",
+                "postgres: after a failed rename audit append, the rollback or the release failed "
+                "too (%s)",
                 type(exc).__name__,
             )
-            lost = exc.__context__
         if lost is not None:
             raise lost
         tee_audits(audits, appended, ts=now)

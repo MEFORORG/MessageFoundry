@@ -8946,8 +8946,10 @@ class AuthService:
             # The rename wrote, then its row failed to append, so the store rolled both back: the
             # row keeps its old name and nobody is told. CAUGHT BEFORE THE ARM BELOW, because the
             # append can raise its driver's integrity class, which that arm would read as a lost
-            # race and audit as a conflict with a false lockout warning. Handled after this block,
-            # so the append's own error is raised or logged with its own chain, not this wrapper's.
+            # race. After the rollback its re-read finds no holder of the new name, so it would
+            # audit a ``write_race`` conflict that never happened and log that the write "lost to
+            # another writer". Handled after this block, so the append's own error is raised or
+            # logged with its own chain, not this wrapper's.
             refused = exc.cause
             written = False
         except Exception as exc:
@@ -9000,11 +9002,15 @@ class AuthService:
         if refused is not None:
             # A sign-in raises the append's own error, as a refused row always failed it. The
             # reconciler (``audit_soft``) logs a store refusal at ERROR and goes on, as
-            # ``_audit_reconciler_row`` does for its rows: a raise here would end the pass and skip
-            # every later account's revocation (BACKLOG #3018 step 1). The row still holds the old
-            # name, so a later pass that probes the account, or its next sign-in, renames it again
-            # and writes the row and the notice then. A defect still raises. The sort is
-            # ``write_audit_soft``'s, with ``_audit_reconciler_row``'s sets, so the two cannot drift.
+            # ``_audit_reconciler_row`` does for its rows (BACKLOG #3018 step 1). The pass applies
+            # every revocation before its renames, so a raise here skips none of them. It would end
+            # the pass with no plan returned, so the lifespan task would raise no alert for the
+            # revocations already applied, and the later renames and every record written after
+            # the rename loop (referral, configuration refusal, probe fault, paging refusal, hold,
+            # unkeyed-binding report) would be skipped. The row still holds the old name, so a
+            # later pass that probes the account, or its next sign-in, renames it again and writes
+            # the row and the notice then. A defect still raises. The sort is
+            # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.
             if not audit_soft:
                 raise refused
             cause = refused

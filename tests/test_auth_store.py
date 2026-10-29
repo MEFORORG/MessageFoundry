@@ -445,12 +445,21 @@ class _ConnectionClosed(Exception):
     """Stands in for asyncpg's error when a rollback runs on a connection that is gone."""
 
 
-async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append() -> None:
+class _ReleaseFailed(Exception):
+    """Stands in for asyncpg's pool release re-raising a failed reset on that connection."""
+
+
+@pytest.mark.parametrize("release_fails", [False, True], ids=["rollback", "rollback-then-release"])
+async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append(
+    release_fails: bool,
+) -> None:
     """BACKLOG #3018 step 7. On PostgreSQL an append that fails because the connection dropped is
-    followed by a rollback that fails too, and that error replaces the append's. The store raises
-    the append's ``UsernameAuditAppendError`` anyway, so the reconciler reads a refused row and
-    goes on, rather than a store fault that ends its pass. Driven against the real method with its
-    I/O seams replaced, because the live leg cannot drop a connection on cue."""
+    followed by a rollback that fails too, and that error replaces the append's. With
+    ``release_fails`` the pool's release then fails as well, so the append's error sits two levels
+    down the chain. The store raises the append's ``UsernameAuditAppendError`` either way, so the
+    reconciler reads a refused row and goes on, rather than a store fault that ends its pass. Driven
+    against the real method with its I/O seams replaced, because the live leg cannot drop a
+    connection on cue."""
     from contextlib import asynccontextmanager
 
     from messagefoundry.store.postgres import PostgresStore
@@ -475,7 +484,11 @@ async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_appe
 
     @asynccontextmanager
     async def _acquire(*, record: bool = True) -> Any:
-        yield _Conn()
+        try:
+            yield _Conn()
+        finally:
+            if release_fails:
+                raise _ReleaseFailed("synthetic: the reset on release failed")
 
     async def _write_user(*_a: object) -> object:
         return object()  # the write landed
