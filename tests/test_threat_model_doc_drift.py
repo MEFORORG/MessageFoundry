@@ -1549,6 +1549,64 @@ def test_the_site_scans_read_the_toolkit() -> None:
     assert planted_key not in _subprocess_sites(code) | _shell_sites(code)
 
 
+# --- the harness's process starts: this file's detector against the page's register ------------
+#
+# The register above covers the engine and the toolkit. The harness is in the assessed scope too,
+# and docs/DANGEROUS-FUNCTIONALITY.md section 11 keeps its process starts, held to the code by that
+# page's own detector. Two registers of one class, read by two detectors, drift apart unless
+# something compares them (vault BACKLOG #3474, item 10). The harness is not added to
+# _ALLOWED_SUBPROCESS_SITES: that register is the 15.1.5 section's, matched by basename, and seven
+# harness modules there would be checked against a section that does not cover them.
+
+_HARNESS = _ROOT / "harness"
+_DANGEROUS_PAGE = _ROOT / "docs" / "DANGEROUS-FUNCTIONALITY.md"
+_HARNESS_STARTS_LEAD = "**Process starts.**"
+_TABLE_MODULE_RE = re.compile(r"^\| `([^`]+\.py)` \|", re.M)
+
+
+def _harness_start_register(page: str) -> set[str]:
+    """The modules section 11's process-start table names, as paths under ``harness/``."""
+    section = re.search(r"^## 11\. .*?(?=^## |\Z)", page, re.M | re.S)
+    assert section is not None, "DANGEROUS-FUNCTIONALITY.md has no section 11"
+    region = section.group(0).partition(_HARNESS_STARTS_LEAD)[2]
+    assert region, f"section 11 has no {_HARNESS_STARTS_LEAD!r} paragraph"
+    region = re.split(r"^\*\*", region, maxsplit=1, flags=re.M)[0]
+    return set(_TABLE_MODULE_RE.findall(region))
+
+
+def _harness_code() -> dict[str, str]:
+    return {
+        path.relative_to(_HARNESS).as_posix(): _code_text(path)
+        for path in sorted(_HARNESS.rglob("*.py"))
+    }
+
+
+def test_the_harness_process_starts_match_the_pages_register() -> None:
+    """Every harness module this file's spawn forms find is in section 11's table, and back."""
+    register = _harness_start_register(_DANGEROUS_PAGE.read_text(encoding="utf-8"))
+    code = _harness_code()
+    live = _subprocess_sites(code)
+    assert live, "no harness process start found: the scan is dead"
+    assert live == register, (
+        f"the harness process-start registers disagree on {sorted(live ^ register)}. A module this "
+        "file's _SUBPROCESS_RE finds must have a row in docs/DANGEROUS-FUNCTIONALITY.md section 11, "
+        "and a row must name a module that starts a process"
+    )
+
+
+def test_the_harness_register_comparison_fires() -> None:
+    """A start the page does not list, and a row the code does not back, each show as a gap."""
+    page = _DANGEROUS_PAGE.read_text(encoding="utf-8")
+    register = _harness_start_register(page)
+    code = _harness_code()
+    planted = {**code, "load/planted.py": "import os\nos.startfile(path)\n"}
+    assert _subprocess_sites(planted) - register == {"load/planted.py"}
+    anchor = "| `__main__.py` | `git rev-parse HEAD` |"
+    assert page.count(anchor) == 1, "re-anchor the planted row on a row section 11 still has"
+    widened = page.replace(anchor, "| `load/ghost.py` | x | x | argument list |\n" + anchor)
+    assert _harness_start_register(widened) - _subprocess_sites(code) == {"load/ghost.py"}
+
+
 # --- 15.1.3: the relative links the sections cite must resolve ---------------------------------
 
 _MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
