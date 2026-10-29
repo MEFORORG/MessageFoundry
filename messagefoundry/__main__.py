@@ -97,7 +97,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
-    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.settings import AlertsSettings, ServiceSettings, StoreSettings
     from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
@@ -8031,8 +8031,10 @@ def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> 
 
 #: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
 _PROVISION_ADMIN_GRANT_VIA = "provision_admin"
-#: How long ``provision-admin`` waits for the alert's open-instance write before it closes the store.
-_OFFLINE_ALERT_DRAIN_SECONDS = 10.0
+#: How long ``provision-admin`` waits, in all, for the alert's sends and its open-instance write
+#: before it closes the store. Bounded because the operator's recovery codes are shown only after
+#: it, and a relay that hangs would otherwise hold them for every transport's timeout in turn.
+_OFFLINE_ALERT_WAIT_SECONDS = 15.0
 
 
 def _offline_alert_notifier(
@@ -8040,31 +8042,53 @@ def _offline_alert_notifier(
 ) -> NotifierAlertSink | None:
     """The ``[alerts]`` notifier ``serve`` would wire, built for an offline command (vault BACKLOG
     #3849 B5), or ``None`` when no transport is configured, as ``serve`` then falls back to its
-    logging sink.
+    logging sink. Synchronous, and it may read anchor files and reach a secret provider, so an
+    async caller runs it off the loop.
 
     The email transport is dropped, and any webhook kept, when the SMTP hop is one an offline command
     refuses (:func:`_offline_smtp_hop_unauthenticated_permitted`) or its relay CA is refused
     (:func:`_offline_smtp_relay_ca_accepted`), as the ``serve`` lifespan drops it for a refused CA.
-    A build failure is WARNED and yields ``None``, so the caller's alert reaches the log instead:
-    the grant it reports has already been written, and a recovery command must not die on its page.
+    The checks run only when the email transport would be built at all. A build failure with email
+    configured is WARNED and retried without email, so a secret this shell cannot resolve for the
+    relay does not also cost the webhook. A failure without email yields ``None``, and the caller's
+    alert reaches the log instead: the grant it reports has already been written, and a recovery
+    command must not die on its page.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
-    from messagefoundry.pipeline.alert_sinks import alerts_without_email, notifier_from_settings
+    from messagefoundry.pipeline.alert_sinks import (
+        alerts_without_email,
+        configured_alert_transport_names,
+        notifier_from_settings,
+    )
 
-    alerts = settings.alerts
-    try:
-        if alerts.email_smtp_host and not (
-            _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
-            and _offline_smtp_relay_ca_accepted(settings, what="alert email")
-        ):
-            alerts = alerts_without_email(alerts)
+    def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
         return notifier_from_settings(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
             posture=posture,
         )
+
+    alerts = settings.alerts
+    emails = "email" in configured_alert_transport_names(alerts)
+    try:
+        if emails and not (
+            _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
+            and _offline_smtp_relay_ca_accepted(settings, what="alert email")
+        ):
+            alerts, emails = alerts_without_email(alerts), False
+        return build(alerts)
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
+        if emails:
+            print(
+                f"WARNING: the [alerts] notifier could not be built with email ({exc}), so this "
+                "command sends no alert email; it tries the other transports.",
+                file=sys.stderr,
+            )
+            try:
+                return build(alerts_without_email(alerts))
+            except Exception as retry:  # noqa: BLE001 - as above
+                exc = retry
         print(
             f"WARNING: the [alerts] notifier could not be built ({exc}), so this command's alert "
             "goes to the log only.",
@@ -8092,29 +8116,49 @@ async def _raise_offline_administrator_granted(
 
     The notifier is the one ``serve`` wires, with the opened store set, so the alert also lands
     as an open alert instance the web console lists once the engine runs (ADR 0044). Started, fed
-    and drained here, because the loop ends with the command. No suspend window is primed: a
-    muted key would page anyway, the safe direction for one alert. Best effort, and it never
-    raises: the grant is written and audited, and the page is the smaller loss."""
+    and drained here, because the loop ends with the command, within
+    :data:`_OFFLINE_ALERT_WAIT_SECONDS` in all. No suspend window is primed: a muted key would page
+    anyway, the safe direction for one alert.
+
+    True only when the notifier took the alert. A notifier that could not be built, or that raised
+    on the alert, leaves it to the logging sink, and the caller then says nobody was paged. Best
+    effort, and it never raises: the grant is written and audited, and the page is the smaller
+    loss."""
+    import asyncio
+
     from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
 
-    notifier = _offline_alert_notifier(settings, posture)
-    # `administrator_granted_alert` builds the key and swallows a sink fault, as the reconciler's.
-    raise_alert = administrator_granted_alert(notifier or LoggingAlertSink(), granted_by=granted_by)
-    if notifier is None:
-        raise_alert(username, _PROVISION_ADMIN_GRANT_VIA)
-        return False
-    try:
-        notifier.set_store(store)
-        notifier.start()
+    log = logging.getLogger(__name__)
+    notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
+    taken = False
+    if notifier is not None:
         try:
-            raise_alert(username, _PROVISION_ADMIN_GRANT_VIA)
-        finally:
-            await notifier.drain_state(timeout=_OFFLINE_ALERT_DRAIN_SECONDS)
-            await notifier.aclose()
-    except Exception:  # noqa: BLE001 - the caller still has recovery codes to show, so nothing
-        # here may raise past it.
-        logging.getLogger(__name__).exception("the administrator_granted alert failed to drain")
-    return True
+            notifier.set_store(store)
+            notifier.start()
+            try:
+                notifier.administrator_granted(
+                    f"user:{username}", via=_PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
+                )
+                taken = True
+            finally:
+                async with asyncio.timeout(_OFFLINE_ALERT_WAIT_SECONDS):
+                    await notifier.drain_state(timeout=_OFFLINE_ALERT_WAIT_SECONDS)
+                    await notifier.aclose()
+        except TimeoutError:
+            log.warning(
+                "the [alerts] notifier did not finish within %.0f s, so the administrator_granted "
+                "alert may not have been sent, or recorded as an open alert",
+                _OFFLINE_ALERT_WAIT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - the caller still has recovery codes to show, so
+            # nothing here may raise past it.
+            log.exception("the [alerts] notifier failed on the administrator_granted alert")
+    if not taken:
+        # Builds the key and swallows a sink fault, as the reconciler's raise does.
+        administrator_granted_alert(LoggingAlertSink(), granted_by=granted_by)(
+            username, _PROVISION_ADMIN_GRANT_VIA
+        )
+    return taken
 
 
 class _ProvisionStore:

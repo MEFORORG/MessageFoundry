@@ -9571,9 +9571,11 @@ class PostgresStore:
         """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
         async with self._timed_acquire() as conn, conn.transaction():
             await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
+            # DO NOTHING: a concurrent reset of the account may have committed its marker after
+            # this DELETE's snapshot, and the record is then already what this one writes.
             await conn.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
-                " VALUES ($1, $2, 0, 0)",
+                " VALUES ($1, $2, 0, 0) ON CONFLICT (user_id, address) DO NOTHING",
                 user_id,
                 LOGIN_ADDRESS_RESET_MARKER,
             )

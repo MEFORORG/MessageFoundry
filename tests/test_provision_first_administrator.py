@@ -2160,7 +2160,9 @@ def test_a_failing_alert_still_shows_the_recovery_codes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The alert runs after the grant committed and before the codes are shown, so a notifier
-    that breaks its never-raise contract must not cost the operator the codes."""
+    that breaks its never-raise contract must not cost the operator the codes. Nor may it be
+    reported as paging anyone: the alert falls back to the log, and the output says so (review
+    round 1 of vault BACKLOG #3849)."""
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 
     class _Broken(NotifierAlertSink):
@@ -2178,7 +2180,39 @@ def test_a_failing_alert_still_shows_the_recovery_codes(
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
     assert main([*argv, "--email", "operator@example.invalid"]) == 0
-    assert json.loads(capsys.readouterr().out)["ok"] is True
+    body = json.loads(capsys.readouterr().out)
+    assert body["ok"] is True
+    # The log fallback itself is pinned, without --json, by the no-notifier test above.
+    assert body["administrator_granted_alerted"] is False
+
+
+def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A build failure with email configured, such as an SMTP password secret this shell cannot
+    resolve, costs the email transport only (review round 1 of vault BACKLOG #3849)."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.pipeline import alert_sinks
+
+    real = alert_sinks.notifier_from_settings
+
+    def refuse_email(alerts: AlertsSettings, **kw: object) -> object:
+        if alerts.email_to:
+            raise ValueError("synthetic unresolved SMTP secret")
+        return real(alerts, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alert_sinks, "notifier_from_settings", refuse_email)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    assert "sends no alert email" in capsys.readouterr().err
 
 
 def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webhook(
@@ -2700,6 +2734,36 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         assert await store.list_known_login_addresses("earlier", since=0.0) == [
             LOGIN_ADDRESS_RESET_MARKER
         ]
+    finally:
+        await store.close()
+
+
+async def test_a_refused_takeover_leaves_the_holders_known_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3849 B2, review round 1: the clear runs once the role is granted, so a run
+    refused at the grant takes nothing over and must not reset the holder's record."""
+    from messagefoundry.store.store import AdminGrant
+
+    store = await MessageStore.open(":memory:")
+    try:
+        await _roleless_account(store, email=None)
+        await store.remember_login_address("roleless", "10.9.9.9", now=time.time())
+        service = AuthService(store, AuthSettings())
+
+        async def refuse(*_a: object, **_k: object) -> AdminGrant:
+            return AdminGrant.ADMIN_EXISTS
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", refuse)
+        with pytest.raises(FirstAdministratorRefused, match="granted no role"):
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
+            )
+        assert await store.list_known_login_addresses("roleless", since=0.0) == ["10.9.9.9"]
     finally:
         await store.close()
 
