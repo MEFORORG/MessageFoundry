@@ -3065,8 +3065,8 @@ def vault_client_verify_kwargs(
     except ValueError:
         # A malformed bracketed host, or an address that names no host (BACKLOG #2207). Not
         # raised here: the client build refuses a given address it cannot read as one URL, with
-        # fixed text and the provider's own error type (BACKLOG #2317). An unset address lands
-        # here too: hvac then picks its own, which this function cannot see. NOT "":
+        # fixed text and the provider's own error type (BACKLOG #2317). An unset address does
+        # not reach here from a provider, which refuses it first (BACKLOG #2851). NOT "":
         # is_loopback_hop_host("") is True, and a host this function cannot read must not count
         # as on-box.
         host = "(unreadable host)"

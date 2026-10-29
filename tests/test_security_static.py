@@ -1775,6 +1775,9 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # states which revision of the record it read. The record is in another repository, so a commit
     # ref would name something the reader cannot resolve. No key.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
+    # Vault BACKLOG #3411 wave 3.1: the AppContainer spike signs a SHA-256 of a synthetic constant
+    # with a key it makes for the run and deletes -- see the INVENTORY row this duplicates.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     # BACKLOG #1276 part A: the harness supplies its own TLS certificate for a spawned engine rather
     # than chasing the one the engine mints -- see crypto_inventory_check.py's INVENTORY entry for

@@ -36,9 +36,18 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.crypto_transit import TransitCipher, build_transit_cipher
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.store import MessageStore
+from tests._vault_hop_env import STORE, supply_vault_hop
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 _KEY_NAME = "mefor-store"
+
+
+@pytest.fixture(autouse=True)
+def _store_vault_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Transit cipher refuses an unset address or token before any client is built (BACKLOG
+    #2851), so every faked test here names both. A live run keeps the operator's own values."""
+    if not _LIVE:
+        supply_vault_hop(monkeypatch, STORE)
 
 
 # --- a faithful local stand-in for OpenBao Transit ------------------------------------------------
@@ -114,6 +123,8 @@ class _FakeClient:
 
 def _use_fake(monkeypatch: pytest.MonkeyPatch, transit: _FakeTransit | None = None) -> _FakeTransit:
     transit = transit or _FakeTransit()
+    # Other modules import this helper, so it names the hop itself (BACKLOG #2851).
+    supply_vault_hop(monkeypatch, STORE)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", _KEY_NAME)
     monkeypatch.setattr(
         crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(transit)
@@ -541,7 +552,12 @@ async def test_default_aesgcm_audit_chain_is_unchanged(tmp_path: Path) -> None:
 
 # --- live OpenBao integration (gated) -------------------------------------------------------------
 
-_LIVE = bool(os.environ.get("MEFOR_STORE_TRANSIT_KEY") and os.environ.get("MEFOR_STORE_VAULT_ADDR"))
+# The token too: since BACKLOG #2851 a live run with only VAULT_TOKEN set refuses, so it skips.
+_LIVE = bool(
+    os.environ.get("MEFOR_STORE_TRANSIT_KEY")
+    and os.environ.get("MEFOR_STORE_VAULT_ADDR")
+    and os.environ.get("MEFOR_STORE_VAULT_TOKEN")
+)
 _live = pytest.mark.skipif(
     not _LIVE,
     reason="live OpenBao: set MEFOR_STORE_VAULT_ADDR / MEFOR_STORE_VAULT_TOKEN / MEFOR_STORE_TRANSIT_KEY "

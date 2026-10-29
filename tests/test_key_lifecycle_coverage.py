@@ -294,6 +294,10 @@ _NO_KEY: dict[str, str] = {
     "scripts/asvs/scorecard.py": _KEYLESS,
     "scripts/asvs/prove_report.py": _KEYLESS,
     "scripts/asvs/anchor_report.py": _KEYLESS,
+    # Vault BACKLOG #3411 wave 3.1: a CI spike on a throwaway runner, never shipped.
+    "scripts/ci/appcontainer_spike_worker.py": _EPHEMERAL
+    + " (a P-256 signing key the spike makes for one run, signs a synthetic constant with, and"
+    " deletes; it protects nothing)",
     "scripts/security/dast_target.py": _EPHEMERAL + " (a throwaway scan password)",
     "scripts/webconsole_seam_snapshot.py": _KEYLESS,
     "scripts/security/build_password_corpus.py": _KEYLESS,
