@@ -1813,13 +1813,21 @@ async def admin_guard_counts(
     sealer: RowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
     counts: AdminHolderTest | None = None,
+    *,
+    role_id: str,
 ) -> tuple[int, int]:
     """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
     rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
     ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
     counting it would let the last usable administrator be removed. With ``counts``, it must also
     pass that test (the first-administrator grant's); the removal guard passes none, so it counts
-    every sealed holder."""
+    every sealed holder.
+
+    **The record it counts is the record it judged** (vault BACKLOG #3849 C4). The holder list
+    comes from a join that reads ``users.disabled`` and ``user_roles`` once, and the record is read
+    after it, so the record must itself be enabled and hold ``role_id``, the role the join selected
+    on. The seal vouches for the record, not for the join: before this, a holder the join listed
+    counted whatever the sealed record then said about either."""
     target = others = 0
     for holder_id, is_target in holders:
         if is_target:
@@ -1827,6 +1835,8 @@ async def admin_guard_counts(
             continue
         record = await read_record(holder_id)
         if record is None or not user_seal_ok(sealer, record):
+            continue
+        if record.row.disabled or role_id not in record.role_ids:
             continue
         if counts is None or counts(record.row):
             others += 1
@@ -16489,7 +16499,7 @@ class MessageStore:
                 cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                 holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                 target, others = await admin_guard_counts(
-                    holders, self._row_sealer, self._read_user_record
+                    holders, self._row_sealer, self._read_user_record, role_id=admin_role_id
                 )
                 if target and not others:
                     await self._db.rollback()
@@ -16538,7 +16548,11 @@ class MessageStore:
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
-                        holders, self._row_sealer, self._read_user_record, counts_as_admin
+                        holders,
+                        self._row_sealer,
+                        self._read_user_record,
+                        counts_as_admin,
+                        role_id=admin_role_id,
                     )
                     if others:
                         await self._db.rollback()

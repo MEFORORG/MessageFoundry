@@ -31,11 +31,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
 from messagefoundry.store.store import AdminGrant, MessageStore
-from tests._admin_account import PROVISION_EMAIL, provision_totp
+from tests._admin_account import PROVISION_EMAIL, create_admin, provision_totp
 from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
     assert_first_admin_grant_contract,
@@ -169,19 +170,23 @@ def _hold_both_after_the_read(
     """Hold each run after the refusal's read, ``_administrator_standing`` (vault BACKLOG #2711
     step 1), until both have read it, so each has seen no administrator before either writes. That
     is the race itself. Returns the event both reads set: a caller asserts it, so a refusal that
-    stops reading this method fails the test instead of leaving the race to scheduling."""
-    arrived = 0
+    stops reading this method fails the test instead of leaving the race to scheduling.
+
+    It counts distinct RUNS, not calls (vault BACKLOG #3849 C3): a run that read twice, such as a
+    later re-read through the same method, would otherwise open the barrier alone, and the race
+    would not be held."""
+    arrived: set[int] = set()
     both_read = asyncio.Event()
-    for service in services:
+    for run, service in enumerate(services):
         original = service._administrator_standing
 
         async def held(
             original: Callable[[], Awaitable[tuple[bool, tuple[str, ...]]]] = original,
+            run: int = run,
         ) -> tuple[bool, tuple[str, ...]]:
-            nonlocal arrived
             found = await original()
-            arrived += 1
-            if arrived >= 2:
+            arrived.add(run)
+            if len(arrived) >= 2:
                 both_read.set()
             await asyncio.wait_for(both_read.wait(), timeout=10)
             return found
@@ -220,15 +225,34 @@ async def _close_pair(stores: list[MessageStore]) -> None:
         await s.close()
 
 
+@pytest.mark.parametrize(
+    "beside_directory",
+    [False, True],
+    ids=["no-administrator", "beside-a-directory-administrator"],
+)
 @pytest.mark.parametrize("shared", [False, True], ids=["one-store", "two-stores-one-file"])
 async def test_two_runs_with_different_usernames_make_one_administrator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool, beside_directory: bool
 ) -> None:
+    """``beside_directory`` (vault BACKLOG #3849 C2): the race on a store that already holds a
+    directory Administrator, which neither the refusal nor the guard counts (vault BACKLOG #2711
+    step 1). Still exactly one local Administrator is made."""
     stores = await _open_pair(tmp_path, shared)
     try:
         services = [AuthService(s, AuthSettings()) for s in stores]
         for service in services:
             await service.initialize()
+        directory: set[str] = set()
+        if beside_directory:
+            await stores[0].create_user(
+                user_id="dir-a",
+                username="dir-a",
+                auth_provider=AuthProvider.AD.value,
+                password_hash=None,
+                password_generated=False,
+            )
+            await stores[0].set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            directory = {"dir-a"}
         both_read = _hold_both_after_the_read(services, monkeypatch)
         outcomes = await asyncio.gather(
             _provision(services[0], "site-admin-one"),
@@ -241,8 +265,8 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
         assert len(refused) == 1 and len(won) == 1, outcomes
         assert "another enabled Administrator was created while this command ran" in str(refused[0])
         assert "remove any authenticator entry" in str(refused[0])
-        # One enabled Administrator, and it is the winner's account.
-        assert await enabled_admins(stores[0]) == {won[0].user_id}
+        # One enabled local Administrator, and it is the winner's account, beside any directory one.
+        assert await enabled_admins(stores[0]) == {won[0].user_id} | directory
         assert won[0].recovery_codes
         # The loser wrote no provisioned row; its account holds no role.
         [row] = await _provisioned_rows(stores[0])
@@ -492,6 +516,80 @@ async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
     assert revokes == ["halfwritten", "halfwritten"]
     assert len(_error_lines(caplog)) == 1
     assert await _provisioned_rows(store) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "names_the_other"),
+    [
+        pytest.param(AuthProvider.LOCAL, True, id="usable-local-administrator"),
+        pytest.param(AuthProvider.AD, False, id="directory-administrator"),
+    ],
+)
+async def test_an_unknown_grant_outcome_names_an_administrator_that_appeared_meanwhile(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: AuthProvider,
+    names_the_other: bool,
+) -> None:
+    """Vault BACKLOG #3849 C5: the ``has_self_sufficient_administrator`` branch of
+    ``_unexpected_grant_refusal``. A local Administrator with a usable password that appeared while
+    the run held is named as the cause; a directory one is not, because the refusal does not count
+    it (vault BACKLOG #2711 step 1), and the advice is the roleless re-run instead."""
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    roleless = _out_of_contract_grant(store, writes_role=False)
+
+    async def another_appears_then_answer(*a: Any, **k: Any) -> object:
+        if kind is AuthProvider.LOCAL:
+            await create_admin(service)
+        else:
+            await store.create_user(
+                user_id="dir-a",
+                username="dir-a",
+                auth_provider=AuthProvider.AD.value,
+                password_hash=None,
+                password_generated=False,
+            )
+            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+        return await roleless(*a, **k)
+
+    monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", another_appears_then_answer)
+    with pytest.raises(FirstAdministratorRefused, match="unexpected outcome") as refused:
+        await _provision(service, "site-admin")
+    message = str(refused.value)
+    assert ("another enabled Administrator now exists" in message) is names_the_other
+    assert ("That account holds no role" in message) is not names_the_other
+    assert await _provisioned_rows(store) == []
+
+
+async def test_the_guard_counts_only_a_record_that_is_enabled_and_holds_the_role(
+    store: MessageStore,
+) -> None:
+    """Vault BACKLOG #3849 C4: ``admin_guard_counts`` judges the record it reads, not the join that
+    listed the holder. A holder whose record reads disabled, or without the role, is not counted,
+    on the removal guard and on the grant. RED before #3849, which counted either."""
+    service = AuthService(store, AuthSettings())
+    other = await create_admin(service)
+    holders = [(other.user_id, False)]
+    record = await store._read_user_record(other.user_id)
+    assert record is not None
+
+    async def read_as(changed: Any) -> Any:
+        return changed
+
+    role = Role.ADMINISTRATOR.value
+    counted = await store_module.admin_guard_counts(
+        holders, None, lambda _id: read_as(record), role_id=role
+    )
+    assert counted == (0, 1)  # control: the record as it is counts
+    disabled = record.changed(disabled=True)
+    assert await store_module.admin_guard_counts(
+        holders, None, lambda _id: read_as(disabled), role_id=role
+    ) == (0, 0)
+    roleless = record.with_roles([], assigned_by="test", now=1.0)
+    assert await store_module.admin_guard_counts(
+        holders, None, lambda _id: read_as(roleless), lambda _row: True, role_id=role
+    ) == (0, 0)
 
 
 # --- the #3025 fold-in: no Administrator over another run's credential -----------------------------

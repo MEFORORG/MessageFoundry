@@ -9609,6 +9609,7 @@ class PostgresStore:
                     [(str(r["id"]), bool(r["is_target"])) for r in rows],
                     self._row_sealer,
                     lambda holder: self._read_user_record(conn, holder, lock=False),
+                    role_id=admin_role_id,
                 )
                 if target and not others:
                     return False  # nothing written; the commit releases the lock
@@ -9662,6 +9663,7 @@ class PostgresStore:
                 self._row_sealer,
                 lambda holder: self._read_user_record(conn, holder, lock=False),
                 counts_as_admin,
+                role_id=admin_role_id,
             )
             if others:
                 return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock

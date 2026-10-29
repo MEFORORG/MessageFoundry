@@ -830,16 +830,21 @@ function awaitExit(term: vscode.Terminal): Promise<number | undefined> {
   });
 }
 
-/** The store has no enabled Administrator: provision one (the default), start without one, or stop. */
+/** The store has no enabled local Administrator with a usable password: provision one (the default),
+ *  start without one, or stop. The probe cannot tell this modal whether directory Administrators exist
+ *  (vault BACKLOG #2711 step 1), so the text covers both stores (vault BACKLOG #3849 B3). */
 async function chooseToProvision(): Promise<"provision" | "skip" | undefined> {
   const provision = "Provision administrator";
   const skip = "Start without one";
   const pick = await vscode.window.showWarningMessage(
-    "This engine's store has no enabled administrator, so nobody can manage its users and roles. " +
-      "Provision one now? At the shipped settings the engine refuses to start without one. This " +
-      "check lets it start under [security].enforcement = warn, or with the security-notice " +
-      "requirement waived. Other checks under enforce may still refuse the start. If it starts, it " +
-      "routes HL7, but no account can manage users or roles until you provision one.",
+    "This engine's store has no enabled local administrator that signs in with a password. Either " +
+      "it has no administrator at all, or every administrator signs in through Active Directory or " +
+      "an identity provider and cannot manage the engine while that service is down. Provision a " +
+      "local one now? With no administrator at all, the engine refuses to start at the shipped " +
+      "settings. That check lets it start under [security].enforcement = warn, or with the " +
+      "security-notice requirement waived. Other checks under enforce may still refuse the start. " +
+      "If it starts with no administrator, it routes HL7, but no account can manage users or roles " +
+      "until you provision one.",
     { modal: true },
     provision,
     skip,
