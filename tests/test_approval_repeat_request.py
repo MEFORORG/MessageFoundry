@@ -134,15 +134,46 @@ async def test_a_cancelled_rejoin_still_writes_its_repeat_row(
     call = asyncio.ensure_future(
         gate.rejoin(_OP, {"channel_id": "IB_A"}, requester="maker", requester_user_id=_REQUESTER_ID)
     )
-    await started.wait()
-    call.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await call
-    release.set()
-    assert await gate.drain() == []
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+    finally:
+        # Released and drained whatever failed above, so no write is left pending at teardown.
+        release.set()
+        stuck = await gate.drain()
+    assert stuck == []
     repeated = await store.list_audit(action="approval.request_repeated")
     # Before the fix: [], because the cancel reached the write itself.
     assert [json.loads(str(r["detail"]))["approval_id"] for r in repeated] == [held]
+
+
+async def test_rejoin_requester_name_modes(store: MessageStore) -> None:
+    """BACKLOG #3740 item 9: what each ``requester_name`` joins, keyed on the requester's id."""
+    gate = _gate(store)
+    filed = {"channel_id": "IB_A", "requester": "maker"}
+    held = await _guard(gate, filed)
+    renamed = {**filed, "requester": "maker2"}
+
+    async def _rejoin(params: Mapping[str, Any], mode: Any, user_id: str = _REQUESTER_ID) -> Any:
+        return await gate.rejoin(
+            _OP, params, requester="maker", requester_user_id=user_id, requester_name=mode
+        )
+
+    assert await _rejoin(filed, "same") == held
+    assert await _rejoin(renamed, "same") is None
+    assert await _rejoin(filed, "any") == held
+    assert await _rejoin(renamed, "any") == held
+    # "renamed" leaves an exact repeat to guard's serialized step.
+    assert await _rejoin(filed, "renamed") is None
+    assert await _rejoin(renamed, "renamed") == held
+    # Another person never joins, whatever the name.
+    assert await _rejoin(filed, "any", "maker-2-id") is None
+    assert await _rejoin({"channel_id": "IB_B", "requester": "maker2"}, "any") is None
+    # An unknown mode fails closed rather than widening the match.
+    with pytest.raises(ValueError, match="requester_name"):
+        await _rejoin(renamed, "exact")
 
 
 async def test_concurrent_repeats_file_one_request(store: MessageStore) -> None:

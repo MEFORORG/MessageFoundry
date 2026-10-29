@@ -135,7 +135,8 @@ DEFAULT_CLAIM_OWNER = "engine"
 #: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
 #: whose own repeat rule still joins it; only the proof-free path is lost. A renamed requester's
-#: repeat matched only through ``requester_name`` is not joined there, and files a second request.
+#: repeat matched only through ``requester_name="any"`` or ``"renamed"`` is not joined there, and
+#: files a second request.
 REJOIN_SCAN_LIMIT = 1000
 
 #: Faults :meth:`ApprovalGate._read` raises as they are, because they name a defect in the read
@@ -693,8 +694,8 @@ class ApprovalGate:
         cases. The routes skip the rejoin when the session window has lapsed, and for a purge that
         would now be refused. The console's purge and reload demand a proof on every request. A
         repeat can also race the first request's commit. The purge core calls :meth:`rejoin` before
-        this for a renamed requester's repeat only, so an exact repeat still reaches here (BACKLOG
-        #3740 item 9).
+        this on every request, and it joins only a renamed requester's repeat, so an exact repeat
+        still reaches here (BACKLOG #3740 item 9).
 
         **A different requester gets their own request.** The requester of record is the person
         whose authority :meth:`approve` re-checks (ASVS 8.3.2), and the executors attribute their
@@ -891,7 +892,8 @@ class ApprovalGate:
         as below.
 
         It exists so a ``proof_in_route`` route (vault BACKLOG #2625) can answer a repeat BEFORE it
-        demands an action-bound proof. Returning an id here never runs anything and never holds
+        demands an action-bound proof. The purge core also calls it past the proof, with
+        ``requester_name="renamed"``, before :meth:`guard` (BACKLOG #3740 item 9). Returning an id here never runs anything and never holds
         anything new, so a caller who already has an open request needs no new proof to be told its
         id again. Its permissions, pacing, MFA and the rest of its gate still apply. A first request
         still needs the proof, because this finds nothing for it.
@@ -910,13 +912,17 @@ class ApprovalGate:
         exact match is open, so an exact repeat keeps :meth:`guard`'s serialized step. The match is
         still keyed on ``requester_user_id``, so a new holder of a freed name never joins the old
         holder's request, and only a request whose params name a requester counts. The rest is
-        compared as canonical JSON text, as :meth:`guard` compares it. An exact match wins over a
-        renamed one. The joined request keeps the name it was filed under, which is what the
+        compared as canonical JSON text, as :meth:`guard` compares it. A match is renamed only when
+        its ``requester`` differs from the one given, and an exact match wins over a renamed one.
+        Any other ``requester_name`` raises :class:`ValueError`. The joined request keeps the name it was filed under, which is what the
         approver sees and what its executor records. A caller that runs this before :meth:`guard`
         files nothing under an earlier name: a request settled before this read is not found, and
         :meth:`guard` then files one under the current name. One settled after this read is still
         named, as above. Past the scan limit a renamed repeat is not found here, and :meth:`guard`
         files a second request."""
+        # Fail closed: only these values are understood, so a typo never widens the match.
+        if requester_name not in ("same", "any", "renamed"):
+            raise ValueError(f"requester_name must be same, any or renamed, not {requester_name!r}")
         if not self.gates(operation) or not requester_user_id:
             return None
 
@@ -926,21 +932,24 @@ class ApprovalGate:
 
         wanted = _canonical(params)
         wanted_unnamed = _canonical(params, unnamed=True)
+        given_name = params.get("requester")
 
-        def _same(raw: Any) -> bool:
+        def _kind(raw: Any) -> Literal["exact", "renamed"] | None:
             if str(raw) == wanted:
-                return True
+                return "exact"
             if requester_name == "same":
-                return False
+                return None
             # Parsed silently: a row that is not a JSON object matches nothing, and the queue is
             # where an unreadable row is reported.
             held, refusal = json_loads_or_refusal(str(raw))
-            return (
-                refusal is None
-                and isinstance(held, dict)
-                and named_requester(held) is not None
-                and _canonical(held, unnamed=True) == wanted_unnamed
-            )
+            if (
+                refusal is not None
+                or not isinstance(held, dict)
+                or named_requester(held) is None
+                or _canonical(held, unnamed=True) != wanted_unnamed
+            ):
+                return None
+            return "exact" if held.get("requester") == given_name else "renamed"
 
         # Matched first and checked after, so the seal check runs on the one or two rows that match
         # rather than on the whole scan.
@@ -951,12 +960,12 @@ class ApprovalGate:
             )
             if str(r["operation"]) == operation
             and str(r["requester_user_id"] or "") == requester_user_id
-            and _same(r["params"])
+            and _kind(r["params"]) is not None
         )
         if not matches:
             return None
-        best = min(matches, key=lambda r: (r.params != wanted, r.requested_at))
-        if requester_name == "renamed" and best.params == wanted:
+        best = min(matches, key=lambda r: (_kind(r.params) != "exact", r.requested_at))
+        if requester_name == "renamed" and _kind(best.params) == "exact":
             return None  # an exact repeat: guard joins it in its serialized step
         held = best.id
         await self._shielded(

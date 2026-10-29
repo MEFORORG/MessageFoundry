@@ -2219,15 +2219,16 @@ each release attributes its audit row to that name. On its own, the rule above w
 after a rename as a new request. For a purge, both the route and the console look first for the
 caller's open purge request, matched on the user id and on every parameter except that name. Only
 after that do they reach the store's rule. Past the step-up proof this lookup takes only a repeat
-whose name differs, so an exact repeat there still gets the store's serialized step. The joined request keeps the name it was filed under,
-which the approver sees and the release records. That name is a label, not an identity: it may
-since have passed to someone else, whose own requests then show the same name. The self-approval
-refusal and the requester's authority re-check still use the user id. This lookup files nothing.
-A request settled before its read is not found, so the store's rule files a new request under the
-current name. A renamed repeat's request settled after its read is still named in the **202**, as
-the first limit below says. The lookup has the same scan limit as the one below, and past it a renamed requester's purge
-repeat files a second request. A renamed requester's replay or reload repeat still files a second
-request.
+whose name differs, so an exact repeat there still gets the store's serialized step. The joined
+request keeps the name it was filed under, which the approver sees and the release records. That
+name is a label, not an identity: it may since have passed to someone else, whose own requests then
+show the same name. The self-approval refusal and the requester's authority re-check still use the
+user id. This lookup files nothing. A request settled before its read is not found, so the store's
+rule files a new request under the current name. A renamed repeat's request settled after its read
+is still named in the **202**, as the first limit below says. Past the proof, that repeat has also
+spent its proof, so filing again needs a new one. The lookup has the same scan limit as the one
+below, and past it a renamed requester's purge repeat files a second request. A renamed
+requester's replay or reload repeat still files a second request.
 
 **A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
 #2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to

@@ -1074,9 +1074,10 @@ def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
 
     ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
     to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
-    only these params. Both purge rejoins pass ``requester_name``, so a renamed requester's
-    repeat joins the hold they already have (BACKLOG #3740 item 9). The replay and reload holds do
-    not, so a rename still gives those a second hold."""
+    only these params. The route's proof-free rejoin passes ``requester_name="any"`` and the
+    core's passes ``"renamed"``, so a renamed requester's repeat joins the hold they already have
+    (BACKLOG #3740 item 9). The default, ``"same"``, would not. The replay and reload holds do not
+    pass it, so a rename still gives those a second hold."""
     return {"name": name, "scope": scope, "requester": requester}
 
 
