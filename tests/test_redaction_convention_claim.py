@@ -15,12 +15,11 @@ cite is still in section 7.
 
 **Every match is flagged, whatever marker surrounds it.** A correction note that must quote the old
 claim verbatim adds its own entry to :data:`_ALLOWED` in the same change, so a reviewer sees the
-exemption beside the quote. An entry is a path and the exact quoted text, folded the way the scan
-folds it, and it exempts only a claim wholly inside that text where the text appears exactly once
-in its file. An entry that exempts no claim in its file fails
-:func:`test_no_allowlist_entry_is_stale`. A marker-reading exemption was tried first and failed open
-in at least seven shapes (PR 2595), which :func:`test_a_claim_is_flagged_whatever_marker_surrounds_it`
-pins.
+exemption beside the quote. An entry is a scanned path and the exact text, folded the way the scan
+folds it; it exempts a claim only under the rules :func:`_check` states. An entry that exempts no
+claim in the scan fails :func:`test_no_allowlist_entry_is_stale`, because the scan itself reports
+which entries it used. A marker-reading exemption was tried first and failed open in at least seven
+shapes (PR 2595), which :func:`test_a_claim_is_flagged_whatever_marker_surrounds_it` pins.
 """
 
 from __future__ import annotations
@@ -49,47 +48,78 @@ _LINE_MARKER = re.compile(r"^\s*(?:#:?|>)?\s*", re.MULTILINE)
 #: file that :data:`_CLAIM` would match after folding is skipped. Most files fail it and skip the fold.
 _MAYBE = re.compile(r"the\W+(?:only\W+)?control", re.IGNORECASE)
 
-#: Real retractions that quote the old claim: ``(posix path from the repository root, exact quoted
-#: text as folded)``. Empty: no file in the scanned trees quotes the claim today.
-_ALLOWED: tuple[tuple[str, str], ...] = ()
+_Entry = tuple[str, str]
+
+#: Real retractions that quote the old claim: ``(posix path relative to the repository root, exactly
+#: as the scan spells it; the quoting text as folded)``. Empty: no file in the scanned trees quotes
+#: the claim today.
+_ALLOWED: tuple[_Entry, ...] = ()
 
 
 def _folded(text: str) -> str:
     return " ".join(_LINE_MARKER.sub("", text).split())
 
 
-def _claims(
-    text: str, path: str = "", allowed: tuple[tuple[str, str], ...] = _ALLOWED
-) -> list[str]:
-    """Every claim in ``text``, less those wholly inside an allowlisted quote for ``path``.
+def _check(text: str, path: str, allowed: tuple[_Entry, ...]) -> tuple[list[str], set[_Entry]]:
+    """The claims in ``text``, and the entries of ``allowed`` that exempted one.
 
-    A quote that appears more than once exempts nothing, so a second copy pasted elsewhere in the
-    file as a fresh claim is flagged rather than riding on the retraction's entry."""
+    An entry exempts a claim only when its path is ``path`` exactly, its text appears exactly once in
+    the folded ``text``, and the claim sits wholly inside that text with a straight double quote of
+    the entry's own on each side of it. So a second copy pasted elsewhere in the file as a fresh
+    claim, or an entry naming the bare claim sentence, exempts nothing."""
     if not _MAYBE.search(text):
-        return []
+        return [], set()
     folded = _folded(text)
-    spans = [
-        (folded.index(quote), folded.index(quote) + len(quote))
-        for entry_path, quote in allowed
-        if entry_path == path and quote and folded.count(quote) == 1
-    ]
-    return [
-        m.group(0)
-        for m in _CLAIM.finditer(folded)
-        if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans)
-    ]
-
-
-def _stale(root: Path, allowed: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]:
-    """The entries that exempt no claim in their file: the file or the quote is gone, the quote
-    holds no whole claim, or it appears more than once there."""
-    stale = []
+    spans = []
     for entry in allowed:
-        target = root / entry[0]
-        text = target.read_text(encoding="utf-8") if target.is_file() else ""
-        if len(_claims(text, entry[0], (entry,))) == len(_claims(text, entry[0], ())):
-            stale.append(entry)
-    return stale
+        start = folded.find(entry[1]) if entry[0] == path else -1
+        if start != -1 and folded.find(entry[1], start + 1) == -1:
+            spans.append((entry, start, start + len(entry[1])))
+    claims: list[str] = []
+    used: set[_Entry] = set()
+    for m in _CLAIM.finditer(folded):
+        # The two bounds are implied by the quote checks, since a slice that runs backwards is
+        # empty; they stay so the containment rule does not rest on that.
+        covering = {
+            entry
+            for entry, lo, hi in spans
+            if lo <= m.start()
+            and m.end() <= hi
+            and '"' in folded[lo : m.start()]
+            and '"' in folded[m.end() : hi]
+        }
+        if covering:
+            used |= covering
+        else:
+            claims.append(m.group(0))
+    return claims, used
+
+
+def _claims(text: str, path: str = "", allowed: tuple[_Entry, ...] = ()) -> list[str]:
+    return _check(text, path, allowed)[0]
+
+
+def _sources(root: Path) -> list[Path]:
+    me = Path(__file__).resolve()
+    return sorted(
+        path
+        for top in _SCANNED
+        for path in (root / top).rglob("*")
+        if path.suffix in _SUFFIXES and path.is_file() and path.resolve() != me
+    )
+
+
+def _scan(root: Path, allowed: tuple[_Entry, ...]) -> tuple[dict[str, list[str]], list[_Entry]]:
+    """The claims found under ``root``, by scanned path, and the entries that exempted none."""
+    hits: dict[str, list[str]] = {}
+    used: set[_Entry] = set()
+    for path in _sources(root):
+        rel = path.relative_to(root).as_posix()
+        found, exempting = _check(path.read_text(encoding="utf-8"), rel, allowed)
+        used |= exempting
+        if found:
+            hits[rel] = found
+    return hits, [entry for entry in allowed if entry not in used]
 
 
 @pytest.mark.parametrize(
@@ -106,6 +136,17 @@ def _stale(root: Path, allowed: tuple[tuple[str, str], ...]) -> list[tuple[str, 
         # variants a reword could reach for
         'the "never put PHI in an exception message" convention is still the only control',
         'the "never put PHI in an exception message" convention** remains the **control**',
+        # a claim near a correction marker is still the claim: these were flagged before PR 2595's
+        # marker-reading exemption was removed, and must stay flagged if one ever returns
+        "**CORRECTED 2026-10-01:** this said the gate was per route. Neither is a completeness "
+        "claim; the convention above remains the control for both.",
+        'An UNCORRECTED fragment, read "x". The convention above remains the control for both.',
+        'UNCORRECTED 2026-10-28: this read "the convention above remains the control for both".',
+        'Corrected 2026-10-01: this said the gate was per route; the "never put PHI in an exception '
+        'message" convention remains the control.',
+        'the corrected wording read "the convention above remains the control for both".',
+        'corrected 2026-10-28: this read "the convention above remains the control for both".',
+        '**CORRECTED 2026-10-28:** this said "never put PHI in an exception message" is the control',
     ],
 )
 def test_the_scan_finds_each_shipped_wording(shipped: str) -> None:
@@ -156,7 +197,7 @@ _ENTRY = ("docs/EXAMPLE.md", 'this read "the convention above remains the contro
 
 
 def test_an_allowlisted_quote_passes_only_at_its_own_path() -> None:
-    assert _claims(_RETRACTION, "docs/EXAMPLE.md", (_ENTRY,)) == []
+    assert _check(_RETRACTION, "docs/EXAMPLE.md", (_ENTRY,)) == ([], {_ENTRY})
     assert _claims(_RETRACTION, "docs/OTHER.md", (_ENTRY,))  # the same text elsewhere
     assert _claims(_RETRACTION, "docs/EXAMPLE.md", ())  # control: no entry, flagged
     # a second claim in the same file, outside the quote, is still flagged
@@ -168,48 +209,49 @@ def test_an_allowlisted_quote_passes_only_at_its_own_path() -> None:
     assert _claims(_RETRACTION, _ENTRY[0], (head,))
     tail = (_ENTRY[0], 'above remains the control for both"')
     assert _claims(_RETRACTION, _ENTRY[0], (tail,))
+    # an entry naming the bare claim, with no quote of its own around it, exempts nothing
+    bare = (_ENTRY[0], "the convention above remains the control for both")
+    assert _claims(_RETRACTION, _ENTRY[0], (bare,))
+    for one_side in (
+        'the convention above remains the control for both"',
+        'read "the convention above remains the control for both',
+    ):
+        assert _claims(_RETRACTION, _ENTRY[0], ((_ENTRY[0], one_side),)), one_side
 
 
-def test_an_allowlist_entry_gone_from_its_file_is_stale(tmp_path: Path) -> None:
+def test_an_allowlist_entry_the_scan_never_uses_is_stale(tmp_path: Path) -> None:
     docs = tmp_path / "docs"
     docs.mkdir()
     example = docs / "EXAMPLE.md"
     example.write_text(_RETRACTION + "\n", encoding="utf-8")
-    assert _stale(tmp_path, (_ENTRY,)) == []  # control: present and holding a claim
-    partial = (_ENTRY[0], 'this read "the convention above remains the')
-    assert _stale(tmp_path, (partial,)) == [partial]  # present, but no whole claim inside
+    (tmp_path / "README.md").write_text(_RETRACTION + "\n", encoding="utf-8")
+    assert _scan(tmp_path, (_ENTRY,)) == ({}, [])  # control: used, nothing flagged
+    unused = [
+        (_ENTRY[0], 'this read "the convention above remains the'),  # no whole claim inside
+        ("docs/OTHER.md", _ENTRY[1]),  # no such file
+        ("README.md", _ENTRY[1]),  # a file outside the scanned trees
+        ("docs/example.md", _ENTRY[1]),  # not the path as the scan spells it
+        ("./docs/EXAMPLE.md", _ENTRY[1]),
+        ("docs/EXAMPLE.md", "reworded"),
+    ]
+    for entry in unused:
+        assert _scan(tmp_path, (_ENTRY, entry)) == ({}, [entry]), entry
     example.write_text(_RETRACTION + "\n" + _RETRACTION + "\n", encoding="utf-8")
-    assert _stale(tmp_path, (_ENTRY,)) == [_ENTRY]  # present twice, so it exempts neither
+    hits, stale = _scan(tmp_path, (_ENTRY,))
+    assert stale == [_ENTRY]  # present twice, so it exempts neither copy
+    assert len(hits["docs/EXAMPLE.md"]) == 2
     example.write_text("reworded, no quote left\n", encoding="utf-8")
-    assert _stale(tmp_path, (_ENTRY,)) == [_ENTRY]
-    assert _stale(tmp_path, (("docs/GONE.md", _ENTRY[1]),)) == [("docs/GONE.md", _ENTRY[1])]
-    no_claim = ("docs/EXAMPLE.md", "reworded")
-    assert _stale(tmp_path, (no_claim,)) == [no_claim]  # present, but exempts nothing
+    assert _scan(tmp_path, (_ENTRY,)) == ({}, [_ENTRY])
 
 
 def test_no_allowlist_entry_is_stale() -> None:
-    assert _stale(_ROOT, _ALLOWED) == []
-
-
-def _sources() -> list[Path]:
-    me = Path(__file__).resolve()
-    return sorted(
-        path
-        for top in _SCANNED
-        for path in (_ROOT / top).rglob("*")
-        if path.suffix in _SUFFIXES and path.is_file() and path.resolve() != me
-    )
+    assert _scan(_ROOT, _ALLOWED)[1] == []
 
 
 def test_no_document_names_the_convention_as_the_control() -> None:
-    sources = _sources()
     # A moved root would scan nothing and pass; the floor catches an empty or wrong one.
-    assert len(sources) > 500
-    hits = {}
-    for path in sources:
-        rel = path.relative_to(_ROOT).as_posix()
-        if found := _claims(path.read_text(encoding="utf-8"), rel):
-            hits[rel] = found
+    assert len(_sources(_ROOT)) > 500
+    hits = _scan(_ROOT, _ALLOWED)[0]
     assert not hits, (
         f"{hits} -- the exception-message convention binds only the engine's own authors, never a "
         "remote peer; point at docs/PHI.md section 7, 'Who the exception-message convention binds'. "
