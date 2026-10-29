@@ -2221,10 +2221,12 @@ caller's open purge request, matched on the user id and on every parameter excep
 after that do they reach the store's rule. The joined request keeps the name it was filed under,
 which the approver sees and the release records. That name is a label, not an identity: it may
 since have passed to someone else, whose own requests then show the same name. The self-approval
-refusal and the requester's authority re-check still use the user id. This lookup files nothing. So a request settled before the store's step gets a new request
-under the current name. It reads the newest 1000 open requests, as the lookup below does, and past
-that a renamed requester's purge repeat files a second request. A renamed requester's replay or
-reload repeat still files a second request.
+refusal and the requester's authority re-check still use the user id. This lookup files nothing.
+A request settled before its read is not found, so the store's rule files a new request under the
+current name. One settled after its read is still named in the **202**, as the first limit below
+says. The lookup has the same scan limit as the one below, and past it a renamed requester's purge
+repeat files a second request. A renamed requester's replay or reload repeat still files a second
+request.
 
 **A repeat of an open purge or reload needs no new step-up proof on the JSON plane (vault BACKLOG
 #2625).** `POST /connections/{name}/purge` and `POST /config/reload` take a single-use proof bound to

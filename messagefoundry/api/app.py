@@ -1068,8 +1068,9 @@ def _reload_refusal(identity: Identity) -> str | None:
 
 
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
-    """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
-    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445).
+    """What a held purge captures. The route's guard and both its rejoins read it. A repeat is
+    recognised when the two are identical (vault BACKLOG #2625 with #2445), or differ only in
+    ``requester``, by the rejoins.
 
     ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
     to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
@@ -5428,7 +5429,7 @@ def create_app(
         *,
         any_requester_name: bool = False,
     ) -> str | None:
-        """The caller's open hold for this exact request, answered with no proof, or ``None``.
+        """The caller's open hold for this request, answered with no proof, or ``None``.
 
         For the two ``proof_in_route`` routes (vault BACKLOG #2625). A rejoin holds and runs nothing,
         so it spends no proof, even one the request brought. It does need a live session window,
