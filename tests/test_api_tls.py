@@ -787,12 +787,11 @@ def test_trusted_proxies_refuses_a_zoned_host_uvicorn_parses_and_never_matches(
     ApiSettings(trusted_proxies=[peer], tls_terminated_upstream=True)
 
 
-def test_a_zoned_hop_misses_the_zoneless_entry_and_becomes_the_client() -> None:
-    """BACKLOG #3764 item 1: the gap the refusal's advice leaves, pinned. uvicorn compares a host
-    entry's zone and is handed strings, and zone names cannot be enumerated, so a hop an inner
-    proxy writes WITH its zone misses the zoneless entry the refusal recommends. That fails closed:
-    the hop is untrusted and becomes the client address, so attribution degrades and trust never
-    widens."""
+def test_a_zoned_hop_misses_the_zoneless_host_entry_and_becomes_the_client() -> None:
+    """BACKLOG #3764 item 1: the gap the refusal's advice leaves, pinned as the trusted_proxies row
+    of docs/CONFIGURATION.md states it. uvicorn compares a host entry's zone, so a hop an inner
+    proxy writes WITH its zone misses the zoneless host the refusal recommends and becomes the
+    client address. The one-address network matches it, on any zone."""
     from uvicorn.middleware.proxy_headers import _TrustedHosts
 
     from messagefoundry.config.settings import uvicorn_trusted_hosts
@@ -802,20 +801,46 @@ def test_a_zoned_hop_misses_the_zoneless_entry_and_becomes_the_client() -> None:
     # Control: the same hop written without its zone is trusted, so the real client resolves.
     assert hosts.get_trusted_client_address("203.0.113.5, fe80::1") == ("203.0.113.5", 0)
 
+    network = _TrustedHosts(uvicorn_trusted_hosts(["fe80::1/128"]))
+    for hop in ("fe80::1%eth0", "fe80::1%eth9", "fe80::1"):
+        assert network.get_trusted_client_address(f"203.0.113.5, {hop}") == ("203.0.113.5", 0)
+    ApiSettings(trusted_proxies=["fe80::1/128"], tls_terminated_upstream=True)
 
-@pytest.mark.parametrize("entry", ["fe80::1%eth0", "fe80::1%eth0/128"])
-def test_the_zoned_host_refusal_states_the_gap_its_advice_leaves(entry: str) -> None:
-    """BACKLOG #3764 item 1: the refusal says beside its advice what the test above pins.
 
-    Mutation: drop ``_ZONED_HOP_CAVEAT`` from the refusal's advice. Red: the caveat assertion."""
+#: The caveat both refusal paths add after their zoneless advice, which names no zone.
+_ZONED_HOP_CAVEAT_TEXT = (
+    "A hop an inner proxy writes into X-Forwarded-For with a zone will not match 'fe80::1', and "
+    "becomes the client address; the trusted_proxies row of docs/CONFIGURATION.md says"
+)
+
+
+@pytest.mark.parametrize(
+    ("entry", "advice"),
+    [
+        ("fe80::1%eth0", "List 'fe80::1' instead."),
+        ("fe80::1%eth0/128", "List 'fe80::1' instead."),
+        ("fe80::1%eth0/64", "List the proxy's own address 'fe80::1'."),  # the host-bits path
+        ("fe80::1%eth0\nFORGED LOG LINE/64", "List the proxy's own address 'fe80::1'."),
+    ],
+)
+def test_the_zoned_host_refusal_states_the_gap_its_advice_leaves(entry: str, advice: str) -> None:
+    """BACKLOG #3764 item 1: each refusal that advises a zoneless host says what that leaves open,
+    and never echoes the zone, which ipaddress takes almost unchecked.
+
+    Mutation: drop ``_ZONED_HOP_CAVEAT`` from either refusal. Red: the caveat assertion."""
     with pytest.raises(ValidationError) as exc:
         ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
     message = str(exc.value)
-    assert "List 'fe80::1' instead." in message
-    assert (
-        "A hop an inner proxy writes into X-Forwarded-For with its zone, as 'fe80::1%eth0', will "
-        "not match 'fe80::1': it is untrusted and becomes the client address."
-    ) in message
+    assert advice in message
+    assert _ZONED_HOP_CAVEAT_TEXT in message
+    assert "\nFORGED" not in message
+
+
+def test_a_zoneless_host_bits_refusal_carries_no_zone_caveat() -> None:
+    """The control for the host-bits arm above: a zoneless entry gets no zoned-hop caveat."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["fe80::1/64"], tls_terminated_upstream=True)
+    assert "with a zone will not match" not in str(exc.value)
 
 
 #: A forwarded chain whose last hop, the proxy at 10.0.0.1, a dual-stack proxy behind it wrote in

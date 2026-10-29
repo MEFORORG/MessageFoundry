@@ -166,8 +166,9 @@ then the other spelling of each IPv4 entry (its `::ffff:`-mapped twin) and of ea
 `_TrustedHosts` never normalises a mapped address, so without the twin a dual-stack inner proxy's
 mapped hop would miss a plain entry. Both spellings name the same hosts, so the twin trusts no host
 the entry did not name; `::ffff:0:0/96` does gain `0.0.0.0/0`, which the loosening check already
-counts as the whole IPv4 family. An IPv6 entry outside the mapped block, `::/80` and `::/0`
-included, gains nothing.
+counts as the whole IPv4 family. An IPv6 entry not inside the mapped block gains nothing,
+including `::/80` and `::/0`, which hold the whole block (the loosening check counts each as every
+IPv4 address).
 
 D-1's argument is unchanged: uvicorn's `ProxyHeadersMiddleware` is still the single XFF trust point,
 and the decision still reads `scope["client"]` and parses no header. D-3 still reads the configured
