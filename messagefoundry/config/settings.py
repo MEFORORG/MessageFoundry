@@ -51,7 +51,7 @@ from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, get_args
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -1553,6 +1553,25 @@ def _whatwg_ipv6(address: ipaddress.IPv6Address) -> str:
     return f"::ffff:{n >> 16:x}:{n & 0xFFFF:x}"
 
 
+def _split_origin(entry: str) -> tuple[SplitResult, int | None] | None:
+    """``urlsplit`` and ``.port``, or ``None`` where either refuses (a bad bracketed host, an
+    NFKC-unsafe netloc, a bad or out-of-range port). The caller raises once this has returned, so
+    the parser's error, which quotes the entry, is never on its refusal's chain."""
+    try:
+        parts = urlsplit(entry)
+        return parts, parts.port
+    except ValueError:
+        return None
+
+
+def _ipv6_or_none(host: str) -> ipaddress.IPv6Address | None:
+    """The IPv6 address ``host`` spells, or ``None``; returned rather than raised, as above."""
+    try:
+        return ipaddress.IPv6Address(host)
+    except ValueError:
+        return None
+
+
 def _check_ws_allowed_origin(entry: str, position: int) -> None:
     """Raise ``ValueError`` unless one ``[api].ws_allowed_origins`` entry, the ``position``-th
     (from 1), is an origin spelled as an ``Origin`` header carries it.
@@ -1564,20 +1583,21 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
     ``/``, a default port, an IPv6 literal's spelling) is refused with the spelling to list, rather
     than rewritten, so what the file says is what matches. What is refused is listed in
     docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it: a pasted URL
-    can carry a credential in its userinfo, query or path, and the message reaches the log."""
-    field = f"[api].ws_allowed_origins entry {position}"
+    can carry a credential in its userinfo, query or path, and the message reaches the log. For
+    the same reason no refusal is raised inside a handler: the caught parser error quotes the
+    entry, and ``from exc`` or ``from None`` would keep it on the chain (BACKLOG #1796)."""
+    # Every entry before this one passed, so none was empty; the env form drops empty fields.
+    field = f"[api].ws_allowed_origins entry {position} (counting non-empty entries)"
     if "@" in entry:
         raise ValueError(f"{field} has an '@'; userinfo is refused: {_WS_ORIGIN_FORM}")
     if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
         raise ValueError(
             f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
         )
-    try:
-        # urlsplit refuses a bad bracketed host, and .port a bad or out-of-range port.
-        parts = urlsplit(entry)
-        port = parts.port
-    except ValueError as exc:
-        raise ValueError(f"{field} has a bad host or port: {_WS_ORIGIN_FORM}") from exc
+    split = _split_origin(entry)
+    if split is None:
+        raise ValueError(f"{field} has a bad host or port: {_WS_ORIGIN_FORM}")
+    parts, port = split
     scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
     host = parts.hostname
     if not entry.isascii():
@@ -1595,10 +1615,9 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
     if port == 0:
         raise ValueError(f"{field} has port 0, which a browser blocks: {_WS_ORIGIN_FORM}")
     if parts.netloc.startswith("["):
-        try:
-            literal = ipaddress.IPv6Address(host)
-        except ValueError as exc:  # urlsplit passes an IPvFuture literal such as [v1.x]
-            raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}") from exc
+        literal = _ipv6_or_none(host)
+        if literal is None:  # urlsplit passes an IPvFuture literal such as [v1.x]
+            raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}")
         if literal.scope_id is not None:
             raise ValueError(f"{field} has an IPv6 zone, which no browser sends: {_WS_ORIGIN_FORM}")
         host = f"[{_whatwg_ipv6(literal)}]"
@@ -1613,8 +1632,8 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
         last = labels[-2] if len(labels) > 1 and not labels[-1] else labels[-1]
         if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last) and not is_canonical_ipv4(host):
             raise ValueError(
-                f"{field} is an IPv4 address in a form a browser rewrites; write it as four "
-                f"decimal parts with no leading zeros: {_WS_ORIGIN_FORM}"
+                f"{field} is not an IPv4 address a browser sends as written; write it as four "
+                f"decimal parts from 0 to 255 with no leading zeros: {_WS_ORIGIN_FORM}"
             )
     suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
     canonical = f"{scheme}://{host}{suffix}"

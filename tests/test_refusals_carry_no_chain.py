@@ -56,7 +56,12 @@ from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.settings import EgressSettings, StoreSettings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    EgressSettings,
+    StoreSettings,
+    _check_ws_allowed_origin,
+)
 from messagefoundry.config.wiring import InboundConnection, Registry, WiringError
 from messagefoundry.corepoint_import import (
     CorepointImportError,
@@ -992,3 +997,54 @@ def test_a_malformed_passkey_row_keeps_the_row_off_the_chain(
 def test_a_well_formed_passkey_row_still_parses() -> None:
     cred = WebAuthnCredential.from_mapping(_passkey_row())
     assert cred.transports == ["usb"] and cred.sign_count == 0
+
+
+# ==== BACKLOG #3764 item 2: [api].ws_allowed_origins refusals ======================================
+#
+# The refusal names an entry by position and never quotes it, since a pasted URL can carry a
+# credential. Two paths raised it inside a handler with ``from exc``: urlsplit's error quotes the
+# netloc (a port field holding a password, or a fullwidth '@' that gets past the plain '@' check)
+# and IPv6Address's quotes the host, so the withheld text stayed on ``__cause__``.
+
+_WS_ORIGIN_REFUSALS = [
+    f"https://svc:{_PLANTED}@ops.example.test",  # userinfo
+    f"https://ops.example.test;{_PLANTED}",  # a separator
+    f"https://ops.example.test:{_PLANTED}",  # .port refuses, quoting the field
+    f"https://svc:{_PLANTED}\uff20ops.example.test",  # urlsplit's NFKC check quotes the netloc
+    f"https://[{_PLANTED}",  # urlsplit refuses the bracket, quoting nothing today
+    f"https://ops.example.test/{_PLANTED}\u00fc",  # non-ASCII outside the host
+    f"https://ops.example.test/?token={_PLANTED}",  # not a bare origin
+    "https://ops.example.test:0",
+    f"https://[v1.{_PLANTED}]",  # IPvFuture passes urlsplit; IPv6Address refuses, quoting it
+    f"https://[fe80::1%25{_PLANTED}]",  # an IPv6 zone
+    "https://a<b.example.test",
+    "https://256.1.1.1",
+    "https://ops.example.test:443",  # another spelling, naming the one to list
+]
+
+
+@pytest.mark.parametrize("entry", _WS_ORIGIN_REFUSALS)
+def test_a_refused_ws_origin_keeps_the_entry_off_the_chain(entry: str) -> None:
+    with pytest.raises(ValueError, match="ws_allowed_origins entry 1 ") as caught:
+        _check_ws_allowed_origin(entry, 1)
+    _assert_bare(caught.value)
+
+
+@pytest.mark.parametrize("entry", _WS_ORIGIN_REFUSALS)
+def test_a_refused_ws_origin_keeps_the_entry_out_of_the_validation_error(entry: str) -> None:
+    """The same refusal as settings load raises it: pydantic keeps the validator's error in each
+    error's ``ctx``, so that error's chain is walked too."""
+    with pytest.raises(ValidationError) as caught:
+        ApiSettings.model_validate({"ws_allowed_origins": [entry]})
+    assert _PLANTED not in str(caught.value)
+    _assert_bare(caught.value)
+    for error in caught.value.errors():
+        cause = (error.get("ctx") or {}).get("error")
+        assert isinstance(cause, ValueError)
+        _assert_bare(cause)
+
+
+def test_a_ws_origin_spelled_as_an_origin_header_still_loads() -> None:
+    """Control: the check admits an origin, so the refusals above are about the entries."""
+    s = ApiSettings.model_validate({"ws_allowed_origins": ["https://[fd00::7]:8443"]})
+    assert s.ws_allowed_origins == ["https://[fd00::7]:8443"]
