@@ -42,6 +42,8 @@ ENGINE_REQUIRED = ["CI gate", "cla"]
 NOW = datetime(2026, 10, 28, 18, 0, 0, tzinfo=UTC)
 LOGIN = "wshallwshall"  # every seat posts under this one login
 SESSION = "Lander (session 8a04c9f3), 2026-10-28. "
+#: The seat-id signature the Lander also writes.
+SEAT = "Lander (lander-1028), 2026-10-29. "
 
 
 def _sha(n: int) -> str:
@@ -306,13 +308,18 @@ def test_classification_keys_on_body_not_login(
     assert _turn(rows[13]) == ("LANDER", ["no-hold"])
 
 
-SEAT = "Lander (lander-1028), 2026-10-29. "
+def _ack_body(sha: str, prose: str = "Batch 453 Manager: hold received, fixing.") -> str:
+    """The ack contract's shape: the marker line, then the author's own words."""
+    return f"<!-- hold-ack head={sha} -->\n{prose}"
 
 
-def _ack(
-    at: str, sha: str, prose: str = "Batch 453 Manager: hold received, fixing."
-) -> dict[str, Any]:
-    return _comment(f"<!-- hold-ack head={sha} -->\n{prose}", at)
+def _ack(at: str, sha: str) -> dict[str, Any]:
+    return _comment(_ack_body(sha), at)
+
+
+def _held(n: int, *extra: dict[str, Any], head: str | None = None) -> dict[str, Any]:
+    """PR ``n`` with a marker hold on its own head at noon, then the ``extra`` comments."""
+    return _pr(n, comments=[_hold("2026-10-28T12:00:00Z", _sha(n)), *extra], head=head)
 
 
 def test_a_seat_signed_lander_comment_is_a_lander_event(
@@ -324,13 +331,7 @@ def test_a_seat_signed_lander_comment_is_a_lander_event(
     assert hpt.hold_head(signed) == _sha(101)
     assert hpt.Event(NOW, SEAT + "looking now.", bot=False, trusted=True).lander
     hold = _pr(101, comments=[_comment(signed, "2026-10-28T12:00:00Z")])
-    note = _pr(
-        102,
-        comments=[
-            _hold("2026-10-28T12:00:00Z", _sha(102)),
-            _comment(SEAT + "**Held** pending the flake rerun.", "2026-10-28T13:00:00Z"),
-        ],
-    )
+    note = _held(102, _comment(SEAT + "**Held** pending the flake rerun.", "2026-10-28T13:00:00Z"))
     rows = _engine_rows(tmp_path, capsys, hold, note)
     assert _turn(rows[101]) == ("AUTHOR", ["held"])
     # Still the Lander's turn, but as its own newer comment, not as an author reply.
@@ -343,18 +344,15 @@ def test_an_author_text_starting_lander_paren_never_moves_toward_author(
     """A Manager addressing the Lander writes ``Lander (8a04c9f3): ...``. It now reads as a Lander
     event, and every placement of it relative to the hold still leaves the turn the Lander's."""
     ask = "Lander (8a04c9f3): flip #3844 on merge."
-    after = _pr(
-        103,
-        comments=[_hold("2026-10-28T12:00:00Z", _sha(103)), _comment(ask, "2026-10-28T13:00:00Z")],
-    )
-    tie = _pr(
-        104,
-        comments=[_hold("2026-10-28T12:00:00Z", _sha(104)), _comment(ask, "2026-10-28T12:00:00Z")],
-    )
     older = _comment(ask, "2026-10-28T11:00:00Z")
     older["lastEditedAt"] = "2026-10-28T13:00:00Z"
-    edited = _pr(105, comments=[older, _hold("2026-10-28T12:00:00Z", _sha(105))])
-    rows = _engine_rows(tmp_path, capsys, after, tie, edited)
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(103, _comment(ask, "2026-10-28T13:00:00Z")),
+        _held(104, _comment(ask, "2026-10-28T12:00:00Z")),
+        _pr(105, comments=[older, _hold("2026-10-28T12:00:00Z", _sha(105))]),
+    )
     assert _turn(rows[103]) == ("LANDER", ["no-hold"])
     assert _turn(rows[104]) == ("LANDER", ["no-hold"])
     assert _turn(rows[105]) == ("LANDER", ["edited", "no-new-commit"])
@@ -366,17 +364,13 @@ def test_an_author_text_starting_lander_paren_never_moves_toward_author(
 def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    hold = _hold("2026-10-28T12:00:00Z", _sha(110))
-    full = _pr(110, comments=[hold, _ack("2026-10-28T13:00:00Z", _sha(110))])
-    # A short, upper-cased SHA, in the hold's own second, posted as a review.
+    full = _held(110, _ack("2026-10-28T13:00:00Z", _sha(110)))
+    # A short, upper-cased SHA with a trailing space and CR, in the hold's own second, as a review.
+    odd = f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing"
     short = _pr(
         111,
         comments=[_hold("2026-10-28T12:00:00Z", _sha(111))],
-        reviews=[
-            _review(
-                f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing", "2026-10-28T12:00:00Z"
-            )
-        ],
+        reviews=[_review(odd, "2026-10-28T12:00:00Z")],
     )
     rows = _engine_rows(tmp_path, capsys, full, short)
     assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
@@ -386,9 +380,6 @@ def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
 def test_anything_but_a_valid_ack_still_hands_the_turn_back(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def held(n: int, *extra: dict[str, Any], head: str | None = None) -> dict[str, Any]:
-        return _pr(n, comments=[_hold("2026-10-28T12:00:00Z", _sha(n)), *extra], head=head)
-
     prose = _comment(
         "Batch 453 Manager: hold received. Fixing the findings.", "2026-10-28T13:00:00Z"
     )
@@ -398,23 +389,22 @@ def test_anything_but_a_valid_ack_still_hands_the_turn_back(
     hidden["isMinimized"] = True
     edited = _ack("2026-10-28T13:00:00Z", _sha(125))
     edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
-    dismissed = _review(f"<!-- hold-ack head={_sha(126)} -->\nfixing", "2026-10-28T13:00:00Z")
-    dismissed["state"] = "DISMISSED"
+    dismissed = _review(_ack_body(_sha(126)), "2026-10-28T13:00:00Z", state="DISMISSED")
     rows = _engine_rows(
         tmp_path,
         capsys,
-        held(120, prose),
-        held(121, _ack("2026-10-28T13:00:00Z", "f4f4dd470")),
-        held(
+        _held(120, prose),
+        _held(121, _ack("2026-10-28T13:00:00Z", "f4f4dd470")),
+        _held(
             122,
             _ack("2026-10-28T13:00:00Z", _sha(122)),
             _comment("Manager: done.", "2026-10-28T14:00:00Z"),
         ),
-        held(123, outsider),
-        held(124, hidden),
-        held(125, edited),
+        _held(123, outsider),
+        _held(124, hidden),
+        _held(125, edited),
         _pr(126, comments=[_hold("2026-10-28T12:00:00Z", _sha(126))], reviews=[dismissed]),
-        held(127, _ack("2026-10-28T13:00:00Z", _sha(127)), head=_sha(999)),
+        _held(127, _ack("2026-10-28T13:00:00Z", _sha(127)), head=_sha(999)),
     )
     for n in (120, 121, 122, 123, 124, 126):
         assert _turn(rows[n]) == ("LANDER", ["replied", "no-new-commit"]), n

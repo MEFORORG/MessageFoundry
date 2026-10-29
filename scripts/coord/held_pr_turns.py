@@ -264,9 +264,9 @@ class RepoRead:
     required_error: str | None = None
 
 
-def _first_line_sha(pattern: re.Pattern[str], body: str) -> str | None:
-    """The SHA ``pattern`` captures from the whole first line, lower-cased, else ``None``."""
-    marker = pattern.fullmatch(body.split("\n", 1)[0].rstrip(_TRAILING))
+def _first_line_sha(pattern: re.Pattern[str], first_line: str) -> str | None:
+    """The SHA ``pattern`` captures from the whole of ``first_line``, lower-cased, else ``None``."""
+    marker = pattern.fullmatch(first_line.rstrip(_TRAILING))
     return marker.group(1).lower() if marker else None
 
 
@@ -278,7 +278,7 @@ def hold_head(body: str) -> str | None:
     lines = body.split("\n", 2)
     if len(lines) < 2 or not lines[1].startswith(LANDER_PREFIX):
         return None
-    return _first_line_sha(_HOLD_MARKER, body)
+    return _first_line_sha(_HOLD_MARKER, lines[0])
 
 
 def ack_head(body: str) -> str | None:
@@ -286,7 +286,7 @@ def ack_head(body: str) -> str | None:
 
     The shape only, as ``hold_head``. The gates are ``Event``'s.
     """
-    return _first_line_sha(_ACK_MARKER, body)
+    return _first_line_sha(_ACK_MARKER, body.split("\n", 1)[0])
 
 
 @dataclass(frozen=True)
