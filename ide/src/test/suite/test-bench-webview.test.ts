@@ -68,7 +68,7 @@ interface Bench {
   readonly errors: unknown[];
   /** Every message the page posted to the host, JSON-copied out of the page's realm. */
   readonly posted: Payload[];
-  /** Every console.warn the page wrote. A shape discard names itself there. */
+  /** Every console.warn the page wrote. A shape discard reports itself there, in one fixed phrase. */
   readonly warnings: string[];
   /** Deliver a stamped, same-origin message exactly as the host path would. */
   deliver(data: Record<string, unknown>): void;
@@ -135,11 +135,12 @@ function clone(p: Payload): Payload {
 }
 
 /**
- * Assert that `payload` is DISCARDED: detail's markup and both panes' visibility are unchanged, and
- * nothing threw. The no-throw half matters: a renderer that crashed partway would also leave
- * `detail` alone, and would read here as a discard it is not.
+ * Assert that `payload` is DISCARDED: detail's markup and both panes' visibility are unchanged,
+ * nothing threw, and the console got exactly `warnings`. The no-throw half matters: a renderer that
+ * crashed partway would also leave `detail` alone, and would read here as a discard it is not.
+ * `warnings` defaults to the one shape-discard warning; a drop behind the shape check passes [].
  */
-function assertDiscarded(payload: Payload, why: string): Bench {
+function assertDiscarded(payload: Payload, why: string, warnings: string[] = [DISCARD_WARNING]): Bench {
   const b = bench();
   b.detail.innerHTML = SENTINEL;
   const before = { html: b.detail.innerHTML, d: b.detail.style.display, r: b.results.style.display };
@@ -148,16 +149,13 @@ function assertDiscarded(payload: Payload, why: string): Bench {
   assert.strictEqual(b.detail.innerHTML, before.html, `${why}: detail was re-rendered`);
   assert.strictEqual(b.detail.style.display, before.d, `${why}: detail visibility changed`);
   assert.strictEqual(b.results.style.display, before.r, `${why}: results visibility changed`);
-  // A discard may warn, but only in one of the two fixed forms, so no case echoes message text.
-  for (const w of b.warnings) {
-    assert.match(w, DISCARD_WARNING, `${why}: the warning is not one of the fixed forms: ${w}`);
-  }
+  // A shape discard warns exactly once, with the one fixed phrase, so no case echoes message text.
+  assert.deepStrictEqual(b.warnings, warnings, `${why}: not the expected console warnings`);
   return b;
 }
 
-/** The only warnings a discard writes: a type the page declares, or the fixed unknown-kind phrase. */
-const DISCARD_WARNING =
-  /^MessageFoundry Test Bench: discarded a malformed (?:"(?:detail|trace|hex|collections|collectionRun|caseDetail)" message|message of an unknown kind)$/;
+/** The only warning a discard writes. Nothing in it is chosen by the message, not even its type. */
+const DISCARD_WARNING = "MessageFoundry Test Bench: discarded a malformed message";
 
 /** Assert that `payload` RENDERS, and return the bench so the caller can inspect what rendered. */
 function assertRendered(payload: Payload, why: string, state: Record<string, unknown> | null = null): Bench {
@@ -376,6 +374,7 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
       b.deliver(p);
       assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
       assert.strictEqual(b.detail.innerHTML, SENTINEL, `${why}: detail was re-rendered`);
+      assert.deepStrictEqual(b.warnings, [DISCARD_WARNING], `${why}: not the one fixed warning`);
     }
   });
 
@@ -537,12 +536,24 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
   for (const [payload, why] of unknownTypes) {
     test(`an unknown type is discarded, and its warning carries no text from the message: ${why}`, () => {
       const b = assertDiscarded(payload, why);
-      assert.deepStrictEqual(
-        b.warnings,
-        ["MessageFoundry Test Bench: discarded a malformed message of an unknown kind"],
-        `${why}: the discard was not reported with the fixed phrase`,
-      );
       assert.ok(!b.warnings.some((w) => w.includes(String(payload.type))), `${why}: the type was echoed`);
+    });
+  }
+
+  // A type the page DOES declare is still the message's own discriminant, so it is not named either
+  // (owner decision 2026-10-29, BACKLOG #1123). Each is sent with none of its fields: well-formed
+  // kind, malformed body.
+  const declaredTypes = ["detail", "trace", "hex", "collections", "collectionRun", "caseDetail"];
+  test("the known-type cases cover every type the page declares", () => {
+    // SHAPES is a top-level const of the page's classic script, so it is reachable from its global scope.
+    const keys = (bench().window as unknown as { eval(src: string): unknown }).eval("Object.keys(SHAPES)");
+    assert.deepStrictEqual([...(keys as string[])].sort(), [...declaredTypes].sort());
+  });
+  for (const type of declaredTypes) {
+    test(`a known type with malformed fields is discarded, and its warning does not name the type: ${type}`, () => {
+      // assertDiscarded matches the warning exactly against the fixed phrase, which is what proves the
+      // type is not named. A substring check would add nothing, and would misfire on a type such as "Test".
+      assertDiscarded({ type }, type);
     });
   }
 });
@@ -687,7 +698,10 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     b.deliver({ ...caseDetail(0), index: 7 });
     assert.strictEqual(b.detail.innerHTML, before, "an unasked or stale reply rendered");
     assertShows(b, null, "unasked or stale replies");
-    assertDiscarded(caseDetail(0), "no run on screen");
+    // No warning: the stale-reply check dropped them, not the shape check.
+    assert.deepStrictEqual(b.warnings, [], "a stale reply was refused by the shape check");
+    // Well-formed, so the shape check passes it and the stale-reply check behind it drops it silently.
+    assertDiscarded(caseDetail(0), "no run on screen", []);
   });
 
   test("a case with no difference and no error says so rather than rendering blank", () => {
@@ -741,11 +755,7 @@ suite("Test Bench webview — a collection run reveals values one case at a time
       assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
       assert.strictEqual(b.detail.innerHTML, shown, `${why}: detail was re-rendered`);
       // The discard must come from the shape check, not from the stale-reply check behind it.
-      assert.deepStrictEqual(
-        b.warnings,
-        ['MessageFoundry Test Bench: discarded a malformed "caseDetail" message'],
-        `${why}: not a shape discard, or the warning carried more`,
-      );
+      assert.deepStrictEqual(b.warnings, [DISCARD_WARNING], `${why}: not a shape discard, or the warning carried more`);
     }
   });
 
