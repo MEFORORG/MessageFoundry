@@ -48,8 +48,8 @@ THE HOLD CONTRACT. A hold is recognised ONLY by this shape, which the Lander wri
   stripped from its start, fully matches the marker. Nothing can precede the first line, so no
   blockquote, fence or code span can wrap it: a quoted or shown marker is never line 1. That is why
   the marker goes first, and why no Markdown is parsed here.
-* The SECOND line starts with ``Lander (``. The Lander signs ``Lander (session <id>)`` or
-  ``Lander (<seat id>)``, as in ``Lander (lander-1028)``; both are its signature.
+* The SECOND line starts with the Lander's signature: ``Lander (session`` (the form this script
+  first read), or ``Lander (<seat id>), `` with the comma, as in ``Lander (lander-1028), ``.
 * The author's ``authorAssociation`` is OWNER, MEMBER or COLLABORATOR, and the comment is not
   minimized. This is not a seat check (every seat posts under one GitHub login, so classification
   keys on the body, never the login): it only stops an outside account on a public repository from
@@ -59,18 +59,21 @@ THE HOLD CONTRACT. A hold is recognised ONLY by this shape, which the Lander wri
 Lines split on a line feed only. ``str.splitlines`` also breaks on a vertical tab, U+2028 and
 others, which would let a body whose first line-feed line is not the marker read as a hold.
 
-A LANDER EVENT is a marker hold, or a body starting with ``Lander (`` (a non-hold Lander
+A LANDER EVENT is a marker hold, or a body starting with the Lander's signature (a non-hold Lander
 comment), under the same association gate. Anything else is a non-Lander event. A prose hold
 written before the marker existed (``**Held, ...**`` with no marker line) is therefore a non-hold
 Lander comment, and its PR reads as LANDER's. That is intended, and in the safe direction: the
 Lander looks again and re-posts the hold with a marker.
 
-WHY ``Lander (`` IS WIDE ENOUGH AND NO WIDER. An author's comment can start with it too: a Manager
-addressing the Lander writes ``Lander (8a04c9f3): ...``. Read as a Lander event, such a reply at or
-after the hold is a non-hold Lander event, so it is the newest Lander event (or ties with the hold)
-and the PR reads ``no-hold``, LANDER's; an older one edited after the hold is caught as
-``edited``. So the widening can only move a PR toward LANDER. Only the marker moves one toward
-AUTHOR, and a body that merely starts with ``Lander (`` carries no marker.
+WHY THE SIGNATURE NEEDS ITS COMMA. A Manager addressing the Lander writes ``Lander (8a04c9f3):
+...``, with a colon. A bare ``Lander (`` prefix would read that as the Lander's own: as an unmarked
+comment it would show ``no-hold`` rather than ``replied``, hiding that the author answered, and as
+the second line under a hold marker (an author mistaking the hold marker for the ack marker) it
+would read as a hold and park the PR on its author, the unsafe direction. So a seat-signed form
+counts only with the comma. An author text that does match (``Lander (x), please re-read``) as an
+unmarked comment is a non-hold Lander event at or after the hold, so it is the newest Lander event,
+or ties with the hold, and the PR still reads LANDER's; under a hold marker it is a hold, as an
+author writing ``Lander (session`` under one always was.
 
 THE ACK CONTRACT. An author who has read a hold and is still working on it, with nothing pushed
 yet, may say so without handing the turn back, ONLY by this shape::
@@ -80,11 +83,12 @@ yet, may say so without handing the turn back, ONLY by this shape::
 
 The first line is read exactly as the hold marker's is (a full match, only trailing spaces, tabs
 and carriage returns stripped, and the same association, minimized and dismissed gates), and the
-PR's ``headRefOid`` must start with its SHA, ignoring case. A Lander event is never an ack. Such an
-ack at or after the hold is not a reply, so the PR stays AUTHOR's, flagged ``held`` and
-``acked``. Everything else still hands the turn back: a push (``new-commit``), any other comment
-or review after the hold (``replied``), an ack naming another SHA (a reply), and an edit to the
-ack or to anything else (``edited``). A plain-prose acknowledgement, with no marker, is a reply
+PR's ``headRefOid`` must start with its SHA, ignoring case. It must be an issue comment: a review
+carries inline thread comments this script does not read, so a review is never an ack. A Lander
+event is never an ack. Such an ack at or after the hold is not a reply, so the PR stays AUTHOR's,
+flagged ``held`` and ``acked``. At least these still hand the turn back: a push (``new-commit``),
+any other counted comment or review after the hold (``replied``), an ack naming another SHA or
+posted as a review (a reply), and an edit to the ack or to anything else (``edited``). A plain-prose acknowledgement, with no marker, is a reply
 and the Lander's turn. The ack line says only "still my move"; anything the Lander must read or
 answer goes in a comment WITHOUT the marker, which hands the turn back.
 
@@ -166,9 +170,10 @@ COMMENT_PAGE = 100
 REVIEW_PAGE = 50
 TITLE_WIDTH = 50
 
-#: How every Lander comment begins: ``Lander (session <id>)`` or ``Lander (<seat id>)``. The module
-#: docstring says why an author's text starting with it cannot move a PR toward AUTHOR.
-LANDER_PREFIX = "Lander ("
+#: How every Lander comment begins: ``Lander (session <id>)``, or ``Lander (<seat id>), `` with the
+#: comma that a Manager's ``Lander (<id>): ...`` lacks. WHY THE SIGNATURE NEEDS ITS COMMA says why.
+#: Bounded, with no nested repeat, so it cannot backtrack catastrophically.
+_LANDER_SIGNATURE = re.compile(r"Lander \((?:session|[^()\n]{1,80}\), )")
 #: Associations whose comments may be Lander events: accounts with standing on the repository.
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 #: The hold marker, matched against the whole first line. Literal with one bounded repeat, so it
@@ -276,7 +281,7 @@ def hold_head(body: str) -> str | None:
     The shape only. The association, minimized and dismissed gates are ``Event``'s.
     """
     lines = body.split("\n", 2)
-    if len(lines) < 2 or not lines[1].startswith(LANDER_PREFIX):
+    if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
         return None
     return _first_line_sha(_HOLD_MARKER, lines[0])
 
@@ -300,6 +305,9 @@ class Event:
     #: ``lastEditedAt``: an edit is a reply too, so a non-Lander event dates from its latest edit,
     #: and any edit at or after the hold, a Lander event's included, hands the turn back.
     edited: datetime | None = None
+    #: A PR review, not an issue comment. A review is never an ack: its inline thread comments,
+    #: which this script does not read, may hold the reply.
+    review: bool = False
 
     @property
     def latest(self) -> datetime:
@@ -311,7 +319,9 @@ class Event:
 
     @property
     def lander(self) -> bool:
-        return self.trusted and (self.body.startswith(LANDER_PREFIX) or self._marker is not None)
+        return self.trusted and (
+            _LANDER_SIGNATURE.match(self.body) is not None or self._marker is not None
+        )
 
     @property
     def held_at(self) -> str | None:
@@ -320,8 +330,10 @@ class Event:
 
     @property
     def acked_at(self) -> str | None:
-        """The ack's SHA when this event is an author's hold-ack, else ``None``."""
-        return None if not self.trusted or self.dismissed else ack_head(self.body)
+        """The ack's SHA when this event is an author's hold-ack comment, else ``None``."""
+        if not self.trusted or self.dismissed or self.review:
+            return None
+        return ack_head(self.body)
 
 
 _nodes = pr_state._nodes
@@ -369,6 +381,7 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                     and node.get("authorAssociation") in TRUSTED_ASSOCIATIONS,
                     dismissed=node.get("state") == "DISMISSED",
                     edited=edited,
+                    review=kind == "reviews",
                 )
             )
     return out
