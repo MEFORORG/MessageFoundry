@@ -97,6 +97,14 @@ auto-remediate **quietly** (restart, no page) or fire alongside a page. The cont
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
 mode is a possible follow-up).
 
+**Amendment (BACKLOG #1741).** A `connection_stopped` window can end early. When alert-state is
+wired, an operator's start or restart that finds an inbound up raises a `connection_started` that
+resolves the open `connection_stopped` instance and ends that key's window, even while a rule's restart
+is in flight, so a later stop is a new incident that pages and acts at once. No rule's `restart_inbound`
+raises it, so a loop of rule restarts, including two rules restarting each other's inbound, keeps the
+bound above. An operator's resolve by hand does not end the window. `AlertSink.connection_started`
+lists the operator starts that still raise nothing, so leave the window standing.
+
 ## Options considered
 
 1. **Injected async callback, dispatched off-worker, never-raise (chosen).** Keeps the sink decoupled

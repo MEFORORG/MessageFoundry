@@ -3927,7 +3927,11 @@ Router/Handler is user code that can `raise ValueError(f"...{raw}")`, so every v
 write methods — so an HL7-shaped fragment can't land in those columns. HL7-shaped content (segment dumps,
 ≥2-delimiter field runs) is cut while the exception **type** / field **name** is kept; the residual control
 for free-text PHI a script invents (e.g. a bare `"DOE^JANE"`) remains the read-side gate above + the "never
-put PHI in an exception" convention. These columns are also **encrypted at rest on every backend** —
+put PHI in an exception" convention. That convention binds neither a remote peer, whose captured
+reply lands here, nor a library or the runtime, whose exception text can quote a received value
+(`int()` does); for what the scrub misses in that text, only the read-side gate and the encryption
+below remain
+([PHI.md](PHI.md) section 7, *Who the exception-message convention binds*). These columns are also **encrypted at rest on every backend** —
 SQLite, Postgres, **and SQL Server** (H4 brought SQL Server to parity; `docs/PHI.md` §3) — as
 defense-in-depth around the scrub.
 
@@ -3954,8 +3958,8 @@ loopback is always allowed there. The per-connection `source_ip_allowlist` restr
 listener** and deliberately does **not** inherit the loopback carve-out — an allow-list naming a partner
 must not also admit anything running on the local box. **NOTE:** that one is an **`inbound(...)` keyword** (or
 the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
-`[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after`,
-`stream_inflight_budget_bytes` and `max_staged_depth`, and an unrecognized key in a known section is **refused at load** — so
+`[inbound].source_ip_allowlist` service setting. `[inbound]` carries only the keys its catalog in
+[CONFIGURATION.md](CONFIGURATION.md) lists, and an unrecognized key in a known section is **refused at load** — so
 that spelling in `messagefoundry.toml` **fails the start** (`serve` exit 2), naming the section and the
 key. It used to be accepted and silently discarded, which left the listener ungated with nothing
 reporting a problem; that is the failure mode the refusal exists to remove.
@@ -6095,6 +6099,14 @@ bucket each time and is bounded only by the **global** ceiling. The source IP is
 uvicorn runs with `forwarded_allow_ips` built from `settings.api.trusted_proxies` (defaults to `[]`
 = trust nothing; the [`trusted_proxies` row](CONFIGURATION.md) says what is added), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
 in-process per-IP limiter inherently cannot stop pure IP rotation by a **directly-reachable** attacker.
+The sign-in window and the repeated-credential audit budget fold a client address as the
+new-address signals do (BACKLOG #3764 item 3): an IPv4-mapped address such as `::ffff:203.0.113.5`
+draws the bucket of `203.0.113.5`, and every loopback address, `127.0.0.1` and `::1` among them,
+draws one shared bucket, so local callers share one budget. Any other two addresses draw two
+buckets. At least these still split one host: an IPv6 host that moves between addresses in its
+prefix, a zone id on an address that is neither loopback nor IPv4-mapped (`fe80::1%eth0` apart
+from `fe80::1`), and the IPv4-compatible form `::203.0.113.5`. At least the sign-in failure-burst
+signal and the HTTP listener's intake limiter key the raw address text, with no fold.
 The anti-guessing controls that survive rotation are the **global sign-in ceiling** plus the
 **per-account argon2 lockout (5 / 15 min)**, applied to **both** the password and the MFA
 second-factor paths, so guessing of a specific *local* account stays well-bounded **at the login

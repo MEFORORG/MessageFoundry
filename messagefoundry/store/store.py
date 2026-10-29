@@ -7482,6 +7482,24 @@ def _dead_target_pairs(rows: Iterable[tuple[Any, Any]]) -> list[tuple[str, str]]
     return sorted({(str(c), str(d)) for c, d in rows if c and d})
 
 
+# BACKLOG #1726: every channel's newest received_at, as a loose index scan over ix_messages_channel
+# (channel_id, received_at). The recursive member hops to the next distinct channel_id with one index
+# seek, and each channel's MAX is one more, so the cost follows the number of channels rather than
+# the store's lifetime row count, which the GROUP BY it replaced read in full. channel_id is NOT
+# NULL, so the NULL that MIN returns past the last channel (or on an empty table) is the end of the
+# walk and never a channel. PostgresStore runs this same string, so keep it portable to both
+# dialects: no SQLite-only syntax such as INDEXED BY, and no parameters.
+_LAST_RECEIVED_SQL: Final[str] = (
+    "WITH RECURSIVE ch(channel_id) AS ("
+    " SELECT MIN(channel_id) FROM messages"
+    " UNION ALL"
+    " SELECT (SELECT MIN(m.channel_id) FROM messages m WHERE m.channel_id > ch.channel_id)"
+    " FROM ch WHERE ch.channel_id IS NOT NULL)"
+    " SELECT channel_id,"
+    " (SELECT MAX(m.received_at) FROM messages m WHERE m.channel_id = ch.channel_id) AS last_at"
+    " FROM ch WHERE channel_id IS NOT NULL"
+)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
@@ -18187,9 +18205,7 @@ class MessageStore:
             (MessageStatus.ERROR.value, since),
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in await cur.fetchall()}
-        cur = await db.execute(
-            "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
-        )
+        cur = await db.execute(_LAST_RECEIVED_SQL)
         inbound: dict[str, InboundMetrics] = {}
         for r in await cur.fetchall():
             read, errored = counts.pop(r["channel_id"], (0, 0))
