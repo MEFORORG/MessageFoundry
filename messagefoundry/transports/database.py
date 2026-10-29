@@ -51,7 +51,7 @@ import logging
 import os
 import re
 import weakref
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
@@ -206,10 +206,12 @@ def _build_dsn(
     with read-only routing, that intent sends the connection to a readable secondary, whose data can
     lag the primary's. It is defense-in-depth for the ADR 0010 read-only carve-out, layered with the
     statement guard in :func:`_require_read_only`. **Neither layer is read-only authority.**
-    ApplicationIntent acts only inside an availability group, where read-only routing or a replica's
-    ``ALLOW_CONNECTIONS`` setting reads it, and a primary set to ``READ_WRITE`` refuses it; outside
-    one it is a no-op. A statement guard is a shape test on text. The control that actually refuses a write is the privilege of the account this
-    DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
+    ApplicationIntent is read at least by an Always On availability group, where read-only routing
+    or a replica's ``ALLOW_CONNECTIONS`` setting acts on it and a primary set to ``READ_WRITE``
+    refuses it, and by Azure SQL read scale-out, which sends it to a read-only replica. Where nothing
+    reads it, it changes nothing. A statement guard is a shape test on text. The control that
+    actually refuses a write is the privilege of the account this DSN dials, which only the operator
+    can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
@@ -1458,7 +1460,8 @@ class AutocommitNotConfirmed(RuntimeError):
     """A connection from an autocommit pool could not be put in autocommit mode (BACKLOG #2148).
 
     The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
-    on it until a later borrow has set the mode. The text names neither the DSN nor the server."""
+    on it until a later borrow has set the mode. A setter that raised a driver error instead has its
+    connection closed and dropped. The text names neither the DSN nor the server."""
 
 
 def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
@@ -1543,9 +1546,39 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
         logger.debug("DATABASE: returning a pooled connection failed: %s", safe_exc(exc))
 
 
+async def _discard_connection(pool: Any, conn: Any) -> None:
+    """Close ``conn``, then hand it back to ``pool``, which drops a closed connection. Call it only
+    once no worker thread is inside a call on ``conn``: closing under a running call frees handles
+    that call is using (BACKLOG #2049). Never raises but a cancellation; the release is in a
+    ``finally`` so a cancellation during the close still returns the slot.
+
+    For a connection whose autocommit set RAISED. That is a driver error, often a dead link, and a
+    dead connection returned open would be handed out, and fail, on every later borrow. Closed, it
+    is dropped and the pool dials a fresh one. aioodbc may not wake a borrower already waiting for
+    a free slot when the slot it frees held a closed connection; that borrower then waits out its
+    ``acquire_timeout``, a transient failure, which is the lesser cost."""
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - the set's own failure is the error that matters
+        logger.warning(
+            "DATABASE: closing a pooled connection whose autocommit set failed did not succeed; "
+            "it goes back to the pool and is set again on its next borrow: %s",
+            safe_exc(exc),
+        )
+    finally:
+        await _return_to_pool(pool, conn)
+
+
 #: Connections returned after their borrower stopped waiting. The loop holds a task only weakly
 #: (ruff RUF006), so this set keeps each one alive until it ends.
 _DETACHED_SETTLES: set[asyncio.Task[None]] = set()
+
+
+def _detach(coro: Coroutine[Any, Any, None]) -> None:
+    """Run ``coro`` with no awaiting caller, kept alive in :data:`_DETACHED_SETTLES` until it ends."""
+    task = asyncio.ensure_future(coro)
+    _DETACHED_SETTLES.add(task)
+    task.add_done_callback(_DETACHED_SETTLES.discard)
 
 
 def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: str) -> None:
@@ -1554,12 +1587,13 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
 
     **Never return a connection while a worker thread may still be using it.** A thread inside a
     pyodbc call on a connection the pool hands to the next borrower is concurrent use of one ODBC
-    handle, the crash shape BACKLOG #2049 recorded. A ``work`` that completed, with a result or an
-    exception, has seen its thread finish. A CANCELLED ``work`` has not: a task cancel, such as loop
-    teardown cancelling every task, ends the await and leaves the thread running, and nothing then
-    says when it ends. So that connection is kept out of the pool, and logged. It is not closed
-    either, since closing it under a running call is the same crash. The slot stays in use for the
-    pool's life, which costs a slot on a pool that is being torn down anyway."""
+    handle, the crash shape BACKLOG #2049 recorded. A ``work`` the thread resolved
+    (:func:`_thread_settled`) proves it, and is never cancelled, so on that path the connection
+    always goes back. Only the fallback for a cursor with no raw pyodbc cursor (a test double, or an
+    aioodbc that renamed ``_impl``) passes a task, and a CANCELLED task proves nothing: loop
+    teardown cancels every task and leaves the thread running. That connection is kept out of the
+    pool, and logged. Not closed either, since that is the same crash. It then holds any
+    ``wait_closed`` on its pool, so this fallback is a known cost, logged when it happens."""
 
     def _done(finished: asyncio.Future[Any]) -> None:
         if finished.cancelled():
@@ -1569,9 +1603,7 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
                 what,
             )
             return
-        task = asyncio.ensure_future(_return_to_pool(pool, conn))
-        _DETACHED_SETTLES.add(task)
-        task.add_done_callback(_DETACHED_SETTLES.discard)
+        _detach(_return_to_pool(pool, conn))
 
     work.add_done_callback(_done)
 
@@ -1641,21 +1673,24 @@ class _AutocommitPool:
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
+            # No driver call has run on it before this succeeds: _thread_settled raises at once
+            # if the default executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
-        except AutocommitNotConfirmed:
-            await _return_to_pool(self._pool, conn)  # no driver call was made on it
+            work = _thread_settled(partial(_set_and_read_autocommit, raw))
+        except (AutocommitNotConfirmed, RuntimeError):
+            await _return_to_pool(self._pool, conn)
             raise
-        work = _thread_settled(partial(_set_and_read_autocommit, raw))
         try:
             kept = await asyncio.shield(work)
-        except asyncio.CancelledError:
-            work.add_done_callback(partial(self._note_detached, conn))
-            _return_when_settled(self._pool, conn, work, "an autocommit set")
-            raise
-        except Exception:
-            # The thread resolved ``work``, so no driver call is running on this connection. A
-            # GeneratorExit or other BaseException is let through without an await.
-            await _return_to_pool(self._pool, conn)
+        except BaseException as exc:
+            if work.done() and isinstance(exc, Exception):
+                # The thread resolved ``work`` with a driver error, so no call is running on it.
+                await _discard_connection(self._pool, conn)
+            else:
+                # The borrower left (a cancel, or the coroutine closed) while the thread may still
+                # be inside the setter. Settled when the thread resolves ``work``, never sooner,
+                # and with no await here, so GeneratorExit is let through too.
+                work.add_done_callback(partial(self._settle_detached, conn))
             raise
         if not kept:
             await _return_to_pool(self._pool, conn)
@@ -1666,22 +1701,33 @@ class _AutocommitPool:
         self._mark_confirmed(conn)
         return conn
 
-    def _note_detached(self, conn: Any, work: asyncio.Future[bool]) -> None:
-        """Mark ``conn`` confirmed if a set its borrower abandoned passed, or log why it did not:
-        no borrower is left to raise that to (CLAUDE.md section 6). A done callback, so it never
-        raises. Returning the connection is :func:`_return_when_settled`'s, registered after this
-        callback, so the mark lands first."""
-        if work.cancelled():
-            return  # _return_when_settled logs it and keeps the connection out
+    def _settle_detached(self, conn: Any, work: asyncio.Future[bool]) -> None:
+        """Settle ``conn`` once the thread has resolved a set its borrower abandoned: marked
+        confirmed and returned if it passed, logged (no borrower is left to raise to, CLAUDE.md
+        section 6) and returned unconfirmed if it was not kept, discarded if the driver raised. A
+        done callback, so it never raises. ``work`` is a :func:`_thread_settled` future, which only
+        its thread completes, so this runs only once the setter has returned (PR 2593 review)."""
+        if work.cancelled():  # nothing cancels a _thread_settled future; refuse to guess if one is
+            logger.warning(
+                "DATABASE: an abandoned autocommit set was cancelled before its worker thread was "
+                "known to have ended, so the connection is kept out of the pool"
+            )
+            return
         failure = work.exception()
         if failure is None and work.result():
             self._mark_confirmed(conn)
+            _detach(_return_to_pool(self._pool, conn))
             return
         logger.warning(
-            "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
-            "back unconfirmed and is set again on its next borrow",
+            "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection is "
+            "%s",
             "not kept" if failure is None else safe_exc(failure),
+            "returned unconfirmed" if failure is None else "discarded",
         )
+        if failure is None:
+            _detach(_return_to_pool(self._pool, conn))
+        else:
+            _detach(_discard_connection(self._pool, conn))
 
     async def release(self, conn: Any) -> None:
         await self._pool.release(conn)
@@ -1775,22 +1821,50 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     aioodbc closes a cursor on a worker thread, and a cursor close can take a while, since the
     driver may discard unread rows. A cancellation that lands during it ends the await and leaves
     the thread running. Releasing then, as a ``finally`` did, hands the connection to the next
-    borrower while another thread is still inside the driver on it. So the close is shielded: the
-    caller's cancellation goes through at once, and the connection goes back only when the close
-    task has finished, which is when its thread has. It still goes back, so a later
-    ``wait_closed`` does not wait forever. A close task that is itself cancelled, as loop teardown
-    cancels every task, proves nothing about its thread, so that connection is kept out of the
-    pool (:func:`_return_when_settled`)."""
+    borrower while another thread is still inside the driver on it. So the close runs on
+    :func:`_thread_settled` against aioodbc's raw pyodbc cursor (``_impl``, as ``store/sqlserver.py``
+    reads it), and is shielded: the caller's cancellation goes through at once, and the connection
+    goes back only when the thread has resolved the close. No task cancel can resolve it, loop
+    teardown's included, so the connection always does go back, and a later ``wait_closed`` waits
+    only for the close itself.
+
+    **What this does not cover.** A cancellation that lands during ``conn.cursor()``,
+    ``execute`` or a fetch, which also run on aioodbc's worker threads, reaches this function while
+    that call may still be running; this close then runs beside it. That is the same defect class,
+    wider than this function, and not closed here. A cursor with no ``_impl`` (a test double, or an
+    aioodbc that renamed it) is closed through its own ``close()`` as a task, and a teardown cancel
+    of that task keeps the connection out of the pool (:func:`_return_when_settled`)."""
     if cur is None:
         await pool.release(conn)
         return
-    close = asyncio.ensure_future(_close_cursor(cur))
+    raw_cur = getattr(cur, "_impl", None)
+    work: asyncio.Future[Any]
+    if raw_cur is not None:
+        try:
+            work = _thread_settled(partial(_close_raw_cursor, raw_cur))
+        except RuntimeError as exc:
+            # The default executor is shut down: no close thread started, so none runs on it.
+            # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
+            logger.debug("DATABASE: cursor close not run, executor shut down: %s", exc)
+            await pool.release(conn)
+            return
+    else:
+        work = asyncio.ensure_future(_close_cursor(cur))
     try:
-        await asyncio.shield(close)
-    except asyncio.CancelledError:
-        _return_when_settled(pool, conn, close, "a cursor close")
+        await asyncio.shield(work)
+    except BaseException:
+        _return_when_settled(pool, conn, work, "a cursor close")
         raise
     await pool.release(conn)
+
+
+def _close_raw_cursor(raw_cur: Any) -> None:
+    """On a worker thread: close a pyodbc cursor. Never raises, as :func:`_close_cursor` never
+    does: a close failure must not mask the caller's outcome or skip the release."""
+    try:
+        raw_cur.close()
+    except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
+        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
 
 
 async def _probe_db(
@@ -2561,7 +2635,8 @@ def _lookup_max_rows(value: Any, connection: str) -> int | None:
     """Read one lookup connection's ``max_rows``: a positive ceiling, or ``None`` for the documented
     ``0`` opt-out. Unset (``None``) takes :data:`DEFAULT_DB_LOOKUP_MAX_ROWS`.
 
-    Anything but a whole, non-negative number is refused at construction, which ``serve`` reaches at
+    Zero in any spelling, an empty ``env()`` value included, is the opt-out; anything else but a
+    whole, positive number is refused at construction, which ``serve`` reaches at
     start and ``messagefoundry check`` reaches in its build leg. The rule is :func:`max_rows_setting`."""
     return max_rows_setting(
         value, label=f"DatabaseLookup {connection!r}", default=DEFAULT_DB_LOOKUP_MAX_ROWS
@@ -2599,8 +2674,8 @@ class DatabaseLookupExecutor:
     Two layers sit in front of a lookup: :func:`_require_read_only` refuses a statement that does not
     open with SELECT/WITH or that carries a write/EXEC keyword or a chained statement, and the pool DSN
     carries ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Neither is authority.
-    ApplicationIntent acts only inside an availability group (:func:`_build_dsn` says what it does
-    there) and grants no authority anywhere. Pools here are opened **autocommit**, so a write that
+    :func:`_build_dsn` says which servers act on ApplicationIntent and how; it grants no authority
+    anywhere. Pools here are opened **autocommit**, so a write that
     got past the statement test would commit rather than be rolled back. What actually bounds this connection is the
     privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
     (BACKLOG #1574). ADR 0010's *Scope* consequence says this executor never commits; a dated

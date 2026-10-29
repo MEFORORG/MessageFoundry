@@ -202,10 +202,9 @@ def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None =
     ``dialect``. The per-connection attestation is read and validated here too (#200).
 
     The DSN advertises ``ApplicationIntent=ReadOnly``, as the ``db_lookup`` DSN does (BACKLOG #2617).
-    Against an Always On listener with read-only routing, the sync then reads a readable secondary,
-    whose data can lag the primary's. An availability-group replica's ``ALLOW_CONNECTIONS`` setting
-    can also refuse a read-intent connection, as a primary set to ``READ_WRITE`` does; outside an
-    availability group the keyword changes nothing (docs/CONNECTIONS.md)."""
+    Which servers act on it, and how, is stated once in ``transports.database._build_dsn``: at least
+    a read-only replica can serve the sync, with lagging data, and a ``READ_WRITE`` primary can
+    refuse it (docs/CONNECTIONS.md)."""
     from messagefoundry.transports.database import _build_dsn
 
     attested = hop_attestation_from_settings(settings)
@@ -309,8 +308,8 @@ async def _load_database_source(
             columns = [d[0] for d in cur.description]
             rows = await _fetch_reference_rows(cur, limit, name)
         finally:
-            # Releases even when a cancellation lands during the cursor close, or the wait_closed
-            # below would wait for the connection forever.
+            # A cancellation during the cursor close returns the connection once the close's thread
+            # has ended, never before, so the wait_closed below waits for that close and no longer.
             await _close_and_release(pool, conn, cur)
     finally:
         pool.close()

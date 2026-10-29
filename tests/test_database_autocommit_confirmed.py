@@ -191,6 +191,30 @@ async def test_a_connection_that_does_not_keep_autocommit_is_refused_and_set_aga
     assert inner.conn.executed_under == []
 
 
+class _RaisingRaw(_RawConnection):
+    """A driver whose autocommit setter raises, as a dead link does (SQLSTATE 08S01)."""
+
+    @property
+    def autocommit(self) -> bool:
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        raise ConnectionError("08S01")
+
+
+async def test_a_setter_that_raises_discards_the_connection(driver: _Driver) -> None:
+    """A dead connection returned open would be handed out, and fail, on every later borrow
+    (PR 2593 covering review). The setter's thread has ended, so closing it here is safe."""
+    pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
+    inner = driver.pools[0]
+    inner.conn = _Connection(_RaisingRaw())
+    with pytest.raises(ConnectionError):
+        await _acquire(pool, 5.0)
+    assert inner.conn.closed is True
+    assert inner.released == [inner.conn]
+
+
 async def test_a_connection_with_no_driver_handle_is_refused(driver: _Driver) -> None:
     """Fail closed: a connection whose mode cannot be set is not handed out as autocommit."""
     pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
@@ -256,24 +280,37 @@ async def test_a_borrow_abandoned_mid_set_keeps_its_bound_and_never_closes_under
     assert raw.autocommit is True and inner.conn.closed is False  # the set passed: returned, kept
 
 
-class _ThreadCloseCursor(_Cursor):
-    """A cursor whose close runs on a worker thread, as aioodbc's does, and hangs there until
-    released. ``running`` is True while the thread is inside the close."""
+class _RawCursor:
+    """A pyodbc cursor whose close hangs on its thread until released."""
 
-    def __init__(self, conn: _Connection) -> None:
+    def __init__(self, owner: _ThreadCloseCursor) -> None:
+        self._owner = owner
+
+    def close(self) -> None:
+        self._owner.blocking_close()
+
+
+class _ThreadCloseCursor(_Cursor):
+    """A cursor whose close runs on a worker thread and hangs there until released. With
+    ``raw=True`` it carries a pyodbc cursor on ``_impl``, as aioodbc 0.5.0's does; without it, only
+    its own async ``close()``. ``running`` is True while the thread is inside the close."""
+
+    def __init__(self, conn: _Connection, *, raw: bool) -> None:
         super().__init__(conn)
         self.entered = threading.Event()
         self.proceed = threading.Event()
         self.running = False
+        if raw:
+            self._impl = _RawCursor(self)
+
+    def blocking_close(self) -> None:
+        self.running = True
+        self.entered.set()
+        self.proceed.wait(10)
+        self.running = False
 
     async def close(self) -> None:
-        def _close() -> None:
-            self.running = True
-            self.entered.set()
-            self.proceed.wait(10)
-            self.running = False
-
-        await asyncio.to_thread(_close)
+        await asyncio.to_thread(self.blocking_close)
 
 
 def _recording_pool(conn: _Connection, cur: _ThreadCloseCursor) -> tuple[_Pool, list[bool]]:
@@ -297,13 +334,25 @@ async def _until(predicate: Any, seconds: float = 5.0) -> None:
         await asyncio.sleep(0.01)
 
 
-async def test_a_cancelled_cursor_close_returns_the_connection_only_after_the_close_ends() -> None:
+def _cancel_tasks_since(before: set[asyncio.Task[Any]]) -> None:
+    """Cancel every task this test created, as loop teardown would, and none it did not: the test
+    loop is shared across the session, so another test's tasks are left alone."""
+    me = asyncio.current_task()
+    for other in asyncio.all_tasks() - before:
+        if other is not me:
+            other.cancel()
+
+
+@pytest.mark.parametrize("raw", [True, False], ids=["raw-cursor", "fallback"])
+async def test_a_cancelled_cursor_close_returns_the_connection_only_after_the_close_ends(
+    raw: bool,
+) -> None:
     """The Lander hold on PR 2593: a cancellation during the cursor close released the connection
     at once, while the worker thread was still closing the cursor on it, so the next borrower could
     reach a handle another thread was using. Now the slot goes back only once the close has ended,
     and it still goes back, so ``wait_closed`` does not wait forever."""
     conn = _Connection(_RawConnection())
-    cur = _ThreadCloseCursor(conn)
+    cur = _ThreadCloseCursor(conn, raw=raw)
     pool, while_running = _recording_pool(conn, cur)
     task = asyncio.ensure_future(_close_and_release(pool, conn, cur))
     await asyncio.to_thread(cur.entered.wait, 5)
@@ -318,20 +367,39 @@ async def test_a_cancelled_cursor_close_returns_the_connection_only_after_the_cl
     assert while_running == [False]
 
 
-async def test_a_cursor_close_cancelled_at_teardown_keeps_the_connection_out_of_the_pool(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Loop teardown cancels every task, the close task included. Its worker thread may still be
-    running, and nothing can tell when it ends, so the connection is never handed back."""
+async def test_a_raw_cursor_close_cancelled_at_teardown_still_returns_the_connection() -> None:
+    """Loop teardown cancels every task. The raw close's future is resolved by its thread, which no
+    task cancel reaches, so the connection still goes back, after the thread, and a
+    ``wait_closed`` on the pool waits for the close and no longer (PR 2593 covering review)."""
     conn = _Connection(_RawConnection())
-    cur = _ThreadCloseCursor(conn)
+    cur = _ThreadCloseCursor(conn, raw=True)
     pool, while_running = _recording_pool(conn, cur)
+    before = asyncio.all_tasks()
     task = asyncio.ensure_future(_close_and_release(pool, conn, cur))
     await asyncio.to_thread(cur.entered.wait, 5)
-    me = asyncio.current_task()
-    for other in asyncio.all_tasks():
-        if other is not me:
-            other.cancel()
+    _cancel_tasks_since(before)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+    assert pool.released == []  # still closing
+    cur.proceed.set()
+    await _until(lambda: pool.released)
+    assert pool.released == [conn]
+    assert while_running == [False]
+
+
+async def test_a_fallback_close_cancelled_at_teardown_keeps_the_connection_out_of_the_pool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cursor with no raw pyodbc cursor is closed as a task, and a teardown cancel of that task
+    says nothing about its thread. That connection is never handed back, and the log says so."""
+    conn = _Connection(_RawConnection())
+    cur = _ThreadCloseCursor(conn, raw=False)
+    pool, while_running = _recording_pool(conn, cur)
+    before = asyncio.all_tasks()
+    task = asyncio.ensure_future(_close_and_release(pool, conn, cur))
+    await asyncio.to_thread(cur.entered.wait, 5)
+    _cancel_tasks_since(before)
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0.05)
@@ -361,12 +429,10 @@ async def test_a_confirm_cancelled_at_teardown_never_returns_the_connection_unde
         await release(c)
 
     inner.release = _release  # type: ignore[method-assign,assignment]
+    before = asyncio.all_tasks()
     borrow = asyncio.ensure_future(_acquire(pool, 30.0))
     await asyncio.to_thread(raw.entered.wait, 5)
-    me = asyncio.current_task()
-    for other in asyncio.all_tasks():
-        if other is not me:
-            other.cancel()
+    _cancel_tasks_since(before)
     with pytest.raises(asyncio.CancelledError):
         await borrow
     await asyncio.sleep(0.05)

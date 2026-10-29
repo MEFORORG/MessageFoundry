@@ -895,7 +895,7 @@ def DatabaseRef(
     *,
     server: str | EnvRef,
     database: str | EnvRef,
-    statement: str,
+    statement: str | EnvRef,
     key_column: str,
     value_column: str | None = None,
     auth: str = "sql",
@@ -920,12 +920,13 @@ def DatabaseRef(
     cadence and builds the snapshot from the rows. The statement passes the same read-only statement
     test as a ``db_lookup`` (BACKLOG #2617): it must open with ``SELECT`` or ``WITH``, carry no write,
     ``EXEC`` or DDL keyword outside a literal or comment, and chain no second statement. So a stored
-    procedure is refused. The test runs here, when the set is declared, so every path that loads the
-    config refuses it, and again at every sync. It is a shape test on text, not read-only authority:
-    give the login only ``SELECT`` (docs/CONNECTIONS.md). The connection also advertises
-    ``ApplicationIntent=ReadOnly``; against an Always On listener with read-only routing it is sent to
-    a readable secondary, whose data can lag the primary's, and an availability-group replica that
-    admits only read-write connections refuses it.
+    procedure is refused. A literal statement is tested here, when the set is declared, so every path
+    that loads the config refuses it. An ``env()`` statement has no value here; the build check
+    (``messagefoundry check``'s build leg, reload) tests it once resolved. Every sync tests the
+    statement again. It is a shape test on text, not read-only authority: give the login only
+    ``SELECT`` (docs/CONNECTIONS.md). The connection also advertises ``ApplicationIntent=ReadOnly``;
+    ``transports.database._build_dsn`` says which servers act on it, at least by sending it to a
+    lagging read-only replica or, on a ``READ_WRITE`` availability-group primary, refusing it.
     ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
@@ -951,9 +952,9 @@ def DatabaseRef(
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
-    # BACKLOG #2617: the statement is a literal, so the read-only statement test runs here and every
-    # load path refuses it, not only the build check, which `messagefoundry check` runs only with a
-    # messagefoundry.toml. Imported here: messagefoundry.transports imports this module at its top.
+    # BACKLOG #2617: a literal statement is tested here, so every load path refuses it, not only the
+    # build check, which `messagefoundry check` runs only with a messagefoundry.toml. Imported here:
+    # messagefoundry.transports imports this module at its top level.
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.transports.database import _require_read_only
 
