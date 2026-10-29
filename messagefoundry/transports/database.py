@@ -1505,7 +1505,9 @@ def _release_after_close(pool: Any, conn: Any, _closing: asyncio.Future[None]) -
         try:
             await pool.release(conn)
         except Exception as exc:  # noqa: BLE001 - hygiene only; there is no caller left to inform
-            logger.warning("DATABASE: releasing a connection after a cancel failed: %s", exc)
+            logger.warning(
+                "DATABASE: releasing a connection after a cancel failed: %s", _safe_db_error(exc)
+            )
 
     task = asyncio.ensure_future(_release())
     _DEFERRED_RELEASES.add(task)
@@ -1530,6 +1532,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     try:
         await asyncio.shield(closing)
     except asyncio.CancelledError:
+        # The loop holds the close task weakly too, and its done-callback is the release.
+        _DEFERRED_RELEASES.add(closing)
+        closing.add_done_callback(_DEFERRED_RELEASES.discard)
         closing.add_done_callback(functools.partial(_release_after_close, pool, conn))
         raise
     await pool.release(conn)
@@ -2006,33 +2011,34 @@ class DatabaseSource(SourceConnector):
         **Every wait after a cancel is bounded.** The cut task is joined for at most
         :data:`_CUT_JOIN_TIMEOUT_S`, and the pool close waits at most :data:`_POOL_CLOSE_TIMEOUT_S`,
         so a driver call hung on a thread cannot hold a cancelled stop(). The pool is closed even
-        when the cut task is still running, so a source nobody stops again leaks no connection: one
-        the task still holds is closed when the task releases it. That task stays referenced, and
-        the next stop() joins it. A close failure after a cancel is logged, never raised over it.
+        when the cut task is still running: a connection the task still holds is closed when the
+        task releases it, though a close that times out leaves the connections it had not closed
+        yet to the driver. That task stays referenced, and the next stop() joins it. A close
+        failure after a cancel is logged, never raised over it.
         """
         self._stop.set()
         task = self._task
         try:
             if task is not None:
                 await self._join_poll(task)
-        except BaseException:
+        except (asyncio.CancelledError, Exception):
             await self._finish_stop(task, interrupted=True)
             raise
         await self._finish_stop(task, interrupted=False)
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
-        if task is not None:
+        if task is not None and task.done():
             # A faulted poll task must not re-raise here — stop() runs during reload quiesce,
-            # outside its rollback (mirrors the File source). It is logged instead, by the stop()
-            # that clears it; reading it in every stop() keeps it from going unretrieved.
-            fault = task.exception() if task.done() and not task.cancelled() else None
-            if self._task is not task:
-                return  # an overlapping stop() already owns the log and the close
-            if task.done():
+            # outside its rollback (mirrors the File source). It is logged instead, once, by the
+            # stop() that clears it; reading it in every stop() keeps it from going unretrieved.
+            fault = None if task.cancelled() else task.exception()
+            if self._task is task:
                 self._task = None
                 if fault is not None:
                     logger.warning("DATABASE source poll task failed: %s", safe_exc(fault))
+        if task is not None and self._task is not None and self._task is not task:
+            return  # a later start() made a new poll task, and the pool is now that task's
         try:
             await self.aclose(timeout=_POOL_CLOSE_TIMEOUT_S if interrupted else None)
         except Exception as exc:
@@ -2055,6 +2061,10 @@ class DatabaseSource(SourceConnector):
                     await self._row_grace(task)
             finally:
                 task.cancel()  # a no-op once the task has finished
+                if self._row_step_task is task:
+                    # Cut: a later cancelled stop() must not grant this task a grace again while it
+                    # only finishes a cursor close.
+                    self._row_step_task = None
                 # wait, not gather, again: a further cancel is not forwarded into the task, and the
                 # timeout bounds a task a driver call holds.
                 await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
@@ -2073,11 +2083,20 @@ class DatabaseSource(SourceConnector):
         it within that interval."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _ROW_STEP_GRACE_S
-        while not task.done() and self._leads():
+        while not task.done() and self._leads_or_cut():
             left = deadline - loop.time()
             if left <= 0:
                 return
             await asyncio.wait({task}, timeout=min(left, _LEADER_RECHECK_S))
+
+    def _leads_or_cut(self) -> bool:
+        """:meth:`_leads` for the row grace: a gate that raises ends the grace rather than
+        replacing the cancel stop() is handling."""
+        try:
+            return self._leads()
+        except Exception as exc:  # noqa: BLE001 - the cancel in flight is the outcome that matters
+            logger.warning("DATABASE source leader gate failed; cutting the row step: %s", exc)
+            return False
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -2354,16 +2373,21 @@ class DatabaseSource(SourceConnector):
     async def aclose(self, *, timeout: float | None = None) -> None:
         """Close the pool, waiting at most ``timeout`` seconds when one is given (BACKLOG #1620).
 
-        The reference is dropped before the wait, so neither a cancel nor the timeout leaves this
-        source holding a closing pool; the next :meth:`_get_pool` opens a fresh one. On a timeout
-        the connections the pool had not yet closed are left to the driver."""
-        pool, self._pool = self._pool, None
+        Unbounded, the reference is kept until the close succeeds, so a stop() retried after a
+        failed close finishes it. Bounded, it is dropped before the wait, so neither a cancel nor
+        the timeout leaves this source holding a closing pool; the next :meth:`_get_pool` opens a
+        fresh one, and on a timeout the connections the pool had not yet closed are left to the
+        driver."""
+        pool = self._pool
         if pool is None:
             return
         pool.close()
         if timeout is None:
             await pool.wait_closed()
+            if self._pool is pool:
+                self._pool = None
             return
+        self._pool = None
         try:
             await asyncio.wait_for(pool.wait_closed(), timeout)
         except TimeoutError:

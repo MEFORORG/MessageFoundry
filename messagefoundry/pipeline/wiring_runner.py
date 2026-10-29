@@ -5704,7 +5704,8 @@ class RegistryRunner:
             log.warning(
                 "demotion: %d inbound listener(s) did not stop within %.2fs and were ABANDONED "
                 "(their listening sockets are already closed; the client drain finishes in the "
-                "background and is settled at the next promotion). The node is NOT quiescent — a "
+                "background; the next demotion cancels it, and engine shutdown settles it). The "
+                "node is NOT quiescent — a "
                 "message mid-handler still finishes its commit and its ACK, which count-and-log "
                 "requires; the successor drains the body.",
                 len(still),

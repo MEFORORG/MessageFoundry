@@ -1480,6 +1480,31 @@ async def test_the_pool_close_is_bounded() -> None:
     assert pool.closed and src._pool is None
 
 
+async def test_a_failed_unbounded_pool_close_is_retried_by_the_next_stop() -> None:
+    """An uncancelled stop() keeps the pool until its close succeeds, so a retried stop() finishes
+    the close. Mutation: drop the reference before the unbounded wait. Red: the retry sees no pool
+    and the close is never finished."""
+
+    class _FailOnce(_SrcPool):
+        def __init__(self, conn: _SrcConn) -> None:
+            super().__init__(conn)
+            self.attempts = 0
+
+        async def wait_closed(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("close failed")
+
+    src = _src(body_column="payload")
+    pool = _FailOnce(_SrcConn(_SrcCursor([], [])))
+    src._pool = pool
+    with pytest.raises(RuntimeError):
+        await src.stop()
+    assert src._pool is pool
+    await src.stop()
+    assert pool.attempts == 2 and src._pool is None
+
+
 @pytest.mark.parametrize("leader", [True, False])
 async def test_the_row_grace_is_fenced_on_leadership(
     monkeypatch: pytest.MonkeyPatch, leader: bool

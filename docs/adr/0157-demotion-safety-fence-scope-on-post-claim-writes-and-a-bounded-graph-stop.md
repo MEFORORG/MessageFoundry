@@ -1251,9 +1251,9 @@ At least these, read 2026-10-26:
   `_POOL_CLOSE_TIMEOUT_S`, with the reference dropped before the wait. A cancelled Database
   `stop()` therefore returns within the row grace plus those two bounds of the first cancel,
   behind a driver call hung on a thread too. A task still running stays referenced, and the next
-  `stop()` joins it. Its connections are not leaked if no `stop()` follows, because the pool was closed
-  under it and closes each connection as the task releases it. A cursor close is shielded from a
-  cancel, and its connection is released only once the close has finished
+  `stop()` joins it. If no `stop()` follows, the connection it holds is still closed, because the
+  pool was closed under it and closes each connection as the task releases it. A cursor close is
+  shielded from a cancel, and its connection is released only once the close has finished
   (`_close_and_release`), so a cut neither leaves the pool waiting on a connection nobody returns
   nor hands the next borrower a connection whose cursor close is still running. It waits for the
   close only: a statement the cancel abandoned on a driver thread is not waited for. A pool close
