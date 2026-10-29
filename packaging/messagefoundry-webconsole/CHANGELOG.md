@@ -31,11 +31,13 @@ this line.**
 
 ### Security
 
-- **The passkey registration finish no longer spends the ceremony budget on a session it refuses
-  for owing a factor, and its 429 sends `Retry-After: 30`.** `POST /ui/account/webauthn/verify`
-  asks `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, so a
-  password holder refused there in a loop no longer throttles the real user's ceremonies; the
-  admin-write floor its gate charges first is unchanged. Its 429 now sends the constant the other
+- **The passkey registration finish no longer spends the ceremony budget on a session the factor
+  rule refuses, and its 429 sends `Retry-After: 30`.** `POST /ui/account/webauthn/verify` asks
+  `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, and skips
+  the draw for a refused session, auditing each such request as `auth.mfa_denied` instead. This
+  route no longer spends the real user's budget for such a session; `POST /ui/mfa` and
+  `POST /ui/reauth`, which a pending session also reaches, still draw it, and the admin-write
+  floor this route's gate charges first is unchanged. Its 429 now sends the constant the other
   console ceremony 429s on that budget send. No seam change. (BACKLOG #3690)
 - **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
   and still clears the cookie when the sign-out's audit row fails.** A retired cookie that

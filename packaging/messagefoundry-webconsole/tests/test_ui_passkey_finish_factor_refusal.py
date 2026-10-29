@@ -105,8 +105,9 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: the route stops reaching the service's factor refusal, answers it as anything but
-    a 400 the page's fetch can read, stores a passkey, stamps the session, or charges the per-actor
-    ceremony budget for a request the finish refuses for owing a factor (BACKLOG #3690 items 4, 6).
+    a 400 the page's fetch can read, stores a passkey, stamps the session, charges the per-actor
+    ceremony budget for a request the factor rule refuses (BACKLOG #3690 items 4, 6), or leaves such
+    a request unaudited.
     """
     service = await _service(engine)
     identity, token = await _sign_in(service)
@@ -130,8 +131,14 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     assert calls == [], f"a session the finish refuses was charged: {calls}"
     assert await service.store.list_webauthn_credentials(identity.user_id) == []
     assert await service.mfa_satisfied(token) is False
-    rows = await service.store.list_audit(action="auth.mfa_denied")
-    assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    # Each uncharged request leaves a row, as #1973's refusals do, since none reaches the 429's
+    # WARNING line; the service adds one when it ends the ceremony.
+    paths = [
+        json.loads(r["detail"])["path"]
+        for r in await service.store.list_audit(action="auth.mfa_denied")
+    ]
+    assert paths.count(_VERIFY) == 3
+    assert paths.count("finish_webauthn_registration") == 1
 
 
 async def test_the_route_still_charges_a_finish_it_lets_through(
@@ -156,16 +163,21 @@ async def test_the_routes_429_sends_the_ceremony_retry_after(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: the passkey finish's 429 sends no ``Retry-After``, or one other than the constant
-    the other console ceremony 429s on the same budget send (BACKLOG #3690 item 5). The ceremony
-    survives the throttle, so nothing is stored."""
+    the other console ceremony 429s on the same budget send (BACKLOG #3690 item 5), or the 429
+    ends the ceremony: the same response must still finish once the budget allows it."""
     service = await _service(engine)
     identity, token = await _sign_in(service)
     body = await _staged_body(service, identity, token)
+    real = service.allow_reauth_attempt
     monkeypatch.setattr(service, "allow_reauth_attempt", lambda _actor: False)
 
     async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
         c.cookies.set("mf_session", token)
         refused = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
-    assert refused.status_code == 429 and refused.json()["ok"] is False, refused.text
-    assert refused.headers["Retry-After"] == "30"
-    assert await service.store.list_webauthn_credentials(identity.user_id) == []
+        assert refused.status_code == 429 and refused.json()["ok"] is False, refused.text
+        assert refused.headers["Retry-After"] == "30"
+        assert await service.store.list_webauthn_credentials(identity.user_id) == []
+
+        monkeypatch.setattr(service, "allow_reauth_attempt", real)
+        served = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+    assert served.status_code == 200 and served.json()["ok"] is True, served.text
