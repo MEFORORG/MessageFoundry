@@ -791,7 +791,11 @@ def test_a_zoned_hop_misses_the_zoneless_host_entry_and_becomes_the_client() -> 
     """BACKLOG #3764 item 1: the gap the refusal's advice leaves, pinned as the trusted_proxies row
     of docs/CONFIGURATION.md states it. uvicorn compares a host entry's zone, so a hop an inner
     proxy writes WITH its zone misses the zoneless host the refusal recommends and becomes the
-    client address. The one-address network matches it, on any zone."""
+    client address.
+
+    The one-address network ``fe80::1/128`` loads and does match the zoned hop, on any zone. That is
+    pinned here as a measurement only: whether to advise it is an open question, since the zoned
+    network refusal names trusting an address on every interface as its reason."""
     from uvicorn.middleware.proxy_headers import _TrustedHosts
 
     from messagefoundry.config.settings import uvicorn_trusted_hosts
@@ -824,8 +828,9 @@ _ZONED_HOP_CAVEAT_TEXT = (
     ],
 )
 def test_the_zoned_host_refusal_states_the_gap_its_advice_leaves(entry: str, advice: str) -> None:
-    """BACKLOG #3764 item 1: each refusal that advises a zoneless host says what that leaves open,
-    and never echoes the zone, which ipaddress takes almost unchecked.
+    """BACKLOG #3764 item 1: each refusal that advises a zoneless host says what that leaves open.
+    The caveat names no zone, which ipaddress takes almost unchecked; the entry itself is quoted
+    escaped, so a newline in it never reaches the message raw.
 
     Mutation: drop ``_ZONED_HOP_CAVEAT`` from either refusal. Red: the caveat assertion."""
     with pytest.raises(ValidationError) as exc:

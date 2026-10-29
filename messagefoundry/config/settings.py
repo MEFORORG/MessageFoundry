@@ -1346,7 +1346,7 @@ _TRUST_ALL_PROXIES_REFUSAL = (
 
 _ZONED_HOST = (
     "an IPv6 entry with a zone. The engine reports every peer without its zone and uvicorn "
-    "compares a host entry's zone, so uvicorn would parse this entry and match no peer, "
+    "compares a host entry's zone, so uvicorn would parse this entry and match no socket peer, "
     "collapsing every client source IP to the proxy."
 )
 _ZONED_NETWORK = (
@@ -1359,7 +1359,7 @@ _ZONED_NETWORK = (
 _ZONED_HOP_CAVEAT = (
     "A hop an inner proxy writes into X-Forwarded-For with a zone will not match '{host}', and "
     "becomes the client address; the trusted_proxies row of docs/CONFIGURATION.md says what "
-    "that costs and which entry matches such a hop."
+    "that costs."
 )
 
 #: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
