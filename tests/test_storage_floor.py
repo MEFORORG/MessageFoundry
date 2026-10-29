@@ -119,6 +119,7 @@ def _write_quiet_config(tmp_path: Path, extra: str = "") -> None:
         "security.delete_message_bodies_after_days = 30\n"
         "retention.dead_letter_days = 30\n"
         "retention.reference_snapshot_days = 30\n"
+        "retention.processed_archive_days = 30\n"
         "retention.state_max_age_days = 30\n"
         "retention.search_preset_days = 30\n"
         "security.local_access_only = true\n" + extra,

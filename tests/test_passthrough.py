@@ -767,10 +767,10 @@ def _file_graph(inbox: Any, outdir: Any, *, with_pt: bool) -> Registry:
 
 
 def _patch_load_config(monkeypatch: Any, registry: Registry) -> None:
-    """Make engine.reload()'s ``load_config(path)`` return ``registry`` (it runs in a thread, so the
-    target imported into the engine module is what we patch)."""
+    """Make engine.reload()'s ``load_config(path, snapshot=...)`` return ``registry`` (it runs in a
+    thread, so the target imported into the engine module is what we patch)."""
     monkeypatch.setattr(
-        "messagefoundry.pipeline.engine.load_config", lambda _path: registry, raising=True
+        "messagefoundry.pipeline.engine.load_config", lambda _path, **_kw: registry, raising=True
     )
 
 

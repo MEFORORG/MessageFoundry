@@ -33,7 +33,7 @@ import aiosqlite
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.api.app import _alert_reconcile_plan
+from messagefoundry.api.app import _OUTAGE_ALERT_SOURCE, _alert_reconcile_plan
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
@@ -72,6 +72,7 @@ from messagefoundry.store.store import (
     audit_row_hash,
 )
 from tests._admin_account import create_local_user_chosen
+from tests.test_ad_user_account_control import _InverseSink
 from tests.test_approval_requester_recheck import _Sink
 from tests.test_user_seal import _raw_for
 
@@ -2489,10 +2490,220 @@ async def test_an_outage_beside_an_id_less_row_counts_only_the_probes_asked(
             for a in await store.list_audit()
             if a["action"] == "auth.ad_reconcile_skipped"
         ]
-        assert skipped == [{"reason": "directory_unavailable", "asked": 2}]
+        assert skipped == [{"reason": "directory_unavailable", "asked": 2, "passes": 1}]
         warned = [r.getMessage() for r in caplog.records if "probes failed" in r.getMessage()]
         assert len(warned) == 1 and "ALL 2 probes failed" in warned[0]
         assert (plan.probed, plan.asked, plan.unavailable) == (3, 2, 2)
+    finally:
+        await store.close()
+
+
+def _outage_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]]]:
+    return [e for e in sink.events if e[1] == _OUTAGE_ALERT_SOURCE]
+
+
+async def _outage_service(store: MessageStore, **over: object) -> tuple[AuthService, _FakeLdap]:
+    ldap = _FakeLdap({"alice": _principal("alice"), "bob": _principal("bob")})
+    service = AuthService(store, _ad_settings(**over), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    for name in ("alice", "bob"):
+        assert await _signed_in_ad_user(service, store, name) is not None
+    return service, ldap
+
+
+async def _pass(service: AuthService, sink: _InverseSink) -> reconcile.ReconcilePlan:
+    plan = await service.reconcile_directory_sessions()
+    _alert_reconcile_plan(plan, service, sink)
+    return plan
+
+
+@pytest.mark.parametrize("threshold", [2, 3, 5])
+async def test_a_lasting_outage_pages_once_and_the_next_reach_resolves_it(threshold: int) -> None:
+    """BACKLOG #3709. ``threshold`` unreachable passes page exactly once; one more unreachable pass
+    pages nothing more; the first pass that reaches the directory resolves the instance.
+
+    RED when: an outage never pages, pages on every pass, or nothing resolves it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=threshold)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for n in range(1, threshold):
+            plan = await _pass(service, sink)
+            assert plan.directory_outage and plan.outage_passes == n
+        assert _outage_events(sink) == []  # the N-1 control: no page yet
+        plan = await _pass(service, sink)
+        assert plan.outage_page and plan.outage_passes == threshold
+        paged = _outage_events(sink)
+        assert len(paged) == 1
+        kind, _source, payload = paged[0]
+        assert kind == "ad_reconcile_aborted"
+        assert payload["reason"] == "directory_unavailable" and payload["probed"] == 2
+        assert f"succeeded in {threshold} reconcile passes" in payload["detail"]
+        assert len(payload["detail"]) <= 200  # the store keeps 200 characters of a reason
+
+        await _pass(service, sink)  # one more unreachable pass after firing
+        assert len(_outage_events(sink)) == 1
+
+        ldap.unreachable = set()  # the directory comes back
+        plan = await _pass(service, sink)
+        assert plan.outage_clear and plan.outage_passes == 0
+        assert _outage_events(sink)[1:] == [
+            ("ad_reconcile_breaker_cleared", _OUTAGE_ALERT_SOURCE, {})
+        ]
+        skipped = [
+            json.loads(a["detail"])["passes"]
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_skipped"
+        ]
+        assert sorted(skipped) == list(range(1, threshold + 2))  # newest first, so sorted
+    finally:
+        await store.close()
+
+
+async def test_an_outage_run_one_short_pages_nothing_and_a_reach_restarts_the_count() -> None:
+    """BACKLOG #3709. N-1 unreachable passes page nothing, and a reach between two short runs
+    restarts the count, so two short runs never add up to a page. Nothing paged, so nothing
+    resolves either.
+
+    RED when: the count survives a pass that reached the directory, or a reach with nothing paged
+    raises the inverse."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default, 3
+        sink = _InverseSink()
+        for _run in range(2):
+            ldap.unreachable = {"alice", "bob"}
+            for _ in range(2):
+                assert (await _pass(service, sink)).directory_outage
+            ldap.unreachable = set()
+            plan = await _pass(service, sink)
+            assert not plan.outage_clear and plan.outage_passes == 0
+        assert _outage_events(sink) == []
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_asks_nothing_leaves_the_outage_run_alone() -> None:
+    """BACKLOG #3709. A pass with nobody signed in asks the directory nothing, so it neither ends
+    nor extends a run: it learned nothing about the directory.
+
+    RED when: a no-candidate pass resets the count, or counts as unreachable."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        for name in ("alice", "bob"):  # everyone signs out
+            row = await store.get_user_by_username(name)
+            assert row is not None
+            await store.revoke_user_sessions(row.id)
+            assert await store.list_sessions(row.id) == []
+        empty = await _pass(service, sink)
+        assert empty.asked == 0 and not empty.outage_page and not empty.outage_clear
+        assert _outage_events(sink) == []
+        ldap.unreachable = set()  # to sign back in; the directory then goes away again
+        assert await _signed_in_ad_user(service, store, "alice") is not None
+        ldap.unreachable = {"alice", "bob"}
+        third = await _pass(service, sink)  # the run's third, not a new run's first
+        assert third.outage_page and third.outage_passes == 3
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+def test_the_outage_page_threshold_is_at_least_two() -> None:
+    """BACKLOG #3709. One pass is a blip, so a threshold of one would page on every blip."""
+    assert _ad_settings().ad_reconcile_outage_passes == 3
+    for refused in (1, 101):  # 101: a huge value would switch the page off in all but name
+        with pytest.raises(ValidationError, match="ad_reconcile_outage_passes"):
+            _ad_settings(ad_reconcile_outage_passes=refused)
+    for kept in (2, 100):
+        assert _ad_settings(ad_reconcile_outage_passes=kept).ad_reconcile_outage_passes == kept
+
+
+async def test_a_pass_of_id_less_rows_only_leaves_the_outage_run_alone() -> None:
+    """BACKLOG #3709. A pass whose only candidates are id-less rows asks the directory nothing, so
+    it neither ends the run nor resolves a page.
+
+    RED when: such a pass resets the count, or raises the inverse."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        for name in ("alice", "bob"):
+            await _clear_directory_object_id(store, name)
+        unasked = await _pass(service, sink)
+        assert unasked.asked == 0 and unasked.outage_passes == 2 and not unasked.outage_clear
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_fault_only_pass_leaves_the_run_and_a_referral_pass_resolves_it() -> None:
+    """BACKLOG #3709. A pass whose every probe failed or faulted says nothing about whether the
+    directory was reached, so it neither ends the run nor resolves the page. A pass of referrals
+    only judged nothing, but the directory answered it, so it resolves the page.
+
+    RED when: a fault-only pass reads as a reach, or a referral-only pass does not."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        ldap.unreachable = {"bob"}
+        ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
+        faulted = await _pass(service, sink)
+        assert faulted.probe_fault and faulted.outage_passes == 2 and not faulted.outage_clear
+        ldap.unreachable, ldap.broken = set(), {}
+        ldap.referring = {"alice", "bob"}
+        referred = await _pass(service, sink)
+        assert referred.directory_referral and referred.outage_clear
+        assert _outage_events(sink)[-1] == (
+            "ad_reconcile_breaker_cleared",
+            _OUTAGE_ALERT_SOURCE,
+            {},
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709. The page is latched only once its pass's rows are written, so a pass that
+    raises first leaves the next outage pass to page, as a paging refusal's does.
+
+    RED when: the latch is set before the pass can raise, so the run never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        await _pass(service, sink)
+        real = service._record_paging_refusals
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: store refused")
+
+        monkeypatch.setattr(service, "_record_paging_refusals", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(service, "_record_paging_refusals", real)
+        plan = await _pass(service, sink)
+        assert plan.outage_page and plan.outage_passes == 3
+        assert len(_outage_events(sink)) == 1
+        await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
     finally:
         await store.close()
 

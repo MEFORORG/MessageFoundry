@@ -212,7 +212,8 @@ def _step_up_landing(
 #: map. Both slugs describe the state of an account the visitor has not authenticated as, so a
 #: distinct code on the login page would confirm to an unauthenticated caller that the account exists
 #: and say which of the two states it is in. The collapse to ``oidc_failed`` is the control. The
-#: operator still gets the precise reason: it is on the ``auth.login_failed`` audit row.
+#: operator still gets the precise reason on the audit row: ``auth.login_failed`` for ``disabled``,
+#: ``auth.directory_login_locked`` for ``locked`` (BACKLOG #3726).
 _REASON_TO_CODE = {
     "state_unknown": "flow_binding_missing",
     "state_mismatch": "flow_binding_missing",

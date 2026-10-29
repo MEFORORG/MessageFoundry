@@ -186,8 +186,9 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: leave it;
 #: a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares
 #: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern has no such rule:
-#: a credential label glued to a pipe run still goes with it, which is older than this pattern and
-#: is not fixed here.
+#: a credential label glued to a pipe run still goes with it. Since BACKLOG #2968 the value after
+#: such a label is masked in place where it is one plain word (:data:`_GLUED_CREDENTIAL_LABEL`); some
+#: of the shapes it leaves are pinned in ``tests/test_redaction_glued_credential_label.py``.
 _HL7_ENCODED_FIELD_RUN = re.compile(
     r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
     r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
@@ -1898,6 +1899,19 @@ _STRUCTURED_ROUNDS = 8
 #   head of a word read with no boundary before it (:data:`_UNBOUNDED_HEADS`): ``...ZqMSH`` plus a
 #   caller's ``*^~\&*`` declares delimiters, and a mask would not.
 #
+# **A CREDENTIAL label glued to the token takes the same route (BACKLOG #2968).** The run takes the
+# label, so the credential filters after this module find none; the next word, when it is the whole
+# value, is masked in place under every rule above (:data:`_GLUED_CREDENTIAL_LABEL`), and only where
+# the PHI arms decline the token. The label is not kept: a design that kept it was withdrawn under
+# batch 255, since a kept label took a later label as its value. The mask keeps the secret's length
+# and its letter, case and digit layout, which the plain answer printed whole. One rule is narrower
+# for it, at the answer's end; :func:`_maskable_rest` says why. Only the LABEL arm of
+# :data:`_CREDENTIAL_AHEAD` is read here, from ``\b`` alone, so at least these glued to a run print
+# as before: a bare ``bearer`` scheme, the query keys ``code=``, ``state=`` and ``session_state=``,
+# a label right after a ``%XX`` escape, and a label longer than :data:`_GLUED_LABEL_SPAN`. A
+# credential value followed by anything but a space or the text's end, such as the closing quote
+# of a repr or a JSON string, prints as before too.
+#
 # Where any of that fails, the token is scrubbed as in the plain answer. Residuals, at least these: a
 # value holding punctuation, a non-ASCII letter or one of those words; a value longer than
 # :data:`_GLUED_VALUE_MAX`; an unquoted value past its first word; a label outside the vocabulary
@@ -1921,6 +1935,40 @@ _GLUED_XML_LABEL = re.compile(
 _GLUED_BARE_LABEL = re.compile(
     r"""(?:(?<![A-Za-z0-9])(?i:mrn)['"]?[:#=]{0,2}|(?<!\w)Patient[A-Za-z]*+[=:]"""
     r"""|\(0010, ?[0-9A-Fa-f]{4}\))\Z"""
+)
+#: The tail of a token that ends on a CREDENTIAL label and its separator (BACKLOG #2968):
+#: :data:`_CREDENTIAL_AHEAD`'s label arm, anchored at the token's end. The run takes the label with
+#: its token, so the credential filters after this module find no label, and the value that follows
+#: is masked here the way a PHI value is. Its value is the next word, as an unquoted MRN's is. A
+#: plain literal, so the static regex gate reads it; a test holds its words to
+#: :data:`_CREDENTIAL_AHEAD`'s.
+_GLUED_CREDENTIAL_LABEL = re.compile(
+    r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|token|pass|pwd)))\b['"]?[:=]\Z"""
+)
+#: The keywords that pattern spells, for a screen in front of its search. A test holds the two to
+#: the same words.
+_GLUED_CREDENTIAL_WORDS = (
+    "encryption_keys_retired",
+    "intake_api_key_next",
+    "encryption_key",
+    "authorization",
+    "private_key",
+    "passphrase",
+    "credential",
+    "password",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "bearer",
+    "passwd",
+    "secret",
+    "token",
+    "pass",
+    "pwd",
 )
 #: How far back of a token's end a label is looked for, and how far on its value may run.
 _GLUED_LABEL_SPAN = 48
@@ -1972,34 +2020,76 @@ _UNBOUNDED_HEADS = tuple(
         }
     )
 )
+#: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's
+#: heads that hold digits. A PHI last word that ends the answer is letters only, so it cannot end in
+#: these; a credential's may (code review round 2, #2968). They are not added above, since a quoted
+#: PHI value is masked there whatever its last word holds, and adding them would leave such a value
+#: in view where the answer before #2968 masked it (measured, 7 texts in 90,000).
+_CREDENTIAL_UNBOUNDED_HEADS = (*_UNBOUNDED_HEADS, "mfb6", "mfb64")
 #: Whitespace to the end of the text, matched where a value ends.
 _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 
 def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> str | None:
-    """The rest of a PHI value that the field run ``run`` cut through, when it is safe to mask: the
-    text after the token, up to the value's terminator. ``None`` leaves the plain scrub."""
+    """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
+    to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
+    scrub.
+
+    The PHI arms answer first, exactly as they did before BACKLOG #2968. Only where they decline
+    does a credential label at the token's end mask the next word, so the credential arm adds a
+    mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
+    stop = _glued_phi_value_end(text, token, end)
+    if stop is not None:
+        rest = _maskable_rest(text, end, stop, field_run, credential=False)
+        if rest is not None:
+            return rest
+    if not _ends_in_credential_label(token):
+        return None
+    bare = _GLUED_BARE_VALUE.match(text, end)
+    return (
+        None if bare is None else _maskable_rest(text, end, bare.end(), field_run, credential=True)
+    )
+
+
+def _ends_in_credential_label(token: str) -> bool:
+    """Whether ``token`` ends on a credential label and its separator. On an ASCII tail the word
+    screen is a necessary condition of the pattern, so most tokens skip the search. A tail outside
+    ASCII always takes the search, since the pattern folds case the Unicode way (``\\u017fecret``
+    reads as ``secret``) and ``str.lower`` does not."""
+    tail = token[-_GLUED_LABEL_SPAN:]
+    if tail.isascii() and not (
+        tail.rstrip(":='\"").lower().endswith(_GLUED_CREDENTIAL_WORDS) or "MEFOR_" in tail
+    ):
+        return False
+    return _GLUED_CREDENTIAL_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)) is not None
+
+
+def _glued_phi_value_end(text: str, token: str, end: int) -> int | None:
+    """Where the PHI value a run's ``token`` ends inside stops, or ``None`` if it ends in none."""
     quote = max(token.rfind('"'), token.rfind("'"))
     if "<" in token[quote + 1 :]:
         if not _GLUED_XML_LABEL.fullmatch(token, token.rfind("<")):
             return None
         stop = text.find("<", end, end + _GLUED_VALUE_MAX)
-        if stop == -1 or not text.startswith("</", stop):
-            return None
-    elif quote != -1 and "\\" not in token[quote:]:
+        return stop if stop != -1 and text.startswith("</", stop) else None
+    if quote != -1 and "\\" not in token[quote:]:
         if not _GLUED_QUOTED_LABEL.search(token, max(0, quote - _GLUED_LABEL_SPAN), quote + 1):
             return None
         stop = text.find(token[quote], end, end + _GLUED_VALUE_MAX)
         if stop == -1 or text[stop + 1 : stop + 2] not in _QUOTE_FOLLOWERS:
             return None
-    else:
-        if not _GLUED_BARE_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)):
-            return None
-        bare = _GLUED_BARE_VALUE.match(text, end)
-        if bare is None:
-            return None
-        stop = bare.end()
+        return stop
+    if not _GLUED_BARE_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)):
+        return None
+    bare = _GLUED_BARE_VALUE.match(text, end)
+    return None if bare is None else bare.end()
+
+
+def _maskable_rest(
+    text: str, end: int, stop: int, field_run: re.Pattern[str], *, credential: bool
+) -> str | None:
+    """``text[end:stop]`` when masking it leaves every pass reading what it read before."""
     rest = text[end:stop]
     if _GLUED_VALUE_REST.fullmatch(rest) is None:
         return None
@@ -2011,10 +2101,16 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
     glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
     # Punctuation after the last word, a caller's or the terminator, could complete a word read
     # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
-    if (ends or glued) and last.endswith(_UNBOUNDED_HEADS):
+    heads = _CREDENTIAL_UNBOUNDED_HEADS if credential else _UNBOUNDED_HEADS
+    if (ends or glued) and last.endswith(heads):
         return None
-    if ends and not last.isalpha():
-        return None  # a caller's glued digits would join a date arm
+    # A caller's glued digits would join a date arm, and every date arm opens with a digit at a word
+    # boundary, so it can start only at the last word's first character and then run on through
+    # letters (``19800505T`` plus a caller's ``1230``). A credential value ends in a digit far more
+    # often than a name does, so that arm refuses only a last word that opens with a digit; the PHI
+    # arms keep #3318's all-letters rule.
+    if ends and (last[0].isdigit() if credential else not last.isalpha()):
+        return None
     # Two letters glued to a quote can be a string prefix (``b"``, ``rb"``), and a run through the
     # terminator's token would start inside the mask.
     if glued and (len(last) <= 2 or field_run.match(text, stop - len(last)) is not None):
@@ -2024,7 +2120,7 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
 
 def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
     """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
-    placeholder, and the rest of a PHI value a run cut through masked in place
+    placeholder, and the rest of a PHI or credential value a run cut through masked in place
     (:func:`_glued_value`)."""
     if field_run is None:
         field_run = _HL7_FIELD_RUN

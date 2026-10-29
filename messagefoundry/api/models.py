@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
@@ -679,7 +679,7 @@ class ConfigProvenance(BaseModel):
     (or if the fingerprint could not be computed); ``drift`` is only meaningful when ``loaded`` is True."""
 
     loaded: bool
-    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v2)
+    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v3)
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     drift: bool = False  # the on-disk config now differs from what was loaded
@@ -1024,6 +1024,10 @@ class DbInfo(BaseModel):
     # like `synchronous` below: that default exists for wire compatibility, and this field has never
     # been optional on the wire, so a caller must say which of the two it means.
     disk_free_bytes: int | None
+    # Which reading disk_free_bytes is, as the backend states it: the values of the store's
+    # DiskFreeStatus, spelled out here so the API models import nothing from the store (BACKLOG
+    # #1563). Required for the reason disk_free_bytes is: a caller must say which case it means.
+    disk_free_status: Literal["observed", "not_applicable", "unobservable"]
     journal_mode: str
     messages: int
     events: int
@@ -1034,6 +1038,17 @@ class DbInfo(BaseModel):
     # server backends (a SQLite-only knob). Read-only observability (B7) so a status reader / load run
     # records which durability mode it measured. Defaulted so older clients deserialize unchanged.
     synchronous: str | None = None
+
+    @model_validator(mode="after")
+    def _figure_exactly_when_observed(self) -> DbInfo:
+        # The pair DbStatus.__post_init__ enforces, refused here too, so a reader of the wire
+        # model never has to decide which half of a contradiction to trust (BACKLOG #1563).
+        if (self.disk_free_status == "observed") != (self.disk_free_bytes is not None):
+            raise ValueError(
+                f"disk_free_status={self.disk_free_status!r} contradicts"
+                f" disk_free_bytes={self.disk_free_bytes!r}"
+            )
+        return self
 
 
 class LogInfo(BaseModel):

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import httpx
@@ -47,9 +47,41 @@ def _down_cleartext_listener() -> Registry:
     return reg
 
 
+def _down_ftps_poll() -> Registry:
+    """One FTPS poll, left down at start, whose revocation-hop guard refuses it when it is built:
+    off-box, with no CRL and no attestation (BACKLOG #2193). The guard raises
+    ``InsecureHopRefused``, a ``ValueError`` and not a ``WiringError``."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_DOWN",
+            ConnectionSpec(
+                ConnectorType.REMOTEFILE,
+                {"host": "10.0.0.5", "remote_dir": "/in", "protocol": "ftps"},
+            ),
+            router="r",
+            auto_start=False,
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+#: Each down inbound, with a phrase only its refusal's own text carries.
+_REFUSED = [
+    pytest.param(_down_cleartext_listener, "without TLS", id="exposure-gate"),
+    pytest.param(_down_ftps_poll, "revocation", id="ftps-poll-revocation"),
+]
+
+
+@pytest.mark.parametrize(("build", "gate_text"), _REFUSED)
 @pytest.mark.parametrize("action", ["start", "restart"])
 async def test_a_gate_refused_operator_start_answers_409_and_is_audited(
-    store: MessageStore, caplog: pytest.LogCaptureFixture, action: str
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    action: str,
+    build: Callable[[], Registry],
+    gate_text: str,
 ) -> None:
     engine = Engine(
         store,
@@ -57,7 +89,7 @@ async def test_a_gate_refused_operator_start_answers_409_and_is_audited(
         hop_posture=HopPosture(enforcing=True),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_down_cleartext_listener())
+    engine.add_registry(build())
     await engine.start()
     try:
         transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
@@ -68,9 +100,9 @@ async def test_a_gate_refused_operator_start_answers_409_and_is_audited(
         detail = r.json()["detail"]
         assert "IB_DOWN" in detail and "see the server log" in detail
         # The answer names only the listener; the gate's own text goes to the operator log.
-        assert "without TLS" not in detail
+        assert gate_text not in detail
         assert any(
-            rec.name == "messagefoundry.api.app" and "without TLS" in rec.getMessage()
+            rec.name == "messagefoundry.api.app" and gate_text in rec.getMessage()
             for rec in caplog.records
         )
         rows = await store.list_audit(action="connection_control", limit=10)

@@ -149,7 +149,12 @@ def test_every_name_printed_is_a_constant_and_never_a_registry_string() -> None:
     printed = "".join(risk for _name, risk in service_env_loosenings(posture)) + str(
         service_env_refusal(posture)
     )
-    assert set(re.findall(r"MEFOR_[A-Z_]+", printed, flags=re.IGNORECASE)) == set(known)
+    # Plus the secrets directory's own variable, a constant the loosening points to (vault BACKLOG
+    # #2595, ADR 0214).
+    assert set(re.findall(r"MEFOR_[A-Z_]+", printed, flags=re.IGNORECASE)) == {
+        *known,
+        "MEFOR_SECRETS_DIRECTORY",
+    }
 
 
 #: A stand-in for the identifier words CodeQL's ``py/clear-text-logging-sensitive-data`` takes as

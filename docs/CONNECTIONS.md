@@ -145,8 +145,9 @@ transport = "mllp"
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. A
-  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
-  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
+  boolean setting is mostly the exception: once resolved, it is read strictly whatever the cast,
+  `ftp`'s `tls` included (vault BACKLOG #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the
+  spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
@@ -281,8 +282,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > **refused at construction** (`messagefoundry check`, dry-run, reload, and the live build when
 > `serve` starts), not merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
-> endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, a
-> `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not
+> endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, an
+> FTPS poll, a `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not
 > connections at all: the **PostgreSQL store hop**, the
 > **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs**, which are checked when
 > `serve` builds the auth service rather than by `messagefoundry check`. Read it as "at least these" rather than as a covered estate
@@ -313,14 +314,15 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > each construction it lets through on an enforcing instance logs a WARNING carrying the reason
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
 > The same pair on an `inbound()` mTLS listener clears the listener's revocation gate, where
-> `tls_crl_file` is the in-engine fix to prefer. The process-wide
+> `tls_crl_file` is the in-engine fix to prefer. On an `Ftp(tls=True)` poller, an inbound that
+> dials out, the `inbound()` pair is this hop's attestation too (BACKLOG #2193). The process-wide
 > `MEFOR_TLS_REVOCATION_ATTESTED=1` no longer crosses an enforcing outbound hop (BACKLOG #299): one
 > variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
 > proxy does **not** change the decision: the authority has no input for one. Anything else is a
 > *posture change* rather than a fix: `[security].enforcement = warn` downgrades it to a WARN.
 > Nothing silences it instance-wide any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 >
-> **Some of the engine's other verifying TLS hops are not gated at all** — the inbound FTPS poll,
+> **Some of the engine's other verifying TLS hops are not gated at all** —
 > the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
 > hop, LDAPS — so confirming the refusal on MLLP tells you nothing about those: revocation there is your
 > PKI's job, and `MEFOR_TLS_REVOCATION_ATTESTED` is not consulted for them. Full treatment:
@@ -369,7 +371,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_ca_pin` | both | - | the SHA-256 of `tls_ca_file`; the syntax is *Trust-anchor pin syntax* in [CONFIGURATION.md](CONFIGURATION.md#api). Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. An outbound connection's CA takes the same checks at start and at every reload, under `outbound:<connection name>`, and there a matching pin is no escape: see [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) (vault BACKLOG #2371). It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 | `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and the MLLP verify-off refusal does not read [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested) either. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). `false` keeps the chain check and accepts any certificate from the trust anchor, whatever host it names. It is a [reported loosening](SECURITY-LOOSENING.md): a WARNING at each build, a `tls-check-hostname` line in `messagefoundry check`, and a `security_loosenings()` entry (ASVS 12.3.2). |
-| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain and key usage, and the hostname too unless `tls_check_hostname = false` — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on the two connectors with no revocation gate (**DICOM-SCU, FTPS**) nothing else would catch that certificate either. **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it. It **is reported**, by the WARNING logged at each connector build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture`; the serve-time loosening warning fires before the graph loads and cannot name it. CORRECTED 2026-10-01: this row said it was absent from `security_loosenings()` and from `check`, which stopped being true under BACKLOG #333. Nothing expires a "two-week bridge" set when a partner's cert lapses, so record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and on the `Ftp(tls=True)` inbound poller, which dials out through the same FTPS context (CORRECTED 2026-10-01: this said "six outbound connectors only"), and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
+| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain and key usage, and the hostname too unless `tls_check_hostname = false` — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on a verifying hop with no revocation gate nothing else would catch that certificate either (CORRECTED 2026-10-28: this named DICOM-SCU and FTPS as such hops; BACKLOG #2193 has since gated both). **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it. It **is reported**, by the WARNING logged at each connector build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture`; the serve-time loosening warning fires before the graph loads and cannot name it. CORRECTED 2026-10-01: this row said it was absent from `security_loosenings()` and from `check`, which stopped being true under BACKLOG #333. Nothing expires a "two-week bridge" set when a partner's cert lapses, so record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and on the `Ftp(tls=True)` inbound poller, which dials out through the same FTPS context (CORRECTED 2026-10-01: this said "six outbound connectors only"), and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
 | `encoding_characters` | out | (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order: MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. A non-HL7 payload, or a value the new delimiters cannot carry as data, fails the delivery permanently (code `reencode`, [ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md)) and is dead-lettered at once. On a batched outbound the whole batch goes with it; ADR 0206 records that gap. |
 | `hl7_raw_separators` | out | `false` | **(BACKLOG #107) escape-hatch for a partner that cannot decode HL7 escapes:** emit the four reserved **structural** separators as RAW bytes (`\F\ \S\ \R\ \T\` become the message's own field/component/repetition/subcomponent char) instead of their escape sequences. Reserved chars are read from the payload's own MSH; re-serialized via the parsed model, never string-slicing. `false` (default) = payload **byte-identical**. Enabling it can produce **non-conformant** output (a formerly-escaped `^` now reads as a component separator); that is the point; use only for such a broken partner. Composes after `encoding_characters` (delimiter rewrite first, then raw-separator emit). A non-HL7 payload fails the delivery permanently (code `reencode`, ADR 0206) and is dead-lettered at once; on a batched outbound, see ADR 0206. **HL7v2/MLLP outbound only.** |
 | `verify_ack_control_id` | out | `false` | **(BACKLOG #82)** tighten the *accept* decision: accept a **positive** ACK (MSA-1 AA/CA) only if its MSA-2 (message control id) echoes the sent message's MSH-10 — a reply carrying a different id is a correlation failure (retryable `DeliveryError` → retried per the at-least-once path). Both ids are read **separator-aware** from the message (never hardcoded `\|^~\&`). If the sent MSH-10 is absent/unreadable there is nothing to correlate, so the check is skipped and the message delivers as before. Does not alter a **negative** ACK's handling. `false` (default) = **byte-identical** (no correlation). |
@@ -1330,8 +1332,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
-| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS **poll** carries the same gate, with the inbound's own `tls_revocation_attested` pair as its attestation. With `tls_allow_expired` set, a CRL cannot admit either direction; off-box on an enforcing instance only the attestation crosses |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. Both FTPS directions have a revocation gate since BACKLOG #2193 (CORRECTED 2026-10-28: this said the poll had none). With this setting on, a CRL does not admit either direction, because the relaxation skips the CRL's validity window too: off-box on an enforcing instance the hop is refused unless the connection attests revocation, and a hop that crosses still accepts an expired *and* revoked partner certificate that no CRL lists: with no `[tls].crl_file` nothing is listed, and a CA may drop an expired certificate from its CRL. A CRL that does reach the hop still refuses a leaf certificate it lists, even past its `nextUpdate`; do not attest on its strength. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
@@ -1592,9 +1594,10 @@ sends meet the rule above. With `[security].require_nonstatic_credentials` on, `
 credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
 the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
 the connection is built, for a proxy written either way. It is refused there unless the proxy is
-on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That check
-follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
-builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`, the owner's
+2026-10-05 ruling on the proxy credential (vault BACKLOG #3007). `[security].enforcement = warn`
+does not lift it: the HTTP family's no-loosen floor turns that WARN back into a refusal. A
+connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
 
 A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
@@ -1747,13 +1750,47 @@ reads `SERVER` as its target.
 
 An `SSLCA` file whose text names a PEM encryption header (`Proc-Type` or `DEK-Info`) after its
 first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The driver loads that
-file with its own TLS library, which can wait for a password on an encrypted block. The check
-runs when the connection is built, not at each connect, so a file replaced afterwards is not
-checked. At least these cases are left to the driver unchecked: a file that does not exist, a
-directory (an `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot
-read, or one over 16 MiB, is refused. An `SSLCA` file that names a PEM label ending in
-`PRIVATE KEY` after its first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA
-file is public trust material. An `SSLCERT` file is not checked this way.
+file with its own TLS library, which can wait for a password on an encrypted block. At least
+these cases are left to the driver unchecked: a file that does not exist, a directory (an
+`SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
+over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
+built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
+check below names, a share Windows reports as not found because it could not reach it (errors
+53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
+material.
+
+An `SSLCA` file is also a trust anchor of the connection's lane, as a `tls_ca_file` is
+(`auth.trust_anchors`, module item 12). The engine checks who can write the file and the folders
+above it, audits its fingerprint in `auth.trust_anchor` rows, and runs the content checks above
+again. A file another account can replace, or whose content now fails, refuses the lane when it
+is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
+ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
+the whole reload, and the running lane is not stopped. A file swapped since the last check is
+audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
+where the driver reads no CA, and there is no pin for this file. A missing file or a directory
+is left to the driver here too, and a pipe or device is refused unread. **What it does not
+cover**, at least: a running lane's pool goes on reading the file at each new connect until the
+lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
+
+An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
+(BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
+with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
+`Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read; a blank `SSLKEY`
+counts as unset, since a driver may trim it. Each file is read
+the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
+driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
+the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
+
+- **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
+  passes this check, the driver ignores it, and it may still prompt for the key's password.
+- **libpq does not read a key out of `sslcert`.** It reads the key from `sslkey`, or from its own
+  default path, which this check never sees. With no `sslkey` set, an encrypted key inside
+  `sslcert` is still refused here, although libpq would not load it.
+- **The key and certificate files are checked only when the connection is built.** Neither is a
+  lane trust anchor, so a file swapped afterwards is not checked.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
@@ -3143,7 +3180,14 @@ reload, and in the live build when `serve` starts (that outbound is recorded fai
 the graph starts), under the default `[security].enforcement = enforce`
 ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
 label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
-does. There are exactly three ways such a hop crosses:
+does. An HTTP-family credential the refusal recognizes, over such a hop to a host off this machine,
+is refused whatever the table below says. Neither `cleartext_accepted` nor `tls_hop_attested` lifts
+it, only a loopback host (vault BACKLOG #3533 item 4). A secret that is not credential-shaped, under
+a neutral header name, still crosses: an
+[accepted limit](SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
+The forward-proxy login is judged by its own
+[rule](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer). A cleartext hop
+that carries no recognized credential crosses in three ways that do not claim the hop is secure:
 
 | | claim | disposition |
 |---|---|---|
@@ -3187,7 +3231,7 @@ cleartext_reason   = "vendor firmware predates TLS; segment is not isolated"
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
-| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape) or an SMTP `AUTH` over cleartext (refused outright) |
+| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape), an SMTP `AUTH` over cleartext (refused outright), or a `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` or `FhirLookup()` credential to a host off this machine, token endpoints and Digest included (refused with no escape, vault BACKLOG #3533 item 4; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `cleartext_reason` | out | str | — | **mandatory** when the flag is set (and rejected without it). The engine checks a reason is present and non-blank; it cannot check that it is *true* — a placeholder is a review problem, not a load problem |
 
 **`Tcp()` and `X12()`: the declaration is permanent, not transitional.** Those connectors have **no TLS
@@ -3223,6 +3267,11 @@ cleartext or verify-off hop then **ALLOWs** it
 2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
 verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not** reach every
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
+Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
+over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
+#3230). A forward-proxy login is the exception, as
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+says.
 
 Set it on the declaration that owns the hop:
 
@@ -3297,7 +3346,7 @@ outbound(
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
-| When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
+| When is it refused as unread? | At least on `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. An `Ftp(tls=env(...))` whose value is a false spelling is refused the same way once it resolves, at start, check and reload (vault BACKLOG #3234). One that resolves to `None` is FTPS and reads the CA. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
 
 **It is opt-in.** Every default still trusts the OS store, so an internal hop without it is verified

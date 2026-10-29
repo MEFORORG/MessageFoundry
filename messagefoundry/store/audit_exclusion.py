@@ -21,8 +21,8 @@ __all__ = ["AuditExclusion"]
 @dataclass(frozen=True)
 class AuditExclusion:
     """``actions`` hides every row with one of those actions. ``rows`` hides a row only when both its
-    action and its detail match one ``(action, detail)`` pair exactly: the lock refusals of the
-    factor and directory legs share an action with ordinary failures, and differ only in detail."""
+    action and its detail match one ``(action, detail)`` pair exactly: at least the lock refusals of
+    the factor legs share an action with ordinary failures, and differ only in detail."""
 
     actions: frozenset[str] = frozenset()
     rows: frozenset[tuple[str, str]] = frozenset()

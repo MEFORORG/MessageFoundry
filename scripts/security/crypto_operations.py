@@ -44,9 +44,10 @@ seen:
   ``asyncio.to_thread``. The reload preflight reaches ``anchor_cadata`` that way (BACKLOG #2025).
   ``Engine.fingerprint_bundle_blocking`` calls its fold directly instead, so that one is seen
   (vault BACKLOG #2839, #2782);
-* a crypto DECISION that is not a call or a TLS-attribute assignment. ``transports/database.py``
-  appends ``Encrypt=`` and ``TrustServerCertificate=`` to a DSN string: a first-party TLS posture
-  decision with no crypto-shaped expression for any pattern instrument to match;
+* a crypto DECISION that is not a call or a TLS-attribute assignment. ``odbc_dsn.py`` appends
+  ``Encrypt=`` and ``TrustServerCertificate=`` to a DSN string for ``transports/database.py`` and
+  ``store/sqlserver.py``: a first-party TLS posture decision with no crypto-shaped expression for
+  any pattern instrument to match;
 * crypto inside a third-party library the engine calls. The call is seen; the library's own
   operations are not;
 * for the non-Python arms, which are PATTERN instruments: an alias that renames the API, an idiom
