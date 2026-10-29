@@ -3355,8 +3355,7 @@ class RegistryRunner:
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
         so a page per refusal would be an alert-restart loop. A start that binds clears the record,
-        and so does a reload that leaves the listener down by design, so the next refusal pages
-        again."""
+        so the next refusal pages again."""
         try:
             await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
@@ -4400,8 +4399,8 @@ class RegistryRunner:
         open alerts afresh.
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
-        this usually only logs the retry. It still records what that method leaves, such as a
-        :class:`NotDeployedError`."""
+        this usually finds the record and only logs the retry. It still records anything that
+        method leaves unrecorded."""
         if ("inbound", name) in self._failed:
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
@@ -7406,16 +7405,7 @@ class RegistryRunner:
                     # an operator action) while a never-started one stays down. Its router/transform
                     # workers are still re-armed below, so any backlog drains (the AC-3 rule).
                     skip = self._listener_skip(ic, old_inbound_names, binding_now=True, now=now)
-                    if skip is _ListenerSkip.NOT_STARTED:
-                        # A refused operator start or restart left a failed record (BACKLOG #3859).
-                        # The reload is the recovery its alert names, and with no bind here to clear
-                        # it, the record would read failed after the fix, and its once-only guard
-                        # would swallow the alert for the next refusal. A refused CA's record is
-                        # kept: _keeps_anchor_failure owns it (vault BACKLOG #2371).
-                        if ("inbound", ic.name) not in self._anchor_refused:
-                            self._failed.pop(("inbound", ic.name), None)
-                        continue
-                    if skip is _ListenerSkip.NOT_DEPLOYED:
+                    if skip is _ListenerSkip.NOT_DEPLOYED or skip is _ListenerSkip.NOT_STARTED:
                         continue
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
                     # threshold (the profile is a per-run decision read at start/reload), so a

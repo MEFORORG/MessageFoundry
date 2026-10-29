@@ -340,37 +340,3 @@ async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
         assert [name for name, _ in sink.stopped] == ["IB_LIVE"], sink.stopped
     finally:
         await runner.stop()
-
-
-async def test_a_reload_clears_the_record_a_refused_start_left_on_a_start_disabled_listener(
-    store: MessageStore, gate: _Gate
-) -> None:
-    """A reload does not bind an ``auto_start = false`` listener, so no bind clears the record a
-    refused operator start left. The reload drops it, as it drops a DR-parked or out-of-window
-    one: the listener reads stopped, and the next refusal pages again rather than being swallowed
-    by the once-only guard."""
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "IB_LIVE", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r", auto_start=False
-        )
-    )
-    reg.add_router("r", lambda m: [])
-    runner, sink = _runner(reg, store)
-    await runner.start()
-    try:
-        gate.refusal = WiringError(_TLS_REFUSAL)
-        with pytest.raises(WiringError):
-            await runner.start_inbound("IB_LIVE", operator=True)
-        assert runner.inbound_failed("IB_LIVE") is not None
-        assert len(sink.stopped) == 1
-        gate.refusal = None
-        await runner.reload(reg)
-        assert runner.inbound_failed("IB_LIVE") is None
-        assert not runner.inbound_running("IB_LIVE")
-        gate.refusal = WiringError(_TLS_REFUSAL)
-        with pytest.raises(WiringError):
-            await runner.start_inbound("IB_LIVE", operator=True)
-        assert len(sink.stopped) == 2, sink.stopped
-    finally:
-        await runner.stop()
