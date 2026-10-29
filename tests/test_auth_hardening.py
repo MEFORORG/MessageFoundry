@@ -290,6 +290,7 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",

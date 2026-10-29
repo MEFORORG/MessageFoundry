@@ -62,6 +62,7 @@ from messagefoundry.auth.ldap import (
     PAGING_TOO_MANY_PAGES,
     AdPrincipal,
     DirectoryAnswer,
+    KerberosPrincipalRefused,
     KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
@@ -5532,6 +5533,17 @@ class AuthService:
             # only in a DEBUG traceback.
             await self._directory_reject_audit(
                 "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
+            )
+            return LoginOutcome(ok=False, error="SSO authentication failed")
+        except KerberosPrincipalRefused as exc:
+            # BACKLOG #2610: another realm, no realm, or not a bare account name. The directory is
+            # never asked. The row names the closed-set refusal, never the principal's text.
+            await self._directory_reject_audit(
+                "<kerberos>",
+                "kerberos",
+                "no_principal",
+                client=client,
+                extra={"refusal": exc.reason},
             )
             return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:

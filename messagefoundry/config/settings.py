@@ -3326,6 +3326,27 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
     return service, hostname
 
 
+def check_kerberos_realm(realm: str) -> str:
+    """Refuse a ``[auth].kerberos_realm`` that is not one bare realm name (BACKLOG #2610).
+
+    The realm is compared with the realm of every ticket's client principal, so it must be the
+    realm alone: printable ASCII, with no whitespace and none of ``@``, ``/`` or ``\\``. ASCII,
+    because a case-insensitive compare folds some non-ASCII letters into ASCII ones (the Kelvin sign
+    lowers to ``k``), and an Active Directory realm is an upper-cased DNS name. The ``ValueError``
+    text never repeats the value.
+    """
+    if not realm or not all(ch.isascii() and ch.isprintable() and not ch.isspace() for ch in realm):
+        raise ValueError(
+            "kerberos_realm must be one realm name in printable ASCII with no whitespace, "
+            "e.g. EXAMPLE.COM"
+        )
+    if any(ch in realm for ch in "@/\\"):
+        raise ValueError(
+            "kerberos_realm must be the realm alone, with no '@', '/' or '\\', e.g. EXAMPLE.COM"
+        )
+    return realm
+
+
 #: The shortest site context term ``[auth].password_extra_context_words`` accepts. The context screen
 #: is a case-insensitive SUBSTRING test, so a one- or two-letter term would refuse a large share of
 #: ordinary passphrases. Three is the length of the shortest shipped term (``hl7``) and admits the
@@ -3695,6 +3716,11 @@ class AuthSettings(_Section):
     # (Windows) asks for the literal principal host/unspecified, so set it there. See
     # split_kerberos_spn.
     kerberos_spn: str | None = None
+    # The one Kerberos realm whose users may sign in, e.g. EXAMPLE.COM (BACKLOG #2610). Required
+    # once kerberos_enabled is on. A ticket from any other realm the KDC trusts is refused, compared
+    # without regard to ASCII case. Never defaulted from ad_domain: that is a UPN suffix, and it
+    # often differs from the realm. See check_kerberos_realm.
+    kerberos_realm: str | None = None
 
     # Federated SSO — OIDC authorization-code + PKCE relying party (ADR 0142, BACKLOG #274). A THIRD
     # login mechanism for an identity that ALREADY exists in on-prem AD: the id_token is verified, then
@@ -4083,6 +4109,15 @@ class AuthSettings(_Section):
             split_kerberos_spn(value)
         return value
 
+    @field_validator("kerberos_realm")
+    @classmethod
+    def _check_kerberos_realm(cls, value: str | None) -> str | None:
+        # Unset or empty reads as unset, as kerberos_spn does; the model validator then refuses
+        # it when kerberos_enabled is on.
+        if value:
+            check_kerberos_realm(value)
+        return value
+
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
     def _check_oidc_skew(cls, value: int) -> int:
@@ -4277,6 +4312,12 @@ class AuthSettings(_Section):
             )
         if self.kerberos_enabled and not self.ad_enabled:
             raise ValueError("kerberos_enabled requires ad_enabled (SSO resolves roles via AD)")
+        if self.kerberos_enabled and not self.kerberos_realm:
+            # BACKLOG #2610; the field's comment says why there is no default.
+            raise ValueError(
+                "kerberos_enabled requires kerberos_realm, the one Kerberos realm whose users may "
+                "sign in, e.g. EXAMPLE.COM"
+            )
         if (
             self.ad_session_recheck_seconds
             and not self.ad_enabled
