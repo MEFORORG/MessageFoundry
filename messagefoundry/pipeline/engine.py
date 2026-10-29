@@ -46,6 +46,7 @@ from messagefoundry.config.settings import (
     ShadowSettings,
     StoreSettings,
     UpdateCheckSettings,
+    engine_owned_dirs,
 )
 from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy
@@ -582,8 +583,13 @@ class Engine:
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         lane_anchor_check: LaneAnchorCheck | None = None,
+        owned_settings: Sequence[object] = (),
     ) -> None:
         self.store = store
+        # Settings models this engine is not otherwise handed ([auth], [security], [tls], ...), read
+        # only for the directories they name, which the `.processed` archive sweep must never reach
+        # (BACKLOG #1188, engine_owned_dirs).
+        self._owned_settings = tuple(owned_settings)
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
         # SandboxSettings defaults (mode=off, byte-identical). Rendered into a SandboxPolicy passed to
         # every runner this engine builds; read ONCE here (a /config/reload does NOT re-read it —
@@ -935,6 +941,32 @@ class Engine:
             Callable[[Exception, int, set[str]], Awaitable[None]] | None
         ) = None
         self._convergence_failures: tuple[int, set[str]] | None = None
+
+    def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+        """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
+        #1188), from every settings model this engine holds plus the paths it was handed directly."""
+        return engine_owned_dirs(
+            (
+                *self._owned_settings,
+                self._retention_settings,
+                self._cert_monitor_settings,
+                self._secret_rotation_settings,
+                self._update_check_settings,
+                self._backup_settings,
+                self._store_settings,
+                self._dr_settings,
+                self._sandbox_settings,
+                self._reference_settings,
+                self._shadow_settings,
+            ),
+            dirs=(self.config_dir,),
+            trees=(self._log_dir,),
+            files=(
+                self._api_tls_cert_file,
+                self._audit_anchor_file,
+                *self._api_tls_client_cert_files,
+            ),
+        )
 
     @classmethod
     async def create(
@@ -2029,6 +2061,7 @@ class Engine:
         # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
         # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
         if self._retention_settings is not None:
+            engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(
                 self.store,
                 self._retention_settings,
@@ -2042,6 +2075,25 @@ class Engine:
                 ),
                 # [logging].log_dir for application-log-file retention (#120); None → sweep no-ops.
                 log_dir=self._log_dir,
+                # The bound File inbounds whose `.processed` archive processed_archive_days ages out
+                # (BACKLOG #1188), read live each pass for the same reason as registry_source.
+                archive_source=lambda: (
+                    self._registry_runner.processed_archives()
+                    if self._registry_runner is not None
+                    else ()
+                ),
+                # Every inbound's watch and `.error` directories on every engine shard, and every
+                # File outbound's target directory, bound or not, which that sweep must never reach
+                # (BACKLOG #1188).
+                guard_source=lambda: (
+                    self._registry_runner.archive_guard_dirs()
+                    if self._registry_runner is not None
+                    else ()
+                ),
+                # And the engine's own directories and trees (store, keys, TLS pair, config, backup
+                # destination, log directory), read once from the settings (BACKLOG #1188).
+                engine_dirs=engine_dirs,
+                engine_trees=engine_trees,
             )
             self._retention_runner.start()
         # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of
@@ -2107,7 +2159,8 @@ class Engine:
         # process's own, so a standby reports its own too, and names itself in the alert key as
         # the intake monitor does. Of the commands, only `serve` builds an engine. The count moves
         # only where the guard is in the process: wherever `messagefoundry.__main__` is imported,
-        # or install_remote_debug_guard is called (docs/SECURITY-LOOSENING.md).
+        # the API's create_app runs, or install_remote_debug_guard is called
+        # (docs/SECURITY-LOOSENING.md).
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity

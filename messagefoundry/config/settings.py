@@ -44,7 +44,7 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
@@ -2259,8 +2259,11 @@ class PipelineSettings(_Section):
     # InternalErrorPolicy.STOP muscle (STOPPED phase + connection_stopped alert + reload/notify_work
     # re-arm), never dead-lettering the good message. "retry_forever" never STOPs — it retries the head
     # at capped backoff forever and emits a throttled lane_stuck alert once the horizon is crossed (for
-    # a deliberately-unattended flaky-infra site). Reliability-core + read ONCE at construction (a
-    # /config/reload does NOT re-read it — restart to change, exactly like claim_mode).
+    # a deliberately-unattended flaky-infra site). A pooled lane whose T17 re-pend itself fails HOLDS
+    # and retries it (BACKLOG #1611). Under "stop" the hold ends at infra_fault_stop_after failed
+    # re-pends and the lane STOPs as above; under "retry_forever" it holds on and raises one
+    # lane_stuck there. Reliability-core + read ONCE at construction (a /config/reload does NOT
+    # re-read it — restart to change, like claim_mode).
     infra_fault_policy: Literal["stop", "retry_forever"] = Field(default="stop")
     # Consecutive zero-progress T17 faults before a "stop"-policy lane transitions to STOPPED. Also the
     # "retry_forever" stuck horizon at which the throttled lane_stuck alert first fires. Under the
@@ -2909,6 +2912,16 @@ class RetentionSettings(_Section):
     # closed cell; do not let a classification table describe this window as covering `reference.value`
     # generally, which would machine-bless a false claim.
     reference_snapshot_days: int = 0
+    # Past N days, DELETE the archived copies a File inbound left in its `.processed` directory
+    # (`processed_subdir`), keyed on ARCHIVE time: the File source sets each file's mtime to the moment
+    # it archives it, so a partner's preserved old mtime cannot age a fresh copy out early. Each copy
+    # is the full clear-text inbound payload, a second PL-1 copy beside the stored body, so it is
+    # auto-bounded at the body window (owner ruling A2 of 2026-10-08, BACKLOG #1188). One level, regular
+    # files only, never through a link; `.error` is NOT swept. Only a running File inbound's directory is
+    # swept, and one that overlaps a directory it must not reach is refused (the list is
+    # docs/CONFIGURATION.md, `processed_archive_days`). 0 = keep forever, which an enforcing PHI
+    # instance refuses unless `allow_unbounded_phi` is set.
+    processed_archive_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
@@ -3005,9 +3018,10 @@ class RetentionSettings(_Section):
     vacuum_at: str = ""
     # Secure-by-default opt-out (#186a, ASVS 14.2.4): `serve` refuses to start under
     # [security].enforcement=enforce (warns under enforcement = warn) when an auto-bounded PHI window
-    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`
-    # (`auto_bounded_windows()` is the list; the first two keep FULL raw message bodies until
-    # purged, the third covers orphaned reference snapshots only) — so PHI does not
+    # is unbounded — `messages_days`, `dead_letter_days`, `reference_snapshot_days` and
+    # `processed_archive_days` (`auto_bounded_windows()` is the list; the first two keep FULL raw
+    # message bodies until purged, the third covers orphaned reference snapshots only, the fourth the
+    # File source's `.processed` copies) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
     # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
     # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
@@ -3029,6 +3043,7 @@ class RetentionSettings(_Section):
         "app_log_compress_days",
         "search_preset_days",
         "reference_snapshot_days",
+        "processed_archive_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
@@ -3331,9 +3346,9 @@ class AuthSettings(_Section):
     lockout_minutes: int = 15
     # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
     # doubles per cycle only where the owner has a way past it (the second-step lock on a local
-    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
-    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
-    # `lockout_minutes`.
+    # account, and the sign-in lock on a local account with TOTP enrolled or a discoverable passkey
+    # under the configured relying party, BACKLOG #3937); every other lock keeps `lockout_minutes`.
+    # 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least `lockout_minutes`.
     lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
@@ -3374,6 +3389,14 @@ class AuthSettings(_Section):
     # independent of [security].enforcement (a substituted AD anchor permits an LDAPS MITM). Dormant
     # when None. Block-scoped (direct-read by the preflight, not desugared).
     ad_tls_ca_cert_pin: str | None = None
+    # BACKLOG #2193: optional PEM file of CRLs checked against the domain controller's certificate on
+    # every LDAPS bind. The LDAPS context resolves no [tls] trust anchor, so [tls].crl_file never
+    # reaches it: this is the hop's own knob, as oidc_tls_crl_file is the IdP's. Each bind builds a
+    # fresh context and loads this file again, so a replaced CRL reaches the next bind. Same
+    # fail-closed refusals as every other CRL: absent or blank at load, unloadable or past
+    # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
+    # instance is refused when serve builds the auth service.
+    ad_tls_crl_file: str | None = None
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -3854,10 +3877,10 @@ class AuthSettings(_Section):
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
-    @field_validator("oidc_tls_crl_file")
+    @field_validator("ad_tls_crl_file", "oidc_tls_crl_file")
     @classmethod
-    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
-        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
+    def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
 
     @field_validator("kerberos_spn")
     @classmethod
@@ -5149,7 +5172,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "gcm_invocations",
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
-        "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
+        # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever), or is
+        # held retrying a failed re-pend of its claimed rows under it (BACKLOG #1611).
+        "lane_stuck",
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
@@ -9815,7 +9840,9 @@ def security_loosenings(
                 "cleartext_accepted",
                 f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
                 f"({named}) — the payload, and any credential the connection carries, ride those hops "
-                "unencrypted and readable by anything on the path",
+                "unencrypted and readable by anything on the path, except an HTTP-family credential "
+                "other than a forward-proxy login, which is still refused to a host off this machine "
+                "(vault BACKLOG #3533 item 4)",
             )
         )
     if expiry_relaxed_hops:
@@ -9882,7 +9909,9 @@ def security_loosenings(
                 f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
-                "and any credential cross in the clear",
+                "and any credential cross in the clear, except an HTTP-family credential other than "
+                "a forward-proxy login, which is still refused over cleartext http off this machine "
+                "or with verification off",
             )
         )
     if revocation_attested_hops:
@@ -10171,3 +10200,77 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
     ):
         return KEYLESS_REFUSED_BY_NO_STRICT_ACK
     return None
+
+
+#: Directory settings whose WHOLE tree the engine owns (BACKLOG #1188): an archive inside one is
+#: refused as well as one that is or holds it. ``base_dir`` is the config-repo root, which commonly
+#: holds watch directories, so it is guarded as a directory only.
+_OWNED_TREE_NAMES: frozenset[str] = frozenset({"destination"})
+_NOT_A_TREE: frozenset[str] = frozenset({"base_dir"})
+
+
+def engine_owned_dirs(
+    models: Iterable[object],
+    *,
+    dirs: Iterable[str | Path | None] = (),
+    trees: Iterable[str | Path | None] = (),
+    files: Iterable[str | Path | None] = (),
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The engine's own directories, which no ``.processed`` archive sweep may reach (BACKLOG #1188),
+    as ``(dirs, trees)``: an archive directory that is, or holds, any of either is refused, and one
+    inside a tree is refused too.
+
+    Read from every settings model given, recursively, by field name, so a setting added later is
+    covered without a list to keep: at least a ``*_file``, ``*_files`` or ``*_path`` setting (and the
+    store's ``path`` and ``[logging].file``) contributes its parent directory, and a ``*_dir`` setting or the backup
+    ``destination`` contributes a tree (``base_dir``, the config-repo root, only a directory). A value
+    that names a URL is skipped. ``dirs``, ``trees`` and ``files`` add paths the settings models do
+    not hold, the config directory or the served TLS certificate say. Relative paths are taken
+    against the working directory, as the engine opens them."""
+    out_dirs: list[Path] = []
+    out_trees: list[Path] = []
+
+    def usable(value: object) -> str | None:
+        if isinstance(value, Path):
+            value = str(value)
+        if not isinstance(value, str) or not value.strip() or "://" in value:
+            return None
+        return value
+
+    def add_file(value: object) -> None:
+        if (v := usable(value)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)).parent)
+
+    def walk(model: object, seen: set[int]) -> None:
+        if not isinstance(model, BaseModel) or id(model) in seen:
+            return
+        seen.add(id(model))
+        for name in type(model).model_fields:
+            value = getattr(model, name, None)
+            if isinstance(value, BaseModel):
+                walk(value, seen)
+            elif name.endswith("_url") or "redirect" in name:
+                continue
+            elif name.endswith("_files") and isinstance(value, list | tuple):
+                for item in value:
+                    add_file(item)
+            elif name.endswith(("_file", "_path")) or name in ("path", "file"):
+                add_file(value)
+            elif (name.endswith("_dir") or name in _OWNED_TREE_NAMES) and (
+                v := usable(value)
+            ) is not None:
+                target = out_dirs if name in _NOT_A_TREE else out_trees
+                target.append(Path(os.path.abspath(v)))
+
+    seen: set[int] = set()
+    for model in models:
+        walk(model, seen)
+    for d in dirs:
+        if (v := usable(d)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)))
+    for d in trees:
+        if (v := usable(d)) is not None:
+            out_trees.append(Path(os.path.abspath(v)))
+    for f in files:
+        add_file(f)
+    return tuple(dict.fromkeys(out_dirs)), tuple(dict.fromkeys(out_trees))

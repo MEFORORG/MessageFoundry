@@ -190,7 +190,8 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     These are the instance-wide CRL knobs that no connection carries, so :func:`certs_from_registry`
     cannot see them. All but one are outbound: ``[tls].crl_file`` (the outbound hops whose context
     the engine builds from the resolved ``[tls]`` trust anchor), ``[logging].forward_tls_crl_file``,
-    ``[auth].oidc_tls_crl_file`` and ``[store].ssl_crl_file``. ``[api].tls_client_crl_file`` is the
+    ``[auth].oidc_tls_crl_file``, ``[auth].ad_tls_crl_file`` (the LDAPS bind, BACKLOG #2193) and
+    ``[store].ssl_crl_file``. ``[api].tls_client_crl_file`` is the
     API listener's inbound CRL. Each is read when its hop builds a TLS context. Past ``nextUpdate``
     it fails every handshake it verifies. Before this, an outbound CRL going stale raised nothing
     until a handshake or a context build failed on it.
@@ -210,6 +211,7 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
         ("tls.crl_file", settings.tls.crl_file),
         ("logging.forward_tls_crl_file", settings.logging.forward_tls_crl_file),
         ("auth.oidc_tls_crl_file", settings.auth.oidc_tls_crl_file),
+        ("auth.ad_tls_crl_file", settings.auth.ad_tls_crl_file),
         ("store.ssl_crl_file", settings.store.ssl_crl_file),
         ("api.tls_client_crl_file", settings.api.tls_client_crl_file),
     )
@@ -722,10 +724,10 @@ def _ca_file_crl_refusal(
             f"{log_timestamp(early.this_update)}, before restarting: until then it refuses every "
             "peer under its issuer",
         )
-    # The states of the file's CRLs, merged. pki.crl_signature_refusal's flag is True for three of
-    # them, and only ``bad`` proves a failure (BACKLOG #3512). Bound before the ``try``, so its
-    # handler can read it. The signature loop is the last step in the ``try``, so an error that
-    # finds an unconfirmed state recorded was raised by the signature check on a later block.
+    # The states of the file's CRLs, merged. Three of them are short of a pass, and only ``bad``
+    # proves a failure (BACKLOG #3512). Bound before the ``try``, so its handler can read it. The
+    # signature loop is the last step in the ``try``, so an error that finds an unconfirmed state
+    # recorded was raised by the signature check on a later block.
     states: set[str] = set()
     try:
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
@@ -779,7 +781,7 @@ def _ca_file_crl_refusal(
         )
     if states - _PASSING - _UNCONFIRMED:
         # A state this scan does not name, beside any other: never a pass and never the weaker
-        # check. pki.crl_signature_refusal flags every state but the two passing ones (#3512).
+        # check (#3512).
         return unjudged
     if states & _UNCONFIRMED:
         # Not proven either way, and pki.CrlSignature names a case where handshakes still pass.
@@ -810,6 +812,13 @@ _CA_FILE_HOP_RESTARTS = (
 #: is conditional, on the CRL-setting hop's trust, and says nothing of the CA-file hop. This is the
 #: set main's "Restart the engine" substring test chose, named so a new remedy is a decision here
 #: (BACKLOG #3512).
+#:
+#: Vault BACKLOG #3506 added two signature remedies short of proof, and neither is here. Each
+#: orders a restart only once a check passes, and says to fix the file otherwise, which applies
+#: it to the CRL-setting hops through the reload and never to the CA-file hop. Their restart is
+#: conditional, as ``_NOT_PROVABLE``'s is, so the CA-file hop's restart follows them, as it
+#: follows ``BAD_SIGNATURE``. Before #3506 those states read ``BAD_SIGNATURE``, so this keeps
+#: main's step for them.
 _RESTARTS_THE_ENGINE = frozenset({RESTART, NO_ISSUER, RETRY})
 
 

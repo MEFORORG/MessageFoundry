@@ -39,7 +39,7 @@ from messagefoundry.remotedebug import (
 #
 # `_serve` and `_supervise` still make the same call first. Their comments describe the window
 # as it was before this call existed; with this one in place theirs normally adds nothing.
-# `install_remote_debug_guard` says when a later call adds a copy, including this one run again.
+# `install_remote_debug_guard` says why a later call adds no second copy, this one run again too.
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
@@ -7927,7 +7927,7 @@ def _build_provision_auth_service(
 
     BACKLOG #2081, and the one place that says why the command builds it this way. Building the
     service checks the OIDC and AD trust anchors (#2034), resolves the directory secrets and applies
-    the OIDC revocation guard, so the command builds it ONCE, before the password prompt and before
+    the OIDC and LDAPS revocation guards (#1887, #2193), so the command builds it ONCE, before the password prompt and before
     any store is opened or created (ADR 0183 AC-15). Before this, a fresh install built it only for
     the write, after the prompt and after ``open_store(create=True)``, so a refused anchor left an
     empty store behind; an existing store built it twice, which at ``warn`` printed each anchor
@@ -7944,7 +7944,8 @@ def _build_provision_auth_service(
     ``SecretProviderError`` loading the provider, a ``SecretProviderError`` resolving a reference,
     an ``LdapError``, a ``FileNotFoundError`` and a ``SigningError`` (the OIDC private_key_jwt key or
     certificate, BACKLOG #296) each get a fixed text. ``InsecureHopRefused``, a
-    refusal ``serve`` also gives (an off-box OIDC IdP with no revocation check, at ``enforce``),
+    refusal ``serve`` also gives (an off-box OIDC IdP, or since BACKLOG #2193 an off-box LDAPS
+    domain controller, with no revocation check, at ``enforce``),
     keeps its own text, which names the hop, its host and the setting that clears it, and reads no
     secret. Any other exception is not this function's to name and reaches the caller as it is.
     """

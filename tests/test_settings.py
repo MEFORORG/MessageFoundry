@@ -2164,6 +2164,7 @@ _CRL_KNOBS = [
     pytest.param("tls", "crl_file", "[tls].crl_file", id="tls"),
     pytest.param("logging", "forward_tls_crl_file", "[logging].forward_tls_crl_file", id="logging"),
     pytest.param("auth", "oidc_tls_crl_file", "[auth].oidc_tls_crl_file", id="auth"),
+    pytest.param("auth", "ad_tls_crl_file", "[auth].ad_tls_crl_file", id="auth-ad"),
     pytest.param("store", "ssl_crl_file", "[store].ssl_crl_file", id="store"),
 ]
 

@@ -51,6 +51,7 @@ webauthn nor the harness extra.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -63,6 +64,9 @@ from messagefoundry.auth.tokens import credential_id_hash
 _PK_RESIDENT = credential_id_hash(b"rot-pk-resident")
 _PK_AGAIN = credential_id_hash(b"rot-pk-again")
 _RF_RESIDENT = credential_id_hash(b"rot-rf-resident")
+_LOCK_PK = credential_id_hash(b"lock-pk-resident")
+_LOCK_PK_PLAIN = credential_id_hash(b"lock-pk-plain")
+_LOCK_PK_AD = credential_id_hash(b"lock-pk-ad-resident")
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
@@ -92,6 +96,7 @@ async def _fail(
     counter: str = "sign_in",
     threshold: int = THRESHOLD,
     lockout_seconds: float = LOCKOUT_SECONDS,
+    passkey_escalates: Any = None,
 ) -> tuple[int, bool, int]:
     result = await store.increment_login_failure(
         user_id,
@@ -102,14 +107,19 @@ async def _fail(
         now=now,
         # The service's rule (BACKLOG #3422), a required argument.
         totp_usable=_opened_totp_state,
+        passkey_escalates=passkey_escalates,
     )
     return (result.attempts, result.just_locked, result.cycles)
 
 
-async def _lock_cycle(store: Any, user_id: str, *, start: float, counter: str) -> float:
+async def _lock_cycle(
+    store: Any, user_id: str, *, start: float, counter: str, passkey_escalates: Any = None
+) -> float:
     """Run one full cycle: THRESHOLD failures from ``start``. Returns the new ``locked_until``."""
     for i in range(THRESHOLD):
-        await _fail(store, user_id, now=start + i, counter=counter)
+        await _fail(
+            store, user_id, now=start + i, counter=counter, passkey_escalates=passkey_escalates
+        )
     user = await store.get_user(user_id)
     assert user is not None
     locked = user.locked_until if counter == "sign_in" else user.second_step_locked_until
@@ -117,10 +127,18 @@ async def _lock_cycle(store: Any, user_id: str, *, start: float, counter: str) -
     return float(locked)
 
 
-async def _assert_lockout_contract(store: Any) -> None:
-    """The behaviour every backend owes ``increment_login_failure`` and the lockout writers."""
+#: What a backend leg passes to plant a passkey cell the escalation's read cannot use: an awaitable
+#: ``corrupt(user_id)`` per case name, each writing straight to the backend's own table.
+PasskeyCorrupters = dict[str, Callable[[str], Awaitable[None]]]
+
+
+async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorrupters) -> None:
+    """The behaviour every backend owes ``increment_login_failure`` and the lockout writers.
+    ``corrupt_passkeys`` drives the unreadable-passkey arm, which needs raw SQL on each backend."""
+    await _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(store, corrupt_passkeys)
     await _assert_single_counter_policy(store)
     await _assert_escalation(store)
+    await _assert_passkey_escalates_the_sign_in_lock(store)
     await _assert_counters_stay_apart_and_clear(store)
     await _assert_generated_credential(store)
     await _assert_conditional_rotation(store)
@@ -273,6 +291,182 @@ async def _assert_escalation(store: Any) -> None:
     assert user.second_step_locked_until == start - 1.0
 
     for user_id in ("lock-totp", "lock-ad", "lock-plain"):
+        await store.delete_user(user_id)
+
+
+async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
+    """BACKLOG #3937 item 8, on every backend: the sign-in lock on a local account whose way past
+    is a discoverable passkey, with no TOTP, doubles per cycle exactly as a TOTP account's does,
+    to the same ceiling. Only where the caller's ``passkey_escalates`` rule counts a passkey the
+    write's own transaction reads: no rule, a passkey the rule does not count, and a passkey removed
+    before the failure all keep the fixed length. A refused TOTP beside a counted passkey escalates,
+    since the passkey is the way past. The second-step lock escalates as before."""
+    from messagefoundry.store.store import passkey_is_way_past, passkey_is_way_past_under
+    from tests._webauthn_store_contract import _cred
+
+    def under(rp_id: str) -> Any:
+        return lambda cred: passkey_is_way_past_under(cred, rp_id)
+
+    expected_escalated = [LOCKOUT_SECONDS * 2**k for k in range(4)] + [MAX_LOCKOUT_SECONDS] * 2
+    fixed = [LOCKOUT_SECONDS] * 4
+
+    async def lengths_of(
+        user_id: str, rule: Any, cycles: int, counter: str = "sign_in"
+    ) -> list[float]:
+        start, seen = 10_000.0, []
+        for _ in range(cycles):
+            locked = await _lock_cycle(
+                store, user_id, start=start, counter=counter, passkey_escalates=rule
+            )
+            seen.append(locked - (start + THRESHOLD - 1))
+            start = locked + 1.0
+        await store.clear_lockout(user_id, reset_cycles=True, now=start)
+        return seen
+
+    await store.create_user(
+        user_id="lock-pk",
+        username="lock-pk",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+    )
+    # Not discoverable: no way past under any rule, so the fixed length. Well formed in every other
+    # respect (today's id-hash scheme, the relying party the rule names), so discoverable=False is
+    # the only thing standing between it and an escalation, and this arm tests that check.
+    await store.add_webauthn_credential(
+        _cred("lock-pk", "plain", id_hash=_LOCK_PK_PLAIN, rp_id="t", discoverable=False)
+    )
+    assert await lengths_of("lock-pk", passkey_is_way_past, 4) == fixed, (
+        "the sign-in lock escalated beside a passkey that is not discoverable"
+    )
+    assert await lengths_of("lock-pk", under("t"), 4) == fixed, (
+        "the sign-in lock escalated beside a passkey under the rule's rp_id that is not discoverable"
+    )
+    await store.add_webauthn_credential(
+        _cred("lock-pk", "resident", id_hash=_LOCK_PK, rp_id="t", discoverable=True)
+    )
+    assert await lengths_of("lock-pk", passkey_is_way_past, 6) == expected_escalated, (
+        "the sign-in lock did not escalate beside a discoverable passkey"
+    )
+    assert await lengths_of("lock-pk", under("t"), 6) == expected_escalated
+    # The same passkey under a rule that does not count it (another relying party), or no rule.
+    assert await lengths_of("lock-pk", under("other"), 4) == fixed, (
+        "the sign-in lock escalated beside a passkey the rule does not count"
+    )
+    assert await lengths_of("lock-pk", None, 4) == fixed, "no rule escalated the sign-in lock"
+    # The second-step lock is unchanged: it escalated before and still does.
+    assert await lengths_of("lock-pk", passkey_is_way_past, 6, "second_step") == expected_escalated
+
+    # A refused TOTP is no way past (BACKLOG #3422), but the passkey beside it still is.
+    cell = await store.set_totp_secret(
+        "lock-pk", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=2.0
+    )
+    assert await store.enable_totp(
+        "lock-pk", expected_secret_cell=cell, recovery_code_hashes=[], now=2.0
+    )
+    assert await lengths_of("lock-pk", passkey_is_way_past, 6) == expected_escalated, (
+        "a refused TOTP stopped a discoverable passkey's escalation"
+    )
+    assert await lengths_of("lock-pk", None, 3) == fixed[:3]
+    await store.disable_totp("lock-pk", now=3.0)
+
+    # Read in the failure's own write: the passkey removed after one cycle no longer escalates the
+    # next, which keeps the base length on cycle 2 rather than doubling it.
+    start = 10_000.0
+    first = await _lock_cycle(
+        store, "lock-pk", start=start, counter="sign_in", passkey_escalates=passkey_is_way_past
+    )
+    assert await store.delete_webauthn_credential("lock-pk", _LOCK_PK)
+    second = await _lock_cycle(
+        store,
+        "lock-pk",
+        start=first + 1.0,
+        counter="sign_in",
+        passkey_escalates=passkey_is_way_past,
+    )
+    assert second - (first + 1.0 + THRESHOLD - 1) == LOCKOUT_SECONDS, (
+        "a removed passkey still escalated the sign-in lock"
+    )
+    user = await store.get_user("lock-pk")
+    assert user is not None and user.lock_cycles == 2
+
+    # A directory account holding a discoverable passkey keeps the fixed sign-in lock.
+    await store.create_user(
+        user_id="lock-pk-ad",
+        username="lock-pk-ad",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+    )
+    await store.add_webauthn_credential(
+        _cred("lock-pk-ad", "resident", id_hash=_LOCK_PK_AD, rp_id="t", discoverable=True)
+    )
+    assert await lengths_of("lock-pk-ad", passkey_is_way_past, 4) == fixed, (
+        "a directory account's sign-in lock escalated beside a passkey"
+    )
+
+    for user_id in ("lock-pk", "lock-pk-ad"):
+        await store.delete_all_webauthn_credentials(user_id)
+        await store.delete_user(user_id)
+
+
+async def _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(
+    store: Any, corrupt_passkeys: PasskeyCorrupters
+) -> None:
+    """BACKLOG #3937 item 8 follow-up, on every backend: the escalation reads the passkey set
+    inside the failed sign-in's own transaction, so a passkey cell that cannot be read there, at
+    fetch time (a cell the driver cannot decode) or at parse time (a value that is not the
+    store's), must never roll the count back. Every failure still counts and the lock arms on
+    every cycle, at the fixed length: a passkey that cannot be read is no way past, so it does not
+    escalate. RED when: the read error escapes the increment (the count is lost and the account
+    never locks), or the unreadable set escalates."""
+    from messagefoundry.store.store import passkey_is_way_past
+    from tests._webauthn_store_contract import _cred
+
+    # Three cycles: an escalation would double the second and third.
+    expected_fixed = [LOCKOUT_SECONDS] * 3
+    for case, corrupt in corrupt_passkeys.items():
+        user_id = f"lock-pk-bad-{case}"
+        await store.create_user(
+            user_id=user_id,
+            username=user_id,
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
+        )
+        await store.add_webauthn_credential(
+            _cred(
+                user_id,
+                "resident",
+                id_hash=credential_id_hash(user_id.encode()),
+                rp_id="t",
+                # Discoverable, the control: read cleanly it would escalate, so only the
+                # unreadable path keeps the fixed length, and a corruption that did not land
+                # fails the arm.
+                discoverable=True,
+            )
+        )
+        await corrupt(user_id)
+        start, seen = 10_000.0, []
+        for cycle in range(1, len(expected_fixed) + 1):
+            locked = await _lock_cycle(
+                store,
+                user_id,
+                start=start,
+                counter="sign_in",
+                passkey_escalates=passkey_is_way_past,
+            )
+            user = await store.get_user(user_id)
+            assert user is not None
+            assert (user.failed_attempts, user.lock_cycles) == (THRESHOLD, cycle), (
+                f"{case}: cycle {cycle} lost a failure"
+            )
+            seen.append(locked - (start + THRESHOLD - 1))
+            start = locked + 1.0
+        assert seen == expected_fixed, f"{case}: an unreadable passkey set escalated the lock"
+        await store.delete_all_webauthn_credentials(user_id)
         await store.delete_user(user_id)
 
 

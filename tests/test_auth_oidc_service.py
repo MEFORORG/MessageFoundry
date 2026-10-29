@@ -1572,7 +1572,8 @@ def test_the_browser_layer_gives_a_refused_account_no_distinguishing_code() -> N
 
     Pinned as a test rather than by comment alone, because the omission looks exactly like an
     oversight to the next reader of that map. The operator loses nothing: the precise reason is on
-    the ``auth.login_failed`` audit row either way.
+    the audit row, ``auth.login_failed`` for ``disabled`` and ``auth.directory_login_locked`` for
+    ``locked`` (BACKLOG #3726).
     """
     from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
 

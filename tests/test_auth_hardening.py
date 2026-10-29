@@ -459,6 +459,7 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
                 totp_usable=_opened_totp_state,
+                passkey_escalates=None,
             )
 
     async with _client(engine, service, serve_ui=True) as c:

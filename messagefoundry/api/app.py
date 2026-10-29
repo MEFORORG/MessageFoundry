@@ -312,11 +312,13 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     TrustAnchorError,
     anchor_refusal,
+    explicit_cause,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
     smtp_hop_anchor_spec,
+    trust_anchor_cause,
 )
 from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
@@ -380,6 +382,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.static_credentials import SETTINGS_PREFIX, static_credential_hops
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     fips_attestation,
     kex_groups_report,
     phi_read_hop_disposition,
@@ -465,7 +468,11 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
+from messagefoundry.remotedebug import (
+    RemoteDebugPosture,
+    install_remote_debug_guard,
+    remote_debug_posture,
+)
 from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
@@ -2292,6 +2299,23 @@ async def _answer_refused_reload(
     raise HTTPException(status, answer) from exc
 
 
+def _refused_by_trust_anchor(exc: WiringError) -> bool:
+    """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
+    cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
+    the shape the settings preflight and ``refused_connection_anchor`` raise.
+
+    A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
+    factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
+    config to fix: ``invalid_config``, as the reload has always audited it (vault BACKLOG
+    #3498). A cycle ends the walk."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while isinstance(cur, WiringError) and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return isinstance(cur, TrustAnchorError)
+
+
 async def _audit_refused_reload(
     engine: Engine,
     exc: Exception,
@@ -2410,7 +2434,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc, WiringError) and isinstance(exc.__cause__, AnchorStoreUnavailable):
+    elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
         # warn, as every refusal here: a convergence reload's retry logs at DEBUG (vault #3109).
@@ -2422,7 +2446,7 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
@@ -3560,22 +3584,6 @@ async def _audit_alert_rules_withheld(
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
-
-    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
-    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
-    would then be hidden as one."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
-
-
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -3625,7 +3633,7 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
-        if _caused_by_trust_anchor(exc):
+        if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
@@ -3810,6 +3818,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
+    # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
+    # imports, so a script injected while they load still runs. Installing at import would put a
+    # permanent audit hook in every process that imports the package, which this does not.
+    # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
+    # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
+    install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -4452,10 +4467,12 @@ def create_app(
         store_privilege = getattr(request.app.state, "store_privilege", None)
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
-        # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process. An app built without `serve` takes it here, once, and that first
-        # reading reads files, so the call is kept off the event loop.
+        # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
+        # says it is missing points at another audit hook in the process.
+        #
+        # The start-up reading is the one `serve` took as it started, kept for the life of the
+        # process. An app built without `serve` takes it here, once, and that first reading reads
+        # files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
         # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
@@ -5105,10 +5122,12 @@ def create_app(
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
                 refused = _ANCHOR_REFUSED_DETAIL
-            except WiringError as exc:
+            except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
-                # audit row. The full refusal goes to the operator log; the answer names only the
+                # audit row. BACKLOG #2193: a hop guard the connector's own constructor runs, such
+                # as the FTPS poll's revocation guard, raises InsecureHopRefused, a ValueError and
+                # not a WiringError, and is the same refusal. The full refusal goes to the operator log; the answer names only the
                 # listener, because other start gates' text can name paths and sibling bindings.
                 _log.warning(
                     "operator %s of inbound connection %r refused: %s",
@@ -11192,10 +11211,13 @@ def create_managed_app(
         # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
         # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
-        # UNCLAMPED without an explicit posture, and the plain ldap:// bind refusal reads it too
-        # (vault BACKLOG #2354); threading this makes both apply on first deployment. The LDAPS
-        # ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only for an embedding that passes no [ai] (serve always passes it); since
-        # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
+        # UNCLAMPED without an explicit posture, and the LDAPS revocation guard reads it (BACKLOG
+        # #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain ldap://
+        # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
+        # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
+        # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
+        # fails closed (vault BACKLOG #2354), but the two revocation guards are the unstamped
+        # no-op, as for any hop built outside a posture. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
@@ -11516,6 +11538,23 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
+            # directories they name (key files, CA files, spool dirs), which the `.processed`
+            # archive sweep must never reach.
+            owned_settings=(
+                auth_settings,
+                ai_settings,
+                security_settings,
+                alerts_settings,
+                secrets_settings,
+                tls_settings,
+                cluster_settings,
+                approvals_settings,
+                integrity_settings,
+                service_settings,
+                static_credential_settings,
+                egress_settings,
+            ),
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
             # every real reload. Each listener's own build then enforces again and loads the bytes
@@ -11753,9 +11792,10 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the AD bind, which is built out of the
-                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
-                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
+                    # Thread the derived instance posture to the hops this service builds out of the
+                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
+                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
+                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.
