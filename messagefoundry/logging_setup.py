@@ -1486,8 +1486,13 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 # first, between our read of ``last`` and our stamp. Nothing is left to report.
                 return
         records = self._records
-        depth = records.lane_maxsize if isinstance(records, _ForwardLanes) else records.maxsize
-        # The line names no lane and prints the general lane's depth whichever lane dropped, so
+        depth = (
+            min(records.lane_maxsize, records.audit_maxsize)
+            if isinstance(records, _ForwardLanes)
+            else records.maxsize
+        )
+        # The line names no lane and prints the smaller lane bound whichever lane dropped, the cap
+        # ``queued`` reads (:meth:`_ForwardLanes.reported_qsize`), so
         # its wording adds no audit-row signal to ``GET /logs/tail`` (BACKLOG #1131). Its counts
         # are combined over both lanes, as ``queue_dropped`` on ``GET /status`` is, and they can
         # still rise with audit rows alone; docs/SECURITY.md records that as not closed.

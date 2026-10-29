@@ -358,8 +358,8 @@ def test_a_general_drop_raises_the_same_reason_as_an_audit_drop() -> None:
 def test_queued_does_not_move_with_audit_rows_while_the_general_lane_is_full() -> None:
     """While the general lane is pinned full, general records are dropped and cannot move a depth,
     so a ``queued`` over both lanes would rise by one per audit row written, the hidden lock rows
-    included (BACKLOG #1131, #2612). ``queued`` counts both lanes capped at the general lane's
-    bound, so it stays pinned there. The control is the queue's own size, which does hold the
+    included (BACKLOG #1131, #2612). ``queued`` counts both lanes capped at the smaller lane
+    bound, here the general lane's, so it stays pinned there. The control is the queue's own size, which does hold the
     audit lines."""
     handler, _ = _attach(_Collector(), maxsize=3, audit_maxsize=100)
     for _ in range(5):  # three fit; two are dropped, so the lane is pinned full

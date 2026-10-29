@@ -1477,7 +1477,7 @@ def test_the_drop_report_reads_the_same_whichever_lane_dropped(
     assert len(audit) == 1, audit
     assert audit == general  # the control is the general lane: same text, so no lane signal
     assert "lane" not in audit[0].lower() and "audit" not in audit[0].lower(), audit[0]
-    assert re.findall(r"\d+", audit[0]) == ["1", "3", "1"], audit[0]  # the general lane's depth
+    assert re.findall(r"\d+", audit[0]) == ["1", "2", "1"], audit[0]  # the smaller lane bound
 
 
 def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_deadlock(

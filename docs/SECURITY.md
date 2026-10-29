@@ -6429,9 +6429,11 @@ is the source of record for both, and still governs a store that does not open. 
 which can skip numbers. All the pairs are checked in one walk of the chain, which matters under
 `vault_transit`, where each row costs a Transit round trip. **The pairs witness only as well as the
 copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
-hop that drops lines loses witnesses. The forwarder counts what its queue and spool drop and, over
-TCP or TLS, what a failed send costs (`GET /status`, `log_forward_failed`), but a datagram lost over
-UDP is counted nowhere, and `audit-verify` does not say which rows had no pair; read the tee's own limits, in
+hop that drops lines loses witnesses. The forwarder counts some losses on `GET /status` and in
+`log_forward_failed`, at least what its queue and spool drop and, over TCP or TLS, what a failed
+send costs. At least these are counted nowhere there: a datagram lost over UDP, bytes a TCP
+collector's reset loses after a send returned, and records still queued at the shutdown drain
+deadline, which only a log line reports. `audit-verify` does not say which rows had no pair; read the tee's own limits, in
 `messagefoundry/store/audit_tee.py`, before resting a control on an export. Every audit row carries a
 `row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
