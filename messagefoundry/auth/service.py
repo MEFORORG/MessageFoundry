@@ -12189,12 +12189,12 @@ class AuthService:
         self, token_hash: str, *, local_only: bool = False
     ) -> bool:
         """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
-        if await self._mfa_satisfied_hash(token_hash):
-            return False
         session = await self._load_session(token_hash)
         if session is None:
             return True  # no session to act on, so fail closed
-        user = await self._load_user(session.user_id)
+        satisfied, user = await self._session_satisfaction(session)
+        if satisfied:
+            return False
         if user is None:
             return True
         if local_only and user.auth_provider == AuthProvider.AD.value:
@@ -13187,14 +13187,24 @@ class AuthService:
         session = await self._load_session(token_hash)
         if session is None or session.revoked_at is not None:
             return False
+        satisfied, _user = await self._session_satisfaction(session)
+        return satisfied
+
+    async def _session_satisfaction(
+        self, session: SessionRecord
+    ) -> tuple[bool, VerifiedUser | None]:
+        """Whether a loaded, live session is MFA-satisfied, and the account read to decide it:
+        ``None`` when the stamp decided it or the account is gone. The one rule
+        :meth:`_mfa_satisfied_hash` and :meth:`_owes_enrolled_factor_hash` share, so the second can
+        reuse the rows it read rather than read them again (BACKLOG #3690 item 7)."""
         if session.mfa_verified_at is not None:
-            return True
-        user = await self._load_user(session.user_id)
-        if user is None:
-            return False
+            return True, None
         # The extra store reads only execute for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
-        return not await self._unverified_session_owes_factor(user)
+        user = await self._load_user(session.user_id)
+        if user is None:
+            return False, None
+        return not await self._unverified_session_owes_factor(user), user
 
     async def _unverified_session_owes_factor(self, user: VerifiedUser) -> bool:
         """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second

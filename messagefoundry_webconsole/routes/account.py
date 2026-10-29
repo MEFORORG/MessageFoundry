@@ -56,7 +56,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _refusal_error
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -762,11 +762,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
-        # alone). JSON, so the page's fetch can read `error`.
+        # alone). JSON, so the page's fetch can read `error`, with the ceremony routes' constant
+        # Retry-After (BACKLOG #3690 item 5). Skipped for a session the service refuses for owing a
+        # factor, which still answers it (item 6, the #1973 rule).
         client = client_ip(request)
-        if not allow_reauth_attempt(service, identity):
+        blocked = await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL)
+        if not blocked and not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
-            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
+            return JSONResponse(
+                {"ok": False, "error": exc.detail},
+                status_code=exc.status_code,
+                headers={"Retry-After": _CEREMONY_RETRY_AFTER},
+            )
         try:
             elevation = await service.finish_webauthn_registration(
                 identity,

@@ -975,8 +975,9 @@ _SOME_SESSION_ID = "0" * 64
 #: where that refusal sends it. The password route refuses before rotating (#1954); the rest are the
 #: ``require_ui_reauth_only_action`` lanes (#1951). NOT every pending-exempt POST:
 #: ``POST /ui/account/webauthn/verify`` rides ``require_ui_reauth_only``, which has no such hook and
-#: still charges before the service's finish-time check refuses (BACKLOG #3014). #1973 left it out
-#: of scope.
+#: still charges the admin-write floor before the service's finish-time check refuses (BACKLOG
+#: #3014; that order is #2652's). #1973 left it out of scope. Its own ceremony-budget draw is skipped
+#: for such a session (BACKLOG #3690 item 6), pinned in test_ui_passkey_finish_factor_refusal.py.
 _PENDING_REFUSED_POSTS = (
     pytest.param(_PASSWORD, "/ui/mfa", id="password"),
     pytest.param(
