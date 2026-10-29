@@ -654,8 +654,9 @@ the password could be refused in a loop and still throttle the real user's write
 route is not covered:** `POST /ui/account/webauthn/verify`, on `require_ui_reauth_only`, still
 charges the floor before `finish_webauthn_registration` refuses such a session (BACKLOG #3014).
 It does not charge the per-actor ceremony budget for that session: the route asks the same rule
-first, skips the draw, and audits each such request as `auth.mfa_denied` (BACKLOG #3690 item 6).
-`POST /ui/mfa` and `POST /ui/reauth` still draw that budget for a pending session.
+first, skips the draw, and logs a WARNING for each such request (BACKLOG #3690 item 6). At least
+`POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` still draw that budget for a
+pending session.
 
 **The write floor's `Retry-After` is the actor's real wait (BACKLOG #2144).** The header carries
 the time until that actor's next write would be admitted, in whole seconds, rounded up, and never
@@ -6047,7 +6048,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/reauth/oidc` | per-actor ceremony budget | registered only with federation on; the federated step-up's start leg (BACKLOG #296). Its 429 re-renders the step-up page and carries **no** `Retry-After`. The IdP's return lands on `GET /ui/oidc/callback`, which charges this limiter too, under a key of its own for the user the staged flow names, and answers a refusal with the same 429 page and no `Retry-After` (BACKLOG #3374) |
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
-| `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` carrying `Retry-After: 30` (BACKLOG #3690 item 5), charged after the gate's admin-write floor, and not charged for a session the factor-binding rule refuses, which is audited `auth.mfa_denied` instead (BACKLOG #3690 item 6) |
+| `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` carrying `Retry-After: 30` (BACKLOG #3690 item 5), charged after the gate's admin-write floor, and not charged for a session the factor-binding rule refuses, which logs a WARNING instead (BACKLOG #3690 item 6) |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
 | **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
