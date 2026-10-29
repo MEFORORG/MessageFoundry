@@ -645,9 +645,7 @@ environment.
 > says which other key providers are not built. For any other source, fetch the secret in your
 > service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
 > file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
-> **managed identity**, and any credential with no reference field. A Vault token on Windows is
-> not one of these: [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)
-> says how it is supplied and who may write its file (BACKLOG #2851). An AD **gMSA** has no
+> **managed identity**, and any credential with no reference field. An AD **gMSA** has no
 > secret to export: for the SQL Server store, run the service as the gMSA with
 > `[store].auth = "integrated"`, as the walkthrough linked above describes.
 
