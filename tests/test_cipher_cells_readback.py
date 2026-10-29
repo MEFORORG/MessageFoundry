@@ -605,8 +605,9 @@ def _like_that_skips_blobs(pattern: object, value: object) -> bool:
     return isinstance(value, str) and _MARKER_RX.fullmatch(value) is not None
 
 
-#: The ways a connection's LIKE can differ from this machine's default build (see ``_sealed_sql``
-#: in store/cipher_cells.py), each with a probe that is true when it is in force.
+#: At least two ways a connection's LIKE can differ from this machine's default build (see
+#: ``_sealed_test`` in store/cipher_cells.py), each with a probe that is true when it is in force.
+#: Not every way: an ICU build, for one, is not emulated here.
 _LIKE_BUILDS: dict[str, tuple[Callable[[sqlite3.Connection], None], str]] = {
     "like-skips-blobs": (
         lambda c: c.create_function("like", 2, _like_that_skips_blobs, deterministic=True),
@@ -623,9 +624,9 @@ _LIKE_BUILDS: dict[str, tuple[Callable[[sqlite3.Connection], None], str]] = {
 def sqlite_like_build(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:
-    """Run a test under this machine's own LIKE, then under each other LIKE a SQLite build or
-    connection can have, whatever this machine's SQLite was built with. Every connection the walk
-    opens, the restore-verify's and ``cipher-audit``'s, gets the variant."""
+    """Run a test under this machine's own LIKE, then under each of :data:`_LIKE_BUILDS`, whatever
+    this machine's SQLite was built with. Every connection the walk opens, the restore-verify's
+    and ``cipher-audit``'s, gets the variant."""
     if request.param == "native-like":
         yield
         return
@@ -647,29 +648,32 @@ def sqlite_like_build(
 
 
 @pytest.mark.usefixtures("sqlite_like_build")
-@pytest.mark.parametrize("damaged", [False, True], ids=["intact", "flipped"])
-def test_a_sealed_value_stored_as_a_blob_fails_as_a_blob(
-    tmp_path: Path, _template: tuple[Path, StoreSettings], damaged: bool
+@pytest.mark.parametrize("shape", ["intact", "flipped", "plaintext"])
+def test_a_value_stored_as_a_blob_fails_as_a_blob(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], shape: str
 ) -> None:
-    """A sealed value stored as a BLOB is selected as sealed under every LIKE, and fails: the
-    store's reader cannot take a BLOB as a sealed cell, intact or not. Where LIKE skipped a BLOB a
-    damaged one passed the restore-verify unread (engine PR 2608, the ubuntu leg)."""
+    """A BLOB in a cipher-covered cell is selected as sealed under every LIKE, and fails: the
+    store's reader cannot take one as a sealed cell, intact, damaged or never marked at all. Where
+    LIKE skipped a BLOB a damaged one passed the restore-verify unread (engine PR 2608, the
+    ubuntu leg)."""
     db, settings = _copy(_template, tmp_path)
     rowid, value = _first_sealed(db, "messages", "raw")
-    if damaged:
+    if shape == "flipped":
         head, _, payload = value.rpartition(":")
         blob = bytearray(base64.b64decode(payload))
         blob[-1] ^= 0x01
         value = f"{head}:{base64.b64encode(bytes(blob)).decode()}"
+    elif shape == "plaintext":
+        value = "MSH|^~\\&|BLOB-PLAINTEXT"
     _set(db, "messages", "raw", rowid, value.encode())
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
-def test_a_keyless_walk_names_a_blob_marker_that_is_not_utf8(tmp_path: Path) -> None:
-    """A keyless restore-verify of a store whose one sealed value is a BLOB starting with the
-    marker's bytes, then bytes that are not UTF-8: that is a sealed cell no key opened, not
-    plaintext, so the verdict is KEY_MISMATCH rather than PASS."""
+def test_a_keyless_walk_fails_a_blob_rather_than_blame_the_key(tmp_path: Path) -> None:
+    """A keyless restore-verify of a store whose one marked value is a BLOB, not even UTF-8 after
+    the marker. No key would open a BLOB, so the verdict is FAIL naming it, not a KEY_MISMATCH that
+    sends the operator to find a key, and not the PASS of a walk that skipped it."""
     db = tmp_path / "msg.db"
     settings = StoreSettings(path=str(db))
 
@@ -688,7 +692,7 @@ def test_a_keyless_walk_names_a_blob_marker_that_is_not_utf8(tmp_path: Path) -> 
     finally:
         conn.close()
     status, message, _ = dr_backup._decrypt_check(db, settings)
-    assert status == "KEY_MISMATCH" and "messages.raw" in message, message
+    assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
 @pytest.mark.usefixtures("sqlite_like_build")

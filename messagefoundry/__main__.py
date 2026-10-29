@@ -10071,10 +10071,10 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     it. This walks the same cell inventory the full restore-verify does
     (:data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`) on a read-only connection, in
     short chunks, so it can run beside the service. It reports per-cell counts and each cell's first
-    failing row by its locator, never a value. In a keyed store it also counts the non-blank text values
-    that carry no marker, which a walk selecting by the marker never reads: a FAIL on a surface the
-    store has sealed, which refuses them at read, and reported only on one no keyed open has sealed
-    yet. A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than
+    failing row by its locator, never a value. In a keyed store it also counts the non-blank text
+    values that carry no marker, which a walk selecting by the marker never reads: a FAIL on a
+    surface the store has sealed, which refuses them at read, and reported only on one no keyed
+    open has sealed yet. A BLOB in a cipher-covered cell fails as one, marked or not. A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than
     a count over a subset.
 
     Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server backend), 4 KEY_MISMATCH (a
@@ -10205,7 +10205,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     elif audit.failed:
         status, code = "FAIL", 1
         first = next(t.first_failure for t in audit.tallies if t.first_failure)
-        reason = f"{audit.failed} sealed value(s) did not decrypt; the first: {first}"
+        reason = f"{audit.failed} value(s) read as sealed did not open; the first: {first}"
     elif audit.unmarked and not store.allow_unmarked_ciphertext:
         status, code = "FAIL", 1
         first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
