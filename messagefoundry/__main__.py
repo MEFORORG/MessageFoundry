@@ -10074,9 +10074,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     failing row by its locator, never a value. In a keyed store it also counts the non-blank text
     values that carry no marker, which a walk selecting by the marker never reads: a FAIL on a
     surface the store has sealed, which refuses them at read, and reported only on one no keyed
-    open has sealed yet. Under a key, a BLOB in a cipher-covered cell fails as one, marked or not.
-    A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than a
-    count over a subset.
+    open has sealed yet. A BLOB in a cipher-covered cell fails as one, marked or not. A VACUUM part way, or the key service going unreachable, stops it with a FAIL rather than
+    a count over a subset.
 
     Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server backend), 4 KEY_MISMATCH (a
     sealed value and no key resolved, the usual cause being a shell without the service's key)."""

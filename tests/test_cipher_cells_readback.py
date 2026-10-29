@@ -670,23 +670,10 @@ def test_a_value_stored_as_a_blob_fails_as_a_blob(
     assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
-@pytest.mark.parametrize(
-    ("blob", "verdict"),
-    [
-        # The marker's bytes, then bytes that are not UTF-8: a sealed cell no key opened, as the
-        # same value in text would be, whichever value comes first in the walk.
-        (MARKER_PREFIX.encode() + b"v4:\xff\xfe", "KEY_MISMATCH"),
-        # No marker: the keyless reader returns it as it is, so the keyless walk passes it over.
-        (b"MSH|^~\\&|BLOB-PLAINTEXT", "PASS"),
-        (b"", "PASS"),
-    ],
-    ids=["marked", "plaintext", "empty"],
-)
-def test_a_keyless_walk_judges_a_blob_by_its_marker(
-    tmp_path: Path, blob: bytes, verdict: str
-) -> None:
-    """A keyless walk reads a BLOB as the keyless reader does, by whether it carries the marker:
-    no key was in play, so a BLOB is not failed for its type there (a keyed walk fails it)."""
+def test_a_keyless_walk_fails_a_blob_rather_than_blame_the_key(tmp_path: Path) -> None:
+    """A keyless restore-verify of a store whose one marked value is a BLOB, not even UTF-8 after
+    the marker. No key would open a BLOB, so the verdict is FAIL naming it, not a KEY_MISMATCH that
+    sends the operator to find a key, and not the PASS of a walk that skipped it."""
     db = tmp_path / "msg.db"
     settings = StoreSettings(path=str(db))
 
@@ -700,14 +687,12 @@ def test_a_keyless_walk_judges_a_blob_by_its_marker(
     asyncio.run(write())
     conn = sqlite3.connect(db)
     try:
-        conn.execute("UPDATE messages SET raw = ?", (blob,))
+        conn.execute("UPDATE messages SET raw = ?", (MARKER_PREFIX.encode() + b"v4:\xff\xfe",))
         conn.commit()
     finally:
         conn.close()
     status, message, _ = dr_backup._decrypt_check(db, settings)
-    assert status == verdict, message
-    if verdict == "KEY_MISMATCH":
-        assert "messages.raw" in message, message
+    assert status == "FAIL" and "messages.raw" in message and "BLOB" in message, message
 
 
 @pytest.mark.usefixtures("sqlite_like_build")
