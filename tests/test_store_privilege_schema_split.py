@@ -1398,7 +1398,7 @@ async def test_sqlserver_starts_a_fresh_chain_with_insert_alone(
     async def _commit(_conn: Any) -> None:
         return None
 
-    async def _applock(_cur: Any, _resource: str) -> None:
+    async def _applock(_cur: Any, _resource: str, *, timeout_ms: int | None = None) -> None:
         return None
 
     async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:

@@ -69,8 +69,12 @@ class _FakeConn:
         # The underlying pyodbc connection aioodbc exposes as `_conn`; _acquire sets its statement
         # timeout, and _ensure_schema (B10) overrides it to 0 for the schema-DDL batch.
         self._conn = types.SimpleNamespace(timeout=None)
+        # (statements executed so far, connection timeout) at each cursor creation: pyodbc copies
+        # the connection's timeout into a cursor only when it creates it.
+        self.cursors_made: list[tuple[int, object]] = []
 
     async def cursor(self) -> _FakeCursor:
+        self.cursors_made.append((len(self.cursor_obj._executed), self._conn.timeout))
         return self.cursor_obj
 
     async def commit(self) -> None:
@@ -196,7 +200,8 @@ async def test_ensure_schema_exempts_statement_timeout_for_the_ddl_batch() -> No
 
 async def test_schema_applock_waits_unbounded_for_a_peer_migration() -> None:
     """BACKLOG #1726: the schema applock waits without limit, not ``command_timeout*1000``;
-    ``SqlServerStore._ensure_schema`` says why. Red before the fix: the timeout parameter is 30000."""
+    ``SqlServerStore._ensure_schema`` says why. Red before the fix: the timeout parameter is 30000,
+    and the batch ran on the probe's cursor, made while the connection timeout was still 30."""
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)
@@ -204,8 +209,25 @@ async def test_schema_applock_waits_unbounded_for_a_peer_migration() -> None:
 
     await store._ensure_schema()
 
-    params_lock = executed[_applock_index(executed)][1]
-    assert params_lock == (_SCHEMA_LOCK, -1)  # -1: sp_getapplock waits without limit
+    lock_i = _applock_index(executed)
+    assert executed[lock_i][1] == (_SCHEMA_LOCK, -1)  # -1: sp_getapplock waits without limit
+    # The cursor the applock and the DDL run on was made after the timeout was lifted.
+    made_before_lock = [timeout for n, timeout in conn.cursors_made if n <= lock_i]
+    assert made_before_lock[-1] == 0
+    assert conn.cursors_made[0][1] == 30  # control: the probe's cursor kept command_timeout
+
+
+async def test_other_applocks_keep_the_command_timeout_bound() -> None:
+    """Only the schema lock is unbounded: a call that passes no override still sends
+    ``command_timeout*1000``."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30)  # type: ignore[assignment]
+
+    await store._applock(conn.cursor_obj, "mefor:finalize:m1")
+
+    assert executed[-1][1] == ("mefor:finalize:m1", 30000)
 
 
 async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> None:

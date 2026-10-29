@@ -5959,12 +5959,14 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
     real_applock = store._applock
     skipped = 0
 
-    async def _applock_without_finalize(cur: Any, resource: str) -> None:
+    async def _applock_without_finalize(
+        cur: Any, resource: str, *, timeout_ms: int | None = None
+    ) -> None:
         nonlocal skipped
         if resource.startswith("mefor:finalize:"):
             skipped += 1
             return
-        await real_applock(cur, resource)
+        await real_applock(cur, resource, timeout_ms=timeout_ms)
 
     monkeypatch.setattr(store, "_applock", _applock_without_finalize)
 

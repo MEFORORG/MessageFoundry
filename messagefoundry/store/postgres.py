@@ -1967,10 +1967,14 @@ class PostgresStore:
                 # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
                 # scopes to this txn and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
-                # The wait is unbounded too (BACKLOG #1726). A peer holding this lock is running the
-                # same batch with its builds exempt from command_timeout, so bounding the wait by
-                # command_timeout would fail this open at startup while the peer's upgrade is still
-                # healthy. The lock is transaction-scoped, so a peer that dies releases it.
+                # The wait is unbounded too (BACKLOG #1726), on both server backends. A peer holding
+                # this lock runs the same batch with its builds exempt from command_timeout, so
+                # bounding the wait by command_timeout would fail this open at startup while the
+                # peer's upgrade is still healthy. The lock is transaction-scoped: it is released
+                # when the holder commits or rolls back, or once the server sees the holder's
+                # session end, which for a crashed host can take as long as TCP keepalive allows.
+                # Only command_timeout is lifted; a role-configured lock_timeout still bounds it.
+                log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 await self._advisory_lock(
                     conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=float("inf")
                 )
@@ -2557,13 +2561,13 @@ class PostgresStore:
         """Take a transaction-scoped advisory lock in the ``classid`` family (auto-released at commit).
         Uses the two-key form so each family has its own 32-bit hashtext namespace (no cross-family
         collisions). ``timeout`` overrides asyncpg's client-side ``command_timeout`` for the wait;
-        ``None``, asyncpg's own default, keeps it."""
-        await conn.execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-            classid,
-            self._lock_key(key),
-            timeout=timeout,
-        )
+        ``None`` keeps the pool default."""
+        sql = "SELECT pg_advisory_xact_lock($1, hashtext($2))"
+        # Only an override passes the keyword, so every other lock's call is unchanged.
+        if timeout is None:
+            await conn.execute(sql, classid, self._lock_key(key))
+        else:
+            await conn.execute(sql, classid, self._lock_key(key), timeout=timeout)
 
     async def _lock_outbound_lanes(self, conn: Any, destinations: Iterable[str]) -> None:
         """ADR 0090 strict-FIFO writer-funnel: take the per-lane advisory lock for each distinct

@@ -527,6 +527,9 @@ async def test_postgres_schema_lock_wait_is_exempt_from_the_client_timeout() -> 
     assert conn.executed[lock][1] == math.inf
     # The server-side statement_timeout is lifted first, in the same transaction.
     assert sqls.index("SET LOCAL statement_timeout = 0") < lock
+    # Control: a lock with no override keeps the pool's command_timeout (no timeout passed).
+    await store._advisory_lock(conn, 1, "finalize:m1")
+    assert conn.executed[-1] == ("SELECT pg_advisory_xact_lock($1, hashtext($2))", None)
 
 
 # --- upgrade ---------------------------------------------------------------------------------------

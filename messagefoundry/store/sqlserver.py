@@ -4583,22 +4583,29 @@ class SqlServerStore:
         ):
             await self._verify_schema_external(expected)
             return False
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip the
-                # batch AND the exclusive schema applock. Re-running the full guarded batch under one
-                # exclusive applock on EVERY open made N concurrent opens convoy (WS-B Finding 2: a
-                # loser blows the 30s lock timeout → startup failure). The probe is two cheap SELECTs
-                # under the normal command timeout; a virgin/pre-marker DB falls through to the full
-                # run. Out-of-band drift (an operator hand-dropping an object) is no longer healed on
-                # every open — the remedy is `DELETE FROM schema_meta`, which forces one full run.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
-                    log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
-                    return False
-                if not provisioning and not create and not await self._schema_meta_present(cur):
-                    # Raised inside the try, so the except below rolls the probe's read txn back.
-                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+                async with self._cursor(conn) as cur:
+                    # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip
+                    # the batch AND the exclusive schema applock. Re-running the full guarded batch
+                    # under one exclusive applock on EVERY open made N concurrent opens convoy (WS-B
+                    # Finding 2: a loser blows the 30s lock timeout → startup failure). The probe is
+                    # two cheap SELECTs under the normal command timeout; a virgin/pre-marker DB falls
+                    # through to the full run. Out-of-band drift (an operator hand-dropping an object)
+                    # is no longer healed on every open — the remedy is `DELETE FROM schema_meta`,
+                    # which forces one full run.
+                    if await self._schema_marker_current(cur, expected):
+                        # Close the probe's read txn (autocommit=False pool).
+                        await self._commit(conn)
+                        log.debug(
+                            "sqlserver: schema current (%s…) — DDL batch skipped", expected[:12]
+                        )
+                        return False
+                    if not provisioning and not create and not await self._schema_meta_present(cur):
+                        # Raised inside the try, so the except below rolls the probe's txn back.
+                        raise StoreNotFoundError.server_schema(
+                            self.backend, self._settings.database
+                        )
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
@@ -4608,39 +4615,44 @@ class SqlServerStore:
                 raw = getattr(conn, "_conn", None)
                 if raw is not None:
                     raw.timeout = 0
-                # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start against a
-                # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
-                # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
-                # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
-                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
-                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
-                # path probe above already ran one or two table-reading SELECTs on this connection with
-                # no commit between, so the autocommit=False pool has an open transaction for
-                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
-                # statement opens the txn" — it predated the probe and was stale, not a contradiction
-                # of the applock rule record_audit now follows.)
-                # The wait is unbounded (BACKLOG #1726). The peer holding this lock
-                # runs the same batch with no statement timeout, so a wait bounded by command_timeout
-                # would fail this open at startup while the peer's upgrade is still healthy. The
-                # applock is transaction-scoped, so a peer that dies releases it.
-                await self._applock(cur, _SCHEMA_LOCK, timeout_ms=_APPLOCK_WAIT_FOREVER)
-                # Double-check under the lock: the peer we queued behind may have just applied this
-                # exact batch and committed its marker — then this open has nothing to do.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # releases the txn-scoped applock
-                    log.debug("sqlserver: schema applied by a peer (%s…) — skipped", expected[:12])
-                    return False
-                for statement in _SCHEMA:
-                    await cur.execute(statement)
-                await cur.execute("DELETE FROM schema_meta WHERE id=1")
-                await cur.execute(
-                    "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
-                    (expected, time.time()),
-                )
-                await self._commit(conn)
-                log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
-                return True
+                # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
+                # so the batch runs on a cursor opened AFTER the lift; the probe's cursor still carries
+                # command_timeout (BACKLOG #1726).
+                async with self._cursor(conn) as cur:
+                    # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start
+                    # against a virgin DB) — the T-SQL analog of the Postgres store's schema advisory
+                    # lock. Without it the `IF OBJECT_ID(...) IS NULL CREATE` guards below are
+                    # check-then-create: two nodes both see NULL and both CREATE, and the loser dies on
+                    # a 2714 "There is already an object named ...". The applock is transaction-scoped,
+                    # so it auto-releases on the commit/rollback below; the second node then runs the
+                    # now-no-op guarded CREATEs cleanly. It is NOT this transaction's first statement
+                    # and must not become one: the ADR 0064 fast-path probe above already ran one or
+                    # two table-reading SELECTs on this connection with no commit between (closing the
+                    # probe's cursor does not end the transaction), so the autocommit=False pool has an
+                    # open transaction for `@LockOwner='Transaction'` to attach to. (An earlier comment
+                    # here read "this first statement opens the txn" — it predated the probe and was
+                    # stale, not a contradiction of the applock rule record_audit now follows.)
+                    # The wait is unbounded, as on Postgres; PostgresStore._ensure_schema says why.
+                    log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
+                    await self._applock(cur, _SCHEMA_LOCK, timeout_ms=_APPLOCK_WAIT_FOREVER)
+                    # Double-check under the lock: the peer we queued behind may have just applied
+                    # this exact batch and committed its marker — then this open has nothing to do.
+                    if await self._schema_marker_current(cur, expected):
+                        await self._commit(conn)  # releases the txn-scoped applock
+                        log.debug(
+                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
+                    for statement in _SCHEMA:
+                        await cur.execute(statement)
+                    await cur.execute("DELETE FROM schema_meta WHERE id=1")
+                    await cur.execute(
+                        "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
+                        (expected, time.time()),
+                    )
+                    await self._commit(conn)
+                    log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
+                    return True
             except Exception:
                 await conn.rollback()  # roll back the partial DDL batch (M-6)
                 raise
