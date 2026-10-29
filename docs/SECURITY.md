@@ -4793,10 +4793,14 @@ alerts instead, with no notice.
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
 the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
-a refused row at ERROR, naming the action and the account. That line is the only record of the row,
-and nothing writes it later. Any notice the account was due still goes. Its alert still goes too,
-unless something later in the same pass raises and ends it. Then that account has neither its row
-nor its alert. A later refused audit write does not end the pass.
+a refused row at ERROR, naming the action and the account. For every row but a rename's, that line
+is the only record of the row, and nothing writes it later. Any notice the account was due still
+goes. Its alert still goes too, unless something later in the same pass raises and ends it. Then
+that account has neither its row nor its alert. A later refused audit write does not end the pass.
+A rename's `auth.ad_username_refreshed` row is different: it commits in the rename's own
+transaction (BACKLOG #3018 step 7), so a refused one rolls the rename back. The row keeps its old
+name, no row is written and no notice goes on that pass. A later pass that probes the account, or
+its next sign-in, applies the rename and writes its row and its notice then.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same

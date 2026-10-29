@@ -5330,7 +5330,13 @@ async def test_a_refused_rename_audit_row_rolls_the_rename_back_and_a_later_pass
         assert await _actors(store, "auth.ad_username_refreshed") == [kept]
         told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
         assert told == [kept], "a rename that rolled back was told"
-        assert _logged_at_error(caplog, "auth.ad_username_refreshed", lost, "rolled back")
+        # The line names the account by its id as well, since no row holds the new name after the
+        # rollback (BACKLOG #2291's rule: name the account as its row does).
+        unrenamed = await store.get_user_by_username(lost.removesuffix("-new"))
+        assert unrenamed is not None
+        assert _logged_at_error(
+            caplog, "auth.ad_username_refreshed", unrenamed.id, lost, "rolled back"
+        ), "the refused rename was not logged at ERROR naming the account's id and the new name"
         assert not await _actors(store, "auth.ad_username_refresh_conflict"), (
             "a refused audit append was audited as a name conflict"
         )

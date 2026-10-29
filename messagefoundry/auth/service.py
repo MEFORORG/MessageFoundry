@@ -9019,10 +9019,11 @@ class AuthService:
             await write_audit_soft(
                 _refused,
                 log=_log,
-                message="directory reconcile: the auth.ad_username_refreshed audit row for %s "
-                "could not be written, so its rename was rolled back and nobody was told; a later "
-                "pass that probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
-                args=lambda: (scrub_log_argument(new_username),),
+                message="directory reconcile: the auth.ad_username_refreshed audit row for account "
+                "%s (renaming to %s) could not be written, so its rename was rolled back and nobody "
+                "was told; a later pass that probes the account, or its next sign-in, applies it "
+                "again (BACKLOG #3018)",
+                args=lambda: (user_id, scrub_log_argument(new_username)),
                 errors=audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,
             )
