@@ -107,8 +107,13 @@ export function securityEditorScript(token: string, fields: unknown): string {
     let defaults = {};
     // The refusal now showing, or '' while the form is up. See refuse().
     let refusal = '';
+    // True only while the form holds a state that rendered. Save checks it as well as its disabled
+    // attribute, so a click that still reaches the button posts nothing (refuse() says why).
+    let rendered = false;
 
-    // Build the grouped form once; values are filled in on 'state'.
+    // Build the grouped form with every control UNSET; values are filled in on 'state'. It is run
+    // again by refuse(), so every control, and the 'loosened' mark on its field, is made new rather
+    // than reset one property at a time, and nothing an earlier state put on an element survives.
     function buildForm() {
       const root = $('form');
       root.innerHTML = '';
@@ -140,6 +145,13 @@ export function securityEditorScript(token: string, fields: unknown): string {
         if (f.risk !== undefined) { const w = document.createElement('div'); w.className = 'warn'; w.textContent = 'Loosened: ' + f.risk + '.'; wrap.appendChild(w); }
         root.appendChild(wrap);
       }
+      // Unset, not each select's first option: a Yes/No that shows "Yes" before any state has said
+      // so is a value nobody read, and a tristate's '' option is a real value (derived), not unset.
+      // After the loop, once every select holds its options and is on the page.
+      for (const f of FIELDS) {
+        const input = $('in-' + f.key);
+        if (input.tagName === 'SELECT') { input.selectedIndex = -1; } else { input.value = ''; }
+      }
     }
 
     function currentValue(f) {
@@ -170,16 +182,24 @@ export function securityEditorScript(token: string, fields: unknown): string {
       defaults = state.defaults || {};
       for (const f of FIELDS) { setValue(f, state.values ? state.values[f.key] : undefined); }
       refusal = '';
+      rendered = true;
       errorEl.style.display = 'none';
       $('form').style.display = '';
       $('save').disabled = false;
     }
 
-    // A state this form cannot read. The form is hidden and Save goes off, so nothing can be written
-    // from placeholders or from the values of an earlier state. textContent (through show): the
-    // problem names a switch, and no part of a message is ever parsed as markup here.
+    // A state this form cannot read. Save goes off and the form is hidden, and everything an earlier
+    // state left is CLEARED, not only hidden (owner ruling R4, 2026-10-29, BACKLOG #1123): the
+    // defaults collectUpdates() compares against, every control's value including an edit nobody
+    // saved, and each field's 'loosened' mark. The form is rebuilt unset rather than re-rendered
+    // from the last good state, which is itself an earlier message. So the next well-formed state
+    // is rendered from itself alone, and nothing is left for a Save to send. textContent (through
+    // show): the problem names a switch, and no part of a message is ever parsed as markup here.
     function refuse(problem) {
+      rendered = false;
       $('save').disabled = true;
+      defaults = {};
+      buildForm();
       $('form').style.display = 'none';
       refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
         '. Save is off until a well-formed state arrives.';
@@ -203,7 +223,10 @@ export function securityEditorScript(token: string, fields: unknown): string {
     // the element back to that rule, so the text would be set and never seen.
     function show(msg) { errorEl.textContent = msg; errorEl.style.display = 'block'; }
 
-    $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
+    $('save').addEventListener('click', () => {
+      if (!rendered) { return; }
+      vscode.postMessage({ command: 'save', updates: collectUpdates() });
+    });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
     // The JS type each FIELDS type arrives as, and how the refusal names it. Types only: a negative
@@ -275,8 +298,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
       else if (d.command === 'error') { show(refusal ? refusal + ' The engine also reported: ' + d.message : d.message); }
     });
 
-    // Save stays off until a state has rendered. Until then the form holds placeholders, not the file's
-    // values (every Yes/No shows its first option), and saving those would write them as explicit sets.
+    // Save stays off until a state has rendered. Until then every control is unset, not the file's
+    // values, and saving that would write most switches as an explicit false, 0 or empty text.
     $('save').disabled = true;
     buildForm();
   `;

@@ -52,6 +52,7 @@ interface JsdomWindow {
   document: DomNode;
   origin: string;
   MessageEvent: new (type: string, init?: Record<string, unknown>) => unknown;
+  Event: new (type: string) => unknown;
   dispatchEvent(event: unknown): boolean;
   close(): void;
   [key: string]: unknown;
@@ -929,6 +930,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     const doc = p.window.document;
     const save = doc.getElementById("save");
     assert.strictEqual(save.disabled, true, "Save was on before any state arrived");
+    // Unset, not each select's first option: no Yes/No may say "Yes" before a state has said so.
+    assert.deepStrictEqual(setControls(p), [], "a control showed a value before any state arrived");
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults));
     assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
     p.deliver(STATE_OK);
@@ -1240,6 +1243,104 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults.max_session_hours));
     save.click();
     assert.strictEqual(p.posted.length, 1, "Save posted from a stale form");
+  });
+
+  // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
+  // 2026-10-29, BACKLOG #1123). One case per kind of problem stateProblem() refuses, since each is a
+  // path into refuse(). Each first renders a state with insecure values, so 'loosened' is set and
+  // defaults are held, and edits two controls without saving, one of them into a loosening.
+  const REFUSE_TRIGGERS: [string, (c: Payload) => void][] = [
+    ["there is no state", (c) => delete c.state],
+    ["the state is a list", (c) => (c.state = [c.state])],
+    ["there is no values object", (c) => delete c.state.values],
+    ["defaults is not an object", (c) => (c.state.defaults = "secure")],
+    ["values has no switch", (c) => delete c.state.values.serve_web_console],
+    ["defaults has no switch", (c) => delete c.state.defaults.max_session_hours],
+    ["a value has the wrong type", (c) => (c.state.values.require_mfa = "false")],
+    ["a default has the wrong type", (c) => (c.state.defaults.production_instance = 0)],
+    ["set is not a list of text", (c) => (c.state.set = null)],
+    ["loosenings is not a list of entries", (c) => delete c.state.loosenings[0].risk],
+  ];
+
+  /** Every control in the form that is not unset: a select with an option chosen, or an input with text. */
+  function setControls(p: Page): string[] {
+    const controls = [...p.window.document.querySelectorAll("#form input, #form select")];
+    return controls
+      .filter((c: DomNode) => (c.tagName === "SELECT" ? c.selectedIndex !== -1 : c.value !== ""))
+      .map((c: DomNode) => `${c.id}=${JSON.stringify(c.value)}`);
+  }
+
+  /** The page's own `defaults` binding, read in the page's realm: the object collectUpdates() reads. */
+  function heldDefaults(p: Page): string[] {
+    return JSON.parse((p.window.eval as (s: string) => string)("JSON.stringify(Object.keys(defaults))")) as string[];
+  }
+
+  function loosenedFields(p: Page): string[] {
+    return [...p.window.document.querySelectorAll(".loosened")].map((e: DomNode) => String(e.id)).sort();
+  }
+
+  for (const [why, change] of REFUSE_TRIGGERS) {
+    test(`Security Settings: a discarded state clears the form, defaults and every loosened mark when ${why}`, () => {
+      const p = security.load();
+      const doc = p.window.document;
+      const save = doc.getElementById("save");
+      p.deliver(variant(STATE_OK, (c) => (c.state.values.allow_unencrypted_phi = true)));
+      // Unsaved edits: a number, and a Yes/No turned into a loosening, as the operator would.
+      const hours = doc.getElementById("in-max_session_hours");
+      hours.value = "99";
+      hours.dispatchEvent(new p.window.Event("input"));
+      const local = doc.getElementById("in-local_access_only");
+      local.value = "false";
+      local.dispatchEvent(new p.window.Event("change"));
+      // THE CONTROL: the state rendered, and every piece of state this test expects cleared is held.
+      assert.deepStrictEqual(p.warnings, [], `${why}: the good state was discarded`);
+      assert.strictEqual(save.disabled, false, `${why}: the good state did not render`);
+      assert.deepStrictEqual(
+        loosenedFields(p),
+        ["field-allow_unencrypted_phi", "field-local_access_only", "field-require_mfa"],
+        `${why}: the good state and the edit did not mark their loosenings`,
+      );
+      assert.ok(FIELDS.every((f) => heldDefaults(p).includes(f.key)), `${why}: the defaults are not held`);
+      assert.ok(setControls(p).includes('in-max_session_hours="99"'), `${why}: the edit did not take`);
+
+      p.deliver(variant(STATE_OK, change));
+
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
+      assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: the state was not discarded`);
+      assert.ok(refusalShown(p).startsWith(REFUSAL), `${why}: no refusal, got "${refusalShown(p)}"`);
+      assert.deepStrictEqual(setControls(p), [], `${why}: a control still holds a value from before the refusal`);
+      assert.deepStrictEqual(heldDefaults(p), [], `${why}: collectUpdates() would still compare against old defaults`);
+      assert.deepStrictEqual(loosenedFields(p), [], `${why}: a loosened mark outlived the refusal`);
+      assert.strictEqual(save.disabled, true, `${why}: Save is on after a refusal`);
+      // The handler holds on its own, not only the attribute.
+      save.disabled = false;
+      save.click();
+      assert.strictEqual(p.posted.length, 0, `${why}: Save posted after a refusal: ${JSON.stringify(p.posted)}`);
+    });
+  }
+
+  test("Security Settings: the state after a refusal renders from itself alone", () => {
+    // A page that was refused, then sent a well-formed state, must match a page sent that state on
+    // its own: same controls, same loosened marks, same Save. Nothing from before the refusal leaks.
+    const next = variant(STATE_OK, (c) => {
+      c.state.values.production_instance = true;
+      c.state.values.delete_message_bodies_after_days = 0;
+    });
+    const p = security.load();
+    const pdoc = p.window.document;
+    p.deliver(variant(STATE_OK, (c) => (c.state.values.allow_unencrypted_phi = true)));
+    pdoc.getElementById("in-listen_address").value = "0.0.0.0";
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
+    p.deliver(next);
+    const q = security.load();
+    q.deliver(next);
+    assert.strictEqual(formValues(p), formValues(q), "the controls differ from a page that saw only this state");
+    assert.deepStrictEqual(loosenedFields(p), loosenedFields(q), "the loosened marks differ");
+    assert.deepStrictEqual(loosenedFields(q), ["field-delete_message_bodies_after_days", "field-require_mfa"]);
+    pdoc.getElementById("save").click();
+    q.window.document.getElementById("save").click();
+    assert.strictEqual(p.posted.length, 1, "Save did not post after the well-formed state");
+    assert.strictEqual(JSON.stringify(p.posted), JSON.stringify(q.posted), "Save sends something else");
   });
 
   test("Security Settings: a key this form has no switch for, and a tristate that is set, still render", () => {
