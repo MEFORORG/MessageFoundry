@@ -4669,40 +4669,45 @@ class SqlServerStore:
                         )
                     except _ApplockTimeout as exc:
                         raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
-                    # Double-check under the lock: the peer we queued behind may have just applied
-                    # this exact batch and committed its marker — then this open has nothing to do.
-                    if await self._schema_marker_current(cur, expected):
-                        await self._commit(conn)  # releases the txn-scoped applock
-                        log.debug(
-                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
-                        )
-                        return False
                     # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The cursor has
-                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this a
-                    # CREATE INDEX or ALTER queued behind any open transaction on its table waits
-                    # forever while holding the schema lock. LOCK_TIMEOUT bounds only the wait for
-                    # each lock, never how long a build runs once it has it. It is SESSION-scoped
-                    # and survives the commit, so it is reset before the pooled connection is
-                    # released: inside the transaction before the commit, or after the rollback
-                    # below. Set AFTER the applock, which takes its own @LockTimeout. The flag is
-                    # raised first: a SET the server applied but whose round trip then failed must
-                    # still be reset.
+                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this the
+                    # double-check's read of schema_meta, or a CREATE INDEX or ALTER, queued behind
+                    # any open transaction on its table waits forever while holding the schema lock,
+                    # and cancelling the open cannot interrupt the driver thread. So the bound is set
+                    # as soon as the applock is held, BEFORE the double-check. LOCK_TIMEOUT bounds
+                    # only the wait for each lock, never how long a build runs once it has it. It is
+                    # SESSION-scoped and survives the commit, so it is reset before the pooled
+                    # connection is released: inside the transaction before the commit, on both the
+                    # skip and the apply path, or after the rollback below. Set AFTER the applock,
+                    # which takes its own @LockTimeout. The flag is raised first: a SET the server
+                    # applied but whose round trip then failed must still be reset.
                     lock_bounded = True
                     try:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
-                        for statement in _SCHEMA:
-                            await cur.execute(statement)
-                        await cur.execute("DELETE FROM schema_meta WHERE id=1")
-                        await cur.execute(
-                            "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
-                            (expected, time.time()),
-                        )
+                        # Double-check under the lock: the peer we queued behind may have just
+                        # applied this exact batch and committed its marker, so this open has
+                        # nothing to do.
+                        peer_applied = await self._schema_marker_current(cur, expected)
+                        if not peer_applied:
+                            for statement in _SCHEMA:
+                                await cur.execute(statement)
+                            await cur.execute("DELETE FROM schema_meta WHERE id=1")
+                            await cur.execute(
+                                "INSERT INTO schema_meta (id, schema_hash, applied_at)"
+                                " VALUES (1, ?, ?)",
+                                (expected, time.time()),
+                            )
                         await cur.execute(_LOCK_TIMEOUT_RESET)
                     except Exception as exc:
                         if _is_lock_timeout(exc):
                             raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
                         raise
-                    await self._commit(conn)
+                    await self._commit(conn)  # releases the txn-scoped applock
+                    if peer_applied:
+                        log.debug(
+                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
                     log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
                     return True
             except Exception:
