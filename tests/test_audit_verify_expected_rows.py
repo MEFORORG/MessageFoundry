@@ -260,3 +260,34 @@ def test_one_seq_with_two_hashes_is_refused_not_reported_as_tampering(
 def test_a_seq_no_store_can_emit_is_malformed(seq: str) -> None:
     with pytest.raises(store_mod.AuditRowPairError):
         store_mod.parse_audit_row_pair(f"{seq}:" + "a" * 64)
+
+
+def test_space_either_side_of_the_colon_reads_alike() -> None:
+    """Review finding: space after the ':' was stripped and space before it was refused."""
+    head = "a" * 64
+    assert store_mod.parse_audit_row_pair(f"7 :{head}") == store_mod.parse_audit_row_pair(
+        f"7: {head}"
+    )
+
+
+def test_a_refusal_names_the_line_a_text_editor_shows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``str.splitlines`` also breaks on form feed and NEL, so a stray one in an earlier line moved
+    the line number a refusal names. Only a newline ends a line now; CRLF still reads as one."""
+    db = tmp_path / "l.db"
+    pairs = _seed(db, 2)
+    rows = tmp_path / "rows.txt"
+    good = [f"{s}:{h}" for s, h in pairs]
+    rows.write_bytes(
+        (good[0] + "\r\n" + good[1] + "\r\n" + "x\x0cy\x85z\r\n" + "BADLINE\r\n").encode("utf-8")
+    )
+    assert main(["audit-verify", "--db", str(db), "--expected-rows-file", str(rows)]) == 2
+    err = capsys.readouterr().err
+    assert "line 3" in err, err
+    assert store_mod.read_bounded_utf8_lines(rows, 1 << 20, too_large="x") == [
+        good[0],
+        good[1],
+        "x\x0cy\x85z",
+        "BADLINE",
+    ]

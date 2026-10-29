@@ -4186,7 +4186,12 @@ def read_bounded_utf8_lines(path: str | Path, max_bytes: int, *, too_large: str)
         data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise OSError(too_large)
-    return data.decode("utf-8-sig").splitlines()
+    # Split on newlines only: ``str.splitlines`` also breaks on form feed, NEL, U+2028 and more,
+    # so a stray one would shift every line number a refusal names.
+    lines = [line.removesuffix("\r") for line in data.decode("utf-8-sig").split("\n")]
+    if lines and not lines[-1]:
+        lines.pop()  # the final newline ends the last line; it does not start another
+    return lines
 
 
 def parse_audit_anchor(text: str) -> tuple[int, str]:
@@ -4304,6 +4309,7 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
+    seq_text = seq_text.strip()  # space either side of the ':' reads alike
     # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
     # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
     if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
