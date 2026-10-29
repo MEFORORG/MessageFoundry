@@ -1514,21 +1514,22 @@ def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_
     assert held == [True] and fwd.dropped == 1
 
 
+def _lane_record(name: str, msg: str) -> logging.LogRecord:
+    return logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None)
+
+
 def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
     """Failed sign-ins write audit rows, so an unauthenticated client drives the audit rate. The
     lanes serve at most ``_FORWARD_AUDIT_BURST`` audit lines in a row while a general record waits,
     and serve the stop sentinel only once the audit lane is empty (BACKLOG #2612)."""
     from messagefoundry.store import audit_tee
 
-    def rec(name: str, msg: str) -> logging.LogRecord:
-        return logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None)
-
     burst = logging_setup._FORWARD_AUDIT_BURST
     lanes = logging_setup._ForwardLanes(100, 100)
     for i in range(burst * 3):
-        lanes.put_nowait(rec(audit_tee.audit_logger.name, f"a{i}"))
-    lanes.put_nowait(rec("mefor.test", "g0"))
-    lanes.put_nowait(rec("mefor.test", "g1"))
+        lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, f"a{i}"))
+    lanes.put_nowait(_lane_record("mefor.test", "g0"))
+    lanes.put_nowait(_lane_record("mefor.test", "g1"))
     lanes.put_nowait(None)
     order = []
     while lanes.qsize():
@@ -1559,22 +1560,15 @@ def test_general_lines_drain_while_the_audit_lane_stays_full(
     audit_bound, general = 50, 20
     lanes = logging_setup._ForwardLanes(100, audit_bound)
 
-    def audit_line() -> logging.LogRecord:
-        return logging.LogRecord(
-            audit_tee.audit_logger.name, logging.INFO, __file__, 1, "{}", None, None
-        )
-
     def top_up() -> None:
         while True:
             try:
-                lanes.put_nowait(audit_line())
+                lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, "{}"))
             except queue.Full:
                 return
 
     for i in range(general):
-        lanes.put_nowait(
-            logging.LogRecord("mefor.test", logging.INFO, __file__, 1, f"g{i}", None, None)
-        )
+        lanes.put_nowait(_lane_record("mefor.test", f"g{i}"))
     top_up()
     served = (cap + 1) * general
     general_seen: list[str] = []

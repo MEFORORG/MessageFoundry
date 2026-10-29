@@ -1028,7 +1028,7 @@ class _ForwardLanes(queue.Queue[Any]):
         (BACKLOG #1131). Below the cap the reading is the one a single queue of that bound would
         give for the same records, so it says nothing the single queue did not."""
         with self.mutex:
-            return min(len(self.queue) + len(self.audit), self.lane_maxsize)
+            return min(self._qsize(), self.lane_maxsize)
 
     def _put(self, item: Any) -> None:
         audit = _is_audit_record(item)
