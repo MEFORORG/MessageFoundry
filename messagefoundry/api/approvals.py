@@ -893,10 +893,11 @@ class ApprovalGate:
 
         It exists so a ``proof_in_route`` route (vault BACKLOG #2625) can answer a repeat BEFORE it
         demands an action-bound proof. The purge core also calls it past the proof, with
-        ``requester_name="renamed"``, before :meth:`guard` (BACKLOG #3740 item 9). Returning an id here never runs anything and never holds
-        anything new, so a caller who already has an open request needs no new proof to be told its
-        id again. Its permissions, pacing, MFA and the rest of its gate still apply. A first request
-        still needs the proof, because this finds nothing for it.
+        ``requester_name="renamed"``, before :meth:`guard` (BACKLOG #3740 item 9). Returning an id
+        here never runs anything and never holds anything new, so a caller who already has an open
+        request needs no new proof to be told its id again. Its permissions, pacing, MFA and the
+        rest of its gate still apply. A first request still needs the proof, because this finds
+        nothing for it.
 
         **The read and the audit row are two steps, not one.** A request approved, rejected or
         expired between them is still named in the 202. Nothing new runs or is held because of it.
@@ -914,12 +915,12 @@ class ApprovalGate:
         holder's request, and only a request whose params name a requester counts. The rest is
         compared as canonical JSON text, as :meth:`guard` compares it. A match is renamed only when
         its ``requester`` differs from the one given, and an exact match wins over a renamed one.
-        Any other ``requester_name`` raises :class:`ValueError`. The joined request keeps the name it was filed under, which is what the
-        approver sees and what its executor records. A caller that runs this before :meth:`guard`
-        files nothing under an earlier name: a request settled before this read is not found, and
-        :meth:`guard` then files one under the current name. One settled after this read is still
-        named, as above. Past the scan limit a renamed repeat is not found here, and :meth:`guard`
-        files a second request."""
+        Any other ``requester_name`` raises :class:`ValueError`. The joined request keeps the name
+        it was filed under, which is what the approver sees and what its executor records. A caller
+        that runs this before :meth:`guard` files nothing under an earlier name: a request settled
+        before this read is not found, and :meth:`guard` then files one under the current name. One
+        settled after this read is still named, as above. Past the scan limit a renamed repeat is
+        not found here, and :meth:`guard` files a second request."""
         # Fail closed: only these values are understood, so a typo never widens the match.
         if requester_name not in ("same", "any", "renamed"):
             raise ValueError(f"requester_name must be same, any or renamed, not {requester_name!r}")
