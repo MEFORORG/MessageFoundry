@@ -2064,9 +2064,11 @@ def _make_client(
 #: refusal (see :func:`_guard_ftps_revocation`), so the connection-shaped default, which offers
 #: ``[tls].crl_file``, would name a lever that cannot work there (SDS-3.7).
 _EXPIRY_RELAXED_WAYS_ACROSS = (
-    "This hop sets tls_allow_expired, so a CRL cannot check it: the relaxation skips the CRL's "
-    "validity window too. Set tls_revocation_attested=true with a tls_revocation_attested_reason "
-    "on this connection, or remove tls_allow_expired so a [tls].crl_file on this hop can check it."
+    "This hop sets tls_allow_expired, so a CRL cannot admit it: a certificate the CRL lists is "
+    "still refused, but the relaxation skips the CRL's own validity window, so a CRL past its "
+    "nextUpdate is still used. Set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
+    "[tls].crl_file on this hop can admit it."
 )
 
 
