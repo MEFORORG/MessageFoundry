@@ -2442,8 +2442,10 @@ the agent's file sink at the file named `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECR
 this directory, and leaves the sink unwrapped and unencrypted, so the file holds the bare token.
 The file is held to the rules above. On POSIX that is mode `0600` owned by the engine's account,
 so the agent writes it as that account, with the sink's `mode` set to `0600`: a group bit, as in
-the agent's default sink mode, is refused. On Windows, grant the agent's account the rights it
-needs in the directory to create, replace and delete that file, and no broad group anything.
+the agent's default sink mode, is refused. On Windows too, run the agent as the engine's own
+service account, so no second account joins the directory's access list. That account then
+needs the rights in the directory to create, replace and delete the token file, as the POSIX
+owner has, beyond the read granted above. Grant no other account and no broad group anything.
 
 - **When a replaced token is used.** The engine reads the file each time it builds a Vault client.
   For the `vault` key provider that is at least every store open and every DR backup pass, and for
