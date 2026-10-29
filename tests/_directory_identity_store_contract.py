@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from messagefoundry.store.store import AuditAppend, UsernameAuditAppendError
 
 #: A bound account's directory id, in the ONE spelling ``auth/ldap.py``'s normaliser emits
@@ -347,16 +349,13 @@ async def _assert_username_refresh_contract(store: Any) -> None:
 
     store._append_audits = refuse
     try:
-        try:
+        with pytest.raises(UsernameAuditAppendError) as refused:
             await store.set_user_username(
                 "rename-me", "jdoe-lost", expected_username="jdoe-audited", audits=(row("lost"),)
             )
-        except UsernameAuditAppendError as exc:
-            assert exc.cause is refusal
-        else:
-            raise AssertionError("a refused audit append did not raise")
     finally:
         del store._append_audits
+    assert refused.value.cause is refusal
     kept = await store.get_user("rename-me")
     assert kept is not None and kept.username == "jdoe-audited", "the rename outlived its row"
     assert await refreshed() == ["jdoe-audited"]

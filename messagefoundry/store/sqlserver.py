@@ -14270,30 +14270,34 @@ class SqlServerStore:
         now = time.time() if now is None else now
         appended: list[AppendedAuditRow] = []
         async with self._audit_lock if audits else nullcontext():  # noqa: SIM117
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    await cur.execute(
-                        "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
-                    )
-                    taken = bool(await cur.fetchall())
-                    written = None
-                    if not taken:
-                        written = await self._write_user(
-                            cur,
-                            user_id,
-                            lambda r: (
-                                r.changed(username=username, updated_at=float(now))
-                                if r.row.username == expected_username
-                                else None
-                            ),
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
                         )
-                    if written is not None:
-                        appended = await append_rename_audits(
-                            self._append_audits(cur, audits, now=now)
-                        )
-                    await self._commit(conn)
+                        taken = bool(await cur.fetchall())
+                        written = None
+                        if not taken:
+                            written = await self._write_user(
+                                cur,
+                                user_id,
+                                lambda r: (
+                                    r.changed(username=username, updated_at=float(now))
+                                    if r.row.username == expected_username
+                                    else None
+                                ),
+                            )
+                        if written is not None:
+                            appended = await append_rename_audits(
+                                self._append_audits(cur, audits, now=now)
+                            )
+                        await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    # BACKLOG #1940: a rollback that fails could leave the audit INSERT open on a
+                    # recycled connection; see _rollback_or_discard. After the cursor block, as
+                    # _write_user_with_audits runs it.
+                    await self._rollback_or_discard(conn)
                     raise
         if written is None:
             return False

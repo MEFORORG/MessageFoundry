@@ -6628,9 +6628,9 @@ class UsernameAuditAppendError(Exception):
 
     A class of its own because the append's error can share a class with the UPDATE's. Each
     backend's append can raise its driver's integrity error, and the caller reads that class as a
-    lost race for the name, then audits a conflict and warns of a lockout nobody faces. The name
-    carries neither "Integrity" nor "UniqueViolation", so ``AuthService``'s integrity test, which
-    matches on those names, never reads this as a race. Only ``set_user_username`` raises it."""
+    lost race for the name, then audits a conflict and warns of a lockout nobody faces. What keeps
+    it apart is that ``AuthService._refresh_cached_username`` catches this class before its
+    integrity arm. Only ``set_user_username`` raises it."""
 
     def __init__(self, cause: Exception) -> None:
         super().__init__(f"the rename's audit row could not be appended ({type(cause).__name__})")

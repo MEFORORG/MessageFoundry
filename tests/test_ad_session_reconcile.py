@@ -24,7 +24,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, get_args
@@ -66,7 +66,6 @@ from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
-    AuditAppend,
     MessageStore,
     UserRecord,
     VerifiedUser,
@@ -4484,17 +4483,8 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
         writes: list[bool] = []
         set_user_username = store.set_user_username
 
-        async def _count_write(
-            user_id: str,
-            username: str,
-            *,
-            expected_username: str,
-            now: float | None = None,
-            audits: Sequence[AuditAppend] = (),
-        ) -> bool:
-            wrote = await set_user_username(
-                user_id, username, expected_username=expected_username, now=now, audits=audits
-            )
+        async def _count_write(*a: Any, **kw: Any) -> bool:
+            wrote = await set_user_username(*a, **kw)
             writes.append(wrote)
             return wrote
 
@@ -5174,20 +5164,29 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
 
 
 def _refuse_first(
-    monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str, refusal: Exception
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    action: str,
+    refusal: Exception,
+    *,
+    via: str = "record_audit",
 ) -> list[str]:
     """Make the store refuse the first ``action`` row it sees. Returns the refused row's actor,
-    once there is one, so a test can tell which account lost its row."""
-    real_record = store.record_audit
+    once there is one, so a test can tell which account lost its row.
+
+    ``via`` names the store method refused. ``_append_audit_row`` is the chain append inside a
+    write, which a rename's ``auth.ad_username_refreshed`` row goes through since it commits with
+    the rename (BACKLOG #3018 step 7); it never reaches ``record_audit``."""
+    real = getattr(store, via)
     refused: list[str] = []
 
-    async def failing(name: str, **kwargs: Any) -> None:
+    async def failing(name: str, **kwargs: Any) -> Any:
         if name == action and not refused:
             refused.append(kwargs["actor"])
             raise refusal
-        await real_record(name, **kwargs)
+        return await real(name, **kwargs)
 
-    monkeypatch.setattr(store, "record_audit", failing)
+    monkeypatch.setattr(store, via, failing)
     return refused
 
 
@@ -5272,42 +5271,27 @@ async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
         await store.close()
 
 
-def _refuse_first_append(
-    monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str, refusal: Exception
-) -> list[str]:
-    """Make the store's chain append refuse the first ``action`` row it sees, inside the write
-    that carries it. A rename's ``auth.ad_username_refreshed`` row commits with the rename
-    (BACKLOG #3018 step 7), so it never reaches ``record_audit``, which ``_refuse_first`` patches.
-    Returns the refused row's actor, once there is one."""
-    real_append = store._append_audit_row
-    refused: list[str] = []
-
-    async def failing(name: str, **kwargs: Any) -> Any:
-        if name == action and not refused:
-            refused.append(kwargs["actor"])
-            raise refusal
-        return await real_append(name, **kwargs)
-
-    monkeypatch.setattr(store, "_append_audit_row", failing)
-    return refused
-
-
-async def _two_renamed_accounts() -> tuple[
-    MessageStore, AuthService, _CapturingNotifier, _FakeLdap
-]:
-    """``jdoe`` and ``asmith`` signed in, then renamed in the directory to ``<name>-new``."""
+async def _two_renamed_accounts(
+    names: tuple[str, ...] = ("jdoe", "asmith"),
+) -> tuple[MessageStore, AuthService, _CapturingNotifier]:
+    """``names`` signed in, then renamed in the directory to ``<name>-new``."""
     store = await MessageStore.open(":memory:")
-    names = ("jdoe", "asmith")
-    ldap = _FakeLdap({n: _principal(n) for n in names})
-    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-    notifier = _CapturingNotifier()
-    service._security_notifier = notifier
-    await service.initialize()
-    for name in names:
-        await _signed_in_ad_user(service, store, name)
-    notifier.sent.clear()
-    ldap.present = {f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n)) for n in names}
-    return store, service, notifier, ldap
+    try:
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        for name in names:
+            await _signed_in_ad_user(service, store, name)
+        notifier.sent.clear()
+        ldap.present = {
+            f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n)) for n in names
+        }
+    except BaseException:
+        await store.close()
+        raise
+    return store, service, notifier
 
 
 @pytest.mark.parametrize(
@@ -5330,9 +5314,11 @@ async def test_a_refused_rename_audit_row_rolls_the_rename_back_and_a_later_pass
     applied, audited and told, and the pass returns its plan (step 1). The refusal is logged at
     ERROR, and is not read as a name conflict. A later pass then writes the rename, its row and its
     notice. Before step 7 the name moved, the row was lost, and no later pass ever wrote it."""
-    store, service, notifier, _ldap = await _two_renamed_accounts()
+    store, service, notifier = await _two_renamed_accounts()
     try:
-        refused = _refuse_first_append(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        refused = _refuse_first(
+            monkeypatch, store, "auth.ad_username_refreshed", refusal, via="_append_audit_row"
+        )
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             plan = await service.reconcile_directory_sessions()
         assert len(refused) == 1, "no rename audit row was refused"
@@ -5368,10 +5354,14 @@ async def test_a_defect_in_a_rename_audit_append_is_still_raised(
 ) -> None:
     """BACKLOG #3018. The reconciler passes a store refusal of the rename's row and nothing else:
     a defect still ends the pass, as it does for the pass's own rows. The rename rolled back."""
-    store, service, _notifier, _ldap = await _two_renamed_accounts()
+    store, service, _notifier = await _two_renamed_accounts()
     try:
-        refused = _refuse_first_append(
-            monkeypatch, store, "auth.ad_username_refreshed", defect("synthetic")
+        refused = _refuse_first(
+            monkeypatch,
+            store,
+            "auth.ad_username_refreshed",
+            defect("synthetic"),
+            via="_append_audit_row",
         )
         with pytest.raises(defect):
             await service.reconcile_directory_sessions()
@@ -5424,18 +5414,13 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
     the login path calls it, a refused ``auth.ad_username_refreshed`` row still raises its own
     error, and since step 7 the rename rolls back with it, so the name never moves without its row.
     An integrity error from the append raises too, rather than being read as a lost race."""
-    store = await MessageStore.open(":memory:")
+    store, service, notifier = await _two_renamed_accounts(("jdoe",))
     try:
-        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
-        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-        notifier = _CapturingNotifier()
-        service._security_notifier = notifier
-        await service.initialize()
-        await _signed_in_ad_user(service, store, "jdoe")
         jdoe = await store.get_user_by_username("jdoe")
         assert jdoe is not None
-        notifier.sent.clear()
-        refused = _refuse_first_append(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        refused = _refuse_first(
+            monkeypatch, store, "auth.ad_username_refreshed", refusal, via="_append_audit_row"
+        )
         with pytest.raises(type(refusal), match="synthetic"):
             await service._refresh_cached_username(
                 user_id=jdoe.id,

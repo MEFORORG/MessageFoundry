@@ -8952,20 +8952,24 @@ class AuthService:
             # ``_audit_reconciler_row`` does for its rows: a raise here would end the pass and skip
             # every later account's revocation (BACKLOG #3018 step 1). The row still holds the old
             # name, so a later pass that probes the account, or its next sign-in, renames it again
-            # and writes the row and the notice then. A defect still raises.
+            # and writes the row and the notice then. A defect still raises. The sort is
+            # ``write_audit_soft``'s, with ``_audit_reconciler_row``'s sets, so the two cannot drift.
             cause = exc.cause
-            if (
-                not audit_soft
-                or isinstance(cause, AUDIT_WRITE_DEFECTS)
-                or not isinstance(cause, audit_write_errors())
-            ):
+            if not audit_soft:
                 raise cause from None
-            _log.error(
-                "directory reconcile: the auth.ad_username_refreshed audit row for %s could not be "
-                "written, so its rename was rolled back and nobody was told; a later pass that "
-                "probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
-                scrub_log_argument(new_username),
-                exc_info=cause,
+
+            async def _refused() -> None:
+                raise cause
+
+            await write_audit_soft(
+                _refused,
+                log=_log,
+                message="directory reconcile: the auth.ad_username_refreshed audit row for %s "
+                "could not be written, so its rename was rolled back and nobody was told; a later "
+                "pass that probes the account, or its next sign-in, applies it again (BACKLOG #3018)",
+                args=lambda: (scrub_log_argument(new_username),),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
             )
             return
         except Exception as exc:
@@ -9015,12 +9019,9 @@ class AuthService:
             winner = await self._load_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race", before.username)
             return
-        # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED, which the store now enforces: it appends the
-        # row only when the UPDATE wrote (BACKLOG #3018 step 7). The UPDATE can match zero rows and
-        # raise nothing, so an unconditional success audit would report a rename that did not
-        # happen. An audit trail that says a name moved when it did not is worse than a missing row:
-        # an operator reconciling "who is this account" against the directory would take the
-        # engine's word for a state neither side is in.
+        # The success row was appended only if the UPDATE wrote (the store's contract, BACKLOG #3018
+        # step 7): an UPDATE can match zero rows and raise nothing, and a row for a rename that did
+        # not happen would be worse than none.
         #
         # ``False`` covers three cases, and the re-read below tells them apart.
         #   - The row is gone, deleted between the pre-read and the write: ``row_gone``.
