@@ -86,6 +86,7 @@ from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
     MIRRORED_CONNECTION_SETTING,
     HopPosture,
+    InsecureHopRefused,
     TrustAnchorPolicy,
     active_hop_posture,
     current_hop_posture,
@@ -233,6 +234,7 @@ from messagefoundry.transports.base import (
     IntakeRateLimiter,
     ProcessedArchive,
     ReplyBodyDropped,
+    SourceStartupError,
     SyncReplyResolver,
     check_file_key,
     guard_dir_settings,
@@ -3339,20 +3341,31 @@ class RegistryRunner:
             await self._checked_inbound_start(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
-        """:meth:`_start_inbound_unsafe` after the lane check. A refused CA records the inbound
-        failed before it re-raises, so a poller an operator or an alert rule restarts reads
-        ``failed``, not ``stopped`` (vault BACKLOG #2371).
+        """:meth:`_start_inbound_unsafe` after the lane check. A refused start records the inbound
+        failed before it re-raises, so a listener an operator or an alert rule starts or restarts
+        reads ``failed``, with an alert, not ``stopped`` with none: a refused CA (vault BACKLOG
+        #2371), or a start gate, hop guard, startup validation or bind (BACKLOG #3859). A restart
+        has already unbound the listener when its start is refused. A refused plain start is
+        recorded too, as :meth:`start` records one at boot.
 
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
-        every in-window tick, and :meth:`_record_failed` alerts and logs a traceback each time it
-        runs. Every alert could re-fire a ``restart_inbound`` control action."""
+        every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
+        so a page per refusal would be an alert-restart loop. A start that binds clears the record, so the
+        next refusal pages again. :class:`NotDeployedError` is not recorded: that inbound reads
+        ``not_deployed``, not failed."""
         try:
             await self._check_inbound_lane_anchor(name)
-        except TrustAnchorError as exc:
+            await self._start_inbound_unsafe(name)
+        except (
+            TrustAnchorError,
+            WiringError,  # a start gate, and PortConflictError from a bind race
+            InsecureHopRefused,  # a hop guard the connector's own constructor runs
+            SourceStartupError,  # validate_startup, such as a missing poll directory
+            OSError,  # a bind or startup failure that is not a port conflict
+        ) as exc:
             if ("inbound", name) not in self._failed:
                 self._record_failed(name, exc, kind="inbound")
             raise
-        await self._start_inbound_unsafe(name)
 
     async def stop_inbound(self, name: str) -> None:
         """Stop receiving on one inbound connection (its delivery workers keep draining)."""
@@ -4384,7 +4397,10 @@ class RegistryRunner:
         succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
         only, whatever its reason: keying on the reason text would re-alert every tick on an error
         whose message varies. A reload clears the record (see :meth:`reload`), so the next window
-        open alerts afresh."""
+        open alerts afresh.
+
+        :meth:`_checked_inbound_start` records the refusals it names before this runs (BACKLOG
+        #3859), so for those this only logs the retry; it records what that method does not name."""
         if ("inbound", name) in self._failed:
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
