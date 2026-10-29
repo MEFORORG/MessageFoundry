@@ -1032,7 +1032,7 @@ def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
         fwd.close()  # idempotent: no second report
     reports = [r.getMessage() for r in caplog.records if "drain deadline" in r.getMessage()]
     assert len(reports) == 1
-    assert "moved 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
+    assert "moved at least 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
     assert "late" not in caplog.text  # a count and a directory, never a record
     assert len(_segments(spool_dir)) == 1  # and they are on disk for the next start
 

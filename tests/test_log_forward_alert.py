@@ -11,6 +11,7 @@ alert, and the status model. No test opens a socket or resolves a name.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import socket
@@ -29,10 +30,13 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.logging_setup import (
+    AUDIT_LOGGER_NAME,
     ForwarderStatus,
     SyslogForward,
+    _ForwardLanes,
     _ForwardQueueHandler,
     _ForwardQueueListener,
+    _published_counts,
     _TimeoutSysLogHandler,
     configure_logging,
     forwarder_status,
@@ -97,11 +101,16 @@ class _Collector(logging.Handler):
 
 
 def _attach(
-    collector: _Collector, *, maxsize: int = 100
+    collector: _Collector, *, maxsize: int = 100, audit_maxsize: int | None = None
 ) -> tuple[_ForwardQueueHandler, _ForwardQueueListener]:
     """A forwarder on the root logger whose listener thread is NOT started, so the test decides
-    when a record leaves the queue."""
-    records: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+    when a record leaves the queue. With ``audit_maxsize`` it has the two lanes the shipped
+    forwarder has (BACKLOG #2612); without it, one plain queue."""
+    records: queue.Queue[Any] = (
+        queue.Queue(maxsize=maxsize)
+        if audit_maxsize is None
+        else _ForwardLanes(maxsize, audit_maxsize)
+    )
     listener = _ForwardQueueListener(records, collector)
     handler = _ForwardQueueHandler(records, listener)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -112,6 +121,10 @@ def _attach(
 
 def _record(text: str) -> logging.LogRecord:
     return logging.LogRecord("mefor.test", logging.INFO, __file__, 1, text, None, None)
+
+
+def _audit_record() -> logging.LogRecord:
+    return logging.LogRecord(AUDIT_LOGGER_NAME, logging.INFO, __file__, 1, "{}", None, None)
 
 
 # --- the reading -------------------------------------------------------------------------------
@@ -307,6 +320,101 @@ def test_a_rising_drop_count_raises_the_alert_with_no_record_text() -> None:
     watch.run_once()
     assert sink.forward_failures == [("forwarder:dropping", "queue_full", dropped)]
     assert "DOE" not in repr(sink.forward_failures) and "PID" not in repr(sink.forward_failures)
+
+
+def test_a_full_audit_lane_raises_the_dropping_alert_as_queue_full() -> None:
+    """An audit tee line dropped for a full audit lane raises the ``dropping`` alert, with the same
+    ``queue_full`` reason a general drop raises (BACKLOG #2612). No reason word names the audit
+    lane: the alert's reader may hold ``logs:view`` alone, and a word that rose only on audit
+    drops would tell it an audit row was written (BACKLOG #1131)."""
+    handler, _ = _attach(_Collector(), audit_maxsize=1)
+    sink = _RecordingSink()
+    watch, _ = _watch(sink)
+    watch.run_once()
+    for _ in range(3):
+        handler.handle(_audit_record())
+    status = forwarder_status()
+    # The drop warning is a general record, and the general lane had room for it.
+    assert status.queue_dropped == status.lost == 2
+    assert status.state == "degraded"
+    watch.run_once()
+    assert sink.forward_failures == [("forwarder:dropping", "queue_full", 2)]
+    assert "audit" not in repr(sink.forward_failures)
+
+
+def test_a_general_drop_raises_the_same_reason_as_an_audit_drop() -> None:
+    """The control for the test above: a general record dropped while the audit lane has room
+    raises ``queue_full``, the same reason, so the reason cannot tell the lanes apart."""
+    handler, _ = _attach(_Collector(), maxsize=1, audit_maxsize=1)
+    sink = _RecordingSink()
+    watch, _ = _watch(sink)
+    for _ in range(3):
+        handler.handle(_record(SYNTHETIC_RECORD))
+    watch.run_once()
+    assert [(name, reason) for name, reason, _ in sink.forward_failures] == [
+        ("forwarder:dropping", "queue_full")
+    ]
+
+
+def test_queued_does_not_move_with_audit_rows_while_the_general_lane_is_full() -> None:
+    """While the general lane is pinned full, general records are dropped and cannot move a depth,
+    so a ``queued`` over both lanes would rise by one per audit row written, the hidden lock rows
+    included (BACKLOG #1131, #2612). ``queued`` counts both lanes capped at the smaller lane
+    bound, here the general lane's, so it stays pinned there. The control is the queue's own size, which does hold the
+    audit lines."""
+    handler, _ = _attach(_Collector(), maxsize=3, audit_maxsize=100)
+    for _ in range(5):  # three fit; two are dropped, so the lane is pinned full
+        handler.handle(_record(SYNTHETIC_RECORD))
+    before = forwarder_status()
+    health = _log_forwarder_health()
+    assert before.queued == 3 and health is not None and health.queued == 3
+    assert before.queue_dropped >= 2
+    n = 7
+    for _ in range(n):
+        handler.handle(_audit_record())
+        handler.handle(_record(SYNTHETIC_RECORD))  # general traffic keeps arriving, and drops
+    after = forwarder_status()
+    health = _log_forwarder_health()
+    assert after.queued == before.queued and health is not None and health.queued == before.queued
+    assert handler._records.qsize() == 3 + n  # the control: the audit lane holds every line
+
+
+def test_queued_rises_while_a_stalled_collector_carries_only_audit_lines() -> None:
+    """A collector that stops taking records raises no send error, so ``queued`` is the only field
+    that shows it. With only audit lines arriving, a ``queued`` over the general lane alone read
+    zero and the forwarder looked idle; the single queue before BACKLOG #2612 showed the depth.
+    The control is the queue's own size: the lines really are waiting."""
+    handler, _ = _attach(_Collector(), maxsize=5, audit_maxsize=100)
+    for _ in range(3):
+        handler.handle(_audit_record())
+    status = forwarder_status()
+    health = _log_forwarder_health()
+    assert handler._records.qsize() == 3  # the control
+    assert status.queued == 3 and health is not None and health.queued == 3
+    for _ in range(10):  # past the general lane's bound, the reading is pinned at it
+        handler.handle(_audit_record())
+    assert handler._records.qsize() == 13 and forwarder_status().queued == 5
+
+
+@pytest.mark.parametrize("bounds", [(5, 2), (2, 5)], ids=["audit-smaller", "general-smaller"])
+def test_queued_reads_the_same_whichever_lane_is_full(bounds: tuple[int, int]) -> None:
+    """``queued`` must not tell a reader without ``users:manage`` which lane is dropping, or a
+    full audit lane says audit rows are being written (BACKLOG #1131, #2612). It is capped at the
+    smaller bound, so a full lane of either kind reads the cap whatever the two bounds are. The
+    control is the queue's own size, which differs between the two arms."""
+    general_bound, audit_bound = bounds
+    readings, sizes = [], []
+    for name in (AUDIT_LOGGER_NAME, "mefor.test"):
+        lanes = _ForwardLanes(general_bound, audit_bound)
+        for _ in range(max(bounds) + 2):
+            with contextlib.suppress(queue.Full):
+                lanes.put_nowait(
+                    logging.LogRecord(name, logging.INFO, __file__, 1, "x", None, None)
+                )
+        readings.append(_published_counts(lanes, lanes.qsize())[0])
+        sizes.append(lanes.qsize())
+    assert sizes[0] != sizes[1]  # the control: the lanes did fill to different depths
+    assert readings == [min(bounds)] * 2
 
 
 def test_a_healthy_forwarder_raises_nothing() -> None:

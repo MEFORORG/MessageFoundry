@@ -883,11 +883,19 @@ def FileRef(
     return ReferenceSourceSpec("file", {"path": path, "encoding": encoding})
 
 
+#: Row ceiling for one ``DatabaseRef`` sync when the declaration sets no ``max_rows`` (BACKLOG #2617).
+#: Far above the ``db_lookup`` default, because a reference set is the place a large table belongs:
+#: a provider directory or a code map runs to thousands or tens of thousands of rows. It is a memory
+#: bound on one sync, not a business limit. A sync past it is REFUSED and the last-good snapshot
+#: stays. ``DatabaseRef(max_rows=...)`` moves it; ``0`` removes it.
+DEFAULT_REFERENCE_MAX_ROWS = 100_000
+
+
 def DatabaseRef(
     *,
     server: str | EnvRef,
     database: str | EnvRef,
-    statement: str,
+    statement: str | EnvRef,
     key_column: str,
     value_column: str | None = None,
     auth: str = "sql",
@@ -901,14 +909,25 @@ def DatabaseRef(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
+    max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
 
-    The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
-    the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
+    The engine runs ``statement`` (a read-only ``SELECT``/``WITH`` query) on the set's refresh
+    cadence and builds the snapshot from the rows. The statement passes the same read-only statement
+    test as a ``db_lookup`` (BACKLOG #2617): it must open with ``SELECT`` or ``WITH``, carry no write,
+    ``EXEC`` or DDL keyword outside a literal or comment, and chain no second statement. So a stored
+    procedure is refused. A literal statement is tested here, when the set is declared, so every path
+    that loads the config refuses it. An ``env()`` statement has no value here; the build check
+    (``messagefoundry check``'s build leg, reload) tests it once resolved. Every sync tests the
+    statement again. It is a shape test on text, not read-only authority: give the login only
+    ``SELECT`` (docs/CONNECTIONS.md). The connection also advertises ``ApplicationIntent=ReadOnly``;
+    ``transports.database._build_dsn`` says which servers act on it, at least by sending it to a
+    lagging read-only replica or, on a ``READ_WRITE`` availability-group primary, refusing it.
+    ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
     refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
@@ -921,10 +940,34 @@ def DatabaseRef(
     last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
     the bound is what stops one unresponsive server from stalling every other set's refresh.
 
+    ``max_rows`` (default :data:`DEFAULT_REFERENCE_MAX_ROWS`) bounds one sync's result. The engine
+    reads at most one row past it from the driver, then refuses the sync: the last-good snapshot
+    stays, the AlertSink fires, and a set never synced stays unloaded. The result is never
+    truncated, since a partial set would answer ``get`` wrongly with nothing to say so. ``0``
+    removes the ceiling. Checked when declared, like ``acquire_timeout``; an ``env()`` value is
+    checked by the build check (``messagefoundry check``'s build leg, reload) and at each sync, once
+    resolved.
+
     ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # BACKLOG #2617: a literal statement is tested here, so every load path refuses it, not only the
+    # build check, which `messagefoundry check` runs only with a messagefoundry.toml. Imported here:
+    # messagefoundry.transports imports this module at its top level.
+    from messagefoundry.config.db_lookup import DbLookupError
+    from messagefoundry.transports.database import _require_read_only
+
+    statement_refusal: str | None = None
+    # A statement that is not a literal (an env() ref) waits for the build check and the sync, which
+    # test it once resolved.
+    if isinstance(statement, str):
+        try:
+            _require_read_only(statement, subject="DatabaseRef statement")
+        except DbLookupError as exc:
+            statement_refusal = str(exc)
+    if statement_refusal is not None:
+        raise WiringError(statement_refusal)
     # Refused here, at declaration, because a reference set is first dialled at sync time, after
     # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
     # An env() ref has no value yet; the sync checks it once resolved.
@@ -950,6 +993,20 @@ def DatabaseRef(
             refusal = str(exc)
         if refusal is not None:
             raise WiringError(refusal)
+    # max_rows by the same rule and for the same reason (BACKLOG #2617). An env() ref waits for the
+    # sync and for the build check, which read it once resolved.
+    if not isinstance(max_rows, EnvRef):
+        from messagefoundry.transports.database import max_rows_setting
+
+        rows_refusal: str | None = None
+        try:
+            max_rows_setting(
+                max_rows, label="DATABASE reference source", default=DEFAULT_REFERENCE_MAX_ROWS
+            )
+        except ValueError as exc:
+            rows_refusal = str(exc)
+        if rows_refusal is not None:
+            raise WiringError(rows_refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -969,6 +1026,7 @@ def DatabaseRef(
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            "max_rows": max_rows,
             **attestation,
         },
     )

@@ -729,7 +729,9 @@ re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is lead
 Event, so an abandoned one finishes at most its single in-flight scan. State this per connector; do not
 write "every source".
 *Tests:* N parked sources → wall clock is max(), not sum(); a re-promotion after an abandoned stop cannot
-double-bind; SHUTDOWN remains byte-identical.
+double-bind; SHUTDOWN remains byte-identical. *Corrected 2026-10-26: SHUTDOWN is no longer
+byte-identical in its source phase. Its stops now run concurrently, unbounded, and a teardown
+cancelled from outside gives them a grace before cutting them. See Amendment B (BACKLOG #1620).*
 
 **Inc 5 — DEMOTE ordering + cooperative quiesce + edge trigger.** Under DEMOTE only, move the dispatcher
 block above the source loop and split `d.stop()` into a cooperative `quiesce()` (no `task.cancel()`, so
@@ -1125,3 +1127,207 @@ Removing the floor from `mark_failed` turned four red, and from `mark_batch_fail
 `tests/test_adr0157_postgres_fence.py` drives the real `reclaim_expired_leases` interleaving, and
 `tests/test_adr0157_sqlserver_fence.py` drives a re-pended row under both NOCOUNT states. Both run
 only on the hosted legs.
+
+## Amendment B (2026-10-26): SHUTDOWN inbound stops run concurrently, and an outer cancel gives them a grace (BACKLOG #1620)
+
+### What changed
+
+Inc 4 kept SHUTDOWN byte-identical and made the bounded, concurrent source stop DEMOTE only.
+SHUTDOWN's source phase is now concurrent too. `_teardown_body`'s non-demote branch starts every
+`source.stop()` as a task and joins them all with `asyncio.wait`, so N slow inbound stops cost the
+slowest one, not the sum. A failed stop is logged by inbound name, and once every stop has been
+joined the first failure is re-raised, before anything after the source phase runs. Each inbound
+whose `stop()` returned cleanly is dropped from `_sources` first, so `inbound_running()` does not
+report a closed listener as up; the ones that may still be live, and the whole drain side, stay
+residual state, and the next `stop()` or `start()` retries them.
+
+### Why the parity constraint is relaxed for this phase only
+
+Inc 4 cited the parity constraint against *bounding* the SHUTDOWN stop. That still holds: the
+SHUTDOWN branch adds no bound, cut or abandon of its own on an uncancelled stop. Every stop is
+joined before the dispatchers stop, the source-then-dispatcher order the code comments attribute
+to "ADR 0066 D3" (this ADR's Context records that no such decision exists; the order is the
+code's own), and before `start()` can rebind on its failed-start and residual-state teardowns
+(review M-8). The relaxation is only the order in which the stops run, and when a failure is
+raised. Every other SHUTDOWN phase, and the order of the phases, is unchanged. The Inc 5
+single-node parity sentinel does not drive this branch, so it is no evidence for it either way;
+the tests below are the only controls on it.
+
+A stop task that ended cancelled although nobody cut it is raised as a `RuntimeError`, not as a
+`CancelledError`. A bare cancel raised from a teardown nobody cancelled would read as the caller's
+own cancel, and `Engine._graph_supervisor_loop` re-raises a cancel and exits.
+
+Joined is not stopped. A stop that raised can leave its listener live, for example a DICOM server
+whose shutdown raised. So a failed stop ends teardown right after the source phase, and nothing
+on the drain side is cleared: the dispatchers, the workers, the lanes, the connection-event queue
+and the destinations stay as they were. (A build of this amendment ran the rest of teardown first
+and then re-raised; the Lander held it on exactly this, 2026-10-27.) `_stop` is set at the top of
+teardown, so the worker and dispatcher loops have already stopped claiming, as they had under the
+serial loop. A message the still-live listener takes in that window is committed at the ingress
+stage before its ACK, so it is durable, and the next `start()` drains it: `start()` first re-runs
+teardown on the residual state, then builds fresh workers that claim it.
+
+### What an outer cancel does now
+
+The serial loop, cancelled from outside, cut at most the one stop in flight and never started the
+rest. A plain `gather` over concurrent stops would cut all of them at once. Instead:
+
+1. The cancel reaches the `asyncio.wait`, which never cancels its awaitables (D6). The stops keep
+   running.
+2. `_join_cancelled_source_stops` gives them up to `_CANCELLED_STOP_GRACE_SECONDS` to finish. The
+   grace spares a stop that ends promptly a cut and a redo, and the DICOM cut hazard below
+   (Database guards its own row step). The bound honours the caller's cancel. It saves no
+   shutdown time, and on the production paths it adds up to its own length. Those paths are at
+   least `start()`'s residual-state teardown and its failed-start unwind, each reachable from the graph supervisor while
+   `Engine.stop()`'s `wait_for` on that supervisor expires. `Engine.stop()` next calls
+   `registry_runner.stop()`, which waits on the same stops with no bound. A hung stop is cut here
+   and then hangs, visibly, in that following `stop()`, which covers the rest.
+3. Stops still running after the grace are cancelled and their cancellation is joined. A second
+   cancel cuts at once, whether it arrives during the grace or is coalesced with the first in one
+   loop turn. That is read as `current_task().cancelling()` rising by more than one over its value
+   before the wait, so a cancel the task already carried, swallowed in a cleanup path, does not
+   count.
+4. Every stop that finished with an error is logged by inbound name through `safe_exc`, including
+   a cut stop whose cancellation handling raised one. Stops that ended cancelled without the
+   runner cutting them, as a loop close does to every task, are counted in one warning. A further
+   cancel during the join of the cut stops does not leave a stop TASK running: `gather` forwards
+   the cancel to them and still resolves only once each has finished, so no later `stop()` can
+   overlap the task. A connector thread can outlive its task, as a cut DICOM shutdown does; see
+   per connector. Then the cancel is re-raised. Each inbound that stopped cleanly is dropped from
+   `_sources`; the rest stay, and `_running = False` still runs in `_teardown_unsafe`'s `finally`
+   (the `_running` regression Inc 5's tests pin).
+
+So an outer cancel is bounded by the grace plus each cut stop's own cancellation handling. The serial
+loop's bound was that handling alone. A stop that needs longer than the grace, such as a listener
+in its client drain (`_CLIENT_SHUTDOWN_GRACE`), is cut, as the serial loop cut its one in-flight
+stop.
+
+At least these limits come with running the stops as tasks at all, and so with the concurrency
+itself; the DEMOTE path has had them since Inc 4. A canceller of every task, such as
+`asyncio.run`'s close of a loop with the teardown still in flight, cancels each stop task directly
+and so cuts them all with no grace; that is reached only when a shutdown is already being torn
+down from under it. The listeners' connection events reach the bounded event queue in one burst
+rather than one stop at a time, so at a large inbound count more of them can be dropped as
+overflow. And every `to_thread` shutdown, DICOM's and File's share calls among them, reaches the
+default executor at once, where the serial loop put one there at a time.
+
+### What this relies on, per connector
+
+At least these, read 2026-10-26:
+
+- **MLLP, TCP, X12, HTTP.** `server.close()` runs in the synchronous prologue, so accept stops at
+  once. The client drain is bounded by `_CLIENT_SHUTDOWN_GRACE`, and `wait_closed()` by the same
+  grace. A cut stop still resets its admission tables in a `finally`. A retried stop closes again.
+- **DICOM.** The port is released inside `await to_thread(server.shutdown)`. A cut stop keeps
+  `_server`, so the next stop shuts it down again, but the first shutdown keeps running on its thread
+  until it returns. A retry can therefore overlap it. This is the case the grace exists for.
+- **File.** Bounded by its own `_STOP_GRACE_S` for a blocked share call. When cut, it never cancels
+  a poll task that is inside a store call, so the task exits at its next stop check.
+- **Database.** An uncancelled `stop()` joins the poll task with no timeout of its own, through an
+  `asyncio.wait` that a cancel does not forward. A cancel that lands while a row is in its row step,
+  from the handler call (parse, validation and the store commit) through the mark, waits up to
+  `_ROW_STEP_GRACE_S` for that step, but only while this node leads: `_stop` is set, so the task
+  marks the row and exits at its next stop check. A cancel anywhere else cuts the task at once, at
+  least in the select, the interval wait, the pool open and the undecodable-row event, where no row
+  step has begun. So does a second cancel to the stop task, during the grace or coalesced with the
+  first, by the same `cancelling()` baseline the runner uses.
+
+  **On a node that is not the leader the grace ends and the cut is immediate** (decided 2026-10-28
+  on the Lander's hold of PR 2560, as the strictly safer of its two options). The signal is the
+  source's own `leader_gate`, the coordinator's cached `is_leader`, which a demotion clears before
+  the teardown runs. It is read when the cancel lands and again every `_LEADER_RECHECK_S` during
+  the grace, so a demotion during the grace ends it too. The fence is on the cancel path only: an
+  uncancelled DEMOTE stop still lets its in-flight row step finish, as Inc 4 records, and the row
+  loop still checks only `_stop` between rows. A DEMOTE stop abandoned and later cancelled by
+  `_stop_sources_demote` therefore stops waiting on its row step at once. The cut ends the task's
+  awaits only: a store commit or a mark `UPDATE` already running on a driver thread still
+  completes there. A DEMOTE stop still abandoned at engine shutdown is cancelled by
+  `_settle_pending_source_stops`, the only caller of which is the SHUTDOWN `stop()`; it gets the
+  grace only if the node leads then.
+
+  **Every wait after the cancel is bounded.** The cut task is joined for at most
+  `_CUT_JOIN_TIMEOUT_S`, again through an `asyncio.wait`, so a further cancel is not forwarded into
+  the task. The pool is then closed whether or not the task has finished, waiting at most
+  `_POOL_CLOSE_TIMEOUT_S`, with the reference dropped before the wait. A cancelled Database
+  `stop()` therefore returns within the row grace plus those two bounds of the first cancel,
+  behind a driver call hung on a thread too. A task still running stays referenced, and the next
+  `stop()` joins it. If no `stop()` follows, the connection it holds is still closed, because the
+  pool was closed under it and closes each connection as the task releases it. A cursor close is
+  shielded from a cancel, and its connection is released only once the close has finished
+  (`_close_and_release`), so a cut neither leaves the pool waiting on a connection nobody returns
+  nor hands the next borrower a connection whose cursor close is still running. It waits for the
+  close only: a statement the cancel abandoned on a driver thread is not waited for. A pool close
+  that times out leaves the connections it had not closed yet to the driver. A close failure after
+  a cancel is logged, never raised over the cancel. An uncancelled `stop()` closes the pool with no
+  bound, as before.
+
+  A committed row is left unmarked, a duplicate, when its step outlasts the grace, when a second
+  cancel reaches it, or when the node does not lead. That can now happen to several Database stops
+  at once, where the serial loop could do it to one. A step that finishes inside the grace, on a
+  leader, with one cancel to its stop task, is not cut; no other step is protected.
+
+  The runner cuts with one cancel per stop task, so to a Database stop the runner's own second
+  cancel is a first: on a leader, a row step still gets up to the row grace after it. A cancelled
+  teardown is therefore bounded by the runner grace plus at most one Database stop's cancel bound,
+  and a runner second cancel by that bound alone.
+
+  Not covered, and as before: with an atomic-claim `poll_statement` (`UPDATE ... RETURNING`, a
+  status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
+  stop check between rows, leaves claimed rows that never reached the store. That was true of the
+  serial loop too.
+- **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
+  `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
+  be cut like this. Now any of them can, but only after the grace or a second cancel.
+- **Loopback, PassThrough.** `stop()` returns at once.
+
+### Tests
+
+`tests/test_runner_bounded_source_stop.py`. An outer cancel lets two in-flight stops finish, which
+turns red if the branch goes back to `gather`. A hung stop is cut after a shortened grace and the
+cancel still surfaces, which turns red if the grace wait has no timeout. A second cancel cuts at
+once, which turns red without the second cancel's handler. Two coalesced cancels cut at once, which
+turns red without the `cancelling()` check. A stop that failed before the cancel is still logged by
+name, which turns red if the cancel path skips the failure read. A stop that ended cancelled on
+its own before an outer cancel is still logged, which turns red if the cancel path skips every
+cancelled task. A cut stop that raised while cut is logged by name, which turns red if every cut
+task is skipped. A failed stop is raised only once its slower sibling has finished, which turns red
+under `return_when=FIRST_EXCEPTION`, and leaves only the failed inbound registered, which turns red
+if the cleanly stopped ones are not dropped. A cancel the task already carried
+does not skip the grace, which turns red without the baseline. A stop that ends cancelled on its
+own is raised as a `RuntimeError`, which turns red if it is re-raised as a cancel. A failed stop
+keeps the drain side, which turns red on head `8bf008396`, where the rest of teardown ran first. A
+third cancel still joins the cut stops, which turns red if the cut stops are not gathered; it is a
+pin, green on `8bf008396` too, because `gather` already behaved this way.
+
+`tests/test_database_transport.py`. A cancelled Database `stop()` lets the row in its hand-off mark
+itself, and lets a mark in flight finish; both turn red on head `030780600`, where `stop()` joined
+the poll task with a cancelling `gather` and the cut left the row committed and unmarked. A hung
+row step is cut after the row grace and joined, which turns red if that wait has no timeout. A
+second cancel cuts the row step at once, and so do two coalesced cancels, which turns red without
+the `cancelling()` baseline. The control, a cancelled `stop()` cuts a hung select at
+once after one row was fully handled, turns red if the row-step flag is not reset. These run on
+a fake pool that, as aioodbc's does, closes only once every connection is back, so a skipped
+release hangs the close. Six more turn red on head `9a719f564`: a cancel inside a cursor close
+still releases the connection, once the close has finished; a further cancel while the cut task
+is in its cursor close returns from `stop()` without hanging the pool close; a cut task held by a
+driver call does not hold `stop()`, and its pool is closed; a pool close given a bound keeps it; a
+non-leader cuts the row step at once, with the leader case as its control; and a demotion during
+the grace ends it.
+
+### Not changed here
+
+At least these were found in review and are left as they were, because the serial loop had them
+too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
+re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops;
+an uncancelled Database `stop()`, and RemoteFile and Timer `stop()`, still join their poll task
+with no bound of their own; and
+a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
+`__context__`. Also as the serial loop did: when `Engine.stop()`'s own `registry_runner.stop()`
+re-raises a stop failure, nothing retries it, so the drain side is never torn down,
+and `Engine.stop()`'s later steps, the coordinator stop and the store close among them, do not
+run. (The `8bf008396` build tore the drain side down before raising; the Lander held that build
+for clearing it under a still-live listener.)
+
+Two findings from review of this amendment are closed in it, not left open: the cleared drain side
+under a still-live listener (fixed above, *Joined is not stopped*), and a third cancel leaving cut
+stops unjoined (it cannot happen, step 4 of *What an outer cancel does now*).

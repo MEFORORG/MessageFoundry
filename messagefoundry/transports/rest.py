@@ -126,6 +126,8 @@ __all__ = [
     "refuse_unrevoked_verified_hop",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "url_host_label",
+    "url_scheme",
 ]
 
 logger = logging.getLogger(__name__)
@@ -528,13 +530,17 @@ def _redact_url(url: str) -> str:
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
     does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
-    holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
-    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
-    p = urllib.parse.urlsplit(url)
-    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
-        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
-    )
-    if encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}"):
+    hides a userinfo is withheld too; :func:`_host_hides_userinfo` names the shapes, the port-field
+    ``%40`` among them. A bracketed host, such as an IPv6 literal with its zone, is exempt from the
+    ``:`` test, though not from the ``@`` one.
+
+    A URL ``urlsplit`` cannot parse renders as ``<redacted>`` alone: its ``ValueError`` quotes the
+    whole netloc."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<redacted>"
+    if _withholds_host(p):
         return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
@@ -543,11 +549,54 @@ def _redact_url(url: str) -> str:
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
 
 
+def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
+    """Does the host or port hold ``@`` once unquoted, or an unbracketed host hold ``:``? Then it
+    is userinfo written with ``%40`` or ``%3A``, and ``hostname`` is the username and some of the
+    password. The port counts: in ``svc:PW%40proxy:3128`` the ``%40`` lands in the port field and
+    ``hostname`` is ``svc``. An IPv6 literal holds ``:``, so a bracketed host never counts for it."""
+    return "@" in urllib.parse.unquote(p.netloc.rpartition("@")[2]) or _host_holds_encoded_colon(p)
+
+
+def _host_holds_encoded_colon(p: urllib.parse.SplitResult) -> bool:
+    """Does an unbracketed host hold ``:`` once unquoted? No host name holds one."""
+    return not p.netloc.rpartition("@")[2].startswith("[") and ":" in urllib.parse.unquote(
+        p.hostname or ""
+    )
+
+
+def _withholds_host(p: urllib.parse.SplitResult) -> bool:
+    """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686)."""
+    return _host_hides_userinfo(p) or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
+
+
+#: Where a refusal tells the operator to put an endpoint's credential instead of its URL.
+_URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
+
+#: What :func:`url_host_label` prints in place of a host it must not print.
+HOST_WITHHELD = "(withheld: an '@' or encoded ':' in the URL may hide a credential)"
+
+
+def url_host_label(url: str) -> str:
+    """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
+    Never raises. A host of ``""`` prints as ``""``.
+
+    Withheld wherever :func:`_redact_url` would withhold it, whether or not
+    :func:`refuse_url_credentials` has passed ``url``. That screen lets an ``@`` with no port, or
+    one in a query after a real path, through: ``https://TOKENHEAD/TAIL@host`` and
+    ``https://svc:12/a?b@host`` both pass it, and their ``hostname`` is the username or token
+    head. So any ``@`` after the authority withholds the host, an email in a query included."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return HOST_WITHHELD
+    return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
+
+
 def refuse_url_credentials(
     url: str,
     setting: str,
     *,
-    use: str = "basic_user/basic_password or bearer_token",
+    use: str = _URL_CREDENTIAL_USE,
     error: type[ValueError] = ValueError,
 ) -> None:
     """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
@@ -573,18 +622,7 @@ def refuse_url_credentials(
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    # Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
-    # all, and ``from None`` would leave it on ``__context__`` (#1796).
-    try:
-        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
-    except ValueError:
-        parsed = None
-    if parsed is None:
-        raise error(
-            f"{setting} is not a URL that can be parsed. A password written into the URL can "
-            f"cause this; set credentials in {use} instead"
-        )
-    p = parsed
+    p = _split_or_refuse(url, setting, use=use, error=error)
     if "@" in urllib.parse.unquote(p.netloc):
         raise error(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
@@ -610,6 +648,48 @@ def refuse_url_credentials(
             f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
             "default port"
         )
+    # A password head written with ``%3A`` and then ``%5D`` hides its port from both readers above,
+    # since the dialling reader takes the ``]`` for an IPv6 literal's end (BACKLOG #2686). No host
+    # name holds a ``:``, so an encoded one outside brackets is refused whatever follows it.
+    if _host_holds_encoded_colon(p):
+        raise error(
+            f"{setting} has a ':' written as %3A in its host. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+
+
+def _split_or_refuse(
+    url: str, setting: str, *, use: str, error: type[ValueError]
+) -> urllib.parse.SplitResult:
+    """``urlsplit(url)``, or a refusal that names ``setting`` and nothing of the URL.
+
+    Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
+    all, and ``from None`` would leave it on ``__context__`` (#1796)."""
+    try:
+        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise error(
+            f"{setting} is not a URL that can be parsed. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+    return parsed
+
+
+def url_scheme(
+    url: str,
+    setting: str,
+    *,
+    use: str = _URL_CREDENTIAL_USE,
+    error: type[ValueError] = ValueError,
+) -> str:
+    """``url``'s lower-cased scheme, for a constructor that checks it BEFORE
+    :func:`refuse_url_credentials` (BACKLOG #2686). A bare ``urlsplit(url).scheme`` raises urlsplit's
+    own ``ValueError`` on a URL it cannot parse, and that text quotes the whole netloc. This raises
+    the refusal :func:`refuse_url_credentials` would, with the same ``setting``, ``use`` and
+    ``error``, and nothing of the URL on the message or the exception chain."""
+    return _split_or_refuse(url, setting, use=use, error=error).scheme.lower()
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -2297,7 +2377,7 @@ def proxy_config_from_settings(
             digest=None,
             connection=connection,
         )
-    proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
+    proxy_scheme = url_scheme(proxy_url, "proxy_url", use="proxy_user/proxy_password")
     if proxy_scheme not in ("http", "https"):
         raise ValueError(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
@@ -2363,10 +2443,13 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
-    parsed = urllib.parse.urlsplit(sidecar)
+    # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
+    # (BACKLOG #2686).
+    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {sidecar!r} (ADR 0139)"
+            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
+            "(ADR 0139)"
         )
     if not is_never_proxied_host(parsed.hostname):
         raise ValueError(
@@ -2449,7 +2532,7 @@ class RestDestination(DestinationConnector):
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "REST destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "REST destination 'url'")

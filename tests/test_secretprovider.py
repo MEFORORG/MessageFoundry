@@ -27,6 +27,15 @@ from messagefoundry.config.secretprovider import (
     resolve_secret_provider,
 )
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, SecretsSettings
+from tests._vault_hop_env import SECRETS, supply_vault_hop
+
+
+@pytest.fixture(autouse=True)
+def _secrets_vault_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The KV provider refuses an unset address or token before any client is built (BACKLOG
+    #2851), so every test here names both."""
+    supply_vault_hop(monkeypatch, SECRETS)
+
 
 # --- fakes -------------------------------------------------------------------
 

@@ -413,7 +413,8 @@ cross-subnet listener:
 > cross-subnet failover can leave the driver dialing the stale subnet's IP until the TCP/login
 > timeout. `[store].connect_timeout` (default 15 s) bounds each attempt, and ODBC 18's default TNIR
 > softens but does not eliminate the penalty. `ApplicationIntent=ReadOnly` exists only on the
-> separate `db_lookup` connector ([`../messagefoundry/transports/database.py`](../messagefoundry/transports/database.py));
+> separate `db_lookup` connector and the `DatabaseRef` reference sync (BACKLOG #2617;
+> [`../messagefoundry/transports/database.py`](../messagefoundry/transports/database.py));
 > the store connection takes exactly one AG-aware keyword, and **it has shipped**:
 > **`[store].multi_subnet_failover`** emits ODBC `MultiSubnetFailover=Yes` so the driver races the
 > subnets instead of serially waiting out each one

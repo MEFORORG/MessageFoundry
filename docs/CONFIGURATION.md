@@ -90,11 +90,13 @@
 > your own manifests set `enableServiceLinks: false` too. The
 > engine reads no service-link variable, and cluster DNS still resolves Services with it off.
 >
-> **Variables that are not settings are spared by name.** Their consuming module reads them straight
-> from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
+> **Variables that are not settings are spared by name.** Their consuming module reads them itself,
+> and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,
 > `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and the two
-> phase-timing variables. The list is `_OUT_OF_BAND_ENV` in `messagefoundry/config/settings.py`. A
-> name on it is spared only as spelled there, in upper case.
+> phase-timing variables. The two Vault tokens are read from the
+> [secrets directory](#the-secrets-directory-mefor_secrets_directory) before the environment, and on
+> Windows are supplied only there. The list is `_OUT_OF_BAND_ENV` in
+> `messagefoundry/config/settings.py`. A name on it is spared only as spelled there, in upper case.
 >
 > An unrecognized `[security]` posture switch is refused from **env as well as the file**, with a
 > message that names the section and key. So are the renamed `[logging]` keys described below, by a
@@ -184,8 +186,8 @@ backend-limited.
 | `encryption_key_file` | path | — | Windows **DPAPI-protected** key file (WP-11d, ASVS 13.3.1) — a path produced by `messagefoundry protect-key`. When `encryption_key` is unset and this is set, the active key is `CryptUnprotectData`'d from this file at store open, so the plaintext key never sits in the service environment. Windows-only, and the **env key takes precedence** when both are present. A **path, not a secret** — it may live in the file. Unset = use `encryption_key`. **Under the Windows service, use this file:** `serve` refuses the store key in the service's environment lists ([SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)). `protect-key` creates the file restricted and refuses to replace an existing one. When the provider reads this file, `serve` first checks that no broad account can read it, and refuses to start under `[security].enforcement = "enforce"` if one can ([PHI.md](PHI.md), "Key files"). |
 | `aad_bind` | bool | `true` | **not a secret** (`MEFOR_STORE_AAD_BIND`); cell binding (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). New at-rest AES-256-GCM writes use the cell-bound writer, `mfenc:v4` (`mfenc:v2` before [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md), which seals each store under its own HKDF data sub-key) — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. **On by default** (ADR 0148 GIVEN 1: the shipped configuration runs the hardened path). Setting it `false` selects the frozen `mfenc:v1` writer (byte-identical at rest) and is a **loosening** — `security_loosenings()` names it, so the opt-out is never silent. No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1` to `v4`, so the default is safe and reversible on an existing store. |
 | `allow_unmarked_ciphertext` | bool | `false` | **not a secret** (`MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT`); refuse unmarked values (ASVS 11.3.3, BACKLOG #1169). On a keyed store, a non-blank value with no `mfenc:` marker in an encrypted column is **refused** (`CipherError`, plus an `integrity_drift` alert with subject `store-cipher` naming only the table and column) instead of being read back as plaintext: it is a stripped marker or a planted row. A purged `''` is never refused. The keyed open seals legacy plaintext only on a `(table, column)` that is still unsealed, one transaction per column. A column is sealed once it holds ciphertext, or once the store has recorded it in its `keyed_surface` table (BACKLOG #3383). A writable keyed open that finishes its sweep records every column. So a plant into a recorded column is refused even when the column holds no ciphertext. Setting it `true` restores the old behaviour (plaintext passthrough, and the open seals every unmarked value, recorded column or not) and is a **loosening** — `security_loosenings()` names it. No effect without an `encryption_key`. **It covers the uploaded-file store too** (owner ruling 2026-09-23): on a keyed store a plaintext upload under `uploads_dir` is refused on every read, and `messagefoundry rotate-key` seals it where it can (not every one: [PHI.md](PHI.md) §3 says which it leaves, and what removes them), alerting under its own subject `upload-cipher`, and `serve` logs the count of such uploads at startup. Setting this `true` restores the upload passthrough as well. Under `cipher_provider = "vault_transit"` uploads keep the passthrough either way; [PHI.md](PHI.md) §3 says why. |
-| `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env` pins `MEFOR_STORE_ENCRYPTION_KEY` and `dpapi` pins `encryption_key_file`, and each ignores the other source. A key set only in the source the pinned provider ignores is **refused, not used as keyless** (BACKLOG #2077): `serve`, `supervise` and `provision-admin` refuse before opening, whatever the audited opt-out says, and `open_store` refuses for every other command. Set `auto` or the source the provider reads. Under `cipher_provider = "vault_transit"` the gate still counts any local key, because the store never resolves `key_provider` there; DR backups and `rotate-key` do, and refuse the ignored key. `vault` **is built** ([store/keyprovider_vault.py](../messagefoundry/store/keyprovider_vault.py)): it envelope-decrypts a wrapped DEK through HashiCorp Vault **Transit** and needs the optional `[vault]` extra. Its wiring comes from the environment. `MEFOR_STORE_VAULT_TRANSIT_KEY` (the KEK name; not the next row's `MEFOR_STORE_TRANSIT_KEY`) and `MEFOR_STORE_VAULT_WRAPPED_DEK` are required. `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_VAULT_CA_FILE` are optional, and an unset address or token is **not refused**: hvac falls back to its own `VAULT_ADDR`/`VAULT_TOKEN` handling and built-in defaults, so set both. The unwrap runs wherever the key is resolved, at least at every store open and every DR backup pass. It reads the KEK's metadata to check its type before decrypting, so the token needs both. A missing required variable or extra, a KEK of an unsuitable type, a Vault that is off the box with no `vault_revocation_attested` (two rows below), or a failed unwrap **fails closed**: the store does not open, or that backup pass fails. Only the **active** key comes from Vault; retired keys still come from `encryption_keys_retired`, in plaintext. The unwrapped DEK feeds the in-process cipher, so unlike `cipher_provider = "vault_transit"` it does enter engine heap. **The keyless-PHI gate counts it as a key** (BACKLOG #1998). `_store_key_configured` in [`__main__.py`](../messagefoundry/__main__.py) treats every external provider as a configured key without resolving it, because the gate runs before the store opens and must not need the network. So a PHI instance set to `vault` with no local key passes the gate, and a provider that cannot resolve fails closed when the store opens. Under `cipher_provider = "vault_transit"` the store never resolves `key_provider`; DR backups and `rotate-key` still do, and fail closed there. `aws_kms`·`azure_kv`·`gcp_kms`·`pkcs11` are **not built yet**; selecting one **fails closed** the same way, never a silent downgrade. Names a *provider*, not key material, so it is **not** a secret. |
-| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **At least four preconditions before you plan a deployment on this — read the three here, and the `vault_revocation_attested` row below for the fourth: a Vault that is off the box is refused without it.** (1) *The keyless-PHI serve gate does not treat this setting as a key.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests `encryption_key` / `encryption_key_file` and an external `key_provider` (previous row). It consults `cipher_provider` only to count a local key that a pinned `key_provider` ignores (BACKLOG #2077). All three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key and no external `key_provider` still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**, with a `key_provider` that reads it (`auto` or `env`): the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. (3) *The AES-GCM bound is yours, and `serve` needs your recorded attestation of it* (BACKLOG #2337). The engine counts no encryptions on this cipher, so rotate the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) before any one key version seals 2^32 values; plan to rotate by 2^31, sized from the peak encrypt rate (Vault's `auto_rotate_period`, or a manual schedule). Then run `messagefoundry store attest-transit-bound --reason "<your rotation policy>"` once, on the host, or `serve` **refuses to start** under `[security].enforcement = enforce`. What the record holds, what keeps or voids it, and what it does not check are in [SECURITY.md](SECURITY.md), *On vault_transit, a recorded attestation stands in for the AES-GCM count*. |
+| `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env` pins `MEFOR_STORE_ENCRYPTION_KEY` and `dpapi` pins `encryption_key_file`, and each ignores the other source. A key set only in the source the pinned provider ignores is **refused, not used as keyless** (BACKLOG #2077): `serve`, `supervise` and `provision-admin` refuse before opening, whatever the audited opt-out says, and `open_store` refuses for every other command. Set `auto` or the source the provider reads. Under `cipher_provider = "vault_transit"` the gate still counts any local key, because the store never resolves `key_provider` there; DR backups and `rotate-key` do, and refuse the ignored key. `vault` **is built** ([store/keyprovider_vault.py](../messagefoundry/store/keyprovider_vault.py)): it envelope-decrypts a wrapped DEK through HashiCorp Vault **Transit** and needs the optional `[vault]` extra. Its wiring comes from the environment. `MEFOR_STORE_VAULT_TRANSIT_KEY` (the KEK name; not the next row's `MEFOR_STORE_TRANSIT_KEY`) and `MEFOR_STORE_VAULT_WRAPPED_DEK` are required. `MEFOR_STORE_VAULT_ADDR` and `MEFOR_STORE_VAULT_TOKEN` are required too: an unset or empty one is **refused**, naming the variable, and hvac's own `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token` are never read (BACKLOG #2851). The token may come from the [secrets directory](#the-secrets-directory-mefor_secrets_directory) instead of the environment; on Windows, supply it only there. A Vault Agent sink can write it there except under the default virtual account or any other Windows account but a dedicated engine account the site already chose. `MEFOR_STORE_VAULT_CA_FILE` is optional. The unwrap runs wherever the key is resolved, at least at every store open and every DR backup pass. It reads the KEK's metadata to check its type before decrypting, so the token needs both. A missing required variable or extra, a KEK of an unsuitable type, a Vault that is off the box with no `vault_revocation_attested` (two rows below), or a failed unwrap **fails closed**: the store does not open, or that backup pass fails. Only the **active** key comes from Vault; retired keys still come from `encryption_keys_retired`, in plaintext. The unwrapped DEK feeds the in-process cipher, so unlike `cipher_provider = "vault_transit"` it does enter engine heap. **The keyless-PHI gate counts it as a key** (BACKLOG #1998). `_store_key_configured` in [`__main__.py`](../messagefoundry/__main__.py) treats every external provider as a configured key without resolving it, because the gate runs before the store opens and must not need the network. So a PHI instance set to `vault` with no local key passes the gate, and a provider that cannot resolve fails closed when the store opens. Under `cipher_provider = "vault_transit"` the store never resolves `key_provider`; DR backups and `rotate-key` still do, and fail closed there. `aws_kms`·`azure_kv`·`gcp_kms`·`pkcs11` are **not built yet**; selecting one **fails closed** the same way, never a silent downgrade. Names a *provider*, not key material, so it is **not** a secret. |
+| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). All three are required: an unset address or token is refused as the previous row says, with no fallback to `VAULT_ADDR`, `VAULT_TOKEN` or `~/.vault-token` (BACKLOG #2851). The token is read as the previous row says, from the secrets directory before the environment, and on Windows supplied only in that directory. This cipher reads it once, when the store opens, so a token replaced later takes effect only at the next start. Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **At least four preconditions before you plan a deployment on this — read the three here, and the `vault_revocation_attested` row below for the fourth: a Vault that is off the box is refused without it.** (1) *The keyless-PHI serve gate does not treat this setting as a key.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests `encryption_key` / `encryption_key_file` and an external `key_provider` (previous row). It consults `cipher_provider` only to count a local key that a pinned `key_provider` ignores (BACKLOG #2077). All three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key and no external `key_provider` still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**, with a `key_provider` that reads it (`auto` or `env`): the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. (3) *The AES-GCM bound is yours, and `serve` needs your recorded attestation of it* (BACKLOG #2337). The engine counts no encryptions on this cipher, so rotate the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) before any one key version seals 2^32 values; plan to rotate by 2^31, sized from the peak encrypt rate (Vault's `auto_rotate_period`, or a manual schedule). Then run `messagefoundry store attest-transit-bound --reason "<your rotation policy>"` once, on the host, or `serve` **refuses to start** under `[security].enforcement = enforce`. What the record holds, what keeps or voids it, and what it does not check are in [SECURITY.md](SECURITY.md), *On vault_transit, a recorded attestation stands in for the AES-GCM count*. |
 | `vault_revocation_attested` | bool | `false` | attests that revocation of the **store Vault's** server certificate is covered outside the engine (vault BACKLOG #2983, owner ruling 2026-10-13). It covers both store hops to that Vault: `key_provider = "vault"` and `cipher_provider = "vault_transit"`. The engine verifies that certificate, and its handshake checks no CRL and no OCSP. So each client build **refuses** a Vault that is off the box unless this is `true`. On the box means a loopback host reached with no proxy, decided on the address the client will really dial. The refusal applies under `[security].enforcement = enforce`, and wherever a client is built without a known posture, which counts as enforcing. A caller that hands its posture down crosses with a WARNING on an `enforcement = warn` instance, and a command that holds none refuses; [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md) names the callers. **Under `enforce` this flag is the only way across:** no CRL lever is built for these hops, and the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not cross an enforcing hop. Setting it adds no check on the wire. It never lifts the cleartext or proxy-credential refusals. Through an `https://` proxy it also claims the proxy's certificate, whose TLS leg is judged under the same rule (vault BACKLOG #3561). A loosening, named as `store.vault_revocation_attested`: read [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md) for what the attestation can truthfully rest on. Not a secret. Env: `MEFOR_STORE_VAULT_REVOCATION_ATTESTED` |
 | `vault_revocation_attested_reason` | str | — | **required** with `vault_revocation_attested = true`: what covers revocation of the store Vault's certificate, for example its short lifetime, and of an `https://` proxy's in front of it. The flag without it, a blank one, one holding a control character or a lone surrogate, or a reason without the flag is refused at load. It is printed in the loosening report and the serve-time warning, so put no secret in it. Env: `MEFOR_STORE_VAULT_REVOCATION_ATTESTED_REASON` |
 | `require_encryption` | bool | `false` | keeps the keyless refusal in force past the audited opt-out. It does not create that refusal, which is the default; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule and the opt-out. It encrypts nothing itself, so a key is still needed. |
@@ -686,6 +688,9 @@ crash-re-run — the same accepted caveat as a code-set hot-reload).
   read-only SQL query on the cadence (SQL Server via the `[sqlserver]` extra, **production / supported**; secrets
   via `env()`; the dial-out is gated by the fail-closed `[egress].allowed_db` allowlist). `key_column`
   is the lookup key; `value_column` (if set) is the value, else the value is a dict of the other columns.
+  The statement must pass the `db_lookup` read-only statement test, so a stored procedure is refused,
+  and `max_rows` (default `100000`, `0` = off) refuses a larger result; see
+  [`CONNECTIONS.md`](CONNECTIONS.md) §*A `DatabaseRef` statement passes the same gate, and a row ceiling*.
 - **Sync.** The engine's `ReferenceSyncRunner` materializes each set once at startup (before listeners
   serve, so `reference(...)` resolves on the first message) and every `refresh_seconds`. A source
   failure is **isolated**: it's logged + alerted and the **last-good snapshot is kept** (the write
@@ -1088,11 +1093,31 @@ holds its key, its reason words and its `count`. The key carries the process suf
 applies, and the alert item above says what the suffix holds. The count in the alert list is a
 different number: how many times the engine has raised that alert.
 
-`queued` is how many records sit on the in-memory hand-off queue right now. It does not count
-records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+`queued` is how many records sit on the in-memory hand-off queue right now, both lanes, capped at
+the smaller lane bound. It does not count records waiting in the on-disk spool, and no field
+does. Every other count runs from the start of
 the process. While the state is `not_installed`, every count reads zero, whatever was counted
 before. Each engine process has
 its own forwarder and watches its own: every engine shard, and a cluster standby too.
+
+**Audit tee lines have their own lane of that queue** (vault BACKLOG #2612). Each lane holds up
+to 10,000 records, so a flood of general log lines against a collector that is not taking them
+fills the general lane and leaves the audit lane room. The forwarder sends audit lines first, up
+to four in a row while a general line waits, so an audit line can reach the collector ahead of a
+general line logged before it. The line's own time stamp has whole seconds only, so it cannot restore the
+order of two lines logged in the same second; an audit line's JSON body carries a `ts` with
+fractions of a second, and a general line has nothing like it. `queue_dropped` counts drops from
+both lanes, and `lost` counts each once. **The drop warning in the engine log and the `dropping`
+alert word themselves the same whichever lane dropped.** The warning carries at least the
+combined batch, one capacity figure (the smaller lane bound) and the combined total, as the single
+queue's did; the alert carries at least the `queue_full` reason and `lost`. Neither names a lane
+or gives a count for one lane alone. The counts themselves can still differ by lane. What these counts and `queued` tell a reader about audit rows is in
+[SECURITY.md](SECURITY.md), beside the other audit-row residuals of the log channel. No field gives the audit lane's depth alone. A collector
+whose sends fail shows as `send_failing` and the `degraded` state, and a lane that fills shows as
+the `queue_full` alert reason and a rise in `queue_dropped`. A collector that is
+only slow, or stops taking records without an error, shows in neither until a lane fills; until
+then only a rising `queued` shows it, whichever lane is waiting. Both lanes share one sending thread, one connection and one on-disk
+spool, so a full spool refuses audit lines as it refuses general ones.
 `GET /status` reports the process that answered.
 
 ### `[retention]`
@@ -2369,9 +2394,11 @@ A provider is consulted **only** for a credential whose per-credential `*_secret
 `[auth].ad_bind_password_secret` and `[alerts].email_password_secret` (the wired points); the SQL Server
 store password is seam-only (managed identity is preferred there). A reference is `"<kv-path>"` or
 `"<kv-path>#<field>"` for `vault` (field defaults to `value`; KV mount from `MEFOR_SECRETS_VAULT_KV_MOUNT`,
-default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`
-(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). Point `MEFOR_SECRETS_VAULT_CA_FILE` at the PEM of
-the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
+default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`,
+and both are required: an unset or empty one is refused, naming the variable, and hvac's own
+`VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token` are never read (BACKLOG #2851). The token may come
+from the secrets directory below instead; on Windows, supply it only there. Point
+`MEFOR_SECRETS_VAULT_CA_FILE` at the PEM of the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
 public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
 `MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
 **A web proxy reaches both Vault clients with no engine setting.** They honour `HTTPS_PROXY`,
@@ -2390,8 +2417,9 @@ address (BACKLOG #300). `NO_PROXY` is not a way around it either: a remote `http
 directly is refused too, as the next paragraph says.
 **Each Vault client refuses a Vault address that is not `https://`** (BACKLOG #2317). That holds
 for at least the KV secret provider here, the store key provider and the Transit cipher. It covers
-a direct `http://` address and one behind an `http://` proxy, including hvac's own `VAULT_ADDR`
-fallback. The one `http://` address allowed is a loopback Vault that the client reaches with no
+a direct `http://` address and one behind an `http://` proxy. The address it judges is always the
+hop's own `MEFOR_*_VAULT_ADDR`, since no client is built without one, together with the proxy the
+request would use. The one `http://` address allowed is a loopback Vault that the client reaches with no
 proxy, because that hop stays on the box. Loopback is decided without DNS: the name `localhost` or
 a loopback IP literal, and no other name, whatever it resolves to. An address that does not read as
 one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
@@ -2414,6 +2442,10 @@ counts as credentials. The check reads the proxy variables in either case, `ALL_
 Windows system proxy. It refuses at the same two points and in the same form as the rule above.
 Its text names no part of the proxy URL, and `[security].enforcement` does not relax it. Use an
 `https://` proxy, or one that takes no credentials in its URL.
+**A proxy URL requests cannot read or send is refused too** (vault BACKLOG #3454), whatever its
+scheme. That includes, at least, a URL with a user name and a password where either one is not
+Latin-1 text, which is how requests sends them. requests' own error for such a URL can carry the URL or its credentials, so the
+refusal is fixed text instead, at the same two points and in the same form.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
@@ -2455,12 +2487,73 @@ secret. Each file in that directory holds one setting and is named exactly as it
   [`[store].encryption_key_file`](#store).
 - A trailing line break is dropped; any other character, a space included, is part of the value.
 - The files are plain, protected by their access list alone. Nothing creates the directory for you
-  yet. A variable a library reads for itself, such as `VAULT_TOKEN` or `PGPASSWORD`, is not read
-  from here.
+  yet. A variable a library reads for itself, such as `PGPASSWORD`, is not read from here. The
+  engine reads no `VAULT_TOKEN` at all (BACKLOG #2851).
 
 On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
-control and the service account read, and nothing else. On POSIX, make it mode `0700` and each file
-`0600`, owned by the engine's account.
+control and the service account read, and nothing else, except as the Vault Agent route below
+says. Make each grant inheritable by files (`(OI)` in `icacls` terms): a file an administrator
+creates in the directory then gets the service account's read, where a grant that is not
+inheritable leaves the new file unreadable to the engine. On POSIX, make it mode `0700` and each
+file `0600`, owned by the engine's account.
+
+**A Vault token in this directory** (BACKLOG #2851). The Vault clients never read
+`~/.vault-token`, and no setting names a token file: the token is the file named
+`MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN` here.
+
+- **On Windows, an administrator writes that file by hand.** That is the only route offered for a
+  Vault token on Windows, apart from the dedicated-account agent route below. It needs no agent,
+  no extra account and no LocalSystem. Never put the token in the service's environment
+  ([why](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment)).
+  The file does not renew itself: replace it before the token expires.
+- **On Windows, a SYSTEM scheduled task is not offered.** A scheduled task or script running as
+  SYSTEM that writes or copies the token into this directory is a LocalSystem writer by another
+  name, on any install.
+- **When a replaced file is used**, whoever wrote it. The engine reads the file each time it builds
+  a Vault client. For the `vault` key provider that is at least every store open and every DR
+  backup pass, and for `[secrets].provider = "vault"` every secret read. The `vault_transit`
+  cipher builds its client once, when the store opens. A token replaced after that is not used
+  until the next start, and once the token it holds expires, every Transit call fails. So under
+  `vault_transit`, restart the engine after each replacement.
+
+**A Vault Agent sink can write that file, where this route is offered.** A site running Vault
+Agent auto-auth points the agent's file sink at the file, and leaves the sink unwrapped and
+unencrypted, so the file holds the bare token. The file is held to
+[the directory's rules](#the-secrets-directory-mefor_secrets_directory).
+
+- **POSIX.** The file is mode `0600` owned by the engine's account, so the agent writes it as
+  that account, with the sink's `mode` set to `0600`: a group bit, as in the agent's default sink
+  mode, is refused.
+- **Windows, the engine on its virtual account `NT SERVICE\<ServiceName>` (a default install):
+  not offered.** Do not add write rights in this directory for any other account, the agent's
+  included, and do not run the agent as an account that can already write here, at least
+  LocalSystem and any member of Administrators. The administrator-written file above is the
+  route.
+- **Windows, a dedicated account the site already chose.** A site that already runs the engine
+  under a dedicated account, chosen for other reasons, may run the agent as that same account,
+  which then needs the right to create and delete files in this directory, since the agent may
+  write a temporary file and rename it over the sink. This route is not a reason to leave the
+  virtual account ([SERVICE.md](SERVICE.md#restrict-the-service-token) says what leaving it
+  costs).
+- **Windows, any other account, for the engine or the agent: not offered.** That covers
+  LocalSystem (`-AllowLocalSystem`), another virtual account, and a built-in account other
+  services share, such as NetworkService, where a right in this directory would reach every
+  service that runs as it.
+- **A shared account is a shared trust.** Where the agent and the engine share an account, code
+  running as the engine can replace any setting the directory supplies and can read the agent's
+  own auto-auth material. Keep that material out of this directory: a file whose name starts
+  with `.` is skipped there, not refused.
+
+Where the sink route is used:
+
+- **The agent's own writes can be refused for a moment.** If the agent writes a temporary file
+  beside the sink before renaming it into place, any read that lists the directory at that moment
+  is refused, since the directory refuses a file named for no setting. That refusal covers every
+  setting the directory supplies, not only the token, and can stop a start, a reload or a backup
+  pass. Each such read fails closed; run it again.
+- **Before the agent's first write there is no file,** so the environment variable is read, as
+  for any setting with no file. Leave `MEFOR_*_VAULT_TOKEN` unset in the service's environment,
+  so an engine started before the agent has logged in refuses rather than use a stale token.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
