@@ -164,7 +164,13 @@ def test_the_rules_are_loaded_once_for_the_whole_run(
 
 
 def _warnings(err: str) -> list[str]:
-    return [line for line in err.splitlines() if line.startswith("warning:")]
+    """Every warning line but the one about the site prefix. The tee prints that one when no
+    prefix loaded (BACKLOG #3516), which depends on the token source and not on the overlay."""
+    return [
+        line
+        for line in err.splitlines()
+        if line.startswith("warning:") and not line.startswith("warning: no site prefix loaded")
+    ]
 
 
 def test_keeping_a_default_scrubbed_field_is_printed(

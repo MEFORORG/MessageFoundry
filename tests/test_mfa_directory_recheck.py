@@ -14,10 +14,14 @@ is synthetic.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
+import textwrap
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +32,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -313,6 +318,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
 
 
@@ -1138,3 +1144,117 @@ async def test_the_route_refuses_and_does_not_500_when_the_lookup_raises(
         assert "directory could not confirm this account" in r.json()["detail"]
     finally:
         await engine.stop()
+
+
+@pytest.mark.parametrize("change", ["revoke", "disable"])
+async def test_a_session_lost_while_queued_is_audited_once(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 2. ``verify_mfa`` reads the session and the account again once it holds
+    the account's queue, and a session revoked or an account disabled while it waited answers
+    ``session_lost``. RED when: that refusal writes no ``auth.mfa_failed`` row, as the
+    ``session_lost`` refusal ``_factor_holder_current`` gives does, or writes two, or names the
+    account as it was before a rename that landed with the change (#2291 class). The code is never
+    checked, so nothing is charged."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_lock = e.service._account_credential_lock
+
+    @asynccontextmanager
+    async def _queue_while_something_lands(username: str) -> AsyncIterator[None]:
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        if change == "revoke":
+            await store.revoke_session(hash_token(e.token))
+        else:
+            await store.set_user_disabled(e.user_id, disabled=True)
+        async with real_lock(username):
+            yield
+
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue_while_something_lands)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False and refused.session_lost is True and refused.locked is False
+    rows = await store.list_audit(action="auth.mfa_failed")
+    lost = [
+        r for r in rows if r["detail"] and json.loads(r["detail"]) == {"reason": "session_lost"}
+    ]
+    assert [r["actor"] for r in lost] == ["jdoe-renamed"]
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == 0
+
+
+async def test_the_directory_check_asks_the_shared_provider_reading(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2. ``_directory_vouches_for_factor`` decides whether an account is a
+    directory account through ``_is_directory_account``, the one reading the rest of the service
+    uses (BACKLOG #3117). RED when: it reads ``auth_provider`` itself, so a reading taught a new
+    provider would leave this check behind. Here the shared reading calls the account local, so
+    the directory is not asked."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    monkeypatch.setattr(service_module, "_is_directory_account", lambda user: False)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True  # control: the leg reached the check and passed it
+    assert e.directory.probes == []
+
+
+async def test_the_session_loader_refuses_a_revoked_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2. The premise the second-factor legs rest on when they ask no
+    ``revoked_at`` of the session they load: ``_load_session`` answers ``None`` for a revoked row.
+    RED when: the loader hands a revoked row back, which would let those legs act on it."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    assert await e.service._load_session(hash_token(e.token)) is not None  # control
+    await store.revoke_session(hash_token(e.token))
+
+    assert await e.service._load_session(hash_token(e.token)) is None
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "verify_mfa",
+        "_factor_holder_current",
+        "_enrolment_too_early",
+        "begin_webauthn_assertion",
+        "finish_webauthn_assertion",
+    ],
+)
+def test_the_second_factor_legs_ask_no_revoked_at_of_a_loaded_session(method: str) -> None:
+    """BACKLOG #3780 item 2. A ``revoked_at`` test after ``_load_session`` can never be true, by
+    the premise the test above pins, so these legs carry none on the ``session`` they load. RED
+    when: one comes back."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(AuthService, method))))
+    nodes = list(ast.walk(tree))
+    assert len(nodes) >= 1
+    # Every local the leg binds from `_load_session(...)`, whatever it is named.
+    loaded = {
+        target.id
+        for node in nodes
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_load_session"
+            for call in ast.walk(node.value)
+        )
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    # THE CONTROL: the leg loads its session here, so a leg turned into a delegate fails rather
+    # than passing the absence below on a body that never loads one. A check moved into a helper
+    # the leg calls, or spelt `getattr(session, "revoked_at")`, is not seen.
+    assert loaded
+    reads = [
+        node.lineno
+        for node in nodes
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Load)
+        and node.attr == "revoked_at"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in loaded
+    ]
+    assert reads == []

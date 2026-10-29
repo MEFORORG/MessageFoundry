@@ -692,22 +692,18 @@ def _zzz_message(field_sep: str, value: str) -> str:
     [("123-45-6789", "SSN-shaped"), ("555-555-0100", "phone-shaped")],
     ids=("ssn", "phone"),
 )
-def test_a_shape_split_by_the_field_separator_passes(
+def test_a_shape_split_by_the_field_separator_is_refused(
     checked: Callable[..., str], value: str, shape: str
 ) -> None:
-    """A KNOWN GAP, pinned as docs/PHI.md section 9 states it (BACKLOG #2996). The detectors read
-    one field at a time, so a dashed value under a field separator of ``-`` is three fields and
-    none of them has the shape.
-
-    A fix should turn the first half of this test around: the ``-`` message must then be refused.
-    Update docs/PHI.md section 9 in the same change.
+    """Under a field separator of ``-`` a dashed value is three fields, and none of them has the
+    shape. This was a known gap (BACKLOG #2996): the detectors read one field at a time, so the
+    value left whole. The check now also reads each line as written, and refuses a shape the
+    separator cut, naming the fields it spans and never the value (BACKLOG #3465). More cases,
+    and what still passes, are in ``tests/test_anon_b455_3465.py``.
     """
-    reports: list[object] = []
-    out = checked(_zzz_message("-", value), salt=_SALT, on_report=reports.append)
-    assert out.split("\r")[1] == f"ZZZ-1-{value}"  # the value leaves whole, in the output
-    (report,) = reports
-    assert report.hits == []  # type: ignore[attr-defined]
-    assert report.structural_hits == []  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match=f"{shape} value across ZZZ-2 to ZZZ-4") as exc:
+        checked(_zzz_message("-", value), salt=_SALT)
+    assert value not in str(exc.value)
     # The control: the same value under the usual separator is one field, and it is refused.
     with pytest.raises(RuntimeError, match=f"{shape} value in ZZZ-2"):
         checked(_zzz_message("|", value), salt=_SALT)

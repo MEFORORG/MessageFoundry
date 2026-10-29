@@ -520,8 +520,14 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
     cancels any default scrub on that path. So a keep on ``PID-5`` turns the name scrub off,
     whatever it was added for. :func:`load_rules` logs each one, and a caller with a console of
     its own can repeat them there. Each entry is the default rule, so it names the lost kind.
+
+    A keep with a rewrite on the same path, which only a rule set built in code can hold, is not
+    listed: the anonymizer runs the rewrite, so the field is not left as captured, and
+    :func:`retargeted_defaults` names a change of kind there (BACKLOG #3609).
     """
-    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
+    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP} - {
+        r.path for r in rules if r.kind != SurrogateKind.KEEP
+    }
     return tuple(r for r in DEFAULT_RULES if r.path in kept)
 
 

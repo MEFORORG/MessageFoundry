@@ -424,10 +424,12 @@ class DirectDestination(DestinationConnector):
             # as "this connector has no escape" would be a FALSE ABSENCE claim.
             # MEFOR_ALLOW_INSECURE_TLS still governs this hop: weakened_tls_escape_permitted_here() is
             # that same env var plus the production-PHI clamp. Any absence claim about the raw call is
-            # scoped to THIS FILE and never repo-wide — `insecure_tls_allowed()` remains live at call
-            # sites in auth/ldap.py, pipeline/alert_sinks.py, transports/{ai_broker,database,mllp}.py
-            # and config/settings.py (docs/DEPLOYMENT.md enumerates the ones the clamp does not yet
-            # cover — see #329). Verified by grep at the time of writing, not assumed.
+            # scoped to THIS FILE and never repo-wide. `insecure_tls_allowed()` is still called in
+            # config/settings.py, by `hop_insecure_escape_downgrades`, the clamp every other cell
+            # reads it through. CORRECTED 2026-10-27 (vault BACKLOG #3533 item 11): this named live
+            # calls in auth/ldap.py, pipeline/alert_sinks.py and transports/{ai_broker,database,mllp}.py
+            # too. A grep of messagefoundry/ for the bare call found none of them that day; the LDAPS
+            # one went with engine PR 2310, which left that hop no escape at all.
             if not weakened_tls_escape_permitted_here():
                 raise ValueError(
                     "Direct destination use_tls=false submits over cleartext SMTP; refused unless "

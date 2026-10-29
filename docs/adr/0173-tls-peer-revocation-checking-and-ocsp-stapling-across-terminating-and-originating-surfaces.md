@@ -976,7 +976,7 @@ proposed accept, and only an owner ruling makes it one.
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |
 | `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Guarded** | `RevocationHopGuard.capture` in `DicomScuDestination.__init__`, taken whenever TLS is on (this connector has no verify-off arm) and handed the context the association dials with, so a `[tls].crl_file` that reaches it through the trust anchor relaxes the refusal. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor".)* |
-| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `RemoteFileDestination.__init__`, called after the client is built and handed that client's own context, taken only when the context verifies. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* **`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD.** It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed. *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
+| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) and `RemoteFileSource` (the inbound FTPS poll) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `_guard_ftps_revocation`, which `RemoteFileDestination.__init__` and `RemoteFileSource.__init__` each call after the client is built, handing it that client's own context; taken only when the context verifies. The poll's attestation is the inbound's typed `tls_revocation_attested` pair, which the runner's `_source_config` carries onto its `Source`. *(Corrected 2026-10-28: BACKLOG #2193 slice (a) guarded the poll. Until then this cell graded the upload alone and said the poll still needed a guard; that text is kept below, marked superseded.)* *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* *(Superseded 2026-10-28, kept as the record: "`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD. It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed.")* *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files of an anonymous hop | **Verify-off** | refused on an enforcing instance even with the escape set. A credentialed hop is refused outright in every posture, so no FTP login crosses this arm (vault BACKLOG #2636, CORRECTED 2026-10-06: this row listed the FTP login) |
 | `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard, tracked by #2193** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
 | `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused in every posture, with no escape (vault BACKLOG #3230, CORRECTED 2026-10-12: this read "refused on an enforcing instance (#329)") |
@@ -1022,6 +1022,8 @@ hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the h
 *(Until 2026-10-02 this paragraph read "This ADR names no tracking item for any of them, so they
 are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
 this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
+
+**Note 2026-10-28: the inbound FTPS poll is guarded (BACKLOG #2193 slice (a)).** The remotefile row of the table above says how. One fact it does not: a `tls_allow_expired` FTPS hop, either direction, hands the guard no context, so a CRL cannot relax it, as on REST (BACKLOG #2188). The counts paragraph above names FTPS as one of its seven hops; both directions of it are now guarded. Of the seven, at least LDAPS, the AI broker, the alert and security-notice SMTP hop and the alert webhook stay open on #2193. This note does not re-check the paragraph's other counts.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
@@ -1195,8 +1197,11 @@ decisions too:
    (*code*).
 
 The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
-runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
-it is skipped in CI and the Linux reading is not yet taken.
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. The 2025
+`sqlserver-store` CI leg sets it, against a second container that forces strict encryption, and
+runs the test with the server's certificate untrusted and then trusted (vault BACKLOG #3714). The
+Linux reading comes from that leg's two `BACKLOG-2223-PIN` lines, once a run is read. **CORRECTED 2026-10-27:** this read *"No
+CI job sets it, so it is skipped in CI and the Linux reading is not yet taken."*
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
@@ -1281,7 +1286,10 @@ hop's own CA list. It refuses one case only: the CRL names a listed CA's key by 
 engine ran the signature check with that key, and the check failed (corrected under vault BACKLOG
 #3506; it read "that key did not sign it", which is also true of a signature of another kind than
 the key, and that loads). Anything short of that proof loads with a WARNING, at least an issuer the
-hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+hop does not list, a CRL that names no key, and a key the engine cannot check with. Since vault
+BACKLOG #4159, that last case loads only where the unchecked key is the one the CRL names, or the
+CRL names no listed key: a same-name CA with no subject key identifier no longer stops the
+refusal, whether its key verifies the CRL or cannot be checked. `docs/CONFIGURATION.md`,
 under "CRL files", is the one place that says how often it is logged and what a refusal stops.
 So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
 renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL

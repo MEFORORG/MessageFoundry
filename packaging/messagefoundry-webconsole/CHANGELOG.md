@@ -31,6 +31,27 @@ this line.**
 
 ### Security
 
+- **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
+  and still clears the cookie when the sign-out's audit row fails.** A retired cookie that
+  sign-out sends now ends the session it became, with the owner as the row's actor, rather
+  than leaving it live. Once a session ended, a refused `auth.logout` row no longer answers 500
+  without clearing the cookie and sending Clear-Site-Data. Both are the engine's behaviour; this
+  console passes `AuthService.logout`'s new required `proven_at` and pins that engine seam.
+  (BACKLOG #3715, #3749, #3884)
+- **A passkey sign-in costs one unit of the sign-in window, not two.** `POST /ui/login` pops the
+  challenge the begin leg staged before its own charge, and charges only when the engine did not
+  renew the begin leg's hit (`StagedChallenge.paid`; the engine's SECURITY.md states the rule).
+  Needs the engine seam that carries `AuthService.take_passkey_challenge`. With no configured
+  public origin the enrol-first notice offers TOTP alone. The console also asks
+  `must_enrol_before_rotating` once per request, and the two passkey ceremonies share one
+  serializer in `app.js`. (BACKLOG #3937)
+- **The message-export script reports a stopped export as unfinished.** The engine now ends a
+  stopped export as a failed transfer. Once a download has started, the `[data-mf-msg-export]`
+  script in `static/app.js` now says the export did not finish after N messages, that the engine
+  stopped it or the connection failed, and that nothing was saved, rather than "Network error
+  during export.". No console page renders that control today, so no operator sees this message
+  yet; the change keeps the script from reporting a partial file as saved if a page wires it up.
+  No seam change. (BACKLOG #3907)
 - **An IdP step-up's return is charged to the operator's own re-authentication budget, not the
   sign-in budget.** `GET /ui/oidc/callback` now reads the user its staged step-up flow names and
   charges a key of its own for that user in the per-actor limiter `POST /ui/reauth/oidc` already

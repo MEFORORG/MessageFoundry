@@ -33,6 +33,7 @@ import pytest
 
 import messagefoundry.anon as engine_anon
 import tee.anon as tee_anon
+from tests.test_anon_core import _field_of
 
 _BOTH = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
 
@@ -42,7 +43,7 @@ _ACK = "retarget_acknowledged"
 # One synthetic patient. Each piece a narrower kind leaves behind is a distinct token below.
 _MESSAGE = (
     "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
-    "PID|1||999^^^H^MR||ZZTESTFAM^ZZTESTGIVEN^ZZTESTMID||19700315|M|||"
+    "PID|1||999^^^H^MR||ZZTESTFAM^ZZTESTGIVEN^ZZTESTMID||19150315|M|||"
     "1 ZZ STREET^^FAKECITY^ZZ^99999||5550100^PRN^PH^zz@example.invalid\r"
     "PV1|1|I|||||1234^ZZDOCLAST^ZZDOCGIVEN"
 )
@@ -111,8 +112,10 @@ _RETARGETS = pytest.mark.parametrize(
         ("PID-13", "phone", "id", "^PRN^PH^zz@example.invalid"),
         ("PID-13", "phone", "ssn", "^PRN^PH^zz@example.invalid"),
         ("PV1-7", "provider", "id", "^ZZDOCLAST^ZZDOCGIVEN"),
-        # date keeps the year, so on a date of birth it keeps the birth year.
-        ("PID-7", "dob", "date", "|1970"),
+        # date keeps the year, so on a date of birth it keeps the birth year. The year is one the
+        # default dob scrub never draws (it draws 1920 to 2021), so its absence from the default
+        # output holds for any salt (BACKLOG #3609 finding 6).
+        ("PID-7", "dob", "date", "1915"),
     ],
 )
 
@@ -153,10 +156,14 @@ def test_an_acknowledged_retarget_loads_and_warns(
     assert listed == [(path, default, path, kind)]
     assert rules.kept_defaults(loaded) == ()
 
-    # What the warning is about: with this overlay that part of the value is in the output, and
-    # with the default rules it is not.
-    assert left_behind in anon.anonymize(_MESSAGE, salt=_SALT, rules=loaded)
-    assert left_behind not in anon.anonymize(_MESSAGE, salt=_SALT)
+    # What the warning is about: with this overlay that part of the value is in the field, and
+    # with the default rules it is not. Read in the field, so another field's surrogate cannot
+    # supply the same characters.
+    assert left_behind in _field_of(anon.anonymize(_MESSAGE, salt=_SALT, rules=loaded), path)
+    # Nowhere in the default output. A bare year is read in its field alone, since another
+    # field's fabricated digits could hold the same four characters.
+    default = anon.anonymize(_MESSAGE, salt=_SALT)
+    assert left_behind not in (_field_of(default, path) if left_behind.isdigit() else default)
     # A field address and kinds only: nothing of the message, which the loader never saw.
     assert "ZZTEST" not in line
 

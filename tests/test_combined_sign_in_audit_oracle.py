@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ from messagefoundry.__main__ import main as cli_main
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.audit_visibility import (
-    DIRECTORY_LOCKED_REFUSAL_DETAIL,
+    DIRECTORY_LOGIN_LOCKED_ACTION,
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
 )
 from messagefoundry.auth.identity import Identity
@@ -259,13 +260,14 @@ class _FakeNotifier:
 # way that reader does -- through the real routes, as the built-in Auditor -- and compare the two
 # campaigns row for row.
 
-#: The four actions the ruling hides from a reader without ``users:manage``. Named here, not
+#: The actions the ruling hides from a reader without ``users:manage``. Named here, not
 #: imported, so a change to the engine's set has to change this test as well.
 _HIDDEN_LOCK_ACTIONS = (
     "auth.account_locked",
     "auth.lock_notice",
     "auth.lock_notice_undelivered",
     "auth.login_locked",
+    "auth.directory_login_locked",
     "auth.admin_unlocked",
 )
 _READER_PASSWORD = "a-strong-test-passphrase"
@@ -567,7 +569,8 @@ async def test_admin_unlock_leaves_no_trace_an_auditor_can_compare(
 
 
 #: The locked-refusal rows of the other legs, which say "a lock is live" in their detail rather than
-#: their action. Hidden exactly, as ``(action, detail)``.
+#: their action. Hidden exactly, as ``(action, detail)``. The directory one: see
+#: ``audit_visibility.DIRECTORY_LOCKED_REFUSAL_DETAIL``.
 _HIDDEN_LOCKED_REFUSALS = (
     ("auth.mfa_failed", '{"reason": "locked"}'),
     ("auth.webauthn_failed", '{"reason": "locked"}'),
@@ -655,22 +658,77 @@ async def test_the_own_security_events_feed_still_shows_the_holder_their_own_loc
 async def test_the_hidden_refusal_details_match_what_the_writers_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The factor and directory lock refusals are hidden by EXACT detail text, so the text a writer
-    stores and the text the exclusion names must be the same string. The TOTP and passkey writers
-    use the shared constant; the directory writer builds its detail from the reason, so this pins
-    it by running the real writer."""
+    """The factor lock refusals are hidden by EXACT detail text, so the text a writer stores and
+    the text the exclusion names must be the same string; their writers use the shared constant.
+    The directory lock refusal is hidden by its ACTION (BACKLOG #3726), so this pins, by running
+    the real writer, that it lands under that action."""
     world = await _open_world(tmp_path, monkeypatch)
     try:
         await world.service._refuse_directory_row("probe-directory", "locked", client=None)
         rows = await world.engine.store.list_audit(actor="probe-directory")
-        assert [(r["action"], r["detail"]) for r in rows] == [
-            ("auth.login_failed", DIRECTORY_LOCKED_REFUSAL_DETAIL)
-        ]
-        assert ("auth.login_failed", DIRECTORY_LOCKED_REFUSAL_DETAIL) in (
-            HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
-        )
+        assert [r["action"] for r in rows] == [DIRECTORY_LOGIN_LOCKED_ACTION]
         assert set(_HIDDEN_LOCK_ACTIONS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions
         assert set(_HIDDEN_LOCKED_REFUSALS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+    finally:
+        await world.engine.stop()
+
+
+async def test_a_marked_directory_lock_refusal_is_hidden_whole_on_every_read_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3726, end to end. The real writer stores a directory lock refusal carrying the OIDC
+    floor-exempt marker. ``GET /audit``, the CSV export and ``/ui/audit`` show the Auditor nothing
+    of it, and show an Administrator the row with its marker. Before, the row was hidden only by
+    its exact text, so any added field made it visible. ``GET /audit?action=`` is covered by
+    :func:`test_the_routes_hide_lock_rows_from_a_reader_without_users_manage`."""
+    world = await _open_world(tmp_path, monkeypatch)
+    marker = {"callback_floor_exempt_amr": ["wia"]}
+    try:
+        await world.service._refuse_directory_row(
+            "probe-locked", "locked", client=None, extra=marker
+        )
+        # The positive control: a refusal from the same writer, with the same marker, that is not
+        # a lock and so is shown to the Auditor. Without it, an Auditor read that came back empty
+        # for any reason would pass the absence assertion below.
+        await world.service._refuse_directory_row(
+            "probe-visible", "disabled", client=None, extra=marker
+        )
+
+        # A helper, not a loop body: the absence lint counts a guard only at a scope's top level.
+        async def hidden_from_the_auditor_only(
+            read: Callable[[_World, str], Awaitable[list[_Row]]],
+        ) -> None:
+            seen = await read(world, _AUDITOR)
+            assert len(seen) >= 1, (read.__name__, seen)
+            control = [r for r in seen if r[0] == "probe-visible"]
+            assert [r[1] for r in control] == ["auth.login_failed"], (read.__name__, seen)
+            assert (
+                json.loads(control[0][3] or "{}")["callback_floor_exempt_amr"]
+                == marker["callback_floor_exempt_amr"]
+            )
+            auditor = [r for r in seen if r[0] == "probe-locked"]
+            admin = [r for r in await read(world, _SECOND_ADMIN) if r[0] == "probe-locked"]
+            assert auditor == [], (read.__name__, auditor)
+            assert [r[1] for r in admin] == [DIRECTORY_LOGIN_LOCKED_ACTION], (read.__name__, admin)
+            assert (
+                json.loads(admin[0][3] or "{}")["callback_floor_exempt_amr"]
+                == marker["callback_floor_exempt_amr"]
+            )
+
+        for read in (_read_trail, _read_export):
+            await hidden_from_the_auditor_only(read)
+
+        async with _client(world, serve_ui=True) as c:
+            for reader, expect_shown in ((_AUDITOR, False), (_SECOND_ADMIN, True)):
+                c.cookies.clear()
+                r = await c.post(
+                    "/ui/login", data={"username": reader, "password": _READER_PASSWORD}
+                )
+                assert r.status_code == 303, r.text
+                r = await c.get("/ui/audit")
+                # A redirect or an error page would pass the Auditor's half with nothing proven.
+                assert r.status_code == 200 and "auth.login_success" in r.text, (reader, r.text)
+                assert ("probe-locked" in r.text) is expect_shown, reader
     finally:
         await world.engine.stop()
 
@@ -897,6 +955,7 @@ async def test_the_visible_rows_timestamp_does_not_tell_a_lock_refusal_from_a_ve
                         max_lockout_seconds=86_400.0,
                         now=time.time(),
                         totp_usable=_opened_totp_state,
+                        passkey_escalates=None,
                     )
 
             async def fixed_wrong(fn: Any, *args: Any) -> Any:

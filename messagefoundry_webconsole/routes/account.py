@@ -43,6 +43,7 @@ from .._auth import (
     assert_same_origin,
     clear_session_cookie,
     login_redirect_response,
+    must_enrol_first,
     register_ui_action,
     rekey_continuations,
     require_ui,
@@ -224,12 +225,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     _ENROL_TOTP_FIRST_NOTICE = (
         "That action requires MFA: enroll an authenticator app (TOTP) or a passkey to continue."
     )
+    _ENROL_TOTP_ONLY_NOTICE = (
+        "That action requires MFA: enroll an authenticator app (TOTP) to continue. A passkey "
+        "counts here only once the server's public address is configured."
+    )
 
     async def _account_notice(
-        service: AuthService, identity: Identity, m: str | None
+        service: AuthService, identity: Identity, m: str | None, request: Request
     ) -> str | None:
-        if m == "enroll_first" and await service.must_enrol_before_rotating(identity):
-            return _ENROL_TOTP_FIRST_NOTICE
+        if m == "enroll_first" and await must_enrol_first(service, identity, request):
+            # BACKLOG #3937: with no configured relying party a passkey does not discharge the
+            # requirement, so the notice offers TOTP alone.
+            if service.passkeys_count_as_way_past():
+                return _ENROL_TOTP_FIRST_NOTICE
+            return _ENROL_TOTP_ONLY_NOTICE
         return _ACCOUNT_NOTICES.get(m or "")
 
     async def _account_response(
@@ -301,7 +310,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             service,
             identity,
             request,
-            notice=await _account_notice(service, identity, m),
+            notice=await _account_notice(service, identity, m, request),
             session_offer=offer,
         )
         if token and serial is not None and offer is not None:
@@ -323,7 +332,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # ADR 0197 Amendment A, AC-A3: an account the requirement covers that holds no factor with a
         # way past the sign-in lock enrols one BEFORE it may rotate. The service refuses the
         # rotation itself; this sends the holder to enrolment instead of to that error.
-        if await service.must_enrol_before_rotating(_identity):
+        if await must_enrol_first(service, _identity, request):
             # RAISED, not returned: require_ui audits a returned refusal as ``auth.mfa_denied``, and
             # an account that must enrol owes no factor it has, so this refuses nothing it could
             # prove. It is a redirect to the next step, not an MFA denial.
