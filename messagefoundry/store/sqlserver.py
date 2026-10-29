@@ -13904,6 +13904,7 @@ class SqlServerStore:
                             holders,
                             self._row_sealer,
                             lambda holder: self._read_user_record(cur, holder, lock=False),
+                            role_id=admin_role_id,
                         )
                         if target and not others:
                             await conn.rollback()  # nothing written; releases the applock
@@ -13966,6 +13967,7 @@ class SqlServerStore:
                         self._row_sealer,
                         lambda holder: self._read_user_record(cur, holder, lock=False),
                         counts_as_admin,
+                        role_id=admin_role_id,
                     )
                     if others:
                         await conn.rollback()  # nothing written; releases the applock
