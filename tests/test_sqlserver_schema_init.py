@@ -332,7 +332,7 @@ async def test_the_schema_holder_bounds_its_ddl_lock_waits_and_resets_the_bound(
 class _PeerAppliesCursor(_FakeCursor):
     """The fast-path probe sees a stale marker; the double-check under the applock sees the marker
     a peer committed while this open queued for the lock. ``failure``, when set, is raised by the
-    double-check's read of ``schema_meta``, as pyodbc raises a ``LOCK_TIMEOUT`` expiry (1222)."""
+    double-check's read of ``schema_meta``, as pyodbc raises a driver error."""
 
     failure: Exception | None = None
 
@@ -364,13 +364,18 @@ def _double_check_index(sqls: list[str], lock_i: int) -> int:
     )
 
 
-async def test_the_double_check_under_the_applock_is_lock_bounded_and_reset() -> None:
-    """BACKLOG #1726: the double-check's read of ``schema_meta`` runs on the batch cursor, which has
-    no query timeout, so ``LOCK_TIMEOUT`` is set BEFORE it; a session holding a lock on
-    ``schema_meta`` cannot then hang the open forever. When the double-check finds the marker a
-    peer committed, the batch is skipped and the bound is still reset inside the transaction,
-    before the commit. Red on 2b7bb8144e: the double-check ran before the SET, at LOCK_TIMEOUT -1,
-    and the skip path set and reset nothing."""
+def _cursor_timeout_at(conn: _FakeConn, i: int) -> object:
+    """The query timeout of the cursor statement ``i`` ran on: the last cursor made before it.
+    ``_ensure_schema`` closes each cursor before it makes the next, so that is the open one."""
+    return [timeout for n, timeout in conn.cursors_made if n <= i][-1]
+
+
+async def test_the_double_check_under_the_applock_keeps_command_timeout() -> None:
+    """BACKLOG #1726: the double-check's read of ``schema_meta`` under the applock runs on a cursor
+    made while the connection timeout is ``command_timeout``, as on main, so neither a lock wait
+    nor a stalled link can hold the schema lock forever. When it finds the marker a peer committed,
+    the batch is skipped and no session ``LOCK_TIMEOUT`` is set or reset. Red on 207c24c5b2: the
+    read ran on the applock's cursor, made with timeout 0, after a ``SET LOCK_TIMEOUT``."""
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     conn.cursor_obj = _PeerAppliesCursor(executed)
@@ -382,48 +387,66 @@ async def test_the_double_check_under_the_applock_is_lock_bounded_and_reset() ->
 
     sqls = [sql for sql, _ in executed]
     lock_i = _applock_index(executed)
-    bound = sqls.index("SET LOCK_TIMEOUT 45000")
     double_check = _double_check_index(sqls, lock_i)
-    assert lock_i < bound < double_check
+    assert _cursor_timeout_at(conn, lock_i) == 0  # the applock waits by its own @LockTimeout
+    assert _cursor_timeout_at(conn, double_check) == 30
+    assert not any("LOCK_TIMEOUT" in sql for sql in sqls)
     assert not any("CREATE TABLE" in sql for sql in sqls)
-    # Reset inside the transaction, as its last statement, so the one commit covers it.
-    assert sqls[-2:] == ["SET LOCK_TIMEOUT -1", "COMMIT"]
+    assert sqls[-1] == "COMMIT"
     assert conn.committed == 1 and conn.rolledback == 0
 
 
-async def test_a_lock_timeout_on_the_double_check_names_the_setting_rolls_back_and_resets() -> None:
-    """A 1222 on the double-check's read becomes the store's own error naming
-    ``[store].schema_lock_timeout``; the transaction rolls back, nothing is committed, and
-    LOCK_TIMEOUT is reset after the rollback. Control: another driver error on the same read
-    propagates unchanged, rolls back and resets the same way."""
-    lock_error = RuntimeError("Lock request time out period exceeded. (1222) (SQLExecDirectW)")
-    other_error = RuntimeError("('08S01', 'Communication link failure (10054)')")
-    for failure, expected in ((lock_error, SchemaDdlLockTimeout), (other_error, RuntimeError)):
-        executed: list[tuple[str, object]] = []
-        conn = _FakeConn(executed)
-        conn.cursor_obj = _PeerAppliesCursor(executed)
-        conn.cursor_obj.failure = failure
-        _record_txn_ends(conn, executed)
-        store = _make_store(conn)
-        store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
+async def test_the_ddl_batch_alone_runs_with_no_query_timeout() -> None:
+    """On the apply path the double-check still runs under ``command_timeout``; only the cursor
+    that runs the DDL batch is made with timeout 0, and the session bound is set on it, after the
+    double-check. Red on 207c24c5b2: the double-check and the DDL shared one timeout-0 cursor."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    _record_txn_ends(conn, executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
 
-        with pytest.raises(RuntimeError) as info:
-            await store._ensure_schema()
+    assert await store._ensure_schema() is True
 
-        assert type(info.value) is expected
-        if expected is SchemaDdlLockTimeout:
-            assert info.value.__cause__ is failure
-            message = str(info.value)
-            assert "schema_meta marker" in message
-            assert "[store].schema_lock_timeout" in message
-        else:
-            assert info.value is failure
-        sqls = [sql for sql, _ in executed]
-        assert conn.committed == 0
-        assert not any("CREATE TABLE" in sql for sql in sqls)
-        first_rollback = sqls.index("ROLLBACK")
-        assert sqls[first_rollback + 1 :] == ["SET LOCK_TIMEOUT -1", "ROLLBACK"]
-        assert conn._conn.timeout == 30
+    sqls = [sql for sql, _ in executed]
+    lock_i = _applock_index(executed)
+    double_check = _double_check_index(sqls, lock_i)
+    bound = sqls.index("SET LOCK_TIMEOUT 45000")
+    first_create = next(i for i, sql in enumerate(sqls) if "CREATE TABLE" in sql)
+    assert lock_i < double_check < bound < first_create
+    assert _cursor_timeout_at(conn, double_check) == 30
+    assert _cursor_timeout_at(conn, bound) == 0
+    assert _cursor_timeout_at(conn, first_create) == 0
+    # The DDL cursor was made after the double-check ran, not before it.
+    ddl_cursor_made = [n for n, timeout in conn.cursors_made if n <= bound][-1]
+    assert ddl_cursor_made > double_check
+
+
+async def test_a_failure_on_the_double_check_rolls_back_with_nothing_to_reset() -> None:
+    """A query timeout on the double-check's read surfaces as the driver's own error, as on main;
+    the transaction rolls back, nothing is committed, and since no session ``LOCK_TIMEOUT`` was set
+    there is none to reset. Red on 207c24c5b2: a ``SET LOCK_TIMEOUT`` preceded the read and was
+    reset after the rollback."""
+    failure = RuntimeError(
+        "('HYT00', '[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]Query timeout expired (0) (SQLExecDirectW)')"
+    )
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj = _PeerAppliesCursor(executed)
+    conn.cursor_obj.failure = failure
+    _record_txn_ends(conn, executed)
+    store = _make_store(conn)
+    store._settings = _settings(command_timeout=30, schema_lock_timeout=45)  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError) as info:
+        await store._ensure_schema()
+
+    assert info.value is failure
+    sqls = [sql for sql, _ in executed]
+    assert conn.committed == 0 and conn.rolledback == 1
+    assert not any("CREATE TABLE" in sql for sql in sqls)
+    assert not any("LOCK_TIMEOUT" in sql for sql in sqls)
+    assert sqls[-1] == "ROLLBACK"
 
 
 class _DdlFailingCursor(_FakeCursor):
