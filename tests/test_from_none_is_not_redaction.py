@@ -143,7 +143,7 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
     ),
     _Allowed(
-        "messagefoundry/config/code_sets.py::load_policy::CodeSetError::CodeSetError",
+        "messagefoundry/config/code_sets.py::parse_policy::CodeSetError::CodeSetError",
         _SAFE + "the new message interpolates the caught CodeSetError whole",
     ),
     _Allowed(
@@ -164,7 +164,7 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "the new message is that same text",
     ),
     _Allowed(
-        "messagefoundry/config/wiring.py::EnvRef.__post_init__::ValueError::WiringError",
+        "messagefoundry/config/wiring.py::_strict_bool_default::ValueError::WiringError",
         _SAFE + "_cast_bool's fixed text withholds the value and lists the spellings, which the "
         "new message also lists",
     ),

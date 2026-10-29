@@ -21,13 +21,21 @@ from messagefoundry.service import ServiceControlOutcome, control_service_ex
 from messagefoundry.service_status import _system_dir
 
 
-def test_rejects_unsafe_name_before_platform_check(monkeypatch: pytest.MonkeyPatch) -> None:
+# After the metacharacter case come BACKLOG #1680's edges: a leading space, dot or dash, and a
+# trailing line feed, which `$` with `.match` admitted.
+@pytest.mark.parametrize(
+    "bad", ['evil" & calc.exe & "', " MyEngine", ".MyEngine", "-MyEngine", "MyEngine\n"]
+)
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_rejects_unsafe_name_before_platform_check(
+    monkeypatch: pytest.MonkeyPatch, bad: str, platform: str
+) -> None:
     # An unsafe name must raise on every OS (before the platform check) and never elevate.
     tripped: list[object] = []
     monkeypatch.setattr(service, "_runas_wait", lambda *a: tripped.append(a))
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", platform)
     with pytest.raises(ValueError, match="unsafe service name"):
-        control_service_ex("start", 'evil" & calc.exe & "')
+        control_service_ex("start", bad)
     assert tripped == []
 
 
@@ -52,9 +60,10 @@ _CMD = os.path.join(_SYSDIR, "cmd.exe")
 _NET = os.path.join(_SYSDIR, "net.exe")
 
 
+@pytest.mark.parametrize("name", ["MyEngine", "My Engine"])
 @pytest.mark.parametrize("action", ["start", "stop", "restart"])
 def test_builds_system32_command_and_delegates(
-    monkeypatch: pytest.MonkeyPatch, action: str
+    monkeypatch: pytest.MonkeyPatch, action: str, name: str
 ) -> None:
     """Elevation must target the system directory's ``cmd.exe`` and ``net.exe``, with the validated
     name — never a program a search path resolves out of the caller's working directory.
@@ -71,12 +80,12 @@ def test_builds_system32_command_and_delegates(
     monkeypatch.setattr(service, "_runas_wait", fake_runas)
     monkeypatch.setattr(sys, "platform", "win32")
     tail = (
-        f'"{_NET}" stop "MyEngine" & "{_NET}" start "MyEngine"'
+        f'"{_NET}" stop "{name}" & "{_NET}" start "{name}"'
         if action == "restart"
-        else f'"{_NET}" {action} "MyEngine"'
+        else f'"{_NET}" {action} "{name}"'
     )
 
-    assert control_service_ex(action, "MyEngine") is ServiceControlOutcome.DISPATCHED
+    assert control_service_ex(action, name) is ServiceControlOutcome.DISPATCHED
     assert recorded == [(_CMD, f'/s /c "{tail}"')]
 
 

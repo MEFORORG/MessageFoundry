@@ -1784,6 +1784,7 @@ def test_serve_loopback_emits_no_new_stderr(
         "security.delete_message_bodies_after_days = 30\n"
         "retention.dead_letter_days = 30\n"
         "retention.reference_snapshot_days = 30\n"
+        "retention.processed_archive_days = 30\n"
         # The two PL-2 tiers the engine deliberately does NOT default, because each keys on a
         # timestamp that only moves on a write, so a silent default would delete data still in use.
         # They warn when unset, which on this test's own terms is a line on a stream it asserts is
@@ -4312,7 +4313,7 @@ def test_a_cert_held_open_elsewhere_is_waited_out_during_recovery(tmp_path: Path
     """On Windows another process holding the certificate open (the tray pinning it, a backup, an
     antivirus scan) refuses its deletion. Recovery must ride out that brief hold, not crash on it.
 
-    Mutation: make `_unlink_generated` a bare `path.unlink()`. Red: PermissionError [WinError 32]."""
+    Mutation: make `unlink_generated` a bare `path.unlink()`. Red: PermissionError [WinError 32]."""
     api = ApiSettings()
     material = ensure_api_tls_material(api, state_dir=tmp_path)
     assert material is not None

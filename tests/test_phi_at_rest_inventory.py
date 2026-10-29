@@ -53,10 +53,12 @@ import messagefoundry.store.privilege as store_privilege
 import messagefoundry.store.sqlserver as store_sqlserver
 import messagefoundry.store.store as store_store
 from messagefoundry.config.settings import ServiceSettings
+from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store.base import Store
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
+from messagefoundry.transports.file import FileSource
 from tests._ast_sites import (
     call_sites,
     code_strings,
@@ -1288,10 +1290,21 @@ def _purge_table_cells(section: str) -> dict[str, dict[str, str]]:
     return out
 
 
-#: §8 rows whose operation is NOT a Store method: the app-log sweep is filesystem work owned by the
-#: RetentionRunner itself, identical on every backend. Reviewed and pinned below, so it cannot be
-#: used as a hiding place for a store operation that quietly stopped being implemented.
-_NON_STORE_OPERATIONS = frozenset({"app_log_days"})
+#: §8 rows whose operation is NOT a Store method: filesystem work the RetentionRunner drives,
+#: identical on every backend. The app-log sweep is the runner's own; the `.processed` sweep is run
+#: by the runner and done by each File source. Reviewed and pinned below, each to the code that does
+#: the work, so it cannot be used as a hiding place for an operation that quietly stopped existing.
+_NON_STORE_OPERATIONS = frozenset({"app_log_days", "processed_archive_days"})
+
+#: For each exempt operation, (class, method) pairs that must still exist, read off the imported
+#: classes: a setting name alone survives in a log string after the code that honours it is gone.
+_NON_STORE_IMPLEMENTATIONS: dict[str, tuple[tuple[type, str], ...]] = {
+    "app_log_days": (),
+    "processed_archive_days": (
+        (RetentionRunner, "_prune_processed_archives"),
+        (FileSource, "prune_processed_archive"),
+    ),
+}
 
 
 def _method_shape(cls: type, name: str) -> str:
@@ -1344,6 +1357,10 @@ def test_per_backend_purge_verdicts_are_bound_to_the_method_bodies() -> None:
             f"{operation} is exempted as RetentionRunner-owned but no longer appears in "
             "pipeline/retention.py — the §8 row describes nothing."
         )
+        for owner, method in _NON_STORE_IMPLEMENTATIONS[operation]:
+            assert callable(owner.__dict__.get(method)), (
+                f"{operation}: {owner.__name__}.{method} is gone, so the §8 row describes nothing."
+            )
 
 
 def _verdict_mismatches(table: dict[str, dict[str, str]], backends: dict[str, type]) -> list[str]:

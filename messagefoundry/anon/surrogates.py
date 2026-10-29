@@ -35,6 +35,8 @@ from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind
 #: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
 #: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
 _NEVER: re.Pattern[str] = re.compile(r"(?!x)x")
+#: A UTF-8 byte-order mark, which an editor can save ahead of a token file's first line.
+_BOM = chr(0xFEFF)
 
 
 def _resolve_token_text() -> str | None:
@@ -80,13 +82,18 @@ def _load_site_prefixes() -> tuple[str, ...]:
     prefixes: list[str] = []
     section: str | None = None
     for raw in text.splitlines():
-        line = raw.strip()
+        # A byte-order mark is dropped first, as the publish guard's own parser does. Kept, it hid
+        # a first-line ``[site_prefix]`` header while the guard still called the token tables live,
+        # and inline content in the variable never passes through a file read (BACKLOG #3609).
+        line = raw.lstrip(_BOM).strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip().lower()
             continue
-        if section == "site_prefix" and line.isdigit() and len(line) == 2:
+        # ASCII only, as the guard reads it: ``isdigit`` alone takes a fullwidth or superscript
+        # digit, which no site code holds, and the prefix would load and match nothing.
+        if section == "site_prefix" and line.isascii() and line.isdigit() and len(line) == 2:
             prefixes.append(line)
     return tuple(dict.fromkeys(prefixes))
 
@@ -118,6 +125,16 @@ def reload_site_prefixes() -> None:
 
 
 reload_site_prefixes()
+
+
+def site_prefixes_loaded() -> bool:
+    """True when at least one site-code prefix loaded, so the site-code scrub can match anything.
+
+    False whatever the cause: no token source, a file that could not be read, or a source with no
+    two-digit entry under ``[site_prefix]``. A caller with a console of its own says so there,
+    because nothing here logs it (BACKLOG #3516)."""
+    return bool(_SITE_PREFIXES)
+
 
 #: What :class:`SurrogateKind.FREETEXT` collapses a narrative field to. Free text routinely embeds
 #: identifiers (a name/MRN/DOB in prose) that field-level surrogation cannot reach and the leak-check

@@ -261,6 +261,11 @@ false-premise defect:
    one call, `_TokenEndpointProvider._open_token_hop` in `transports/smart.py`, so one site now
    serves two hops. Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
+   *(Note 2026-10-27: revocation "proven in front" never crossed this refusal on a shipped hop: no
+   engine call site set `proxy_proven` True, and the parameter is now gone from
+   `revocation_hop_disposition` and `RevocationHopGuard`, vault BACKLOG #3514 item 5. The
+   docstring of `revocation_hop_disposition` is the source of record.
+   The item keeps its original wording.)*
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
@@ -599,13 +604,18 @@ the guarded originating hops listed at §1.5 rider 1. *(This read "the seven gua
 than warn: `config/settings.py:2338-2342` derives `DataClass.PHI` for `dev`, `staging` **and** `prod`,
 and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. The disposition ladder
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
-loopback, a proven terminator, an attestation, or a non-PHI posture.
+loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
+outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
+says why. The sentence keeps its original wording.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
-`RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** (`tls_policy.py:1044-1046`)
-— a live serve build after the pre-flight, or a direct test or embedding. The `build_check` gate is
-the authority there, by design. A configuration that names no environment and declares no data class
-lands on the not-PHI ALLOW arm and gets nothing.
+`RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
+build, or an embedding that stamps none. `build_check` (`messagefoundry check`, dry-run, reload)
+stamps the posture, and so does the runner around its live builds when `serve` starts the graph, so
+neither path is unstamped. *(Until 2026-10-26 this caveat named "a live serve build after the
+pre-flight" as unstamped, with the `build_check` gate as the authority there; `serve` runs no such
+pre-flight. It also said a configuration naming no environment and no data class lands on a not-PHI
+ALLOW arm; BACKLOG #1279 removed that arm. Vault BACKLOG #3514.)*
 
 ### 4.2 Accepted with no risk to accept
 
@@ -712,6 +722,8 @@ OAuth2 token hop. Two reasons:
 - It delivers the second option's outcome without a second rule. With no context `crl_checked` is
   false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+  *(Note 2026-10-27: `revocation_hop_disposition` and `RevocationHopGuard` have no `proxy_proven`
+  parameter either now, so no hop can declare one.)*
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
 `[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
@@ -783,7 +795,9 @@ which the same CRL relaxes the same hop without a sidecar.
   or attest. Some sites will attest without a revocation-checking PKI behind the claim, because
   attesting is one environment variable and standing up a proxy is a project. The control is honest by
   construction — the flag is named an attestation and its use is audited — but the residual risk moves
-  into a claim the engine cannot check.
+  into a claim the engine cannot check. *(Note 2026-10-27: a revocation-checking egress proxy does
+  not cross the refusal; `docs/DEPLOYMENT.md`, *The ways across*, lists what does. The bullet keeps
+  its original wording.)*
 - **Direction 3 remains opt-in and default-off**, so a site that configures nothing gets no
   client-certificate revocation and, on an enforcing PHI posture, a start-time refusal telling it so.
 - **An operator who enables direction 3 takes on CRL refresh.** The engine alarms on expiry
@@ -962,11 +976,11 @@ proposed accept, and only an owner ruling makes it one.
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |
 | `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Guarded** | `RevocationHopGuard.capture` in `DicomScuDestination.__init__`, taken whenever TLS is on (this connector has no verify-off arm) and handed the context the association dials with, so a `[tls].crl_file` that reaches it through the trust anchor relaxes the refusal. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor".)* |
-| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `RemoteFileDestination.__init__`, called after the client is built and handed that client's own context, taken only when the context verifies. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* **`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD.** It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed. *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
+| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) and `RemoteFileSource` (the inbound FTPS poll) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `_guard_ftps_revocation`, which `RemoteFileDestination.__init__` and `RemoteFileSource.__init__` each call after the client is built, handing it that client's own context; taken only when the context verifies. The poll's attestation is the inbound's typed `tls_revocation_attested` pair, which the runner's `_source_config` carries onto its `Source`. *(Corrected 2026-10-28: BACKLOG #2193 slice (a) guarded the poll. Until then this cell graded the upload alone and said the poll still needed a guard; that text is kept below, marked superseded.)* *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* *(Superseded 2026-10-28, kept as the record: "`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD. It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed.")* *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files of an anonymous hop | **Verify-off** | refused on an enforcing instance even with the escape set. A credentialed hop is refused outright in every posture, so no FTP login crosses this arm (vault BACKLOG #2636, CORRECTED 2026-10-06: this row listed the FTP login) |
-| `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard, tracked by #2193** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
+| `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Guarded** | `RevocationHopGuard.capture` in `_refuse_ad_revocation`, which `LdapAuthenticator.__init__` calls after the `NarrowedTls` is built, handing it a context that `NarrowedTls`'s factory builds, the recipe every bind's `wrap_socket` runs. Its CRL is the hop's own `[auth].ad_tls_crl_file`, which the factory loads on every bind, failing closed on a file it cannot load; `[tls].crl_file` does not reach it. Built outside the connector gate like the OIDC legs, so `AuthService` and the privilege probe pass it the posture. No attestation exists for this hop, by the owner ruling of 2026-10-27. *(Graded "Needs a guard, tracked by #2193" until 2026-10-28, when BACKLOG #2193 slice (b) built it. It read: "a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.**" CORRECTED 2026-09-30 before that: "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context.)* |
 | `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused in every posture, with no escape (vault BACKLOG #3230, CORRECTED 2026-10-12: this read "refused on an enforcing instance (#329)") |
-| `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30) |
+| `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30). Since BACKLOG #2193 it also loads `[auth].ad_tls_crl_file` onto that context |
 | `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard, built outside the connector gate |
 | `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard |
 | `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in `DirectDestination.__init__`, taken when a username is set, called after the context is built and handed it. That is the AUTH credential leg. A DIRECT hop with no username sends no credential and takes no guard: the shipped comment's S/MIME reasoning covers that case, and its wording now says so. *(Graded "Owner question" until 2026-10-04, when BACKLOG #2193 built the credential leg. It read: "a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set. (Added 2026-10-02.) #2193 tracks this row with a checklist line: guard the AUTH credential leg, and leave the S/MIME decline as it is. Manager batch 164 chose that line, as #2193 records. Building it reverses the shipped decline for the credential leg, and the grade then moves to Guarded. Declining it is an accept, which needs an owner ruling".)* |
@@ -997,8 +1011,11 @@ pass will meet: no CRL reaches the two `requests`-based Vault clients today, bec
 `requests_verify_from_anchor` in `tls_policy.py` would refuse an anchor's `crl_file` if one ever
 reached them.
 
+**Note 2026-10-28: the LDAPS AD bind is guarded (BACKLOG #2193 slice (b), owner ruling 2026-10-27).** The LDAPS row of the table above says how. The counts paragraph below names LDAPS as one of its seven hops; it no longer needs a guard. Two facts the row does not carry. A Kerberos sign-in adds no hop: the SPNEGO acceptor reads a ticket the browser sent and builds no TLS context, and the directory lookups a Kerberos or OIDC sign-in makes are binds over this one guarded context, since every bind in `auth/ldap.py` is an ldap3 SIMPLE bind. And `messagefoundry check` has no leg for this guard, where it reports the OIDC legs' through its required `oidc-revocation` leg (BACKLOG #2131). At least `serve`, `provision-admin` and `messagefoundry check-privileges` reach it. This note does not re-check the paragraph's other counts.
+
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker, the DICOM SCU,
-FTPS, LDAPS, the alert and security-notice SMTP hop, and the alert webhook. BACKLOG #2193 tracks
+FTPS, LDAPS (guarded since 2026-10-28, see the note above), the alert and security-notice SMTP hop,
+and the alert webhook. BACKLOG #2193 tracks
 all seven, one checklist line per hop. No row in this table needs an owner answer now. DIRECT,
 the last that did, is graded *Guarded* since BACKLOG #2193 built its credential leg on 2026-10-04.
 *(Until 2026-10-11 this read "One row needs an owner answer: DIRECT. #2193 also tracks it, and its
@@ -1008,6 +1025,8 @@ hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the h
 *(Until 2026-10-02 this paragraph read "This ADR names no tracking item for any of them, so they
 are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
 this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
+
+**Note 2026-10-28: the inbound FTPS poll is guarded (BACKLOG #2193 slice (a)).** The remotefile row of the table above says how. One fact it does not: a `tls_allow_expired` FTPS hop, either direction, hands the guard no context, so a CRL cannot relax it, as on REST (BACKLOG #2188). The counts paragraph above names FTPS as one of its seven hops; both directions of it are now guarded. Of the seven, at least the AI broker, the alert and security-notice SMTP hop and the alert webhook stay open on #2193; LDAPS is guarded too, as the note above says. This note does not re-check the paragraph's other counts.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
@@ -1048,8 +1067,8 @@ of the list above:
   This bullet said it "stands where *Owner question* does: the honest answer might be an
   accept".)*
 - *No revocation check, a guard is possible* is an unguarded verifying hop. Section 4.3's default
-  for one is *Needs a guard*, and the LDAPS row above carries that grade with no CRL setting
-  reaching it either. These rows read *Needs a guard, tracked by* an item once one names them.
+  for one is *Needs a guard*, and the LDAPS row above carried that grade with no CRL setting
+  reaching it either, until BACKLOG #2193 guarded it on 2026-10-28. These rows read *Needs a guard, tracked by* an item once one names them.
   *(Since 2026-10-13 no row in this note carries this grade. The three Vault rows read *Guarded
   by attestation*, which §12 defines.)*
 - The weakened arms the rows mention are *Verify-off* in the list's terms, and need no decision.
@@ -1061,9 +1080,9 @@ of the list above:
 | DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
-| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
-| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
+| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
+| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
+| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
 **The ODBC hops are a named gap by owner ruling, and the driver test is still owed.** BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
@@ -1158,7 +1177,7 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 `Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
 `Encrypt=yes`, and both stay inside the last-wins tail (*code*). The reason: on the Driver 18.7 build
-tested, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+tested on Windows, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
@@ -1181,12 +1200,17 @@ decisions too:
    (*code*).
 
 The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
-runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
-it is skipped in CI and the Linux reading is not yet taken.
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. The 2025
+`sqlserver-store` CI leg sets it, against a second container that forces strict encryption, and
+runs the test with the server's certificate untrusted and then trusted (vault BACKLOG #3714). The
+Linux reading comes from that leg's two `BACKLOG-2223-PIN` lines, once a run is read. **CORRECTED 2026-10-27:** this read *"No
+CI job sets it, so it is skipped in CI and the Linux reading is not yet taken."*
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
 amendment.
+*(Corrected 2026-10-27: the amendment's reason read "on the Driver 18.7 build tested", without
+"on Windows". The measurement was taken on Windows only. Vault BACKLOG #3714 item 10.)*
 
 **The counts, after this note.** The counts paragraph above covers the table above, and this note
 leaves it as written. *(Corrected 2026-10-11: that paragraph has since been edited once, for
@@ -1204,7 +1228,8 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
 search for other hops of the same shape, and it did not grade the Vault proxy leg. *(§12 records
-that leg as a named gap.)*
+that leg as a named gap.)* *(Since 2026-10-26 §12 records a guard on that leg instead, under vault
+BACKLOG #3561, so it is no longer a named gap.)*
 
 ## 8. Sources that are stale, and must not be cited as current
 
@@ -1260,9 +1285,14 @@ only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are un
 **CORRECTED 2026-10-12 (vault BACKLOG #2905, owner ruling 2026-10-05).** The paragraph above said a
 badly signed CRL "would load and then fail every handshake". That described a start as well as
 OpenSSL, and a start has changed. `harden_crl_check` now checks each CRL's signature against the
-hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, and
-that key did not sign it. Anything short of that proof loads with a WARNING, at least an issuer the
-hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, the
+engine ran the signature check with that key, and the check failed (corrected under vault BACKLOG
+#3506; it read "that key did not sign it", which is also true of a signature of another kind than
+the key, and that loads). Anything short of that proof loads with a WARNING, at least an issuer the
+hop does not list, a CRL that names no key, and a key the engine cannot check with. Since vault
+BACKLOG #4159, that last case loads only where the unchecked key is the one the CRL names, or the
+CRL names no listed key: a same-name CA with no subject key identifier no longer stops the
+refusal, whether its key verifies the CRL or cannot be checked. `docs/CONFIGURATION.md`,
 under "CRL files", is the one place that says how often it is logged and what a refusal stops.
 So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
 renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL
@@ -1365,10 +1395,38 @@ carries the reason, because a Vault hop can be dialled before any store is open.
    log nothing:** an attested hop, and a hop crossed on the process-wide variable.
 4. `messagefoundry check` lists each set pair on its `vault-revocation-attested` line.
 
-**Named gap: the proxy leg.** Through an `https://` proxy a Vault hop has a second TLS leg, to the
-proxy. Nothing checks revocation of the proxy's certificate, no guard judges that leg, and the
-attestation does not claim it. The Vault leg's own TLS, inside the tunnel, is what protects the
-token. This leg has no tracking item.
+**The proxy leg is guarded as of 2026-10-26 (vault BACKLOG #3561).** Through an `https://` proxy
+a Vault hop has a second TLS leg, to the proxy. The Vault leg's own TLS, inside the tunnel, still
+protects the token. But proxy credentials cross that leg, because a credentialed `https://` proxy
+is allowed, and so does the Vault host name in the `CONNECT`. On 2026-10-26 the owner ruled, in
+the batch 342 Manager's session, to build a guard on that leg rather than close the row with a
+note (decision log `d20261026T140954228-ff8cff`).
+
+- The guard is `_refuse_an_unrevoked_proxy_leg` in `transports/strict_requests.py`. Each
+  tunnelled connection runs it in `connect`, before its socket opens, so before `CONNECT` and
+  before any proxy credentials cross.
+- It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
+  on the hop's posture and attestation, as the Vault leg's guard does. For this leg a proxy on
+  a loopback address is on the box, decided without DNS, but the Vault leg's guard still counts
+  any proxied hop as off the box. A proxy that takes no credentials is judged the same way,
+  because the host name still crosses.
+- **The hop's attestation now claims the proxy's certificate too.** Both legs are on the one path
+  to Vault, so a hop crosses only when both are covered. A second settings pair would let nothing
+  new cross. Both legs' refusals ask for a reason that covers both certificates.
+- Under `warn` an unattested leg crosses with a WARNING of its own, unless
+  `MEFOR_TLS_REVOCATION_ATTESTED` makes it silent. An attested crossing under an enforcing or
+  unknown posture logs a line of its own. Each is written once per process for each hop.
+- **Under an enforcing or unknown posture the Vault leg's guard refuses first, today.** A proxied
+  hop is never on the box, and both legs' contexts come from one factory. So an unattested
+  proxied hop is refused before any connection opens. The proxy leg's refusal fires on its own
+  only when the two legs' contexts differ, for example a CRL check that reached one leg and not
+  the other. It is the guard that reads the proxy leg's own context.
+- It adds no check on the wire. `tests/test_vault_revocation_hop_guard.py` holds its tests.
+
+*Until 2026-10-26 this paragraph read:* "**Named gap: the proxy leg.** Through an `https://`
+proxy a Vault hop has a second TLS leg, to the proxy. Nothing checks revocation of the proxy's
+certificate, no guard judges that leg, and the attestation does not claim it. The Vault leg's own
+TLS, inside the tunnel, is what protects the token. This leg has no tracking item."
 
 **What vault BACKLOG #2983's closing items map to.**
 

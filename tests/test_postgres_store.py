@@ -46,7 +46,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.queue_tag import queue_row_aad
-from messagefoundry.store.store import load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -808,6 +808,7 @@ async def test_stats_and_metrics(store) -> None:
     # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
     # this guards every run.
     assert db.disk_free_bytes is None
+    assert db.disk_free_status is DiskFreeStatus.NOT_APPLICABLE  # stated, not inferred
     ok, _ = await store.integrity_check()
     assert ok is True
 
@@ -1082,6 +1083,14 @@ async def test_webauthn_store_contract(store) -> None:
     await _assert_webauthn_store_contract(store)
 
 
+async def test_webauthn_conditional_bind_contract(store) -> None:
+    """BACKLOG #3014, #3690 item 1 on the real Postgres backend: the conditional passkey insert,
+    checked with the account row held under FOR UPDATE."""
+    from tests._webauthn_store_contract import _assert_webauthn_conditional_bind_contract
+
+    await _assert_webauthn_conditional_bind_contract(store)
+
+
 async def test_totp_store_contract(store) -> None:
     """WP-14 TOTP store contract on the real Postgres backend — the backfill that finally executes
     the FOR UPDATE row-lock paths (consume_totp_step / consume_recovery_code_hash) under test."""
@@ -1100,7 +1109,15 @@ async def test_lockout_store_contract(store) -> None:
     contract above states."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    async def corrupt(user_id: str) -> None:
+        # A UTF8 database refuses a cell it cannot decode at write time, so only the parse arm can
+        # be planted here; the fetch-time arm runs on SQLite and SQL Server.
+        async with store._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=$1", user_id
+            )
+
+    await _assert_lockout_contract(store, corrupt_passkeys={"parse": corrupt})
 
 
 async def test_login_address_store_contract(store) -> None:
@@ -5537,8 +5554,8 @@ async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> No
     ``tests/_finalize_race_contract`` carries the property, the mechanism, and the paired-arm
     measurement behind the round count -- read it there rather than here.
 
-    THIS is the backend that measurement was taken on, so a red here is the shared contract's first
-    and best signal.
+    This backend's lock-removed result is one local run, and unlike the SQL Server leg it has no
+    standing negative control, so a change that blinded only this leg's race would leave it green.
     """
     from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
 

@@ -23,18 +23,12 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["SIGN_IN_ANY_TENSE", "SIGN_IN_CLAIM", "SIGN_IN_VERB", "rejoin_wrapped_hyphens"]
+__all__ = ["SIGN_IN_CLAIM", "SIGN_IN_VERB", "rejoin_wrapped_hyphens"]
 
 SIGN_IN_VERB = re.compile(
     r"\b(?:sign(?:s|ing)?[ -]?in(?:to)?|log(?:s|ging)?[ -]?(?:in|on)(?:to)?)\b"
     r"(?![ -]?lock(?:s|out|outs)?\b)",
     re.IGNORECASE,
-)
-
-#: The verb in any tense, the states included. For a claim about WHEN a password crosses the wire,
-#: "every user who signed in" is the same claim as "every user who signs in".
-SIGN_IN_ANY_TENSE = re.compile(
-    SIGN_IN_VERB.pattern + r"|\b(?:signed|logged)[ -]?(?:in|on)\b", re.IGNORECASE
 )
 
 # "no one" is not "no one-time password": the lookahead keeps the hyphenated compound out.

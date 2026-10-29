@@ -32,9 +32,11 @@ from __future__ import annotations
 import ast
 import builtins
 import hashlib
+import importlib.abc
 import importlib.machinery
 import importlib.util
 import inspect
+import io
 import ipaddress
 import logging
 import math
@@ -50,14 +52,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-from types import MappingProxyType, ModuleType
+from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
     CodeSetError,
-    load_code_sets,
+    code_sets_from_files,
+    is_code_set_name,
 )
 from messagefoundry.config.code_sets import (
     activated as _code_sets_activated,
@@ -86,9 +89,11 @@ from messagefoundry.config.models import (
     bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
+    remote_file_protocol,
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
     fhir_lookup_record_name,
@@ -258,13 +263,11 @@ class EnvRef:
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
         # the reason ``_cast_bool`` gives.
         if self.cast is _cast_bool and self.default is not _UNSET and self.default is not None:
-            try:
-                object.__setattr__(self, "default", _cast_bool(self.default))
-            except ValueError:
-                raise WiringError(
-                    f"env reference {self.key!r} with a bool cast: default= is not a boolean "
-                    f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
-                ) from None
+            object.__setattr__(
+                self,
+                "default",
+                _strict_bool_default(self.default, f"env reference {self.key!r} with a bool cast"),
+            )
 
     def __repr__(self) -> str:
         # The generated repr printed the ``_UNSET`` sentinel and a function cast by address, which
@@ -272,6 +275,20 @@ class EnvRef:
         default = "<unset>" if self.default is _UNSET else repr(self.default)
         cast = None if self.cast is None else _cast_name(self.cast)
         return f"EnvRef(key={self.key!r}, default={default}, cast={cast})"
+
+
+def _strict_bool_default(default: Any, subject: str) -> bool:
+    """An ``env()`` ``default=`` read with the strict spelling cast, or a :class:`WiringError` naming
+    ``subject`` with the value withheld, for the reason ``_cast_bool`` gives. A default is never cast
+    at resolve time, so each place that needs one read strictly reads it here, once, when the
+    reference is made."""
+    try:
+        return _cast_bool(default)
+    except ValueError:
+        raise WiringError(
+            f"{subject}: default= is not a boolean "
+            f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
+        ) from None
 
 
 def _cast_name(cast: Callable[[Any], Any]) -> str:
@@ -300,10 +317,10 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a setting whose
-    factory parameter is annotated ``bool``, :func:`resolve_env_settings` then reads the result the
-    same strict way, so an uncast or ``str``-cast ``env()`` there cannot hand the connector the text
-    ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
+    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
+    the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
+    hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
     ``cast=lambda s: bool(s)`` still keeps the builtin's trap."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
@@ -773,7 +790,18 @@ def refuse_resolved_verify_off(
     read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
     falsy, and more often since vault BACKLOG #3138 made ``cast=bool`` read ``false`` as False. So
     the same test runs here, on the value the connector will read. SOAP needs no copy: its
-    connector refuses a client cert with verification off when it is built."""
+    connector refuses a client cert with verification off when it is built.
+
+    ``Ftp()`` is the other factory with such a refusal: a CA beside a literal ``tls=False``. An
+    ``env()`` ``tls`` resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp``
+    with a CA is refused here, in either direction, with or without a pin."""
+    if type_ is ConnectorType.REMOTEFILE:
+        if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
+            raise WiringError(
+                f"{where}: Ftp tls_ca_file would never be read: the protocol resolved to plain "
+                "ftp (tls off), which builds no TLS context."
+            )
+        return
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
     # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
@@ -1135,7 +1163,7 @@ def FhirLookup(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -1182,7 +1210,9 @@ def FhirLookup(
     :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
     ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
-    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). Neither declaration lifts a refusal of a
+    lookup that sends a credential, over ``verify_tls=False`` or over cleartext ``http`` off this
+    machine (vault BACKLOG #3230, #3533 item 4). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1263,6 +1293,19 @@ _SETTINGS_FACTORY_RETURNS: Final = frozenset(
 )
 _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 
+#: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
+#: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
+#: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
+#: and OAuth2 read it as off, not the composer's default of on: their readers' documented rule is
+#: that a falsy flag is off (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
+#: ``None`` as on would start a token hop the author did not ask for. ``sign_enabled`` keeps
+#: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
+#: Listed rather than imported, so the first resolve does not load the composers' modules and
+#: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
+_COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool | None]] = MappingProxyType(
+    {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}
+)
+
 
 class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
@@ -1277,7 +1320,8 @@ class _BoolSettings(NamedTuple):
 
 @cache
 def _bool_settings() -> _BoolSettings:
-    """Every setting name a factory in this module annotates ``bool`` (vault BACKLOG #3234).
+    """Every setting name a factory in this module annotates ``bool``, and every composer flag
+    :data:`_COMPOSER_BOOL_SETTINGS` lists (vault BACKLOG #3234).
 
     :func:`resolve_env_settings` reads these strictly. It sees a settings mapping and not the factory
     that built it, and its callers include lookups, reference sources and trust anchors as well as
@@ -1288,8 +1332,9 @@ def _bool_settings() -> _BoolSettings:
     the connection factories ``connections.toml`` offers, and this needs the lookup and reference
     factories too. The annotation is read the way the ``connections.toml`` type check reads it, through
     the same resolver and classifier, so the two cannot disagree on which settings are boolean.
-    Composers in other modules (``with_smart_backend``'s ``enabled``, stored as ``smart_enabled``)
-    are NOT covered: their parameter names are not their settings keys.
+    A composer in another module writes its flag under a key that is not its parameter's name
+    (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so those are listed in
+    :data:`_COMPOSER_BOOL_SETTINGS`, with what a ``None`` reads as.
     Cached: the key set is closed, and the annotations are fixed once the module is imported."""
     from messagefoundry.config.connections_file import _classify, _factory_signature
 
@@ -1321,6 +1366,8 @@ def _bool_settings() -> _BoolSettings:
                 defaults.setdefault(param.name, set()).add(param.default)
             else:
                 other_names.add(param.name)
+    for key, default in _COMPOSER_BOOL_SETTINGS.items():
+        defaults.setdefault(key, set()).add(default)
     strict: dict[str, bool | None] = {}
     for name, seen in defaults.items():
         if name in other_names:
@@ -1351,7 +1398,7 @@ def resolve_env_settings(
     refused in the same error, naming the setting, the key and ``connection`` when given.
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
-    ``default``, else it's *missing*. A setting a factory annotates ``bool`` is then read with the
+    ``default``, else it's *missing*. A setting :func:`_bool_settings` names is then read with the
     strict spelling cast, from either source (vault BACKLOG #3234). Raises a single
     :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
@@ -1648,7 +1695,12 @@ def _is_secret_header(name: str, value: object = None) -> bool:
 
     **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
     reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
-    #3230), so narrowing it narrows that no-escape refusal too.
+    #3230). Since vault BACKLOG #3533 that refusal also takes any name off its own allowlist. For
+    that refusal, narrowing the NAME arm here changes only how a refused header is labelled, and
+    narrowing the VALUE arm narrows it for the allowlisted names. Either still narrows the masking.
+    **Over cleartext http off this machine there is no allowlist** (vault BACKLOG #3533 item 4):
+    this function alone decides whether a static or per-message header is a credential the hop
+    refuses, so narrowing EITHER arm lets that header cross there in the clear.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -1725,7 +1777,7 @@ def connector_secret_env_values(
     """The per-Connection ``env()``-sourced credential VALUES the wired graph references right now, keyed
     by their environment-value key (a NON-SECRET identifier) — the input to the ASVS-13.3.4 rotation
     watcher's ``extra_values`` (``pipeline/secret_rotation.reconcile_rotation_meta``), which fingerprints
-    each with the DEK-derived keyed MAC so a per-Connection connector credential is monitored for rotation
+    each with the sealed keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
     A setting is included when its key is a **rotatable** credential — recognised by
@@ -3265,7 +3317,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3368,7 +3420,7 @@ def FHIR(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3782,7 +3834,7 @@ def DICOMweb(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -4187,7 +4239,7 @@ def Soap(
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -4332,8 +4384,9 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
-    ``[security].enforcement = warn``. Put secrets (``password``/
+    refused). ``MEFOR_ALLOW_INSECURE_TLS`` at ``[security].enforcement = warn`` accepts an unknown
+    key for a key-only login, and never saves it. A ``password`` login to an unknown key is refused
+    with no escape (vault BACKLOG #3230, #3533 item 8). Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
@@ -4375,11 +4428,63 @@ def Sftp(
     )
 
 
+def _protocol_for_tls(flag: Any) -> str:
+    """``"ftps"`` or ``"ftp"`` for an ``Ftp`` ``env()`` ``tls`` value read strictly. A ``None`` is
+    FTPS, not the literal's default of off: before vault BACKLOG #3234 every ``env()`` ``tls`` meant
+    FTPS, and a ref that resolves to ``None`` must not turn TLS off. Only a false spelling does."""
+    return "ftps" if _read_bool_setting(flag, True) else "ftp"
+
+
+@dataclass(frozen=True)
+class _FtpTlsProtocol:
+    """The cast of the derived ``protocol`` reference :func:`_ftp_protocol` builds: the author's own
+    cast, then the strict boolean read, then the protocol.
+
+    A frozen dataclass rather than a closure, so two loads of one config build EQUAL specs. The
+    reload compares the prior spec with the new one to decide whether a connection changed, and a
+    fresh closure per load would read every ``Ftp(tls=env(...))`` as changed on every reload."""
+
+    inner: Callable[[Any], Any] | None
+
+    #: What a refusal and EnvRef's repr print: "value is not a valid bool for tls".
+    __name__ = "bool for tls"
+
+    def __call__(self, raw: Any) -> str:
+        return _protocol_for_tls(raw if self.inner is None else self.inner(raw))
+
+
+def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
+    """The ``protocol`` setting ``Ftp(tls=...)`` stores: ``"ftps"`` or ``"ftp"``, or for an
+    ``env()`` reference a derived reference that resolves to one of them (vault BACKLOG #3234).
+
+    The factory turns ``tls`` into ``protocol``, so no ``tls`` key ever reaches
+    :func:`resolve_env_settings` and its strict boolean read. A reference passed through as it was
+    is truthy, so ``"ftps" if tls`` chose FTPS whatever the environment said, and a value of
+    ``false`` could not turn TLS off. The derived reference reads the value with the reference's own
+    cast and then strictly, as a ``bool`` setting is read, so ``false`` reads as plain FTP and an
+    unknown spelling is refused with the value withheld. A ``None``, from ``default=None`` or from
+    the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
+    here, because :func:`resolve_env_settings` never casts a default.
+
+    A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
+    item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""
+    if not isinstance(tls, EnvRef):
+        return "ftps" if tls else "ftp"
+    default = tls.default
+    if default is not _UNSET:
+        # Not through the ref's own cast: that never touches a default.
+        flag = (
+            None if default is None else _strict_bool_default(default, f"Ftp tls env {tls.key!r}")
+        )
+        default = _protocol_for_tls(flag)
+    return EnvRef(key=tls.key, default=default, cast=_FtpTlsProtocol(tls.cast))
+
+
 def Ftp(
     *,
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
-    tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
+    tls: bool | EnvRef = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
     # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
@@ -4415,6 +4520,8 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
+    # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
@@ -4422,7 +4529,7 @@ def Ftp(
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
-            "protocol": "ftps" if tls else "ftp",
+            "protocol": _ftp_protocol(tls),
             "host": host,
             "port": port,
             "tls_allow_expired": tls_allow_expired,
@@ -5397,6 +5504,17 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # EVERY inbound's DIRECTORY settings in the deployment (NAME -> connector type + only the settings
+    # it reads its watch and `.error` directories from, before env() resolution; None for a connector
+    # that declares directories but not their settings), pinned beside the shard identity by
+    # pipeline.sharding (None on an unfiltered graph / single-shard config, where `inbound` IS the
+    # whole config). Read only by the `.processed` archive sweep's guard (BACKLOG #1188): a sibling
+    # shard's watch directory is a fact about the CONFIG, and an archive directory that overlaps it
+    # would otherwise age out that shard's undelivered drops. Never a whole spec: a credential setting
+    # does not travel with it, and every other reader of `inbound` keeps seeing only this shard's.
+    all_inbound_guard_settings: (
+        Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
+    ) = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -5404,9 +5522,13 @@ class Registry:
     source_dir: Path | None = None
     # A digest of the config modules' bytes as this load read them
     # (:func:`config_code_digest`), or
-    # None for a graph built in code or a module that could not be read. A sandbox worker loads the
-    # directory again, and the engine refuses one whose digest differs (vault BACKLOG #2724).
+    # None for a graph built in code or a module that could not be read. The engine refuses a
+    # sandbox worker whose digest differs (vault BACKLOG #2724).
     code_digest: str | None = None
+    # The one read of the directory this graph was loaded from, whose bytes it ran (vault BACKLOG
+    # #2596), or None for a graph built in code. Its fingerprint is the reload's audit digest, and a
+    # sandbox worker is sent it, so a worker runs these bytes and never reads the directory.
+    config_snapshot: ConfigSnapshot | None = field(default=None, repr=False, compare=False)
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -6158,7 +6280,8 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
-    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``check_inbound_revocation`` refusal, or an FTPS poller, the ``RevocationHopGuard`` its
+    constructor runs, BACKLOG #2193), ``outbound`` (the ``RevocationHopGuard``) and
     ``fhir_lookups`` (a lookup's https read and the SMART token hop it signs in to). All three carry
     it as typed fields, like ``cleartext_accepted``, and this reads those fields: a copy in a
     ``FhirLookupSpec``'s
@@ -7050,7 +7173,9 @@ def inbound(
     listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
     ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
     attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
-    Also a ``connections.toml`` key."""
+    On an ``Ftp(tls=True)`` poller, which dials out, the same pair attests the partner SERVER's
+    certificates instead, and crosses the refusal of an off-box poll with no ``[tls].crl_file`` on
+    its context (BACKLOG #2193). Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -7532,49 +7657,42 @@ def handler(
 _CODE_DIGEST_SCHEME: Final = b"mefor-config-code:v1\n"
 
 
-def config_code_digest(directory: Path) -> str | None:
-    """A SHA-256 over every config module a load of ``directory`` may run, ``_`` helpers included:
-    each file's name and the digest of its bytes, in :func:`config_py_files` order (vault BACKLOG
-    #2724).
+def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
+    """A SHA-256 over every config module a load may run, ``_`` helpers included: each file's name
+    and the digest of its bytes, in name order (vault BACKLOG #2724).
 
+    ``source`` is the :class:`~messagefoundry.config.snapshot.ConfigSnapshot` a load ran, so the
+    digest describes the bytes that ran (vault BACKLOG #2596), or a directory, which is read now.
     The loader records it on the graph, and a sandbox worker's load records its own; the engine
     refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
     graph's names, which are compared anyway, and the worker serves the code sets the engine hands
-    it, not its own read. None when a module cannot be read, which is logged.
+    it. None when a module cannot be read, which is logged.
 
     Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
     would give every importer of the loader its comparison and hash operations in the crypto
     inventory (``scripts/security/crypto_inventory_check.py``)."""
-    digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
-    try:
-        for path in config_py_files(directory):
-            if not path.is_file():
-                continue
-            digest.update(path.name.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
-            digest.update(b"\0")
-    except OSError as exc:
+    # Not strict: only the modules are digested, so a code-set table or value file that cannot be
+    # read does not take the digest away.
+    snapshot = (
+        source if isinstance(source, ConfigSnapshot) else read_config_snapshot(source, strict=False)
+    )
+    unread = [rel for rel in snapshot.unreadable if rel == "." or rel.lower().endswith(".py")]
+    if unread:
+        # A module it could not read is not described by the rest.
         _logger.warning(
             "config module digest unavailable for %s, so a sandbox worker's config code is not "
-            "compared with this load's: %s",
-            scrub_log_argument(str(directory)),
-            scrub_log_argument(str(exc)),
+            "compared with this load's: could not read %s",
+            scrub_log_argument(str(snapshot.directory)),
+            scrub_log_argument(", ".join(unread)),
         )
         return None
+    digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
+    for name in snapshot.modules:
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(snapshot.files[name]).digest())
+        digest.update(b"\0")
     return digest.hexdigest()
-
-
-def config_py_files(directory: Path) -> list[Path]:
-    """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
-
-    ``Path.glob("*.py")`` matches ``.IB_OLD.py`` (an editor or manual backup) and ``._IB_ACME_ADT.py``
-    (a macOS AppleDouble file left by an SMB copy) too, because pathlib has no hidden-file rule. Neither
-    is config, so the loader, both config-source trust checks and the fingerprint skip a dot-named
-    module the same way (vault BACKLOG #2781). The ``_``-helper skip is the loader's own rule on top of
-    this, not part of it: a helper is still run when a sibling imports it, so the trust check and the
-    fingerprint keep it."""
-    return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
 
 
 #: How every config-source refusal of a load begins.
@@ -7593,10 +7711,12 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     with each table the loader reads from it. Both config-source trust checks walk this list (vault
     BACKLOG #2626 step 3, #2596 step 4).
 
-    **The cache folder is the reason for the list.** The loader uses Python's ordinary source loader,
-    which runs a matching ``.pyc`` in place of the ``.py`` and never compares the two. The checks
-    used to read the ``.py`` alone, so a cache file nobody vetted could run under a source that
-    passed (vault BACKLOG #2596).
+    **The cache folder is on the list although no load reads it.** The loader compiles each module
+    from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
+    its ``.py``. It once did: Python's ordinary source loader prefers a matching cache file and never
+    compares the two, and the checks then read the ``.py`` alone (vault BACKLOG #2596). The folder
+    stays vetted because a writer of it is a writer inside the config directory, and because tools
+    other than the loader (``python -m``, an editor's run button) still read it.
 
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
@@ -7615,12 +7735,10 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     codesets = directory / CODESETS_DIR_NAME
     if codesets.is_dir():
         paths.append(codesets)
-        # The loader's own rule (code_sets.load_code_sets): a file whose suffix, in lower case, is
-        # .csv or .toml. Matched the same way here, so a table spelled .CSV is vetted on POSIX too.
+        # The loader's own rule (code_sets.is_code_set_name), so a table spelled .CSV is vetted on
+        # POSIX too.
         paths.extend(
-            p
-            for p in sorted(codesets.iterdir())
-            if p.is_file() and p.suffix.lower() in (".csv", ".toml")
+            p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
         )
     return paths
 
@@ -7761,6 +7879,51 @@ def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str
     return found
 
 
+class _SnapshotLoader(importlib.abc.InspectLoader):
+    """The import loader for one config module or helper: it serves the bytes the load's
+    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` holds for ``path``, once.
+
+    It takes the place of the ``SourceFileLoader`` that ``spec_from_file_location`` gave a config
+    module before (vault BACKLOG #2596). The module still executes through the import system's own
+    ``exec_module``; only where the bytes come from changed. It has no bytecode methods, so it never
+    reads or writes a ``__pycache__`` file, and it reads nothing from the directory: a sandbox
+    worker that was sent the snapshot runs the same bytes.
+
+    **One code object, for the load's own run.** The first :meth:`get_code` drops the snapshot, so
+    nothing can run the module a second time through its spec (``runpy.run_module`` gets no code
+    and refuses, as it did when a config module had no loader), and a module kept alive after a
+    reload holds no snapshot bytes.
+
+    No source and no ``get_data``. :mod:`inspect` and a traceback read the file on disk, which may
+    hold other bytes than the ones that ran, as before this loader. ``pkgutil.get_data`` and
+    :mod:`importlib.resources` find no resources beside a config module, since the snapshot holds
+    only the files a load reads."""
+
+    def __init__(self, files: Mapping[str, bytes], path: Path) -> None:
+        self._files: Mapping[str, bytes] | None = files
+        self._path = path
+
+    def is_package(self, fullname: str) -> bool:
+        return False
+
+    def get_source(self, fullname: str) -> None:
+        # No source: linecache would cache what this returned, for a file missing at that moment,
+        # with no time to check it against, so a later load of the same path would show these lines.
+        # linecache and inspect read the file, as they did when a config module had no loader.
+        return None
+
+    def get_code(self, fullname: str) -> CodeType | None:
+        files, self._files = self._files, None
+        if files is None:
+            return None  # already run: exec_module and runpy refuse with an ImportError
+        # compile() here, not InspectLoader.source_to_code, so a compile failure's innermost frame is
+        # this package's, as _exec_module expects; the lookup is here too, inside its try. Compiled
+        # from the bytes, so a PEP 263 coding line and a BOM are read from them, as the source loader
+        # reads them. The file name is the path an author edits, which a traceback and a load
+        # diagnostic name.
+        return compile(files[self._path.name], str(self._path), "exec", dont_inherit=True)
+
+
 class _HelperImporter:
     """Resolve a config module's ``import _helpers`` to a sibling ``_helpers.py``, for one load only.
 
@@ -7789,10 +7952,15 @@ class _HelperImporter:
     builtins are a copy taken when the load starts, so a name added to :mod:`builtins` later is not
     seen by config code; a live view would cost a Python-level lookup on every builtin name a
     Handler reads, on the per-message path. :func:`_assert_safe_config_source` vets every ``*.py``
-    (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+    (including ``_*``), so a helper sits inside the same trust boundary as its importers.
 
-    def __init__(self, directory: Path) -> None:
-        self._dir = directory
+    Every helper is compiled from the load's :class:`~messagefoundry.config.snapshot.ConfigSnapshot`,
+    never read from the directory, so a helper runs the bytes the load hashed, and a ``__pycache__``
+    file is never consulted (vault BACKLOG #2596)."""
+
+    def __init__(self, snapshot: ConfigSnapshot) -> None:
+        self._snapshot = snapshot
+        self._dir = snapshot.directory
         self._modules: dict[str, ModuleType] = {}
         self._open = True
         # Helper files whose body imports are not yet loaded, drained by preload().
@@ -7805,9 +7973,10 @@ class _HelperImporter:
         self._failed: dict[str, tuple[ImportError, str]] = {}
         # The helper stems present when the load starts: the only names this importer serves, so an
         # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
-        self._stems = frozenset(
-            p.stem for p in config_py_files(directory) if _is_helper_name(p.stem)
-        )
+        self._files = {
+            Path(name).stem: name for name in snapshot.modules if _is_helper_name(Path(name).stem)
+        }
+        self._stems = frozenset(self._files)
         self.builtins: dict[str, Any] = {**vars(builtins), "__import__": self._import}
 
     def close(self) -> None:
@@ -7887,21 +8056,16 @@ class _HelperImporter:
                 ) from failed
         return builtins.__import__(name, globals, locals, fromlist, level)
 
-    def _load(self, name: str) -> ModuleType | None:
-        path = self._dir / f"{name}.py"
-        if not path.is_file():
-            return None  # gone since the load started: resolved the normal way
+    def _load(self, name: str) -> ModuleType:
+        path = self._dir / self._files[name]
         _refuse_shadowing_helper(name, path)
         mod_name = _config_module_name(path)
-        spec = importlib.util.spec_from_file_location(mod_name, path)
-        if spec is None or spec.loader is None:
-            raise WiringError(f"cannot load config helper: {path}")
-        module = self.new_module(spec)
+        module = self.new_module(mod_name, path)
         # Cached before it runs, as Python's own import does, so a helper cycle sees the partial module.
         self._modules[name] = module
         self.register(mod_name, module)
         try:
-            spec.loader.exec_module(module)
+            self.run(module, path)
         except BaseException:
             del self._modules[name]
             self.unregister(mod_name, module)
@@ -7909,11 +8073,43 @@ class _HelperImporter:
         self._pending.append(path)
         return module
 
-    def new_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
-        """A module for ``spec`` whose own ``import`` statements resolve helpers through this load."""
+    def new_module(self, mod_name: str, path: Path) -> ModuleType:
+        """A module named ``mod_name`` for the config file at ``path``, whose own ``import``
+        statements resolve helpers through this load.
+
+        Its spec names ``path`` as its origin, so ``__file__``, a traceback and a diagnostic name
+        the file an author edits, and its loader is a :class:`_SnapshotLoader` over this load's
+        snapshot, so it never finds a cache file. ``importlib.reload`` still refuses it: no finder
+        on ``sys.meta_path`` knows its mangled name, so nothing runs it again from disk."""
+        # Built by hand with has_location, as spec_from_file_location builds one, so the module
+        # gets a __file__; spec_from_loader would leave it without one.
+        loader = _SnapshotLoader(self._snapshot.files, path)
+        spec = importlib.machinery.ModuleSpec(mod_name, loader, origin=str(path))
+        spec.has_location = True  # sets __file__ from the origin
         module = importlib.util.module_from_spec(spec)
+        module.__dict__["__cached__"] = None  # no cache file is ever read for it
         module.__dict__["__builtins__"] = self.builtins
         return module
+
+    def run(self, module: ModuleType, path: Path) -> None:
+        """Run ``module``'s body the way ``import`` runs one, by its spec's loader: the
+        :class:`_SnapshotLoader` :meth:`new_module` gave it, over the snapshot's bytes for ``path``.
+
+        Config modules are code by design (CLAUDE.md section 1); the directory's trust check (ADR
+        0036) is what holds them, and docs/DANGEROUS-FUNCTIONALITY.md section 2 names this site."""
+        spec = module.__spec__
+        if spec is None or not isinstance(spec.loader, _SnapshotLoader):  # pragma: no cover
+            raise WiringError(f"error loading config file {path.name}: not a snapshot module")
+        spec.loader.exec_module(module)
+
+    def source_of(self, filename: str) -> bytes | None:
+        """The snapshot bytes a module compiled under ``filename`` ran, or ``None`` for a file
+        this load did not compile. A diagnostic reads its line from these rather than from the
+        directory, which may hold other bytes by now and which a sandbox worker never reads."""
+        path = Path(filename)
+        if path.parent != self._dir:
+            return None
+        return self._snapshot.files.get(path.name)
 
     def preload(self, path: Path) -> None:
         """Load every helper a function body in ``path`` imports -- and, in turn, every helper those
@@ -7926,10 +8122,8 @@ class _HelperImporter:
     def _preload_one(self, current: Path) -> None:
         if not self._stems:
             return
-        try:
-            source = current.read_bytes()
-        except OSError:
-            return  # it already ran; the file going away now is not this pass's to report
+        # The bytes that ran, from the snapshot: the directory is never read again.
+        source = self._snapshot.files[current.name]
         for name, caught in _body_helper_imports(source, self._stems):
             if name in self._modules:
                 continue
@@ -7960,7 +8154,9 @@ class _HelperImporter:
                 # load. Names only, never the exception text (CLAUDE.md section 9).
                 self._failed[name] = (
                     _textless_import_error(exc),
-                    _failure_detail(self._dir.resolve(), f"{name}.py", exc),
+                    _failure_detail(
+                        self._dir.resolve(), self._files[name], exc, source_of=self.source_of
+                    ),
                 )
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
@@ -7976,16 +8172,16 @@ _load_lock = threading.Lock()
 
 
 @contextmanager
-def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
+def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperImporter]:
     """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
     as the active set** (so a module-top-level ``code_set(...)`` resolves), and yield the load's
-    :class:`_HelperImporter`, closed on exit so it serves only what this load imported. A load that
-    raises inside this block gets back, in ``sys.modules``, whatever each of its names held before, so
-    a live graph loaded earlier from the same files keeps its modules. (A failure after the block --
-    graph validation, the connections.toml merge -- leaves this load's entries, as it leaves its config
-    modules'.)"""
+    :class:`_HelperImporter` over ``snapshot``, closed on exit so it serves only what this load
+    imported. A load that raises inside this block gets back, in ``sys.modules``, whatever each of
+    its names held before, so a live graph loaded earlier from the same files keeps its modules. (A
+    failure after the block -- graph validation, the connections.toml merge -- leaves this load's
+    entries, as it leaves its config modules'.)"""
     global _active
-    helpers = _HelperImporter(directory)
+    helpers = _HelperImporter(snapshot)
     with _load_lock:
         _active = registry
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
@@ -8001,7 +8197,50 @@ def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
             helpers.close()
 
 
-def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
+def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> ConfigSnapshot:
+    """Read the config directory a load runs, after its trust check: the one read of it.
+
+    Refuses a missing directory (:class:`~messagefoundry.config.fingerprint.ConfigDirMissing`), a
+    source :func:`_assert_safe_config_source` refuses, and a file the load needs but cannot read
+    (``WiringError``). A file only the fingerprint covers (``environments/*.toml``) that cannot be
+    read is left out and named in :attr:`ConfigSnapshot.unreadable`, as the observational
+    fingerprint names it. With ``strict``, any file or folder it cannot read raises its
+    ``OSError`` instead, so the snapshot's digest covers every file the fingerprint names: the
+    digest a dual-control release checks. Blocking."""
+    directory = Path(directory)
+    # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
+    # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
+    if not directory.is_dir():
+        # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
+        # moved away after the reload's own check still answers as missing (BACKLOG #3157).
+        from messagefoundry.config.snapshot import ConfigDirMissing
+
+        raise ConfigDirMissing(f"config directory not found: {directory}")
+    _assert_safe_config_source(directory)
+    snapshot = read_config_snapshot(directory, strict=strict)
+    if not strict and not snapshot.files and not directory.is_dir():
+        # A lax read reads a vanished directory as an empty one; a load must not run that as an
+        # empty graph, so it still answers as missing (BACKLOG #3157).
+        from messagefoundry.config.snapshot import ConfigDirMissing
+
+        raise ConfigDirMissing(f"config directory not found: {directory}")
+    _require_loadable(snapshot)
+    return snapshot
+
+
+def _require_loadable(snapshot: ConfigSnapshot) -> None:
+    """Refuse a snapshot missing a file a load would read: it cannot run bytes it does not have."""
+    missing = snapshot.unreadable_loaded
+    if missing:
+        raise WiringError(
+            f"refusing to load config from {snapshot.directory}: could not read "
+            f"{', '.join(missing)}; see the engine log and docs/SERVICE.md for required permissions"
+        )
+
+
+def load_config(
+    directory: str | Path, *, allow_empty: bool = False, snapshot: ConfigSnapshot | None = None
+) -> Registry:
     """Load every ``*.py`` config module in ``directory`` (sorted; ``_*`` skipped) into a Registry.
 
     Config modules are **executed** in-process with the engine's full privilege, so the source
@@ -8009,70 +8248,81 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
     group/world-writable directory before any code runs. Blocking: an async caller (engine reload)
     should run this via ``asyncio.to_thread`` so heavy user-config imports don't stall listeners.
 
+    **One read, then the bytes it read** (vault BACKLOG #2596). The directory is read once, into a
+    :class:`~messagefoundry.config.snapshot.ConfigSnapshot` (:func:`read_trusted_snapshot`), and
+    everything the load runs or parses comes from it: each module and helper is compiled from its
+    bytes by the loader itself, so a ``__pycache__`` file is never consulted, and the code sets and
+    ``connections.toml`` are parsed from it. The graph carries the snapshot
+    (:attr:`Registry.config_snapshot`), so its fingerprint and a sandbox worker use the same bytes.
+    ``snapshot`` is one the caller already read with :func:`read_trusted_snapshot`, such as the one a
+    dual-control release checked against its approval; the directory is then not read again.
+
     ``allow_empty`` is passed straight to :meth:`Registry.validate` and suppresses the empty-graph
     refusal only. It exists for ``messagefoundry check --allow-empty-config`` (BACKLOG #1648) and
     is deliberately NOT reachable from ``serve``: a running engine must never start on a graph that
     would receive and send nothing."""
     directory = Path(directory)
-    # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
-    # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
-    if not directory.is_dir():
-        # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
-        # moved away after the reload's own check still answers as missing (BACKLOG #3157).
-        from messagefoundry.config.fingerprint import ConfigDirMissing
+    if snapshot is None:
+        snapshot = read_trusted_snapshot(directory)
+    # Resolved, so the graph names the directory it came from even if a link in the path moves.
+    return load_snapshot(snapshot, allow_empty=allow_empty, source_dir=directory.resolve())
 
-        raise ConfigDirMissing(f"config directory not found: {directory}")
-    _assert_safe_config_source(directory)
-    # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
-    # The digest is read just before the modules run (vault BACKLOG #2724).
-    registry = Registry(source_dir=directory.resolve(), code_digest=config_code_digest(directory))
+
+def load_snapshot(
+    snapshot: ConfigSnapshot,
+    *,
+    allow_empty: bool = False,
+    source_dir: Path | None = None,
+    code_sets: Mapping[str, CodeSet] | None = None,
+) -> Registry:
+    """Load the graph ``snapshot`` holds, reading nothing from disk.
+
+    :func:`load_config` once the directory is read and checked. A ``[sandbox].mode=subprocess``
+    worker calls it with the snapshot its engine sent, so a worker, a respawned one included, runs
+    the bytes the engine loaded and never reads the directory (vault BACKLOG #2596). The trust
+    check belongs to whoever read the snapshot; this function runs what it is given.
+    ``source_dir`` is recorded as :attr:`Registry.source_dir`, the snapshot's directory when
+    omitted. ``code_sets``, when given, are the tables the load publishes in place of parsing the
+    snapshot's ``codesets/``: a worker is sent the engine's parsed tables and not their files, so
+    one boot frame does not carry each table twice."""
+    _require_loadable(snapshot)
+    directory = snapshot.directory
+    registry = Registry(
+        source_dir=source_dir if source_dir is not None else directory,
+        code_digest=config_code_digest(snapshot),
+        config_snapshot=snapshot,
+    )
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
-    try:
-        registry.code_sets = load_code_sets(directory / CODESETS_DIR_NAME)
-    except CodeSetError as exc:
-        raise WiringError(str(exc)) from exc
-    with _loading(directory, registry) as helpers:
-        for path in config_py_files(directory):
-            if not path.name.startswith("_"):
-                _exec_module(path, helpers)
-        if registry.code_digest is not None:
-            # Inside the block, so a refusal discards this load's modules like any failed load.
-            _require_unchanged_code(directory, registry.code_digest)
+    if code_sets is not None:
+        registry.code_sets = dict(code_sets)
+    else:
+        try:
+            registry.code_sets = code_sets_from_files(
+                snapshot.code_set_files, directory / CODESETS_DIR_NAME
+            )
+        except CodeSetError as exc:
+            raise WiringError(str(exc)) from exc
+    with _loading(snapshot, registry) as helpers:
+        for name in snapshot.modules:
+            if not name.startswith("_"):
+                _exec_module(directory / name, helpers)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
         connections_file_path,
-        load_connections_file,
+        load_connections_data,
     )
 
-    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
-    # live one (vault BACKLOG #2782).
-    conn_file = connections_file_path(directory)
-    if conn_file.is_file():
-        load_connections_file(conn_file, registry)
+    if snapshot.connections is not None:
+        # Named as the live file, or the candidate a `connections_edit` write is validating before
+        # it replaces the live one (vault BACKLOG #2782); the bytes are the snapshot's.
+        load_connections_data(snapshot.connections, connections_file_path(directory), registry)
     registry.validate(allow_empty=allow_empty)
     return registry
-
-
-def _require_unchanged_code(directory: Path, before: str) -> None:
-    """Refuse a load whose config modules changed on disk while it ran (vault BACKLOG #2724).
-
-    The digest was read before the modules ran. A module rewritten in between ran bytes the digest
-    does not describe, and a sandbox worker would then pass the comparison with edited code."""
-    after = config_code_digest(directory)
-    if after is None:
-        raise WiringError(
-            f"config modules in {directory} could not be read again after the load, so what ran "
-            "cannot be shown to match what was read; load again"
-        )
-    if after != before:  # both are public digests of public bytes; nothing to time
-        raise WiringError(
-            f"config modules in {directory} changed on disk while they were loading; load again"
-        )
 
 
 # Group-write (0o020) | world-write (0o002): a writable bit for anyone but the owner.
@@ -8917,7 +9167,7 @@ def _file_and_folder(files: Iterable[Path]) -> list[Path]:
 
 
 def assert_trusted_start_paths(
-    files: Iterable[Path], *, lead: str = "refusing to start from"
+    files: Iterable[Path], *, lead: str = "refusing to start from", folders: Iterable[Path] = ()
 ) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
@@ -8933,10 +9183,16 @@ def assert_trusted_start_paths(
     in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
     step 3).
 
+    Each of ``folders`` that exists is checked too, whether or not a file in it does: a reload that
+    applies value bytes read earlier needs the folder vetted even when the file has gone since
+    (vault BACKLOG #2596).
+
     **Not checked**, at least: the folders above each file's own folder, and a file named in the
     settings that the start reads later, such as a key, certificate or CRL file. Those have their
     own checks where they are read, or none."""
-    _check_trusted_paths(_file_and_folder(files), lead=lead, refuse=_refuse_unsafe_config_source)
+    paths = _file_and_folder(files)
+    paths += [f.absolute() for f in folders if f.is_dir() and f.absolute() not in paths]
+    _check_trusted_paths(paths, lead=lead, refuse=_refuse_unsafe_config_source)
 
 
 def install_trust_paths() -> list[Path]:
@@ -9001,7 +9257,9 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
 
-def _module_failure(path: Path, exc: BaseException) -> str:
+def _module_failure(
+    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None] | None = None
+) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
     file and line it was raised from, and for an import or name error the identifier, but never the
     exception's text (vault BACKLOG #3249).
@@ -9012,11 +9270,18 @@ def _module_failure(path: Path, exc: BaseException) -> str:
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary."""
     return (
         f"error loading config module {path.name}: "
-        f"{_failure_detail(path.parent.resolve(), path.name, exc)} ({_WITHHELD})"
+        f"{_failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)} "
+        f"({_WITHHELD})"
     )
 
 
-def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
+def _failure_detail(
+    config_dir: Path,
+    own_file: str,
+    exc: BaseException,
+    *,
+    source_of: Callable[[str], bytes | None] | None = None,
+) -> str:
     """``exc``'s TYPE, the config-directory file and line it was raised from (the file only when it
     is not ``own_file``), and for an import or name error each identifier the source line spells.
 
@@ -9046,7 +9311,8 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
     detail += f" at line {line}"
     if isinstance(exc, _NAMED_EXCEPTIONS):
         # `from x import y` puts the module in `name` and the symbol in `name_from`.
-        names_on_line = _dotted_names_on_line(source_file, line)
+        source = source_of(source_file) if source_of is not None else None
+        names_on_line = _dotted_names_on_line(source_file, line, source)
         idents = [
             ident
             for ident in map(_source_name, (exc.name, getattr(exc, "name_from", None)))
@@ -9057,32 +9323,45 @@ def _failure_detail(config_dir: Path, own_file: str, exc: BaseException) -> str:
     return detail
 
 
-def _dotted_names_on_line(source_file: str, line: int) -> list[str]:
+def _dotted_names_on_line(source_file: str, line: int, source: bytes | None = None) -> list[str]:
     """Every dotted name (``a``, ``a.b.c``) written in code in the statement that starts on, or spans,
     ``line`` of ``source_file`` -- a parenthesized import over several lines is one statement --
     never a string literal's or a comment's content.
 
-    The file is read afresh, never through :mod:`linecache`: that cache holds whatever version of the
-    file was read first, so after an edit and a reload a stale line could vouch for a run-time value.
-    It is tokenized from the top, so a line inside a multi-line string is read as the string it is.
-    ``[]`` -- nothing vouched for -- when the file cannot be read or tokenized."""
-    runs: list[list[str]] = [[]]
+    ``source`` is the bytes that ran, from the load's snapshot, so the line read is the line that
+    raised even when the file has been edited since, and a sandbox worker reads no file (vault
+    BACKLOG #2596). Without it the file is read afresh, never through :mod:`linecache`: that cache
+    holds whatever version of the file was read first, so after an edit and a reload a stale line
+    could vouch for a run-time value. It is tokenized from the top, so a line inside a multi-line
+    string is read as the string it is. ``[]`` -- nothing vouched for -- when the source cannot be
+    read or tokenized."""
     try:
-        with tokenize.open(source_file) as f:
-            for tok in tokenize.generate_tokens(f.readline):
-                if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
-                    # A logical line ended: keep it only if it spans `line`, else start afresh.
-                    if tok.start[0] >= line:
-                        break
-                    runs = [[]]
-                elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
-                    runs[-1].append(tok.string)
-                elif runs[-1]:
-                    runs.append([])
+        if source is not None:
+            # tokenize.tokenize reads a PEP 263 coding line and a BOM from the bytes, as compile did.
+            runs = _name_runs(tokenize.tokenize(io.BytesIO(source).readline), line)
+        else:
+            with tokenize.open(source_file) as f:
+                runs = _name_runs(tokenize.generate_tokens(f.readline), line)
     except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError):
         return []
     # "a b" is two runs of names, never one name, so a run is split where two names abut.
     return [name for run in runs for name in " ".join(run).replace(" . ", ".").split()]
+
+
+def _name_runs(tokens: Iterable[tokenize.TokenInfo], line: int) -> list[list[str]]:
+    """The runs of names and dots in the logical line of ``tokens`` that spans ``line``."""
+    runs: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            # A logical line ended: keep it only if it spans `line`, else start afresh.
+            if tok.start[0] >= line:
+                break
+            runs = [[]]
+        elif tok.type == tokenize.NAME or (tok.type == tokenize.OP and tok.string == "."):
+            runs[-1].append(tok.string)
+        elif runs[-1]:
+            runs.append([])
+    return runs
 
 
 def _spelled(ident: str, names: list[str]) -> bool:
@@ -9133,22 +9412,25 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     # Register the module in sys.modules under its path-derived name so intra-config imports and
     # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
     mod_name = _config_module_name(path)
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise WiringError(f"cannot load config module: {path}")
-    module = helpers.new_module(spec)
+    module = helpers.new_module(mod_name, path)
     helpers.register(mod_name, module)
     withheld: WiringError | None = None
     cause: ImportError | None = None
     try:
-        spec.loader.exec_module(module)
+        helpers.run(module, path)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
         helpers.preload(path)
     except Exception as exc:
         helpers.unregister(mod_name, module)
         # An import or name error is judged by its identifier, not its frame: a failed import ends
-        # in this package's own helper finder whoever wrote the import.
-        if _raised_by_the_engine(exc) and not isinstance(exc, _NAMED_EXCEPTIONS):
+        # in this package's own helper finder whoever wrote the import. A SyntaxError is the
+        # author's source failing to compile; the loader compiles it, so its innermost frame is
+        # this package's, and it is judged as the author's failure it is.
+        if (
+            _raised_by_the_engine(exc)
+            and not isinstance(exc, _NAMED_EXCEPTIONS)
+            and not isinstance(exc, SyntaxError)
+        ):
             # The engine's own wording -- a factory or registry refusal naming a connection or a
             # setting -- which is the diagnostic an author needs, so it keeps its text, as before.
             # That relies on engine raise sites not quoting a value. At least a few wrap another
@@ -9158,7 +9440,7 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
                 raise
             raise WiringError(f"error loading config module {path.name}: {exc}") from exc
         try:
-            withheld = WiringError(_module_failure(path, exc))
+            withheld = WiringError(_module_failure(path, exc, helpers.source_of))
         except Exception:  # noqa: BLE001 - a fault building the detail must not escape with `exc`
             # chained as its context; the type alone is still a withheld diagnostic.
             withheld = WiringError(
@@ -9197,23 +9479,33 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         _assert_safe_config_source(directory)
     except WiringError as exc:
         return [Diagnostic(message=str(exc), file=str(directory))]
+    # One read, as load_config's, so the modules, tables and connections it reports on are one
+    # set of bytes (vault BACKLOG #2596). A file it needs but cannot read is a diagnostic.
+    snapshot = read_config_snapshot(directory, strict=False)
     registry = Registry()
-    diagnostics: list[Diagnostic] = []
+    diagnostics: list[Diagnostic] = [
+        Diagnostic(message=f"could not read {rel}", file=str(directory / rel))
+        for rel in snapshot.unreadable_loaded
+    ]
     # Tracked separately from `diagnostics` on purpose — see the empty-graph note at the end of this
     # function. Only a source that could have DECLARED a connection counts: a module or
     # connections.toml. A bad code-set table is a diagnostic that explains nothing about emptiness.
-    declaring_source_failed = False
+    declaring_source_failed = any(
+        rel != CODESETS_DIR_NAME and not rel.startswith(f"{CODESETS_DIR_NAME}/")
+        for rel in snapshot.unreadable_loaded
+    )
     # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
     # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
     codesets_dir = directory / CODESETS_DIR_NAME
     try:
-        registry.code_sets = load_code_sets(codesets_dir)
+        registry.code_sets = code_sets_from_files(snapshot.code_set_files, codesets_dir)
     except CodeSetError as exc:
         diagnostics.append(Diagnostic(message=str(exc), file=str(codesets_dir)))
-    with _loading(directory, registry) as helpers:
-        for path in config_py_files(directory):
-            if path.name.startswith("_"):
+    with _loading(snapshot, registry) as helpers:
+        for name in snapshot.modules:
+            if name.startswith("_"):
                 continue
+            path = snapshot.directory / name
             try:
                 _exec_module(path, helpers)
             except WiringError as exc:
@@ -9229,15 +9521,15 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
         connections_file_path,
-        load_connections_file,
+        load_connections_data,
     )
 
     # The candidate a `connections_edit` write is validating, when this runs inside one (vault
     # BACKLOG #2782), as `load_config` does.
     conn_file = connections_file_path(directory)
-    if conn_file.is_file():
+    if snapshot.connections is not None:
         try:
-            load_connections_file(conn_file, registry)
+            load_connections_data(snapshot.connections, conn_file, registry)
         except WiringError as exc:
             # Scrubbed like the arm below, and for the SAME reason: a WiringError out of the TOML
             # loader is a project-authored TEMPLATE wrapped around somebody else's exception text.

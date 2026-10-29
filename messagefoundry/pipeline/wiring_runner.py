@@ -37,13 +37,17 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.trust_anchors import (
+    AnchorSettingRefused,
     AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
+    inbound_lane_reads_ca,
+    lane_ca_setting,
     refused_connection_anchor,
 )
 from messagefoundry.config.db_lookup import DbLookupError
@@ -187,11 +191,16 @@ from messagefoundry.pipeline.sandbox import (
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
-from messagefoundry.pipeline.sharding import owner_shard_of_destination
+from messagefoundry.pipeline.sharding import inbound_guard_settings, owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
+    _REPEND_RETRY_CAP_SECONDS,
+    HoldResult,
     LaneItemResult,
     LaneResultKind,
+    RependFence,
     StageDispatcher,
+    _capped_backoff,
+    wait_to_retry,
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
@@ -222,9 +231,13 @@ from messagefoundry.transports.base import (
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ProcessedArchive,
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
+    guard_dir_settings,
+    guarded_destination_dirs,
+    guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
@@ -811,8 +824,8 @@ def _log_inflight_strand(stage: str, name: str, count: int, age: float) -> None:
     in flight rather than pending, so this line does. Lane name and counts only, never content."""
     log.warning(
         "%d row(s) held in flight on %s lane %r, oldest claimed %.0fs ago with no handoff; "
-        "a stranded row stays in flight until a store recovery path re-pends it, at least a "
-        "restart",
+        "a worker that could not re-pend its row holds the lane and retries, and a row no live "
+        "worker holds stays in flight until a store recovery path re-pends it, at least a restart",
         count,
         stage,
         name,
@@ -3049,6 +3062,60 @@ class RegistryRunner:
         """The inbounds whose listener is bound now."""
         return frozenset(self._sources)
 
+    def processed_archives(self) -> tuple[ProcessedArchive, ...]:
+        """The bound inbounds whose source archives what it read, such as the File source's
+        ``.processed`` directory, for the retention pass's age sweep (BACKLOG #1188). Only bound
+        ones: a stopped or undeployed inbound has no source object to resolve its directories."""
+        return tuple(s for s in self._sources.values() if isinstance(s, ProcessedArchive))
+
+    def archive_guard_dirs(self) -> tuple[Path, ...] | None:
+        """The directories the ``.processed`` age sweep must never reach (BACKLOG #1188): the watch
+        and ``.error`` directories of EVERY inbound in the deployment, and the target directory of
+        every outbound, bound or not, deployed or not. Read from the configuration rather than the
+        running connections, so a stopped, failed or DR-parked one stays protected. Under
+        ``serve --shard`` this shard's ``inbound`` map holds only its own inbounds, so the inbounds
+        come from :func:`inbound_guard_settings`, the whole config's; outbounds are never
+        filtered. Only the settings a connector declares its directories from are resolved
+        (:func:`guard_dir_settings`). None when one of those cannot be resolved (a missing env()
+        value, or a connector that declares directories but not their settings): the caller then
+        deletes nothing, because a guard that silently drops a directory fails open."""
+        connections = [
+            (False, name, kind, declared, inbound_record_name(name))
+            for name, (kind, declared) in inbound_guard_settings(self.registry).items()
+        ] + [
+            (
+                True,
+                name,
+                oc.spec.type,
+                guard_dir_settings(oc.spec.type, oc.spec.settings, outbound=True),
+                name,
+            )
+            for name, oc in self.registry.outbound.items()
+        ]
+        dirs: list[Path] = []
+        for outbound, name, kind, declared, record in connections:
+            try:
+                if declared is None:
+                    raise TypeError("directories declared without the settings they come from")
+                if not declared:
+                    continue  # a fault in a connection with no directories cannot hide one
+                settings = resolve_env_settings(declared, self._env_values, connection=record)
+                dirs.extend(
+                    guarded_destination_dirs(Destination(type=kind, name=name, settings=settings))
+                    if outbound
+                    else guarded_source_dirs(Source(type=kind, name=name, settings=settings))
+                )
+            except (WiringError, ValueError, TypeError, KeyError) as exc:
+                log.warning(
+                    "%s connection %r: its directories could not be resolved for the "
+                    "[retention].processed_archive_days guard (%s)",
+                    "outbound" if outbound else "inbound",
+                    name,
+                    type(exc).__name__,
+                )
+                return None
+        return tuple(dirs)
+
     async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the
         reload lock, for ``POST /dr/release`` (vault BACKLOG #3140). The DR threshold is kept, so
@@ -3204,7 +3271,7 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         try:
             if ic is not None:
-                if ic.spec.type is ConnectorType.REMOTEFILE and ic.spec.settings.get("tls_ca_file"):
+                if _inbound_lane_reads_ca(ic):
                     cfg = _source_config(
                         ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
                     )
@@ -3629,7 +3696,8 @@ class RegistryRunner:
                 # Broad on purpose, as a start's lane isolation is: this check must not stop a
                 # start. A refusal names the CA's path and digest, so it goes to the server log
                 # only, as in _check_lane_anchor. The status and the alert carry the fixed line.
-                refused = isinstance(exc, (TrustAnchorError, ValueError))
+                # No lane is marked here, so a reload reads a changed setting or file.
+                refused = _lane_anchor_fault(exc) != "unchecked"
                 log.warning(
                     "%s connection %r: trust anchor %s on a passive DR standby: %s",
                     direction,
@@ -3638,25 +3706,8 @@ class RegistryRunner:
                     exc,
                     exc_info=not refused,
                 )
-                if isinstance(exc, ValueError):
-                    # No lane is marked here, so a reload reads the changed setting.
-                    what = _ANCHOR_SETTING_REFUSED
-                    advice = "Fix the setting, then reload; the server log says why"
-                elif refused:
-                    what = "tls_ca_file was refused"
-                    advice = (
-                        "Fix the file, then reload; the server log and the auth.trust_anchor "
-                        "audit rows say why"
-                    )
-                else:
-                    # The check did not run, so nothing says the file is at fault.
-                    what = "tls_ca_file could not be checked"
-                    advice = "The server log says why; reload once the cause is fixed"
-                fixed = TrustAnchorError(
-                    f"{direction} connection '{name}': its {what} on this passive DR standby, "
-                    f"and POST /dr/activate needs it. {advice}"
-                )
-                self._record_failed(name, fixed, kind=direction)
+                line = _lane_anchor_line(direction, name, settings, exc, passive=True)
+                self._record_failed(name, line, kind=direction)
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -3738,11 +3789,10 @@ class RegistryRunner:
         A refusal that fails a lane is raised as a fixed line naming the connection. The refusal
         text names the CA's path, the folders above it and its SHA-256, so it goes to the server
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
-        status and the ``connection_stopped`` alert carry the fixed line. A ``ValueError`` is a
-        refused setting, not a refused file, and its line says so (vault BACKLOG #3224). The
-        reverse does not hold: a pin that is not a SHA-256 raises ``TrustAnchorError`` and still
-        takes the file's line. The exception type cannot tell those two apart; the check that
-        raises would have to say which it is."""
+        status and the ``connection_stopped`` alert carry the fixed line (:func:`_lane_anchor_line`).
+        An :class:`AnchorSettingRefused` is a refused setting, not a refused file, and its line
+        says so (vault BACKLOG #3224, #3498). That includes an ``env()`` pin that resolves but
+        does not parse: the check refuses it before it writes any audit row."""
         if self._lane_anchor_check is None:
             return
         try:
@@ -3755,14 +3805,7 @@ class RegistryRunner:
             # The setting's advice names both steps. The reload takes in the changed value. It
             # also rebuilds the lane when the CA path or the pin changed. A change to any other
             # value, such as the url, leaves the failure kept, and the start then builds the lane.
-            tail = (
-                f"{_ANCHOR_SETTING_REFUSED}. Fix the setting, then reload and start the "
-                "connection; the server log says why"
-                if isinstance(exc, ValueError)
-                else "tls_ca_file was refused. Fix the file, then start the connection; the "
-                "server log and the auth.trust_anchor audit rows say why"
-            )
-            raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
+            raise _lane_anchor_line(direction, name, settings, exc, passive=False) from exc
         except AnchorStoreUnavailable as exc:
             # BACKLOG #3091: the store stopped the check; the file is not known to be bad. A
             # failing lane still fails with a fixed line, so an operator start reads `failed` and
@@ -3772,23 +3815,18 @@ class RegistryRunner:
                 raise
             # No WARNING here: the check logged the store's error once, and a scheduled poller
             # retries at every in-window tick.
-            raise TrustAnchorError(
-                f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
-                "the store refused the trust-anchor audit. Start the connection once the store is "
-                "back; the server log says why"
-            ) from exc
+            raise _lane_anchor_line(direction, name, settings, exc, passive=False) from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
-        """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
-        that dials out. A no-op for any other inbound, a bound one, an unknown name and one not
-        deployed: :meth:`_start_inbound_unsafe` answers those itself."""
+        """:meth:`_check_lane_anchor` for an inbound that dials out and is about to bind: an
+        ``Ftp`` poller or a ``DatabasePoll`` (:func:`_inbound_lane_reads_ca`). A no-op for any
+        other inbound, a bound one, an unknown name and one not deployed: :meth:`_start_inbound_unsafe` answers those itself."""
         ic = self.registry.inbound.get(name)
-        if ic is not None and (
-            ic.spec.type is not ConnectorType.REMOTEFILE or not ic.spec.settings.get("tls_ca_file")
-        ):
-            # An SFTP poller, or FTPS with no CA: nothing to check, so no old refusal stands.
+        if ic is not None and not _inbound_lane_reads_ca(ic):
+            # An SFTP poller, FTPS with no CA, or a DatabasePoll with no sslca: nothing to check,
+            # so no old refusal stands.
             self._anchor_refused.pop(("inbound", name), None)
             return
         if (
@@ -3930,8 +3968,7 @@ class RegistryRunner:
             lanes.append(oc)
         for ic in new.inbound.values():
             if (
-                ic.spec.type is not ConnectorType.REMOTEFILE
-                or not ic.spec.settings.get("tls_ca_file")
+                not _inbound_lane_reads_ca(ic)
                 or self._listener_skip(ic, old_inbound_names, binding_now=False) is not None
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
@@ -3961,7 +3998,14 @@ class RegistryRunner:
                 store_fault = store_fault or exc
                 continue
             except (TrustAnchorError, ValueError) as exc:
-                error = refused_connection_anchor(exc)
+                # The lane's setting, for a refusal that does not name its own: a DR abort shows
+                # it in place of the refusal's text (vault BACKLOG #3498).
+                key = (
+                    _SETTING_KEYS
+                    if isinstance(exc, AnchorSettingRefused)
+                    else lane_ca_setting(settings)
+                )
+                error = refused_connection_anchor(exc, setting=_lane_setting(direction, name, key))
                 raise error from error.__cause__
             passed.append((direction, name))
         if store_fault is not None:
@@ -4653,7 +4697,8 @@ class RegistryRunner:
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start."""
-        reason = safe_exc(exc)
+        fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
+        reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
         self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
         self._log_and_alert_start_failure(
             f"{kind} connection {name!r}",
@@ -5498,9 +5543,11 @@ class RegistryRunner:
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
         AND a config dir is known. The child re-loads the graph to look a function up by name, from
-        ``Registry.source_dir`` (the directory the served graph came from), else the constructor's
-        ``sandbox_config_source``. A reload of a running runner closes the sessions, so a reload
-        from another root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
+        ``Registry.config_snapshot``, the bytes the served graph was loaded from, and never reads
+        the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
+        ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
+        reads once. A reload of a running runner closes the sessions, so a reload from another root
+        moves the children with it (vault BACKLOG #3094). **A graph built in code with no
         config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
         library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
         Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
@@ -5527,6 +5574,9 @@ class RegistryRunner:
                 env=env,
                 graph=self._engine_graph_shape,
                 code_sets=self.registry.code_sets,
+                # The bytes the served graph was loaded from: every worker of this session runs
+                # them and never reads the directory (vault BACKLOG #2596).
+                snapshot=self.registry.config_snapshot,
             )
             self._sandbox_sessions[name] = session
         return session
@@ -6373,6 +6423,8 @@ class RegistryRunner:
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
+            is_leader=self._coordinator.is_leader,
+            current_epoch=self._coordinator.current_epoch,
         )
 
     async def _start_pooled_dispatchers(self) -> None:
@@ -8163,6 +8215,11 @@ class RegistryRunner:
 
     # --- delivery path -------------------------------------------------------
 
+    def _repend_fence(self) -> RependFence:
+        """The lease a worker claims under, read before its claim (BACKLOG #1611), so a lease
+        change during the pass, not only during the re-pend, fences the retries."""
+        return RependFence.capture(self._coordinator.is_leader, self._coordinator.current_epoch)
+
     async def _repend_claimed_on_fault(
         self,
         worker: str,
@@ -8170,49 +8227,122 @@ class RegistryRunner:
         ids: Sequence[str],
         *,
         faults: _WorkerFaultLog | None = None,
-    ) -> None:
-        """Best-effort re-pend of the rows a per-lane worker was holding when its loop faulted
-        (BACKLOG #1611 step 1) — the per-lane analogue of the pooled T17 head re-pend in
-        :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+        fence: RependFence | None = None,
+        abandon: Callable[[], bool] | None = None,
+        give_up_after: int | None = None,
+    ) -> HoldResult:
+        """Re-pend the rows a per-lane worker was holding when its loop faulted, retrying while it
+        holds the lane (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
+        re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+        Returns how the hold ended. Only ``STOPPED``, the runner stopping with the rows still held,
+        makes the caller return rather than claim again; every other end leaves the rows INFLIGHT
+        and the worker loops on, as it did before step 2 after one failed write.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
-        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
-        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()``, the
-        cluster promotion path, and a ``reload()`` for a worker that has RETURNED (ADR 0157 Inc 2)
-        -- which this surviving worker has not. Without this the row waits for a
-        service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
-        reports the lane healthy to the buildup and stall alerts.
+        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
+        claiming would take the row's successor and deliver it first, a per-lane FIFO break, while
+        ``pending_depth`` (pending rows only) reports the lane healthy.
+
+        **So a failed re-pend is retried, on a capped backoff, while the worker HOLDS the lane**: it
+        claims nothing new until the stranded rows are pending again. That is what keeps per-lane
+        FIFO, and it needs no clock and no ownership guess, because the worker retrying is the lane's
+        only consumer (ADR 0059) and knows which rows it holds. A store that stays down keeps the
+        rows in flight, and the runner's in-flight watch pages them on their claim age
+        (:meth:`_check_inflight_strands`), which nothing here touches.
+
+        **How the hold ends.** At least these, each sending no further write:
+
+        * A runner stop returns ``STOPPED`` and leaves the rows for ``reset_stale_inflight`` at the
+          next start, as a cancelled worker's are; the backoff is :meth:`_stop_or_sleep`, and the
+          task stays cancellable.
+        * Leadership and the lease's epoch gate the retries, not the first write, through the
+          :class:`~messagefoundry.pipeline.stage_dispatcher.RependFence`, which says why; each
+          caller passes the one it read before its claim (:meth:`_repend_fence`). Not the
+          leader, the worker keeps holding the lane, so a stop returns ``STOPPED`` and a flap under
+          the same lease resumes the retry; leading under another lease returns ``SUPERSEDED``.
+        * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
+          delivery worker and the pooled batch guard pass the negation of :meth:`_lane_may_deliver`,
+          so a stop or pause of the outbound and the #122 halt are not held until the store heals
+          (that method says how a schedule window or a DR park reaches it). The router, transform
+          and response workers pass :meth:`_inbound_log_halted`, the #122 gate their loop top
+          reads, so the halt ends their hold too and the worker returns at that gate.
+        * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
+          under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
+          per-lane workers never read the policy and have no STOP path, so they pass none.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
         them and a broken dependency is re-claimed ~4x/s. ``reschedule_claimed`` is guarded
         ``status='inflight'`` and FIFO-neutral (``seq`` is never re-minted), so rows the worker already
         resolved are left untouched and the survivors keep their lane position — which is why a caller
-        may pass its whole claimed batch without tracking which row died.
+        may pass its whole claimed batch without tracking which row died. ``reschedule_claimed`` also
+        undoes the claim's ``attempts`` increment, as it always has here, so ``max_attempts`` does NOT
+        bound a row whose handoff faults every pass: the lane stays head-of-line blocked on it, and
+        the in-flight watch and the worker's fault log are what show it.
 
-        Wrapped in its own ``except`` because a re-pend that raises inside an except arm would kill the
-        worker, which is strictly worse than the leak it fixes; a failure here simply falls back to the
-        pre-existing recovery (``reset_stale_inflight`` at the next start).
-
-        A worker loop passes its ``faults`` (BACKLOG #1844), and a failure is then logged on that
-        worker's backoff rather than once per pass: a busy-timeout that fails the handoff tends to fail
-        this write on the same passes.
+        A failure is caught, never raised: a re-pend that raises inside an except arm would kill the
+        worker with the rows still in flight, which is strictly worse than the retry. It is logged at
+        WARNING on the worker's ``faults`` backoff (BACKLOG #1844), one line per 1st, 2nd, 4th ...
+        failure; that run closes, with a line, on the worker's quiet rule rather than when the write
+        lands. A caller without one gets a backoff of its own, which logs a line when the write lands.
+        Each line carries counts and the exception, never a row's content.
         """
         if not ids:
-            return
-        try:
-            await self.store.reschedule_claimed(
-                list(ids), time.time() + _WORKER_ERROR_BACKOFF_SECONDS
-            )
-        except Exception as exc:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
-            message = (
-                "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
-                "for reset_stale_inflight at the next start"
-            )
-            if faults is None:
-                log.warning(message, worker, name, len(ids), exc_info=True)
+            return HoldResult.LANDED
+        rows = list(ids)
+        if fence is None:  # read before the first write, which can hang across a flap
+            fence = self._repend_fence()
+        # Without a worker's `faults` (#1844), this call logs on its own backoff and closes it.
+        own = FailureRun()
+        failures = 0
+        message = (
+            "%s worker %r: reschedule_claimed failed for %d claimed row(s); holding the lane "
+            "and retrying, so no later row overtakes them"
+        )
+        while True:
+            try:
+                await self.store.reschedule_claimed(
+                    rows, time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+                )
+            except Exception as exc:  # noqa: BLE001 — retried while holding the lane; see the docstring
+                failures += 1
+                if faults is not None:
+                    faults.repend_failed(exc, message, worker, name, len(rows))
+                else:
+                    own = own.record(
+                        log, exc, message, worker, name, len(rows), level=logging.WARNING
+                    )
+                if give_up_after is not None and failures >= give_up_after:
+                    return HoldResult.EXHAUSTED
             else:
-                faults.repend_failed(exc, message, worker, name, len(ids))
+                # A worker's own `faults` closes the re-pend run on quiet, with its main run.
+                own.clear(
+                    log, "%s worker %r: reschedule_claimed", worker, name, level=logging.WARNING
+                )
+                return HoldResult.LANDED
+            # One WARNING per leadership loss; a loss after a regain in this retry warns again.
+            ended = await wait_to_retry(
+                _capped_backoff(
+                    _WORKER_ERROR_BACKOFF_SECONDS, failures - 1, _REPEND_RETRY_CAP_SECONDS
+                ),
+                poll=_WORKER_ERROR_BACKOFF_SECONDS,
+                sleep=self._stop_or_sleep,
+                fence=fence,
+                abandon=abandon,
+                not_leader=functools.partial(
+                    log.warning,
+                    "%s worker %r: reschedule_claimed failed %d time(s) for %d claimed row(s) "
+                    "and this node is not the leader, so no retry is sent; the lane stays held "
+                    "with the rows in flight, and the retry resumes only if this node leads "
+                    "again before it stops",
+                    worker,
+                    name,
+                    failures,
+                    len(rows),
+                ),
+            )
+            if ended is not None:
+                return ended
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
@@ -8246,10 +8376,19 @@ class RegistryRunner:
                 exc_info=True,
             )
 
+    def _inbound_log_halted(self, name: str) -> bool:
+        """Whether the #122 halt (ADR 0162) holds inbound ``name``'s internal stages: the gate the
+        router, transform and response workers read at their loop top, and the ``abandon``
+        predicate they pass to a held re-pend (:meth:`_repend_claimed_on_fault`). A new loop-top
+        gate for those workers belongs here as well, or a held re-pend stays deaf to it."""
+        return name in self._log_halted
+
     def _lane_may_deliver(self, name: str) -> bool:
         """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
-        halt and the operator pause), as one predicate for its per-item re-check (#2771). A new
-        loop-top gate belongs here as well, or a claimed batch keeps sending under it."""
+        halt and the pause), as one predicate for its per-item re-check (#2771). A new loop-top
+        gate belongs here as well, or a claimed batch keeps sending under it. The pause is
+        :attr:`_outbound_paused`, which a schedule window or a DR park joins through the same
+        outbound stop an operator's takes; nothing here reads either directly."""
         return not self._delivery_halted and name not in self._outbound_paused
 
     async def _delivery_worker(self, name: str) -> None:
@@ -8267,6 +8406,7 @@ class RegistryRunner:
         claimed: list[str] = []
         faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
             # process has fail-closed, so this lane must not deliver no matter which door started it.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state
@@ -8400,7 +8540,16 @@ class RegistryRunner:
                 # #1844: log with a backoff, not a traceback per pass (see _WorkerFaultLog).
                 faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "delivery",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=lambda: not self._lane_may_deliver(name),
+                )
+                if held is HoldResult.STOPPED:
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -8870,6 +9019,7 @@ class RegistryRunner:
         guard appends the extras' ids to it, and the worker's arm re-pends head and extras in ONE
         write. Two writes for one failed pass would record twice on the worker's backoff, doubling
         its count and pinning the extras' line to positions the schedule never emits."""
+        fence = self._repend_fence()  # #1611: before the extras are claimed
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
@@ -8882,8 +9032,34 @@ class RegistryRunner:
             extras = [it.id for it in members[1:]]
             if extras_out is not None:
                 extras_out.extend(extras)  # the caller's re-pend owns them now
+            # The batch's fault is re-raised however the hold on the extras ended; one that did not
+            # land leaves them INFLIGHT. That is the stop path too, not only the landed one: the head
+            # is the pooled dispatcher's, whose T17 arm sends its one permitted first write and then
+            # reads the same stop, so re-raising ends the pass at once. Returning a result here
+            # instead would tell the dispatcher the head resolved. This hold is the pooled
+            # dispatcher's, so it ends as that dispatcher's own holds do: on a pause of the lane,
+            # and under infra_fault_policy = stop at infra_fault_stop_after failures, after which
+            # the head's hold counts its own failures toward the lane's STOP.
             else:
-                await self._repend_claimed_on_fault("batch delivery", name, extras)
+                held = await self._repend_claimed_on_fault(
+                    "batch delivery",
+                    name,
+                    extras,
+                    fence=fence,
+                    abandon=lambda: not self._lane_may_deliver(name),
+                    give_up_after=(
+                        self._infra_fault_stop_after if self._infra_fault_policy == "stop" else None
+                    ),
+                )
+                if held is not HoldResult.LANDED:
+                    log.warning(
+                        "delivery lane %r: stopped holding %d coalesced batch row(s) whose "
+                        "re-pend had not landed (%s); they stay in flight until a store recovery "
+                        "path re-pends them, at least the next start",
+                        name,
+                        len(extras),
+                        held.name.lower(),
+                    )
             raise
 
     async def _deliver_coalesced_batch(
@@ -9194,10 +9370,11 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("router", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
             # STOP-policy halt leaves, re-armed by restarting this inbound.
-            if name in self._log_halted:
+            if self._inbound_log_halted(name):
                 return
             try:
                 # FIFO per inbound: claim the due head (ingress rows never back off, so this is
@@ -9243,7 +9420,16 @@ class RegistryRunner:
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
                 faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("router", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "router",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
+                )
+                if held is HoldResult.STOPPED:
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9568,7 +9754,8 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
@@ -9590,7 +9777,16 @@ class RegistryRunner:
                 # log, back off, keep going (mirrors the router/delivery workers). #1844: with a backoff.
                 faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("response", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "response",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
+                )
+                if held is HoldResult.STOPPED:
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -9666,7 +9862,8 @@ class RegistryRunner:
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 # FIFO per inbound at the routed stage. Under active-passive HA the graph runs on the
@@ -9716,7 +9913,16 @@ class RegistryRunner:
                     exc, "transform worker %r: unexpected error; backing off and retrying"
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("transform", name, claimed, faults=faults)
+                held = await self._repend_claimed_on_fault(
+                    "transform",
+                    name,
+                    claimed,
+                    faults=faults,
+                    fence=fence,
+                    abandon=functools.partial(self._inbound_log_halted, name),
+                )
+                if held is HoldResult.STOPPED:
+                    return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -10654,11 +10860,13 @@ class RegistryRunner:
 
         **Why this exists.** A claim is its own committed transaction, so a store fault between it and
         the handoff leaves the row ``inflight``. Part A made the per-lane workers re-pend it, and the
-        pooled dispatcher already did (T17), but both re-pends are store writes that can fail too.
-        What is left then is recovered by ``reset_stale_inflight`` at the next start, and nothing
-        before that. It is invisible to ``pending_depth``, so the buildup and stall alerts read the
-        lane healthy, and those alerts only run from the lane's own processing path, which a strand
-        has stopped. This check runs on its own clock and reads in-flight rows directly.
+        pooled dispatcher already did (T17). Both re-pends are store writes that can fail too, so
+        since step 2 each retries its write while holding the lane. A store that stays down keeps
+        the row in flight for as long as it stays down, and a worker killed by a ``BaseException``
+        leaves its row to ``reset_stale_inflight`` at the next start. Such a row is invisible to
+        ``pending_depth``, so the buildup and stall alerts read the lane healthy, and those alerts
+        only run from the lane's own processing path, which a strand has stopped. This check runs on
+        its own clock and reads in-flight rows directly, so it pages whichever recovery is waiting.
 
         **What it pages, on which threshold.** Every lane fires ``queue_buildup`` on the age its
         pending check uses: an outbound lane's resolved :class:`BuildupThreshold`, and the global
@@ -10673,11 +10881,13 @@ class RegistryRunner:
         past the threshold is either stranded or in a send or transform that has run that long, and
         an operator wants the page in both cases.
 
-        **It does not recover the row.** A reclaim would have to know which in-flight rows no live
-        task still holds, and the pooled dispatcher keeps a claimed prefix inside its own serializer
-        where this runner cannot see it. Re-pending a held row sends it twice. So this pages, and
-        the store's existing recovery paths still re-pend. They include at least
-        ``reset_stale_inflight`` at a single-node start and, on Postgres only, the expired-lease
+        **It does not recover the row.** A reclaim from here would have to know which in-flight rows
+        no live task still holds, and the pooled dispatcher keeps a claimed prefix inside its own
+        serializer where this runner cannot see it. Re-pending a held row sends it twice. So this
+        pages, and recovery stays with the holder retrying its own re-pend
+        (:meth:`_repend_claimed_on_fault`, the dispatcher's ``_run_lane``) and with the store's
+        paths. Those include at least ``reset_stale_inflight`` at a single-node start and, on
+        Postgres only, the expired-lease
         reclaim inside the FIFO head claims plus the clustered leader's ``reclaim_expired_leases``
         sweep. An ``ordering=unordered`` lane claims through ``claim_ready``, which has no such
         reclaim. And on a FIFO lane the lease reclaim re-pends the row after its successors have
@@ -10969,6 +11179,8 @@ def _source_config(
     apply_hop_attestation(
         settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
     )
+    # Vault BACKLOG #3234: an Ftp poller's env() tls can resolve to plain ftp beside a CA.
+    refuse_resolved_verify_off(ic.spec.type, settings, f"inbound connection {ic.name!r}")
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
@@ -10998,7 +11210,8 @@ def _source_config(
         tls_hop_attested_reason=ic.tls_hop_attested_reason,
         # ADR 0173: the mTLS listener's revocation attestation. A TOP-LEVEL inbound key, read off the
         # InboundConnection (not the env-resolved settings), so check_inbound_revocation's attested
-        # branch is reachable from config. Default off -> byte-identical.
+        # branch is reachable from config. The FTPS poller's revocation guard reads the same pair
+        # (BACKLOG #2193). Default off -> byte-identical.
         tls_revocation_attested=ic.tls_revocation_attested,
         tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
         # Vault BACKLOG #2370: the FTPS poller verifies its server under [tls], as the outbound does.
@@ -11521,17 +11734,89 @@ def _insecure_bind_cause(source: Source) -> str:
     return "--allow-insecure-bind / require_encryption_for_remote = false"
 
 
-#: What a lane's fixed refusal line says for a ``ValueError`` from its CA check (vault BACKLOG
-#: #3224). That is a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a
-#: ``tls_ca_file`` value that is no path. Mending the file does nothing for it, and a start alone
-#: reads the same setting again. Each site adds its own advice.
-_ANCHOR_SETTING_REFUSED = "tls_ca_pin or tls_ca_file setting was refused"
+#: How much of a lane's fixed CA line (:func:`_lane_anchor_line`)
+#: :meth:`RegistryRunner._record_failed` keeps. At ``safe_exc``'s default of 200 characters a line
+#: with its advice was cut, the store's line for any connection name (vault BACKLOG #3498). A name
+#: is at most 256 characters (``CONNECTION_NAME_PATTERN``), and the longest line's other words are
+#: about 210, so this keeps every line whole with room to spare.
+_ANCHOR_LINE_LIMIT = 512
+
+
+def _lane_anchor_fault(exc: BaseException) -> Literal["setting", "file", "unchecked"]:
+    """What a lane's CA check failure says about the lane (vault BACKLOG #3498).
+
+    ``setting``: an :class:`AnchorSettingRefused`, which the check raises when it refused a
+    setting before it read any file. ``file``: any other :class:`TrustAnchorError` or
+    ``ValueError``, a file the check refused. ``unchecked``: anything else, the store's
+    :class:`AnchorStoreUnavailable` included, a check that did not run. The class comes from the
+    check that knows which step refused, so a ``WiringError``, which is a ``ValueError`` too, no
+    longer reads as a setting."""
+    if isinstance(exc, AnchorSettingRefused):
+        return "setting"
+    if isinstance(exc, (TrustAnchorError, ValueError)):
+        return "file"
+    return "unchecked"
+
+
+def _lane_anchor_line(
+    direction: str, name: str, settings: Mapping[str, Any], exc: BaseException, *, passive: bool
+) -> TrustAnchorError:
+    """The fixed line a lane's CA check failure is shown as in the lane's status and its
+    ``connection_stopped`` alert. The failure's own text names the CA's path, the folders above
+    it and its SHA-256, so it goes to the server log only (vault BACKLOG #3224). One ladder for a
+    start (:meth:`RegistryRunner._check_lane_anchor`) and a passive DR standby
+    (:meth:`RegistryRunner._preflight_passive_lanes`), so the two word a fault alike (vault
+    BACKLOG #3498). It is ``fixed_text``, so :meth:`RegistryRunner._record_failed` keeps it to
+    :data:`_ANCHOR_LINE_LIMIT`.
+
+    A refused setting is not a file to mend, and a start alone reads the same setting again, so
+    its advice is to reload. A check that did not run says nothing against the file. At a start,
+    the only one that reaches here is the store's (:class:`AnchorStoreUnavailable`), which names
+    the store, since the next start checks the file again."""
+    ca = lane_ca_setting(settings)
+    fault = _lane_anchor_fault(exc)
+    if fault == "setting":
+        what = f"{_SETTING_KEYS} setting was refused"
+        start = "" if passive else " and start the connection"
+        advice = f"Fix the setting, then reload{start}; the server log says why"
+    elif fault == "file":
+        what = f"{ca} was refused"
+        then = "reload" if passive else "start the connection"
+        rows = "the server log and the auth.trust_anchor audit rows say why"
+        advice = f"Fix the file, then {then}; {rows}"
+    elif not passive:  # _check_lane_anchor passes only the store's fault here
+        what = f"{ca} could not be checked, because the store refused the trust-anchor audit"
+        advice = "Start the connection once the store is back; the server log says why"
+    else:
+        what = f"{ca} could not be checked"
+        advice = "The server log says why; reload once the cause is fixed"
+    where = " on this passive DR standby, and POST /dr/activate needs it" if passive else ""
+    return TrustAnchorError(
+        f"{direction} connection '{name}': its {what}{where}. {advice}",
+        setting=_lane_setting(direction, name, _SETTING_KEYS if fault == "setting" else ca),
+        fixed_text=True,
+    )
+
+
+#: The keys a lane's setting refusal names: the check does not say which of the two it refused.
+_SETTING_KEYS = "tls_ca_pin or tls_ca_file"
+
+
+def _lane_setting(direction: str, name: str, key: str) -> str:
+    """A lane's setting as :attr:`TrustAnchorError.setting` names one, in
+    :attr:`AnchorSpec.setting`'s form and with no path (vault BACKLOG #3498)."""
+    return f"{direction} connection '{name}' {key}"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:
     """The resolved CA path and pin a lane refusal read (vault BACKLOG #2371). A reload compares a
     lane's new pair with it, so a fixed ``env()`` value ends a kept failure."""
     return (str(settings.get("tls_ca_file") or ""), settings.get("tls_ca_pin"))
+
+
+def _inbound_lane_reads_ca(ic: InboundConnection) -> bool:
+    """:func:`~messagefoundry.auth.trust_anchors.inbound_lane_reads_ca` for inbound ``ic``."""
+    return inbound_lane_reads_ca(ic.spec.type, ic.spec.settings)
 
 
 def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:

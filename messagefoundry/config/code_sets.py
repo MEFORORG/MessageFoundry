@@ -43,14 +43,16 @@ active set; :func:`set_active` to publish one outside a ``with`` block.
 from __future__ import annotations
 
 import csv
+import io
 import logging
+import os
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from messagefoundry.redaction import codec_safe_str
@@ -62,6 +64,10 @@ __all__ = [
     "CodeSet",
     "load_code_set",
     "load_code_sets",
+    "code_sets_from_files",
+    "is_code_set_name",
+    "parse_code_set",
+    "parse_policy",
     "code_set",
     "set_active",
     "activated",
@@ -417,17 +423,42 @@ def load_code_set(path: str | Path) -> CodeSet:
     Auto-detects the format by extension. Raises :class:`CodeSetError` (naming the file) for an
     unknown extension, a malformed file, or a duplicate key — never silently drops data."""
     path = Path(path)
-    name = path.stem
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        data = _load_csv(path)
-    elif suffix == ".toml":
-        data = _load_toml(path)
-    else:
+    _require_supported(path.name)
+    return parse_code_set(path.name, _read_table(path), load_policy(path))
+
+
+def _require_supported(name: str) -> str:
+    """``name``'s suffix in lower case, refused unless it is one the loader parses."""
+    suffix = Path(name).suffix.lower()
+    if not is_code_set_name(name):
         raise CodeSetError(
-            f"code set {path.name!r}: unsupported extension {suffix!r} (use .csv or .toml)"
+            f"code set {name!r}: unsupported extension {suffix!r} (use .csv or .toml)"
         )
-    return CodeSet(name, data, load_policy(path))
+    return suffix
+
+
+def _read_table(path: Path) -> bytes:
+    """The bytes of table file ``path``. An unreadable file is a :class:`CodeSetError` naming it,
+    phrased as its format's parse error is."""
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        if path.suffix.lower() == ".csv":
+            unreadable = f"code set {path.name!r}: invalid CSV — {exc}"
+        else:
+            unreadable = f"code set {path.name!r}: invalid TOML — {codec_safe_str(exc)}"
+    raise CodeSetError(unreadable)
+
+
+def parse_code_set(name: str, data: bytes, policy: UnmappedPolicy | None = None) -> CodeSet:
+    """Parse the bytes of table file ``name`` into a :class:`CodeSet` named for its stem.
+
+    The one parser :func:`load_code_set` and a snapshot load share (vault BACKLOG #2596), so a table
+    read from disk and one read from a :class:`~messagefoundry.config.snapshot.ConfigSnapshot`
+    give the same set, and the same refusals."""
+    suffix = _require_supported(name)
+    table = _parse_csv(name, data) if suffix == ".csv" else _parse_toml(name, data)
+    return CodeSet(Path(name).stem, table, policy if policy is not None else UnmappedPolicy())
 
 
 def _policy_sidecar_path(codeset_path: Path) -> Path:
@@ -460,12 +491,25 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
     sidecar = _policy_sidecar_path(Path(codeset_path))
     if not sidecar.is_file():
         return UnmappedPolicy()
+    return parse_policy(sidecar.name, _read_sidecar(sidecar))
+
+
+def _read_sidecar(path: Path) -> bytes:
     try:
-        with sidecar.open("rb") as fh:
-            raw = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
+        return path.read_bytes()
+    except OSError as exc:
+        unreadable = f"policy sidecar {path.name!r}: invalid TOML — {codec_safe_str(exc)}"
+    raise CodeSetError(unreadable)
+
+
+def parse_policy(sidecar_name: str, data: bytes) -> UnmappedPolicy:
+    """Parse the bytes of policy sidecar ``sidecar_name``, shared by :func:`load_policy` and a
+    snapshot load."""
+    try:
+        raw = tomllib.loads(data.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         invalid: str | None = (
-            f"policy sidecar {sidecar.name!r}: invalid TOML — {codec_safe_str(exc)}"
+            f"policy sidecar {sidecar_name!r}: invalid TOML — {codec_safe_str(exc)}"
         )
     else:
         invalid = None
@@ -476,7 +520,7 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
         return UnmappedPolicy.from_mapping(raw)
     except CodeSetError as exc:
         # Re-raise with the sidecar filename so a bad policy is self-explanatory at load.
-        raise CodeSetError(f"policy sidecar {sidecar.name!r}: {exc}") from None
+        raise CodeSetError(f"policy sidecar {sidecar_name!r}: {exc}") from None
 
 
 def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
@@ -488,18 +532,51 @@ def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
     codesets_dir = Path(codesets_dir)
     if not codesets_dir.is_dir():
         return {}
-    out: dict[str, CodeSet] = {}
-    # Sorted for a deterministic load order, so a clash error names a stable "first" file.
+    files: dict[str, bytes] = {}
     for path in sorted(codesets_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in (".csv", ".toml"):
+        if path.is_file() and is_code_set_name(path.name):
+            reader = _read_sidecar if is_policy_sidecar(path) else _read_table
+            files[path.name] = reader(path)
+    return code_sets_from_files(files, codesets_dir)
+
+
+def code_sets_from_files(
+    files: Mapping[str, bytes], codesets_dir: str | Path
+) -> dict[str, CodeSet]:
+    """Parse ``files`` (each table in ``codesets/``, by its file name there) into a registry.
+
+    The rules of :func:`load_code_sets`, over bytes already read: a ``<name>.policy.toml`` beside a
+    ``<name>.csv`` or ``<name>.toml`` is that table's policy (#162) rather than a table of its own,
+    and two tables of one name are a :class:`CodeSetError`. A config load parses the code sets of
+    its snapshot here, so the tables it publishes are the bytes it hashed (vault BACKLOG #2596).
+    ``codesets_dir`` only names the folder in a refusal. Names are matched as the filesystem would
+    match them: without case on Windows."""
+    by_key = {os.path.normcase(name): name for name in files}
+
+    def sibling(name: str) -> str | None:
+        return by_key.get(os.path.normcase(name))
+
+    def is_sidecar(name: str) -> bool:
+        if not name.endswith(POLICY_SIDECAR_SUFFIX):
+            return False
+        base = name[: -len(POLICY_SIDECAR_SUFFIX)]
+        return sibling(f"{base}.csv") is not None or sibling(f"{base}.toml") is not None
+
+    out: dict[str, CodeSet] = {}
+    # Sorted for a deterministic load order, so a clash error names a stable "first" file. In path
+    # order, as the folder listing was sorted: without case on Windows.
+    for name in sorted(files, key=PurePath):
+        if not is_code_set_name(name):
             continue
         # A ``<name>.policy.toml`` sidecar (#162) is policy METADATA for its code set, not a code set
-        # of its own — skip it here (it is read by load_policy() alongside the code-set file). Skip
-        # ONLY a true sidecar (a companion code set exists); a standalone ``x.policy.toml`` with no
-        # companion is a legacy code set named ``x.policy`` and still loads (no silent drop).
-        if is_policy_sidecar(path):
+        # of its own — skip it here (it is read alongside the code-set file). Skip ONLY a true
+        # sidecar (a companion code set exists); a standalone ``x.policy.toml`` with no companion is
+        # a legacy code set named ``x.policy`` and still loads (no silent drop).
+        if is_sidecar(name):
             continue
-        cs = load_code_set(path)
+        sidecar = sibling(f"{Path(name).stem}{POLICY_SIDECAR_SUFFIX}")
+        policy = parse_policy(sidecar, files[sidecar]) if sidecar is not None else None
+        cs = parse_code_set(name, files[name], policy)
         if cs.name in out:
             raise CodeSetError(
                 f"duplicate code set name {cs.name!r} in {codesets_dir} — two files (different "
@@ -509,71 +586,72 @@ def load_code_sets(codesets_dir: str | Path) -> dict[str, CodeSet]:
     return out
 
 
-def _load_csv(path: Path) -> dict[str, Any]:
+def is_code_set_name(name: str) -> bool:
+    """Whether a file called ``name`` in ``codesets/`` is one the loader reads: its suffix, in lower
+    case, is ``.csv`` or ``.toml``. The snapshot, the fingerprint and the trust check use this rule
+    too, so a table spelled ``x.CSV`` is read, hashed and vetted alike on POSIX (vault BACKLOG
+    #2596)."""
+    return Path(name).suffix.lower() in (".csv", ".toml")
+
+
+def _parse_csv(name: str, data: bytes) -> dict[str, Any]:
     """CSV with a header row: first column = key; one other column → scalar, several → ``{header: cell}``.
 
-    A file that is not UTF-8, that the ``csv`` module refuses, or that cannot be opened, is a
-    :class:`CodeSetError` naming the file, as a malformed TOML one is. Each used to escape raw, past
-    every caller's
+    A file that is not UTF-8, or that the ``csv`` module refuses, is a :class:`CodeSetError` naming
+    the file, as a malformed TOML one is. Each used to escape raw, past every caller's
     ``CodeSetError`` arm, and the decode error's text names the byte it failed on (vault BACKLOG
-    #3295). The reader decodes as it iterates, so the whole read is inside the arms.
-
-    No position is given for a decode error: the reader decodes a block at a time, so the error's
-    offset is into that block, not into the file."""
+    #3295). No position is given for a decode error."""
     try:
-        return _read_csv(path)
+        return _read_csv(name, data.decode("utf-8"))
     except UnicodeDecodeError:
-        invalid = f"code set {path.name!r}: invalid CSV — the file is not valid UTF-8"
+        invalid = f"code set {name!r}: invalid CSV — the file is not valid UTF-8"
     except csv.Error as exc:  # its text is one of the module's fixed phrases
-        invalid = f"code set {path.name!r}: invalid CSV — {exc}"
-    except OSError as exc:  # as _load_toml maps it: an unreadable file is refused by name
-        invalid = f"code set {path.name!r}: invalid CSV — {exc}"
-    # Raised after the handler: the decode error's .object is a block of the file.
+        invalid = f"code set {name!r}: invalid CSV — {exc}"
+    # Raised after the handler: the decode error's .object is the file.
     raise CodeSetError(invalid)
 
 
-def _read_csv(path: Path) -> dict[str, Any]:
+def _read_csv(name: str, text: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
-    with path.open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        fields = reader.fieldnames
-        if not fields:
-            raise CodeSetError(f"code set {path.name!r}: empty CSV (no header row)")
-        key_field, *value_fields = fields
-        if not value_fields:
+    # newline="": the csv module does its own line handling, as over a file opened that way.
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    fields = reader.fieldnames
+    if not fields:
+        raise CodeSetError(f"code set {name!r}: empty CSV (no header row)")
+    key_field, *value_fields = fields
+    if not value_fields:
+        raise CodeSetError(
+            f"code set {name!r}: CSV needs a key column plus at least one value column"
+        )
+    single = len(value_fields) == 1
+    for row in reader:
+        # An over-wide row (more cells than the header) lands in DictReader's ``restkey`` bucket
+        # under the ``None`` key — silently sinking the extra cells (accept-and-drop, CLAUDE.md §1).
+        # Reject it loud so the loader is no stricter/looser than the codeset_edit writer/grid (#240).
+        if None in row:
+            extra = row[None]
             raise CodeSetError(
-                f"code set {path.name!r}: CSV needs a key column plus at least one value column"
+                f"code set {name!r}: a row has more cells than columns "
+                f"({len(fields) + len(extra)} > {len(fields)})"
             )
-        single = len(value_fields) == 1
-        for row in reader:
-            # An over-wide row (more cells than the header) lands in DictReader's ``restkey`` bucket
-            # under the ``None`` key — silently sinking the extra cells (accept-and-drop, CLAUDE.md §1).
-            # Reject it loud so the loader is no stricter/looser than the codeset_edit writer/grid (#240).
-            if None in row:
-                extra = row[None]
-                raise CodeSetError(
-                    f"code set {path.name!r}: a row has more cells than columns "
-                    f"({len(fields) + len(extra)} > {len(fields)})"
-                )
-            key = row.get(key_field)
-            if key is None:
-                continue  # short/blank row — DictReader fills missing cells with None
-            if key in data:
-                raise CodeSetError(f"code set {path.name!r}: duplicate key {key!r}")
-            if single:
-                data[key] = row.get(value_fields[0])
-            else:
-                data[key] = {vf: row.get(vf) for vf in value_fields}
+        key = row.get(key_field)
+        if key is None:
+            continue  # short/blank row — DictReader fills missing cells with None
+        if key in data:
+            raise CodeSetError(f"code set {name!r}: duplicate key {key!r}")
+        if single:
+            data[key] = row.get(value_fields[0])
+        else:
+            data[key] = {vf: row.get(vf) for vf in value_fields}
     return data
 
 
-def _load_toml(path: Path) -> dict[str, Any]:
+def _parse_toml(name: str, data: bytes) -> dict[str, Any]:
     """Flat TOML table → ``{key: scalar}``; a nested table value → ``{key: {…}}`` (mirrors environments)."""
     try:
-        with path.open("rb") as fh:
-            raw = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
-        invalid = f"code set {path.name!r}: invalid TOML — {codec_safe_str(exc)}"
+        raw = tomllib.loads(data.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        invalid = f"code set {name!r}: invalid TOML — {codec_safe_str(exc)}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.
         return dict(raw)

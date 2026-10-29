@@ -737,6 +737,85 @@ Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_
 parse the script and fail on any git verb outside a read-only list, with a positive control. They
 also drive it against a temp repository with a fake gh.
 
+## A seat locks its worktree on arrival, and unlocks it on a clean exit
+
+BACKLOG #2524. A Claude Desktop instance's worktree GC (`[reapUntrackedWorktreeDir]`) runs
+`git worktree remove --force` on another instance's worktree when it looks quiet and clean. On
+Windows that empties and deregisters a folder a live session still holds. The evidence (the vault's
+`docs/reviews/2026-09-30-b184-1917-worktree-emptying.md`) shows the GC's reap path logging
+`(locked)` and keeping a locked folder. It does not show that the GC's manual-cleanup fallback
+respects a lock, so a lock narrows the exposure and is not shown to close it. `prune-merged.ps1`,
+`claim-reconcile.ps1` and `hygiene-report.ps1`'s removal list all keep a locked tree.
+
+So `seat.ps1` runs `git worktree lock --reason "<seat> <session id>"` on the session's worktree. It
+creates it only on the SessionStart `-Prompt` path, because SessionStart and SessionEnd come from
+the same settings file, so the unlock is always wired where the lock was made. `-Declare` only
+relabels a lock this session already holds, and never creates one. Nothing locks on a Stop. The
+seat is whatever the record holds, or `undeclared`. Only the SessionEnd hook
+[`seat-unlock.ps1`](../scripts/hooks/seat-unlock.ps1) unlocks it, and only a seat lock that names
+its own session id. It skips a `/clear` or `/resume`, whose session carries on under a new id.
+`-Close` does not unlock, because a closed seat is often still open. The rules are in
+[`seat-lock.ps1`](../scripts/worktree/seat-lock.ps1)'s header, and this list only summarises them:
+
+- Another holder's lock is kept. Claude Code locks an `isolation: worktree` agent's tree while it
+  runs, and that reason reads `claude agent <name> (pid <n>)`.
+- A seat lock whose session reads DEAD or STALE is taken over by the seat that arrives there. It is
+  rewritten in place, so the tree is never unlocked in between. A lock with no registry record is
+  reported but not taken over, because a live seat this reader cannot see reads the same way.
+- The SessionStart after a `/clear`, `/resume` or `/compact` hands a seat lock in the tree over to
+  the new id, so the new id's exit releases it. It does so only when the occupancy fence can look
+  and finds no other live session in the tree; otherwise the lock is kept.
+- A session with no session id places no lock, since nothing could release or report it.
+- The primary checkout is skipped, because git refuses to lock it. A cloud session is skipped too.
+
+**The handover is not guaranteed under the Desktop app.** There a hook starts in the primary
+checkout, and after a `/clear` or `/compact` it writes no pin (rule 5 in
+[`_hookinput.ps1`](../scripts/hooks/_hookinput.ps1)), so it cannot place the session's own linked
+worktree, and [`seat-declare-prompt.ps1`](../scripts/hooks/seat-declare-prompt.ps1) then skips
+`seat.ps1` altogether. The lock keeps the old id, the new id's exit does not release it, and it is
+stranded once the process ends. `hygiene-report.ps1` section e is where it surfaces.
+
+**A lock has one holder.** When two live seats share a tree, the first one's lock stands for both,
+so once that seat exits and unlocks, the other is unprotected. One session per worktree is the fleet
+rule ([`CLAUDE.md`](../CLAUDE.md) section 5), and this lock does not cover a breach of it.
+
+A session that dies without unlocking leaves its tree locked, and every reclaimer then keeps it.
+`hygiene-report.ps1` lists those locks in section e, with a `git worktree unlock` command for each
+that refuses to run on another host. "No registry record" cannot tell an exited session from one
+that never registered, so check it first. A Codex seat's lock is listed as CODEX, because nothing
+here can fence one.
+`remove.ps1` and `prune-merged.ps1` refusing a locked tree is the intended effect. Unlock it first
+when you mean to remove it.
+
+Tests: [`tests/test_seat_worktree_lock.py`](../tests/test_seat_worktree_lock.py).
+
+### Finding a worktree the GC emptied — `find-emptied-worktrees.ps1`
+
+BACKLOG #2525. When the GC hits a folder a session holds open, it deletes the files, the `.git` link
+and the registration, then fails with `Permission denied` and leaves the empty folder. So a folder
+under `<primary>\.claude\worktrees\` with no `.git` that `git worktree list` does not carry is one it
+emptied, or one left some other way. `hygiene-report.ps1` section f lists each such folder, and
+[`find-emptied-worktrees.ps1`](../scripts/worktree/find-emptied-worktrees.ps1) prints the same list
+on demand. Beside each folder it names the Desktop log lines that name it, read from every
+profile's `logs\*.log`: `[reapUntrackedWorktreeDir] git worktree remove refused` with
+`failed to delete`, and `Git worktree remove failed, will try manual cleanup` with
+`Permission denied`. The logs rotate, so a folder with no line is still reported.
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\find-emptied-worktrees.ps1
+```
+
+It only reads, and it skips the Desktop's own `.ccd-trash~*` tombstones. A session still in an
+emptied folder can re-add the worktree at the same path, on the same branch, from the primary
+checkout. Re-declaring the seat does not lock it again, because `-Declare` only relabels a lock that
+exists: the tree stays unlocked until a SessionStart from a startup or `/resume` runs there, or until
+you run `git worktree lock --reason "<seat> <session id>"` on it, which the session's own exit then
+releases. `git worktree add` refuses a folder that
+is not empty, so a folder that still holds files (the entry count says how many) needs them moved
+aside first. Copy out anything a session wrote there before you do.
+
+Tests: [`tests/test_find_emptied_worktrees.py`](../tests/test_find_emptied_worktrees.py).
+
 ## A PR-state cache for read-only panes — `pr_state.py`
 
 One poller per PC writes the open pull requests and the merge queue to one file. A fleet pane reads
@@ -812,6 +891,35 @@ starts there. A change to any of those files in the primary checkout runs, unatt
 minutes. The installer refuses inside Claude Code and on any machine
 other than `-ExpectedHost`; that decides only who registers the task, not what it runs. Tests:
 [`tests/test_pr_state.py`](../tests/test_pr_state.py).
+
+## Ledger acts owed to the Lander — `owed_ledger_acts.py`
+
+**A Lander ledger pass is briefed from this report's output, never from memory or a notes file.**
+The script's docstring says why (the 2026-10-28 incident).
+
+[`scripts/coord/owed_ledger_acts.py`](../scripts/coord/owed_ledger_acts.py) reads the comments on
+pull requests merged in a window (engine and korus by default) and, through `git` only, a vault
+checkout's ledger at `origin/main`, as text: it runs no code the vault holds. It prints each ask
+the ledger has not acted on: `OWED`, `MISSING` (the row is in neither ledger file) or `READ` (prose
+or a marker it could not parse). Its rules lean toward printing an ask that may be done. When an ask
+counts as done is stated once, in the script's docstring. A failed read prints an `ERROR` line and
+exits 0, never an empty report; only a bad command line exits non-zero. It does not fetch, so fetch
+the vault first if its `origin/main` is old; the header prints the ref's date.
+
+```powershell
+python scripts\coord\owed_ledger_acts.py --vault <vault checkout>          # last 14 days
+python scripts\coord\owed_ledger_acts.py --vault <vault checkout> --days 3 --all --json
+```
+
+**A Manager asking the Lander for a ledger act puts this marker in the PR comment,** beside the
+prose, even when it also sends mail:
+
+    <!-- lander-ledger-ask rows=#3844,#3025 file=2 -->
+
+`rows` names rows whose banner is owed; `file` counts new rows to file. Either may be left out.
+Without the marker the report falls back to a prose read that can miss an ask; what it reads, and
+what it cannot see, are in the script's docstring. Tests:
+[`tests/test_owed_ledger_acts.py`](../tests/test_owed_ledger_acts.py).
 
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 

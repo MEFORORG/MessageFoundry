@@ -136,7 +136,9 @@ from messagefoundry.store.crypto import (
     cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
-    rotation_fingerprint_key,
+    reseal_rotation_fingerprints,
+    rotation_fingerprint_cipher,
+    rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
@@ -219,6 +221,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    DiskFreeStatus,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -233,6 +236,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -272,6 +276,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -318,6 +323,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -1046,8 +1052,9 @@ _SCHEMA: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves
     # _schema_hash() automatically — the ADR 0064 bump — so the table is created at open on Postgres too,
     # engaging the engine's `isinstance(store, SecretRotationMetaStore)` reconcile on this backend.
     """CREATE TABLE IF NOT EXISTS secret_rotation_meta (
@@ -1538,8 +1545,7 @@ def _refuse_store_revocation(
     position the syslog forwarder and the OIDC IdP legs are also in. ``None`` (a direct test /
     embedding that derives no posture) falls through to the ambient ``current_hop_posture``, which is
     unstamped at every ``open_store`` call site -- the store is opened from the API lifespan and the
-    CLI, never inside ``build_check_registry``'s scope -- so it stays the shipped no-op. No
-    ``proxy_proven``: an engine->store hop has no declared revocation-checking egress terminator. Raises
+    CLI, never inside ``build_check_registry``'s scope -- so it stays the shipped no-op. Raises
     :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` -- a ``ValueError`` subclass, so it
     still surfaces at store open exactly like the weakened-TLS refusal it sits beside -- on a
     production-PHI verifying store hop off-loopback; WARNs on a non-production one; allows loopback and
@@ -2468,11 +2474,10 @@ class PostgresStore:
     # `isinstance(store, SecretRotationMetaStore)` reconcile on the Postgres backend (mirrors
     # MessageStore's SQLite implementation).
 
-    def secret_rotation_fingerprint_key(self) -> bytes | None:
-        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
-        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
-        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
-        return rotation_fingerprint_key(self._cipher)
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        """The cipher the rotation watcher seals each non-DEK fingerprint cell with (ASVS 13.3.4,
+        BACKLOG #3472); ``None`` when keyless or ``vault_transit``. Mirrors MessageStore's."""
+        return rotation_fingerprint_cipher(self._cipher)
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
@@ -2495,7 +2500,9 @@ class PostgresStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via ``ON CONFLICT (secret_key) DO
         UPDATE`` (MVCC-atomic — the Postgres equivalent of SQLite's INSERT OR REPLACE), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._pool.execute(
             "INSERT INTO secret_rotation_meta (secret_key, fingerprint, tracked_since, last_rotated)"
             " VALUES ($1,$2,$3,$4)"
@@ -3288,6 +3295,8 @@ class PostgresStore:
             value_col="reason",
             id_keyed=True,
         )
+        # BACKLOG #3472 (ADR 0213): each sealed secret-rotation fingerprint; store.py's twin says why.
+        total += await self._reseal_rotation_fingerprints_to_active(cipher, active_like)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
@@ -3340,6 +3349,33 @@ class PostgresStore:
             await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
+
+    async def _reseal_rotation_fingerprints_to_active(
+        self, cipher: AesGcmCipher, active_like: str
+    ) -> int:
+        """Re-seal each sealed ``secret_rotation_meta.fingerprint`` under the active key (BACKLOG
+        #3472). Mirrors MessageStore._reseal_rotation_fingerprints_to_active: one read, and a cell no
+        key opens is left in place."""
+        sealed, active = rotation_fingerprint_reseal_likes(active_like)
+        rows = await self._fetchall(
+            "SELECT secret_key, fingerprint FROM secret_rotation_meta"
+            " WHERE fingerprint LIKE $1 AND fingerprint NOT LIKE $2",
+            sealed,
+            active,
+        )
+        updates = reseal_rotation_fingerprints(
+            cipher, [(r["secret_key"], r["fingerprint"]) for r in rows]
+        )
+        if updates:
+            async with self._timed_acquire() as conn, conn.transaction():
+                for new_value, skey in updates:
+                    await conn.execute(
+                        "UPDATE secret_rotation_meta SET fingerprint=$1 WHERE secret_key=$2",
+                        new_value,
+                        skey,
+                    )
+            await self._charge_bound_batch()
+        return len(updates)
 
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
@@ -9031,6 +9067,7 @@ class PostgresStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -9054,6 +9091,7 @@ class PostgresStore:
                 passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9135,6 +9173,7 @@ class PostgresStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -9156,6 +9195,7 @@ class PostgresStore:
                 passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
+                passkey_counts=passkey_counts,
             )
             return await self._write_user(conn, user_id, change) is not None
 
@@ -9231,18 +9271,39 @@ class PostgresStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from the store cipher). asyncpg raises
         UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
         and ForeignKeyViolationError for an account that does not exist; the caller tells them
         apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
         BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
-        transaction (BACKLOG #2592)."""
+        transaction (BACKLOG #2592). See :meth:`AuthStore.add_webauthn_credential` for
+        ``for_session``: the account row is taken ``FOR UPDATE`` before the check, as every
+        factor write here takes it, so a factor bound elsewhere either committed before the check
+        reads it or waits until this transaction ends. The session row is taken ``FOR UPDATE``
+        after it, in the users-then-sessions order ``revoke_user_sessions`` keeps, so a revoke of
+        that session cannot land between the check and the commit either."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if for_session is not None:
+                record = await self._read_user_record(conn, cred.user_id)  # FOR UPDATE
+                session = await conn.fetchrow(
+                    "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", for_session
+                )
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    None if session is None else SessionRecord.from_mapping(dict(session)),
+                    record,
+                    await self._account_passkeys(conn, cred.user_id),
+                ):
+                    return False
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)
             )
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -9277,6 +9338,7 @@ class PostgresStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
@@ -9297,6 +9359,7 @@ class PostgresStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     return False
             count = await self._write_passkeys(
@@ -9531,6 +9594,7 @@ class PostgresStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -9543,28 +9607,43 @@ class PostgresStore:
         ``auth_provider`` that decides the escalation (ADR 0197), and for the SIGN-IN lock the
         TOTP's refusal is judged by ``totp_usable`` before the lock, only for a failure that would
         set a later-cycle lock, on a cell the locked row must still hold
-        (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an
+        (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the escalation is
+        ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns ``(0, False, 0)`` for an
         unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with self._timed_acquire() as conn, conn.transaction():
+            # The passkey set the escalation reads is read in the write's own transaction, after
+            # the account row is locked, so a concurrent passkey write waits (BACKLOG #3937 item 8).
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(conn, user_id),
+                read_passkeys=lambda: self._account_passkeys(conn, user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(conn, user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
@@ -10539,6 +10618,7 @@ class PostgresStore:
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
             disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
+            disk_free_status=DiskFreeStatus.NOT_APPLICABLE,
             journal_mode="postgres",
             messages=await self._count("messages"),
             events=await self._count("message_events"),

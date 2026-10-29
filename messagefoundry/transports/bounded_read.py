@@ -124,11 +124,12 @@ import http.client
 import logging
 import re
 import socket
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast, overload
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
@@ -157,6 +158,7 @@ __all__ = [
     "hop_identity",
     "is_never_proxied_host",
     "is_proxy_credential_header_name",
+    "proxy_credential_header_name_shown",
     "read_2xx_reply_text",
     "read_bounded",
     "read_bounded_text",
@@ -812,9 +814,20 @@ _DIRECT_PROXY_CREDENTIALS = (
     "this request carries a web proxy credential and would go direct, past every proxy, so the "
     "credential would reach the destination itself; refusing to send (vault BACKLOG #3417)"
 )
+_MISSPELLED_PROXY_HEADER = (
+    "this request holds a header named like Proxy-Authorization but not spelled exactly so, or "
+    "not held as a plain str, and neither urllib nor a proxy is sure to read it as the proxy's "
+    "own credential. Remove the header, or rename the header to Proxy-Authorization where that "
+    "header may be sent; a connection's own proxy credential belongs in proxy_user and "
+    "proxy_password. Refusing to send (vault BACKLOG #3416, #3457, #3490)"
+)
 _UNSENDABLE_PROXY_HEADER = (
     "this request holds a header named like Proxy-Authorization that can never be sent: "
-    "http.client refuses its name or its value; correct the header name"
+    "http.client refuses its name, its value, or both; correct that header"
+)
+_UNSENDABLE_PROXY_VALUE = (
+    "this request holds a Proxy-Authorization header whose value can never be sent: "
+    "http.client refuses the value; correct the proxy credential"
 )
 _UNVERIFIED_PROXY_TLS = (
     "this request would send a web proxy credential over TLS that does not fully verify the "
@@ -848,15 +861,19 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     **The one exception covers cleartext legs only.** A caller-set header that its connection
     admitted when it was built is sent on the cleartext leg to the proxy that connection's
     ``transports.rest.ProxyConfig`` names. The admitting check is the connection's posture-keyed
-    guard, ``transports.rest.refuse_cleartext_credential_hop``. It admits a ``proxy_user``
-    credential in at least these cases: under ``[security].enforcement = warn``, where it logs a
-    WARNING, and when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``. The
+    guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a ``proxy_user``
+    credential when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``, or the
+    proxy is on this machine. The
     connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
-    header in its plain spelling only, under a name that is a ``str`` and no subclass of one. A
-    header named with any other character at either end is never admitted, and none is sent.
+    header in its plain spelling only, under a name that is a ``str`` and no subclass of one.
+    Every other spelling :func:`is_proxy_credential_header_name` reads is never admitted, and
+    none is sent: a name with other characters at either end, and a name of the plain one, a
+    character no name can hold, and any text after it (vault BACKLOG #3457).
     Each is judged once in a request, and the answer is kept on the request:
     :func:`_proxy_header_verdicts` says how. One that could be sent is refused on every leg, a
-    verified TLS leg included: neither urllib nor a proxy is sure to take that spelling as the
+    verified TLS leg included. Its text is a fixed one about the spelling, except where a
+    cleartext leg is refused for another reason too, and where the request goes direct, which
+    keeps the direct text. Neither urllib nor a proxy is sure to take that spelling as the
     proxy's own. One that can never be sent is not refused by this rule at all; the list below
     says what happens to it. The exception never covers
     a request that goes direct. It never covers a header whose value reads, by ``str()``, as
@@ -894,10 +911,11 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
       Once every refusal above has had its turn, the request fails with the class of error
       ``http.client`` raises for it, a ``ValueError`` or a ``TypeError``, and not with this
       error. :func:`_refuse_a_proxy_header_that_can_never_be_sent` explains.
-    * The value of a plainly spelled header, where it is not a ``str``. The rule matches
+    * The value of a plainly spelled header, where it is not an exact ``str``. The rule matches
       ``str()`` of the value to a proxy URL. ``http.client`` sends a ``bytes`` value as it is,
       and any other by what its ``encode`` gives. So at least a ``bytes`` value that holds a
-      proxy URL's credential is not matched to it.
+      proxy URL's credential is not matched to it. A ``str`` subclass with its own ``__str__``
+      is read, not measured, to be the same.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -923,10 +941,11 @@ def _refuse_cleartext_proxy_credentials(
     ``proxy`` in cleartext. ``proxies`` is the handler's own map. Called after the loopback rule,
     which sends the proxy nothing."""
     # Raised here, outside any handler, so no parser error that quotes the URL rides on the refusal.
-    if _sends_cleartext_proxy_credentials(
+    refusal = _sends_cleartext_proxy_credentials(
         req, proxy, proxies, caller_header_admitted=caller_header_admitted
-    ):
-        raise ProxyCredentialsRefusedError(_CLEARTEXT_PROXY_CREDENTIALS)
+    )
+    if refusal:
+        raise ProxyCredentialsRefusedError(refusal)
 
 
 def _sends_cleartext_proxy_credentials(
@@ -935,17 +954,21 @@ def _sends_cleartext_proxy_credentials(
     proxies: Mapping[str, str],
     *,
     caller_header_admitted: bool,
-) -> bool:
-    """The reading behind the cleartext refusal. ``proxy`` is read exactly as
-    ``ProxyHandler.proxy_open`` reads it, and the request's own ``Proxy-authorization`` header is
-    read as well."""
+) -> str | None:
+    """The reading behind the cleartext refusal: the fixed text to refuse with, or ``None`` to
+    let the leg through. ``proxy`` is read exactly as ``ProxyHandler.proxy_open`` reads it, and
+    the request's own ``Proxy-authorization`` header is read as well.
+
+    A header spelled other than plainly is refused with its own fixed text about the spelling,
+    unless the leg is cleartext and would be refused for another reason too. That leaves the
+    cleartext text where it applies, and gives a verified TLS leg a text that is true of it."""
     try:
         # Private, but it is the parser proxy_open runs, so the two readings cannot differ.
         scheme, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
     except ValueError:
         # urllib raises this error itself, for every request, and its text quotes the value. So a
         # value that could hold credentials is refused first, in fixed text. Any other is left to it.
-        return "@" in proxy
+        return _CLEARTEXT_PROXY_CREDENTIALS if "@" in proxy else None
     # A header an earlier proxy_open put on this request rides along to this proxy (vault BACKLOG
     # #3410), and so does one a redirect copied, and one a caller set (vault BACKLOG #3416).
     carried = _proxy_credential_headers(req)
@@ -955,17 +978,24 @@ def _sends_cleartext_proxy_credentials(
     oddly_spelled = not all(verdict.plain for verdict in carried)
     admitted = caller_header_admitted and not oddly_spelled
     values = _judged_texts(carried)
-    if not _is_from_a_proxy_url(values, user, password, proxies) and (not carried or admitted):
-        return False
+    from_a_proxy_url = _is_from_a_proxy_url(values, user, password, proxies)
+    if not from_a_proxy_url and (not carried or admitted):
+        return None
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
     # A header already on it would then reach the destination, which the strict handlers refuse.
     if req.host and urllib.request.proxy_bypass(req.host):
-        return False
+        return None
     # The TLS leg. urllib then hands the request back to the opener, so an https proxy that takes
     # it is checked here again, with req.type now "https". The strict https handler checks that
     # its context verifies the proxy. An oddly spelled header does not cross even that leg: a
     # proxy that did not take it as its own could pass it on to the destination.
-    return oddly_spelled or not (req.type == "http" and (scheme or "").lower() == "https")
+    tls_leg = req.type == "http" and (scheme or "").lower() == "https"
+    unadmitted_plain = not caller_header_admitted and any(verdict.plain for verdict in carried)
+    if not tls_leg and (from_a_proxy_url or unadmitted_plain):
+        return _CLEARTEXT_PROXY_CREDENTIALS
+    if oddly_spelled:
+        return _MISSPELLED_PROXY_HEADER
+    return None if tls_leg else _CLEARTEXT_PROXY_CREDENTIALS
 
 
 def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, context: object) -> None:
@@ -999,8 +1029,9 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
             raise ProxyCredentialsRefusedError(_UNVERIFIED_PROXY_TLS)
     for verdict in verdicts:
         if verdict.judged and not verdict.plain:
-            # The class and text the proxy handler refuses this spelling with, on any leg.
-            raise ProxyCredentialsRefusedError(_CLEARTEXT_PROXY_CREDENTIALS)
+            # The class the proxy handler refuses this spelling with, on any leg, and its text
+            # for a spelling that is the only fault.
+            raise ProxyCredentialsRefusedError(_MISSPELLED_PROXY_HEADER)
     # Last, as http.client's own refusal came last before: every credential refusal above, and
     # the proxy handler's, has had its turn by now.
     _refuse_a_proxy_header_that_can_never_be_sent(verdicts)
@@ -1024,8 +1055,18 @@ def is_proxy_credential_header_name(name: str | bytes) -> bool:
     letter case is ignored. So is every character at either end that cannot be part of a header
     name: whitespace, a control character, a NUL. ``http.client`` sends at least a name that ends
     in a space, a tab, a NUL or a DEL as it is written, and a proxy may read each as the plain
-    name. A name that differs in any other way is another header, which the rule on
-    :class:`ProxyCredentialsRefusedError` leaves out.
+    name.
+
+    **After the plain name, any text at all is read as well, once a character that cannot be part
+    of a name stands between them** (vault BACKLOG #3457): the plain name, a NUL or a space or a
+    tab, and more text. ``http.client`` sends such a name as it is written. No proxy product was
+    measured. RFC 9112 section 5.1 puts the colon straight after the field name, so a parser that
+    stops the name at the first character a name cannot hold, or a C parser that stops at a NUL,
+    reads the plain name there. Before the plain name only such characters are skipped: text
+    there makes the name start with something else, and a parser that reads up to the first
+    character a name cannot hold reads that other text, so the name is another header.
+    ``Proxy-Authorization-2`` and ``Proxy -Authorization`` are other headers too. The rule on
+    :class:`ProxyCredentialsRefusedError` leaves every other header out.
 
     A ``bytes`` name is read as the wire would carry it. ``http.client`` sends one byte for byte,
     so it is decoded as latin-1, one character for each byte. The name's own characters are
@@ -1036,6 +1077,55 @@ def is_proxy_credential_header_name(name: str | bytes) -> bool:
     """
     text = str(name, "latin-1") if isinstance(name, bytes) else name
     return _PROXY_CREDENTIAL_NAME.fullmatch(text) is not None
+
+
+def proxy_credential_header_name_shown(name: str) -> str:
+    """``name``, which :func:`is_proxy_credential_header_name` accepts, as an error may show it.
+
+    Text around the plain name may be a credential typed into the name (vault BACKLOG #3457),
+    and a credential may hold punctuation as well as letters and digits: base64 holds ``+``,
+    ``/`` and ``=``. So nothing outside the plain name is shown but the characters
+    :func:`_is_shown_separator` names. The name is shown in ``repr`` form from its start,
+    through the plain name, up to the first other character after it, and what follows is named
+    as more text. A name with any other character before the plain name is not shown at all. At
+    most 64 characters are shown, and a cut there is named."""
+    start = _NON_NAME_RUN.match(name)
+    lead = start.end() if start is not None else 0
+    if not all(map(_is_shown_separator, name[:lead])):
+        return "a key holding Proxy-Authorization after other text, not shown"
+    cut = lead + len(_PLAIN_NAME)
+    while cut < len(name) and _is_shown_separator(name[cut]):
+        cut += 1
+    shown = repr(name[: min(cut, 64)])
+    if cut > 64:
+        shown += ", cut at 64 characters,"
+    return shown if cut >= len(name) else f"{shown} followed by more text, not shown"
+
+
+def _is_shown_separator(ch: str) -> bool:
+    """Whether an error may show ``ch`` beside the plain name (vault BACKLOG #3457).
+
+    Whitespace, control characters (category ``Cc``) and the few invisible format characters in
+    :data:`_SHOWN_FORMAT_CHARACTERS`: an operator cannot see them in the key, so the error is the
+    one place that names them, and none carries text. The set is fixed here on purpose rather
+    than read from :data:`~messagefoundry.controlchars.CONTROL_CATEGORIES`, whose safe direction
+    is the opposite (adding to it escapes more, where adding here shows more), and which holds
+    the tag characters and lone surrogates that can spell a credential one to one. And a colon,
+    which a key copied from a ``Name: value`` header line ends in. A colon is printable and a
+    credential may hold one, so a credential that starts with colons has those colons shown;
+    nothing else of it is."""
+    return (
+        ch == ":"
+        or ch.isspace()
+        or unicodedata.category(ch) == "Cc"
+        or ch in _SHOWN_FORMAT_CHARACTERS
+    )
+
+
+#: Invisible format characters an error may show beside the plain name: soft hyphen, zero-width
+#: space, non-joiner and joiner, word joiner, and byte-order mark. Each is one fixed character
+#: and carries no text, unlike the tag characters (U+E0000 block) of the same category.
+_SHOWN_FORMAT_CHARACTERS = frozenset("\u00ad\u200b\u200c\u200d\u2060\ufeff")
 
 
 def _is_spelled_plainly(name: str | bytes) -> bool:
@@ -1082,12 +1172,16 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     come before a credential refusal that applies. Nothing else is caught. Any other error says
     nothing about the header, so it stops the request where it is raised.
 
-    **Only :func:`_verdict_on` asks this, and a header that got an answer is not asked about
-    again while its request keeps that verdict.** :func:`_proxy_header_verdicts` says how long
-    that is, and which header counts as one not seen before. A second call could get another
-    answer: from a value whose ``encode`` fails once, or a name whose ``title()`` changes. An
-    error that is no verdict leaves nothing to keep, so that header is asked about again at the
-    next check, and the request stops there again.
+    **Two callers ask this, and only one answer decides whether a header is judged.**
+    :func:`_verdict_on` asks about a spelling other than the plain one, and a header that got
+    an answer is not asked about again while its request keeps that verdict.
+    :func:`_proxy_header_verdicts` says how long that is, and which header counts as one not
+    seen before. A second call could get another answer: from a value whose ``encode`` fails
+    once, or a name whose ``title()`` changes. An error that is no verdict leaves nothing to
+    keep, so that header is asked about again at the next check, and the request stops there
+    again. :func:`_refuse_a_proxy_header_that_can_never_be_sent` asks about the value of a
+    plainly spelled header, at each open and keeping nothing. That answer can only add a
+    refusal to a header the rule has already let through, so a changed answer lets nothing out.
     """
     probe = _StrictHTTPConnection("localhost")
     probe.putrequest("GET", "/")
@@ -1105,11 +1199,13 @@ class _ProxyHeaderVerdict:
     """What the rule decided about one header whose name reads as ``Proxy-Authorization``.
 
     Compared by identity only. A generated ``==`` would ask the name and the value, and a
-    name object's answer must decide nothing here."""
+    name object's answer must decide nothing here. The name and the value are left out of the
+    generated ``repr``: the value is the credential, and a name may hold any text after the
+    plain name, a credential typed into it included."""
 
     #: The name and the value as the request stores them: the two objects that were judged.
-    name: str | bytes
-    value: Any
+    name: str | bytes = field(repr=False)
+    value: Any = field(repr=False)
     #: Whether :func:`_is_spelled_plainly` accepts the name.
     plain: bool
     #: The class of error ``http.client`` raises for the header, when it is a spelling other
@@ -1125,7 +1221,7 @@ class _ProxyHeaderVerdict:
 
 
 def _verdict_on(name: str | bytes, value: Any) -> _ProxyHeaderVerdict:
-    """Judge one header. Nothing else asks ``http.client`` about one."""
+    """Judge one header. No other verdict is made by asking ``http.client``."""
     if _is_spelled_plainly(name):
         return _ProxyHeaderVerdict(name, value, plain=True, refusal=None)
     refusal = _refusal_by_http_client(name, value)
@@ -1150,7 +1246,8 @@ _VERDICTS_ATTR = "_mefor_proxy_header_verdicts"
 
 def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVerdict, ...]:
     """The verdict on each header of ``req`` whose name reads as ``Proxy-Authorization``, in the
-    order ``do_open`` sends them. Every check on a request reads its headers here.
+    order ``do_open`` sends them. Every check that reads a request's headers reads them here.
+    The cleartext check reads none when the proxy URL will not parse: it returns first.
 
     **A header is judged once, and the answer is kept on the request.** A request is checked
     more than once while it is opened: by the proxy handler, perhaps by a second one, and by
@@ -1158,8 +1255,9 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     holds at that moment, because urllib may add one in between. A header an earlier walk
     judged keeps its verdict while the request holds the same two objects, through a second
     open too. Only a header not seen before is judged: one stored under another name object,
-    or holding another value object. A verdict is dropped at the next check after the request
-    stops holding its header. Until that check the request still holds the value judged.
+    or holding another value object. A verdict is dropped at the next check, after the request
+    stops holding its header, whose walk reaches its end. A walk that raises over a later header
+    drops nothing. Until a verdict is dropped the request still holds the value judged.
 
     **What is kept, and what is not.** A verdict keeps two answers: whether the name is the
     plain spelling, and whether ``http.client`` would send the header. The first is read from
@@ -1212,7 +1310,7 @@ def _refuse_a_proxy_header_that_can_never_be_sent(
     verdicts: tuple[_ProxyHeaderVerdict, ...],
 ) -> None:
     """Raise if ``verdicts`` holds a spelling of ``Proxy-Authorization``, other than the plain
-    one, that ``http.client`` can never send.
+    one, that ``http.client`` can never send, or a plain one whose value it refuses.
 
     At least a name that starts with a space, one that holds a line feed or a colon, and one
     that will not encode as ASCII are such names. No request could carry one, so it is a fault
@@ -1228,13 +1326,42 @@ def _refuse_a_proxy_header_that_can_never_be_sent(
     Where a name is held in both stores, the unredirected header counts first here, whichever
     of the two ``do_open`` would send.
 
-    It reads the verdicts and asks ``http.client`` nothing. So a header judged unsendable is
-    refused here even where a second question would have found it sendable by then.
+    It reads the verdicts and asks ``http.client`` nothing about another spelling. So a header
+    judged unsendable is refused here even where a second question would have found it sendable
+    by then.
+
+    **A plainly spelled header whose value ``http.client`` refuses with a ``ValueError`` is
+    refused here too, with fixed text** (vault BACKLOG #3490). That library's own error quotes
+    the value, and the value is the credential. The rule has already let this header through,
+    so this question can only add a refusal: it asks ``http.client`` about the value now, at
+    each open, and keeps no answer. An answer that differs at the real send can only let
+    ``http.client`` raise its own error there, as it did before. A ``TypeError``, for a value
+    such as ``None``, is left to that library: its text names the type and not the value. An
+    exact ``str`` of printable ASCII is not asked about, because ``http.client`` sends every
+    such value, and the value a connection makes is one. Where a plain name is held in both
+    stores, both values are asked about, as the rule judges both, so a request is refused here
+    even where the value ``do_open`` would send is sendable. Only a hand-built request holds one
+    name in both stores. On a ``CONNECT`` leg the header rides the tunnel request, which
+    ``http.client`` builds without ``putheader``: it encodes the value itself, so at least an
+    ``int`` or a ``bytes`` value passes here and fails there, after the proxy is dialled and
+    with nothing sent, as it did before.
     """
     for verdict in verdicts:
         if verdict.refusal is not None:
             # Raised here, outside any handler, so no http.client error rides on it.
             raise verdict.refusal(_UNSENDABLE_PROXY_HEADER)
+        if (
+            verdict.plain
+            and _value_needs_asking(verdict.value)
+            and _refusal_by_http_client(verdict.name, verdict.value) is ValueError
+        ):
+            raise ValueError(_UNSENDABLE_PROXY_VALUE)
+
+
+def _value_needs_asking(value: Any) -> bool:
+    """Whether ``http.client`` must be asked about a plain header's value. Every exact ``str`` of
+    printable ASCII is a value it sends, so only another value needs the question."""
+    return not (type(value) is str and value.isascii() and value.isprintable())
 
 
 def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:
@@ -1390,11 +1517,15 @@ def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 _TOKEN = f"[{_TCHARS}]+"
 _FIELD_NAME = re.compile(_TOKEN)
-#: ``Proxy-Authorization`` in any ASCII letter case, with any run of characters that no field
-#: name can hold at either end. Matched whole, so a long name costs linear time.
+#: ``Proxy-Authorization`` in any ASCII letter case. Before it, any run of characters that no
+#: field name can hold. After it, nothing, or one such character and then any text at all, so
+#: the plain name, a NUL or a space, and more text is read too (vault BACKLOG #3457). Matched
+#: whole, so a long name costs linear time.
 _PROXY_CREDENTIAL_NAME = re.compile(
-    rf"[^{_TCHARS}]*{_PLAIN_NAME}[^{_TCHARS}]*", re.ASCII | re.IGNORECASE
+    rf"[^{_TCHARS}]*{_PLAIN_NAME}(?:[^{_TCHARS}].*)?", re.ASCII | re.IGNORECASE | re.DOTALL
 )
+#: A run of characters that no field name can hold, matched from the start only.
+_NON_NAME_RUN = re.compile(rf"[^{_TCHARS}]*")
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")

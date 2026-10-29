@@ -507,7 +507,7 @@ validation to succeed, the database's certificate must chain to a CA the host al
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
 | **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
 
 ### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
 
@@ -806,12 +806,14 @@ what it read, so a host that only has `pyodbc` installed does not fail on a poli
 uses.
 
 The answer is unknown where at least one of these holds: the graph did not load or there is no
-`--config` directory; the service settings did not load; they came from the defaults alone, with
-no `--service-config`, no `./messagefoundry.toml` and no `MEFOR_STORE_BACKEND`, because the store
-could then be SQL Server; or every DATABASE connection found uses the generic dialect, whose
-driver brings its own TLS. The row then still reads the policy, but reports a FAIL or ERROR reading as
-MANUAL with the reading in its detail. Run `verify` with `--config` and `--service-config` naming
-the deployment's own, to get a FAIL that counts. Without `--config` the answer is unknown too,
+`--config` directory; the service settings did not load; the shell that runs `verify` does not set
+`MEFOR_STORE_BACKEND`; or every DATABASE connection found uses the generic dialect, whose driver
+brings its own TLS. That variable overrides the service config file, and the service's own
+environment may set it where your shell does not, so a file that says `sqlite` does not show the
+store the service opens, which could be SQL Server. The row then still reads the policy, but
+reports a FAIL or ERROR reading as MANUAL with the reading in its detail. Run `verify` with
+`--config` and `--service-config` naming the deployment's own, and with `MEFOR_STORE_BACKEND` set
+as the service sets it, to get a FAIL that counts. Without `--config` the answer is unknown too,
 because the default, `samples/config`, is the sample graph.
 
 It runs the commands of this step. It differs from them in at least the ways named here:
@@ -822,7 +824,14 @@ It runs the commands of this step. It differs from them in at least the ways nam
   runs the `Get-TlsCipherSuite` the imported module exports, never one looked up by name. Given a path,
   `Import-Module` loads from that path and does not search the module path, which is where a
   module in the account's Documents folder would be found. That is read from the command, not
-  measured: no run planted a same-named module in a Documents folder. No command it runs is
+  measured: no run planted a same-named module in a Documents folder. The PowerShell it starts
+  also gets a `PSModulePath` fixed to the system modules folder, and a `PATH` fixed to the system
+  folders. Given that `PSModulePath`, Windows PowerShell 5.1 leaves the Documents folder off its
+  module path (measured 2026-10-26). The import by path covers the folder's manifest, not every
+  module that manifest names in turn: on one Windows 11 host, read 2026-10-26, `TLS\tls.psd1`
+  names its root module, `Microsoft.WindowsAuthenticationProtocols.Commands`, by name alone, with
+  no file of that name beside it. How PowerShell resolves that name, and whether the fixed
+  `PSModulePath` bounds it, was not read. No command it runs is
   looked up by a bare name, so a program or script of that name on the `PATH`, such as a
   `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
   `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
@@ -836,35 +845,56 @@ It runs the commands of this step. It differs from them in at least the ways nam
   local list that `Get-TlsCipherSuite` prints still holds a suite that is not AEAD. Whether that
   local list follows the policy is **unmeasured**; until it is measured, read such a FAIL against
   the policy list the row prints.
-- Linux: `openssl ciphers -s -v` from the `PATH`, and the `CipherString`, `Ciphersuites` and
-  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. It differs from the manual `grep` in at least
-  these ways. Where `OPENSSL_CONF` is set in the environment, it reads the file that variable
-  names, which is the file `openssl` itself loaded, so there the row and the manual `grep` read
-  different files. It reads only the section OpenSSL applies as the system default: it follows
+- Linux: Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target),
+  so this branch is only for a Linux host outside that support, such as the container image. It
+  runs `openssl ciphers -s -v` from the `PATH`. It reads the `CipherString`, `Ciphersuites` and
+  `MinProtocol` lines of the file that `openssl` loads, which is not always the file the manual
+  `grep` reads. Where `OPENSSL_CONF` is set in the environment, that is the file the variable
+  names, and the row reads it alone. Otherwise it is `openssl.cnf` in the `OPENSSLDIR` folder that
+  `openssl version -d` prints, which the row runs as a second `openssl` start. That folder is
+  fixed when `openssl` is built, so it may not be `/etc/ssl`. Then the row also reads
+  `/etc/ssl/openssl.cnf`, and the worse of the two readings stands. A program named `openssl`
+  earlier on the `PATH` can print any folder, so this keeps it from hiding that file's floor FAIL.
+  It does not stop such a program from supplying the suite verdict, which comes from its own
+  output. Nor does the file check judge what a `CipherString` line allows; it only counts them.
+  One file under both names is read once. Where nothing is at `/etc/ssl/openssl.cnf`, the row
+  reads the binary's file. A FAIL there stands, but a PASS reads MANUAL, because nothing checks
+  the file that `openssl` named. A link there that leads to nothing reads MANUAL, and any other
+  error reading it is an ERROR. It differs from the manual `grep` in at least these ways too. It reads only the section OpenSSL applies as the system default: it follows
   `openssl_conf` in the top of the file, then that section's `ssl_conf`, then that section's
   `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. The
   `ssl_conf` line names a module, so as in OpenSSL it may carry a suffix after its last `.`, such
   as `ssl_conf.0`. A shorter name OpenSSL may match to that module as a prefix, such as `ssl`,
   reads MANUAL. A file where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
   regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
-  drops a `#` comment outside quotes, and drops a leading byte-order mark. It ends a line only at a
-  newline, as OpenSSL does. Any `openssl ciphers` output line not shaped like a suite line makes
-  the row ERROR, as on Windows. It does not follow at
-  least these: an `.include` or `.pragma` line, a line that ends in a backslash, a
-  `section::name` assignment, or a `$name` value. A file with any of the first four anywhere, or
-  with `$` in a `CipherString` or `MinProtocol` value or in the section chain, reads MANUAL. So does
-  an `OPENSSL_CONF` that is set but empty. A PASS still rests on this reading matching OpenSSL's
-  for every construct the file uses. RHEL-family hosts, which set the policy through
-  `update-crypto-policies` and an included file, are outside what this row was written and
-  measured for. On a stock one, expect MANUAL: its file pulls the policy in through `.include`, and
-  it is not at `/etc/ssl/openssl.cnf`. That is **unmeasured**.
+  and drops a leading byte-order mark. As in OpenSSL, a backtick quotes a value too. It drops a
+  `#` comment outside quotes. It ends a line at a newline. OpenSSL can also end one at a lone
+  carriage return, where that falls at the end of a block it reads, so the row refuses a lone
+  carriage return (below). As in OpenSSL, only a space, a tab or a carriage return counts as space.
+  Any `openssl ciphers` output line not shaped like a
+  suite line makes the row ERROR, as on Windows. It does not follow at least these: an `.include`
+  or `.pragma` line, a `section::name` assignment, a variable from the `ENV` section, and a NUL, a
+  lone carriage return or a backslash at the end of a line. Outside a comment line, it does not
+  follow any backslash or non-ASCII character either. OpenSSL reads any name that starts with
+  `.include` as that line, such as `.include_x`, so the row does too. A file with any of these
+  anywhere reads MANUAL. So does a file with `$` in a `CipherString` or `MinProtocol` value or in
+  the section chain. A file with a line the row cannot read as OpenSSL does reads MANUAL as well.
+  Such lines include at least one with no `=`, and one using a `$name` that no earlier line
+  defines. With the OpenSSL 3.5.7 that Git for
+  Windows ships, one such line anywhere made OpenSSL apply none of the file (measured
+  2026-10-26). An `OPENSSL_CONF` that is set but empty reads MANUAL too. Where no file is at the
+  path read, OpenSSL applies no policy, so the row reads FAIL. A PASS still rests on
+  this reading matching OpenSSL's for every construct the file uses. RHEL-family hosts, which set
+  the policy through `update-crypto-policies` and an included file, are outside what this row was
+  written and measured for. On a stock one, expect MANUAL, because its file pulls the policy in
+  through `.include`. That is **unmeasured**.
 
 | Status | When |
 |---|---|
 | PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the system-default section holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
-| FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
-| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
-| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
+| FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. On Linux, no OpenSSL file at the path read fails too, because OpenSSL then applies no policy. |
+| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; `openssl version -d` printed other than one `OPENSSLDIR` line; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
+| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow or holds a line it cannot read (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
 | SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a

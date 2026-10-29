@@ -171,19 +171,12 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
             ad_bind_dn="CN=svc,DC=x",
             ad_bind_password="x",
         )
-    # ldaps is accepted, as is an explicit trusted-network override
+    # ldaps is accepted. The trusted-network override that also let ldap:// through was removed
+    # (vault BACKLOG #3533 item 1); tests/test_security_posture_defaults.py pins its refusal.
     AuthSettings(
         ad_enabled=True,
         ad_server="ldaps://dc",
         ad_user_search_base="DC=x",
-        ad_bind_dn="CN=svc,DC=x",
-        ad_bind_password="x",
-    )
-    AuthSettings(
-        ad_enabled=True,
-        ad_server="ldap://dc",
-        ad_user_search_base="DC=x",
-        ad_allow_insecure_ldap=True,
         ad_bind_dn="CN=svc,DC=x",
         ad_bind_password="x",
     )
@@ -466,6 +459,7 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
                 max_lockout_seconds=86_400.0,
                 now=time.time(),
                 totp_usable=_opened_totp_state,
+                passkey_escalates=None,
             )
 
     async with _client(engine, service, serve_ui=True) as c:

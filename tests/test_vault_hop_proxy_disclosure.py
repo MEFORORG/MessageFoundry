@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import os
 import urllib.request
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +24,7 @@ from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # The cleartext-hop tests' stand-in proxy: a loopback socket that hangs up on every connection.
 from tests._vault_hop_sockets import _closed_port, _Listener
+from tests._vault_hop_sockets import listener as listener  # noqa: F401  (the fixture, re-exported)
 
 pytestmark = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
@@ -65,15 +65,6 @@ def _clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(hvac.v1, name, None, raising=False)
 
 
-@pytest.fixture
-def listener() -> Iterator[_Listener]:
-    lst = _Listener()
-    try:
-        yield lst
-    finally:
-        lst.close()
-
-
 def _disclosures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [r for r in caplog.records if _PICKED in r.getMessage()]
 
@@ -109,9 +100,14 @@ def test_one_proxy_is_named_once_per_hop_and_never_with_its_credential(
     assert "alice" not in text and _CANARY not in text and "@" not in text
 
 
-def test_the_pointer_names_a_heading_the_doc_has() -> None:
+def test_the_pointer_names_a_heading_the_doc_has_under_egress() -> None:
+    """The WARNING says the heading is under ``[egress]``, so the test reads that, not only that
+    the heading exists. Mutation: move the sub-heading under ``[shadow]``; red."""
     doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text("utf-8")
-    assert f"##### {_HOP_HEADING}\n" in doc.replace("\r\n", "\n")
+    lines = doc.replace("\r\n", "\n").split("\n")
+    at = lines.index(f"##### {_HOP_HEADING}")
+    parent = next(line for line in reversed(lines[:at]) if line.startswith("### "))
+    assert parent == "### `[egress]`", parent
 
 
 def test_a_new_proxy_or_another_hop_is_named_again(caplog: pytest.LogCaptureFixture) -> None:
@@ -180,6 +176,38 @@ def test_a_proxy_urllib3_reads_no_host_from_is_named_unreadable(
 
     monkeypatch.setattr(strict_requests, "proxy_label", lambda _value: "http://None")
     assert strict_requests._dialled_proxy_label("http://") == "an unreadable value"
+
+
+def test_a_proxy_with_userinfo_and_no_host_is_named_unreadable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """requests' prepend raises TypeError on "http://u@", joining a userinfo to a host of None.
+    Mutation: drop TypeError from the except; red, the call raises."""
+    from messagefoundry.transports import strict_requests
+
+    assert strict_requests._dialled_proxy_label("http://u@") == "an unreadable value"
+    with caplog.at_level(logging.WARNING):
+        _disclose(_KV, "http://u@")
+    assert f"{_PICKED}an unreadable value." in _disclosures(caplog)[0].getMessage()
+
+
+def test_a_label_that_fails_to_build_leaves_the_value_unmarked(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """So the next send that picks the value still names it. Mutation: mark the value before
+    building the label; red, the second send logs nothing."""
+    from messagefoundry.transports import strict_requests
+
+    def _boom(_value: str) -> str:
+        raise RuntimeError("synthetic: the label failed to build")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(strict_requests, "_dialled_proxy_label", _boom)
+        with pytest.raises(RuntimeError):
+            _disclose(_KV, "http://proxy.example:3128")
+    with caplog.at_level(logging.WARNING):
+        _disclose(_KV, "http://proxy.example:3128")
+    assert len(_disclosures(caplog)) == 1, caplog.text
 
 
 # --- the shipped Vault clients --------------------------------------------------------------------

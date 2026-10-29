@@ -938,9 +938,12 @@ def _anchored_service_config(
     # so the OIDC anchor is the only one checked.
     monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "not-a-real-password")
     security = ""
+    # The DC is on this host too. Since BACKLOG #2193 the LDAPS bind takes the revocation guard,
+    # and this command passes the posture `serve` passes, so an off-box DC with no
+    # [auth].ad_tls_crl_file would be refused at enforce before either anchor is judged.
     auth = (
         "ad_enabled = true\n"
-        'ad_server = "ldaps://dc1.example.test:636"\n'
+        'ad_server = "ldaps://127.0.0.1:636"\n'
         'ad_user_search_base = "DC=example,DC=test"\n'
         'ad_bind_dn = "CN=svc,DC=example,DC=test"\n'
         'ad_domain = "example.test"\n'
@@ -1048,7 +1051,7 @@ def test_the_command_provisions_where_serve_would_start(
         # ONE warning, on both stores (BACKLOG #2081). The command builds AuthService once; an
         # existing store used to build it twice, and so printed the same warning twice.
         assert len(warned) == 1, warned
-        assert "enforcement=warn, starting anyway" in warned[0]
+        assert "enforcement=warn, using it anyway" in warned[0]
 
 
 @pytest.mark.parametrize("hop", _HOPS)
@@ -1156,7 +1159,8 @@ def _secret_ad_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, ref: s
         '[secrets]\nprovider = "env"\n'
         "[auth]\n"
         "ad_enabled = true\n"
-        'ad_server = "ldaps://dc1.example.test:636"\n'
+        # On this host, so the LDAPS revocation guard (BACKLOG #2193) allows it.
+        'ad_server = "ldaps://127.0.0.1:636"\n'
         'ad_user_search_base = "DC=example,DC=test"\n'
         'ad_bind_dn = "CN=svc,DC=example,DC=test"\n'
         'ad_domain = "example.test"\n'
@@ -1347,7 +1351,13 @@ def test_an_off_box_idp_with_no_revocation_check_is_refused_at_enforce_as_serve_
     _key_in_this_shell(monkeypatch)
     _pin_verdict(monkeypatch, owner_only=True)
     cfg = _anchored_service_config(tmp_path, monkeypatch, "oidc", enforcement)
-    text = cfg.read_text(encoding="utf-8").replace("127.0.0.1", "idp.example")
+    # The IdP moves off the box; the DC stays on it, so the LDAPS guard (BACKLOG #2193) allows it
+    # and the OIDC refusal is the one this test reads.
+    text = (
+        cfg.read_text(encoding="utf-8")
+        .replace("https://127.0.0.1", "https://idp.example")
+        .replace('["127.0.0.1"]', '["idp.example"]')
+    )
     cfg.write_text(text, encoding="utf-8")
     db = tmp_path / "p.db"
     argv = [

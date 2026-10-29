@@ -33,7 +33,7 @@ import aiosqlite
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.api.app import _alert_reconcile_plan
+from messagefoundry.api.app import _OUTAGE_ALERT_SOURCE, _alert_reconcile_plan
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
@@ -53,6 +53,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
+    _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
@@ -71,6 +72,7 @@ from messagefoundry.store.store import (
     audit_row_hash,
 )
 from tests._admin_account import create_local_user_chosen
+from tests.test_ad_user_account_control import _InverseSink
 from tests.test_approval_requester_recheck import _Sink
 from tests.test_user_seal import _raw_for
 
@@ -2156,6 +2158,216 @@ async def test_a_deleted_search_base_aborts_alerts_and_never_revokes(
         await store.close()
 
 
+# --- an unanswered account blocks the clears across passes (BACKLOG #3844) -------------------------
+
+_UnansweredKind = Literal["referred", "faulted", "misconfigured"]
+_UNANSWERED_KINDS: tuple[_UnansweredKind, ...] = get_args(_UnansweredKind)
+
+
+def test_the_unanswered_outcomes_are_the_unjudged_ones_less_unavailable() -> None:
+    """BACKLOG #3844. ``service._UNANSWERED_OUTCOMES`` is written out by hand beside
+    ``reconcile._UNJUDGED``. An unjudged outcome added there and not here would not be carried.
+
+    RED when: the two sets drift apart."""
+    expected = reconcile._UNJUDGED - {reconcile.ProbeOutcome.UNAVAILABLE}
+    assert expected == _UNANSWERED_OUTCOMES
+
+
+def _leave_unanswered(ldap: _FakeLdap, name: str, kind: _UnansweredKind) -> None:
+    """Make every probe of ``name`` go unanswered, as a referral, a fault or a refusal."""
+    if kind == "referred":
+        ldap.referring.add(name)
+    elif kind == "faulted":
+        ldap.broken[name] = KeyError("userAccountControl")  # a malformed entry
+    else:
+        ldap.broken[name] = _no_such_base()
+
+
+async def _sampled_pass(
+    service: AuthService, ids: dict[str, str], sample: set[str]
+) -> reconcile.ReconcilePlan:
+    """One pass whose probe sample is exactly ``sample``, on a budget of ``len(sample)``: those
+    accounts read as never probed, so they sort first, and every other one as probed last."""
+    assert len(sample) == service._settings.ad_session_recheck_max_users, "the sample is the budget"
+    later = time.monotonic() + 1e6
+    for name, user_id in ids.items():
+        if name in sample:
+            service._reconcile_last_probed.pop(user_id, None)
+        else:
+            service._reconcile_last_probed[user_id] = later
+    return await service.reconcile_directory_sessions()
+
+
+async def _watched_estate(
+    store: MessageStore, names: tuple[str, ...]
+) -> tuple[AuthService, _FakeLdap, dict[str, str]]:
+    """Every account in ``names`` signed in and read PRESENT once, two per pass, on a process whose
+    own passes held, tripped and saw a referral before, with nothing left unconfirmed or referred.
+    Set directly, as ``_marked`` in ``tests/test_ad_user_account_control.py`` does, so the clear
+    predicate is the only thing left to decide. The pass that completes the record is the
+    control: it marks both clears."""
+    ldap = _FakeLdap({n: _principal(n) for n in names})
+    service = AuthService(store, _ad_settings(ad_session_recheck_max_users=2), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    for name in names:
+        assert await _signed_in_ad_user(service, store, name) is not None
+    ids = {n: (await store.get_user_by_username(n)).id for n in names}  # type: ignore[union-attr]
+    service._reconcile_hold_standing = "held"
+    service._reconcile_breaker_standing = "tripped"
+    service._reconcile_referral_standing = "referred"
+    first = await _sampled_pass(service, ids, {names[0], names[1]})
+    assert (first.breaker_clear, first.hold_clear) == (False, False)  # one account unread yet
+    control = await _sampled_pass(service, ids, {names[0], names[2]})
+    assert (control.breaker_clear, control.hold_clear) == (True, True), "the control did not clear"
+    return service, ldap, ids
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_a_later_sample_misses_still_blocks_both_clears(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844, the two-pass case. ``cdoe`` reads PRESENT, then its probe is referred,
+    faults or is refused for its configuration, beside a clean ``alice``: that pass marks no clear.
+    The next sample misses ``cdoe``, whose older PRESENT is still on record. It must mark neither
+    the breaker's clear nor the hold's: that answer predates the probe that went unanswered. The
+    positive control: once a pass reads ``cdoe`` PRESENT again, both clear.
+
+    The referral's own clear does not read the carried set (``_mark_reconcile_clears`` says why):
+    after a fault or a refusal the missed pass marks it, and after a referral ``cdoe`` is still
+    marked on the referral's own record, so it does not.
+
+    RED when: only THIS pass's referred, faulted or refused accounts stop a clear, so the second
+    pass reads the older answer as current and marks both, or a fault or a refusal holds the
+    referral's clear."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+
+        _leave_unanswered(ldap, "cdoe", kind)
+        unanswered = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert unanswered.aborted is None
+        assert getattr(unanswered, kind) == (ids["cdoe"],)
+        assert (unanswered.breaker_clear, unanswered.hold_clear) == (False, False)
+
+        missed = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert missed.aborted is None and getattr(missed, kind) == ()
+        assert service._reconcile_outcomes[ids["cdoe"]] is reconcile.ProbeOutcome.PRESENT
+        assert (missed.breaker_clear, missed.hold_clear) == (False, False), (
+            f"a sample that missed the {kind} account read its older answer as current"
+        )
+        assert missed.referral_clear is (kind != "referred")
+
+        ldap.referring.clear()
+        ldap.broken.clear()  # the cause is gone
+        answered = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert (answered.breaker_clear, answered.hold_clear) == (True, True)
+        assert answered.referral_clear
+        assert service._reconcile_unanswered == set()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_is_marked_by_a_pass_that_raises_after_its_probes(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. A pass stamps each probed account to the back of the rotation as it probes.
+    One that raises after its probes, on a store read for instance, must still have marked
+    ``cdoe`` unanswered, or a next sample that misses ``cdoe``, as the stamp makes likely, reads
+    its older answer as current. The helper picks that sample by hand; the mark is the subject.
+
+    RED when: the mark is written only once the pass has planned, after the stamp."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+
+        async def _refused(name: str) -> Any:
+            raise RuntimeError("synthetic: store read refused")
+
+        healthy = service._ad_map
+        service._ad_map = _refused  # type: ignore[method-assign]
+        try:
+            with pytest.raises(RuntimeError, match="store read refused"):
+                await _sampled_pass(service, ids, {"alice", "cdoe"})
+        finally:
+            service._ad_map = healthy  # type: ignore[method-assign]
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+
+        missed = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert (missed.breaker_clear, missed.hold_clear) == (False, False)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_any_later_answer_ends_an_unanswered_account_and_an_unreachable_probe_does_not(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. What ends an account's part is a later answer on record, any answer, because
+    the test asks only whether the record postdates the probe that went unanswered; the other
+    tests then judge it. So an ABSENT read ends it, and its strike, not the set, then keeps the
+    breaker's clear. A probe that could not reach the directory recorded nothing, so it does not.
+
+    RED when: only PRESENT ends a part, or an unavailable probe ends one."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+        await _sampled_pass(service, ids, {"alice", "cdoe"})
+
+        ldap.referring.clear()
+        ldap.broken.clear()
+        ldap.unreachable.add("cdoe")
+        unreachable = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert unreachable.unavailable == 1
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+        assert (unreachable.breaker_clear, unreachable.hold_clear) == (False, False)
+
+        ldap.unreachable.clear()
+        del ldap.present["cdoe"]  # answered, as gone from the directory
+        absent = await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert absent.outcomes[ids["cdoe"]] is reconcile.ProbeOutcome.ABSENT
+        assert service._reconcile_unanswered == set()
+        # The hold reads a fresh answer that is not undetermined; the breaker reads a strike.
+        assert (absent.breaker_clear, absent.hold_clear) == (False, True)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", _UNANSWERED_KINDS)
+async def test_an_unanswered_account_that_signs_out_takes_its_part_with_it(
+    kind: _UnansweredKind,
+) -> None:
+    """BACKLOG #3844. The carried set holds accounts still signed in. Once ``cdoe`` signs out
+    unanswered, a clear rests only on the accounts that remain, each with a fresh answer on
+    record, and this rule forfeits nothing: an unjudged probe left the outcome record and the
+    trip's marks as they were, and those are what forfeit on leaving
+    (``_forfeit_clears_on_attrition``). The referral's own record still does: a referred account
+    that leaves before it reads PRESENT forfeits the referral's clear.
+
+    RED when: an unanswered account's leaving forfeits a clear or blocks one, or the set keeps an
+    account that holds no session, so it grows without bound under churn."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap, ids = await _watched_estate(store, ("alice", "bwong", "cdoe"))
+        _leave_unanswered(ldap, "cdoe", kind)
+        await _sampled_pass(service, ids, {"alice", "cdoe"})
+        assert service._reconcile_unanswered == {ids["cdoe"]}
+
+        await store.revoke_user_sessions(ids["cdoe"])  # signs out, still unanswered
+        del ids["cdoe"]
+        after = await _sampled_pass(service, ids, {"alice", "bwong"})
+        assert service._reconcile_unanswered == set()
+        assert (after.breaker_clear, after.hold_clear) == (True, True)
+        assert service._reconcile_breaker_standing == "tripped"
+        assert service._reconcile_hold_standing == "settled"
+        forfeited = service._reconcile_referral_standing == "forfeit"
+        assert forfeited is (kind == "referred")
+    finally:
+        await store.close()
+
+
 async def test_a_breaker_trip_does_not_mark_an_id_less_row_or_forfeit_its_clear() -> None:
     """BACKLOG #2434, the breaker's half of the referral test above. A trip marks every candidate
     unconfirmed until a pass reads it PRESENT, and revoking a marked account forfeits the clear. An
@@ -2278,10 +2490,220 @@ async def test_an_outage_beside_an_id_less_row_counts_only_the_probes_asked(
             for a in await store.list_audit()
             if a["action"] == "auth.ad_reconcile_skipped"
         ]
-        assert skipped == [{"reason": "directory_unavailable", "asked": 2}]
+        assert skipped == [{"reason": "directory_unavailable", "asked": 2, "passes": 1}]
         warned = [r.getMessage() for r in caplog.records if "probes failed" in r.getMessage()]
         assert len(warned) == 1 and "ALL 2 probes failed" in warned[0]
         assert (plan.probed, plan.asked, plan.unavailable) == (3, 2, 2)
+    finally:
+        await store.close()
+
+
+def _outage_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]]]:
+    return [e for e in sink.events if e[1] == _OUTAGE_ALERT_SOURCE]
+
+
+async def _outage_service(store: MessageStore, **over: object) -> tuple[AuthService, _FakeLdap]:
+    ldap = _FakeLdap({"alice": _principal("alice"), "bob": _principal("bob")})
+    service = AuthService(store, _ad_settings(**over), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    for name in ("alice", "bob"):
+        assert await _signed_in_ad_user(service, store, name) is not None
+    return service, ldap
+
+
+async def _pass(service: AuthService, sink: _InverseSink) -> reconcile.ReconcilePlan:
+    plan = await service.reconcile_directory_sessions()
+    _alert_reconcile_plan(plan, service, sink)
+    return plan
+
+
+@pytest.mark.parametrize("threshold", [2, 3, 5])
+async def test_a_lasting_outage_pages_once_and_the_next_reach_resolves_it(threshold: int) -> None:
+    """BACKLOG #3709. ``threshold`` unreachable passes page exactly once; one more unreachable pass
+    pages nothing more; the first pass that reaches the directory resolves the instance.
+
+    RED when: an outage never pages, pages on every pass, or nothing resolves it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=threshold)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for n in range(1, threshold):
+            plan = await _pass(service, sink)
+            assert plan.directory_outage and plan.outage_passes == n
+        assert _outage_events(sink) == []  # the N-1 control: no page yet
+        plan = await _pass(service, sink)
+        assert plan.outage_page and plan.outage_passes == threshold
+        paged = _outage_events(sink)
+        assert len(paged) == 1
+        kind, _source, payload = paged[0]
+        assert kind == "ad_reconcile_aborted"
+        assert payload["reason"] == "directory_unavailable" and payload["probed"] == 2
+        assert f"succeeded in {threshold} reconcile passes" in payload["detail"]
+        assert len(payload["detail"]) <= 200  # the store keeps 200 characters of a reason
+
+        await _pass(service, sink)  # one more unreachable pass after firing
+        assert len(_outage_events(sink)) == 1
+
+        ldap.unreachable = set()  # the directory comes back
+        plan = await _pass(service, sink)
+        assert plan.outage_clear and plan.outage_passes == 0
+        assert _outage_events(sink)[1:] == [
+            ("ad_reconcile_breaker_cleared", _OUTAGE_ALERT_SOURCE, {})
+        ]
+        skipped = [
+            json.loads(a["detail"])["passes"]
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_skipped"
+        ]
+        assert sorted(skipped) == list(range(1, threshold + 2))  # newest first, so sorted
+    finally:
+        await store.close()
+
+
+async def test_an_outage_run_one_short_pages_nothing_and_a_reach_restarts_the_count() -> None:
+    """BACKLOG #3709. N-1 unreachable passes page nothing, and a reach between two short runs
+    restarts the count, so two short runs never add up to a page. Nothing paged, so nothing
+    resolves either.
+
+    RED when: the count survives a pass that reached the directory, or a reach with nothing paged
+    raises the inverse."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default, 3
+        sink = _InverseSink()
+        for _run in range(2):
+            ldap.unreachable = {"alice", "bob"}
+            for _ in range(2):
+                assert (await _pass(service, sink)).directory_outage
+            ldap.unreachable = set()
+            plan = await _pass(service, sink)
+            assert not plan.outage_clear and plan.outage_passes == 0
+        assert _outage_events(sink) == []
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_asks_nothing_leaves_the_outage_run_alone() -> None:
+    """BACKLOG #3709. A pass with nobody signed in asks the directory nothing, so it neither ends
+    nor extends a run: it learned nothing about the directory.
+
+    RED when: a no-candidate pass resets the count, or counts as unreachable."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        for name in ("alice", "bob"):  # everyone signs out
+            row = await store.get_user_by_username(name)
+            assert row is not None
+            await store.revoke_user_sessions(row.id)
+            assert await store.list_sessions(row.id) == []
+        empty = await _pass(service, sink)
+        assert empty.asked == 0 and not empty.outage_page and not empty.outage_clear
+        assert _outage_events(sink) == []
+        ldap.unreachable = set()  # to sign back in; the directory then goes away again
+        assert await _signed_in_ad_user(service, store, "alice") is not None
+        ldap.unreachable = {"alice", "bob"}
+        third = await _pass(service, sink)  # the run's third, not a new run's first
+        assert third.outage_page and third.outage_passes == 3
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+def test_the_outage_page_threshold_is_at_least_two() -> None:
+    """BACKLOG #3709. One pass is a blip, so a threshold of one would page on every blip."""
+    assert _ad_settings().ad_reconcile_outage_passes == 3
+    for refused in (1, 101):  # 101: a huge value would switch the page off in all but name
+        with pytest.raises(ValidationError, match="ad_reconcile_outage_passes"):
+            _ad_settings(ad_reconcile_outage_passes=refused)
+    for kept in (2, 100):
+        assert _ad_settings(ad_reconcile_outage_passes=kept).ad_reconcile_outage_passes == kept
+
+
+async def test_a_pass_of_id_less_rows_only_leaves_the_outage_run_alone() -> None:
+    """BACKLOG #3709. A pass whose only candidates are id-less rows asks the directory nothing, so
+    it neither ends the run nor resolves a page.
+
+    RED when: such a pass resets the count, or raises the inverse."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        for name in ("alice", "bob"):
+            await _clear_directory_object_id(store, name)
+        unasked = await _pass(service, sink)
+        assert unasked.asked == 0 and unasked.outage_passes == 2 and not unasked.outage_clear
+        assert len(_outage_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_fault_only_pass_leaves_the_run_and_a_referral_pass_resolves_it() -> None:
+    """BACKLOG #3709. A pass whose every probe failed or faulted says nothing about whether the
+    directory was reached, so it neither ends the run nor resolves the page. A pass of referrals
+    only judged nothing, but the directory answered it, so it resolves the page.
+
+    RED when: a fault-only pass reads as a reach, or a referral-only pass does not."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
+        ldap.unreachable = {"bob"}
+        ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
+        faulted = await _pass(service, sink)
+        assert faulted.probe_fault and faulted.outage_passes == 2 and not faulted.outage_clear
+        ldap.unreachable, ldap.broken = set(), {}
+        ldap.referring = {"alice", "bob"}
+        referred = await _pass(service, sink)
+        assert referred.directory_referral and referred.outage_clear
+        assert _outage_events(sink)[-1] == (
+            "ad_reconcile_breaker_cleared",
+            _OUTAGE_ALERT_SOURCE,
+            {},
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709. The page is latched only once its pass's rows are written, so a pass that
+    raises first leaves the next outage pass to page, as a paging refusal's does.
+
+    RED when: the latch is set before the pass can raise, so the run never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        await _pass(service, sink)
+        real = service._record_paging_refusals
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: store refused")
+
+        monkeypatch.setattr(service, "_record_paging_refusals", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(service, "_record_paging_refusals", real)
+        plan = await _pass(service, sink)
+        assert plan.outage_page and plan.outage_passes == 3
+        assert len(_outage_events(sink)) == 1
+        await _pass(service, sink)
+        assert len(_outage_events(sink)) == 1
     finally:
         await store.close()
 

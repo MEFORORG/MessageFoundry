@@ -455,9 +455,8 @@ async def _reconciler(
     """A real ``AuthService`` over a fresh store, probing through ``authenticator``."""
     store = await MessageStore.open(":memory:")
     try:
-        settings = _ad_settings(
-            ad_server=f"ldap://127.0.0.1:{port}", ad_allow_insecure_ldap=True, **over
-        )
+        # The AuthService reads no address of its own here: `authenticator` makes every bind.
+        settings = _ad_settings(ad_server=f"ldaps://127.0.0.1:{port}", **over)
         yield AuthService(store, settings, ldap=authenticator), store
     finally:
         await store.close()
@@ -694,24 +693,58 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     assert ldap_module._REFERRAL_TAG not in asn1.BIND_RESPONSE_CONTEXT
 
 
-def test_an_unbind_error_never_replaces_the_refusal() -> None:
+def test_an_unbind_error_never_replaces_how_the_block_ended(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Round-one review finding. Both bind branches answer with the block's own exception, so an
     unbind failing after an undecodable bind must not replace it on one branch only. After a
-    clean block, the unbind's error still propagates."""
+    clean block that marked its answer as standing, a refusal, the unbind's error is logged and
+    not raised either (BACKLOG #3848). After a clean block that did not, a pass, it is raised: an
+    unbind error never upgrades an answer toward a pass. Every time the socket is closed without
+    sending, because ldap3 closes only after a successful send."""
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
-    conn = SimpleNamespace(unbind=_raise(unbind_fault))
+    closes: list[str] = []
+    conn = SimpleNamespace(
+        unbind=_raise(unbind_fault), strategy=SimpleNamespace(close=lambda: closes.append("x"))
+    )
     refusal = LdapUndecodableError("synthetic refusal")
-    with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn):
+    with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn, "user bind"):
         raise refusal
     assert raised.value is refusal
-    with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
+    assert closes == ["x"]
+    caplog.clear()
+    with (
+        caplog.at_level("DEBUG", logger=ldap_module.logger.name),
+        ldap_module._released(conn, "user bind") as release,
+    ):
+        release.answer_stands = True
+    assert [r.getMessage() for r in caplog.records] == [
+        "AD user bind unbind failed: ldap3.core.exceptions.LDAPSocketSendError"
+    ]
+    assert closes == ["x", "x"]
+    with (
+        pytest.raises(ldap3.core.exceptions.LDAPSocketSendError) as unmarked,
+        ldap_module._released(conn, "user bind"),
+    ):
         pass
+    assert unmarked.value is unbind_fault
+    assert closes == ["x", "x", "x"]
+
+
+def test_an_unbind_error_that_is_not_ldap3s_still_propagates() -> None:
+    """THE NARROWING GUARD for the release: only an ldap3 error is logged and dropped. A
+    ``TypeError`` from the unbind is an engine defect, and escapes as itself even a block whose
+    answer stands."""
+    defect = TypeError("synthetic engine defect")
+    conn = SimpleNamespace(unbind=_raise(defect))
+    with pytest.raises(TypeError) as raised, ldap_module._released(conn, "user bind") as release:
+        release.answer_stands = True
+    assert raised.value is defect
 
 
 def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
-    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): unlike
-    ``_released`` above after a clean block, an unbind whose send fails is suppressed, and the probe
-    still answers."""
+    """The service connection's release, end to end (``_service_session``, BACKLOG #3017): an
+    unbind whose send fails is suppressed, and the probe still answers."""
     with _scripted_dc(_groups_answered) as (_dc, authenticator):
         real = ldap3.Connection.unbind
 
@@ -722,6 +755,29 @@ def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(ldap3.Connection, "unbind", failing_unbind)
             assert authenticator.probe_principal("alice").principal is not None
+
+
+def test_a_real_socket_is_closed_when_the_unbind_send_fails() -> None:
+    """The close after a failed unbind, through a REAL ldap3 stack (BACKLOG #3848): the unbind
+    request's send fails inside ldap3's own ``unbind``, before ldap3 would close, and the
+    connection still ends closed with no socket. RED when ``_released`` drops the close, or when a
+    future ldap3's ``BaseStrategy.close`` stops shutting a socket ldap3 left open."""
+    from ldap3.strategy.base import BaseStrategy
+
+    real_send = BaseStrategy.send
+    released: list[Any] = []
+
+    def send(self: Any, message_type: str, request: Any, controls: Any = None) -> Any:
+        if message_type == "unbindRequest":
+            released.append(self.connection)
+            raise ldap3.core.exceptions.LDAPSocketSendError("synthetic: the unbind's send failed")
+        return real_send(self, message_type, request, controls)
+
+    with _scripted_dc(_groups_answered) as (_dc, authenticator), pytest.MonkeyPatch.context() as mp:
+        mp.setattr(BaseStrategy, "send", send)
+        assert authenticator.probe_principal("alice").principal is not None
+    assert len(released) == 1, "the unbind's send did not fail once"
+    assert released[0].closed and released[0].socket is None
 
 
 def test_the_refusal_warns_once_per_operation_and_fault(caplog: pytest.LogCaptureFixture) -> None:

@@ -169,6 +169,12 @@ _RESOURCE_ROW_KEYS: dict[str, str] = {
     "**Per-actor PHI reads**": "/logs/tail",
 }
 
+#: The service-name guard, module-qualified (BACKLOG #1680 gave it one home). The bare name is a
+#: substring of the retired `_is_safe_service_name`, so it accepted a row still naming that deleted
+#: function. A test checks this string against the live symbol, so a move reds it. COUPLED edit: the
+#: vault's 15.1.5 service-control row must name it before this lands, or the vault's drift job reds.
+_SERVICE_NAME_GUARD_ANCHOR = "service_status.is_safe_service_name"
+
 _DANGEROUS_ROW_KEYS: dict[str, str] = {
     "**In-process (default) or subprocess-isolated execution": "sandbox",
     "**`db_lookup`**": "db_lookup",
@@ -289,7 +295,7 @@ _DANGEROUS_ANCHORS: tuple[str, ...] = (
     "/uploads",
     "takeover_hook",
     "ShellExecute",
-    "_is_safe_service_name",
+    _SERVICE_NAME_GUARD_ANCHOR,
     "shell=False",
     "transports/file.py",
     "edit-resend",
@@ -341,6 +347,8 @@ _SHELL_TOKENS: tuple[str, ...] = (
 #:
 #: PowerShell reads a flag without case, after ``-``, ``--`` or ``/``, and takes any prefix of its
 #: name, so every prefix of ``command`` is here, ``c`` included, which is also Python's ``-c``.
+#: Its upper-case ``-C`` is spared only after a literal naming another program, such as git's
+#: ``-C`` (:func:`_another_programs_dash_c`, BACKLOG #3803 R4).
 #: ``-EncodedCommand``'s prefixes start at ``en``, with its ``ec`` alias: the bare ``-e`` is left
 #: out, because Python's ``-E`` is that flag without case, and two engine starts pass it.
 _SCRIPT_TEXT_FLAGS: tuple[str, ...] = (
@@ -1147,13 +1155,69 @@ def _shell_sites(code: dict[str, str]) -> set[str]:
     return {key for key, text in code.items() if any(token in text for token in _SHELL_TOKENS)}
 
 
+#: The programs whose upper-case ``-C`` is ``-Command``, by the start of the file name.
+_POWERSHELL_PROGRAMS = frozenset({"powershell", "pwsh"})
+
+
+def _literal(item: ast.expr) -> str | None:
+    return item.value if isinstance(item, ast.Constant) and isinstance(item.value, str) else None
+
+
+def _is_powershell(text: str) -> bool:
+    """By the file name's start, so ``pwsh-preview``, ``pwsh.dll`` (run by ``dotnet``) and
+    ``powershell_ise`` count as well."""
+    return re.split(r"[\\/]", text)[-1].lower().startswith(tuple(_POWERSHELL_PROGRAMS))
+
+
+def _names_another_program(head: ast.expr) -> bool:
+    """Whether ``head``, the first item of an argument list, is a literal naming a program that
+    is not PowerShell. A literal that starts with ``-``, or with ``/`` and holds no other ``/``,
+    is a flag, not a program; anything not a literal could be PowerShell."""
+    text = _literal(head)
+    if not text or text.startswith("-") or (text.startswith("/") and "/" not in text[1:]):
+        return False
+    return not _is_powershell(text)
+
+
+def _another_programs_dash_c(tree: ast.AST) -> int:
+    """How many ``"-C"`` literals are another program's own flag (BACKLOG #3803 R4).
+
+    Upper-case ``-C`` hands script text to PowerShell alone. So one counts here where its
+    argument list starts with a literal naming another program, such as git, whose ``-C`` is a
+    working folder, and every item before it is a literal naming no PowerShell. A launcher, as in
+    ``["env", "pwsh", "-C", text]``, or an item that is not a literal, keeps it a site."""
+    count = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.List | ast.Tuple) and node.elts):
+            continue
+        if not _names_another_program(node.elts[0]):
+            continue
+        for item in node.elts[1:]:
+            text = _literal(item)
+            if text == "-C":
+                count += 1
+            elif text is None or _is_powershell(text):
+                break  # PowerShell could run from here on
+    return count
+
+
 def _passes_script_text(source: str) -> bool:
     """Whether a string literal in ``source`` carries a flag of :data:`_SCRIPT_TEXT_FLAGS`.
 
     Prose is skipped as :func:`~tests._ast_sites.code_strings` skips it; comments are not in the
     tree at all. A literal anywhere else counts, an error message included: this errs toward a
-    site, which a reviewer then clears by name."""
-    return any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in code_strings(parse_source(source)))
+    site, which a reviewer then clears by name. One literal is spared: a ``"-C"`` item after a
+    literal that names another program (:func:`_another_programs_dash_c`). A ``-C`` inside one
+    command-line string, such as ``"git -C repo"``, still counts."""
+    tree = parse_source(source)
+    texts = code_strings(tree)
+    if any(_SCRIPT_TEXT_FLAG_RE.search(text) for text in texts if text != "-C"):
+        return True
+    # A spared "-C" is an item of an argument list, never prose, so it is among ``texts``, and
+    # each such literal has one parent list, so it is spared at most once. The walk is skipped
+    # where no "-C" is.
+    dash_c = texts.count("-C")
+    return dash_c > 0 and dash_c > _another_programs_dash_c(tree)
 
 
 def _script_text_sites(sources: Mapping[str, str]) -> set[str]:
@@ -1219,6 +1283,19 @@ def test_the_script_text_scan_sees_the_cipher_probe_start() -> None:
         'run(["node", "--eval=x"])',
         'run(["powershell.exe", "-e", blob])',
         'run([sys.executable, "-Ic", code])',
+        # R4's limit: -C is PowerShell's -Command unless a literal names another program first.
+        'run(["pwsh", "-C", text])',
+        'run([r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE", "-C", text])',
+        'run([shell, "-C", text])',
+        'run(["-NoProfile", "-C", text])',
+        'ARGS = ("-C", text)',
+        'run(["git", "-C", repo, "-c", text])',
+        'run(["env", "pwsh", "-C", text])',
+        'run(["pwsh-preview", "-C", text])',
+        'run(["dotnet", "pwsh.dll", "-C", text])',
+        'run(["sudo", shell, "-C", text])',
+        'run(["tar", "-xf", archive, "-C", folder])',
+        "run('git -C repo status')",
     ],
 )
 def test_the_script_text_scan_fires(source: str) -> None:
@@ -1234,6 +1311,11 @@ def test_the_script_text_scan_fires(source: str) -> None:
         'run(["powershell.exe", "-NoProfile", "-File", path])',
         'run(["tool", "-Compress", "-cert", path])',
         'run(["tool", "-command-file"])',
+        # BACKLOG #3803 R4: an upper-case -C after a program named by a literal that is not
+        # PowerShell is that program's own flag, git's working-folder one here.
+        'run(["git", "-C", repo, "status"])',
+        'run(("/usr/bin/tar", "-C", folder, "-xf", archive))',
+        'run(["make.exe", "-C", folder])',
     ],
 )
 def test_the_script_text_scan_spares(source: str) -> None:
@@ -1374,7 +1456,8 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
     "verify/cipher_policy.py": (
         "verify's host cipher policy read (BACKLOG #3277): Get-TlsCipherSuite through the System32 "
-        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, bounded by _PROBE_TIMEOUT_S"
+        "powershell.exe, or `openssl ciphers` and `openssl version -d` on PATH (BACKLOG #3803); "
+        "fixed argv, each start bounded by _PROBE_TIMEOUT_S"
     ),
 }
 
@@ -1979,6 +2062,24 @@ def test_a_deleted_row_is_detected_even_though_the_prose_still_carries_its_ancho
     # And the section-scoped checker is blind to it, because the prose still says `widget_limit`.
     # That is not a defect here; it is the measured reason the row-scoped one exists.
     assert _missing(mutated, ("widget_limit",)) == []
+
+
+def test_a_row_naming_the_retired_service_name_guard_does_not_satisfy_the_anchor() -> None:
+    """A row naming only the deleted `_is_safe_service_name` fails the anchor; one naming the guard
+    where it lives passes. The bare `is_safe_service_name` anchor accepted both."""
+    table = "| Functionality | Guard |\n|---|---|\n| **Service control** | {} gates the name |"
+    anchors = (_SERVICE_NAME_GUARD_ANCHOR,)
+    assert _missing_in_rows(table.format("`_is_safe_service_name`"), anchors) == list(anchors)
+    assert _missing_in_rows(table.format(f"`{_SERVICE_NAME_GUARD_ANCHOR}`"), anchors) == []
+
+
+def test_the_service_name_guard_anchor_names_the_live_symbol() -> None:
+    """The anchor is hand-typed, so a move of the guard must red here rather than leave the
+    document pinned to its old home. Full module path, so a same-named leaf module elsewhere fails."""
+    from messagefoundry.service_status import is_safe_service_name
+
+    live = f"{is_safe_service_name.__module__}.{is_safe_service_name.__qualname__}"
+    assert live == f"messagefoundry.{_SERVICE_NAME_GUARD_ANCHOR}"
 
 
 def test_the_row_mutation_helper_refuses_to_silently_do_nothing() -> None:

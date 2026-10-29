@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import gc
+import itertools
 import logging
+import os
 import re
 import shutil
 import ssl
@@ -33,6 +35,7 @@ import time
 import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -46,6 +49,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from messagefoundry.config import loaded_crls
 from messagefoundry.config import tls_policy as tls_policy_module
 from messagefoundry.config.loaded_crls import (
+    HeldCrl,
     ReloadRefusal,
     crl_fingerprint,
     held_crl_copies,
@@ -81,7 +85,7 @@ from messagefoundry.pipeline.crl_reload import (
 from messagefoundry.pki import (
     CrlBlock,
     _crl_attribute_key,
-    crl_signature_refusal,
+    crl_signature_finding,
     judge_every_crl,
     read_soonest_crl_facts,
 )
@@ -115,7 +119,7 @@ class _Pki:
         revoke: bool = False,
         delta: bool = False,
         scope: bool = False,
-        signer: ec.EllipticCurvePrivateKey | None = None,
+        signer: CertificateIssuerPrivateKeyTypes | None = None,
         aki: x509.AuthorityKeyIdentifier | None = None,
         issuer: x509.Name | None = None,
     ) -> bytes:
@@ -206,7 +210,7 @@ def _ca_cert(
 
 
 def _leaf(
-    issuer: x509.Name, signer: ec.EllipticCurvePrivateKey
+    issuer: x509.Name, signer: CertificateIssuerPrivateKeyTypes
 ) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
     """A ``localhost`` leaf for server and client auth, issued by ``issuer`` and signed by
     ``signer``, and its key."""
@@ -480,7 +484,7 @@ def test_a_bad_replacement_is_refused_and_the_old_copy_kept(
     assert reload_refusal(pki.crl, crl_fingerprint(pki.crl.read_bytes())) == outcome.refusal
     # Logged once per file version, though every pass retries it.
     assert again is not None and again.refusal == outcome.refusal
-    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 1
+    assert _refusals_logged(caplog) == 1
 
 
 def test_a_refusal_clears_once_the_file_is_fixed(pki: _Pki) -> None:
@@ -731,7 +735,9 @@ def test_a_crl_with_a_bad_signature_is_refused_and_handshakes_still_succeed(pki:
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
     assert outcome.refusal.remedy == BAD_SIGNATURE and outcome.refusal.sticky
-    assert "could not confirm its signature" in outcome.refusal.reason
+    # Proven, so the reason says what was proven (vault BACKLOG #3506), not "could not confirm".
+    assert "that key does not verify the CRL's signature" in outcome.refusal.reason
+    assert "could not confirm" not in outcome.refusal.reason
     assert hop.cert_store_stats() == stats
     assert _accepts(hop, pki.server())  # the old copy is kept, and the hop still works
 
@@ -950,6 +956,15 @@ def test_a_reload_applies_a_replacement_whose_issuer_differs_only_in_ascii_case(
     assert _accepts(hop, pki.server()) is not applies
 
 
+def _judge_ca_file(pem: bytes) -> tuple[str, str] | None:
+    """The expiry monitor's CA-file check of ``pem``, for a CA-file-only row (BACKLOG #3512)."""
+    return _ca_file_crl_refusal(pem, time.time(), None, ca_file_only=True, on_unchecked=_no_log)
+
+
+def _no_log() -> None:
+    """The expiry monitor's log of a later CRL it could not check, which these tests ignore."""
+
+
 def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_restarts(
     pki: _Pki,
 ) -> None:
@@ -957,9 +972,9 @@ def test_a_ca_file_with_a_future_crl_beside_a_current_one_in_other_ascii_case_re
     so a restart into this CA file is not refused. The control is a future CRL from another name."""
     current = pki.crl.read_bytes()
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_in_other_case(pki))
-    assert _ca_file_crl_refusal(pki.ca_pem + current + future, time.time(), None) is None
+    assert _judge_ca_file(pki.ca_pem + current + future) is None
     stray = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, issuer=_OTHER_CA)
-    refusal = _ca_file_crl_refusal(pki.ca_pem + current + stray, time.time(), None)
+    refusal = _judge_ca_file(pki.ca_pem + current + stray)
     assert refusal is not None and "not yet in effect" in refusal[0], refusal
 
 
@@ -1043,7 +1058,7 @@ def test_a_staging_failure_is_logged_once_though_each_temp_path_differs(
 
     assert first is not None and first.refusal is not None and not first.refusal.sticky
     assert second is not None and second.refusal == first.refusal
-    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 1
+    assert _refusals_logged(caplog) == 1
     assert _accepts(hop, pki.server())
 
 
@@ -1056,7 +1071,7 @@ def test_an_unexpected_failure_is_logged_once_with_its_traceback(
     def boom(pem: bytes, ca_ders: object) -> None:
         raise RuntimeError("a defect")
 
-    monkeypatch.setattr(crl_reload, "crl_signature_refusal", boom)
+    monkeypatch.setattr(crl_reload, "crl_signature_finding", boom)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         first, second = _reload(pki), _reload(pki)
 
@@ -1162,11 +1177,7 @@ def test_one_context_failing_does_not_stop_the_rest_or_stick(
 ) -> None:
     failing, other = pki.outbound_hop(), pki.outbound_hop()
     pki.crl.write_bytes(_fresher(pki))
-
-    def boom(binary_form: bool = False) -> list[bytes]:
-        raise RuntimeError("a defect in one context")
-
-    failing.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+    _break_ca_list(failing)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         outcome = _reload(pki)
 
@@ -1199,7 +1210,7 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
     assert outcome.refusal.remedy == RESTART and "reloads" in outcome.refusal.reason
     assert not outcome.refusal.sticky  # the other hop's wait is still retried
     # And it does not send the operator into a start that refuses the same file.
-    assert "a start until then refuses this file too" in outcome.refusal.reason
+    assert "a start refuses this file too at least until then" in outcome.refusal.reason
     assert _accepts(capped, pki.server()) and _accepts(fresh, pki.server())
 
 
@@ -1377,10 +1388,10 @@ def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
     )
     anchors = [x509.load_pem_x509_certificate(pki.ca_pem).public_bytes(serialization.Encoding.DER)]
     unlisted_first = other.crl.read_bytes() + forged
-    verdict = crl_signature_refusal(unlisted_first, anchors)
-    assert verdict is not None and verdict[1] is True and "block 2" in verdict[0]
-    alone = crl_signature_refusal(other.crl.read_bytes(), anchors)  # control: unlisted alone
-    assert alone is not None and alone[1] is False
+    verdict = crl_signature_finding(unlisted_first, anchors)
+    assert verdict is not None and verdict.state == "bad" and "block 2" in verdict.why
+    alone = crl_signature_finding(other.crl.read_bytes(), anchors)  # control: unlisted alone
+    assert alone is not None and alone.state == "unlisted"
 
 
 # --- Lander hold on PR 1963: a CRL block OpenSSL does not load -------------------------------------
@@ -1653,6 +1664,15 @@ def _refusals_logged(caplog: pytest.LogCaptureFixture) -> int:
     return sum("refused to apply" in r.getMessage() for r in caplog.records)
 
 
+def _break_ca_list(ctx: ssl.SSLContext) -> None:
+    """Make ``ctx``'s CA list raise, as a defect in one context would."""
+
+    def boom(binary_form: bool = False) -> list[bytes]:
+        raise RuntimeError("a defect in one context")
+
+    ctx.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+
+
 def _assert_refused_for_good(
     pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1793,11 +1813,7 @@ def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
     # The root alone cannot verify the intermediate's CRL, which the reload retries every pass.
     refused = _holder(pki, pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
     if held_back_by == RETRY:
-
-        def boom(binary_form: bool = False) -> list[bytes]:
-            raise RuntimeError("a defect in one context")
-
-        refused.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+        _break_ca_list(refused)
     pki.crl.write_bytes(_fresher(pki))
 
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
@@ -1838,6 +1854,23 @@ def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_
     assert after is not None and after.refusal == first.refusal
     assert _refusals_logged(caplog) == 1
     assert refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_label_takes_one_spelling_whatever_order_the_holders_come_in() -> None:
+    """Stale holders spell one file differently. The label names it the same way whichever the
+    registry met first, and takes an absolute spelling over a relative one (vault BACKLOG #3498).
+    The holders are stand-ins: the label reads only their spelling and setting. Red under: the
+    label taking the first holder's spelling."""
+    absolute = os.path.abspath(os.path.join("crls", "partner.crl"))
+    spellings = [absolute.upper(), "./crls/partner.crl", absolute]
+    holders = [SimpleNamespace(configured_path=p, setting="[tls].crl_file") for p in spellings]
+    labels = set()
+    for order in itertools.permutations(holders):
+        crl_reload._LABELS.clear()
+        stale = [(cast(ssl.SSLContext, None), cast(HeldCrl, h)) for h in order]
+        labels.add(crl_reload._label("key", (1, 2), stale, "fallback", refused=False))
+    (label,) = labels
+    assert label.startswith("[tls].crl_file") and "./crls" not in label and "fallback" not in label
 
 
 def test_bytes_put_back_after_a_change_are_named_by_the_hops_that_hold_the_file_now(
