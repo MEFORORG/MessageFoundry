@@ -594,6 +594,26 @@ async def test_postgres_schema_lock_expiry_names_the_lock_and_the_setting() -> N
     assert "COMMIT" not in sqls
 
 
+async def test_postgres_network_timeout_during_the_lock_wait_is_not_renamed() -> None:
+    """An OS-level ETIMEDOUT is also a ``TimeoutError``, but it is a network fault: it must not be
+    reported as the schema lock having waited out ``[store].schema_lock_timeout``."""
+    import errno
+
+    class _NetworkTimeoutConn(_RecordingPgConn):
+        async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+            await super().execute(sql, *args, timeout=timeout)
+            if "pg_advisory_xact_lock" in sql:
+                raise TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+            return ""
+
+    store = _pg_schema_store(_NetworkTimeoutConn())
+
+    with pytest.raises(TimeoutError) as info:
+        await store._ensure_schema()
+
+    assert info.value.errno == errno.ETIMEDOUT
+
+
 @pytest.mark.parametrize("value", [0, -1, math.inf, math.nan])
 def test_schema_lock_timeout_refuses_an_unbounded_or_empty_wait(value: float) -> None:
     from pydantic import ValidationError

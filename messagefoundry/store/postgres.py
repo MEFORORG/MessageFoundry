@@ -1984,6 +1984,10 @@ class PostgresStore:
                 try:
                     await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=wait)
                 except TimeoutError as exc:
+                    # asyncpg's client timeout carries no errno; an OS-level ETIMEDOUT (also a
+                    # TimeoutError) is a network fault, not a lock wait, so it propagates as is.
+                    if exc.errno is not None:
+                        raise
                     lock = self._lock_key(_SCHEMA_LOCK)
                     raise SchemaLockTimeout(self.backend, lock, wait) from exc
                 # Double-check under the lock: the peer this open queued behind may have just applied
