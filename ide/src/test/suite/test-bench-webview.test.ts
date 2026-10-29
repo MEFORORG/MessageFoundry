@@ -135,11 +135,12 @@ function clone(p: Payload): Payload {
 }
 
 /**
- * Assert that `payload` is DISCARDED: detail's markup and both panes' visibility are unchanged, and
- * nothing threw. The no-throw half matters: a renderer that crashed partway would also leave
- * `detail` alone, and would read here as a discard it is not.
+ * Assert that `payload` is DISCARDED: detail's markup and both panes' visibility are unchanged,
+ * nothing threw, and the console got exactly `warnings`. The no-throw half matters: a renderer that
+ * crashed partway would also leave `detail` alone, and would read here as a discard it is not.
+ * `warnings` defaults to the one shape-discard warning; a drop behind the shape check passes [].
  */
-function assertDiscarded(payload: Payload, why: string, warns = true): Bench {
+function assertDiscarded(payload: Payload, why: string, warnings: string[] = [DISCARD_WARNING]): Bench {
   const b = bench();
   b.detail.innerHTML = SENTINEL;
   const before = { html: b.detail.innerHTML, d: b.detail.style.display, r: b.results.style.display };
@@ -149,7 +150,7 @@ function assertDiscarded(payload: Payload, why: string, warns = true): Bench {
   assert.strictEqual(b.detail.style.display, before.d, `${why}: detail visibility changed`);
   assert.strictEqual(b.results.style.display, before.r, `${why}: results visibility changed`);
   // A shape discard warns exactly once, with the one fixed phrase, so no case echoes message text.
-  assert.deepStrictEqual(b.warnings, warns ? [DISCARD_WARNING] : [], `${why}: not the one fixed warning`);
+  assert.deepStrictEqual(b.warnings, warnings, `${why}: not the expected console warnings`);
   return b;
 }
 
@@ -541,7 +542,13 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
   // A type the page DOES declare is still the message's own discriminant, so it is not named either
   // (owner decision 2026-10-29, BACKLOG #1123). Each is sent with none of its fields: well-formed
   // kind, malformed body.
-  for (const type of ["detail", "trace", "hex", "collections", "collectionRun", "caseDetail"]) {
+  const declaredTypes = ["detail", "trace", "hex", "collections", "collectionRun", "caseDetail"];
+  test("the known-type cases cover every type the page declares", () => {
+    // SHAPES is a top-level const of the page's classic script, so it is reachable from its global scope.
+    const keys = (bench().window as unknown as { eval(src: string): unknown }).eval("Object.keys(SHAPES)");
+    assert.deepStrictEqual([...(keys as string[])].sort(), [...declaredTypes].sort());
+  });
+  for (const type of declaredTypes) {
     test(`a known type with malformed fields is discarded, and its warning does not name the type: ${type}`, () => {
       const b = assertDiscarded({ type }, type);
       assert.ok(!b.warnings.some((w) => w.includes(type)), `${type}: the type was named in the warning`);
@@ -690,7 +697,7 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     assert.strictEqual(b.detail.innerHTML, before, "an unasked or stale reply rendered");
     assertShows(b, null, "unasked or stale replies");
     // Well-formed, so the shape check passes it and the stale-reply check behind it drops it silently.
-    assertDiscarded(caseDetail(0), "no run on screen", false);
+    assertDiscarded(caseDetail(0), "no run on screen", []);
   });
 
   test("a case with no difference and no error says so rather than rendering blank", () => {

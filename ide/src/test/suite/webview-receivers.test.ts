@@ -788,8 +788,8 @@ const UNKNOWN_KINDS: unknown[] = [
 // The whole warning any discard writes: the page's own panel name in one fixed phrase. Nothing in it
 // is chosen by the message, not even its kind (owner decision 2026-10-29, BACKLOG #1123).
 const discardWarning = (panel: string): string => `MessageFoundry ${panel}: discarded a malformed message`;
-const STATE_WARNING = discardWarning("Security Settings");
-const RULES_WARNING = discardWarning("Alert Rules");
+const STATE_WARNING = discardWarning(security.panel);
+const RULES_WARNING = discardWarning(alertRules.panel);
 
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
@@ -1316,17 +1316,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
           } else {
             assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
           }
-          // Exactly the one fixed warning: the kind is well-formed and the page's own, and it is still
-          // not named, because it is the message's own discriminant.
+          // Exactly the one fixed warning. The kind is well-formed and the page's own, and this exact
+          // match is what proves it is not named: it is the message's own discriminant.
           assert.deepStrictEqual(
             p.warnings,
             [discardWarning(r.panel)],
-            `${r.panel} "${type}", ${why}: the discard was not named in the console, or carried more`,
-          );
-          const prefix = `MessageFoundry ${r.panel}`;
-          assert.ok(
-            !p.warnings.some((w) => w.slice(prefix.length).includes(type)),
-            `${r.panel} "${type}", ${why}: the warning named the kind`,
+            `${r.panel} "${type}", ${why}: the discard was not named in the console, carried more, or named the kind`,
           );
         });
       }

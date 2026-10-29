@@ -106,7 +106,6 @@ export function testBenchScript(token: string): string {
           isArrOf(d.differences, isFieldDifference)),
     };
     function shapeOk(m){
-      // Read once, so the type that picks the check is the type that was checked.
       const t = m.type;
       const check = isStr(t) && Object.prototype.hasOwnProperty.call(SHAPES, t) ? SHAPES[t] : null;
       if (typeof check === 'function' && check(m) === true) { return true; }
