@@ -529,7 +529,8 @@ false premise.
 
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-at-exposure refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
-  whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
+  whose admin surface is exposed (an off-loopback bind, or a declared reverse proxy: `[api].tls_terminated_upstream`
+  or a set `[api].trusted_proxies`, vault BACKLOG #2251) with `require_mfa` off,
   MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
   Administrators included, would then sign in over the network with a single factor. The one
   exception is an OIDC sign-in that carries an amr/acr claim checked while
@@ -1169,9 +1170,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `approval.requested` row.
 - **Where it is reported:** `security_loosenings()` names it, so at least the serve-time warning,
   `messagefoundry security show`, `GET /security/posture` and the start's `config_loaded` audit row
-  list it. Nothing refuses it. The
-  serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
-  narrowed or an empty list.
+  list it. Nothing refuses it. On an exposed instance the serve-time dual-control advisory names it
+  too, in the same words, as it names dual control off (vault BACKLOG #3474). That advisory only
+  warns.
 - **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and
   restart. [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
   says what happens to a request that was already held when its operation left the list.

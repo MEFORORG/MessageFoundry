@@ -3236,10 +3236,13 @@ class AuthSettings(_Section):
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
     # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
-    # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
-    # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
-    # it **refuses to start** on a production instance and **warns** on a non-production one, mirroring
-    # the keyless-store / open-egress startup gates (see __main__._serve), so MFA can't be silently
+    # An exposed instance MUST keep this on; ``serve`` makes that posture explicit (sec-mfa-on). Exposed
+    # is ``_serve``'s ``instance_exposed``: an off-loopback bind, a declared TLS-terminating proxy, or a
+    # set ``[api].trusted_proxies`` (vault BACKLOG #2251), on a loopback bind too. With this
+    # **explicitly opted out** there, ``serve`` **refuses to start** under ``[security].enforcement =
+    # "enforce"`` unless ``[security].allow_single_factor_admin_when_exposed`` lowers that to an
+    # audited warning, and **warns** under ``warn``, whatever the environment (see __main__._serve),
+    # so MFA can't be silently
     # skipped at exposure. Scope: since ASVS 6.3.3 it gates **every authorized route** for an in-scope
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
