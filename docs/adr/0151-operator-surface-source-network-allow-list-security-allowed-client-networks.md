@@ -39,8 +39,10 @@ This is the whole correctness argument and everything else hangs off it.
 
 uvicorn's `ProxyHeadersMiddleware` is the **single** X-Forwarded-For trust point in the process. It
 rewrites `scope["client"]` from XFF when, and only when, the socket peer matches
-`forwarded_allow_ips` — which [`__main__.py`](../../messagefoundry/__main__.py) feeds verbatim from
-`[api].trusted_proxies`. So the check is keyed on `trusted_proxies` **by construction**; there is
+`forwarded_allow_ips` — which [`__main__.py`](../../messagefoundry/__main__.py) builds from
+`[api].trusted_proxies` with `uvicorn_trusted_hosts`: each entry as written, then the other spelling
+of each IPv4 or IPv4-mapped entry that the list does not already hold *(corrected 2026-10-29; the
+amendment below says why)*. So the check is keyed on `trusted_proxies` **by construction**; there is
 deliberately no `if trusted_proxies:` anywhere in our decision, and adding a second in-app XFF parse
 would create a divergent trust path. Across the three exposure routes:
 
@@ -153,3 +155,21 @@ step-up `POST /security/client-networks` hot-reload that refuses a write excludi
 own address.
 
 **#26-clean** — a config switch and a middleware; no visual/template-driven authoring, no channel element.
+
+## Amendment (2026-10-29) -- `forwarded_allow_ips` is not the configured list verbatim
+
+D-1 said `__main__.py` feeds `forwarded_allow_ips` verbatim from `[api].trusted_proxies`. Since
+vault BACKLOG #3042 it does not. `serve` hands uvicorn the result of `uvicorn_trusted_hosts` in
+[`config/settings.py`](../../messagefoundry/config/settings.py): every configured entry as written,
+then the other spelling of each IPv4 entry (its `::ffff:`-mapped twin) and of each entry inside
+`::ffff:0:0/96` (its plain IPv4 twin), where the list does not already hold it. uvicorn's
+`_TrustedHosts` never normalises a mapped address, so without the twin a dual-stack inner proxy's
+mapped hop would miss a plain entry. Both spellings name the same hosts, so the twin trusts no host
+the entry did not name; `::ffff:0:0/96` does gain `0.0.0.0/0`, which the loosening check already
+counts as the whole IPv4 family. An IPv6 entry outside the mapped block, `::/80` and `::/0`
+included, gains nothing.
+
+D-1's argument is unchanged: uvicorn's `ProxyHeadersMiddleware` is still the single XFF trust point,
+and the decision still reads `scope["client"]` and parses no header. D-3 still reads the configured
+list. The twin of a single-host entry is a single host too, so D-3's refusal of every multi-address
+entry still covers what uvicorn is handed (vault BACKLOG #3764 item 4).
