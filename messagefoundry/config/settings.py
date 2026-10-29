@@ -1353,6 +1353,14 @@ _ZONED_NETWORK = (
     "an IPv6 entry with a zone. uvicorn ignores a network's zone, so it would trust this prefix "
     "on every interface, not only on the one the zone names."
 )
+#: The gap the advice for a zoned host leaves open (BACKLOG #3764 item 1). uvicorn compares a host
+#: entry's zone and is handed strings, and zone names cannot be enumerated, so a hop an inner proxy
+#: writes WITH its zone misses the zoneless entry. That fails closed: the hop is untrusted and
+#: becomes the client address, which degrades attribution and trusts nothing more.
+_ZONED_HOP_CAVEAT = (
+    "A hop an inner proxy writes into X-Forwarded-For with its zone, as '{zoned}', will not "
+    "match '{host}': it is untrusted and becomes the client address."
+)
 
 #: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
 _IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0:0/96")
@@ -1447,10 +1455,10 @@ def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
         why = _ZONED_NETWORK if isinstance(form, ipaddress.IPv6Network) else _ZONED_HOST
         if isinstance(form, ipaddress.IPv6Network) and form.num_addresses > 1:
             fix = _span_wording(form)  # a range is named, never recommended
-        elif isinstance(form, ipaddress.IPv6Network):
-            fix = f"List '{form.network_address}' instead."
         else:
-            fix = f"List '{form}' instead."
+            host = form.network_address if isinstance(form, ipaddress.IPv6Network) else form
+            zoned = parsed.network_address if isinstance(parsed, ipaddress.IPv6Network) else parsed
+            fix = f"List '{host}' instead. {_ZONED_HOP_CAVEAT.format(host=host, zoned=zoned)}"
         raise ValueError(f"[api].trusted_proxies entry {entry!r} is {why} {fix}")
     return parsed
 

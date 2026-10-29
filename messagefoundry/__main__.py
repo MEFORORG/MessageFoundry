@@ -2706,6 +2706,7 @@ def _serve(args: argparse.Namespace) -> int:
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
+        uvicorn_trusted_hosts,
     )
     from messagefoundry.config.tls_policy import (
         in_process_tls_revocation_refused,
@@ -3293,11 +3294,6 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
-    from messagefoundry.config.settings import uvicorn_trusted_hosts
-
-    # What uvicorn's forwarded_allow_ips is handed, computed here so a refused entry stops serve
-    # before any startup side effect. The log below names the CONFIGURED list instead.
-    forwarded_allow_ips = uvicorn_trusted_hosts(settings.api.trusted_proxies)
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3307,10 +3303,12 @@ def _serve(args: argparse.Namespace) -> int:
             )
         elif settings.api.tls_terminated_upstream:
             # WP-15: a reverse proxy terminates TLS in front; trust forwarded headers only from the
-            # declared proxies (the validator guarantees trusted_proxies is set here).
+            # declared proxies (the validator guarantees trusted_proxies is set here). The log names
+            # the CONFIGURED list; uvicorn_trusted_hosts says what serve adds to it for uvicorn.
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s (each IPv4 address an entry names is trusted plain and ::ffff:-mapped).",
+                "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
+                "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
                 settings.api.host,
                 settings.api.trusted_proxies,
             )
@@ -4918,10 +4916,12 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default. The list is
-    # uvicorn_trusted_hosts' (BACKLOG #3042).
+    # uvicorn_trusted_hosts' (BACKLOG #3042). It cannot refuse here, so it is built where it is
+    # used: the settings load already read every entry with the same parser, and a refused entry
+    # stopped serve there (BACKLOG #3764).
     run_kwargs: dict[str, Any] = {
         "log_config": None,
-        "forwarded_allow_ips": forwarded_allow_ips,
+        "forwarded_allow_ips": uvicorn_trusted_hosts(settings.api.trusted_proxies),
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
