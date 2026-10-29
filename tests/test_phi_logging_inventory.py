@@ -492,9 +492,9 @@ def test_every_alert_event_type_is_named_in_the_inventory() -> None:
 def test_auto_resolve_inverses_are_described_accurately() -> None:
     """Row 8 said "(plus four auto-resolving inverses)" — wrong in both count and kind.
 
-    ``_AUTO_RESOLVE`` has four keys but ``connection_started`` is emitted by no code path, and
     ``_record_state`` routes an inverse to ``resolve_alert_instances_for``, never to
-    ``upsert_alert_instance`` — so none of them is ever an ``alert_instance`` row at all.
+    ``upsert_alert_instance`` — so none of them is ever an ``alert_instance`` row at all. (The row
+    once also called ``connection_started`` unreachable; the runner raises it since BACKLOG #1741.)
     """
     import ast as _ast
 
@@ -520,8 +520,10 @@ def test_auto_resolve_inverses_are_described_accurately() -> None:
             f"the auto-resolve inverse {inverse!r} is named nowhere in §7"
         )
     assert "plus four auto-resolving inverses" not in row, (
-        "the retired over-count is back — connection_started is unreachable, and no inverse is an "
-        "alert_instance row"
+        "the retired over-count is back — no inverse is an alert_instance row"
+    )
+    assert "emitted by no code path" not in row, (
+        "row 8 calls connection_started unreachable again; the runner raises it (BACKLOG #1741)"
     )
     assert "never rows here" in row or "never rows" in row, (
         "row 8 must state that an inverse RESOLVES an open instance rather than inserting one"

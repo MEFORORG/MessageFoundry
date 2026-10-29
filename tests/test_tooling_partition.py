@@ -294,6 +294,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sds_rule_ids_are_stable.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
+        # Guards tests/timing_quarantine.txt, which takes ENGINE tests off the engine legs (BACKLOG
+        # #4773). An edit to that list alone does not trip the tooling job's path gate, so listed as
+        # tooling this guard would not run on the change that breaks the list.
+        "test_timing_quarantine.py",
         # Reads every module under messagefoundry/ and harness/ and lists each call that hands a
         # posture toward a Vault hop (vault BACKLOG #2983). What breaks it is a new caller in the
         # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
@@ -596,7 +600,10 @@ def test_marker_is_registered() -> None:
     ("needle", "why"),
     [
         (
-            "-m 'not tooling'",
+            # The whole engine expression since the timing quarantine (BACKLOG #4773) joined it.
+            # The bare `-m 'not tooling'` now appears only in comments, so it would match nothing
+            # that runs. Back to the bare form when the quarantine is retired.
+            "-m 'not tooling and not timing_quarantine'",
             "the engine legs must DESELECT the harness tier -- without it the partition buys nothing",
         ),
         (

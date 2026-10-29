@@ -423,6 +423,11 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         ("[store].pool_size", _default(StoreSettings, "pool_size"), "config.settings"),
         ("warm_pool_timeout", _default(StoreSettings, "warm_pool_timeout"), "config.settings"),
         ("command_timeout", _default(StoreSettings, "command_timeout"), "config.settings"),
+        (
+            "[store].schema_lock_timeout",
+            _default(StoreSettings, "schema_lock_timeout"),
+            "config.settings",
+        ),
         # SECTION-QUALIFIED. The bare token `connect_timeout` occurs on FOUR rows carrying the value
         # 15, two of which derive from the CONNECTOR default (wiring.Database), so the store pin
         # could be satisfied by a row it does not describe. `[store].connect_timeout` matches only
