@@ -103,6 +103,10 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
     "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
     "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",
+    "Refused inbound body fingerprint": "an unkeyed SHA-256 over a body the listener refused, "
+    "recorded with its length so an operator can match a row stored as a head against the "
+    "sender's copy (vault BACKLOG #2608); not a key, a secret, or a message authenticator, and "
+    "nothing is verified against it",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "SQL Server transport": "a TLS hop trusted via the OS certificate store and the ODBC driver; the "

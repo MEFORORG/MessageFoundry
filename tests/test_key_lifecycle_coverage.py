@@ -256,6 +256,10 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/crl_reload.py": "adds a replaced CRL file to live TLS contexts and "
     "verifies its signature against the hop's PUBLIC CA certificates; it loads no key (BACKLOG #299)",
     "messagefoundry/pipeline/sharding.py": _KEYLESS,
+    # Vault BACKLOG #2608: the unkeyed SHA-256 of a refused body, recorded so an operator can match a
+    # body stored as a head against the sender's copy. Classified the same way in
+    # tests/test_key_usage_scope_inventory.py.
+    "messagefoundry/pipeline/refused_body.py": _KEYLESS,
     "messagefoundry/pipeline/sandbox.py": _EPHEMERAL,
     "messagefoundry/pipeline/alert_sinks.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/engine.py": _POSTURE_ONLY,
