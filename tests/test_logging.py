@@ -1744,20 +1744,23 @@ def _shutdown_lines(
         spool.open()
     gate = threading.Event()
     fwd = _build_queued_forwarder(_CapturingHandler(gate=gate, wait=1.0), fmt="text", spool=spool)
-    fwd.handle(_lane_record("mefor.test", "first"))
-    deadline = time.monotonic() + 5.0
-    while fwd._records.qsize() and time.monotonic() < deadline:
-        time.sleep(0.01)  # until the listener holds the first record inside the stalled send
-    assert fwd._records.qsize() == 0, "the listener never took the first record"
-    for i in range(8):
-        fwd.handle(_lane_record("mefor.test", f"g{i}"))
-    for i in range(audit_rows):
-        fwd.handle(_lane_record(audit_tee.audit_logger.name, f'{{"seq": {i}}}'))
-    assert fwd._records.qsize() == 5 + audit_rows  # the control: the raw depth DOES move
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
-        fwd.close()
-    gate.set()
+    try:
+        fwd.handle(_lane_record("mefor.test", "first"))
+        deadline = time.monotonic() + 5.0
+        while fwd._records.qsize() and time.monotonic() < deadline:
+            time.sleep(0.01)  # until the listener holds the first record inside the stalled send
+        assert fwd._records.qsize() == 0, "the listener never took the first record"
+        for i in range(8):
+            fwd.handle(_lane_record("mefor.test", f"g{i}"))
+        for i in range(audit_rows):
+            fwd.handle(_lane_record(audit_tee.audit_logger.name, f'{{"seq": {i}}}'))
+        assert fwd._records.qsize() == 5 + audit_rows  # the control: the raw depth DOES move
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+            fwd.close()
+    finally:
+        gate.set()
+        fwd.close()  # idempotent; frees the thread and the spool lock if an assert fired first
     where = str(spool.directory) if spool is not None else "<no spool>"
     return [
         r.getMessage().replace(where, "<spool>")  # each run has its own directory
@@ -1797,15 +1800,6 @@ def test_published_counts_share_one_budget_and_the_loss_takes_it_first() -> None
     assert logging_setup._published_counts(unbounded, 9, 7) == (9, 7)
     # A lane bound of 0 is a cap of 0, never "no cap".
     assert logging_setup._published_counts(logging_setup._ForwardLanes(0, 100), 9, 7) == (0, 0)
-
-
-def test_a_spool_that_fills_part_way_publishes_counts_audit_rows_cannot_move() -> None:
-    """Spooled first: a spool with room for a fixed number takes them and the loss gets the rest,
-    audit rows included, so with the loss first both published counts tracked the audit rows
-    below the cap. The raw counts here are a spool of 6 and a loss of 2 plus the audit rows."""
-    lanes = logging_setup._ForwardLanes(8, 100)
-    readings = {logging_setup._published_counts(lanes, 6, 2 + n) for n in (0, 3, 40)}
-    assert readings == {(6, 2)}
 
 
 def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:

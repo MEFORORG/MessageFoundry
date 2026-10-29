@@ -4117,10 +4117,10 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
-#: BACKLOG #2612), and the bound is the second half of that control. A path typo'd onto
-#: ``messagefoundry.toml``, a key file, or a captured HL7 message would otherwise put that file's whole
-#: contents into the service log at WARNING -- which is the PHI rule in CLAUDE.md section 9, breached by
-#: a control whose own purpose is to avoid manufacturing bad outcomes from its input handling.
+#: BACKLOG #2612); only the first line ever reaches the parser, and this bound keeps even that read
+#: small. A caller that printed ``str(exc)`` for a path typo'd onto ``messagefoundry.toml``, a key
+#: file, or a captured HL7 message would put that line into the service log at WARNING -- which is
+#: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
 
 

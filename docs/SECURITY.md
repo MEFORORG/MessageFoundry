@@ -6195,12 +6195,13 @@ states only what it leaves a `logs:view` or `monitoring:read` reader without `us
 lane is full it is pinned there and does not move with audit rows; an uncapped depth over
 both lanes would have risen by one per row. The two shutdown lines in the engine log, which
 `GET /logs/tail` serves, take the same cap: the count of records moved to the spool at the drain
-deadline and the count left undelivered are capped together at that bound, the spooled count
+deadline and the count left undelivered are capped together at that bound, the undelivered count
 first, as a single queue's never passed it. Each line says "at least". At least `queued` and those
 two lines read the queue only through `_published_counts` in `messagefoundry/logging_setup.py`.
-**The cost of the cap:** once the spool has kept the cap's worth, a record the full spool then
-refused is not in the undelivered line; the spool's own drop count on `GET /status` still counts
-it. **Not closed, as on the single queue:** below the cap,
+**Not closed:** when the spool fills part way through the shutdown drain, how the capped total
+splits between the two lines depends on how many records, and how many bytes, the spool took
+before it filled, and both can move with audit rows below the cap. **The cost of the cap:** past
+the cap, neither line counts every record, so each is a floor and not a total. **Not closed, as on the single queue:** below the cap,
 `queued` rises by one per audit row waiting, the same reading a single queue of that bound gives.
 Counting the audit lane is what lets a collector that stalls while only audit lines arrive show a
 rising depth. While the general lane is draining but not full, audit lines are served ahead of it,

@@ -6744,9 +6744,10 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     if raw is None:
         return None
     if args.expected_anchor_file is not None and not raw.strip():
-        # Said as such, not as a malformed line 1 of a file that has none.
+        # An empty file and a blank first line alike: the anchor is read from line 1 only.
         print(
-            f"error: --expected-anchor-file {args.expected_anchor_file!r} holds no COUNT:HEAD line",
+            f"error: --expected-anchor-file {args.expected_anchor_file!r}: line 1 is empty; the "
+            "COUNT:HEAD line must be the file's first line",
             file=sys.stderr,
         )
         return 2
@@ -6791,11 +6792,13 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         read_bounded_utf8_lines,
     )
 
-    #: Each pair with where it came from, by position and never by content, for the refusal below.
-    pairs: list[tuple[int, str, str]] = []
+    #: Each pair with where it came from, by position and never by content, for the refusal below:
+    #: ``-n`` is the n-th ``--expected-row``, ``n`` is line n of the file. An int, not a label, so a
+    #: file of millions of pairs carries no string per pair.
+    pairs: list[tuple[int, str, int]] = []
     for number, text in enumerate(args.expected_row or (), start=1):
         try:
-            pairs.append((*parse_audit_row_pair(text), f"--expected-row {number}"))
+            pairs.append((*parse_audit_row_pair(text), -number))
         except AuditRowPairError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -6826,7 +6829,7 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
         if not line.strip():
             continue
         try:
-            pairs.append((*parse_audit_row_pair(line), f"--expected-rows-file line {number}"))
+            pairs.append((*parse_audit_row_pair(line), number))
         except AuditRowPairError as exc:
             print(
                 f"error: malformed --expected-rows-file line {number}: {exc.reason} — "
@@ -6842,7 +6845,7 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
     return _refuse_contradictory_pairs(pairs)
 
 
-def _refuse_contradictory_pairs(pairs: list[tuple[int, str, str]]) -> list[tuple[int, str]] | int:
+def _refuse_contradictory_pairs(pairs: list[tuple[int, str, int]]) -> list[tuple[int, str]] | int:
     """``pairs``, or the exit code 2 if one seq is given two different row_hashes. No chain matches
     both, so such a set is a bad input, such as an export mixing two engines' tees, never evidence
     of tampering.
@@ -6850,12 +6853,17 @@ def _refuse_contradictory_pairs(pairs: list[tuple[int, str, str]]) -> list[tuple
     The refusal names the two places by position (each pair's third item) and never the seq: a
     seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
     """
-    first: dict[int, tuple[str, str]] = {}
+
+    def where(origin: int) -> str:
+        return f"--expected-row {-origin}" if origin < 0 else f"--expected-rows-file line {origin}"
+
+    first: dict[int, tuple[str, int]] = {}
     for seq, head, origin in pairs:
         earlier_head, earlier_origin = first.setdefault(seq, (head, origin))
         if earlier_head != head:
             print(
-                f"error: {earlier_origin} and {origin} give one seq two different row_hash "
+                f"error: {where(earlier_origin)} and {where(origin)} give one seq two different "
+                "row_hash "
                 "values; no chain matches both, so the set is refused rather than reported as "
                 "tampering",
                 file=sys.stderr,

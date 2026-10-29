@@ -997,16 +997,18 @@ def _depth_cap(records: queue.Queue[Any]) -> int | None:
 
 
 def _published_counts(records: queue.Queue[Any], *counts: int) -> tuple[int, ...]:
-    """``counts``, capped TOGETHER at :func:`_depth_cap`, taken in order: the only form in which
-    a count of what the queue held may reach a log line, a status field or a warning.
+    """``counts``, capped TOGETHER at :func:`_depth_cap`, taken in order: the form in which the
+    queue's depth reaches ``queued`` on ``GET /status`` and the two shutdown lines close() logs.
+    The drop counters are raw, and docs/SECURITY.md records what they tell an audit-row reader.
 
     Together, because the counts close() reports at shutdown share one budget: on a single
     bounded queue the records still queued at the drain deadline, spooled and lost alike, never
     passed its bound, so on the two lanes neither the parts nor their sum may pass the cap.
     Capping each part alone would let two parts that sum past the cap tell how far past it the
-    lanes were, which is the audit-row signal the cap is there to hide (BACKLOG #1131). The order
-    matters too: close() passes the spooled count first, because a spool that fills part way
-    takes a fixed number of records and leaves the rest, audit rows included, to the loss."""
+    lanes were, which is the audit-row signal the cap is there to hide (BACKLOG #1131). close()
+    passes the loss first, so a record that reached neither the collector nor the spool is never
+    hidden behind one the spool kept. The cost: a spool that fills part way through the drain
+    splits the capped total in a way that can move with audit rows; docs/SECURITY.md says so."""
     budget = _depth_cap(records)
     if budget is None:
         return counts
@@ -1515,7 +1517,8 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
                 # A nested count on this thread (the lock is re-entrant) reported the batch
                 # first, between our read of ``last`` and our stamp. Nothing is left to report.
                 return
-        depth = _depth_cap(self._records)
+        cap = _depth_cap(self._records)
+        depth = 0 if cap is None else cap  # an unbounded plain queue printed 0 before, as here
         # The line names no lane and prints the smaller lane bound whichever lane dropped, the cap
         # every published depth reads (:func:`_depth_cap`), so its wording adds no audit-row
         # signal to ``GET /logs/tail`` (BACKLOG #1131). Its counts
@@ -1554,12 +1557,12 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         # until the process exits, which is when the OS releases it anyway.
         spool = self._listener.spool if drained else None
         # Both counts rise by one per audit row while the general lane is full, and this log is
-        # served by GET /logs/tail, so they are published capped together, spooled first
+        # served by GET /logs/tail, so they are published capped together, the loss first
         # (BACKLOG #2612, #1131): _published_counts says why. Both are floors, and say so.
-        kept, undelivered = _published_counts(
+        undelivered, kept = _published_counts(
             self._records,
-            self._listener.spooled_at_stop if spool is not None else 0,
             self._listener.undelivered(),
+            self._listener.spooled_at_stop if spool is not None else 0,
         )
         for target in self.targets:
             target.close()
