@@ -638,7 +638,8 @@ class ApprovalGate:
     @property
     def settings(self) -> ApprovalsSettings:
         """A copy of the ``[approvals]`` this gate was built with. ``GET /security/posture`` names a
-        loosened dwell or expiry from it (BACKLOG #2489). A copy, so a reader cannot change what the
+        loosened dwell or expiry from it (BACKLOG #2489), and a held list that leaves out a default
+        operation or holds none (vault BACKLOG #3123). A copy, so a reader cannot change what the
         gate enforces. A request already pending keeps the deadline stamped when it was made."""
         return self._settings.model_copy(deep=True)
 

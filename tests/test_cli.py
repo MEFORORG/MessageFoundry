@@ -1830,6 +1830,64 @@ def test_serve_exposed_with_approvals_on_no_warn(
     assert "[approvals]" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("operations", "named"),
+    [
+        ("[]", "holds no operation"),
+        ('["dead_letter_replay"]', "leaves out the default operation connection_purge"),
+    ],
+    ids=["empty", "narrowed"],
+)
+def test_serve_exposed_with_a_narrowed_held_list_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operations: str,
+    named: str,
+) -> None:
+    """Dual control on with a held list narrowed below its default leaves the left-out actions on
+    one caller's authority, so the exposure advisory fires as it does with dual control off (vault
+    BACKLOG #3474). It reads ``_approvals_loosenings``, so its wording names what was left out.
+    Still WARN-only: the instance starts."""
+    rc = _dualctl_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n'
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_mfa = true\n"
+        f"[approvals]\nenabled = true\noperations = {operations}\n",
+        env="staging",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    advisory = [line for line in err.splitlines() if "[approvals].operations narrowed" in line]
+    assert len(advisory) == 1, err
+    assert named in advisory[0] and "approvals:approve" in advisory[0], advisory
+    assert "[approvals].enabled off" not in err
+
+
+def test_serve_exposed_holding_more_than_the_default_no_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Adding an operation the default leaves out holds more, so it is not a narrowing."""
+    rc = _dualctl_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n'
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_mfa = true\n"
+        "[approvals]\nenabled = true\n"
+        'operations = ["dead_letter_replay", "connection_purge", "config_reload"]\n',
+        env="staging",
+    )
+    assert rc == 0
+    assert "[approvals]" not in capsys.readouterr().err
+
+
 def _stub_protect_key(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Stub out real DPAPI and the restricted create; capture the read-grants protect-key asks for."""
     import messagefoundry.secrets_dpapi as dpapi_mod

@@ -2680,6 +2680,7 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
+        _approvals_loosenings,
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
@@ -3999,15 +4000,34 @@ def _serve(args: argparse.Namespace) -> int:
     # the sec-mfa-on / retention / notifications prod-refuse ladder above, returning 2) instead of
     # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
     # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
-    if admin_exposed and not settings.approvals.enabled:
-        print(
-            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
-            "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) each "
-            "complete on a single caller's authority with no second sign-off (ASVS 2.3.5). Enable "
-            "dual-control with [approvals].enabled=true so a distinct approver (approvals:approve) must "
-            "release them before exposure.",
-            file=sys.stderr,
-        )
+    #
+    # Dual control on with a narrowed or empty [approvals].operations leaves the same actions on one
+    # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
+    # wording are `_approvals_loosenings`', the one reader of that list against its default, so the
+    # default list is never restated here. Still WARN-only: the arm's body holds no return.
+    held_gap = [
+        risk
+        for switch, risk in _approvals_loosenings(settings.approvals)
+        if switch == "approvals.operations"
+    ]
+    if admin_exposed and (not settings.approvals.enabled or held_gap):
+        if not settings.approvals.enabled:
+            print(
+                f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
+                "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) "
+                "each complete on a single caller's authority with no second sign-off (ASVS 2.3.5). "
+                "Enable dual-control with [approvals].enabled=true so a distinct approver "
+                "(approvals:approve) must release them before exposure.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
+                f"[approvals].operations narrowed: {held_gap[0]} (ASVS 2.3.5). Hold the default "
+                "operations in [approvals].operations so a distinct approver (approvals:approve) "
+                "must release them before exposure.",
+                file=sys.stderr,
+            )
 
     # --- startup TLS-floor probe of the declared front door (ASVS 12.1.1) ---------------------------
     # ORDER MATTERS: this sits AFTER the config-only exposure refusals (/ui exposure,
@@ -10845,7 +10865,8 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
     # degradation marker.
     _api = ApiSettings()
-    # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
+    # BACKLOG #2489, vault #3123: [approvals] carries the dual-control dwell, expiry and held list.
+    # Same read, same marker.
     _approvals = ApprovalsSettings()
     # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
     _cert_monitor = CertMonitorSettings()
