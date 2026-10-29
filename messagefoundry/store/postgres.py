@@ -1973,7 +1973,8 @@ class PostgresStore:
                 # peer's upgrade is still healthy. The lock is transaction-scoped: it is released
                 # when the holder commits or rolls back, or once the server sees the holder's
                 # session end, which for a crashed host can take as long as TCP keepalive allows.
-                # Only command_timeout is lifted; a role-configured lock_timeout still bounds it.
+                # A role- or database-configured lock_timeout (or transaction_timeout) still
+                # bounds it; this lifts only command_timeout and statement_timeout.
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 await self._advisory_lock(
                     conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=float("inf")

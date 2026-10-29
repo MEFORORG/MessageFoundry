@@ -1014,7 +1014,9 @@ _APPLOCK_WAIT_FOREVER: Final[int] = -1
 
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
-    (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
+    (wait forever; nothing else bounds it, since a 0 command timeout sets no pyodbc query timeout
+    either, and the schema lock passes ``-1`` on a cursor made with none). ``0`` -> ``-1`` is why the
+    SYNC handoff pool
     REFUSES to build when ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait
     unboundedly on the applock)."""
     return int(command_timeout * 1000) if command_timeout else _APPLOCK_WAIT_FOREVER
@@ -4632,7 +4634,8 @@ class SqlServerStore:
                     # open transaction for `@LockOwner='Transaction'` to attach to. (An earlier comment
                     # here read "this first statement opens the txn" — it predated the probe and was
                     # stale, not a contradiction of the applock rule record_audit now follows.)
-                    # The wait is unbounded, as on Postgres; PostgresStore._ensure_schema says why.
+                    # The wait is unbounded; PostgresStore._ensure_schema says why. SQL Server has
+                    # no lock_timeout that bounds sp_getapplock, so here nothing else bounds it.
                     log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
                     await self._applock(cur, _SCHEMA_LOCK, timeout_ms=_APPLOCK_WAIT_FOREVER)
                     # Double-check under the lock: the peer we queued behind may have just applied
