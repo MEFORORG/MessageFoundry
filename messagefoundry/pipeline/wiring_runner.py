@@ -4432,8 +4432,10 @@ class RegistryRunner:
         :meth:`AlertSink.connection_started` states the contract; these are the checks behind it.
         Only when no known cause still holds the name down IN EITHER DIRECTION, because alerts key on
         the bare name while every cause here keys on direction (#1813). The alert row lives in the
-        store every process shares, so a clustered node, or an engine shard that does not own the
-        outbound namesake, cannot see every cause and resolves nothing. A pooled lane a dispatcher
+        store every process shares, so a clustered node, or an engine shard that does not own the bare
+        name as an outbound lane, cannot see every cause and resolves nothing. That holds whether or
+        not this runner's registry holds an outbound of that name: one a reload dropped here still
+        drains, and can STOP, on its owning engine shard. A pooled lane a dispatcher
         STOPPED on its own account without a hold (a leadership-loss STOP) counts as a cause too, and
         so does an outbound namesake whose build failed as it left the DR park. A park the ENGINE or
         the calendar made (``deployed=False``, ``auto_start=False``, a schedule park) raises no
@@ -4449,7 +4451,9 @@ class RegistryRunner:
                 or name in self._log_halted
                 or self._delivery_halted
                 or self._coordinator.is_clustered()
-                or (name in self.registry.outbound and not self._owns_destination(name))
+                # Not gated on this runner's registry holding the outbound: a namesake a reload
+                # dropped here keeps draining, and can STOP, on the engine shard that owns it.
+                or not self._owns_destination(name)
                 or self.outbound_failed(name) is not None
                 or ("outbound", name) in self._stop_held
                 or self.outbound_dr_failed(name)

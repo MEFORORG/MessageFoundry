@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -1486,10 +1486,36 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         alert-state is wired, which drops its occurrence count, tier and suspend entry. With
         alert-state wired it also ends the cooldown, so a stop that follows is a new incident that
         pages and dispatches its rule's control action, whatever rule restart is in flight. Without
-        alert-state there is no instance to resolve, and the cooldown stands."""
-        if self._store is not None:
-            self._last_sent.pop(f"connection_stopped:{name}", None)
-        self._record_state({"type": "connection_started", "connection": name}, "info")
+        alert-state there is no instance to resolve, and the cooldown stands.
+
+        The clear is provisional until the durable resolve lands: a stop emitted before the write
+        lands must already see it to page. If the write fails, or never runs, the row stays open,
+        so the cooldown, count and suspend entry go back (:meth:`_restore_unresolved`)."""
+        if self._store is None:
+            return
+        key = f"connection_stopped:{name}"
+        last = self._last_sent.pop(key, None)
+        occurrences = self._occurrences.pop(key, None)
+        suspended = self._suspended.pop(key, None)
+        self._record_state(
+            {"type": "connection_started", "connection": name},
+            "info",
+            on_failure=lambda: self._restore_unresolved(key, last, occurrences, suspended),
+        )
+
+    def _restore_unresolved(
+        self, key: str, last: float | None, occurrences: int | None, suspended: float | None
+    ) -> None:
+        """Put back the in-memory state :meth:`connection_started` cleared, after its durable resolve
+        failed and left the instance open (BACKLOG #1741). A stop emitted in between bumped the open
+        row too, so its occurrences add to the restored count; a cooldown or suspend set in between
+        is newer than the cleared one and stands."""
+        if occurrences is not None:
+            self._occurrences[key] = occurrences + self._occurrences.get(key, 0)
+        if last is not None:
+            self._last_sent.setdefault(key, last)
+        if suspended is not None:
+            self._suspended.setdefault(key, suspended)
 
     @staticmethod
     def _apply_escalation(
@@ -1600,12 +1626,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
     def _record_state(
-        self, event: dict[str, Any], severity: str, *, escalation_tier: int = 0
+        self,
+        event: dict[str, Any],
+        severity: str,
+        *,
+        escalation_tier: int = 0,
+        on_failure: Callable[[], None] | None = None,
     ) -> None:
         """Schedule the alert-instance upsert (or auto-resolve) off ``_emit`` — a fail-soft side observer
         (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
         store. A no-op when no store is wired (state tracking off). The store write never raises into the
-        ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker."""
+        ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker.
+        ``on_failure`` runs when the write fails or is dropped for want of a loop, never when it lands."""
         store = self._store
         if store is None:
             return
@@ -1641,7 +1673,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 escalation_tier=escalation_tier,
                 now=now,
             )
-        wrapper = self._run_state(coro, key)
+        wrapper = self._run_state(coro, key, on_failure)
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
@@ -1650,6 +1682,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # Close both coroutines so neither warns "never awaited".
             wrapper.close()
             coro.close()
+            if on_failure is not None:
+                on_failure()
             return
         self._state_tasks.add(task)
 
@@ -1661,7 +1695,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         task.add_done_callback(_done)
 
-    async def _run_state(self, coro: Coroutine[Any, Any, Any], key: str) -> None:
+    async def _run_state(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        key: str,
+        on_failure: Callable[[], None] | None = None,
+    ) -> None:
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
@@ -1673,6 +1712,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # The alert-instance write is a side observer: a store error must never wedge a delivery
             # worker or drop the notification. Log metadata only (no event body).
             log.warning("alert-instance state write failed", exc_info=True)
+            if on_failure is not None:
+                on_failure()
 
     async def drain_state(self, timeout: float) -> None:
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine

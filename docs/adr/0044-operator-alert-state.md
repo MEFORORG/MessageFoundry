@@ -266,8 +266,8 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   At least these still need a manual resolve: an outbound's start failure while it is still
   recorded, a halt whose name has no
   inbound, a halt no operator restarts, an inbound whose outbound namesake still has an open cause,
-  and any alert raised in a cluster or under an engine shard that does not own the namesake
-  outbound. `AlertSink.connection_started` states the contract, and its exclusions bind here too.
+  and any alert raised in a cluster or under an engine shard that does not own the bare name as an
+  outbound lane, whether or not its registry still holds an outbound of that name. `AlertSink.connection_started` states the contract, and its exclusions bind here too.
 - [ ] **Resolved-instance retention window.** Confirm the prune window for resolved instances (a
   `connection_event_retention_hours` analog) and that it rides the **existing** `RetentionRunner.run_once`
   pass + one audit row (never an open/acknowledged instance).

@@ -241,7 +241,8 @@ class AlertSink(Protocol):
         them whatever this event does. A rule-driven loop must keep counting, so a rule's restart
         also keeps the cooldown and the count. On that door, at least these starts never raise it: an
         outbound's own start; a start where the runner cannot see every cause (on a clustered node,
-        or on an engine shard that does not own the outbound namesake); and a start while the
+        or on an engine shard that does not own the bare name as an outbound lane, even with no
+        outbound of that name in its own registry); and a start while the
         outbound namesake is under an operator-style pause, which a log-write halt's pause looks
         like. A park the engine or the calendar made of the outbound namesake does not hold it back.
         ``RegistryRunner._emit_inbound_started`` holds the checks. ``name`` is the connection label

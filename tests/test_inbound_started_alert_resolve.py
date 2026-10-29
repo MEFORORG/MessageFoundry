@@ -41,6 +41,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 
@@ -333,12 +334,12 @@ async def test_a_clustered_node_or_unowned_namesake_resolves_nothing(
     await runner.start()
     try:
         sink.started.clear()
-        # Another engine shard owns the namesake outbound. An inbound with no namesake is not
-        # held back by where its bare name would hash.
+        # Another engine shard owns the bare name as an outbound lane. That holds back an inbound
+        # with no namesake in this registry too: one a reload dropped here can still STOP there.
         monkeypatch.setattr(runner, "_owns_destination", lambda name: False)
         await runner.restart_inbound("SHARED", operator=True)
         await runner.restart_inbound("ALONE", operator=True)
-        assert sink.started == ["ALONE"]
+        assert sink.started == []
         sink.started.clear()
         monkeypatch.undo()
         monkeypatch.setattr(runner, "_coordinator", _ClusterNode())
@@ -914,3 +915,76 @@ async def test_an_internal_stage_stop_stays_open_across_a_fresh_start_and_a_relo
         assert await _open(store) == set()
     finally:
         await runner.stop()
+
+
+def _name_owned_by(owner: str, universe: tuple[str, ...]) -> str:
+    for i in range(1000):
+        if owner_shard_of_destination(name := f"IB_{i}", universe) == owner:
+            return name
+    raise AssertionError("no name hashes to the owner")  # pragma: no cover
+
+
+async def test_a_dropped_outbound_namesake_owned_by_another_shard_keeps_its_stop_open(
+    store: MessageStore,
+) -> None:
+    # A reload dropped the outbound of this name from this engine shard's registry, but its queued
+    # rows still drain on the engine shard that owns the lane, whose STOP raised connection_stopped
+    # into the shared store. This shard cannot see that cause, so an operator start of the inbound
+    # of the same name must not resolve it. On an earlier cut the ownership check ran only for an
+    # outbound in this registry, so the start resolved the other shard's stop.
+    universe = ("a", "b")
+    name = _name_owned_by("b", universe)
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection(name, MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    reg.shard_id, reg.all_shard_ids = "a", universe
+    sink = NotifierAlertSink([], store=store)
+    runner = _runner(reg, store, sink)
+    await runner.start()
+    try:
+        assert name not in runner.registry.outbound and not runner._owns_destination(name)
+        sink.connection_stopped(name, detail="outbound halted on internal error")  # shard b's
+        await _settle(sink)
+        await runner.start_inbound(name, operator=True)
+        assert runner.inbound_running(name)
+        await _settle(sink)
+        assert await _open(store) == {("connection_stopped", name)}
+        assert sink._occurrences[f"connection_stopped:{name}"] == 1
+    finally:
+        await runner.stop()
+
+
+async def test_a_failed_resolve_leaves_the_count_cooldown_and_suspend_in_place() -> None:
+    # connection_started clears the in-memory state at once, so a stop emitted before the write
+    # lands pages. When the durable resolve then fails, the row is still open, so the cooldown,
+    # count and suspend entry come back, with the in-between stop's count added. On an earlier cut
+    # they stayed cleared: memory said resolved while the row stayed open.
+    class _FailingResolve:
+        async def upsert_alert_instance(self, **_kw: object) -> None:
+            return None
+
+        async def resolve_alert_instances_for(self, **_kw: object) -> int:
+            raise OSError("store unavailable")
+
+    key = "connection_stopped:IB"
+    sink = NotifierAlertSink([], realert_seconds=3600.0, store=_FailingResolve())  # type: ignore[arg-type]
+    sink.connection_stopped("IB", detail="router halted")
+    sink.connection_stopped("IB", detail="router halted")
+    until = time.time() + 3600
+    sink.suspend("connection_stopped", "IB", until=until)
+    last = sink._last_sent[key]
+    sink.connection_started("IB")
+    assert key not in sink._occurrences and key not in sink._last_sent
+    await _settle(sink)
+    assert sink._occurrences[key] == 2
+    assert sink._last_sent[key] == last
+    assert sink._suspended[key] == until
+    # A stop between the clear and the failure bumped the still-open row, so it adds to the count,
+    # and the cooldown it set is the newer one.
+    sink.connection_started("IB")
+    sink.connection_stopped("IB", detail="router halted")
+    newer = sink._last_sent[key]
+    await _settle(sink)
+    assert sink._occurrences[key] == 3
+    assert sink._last_sent[key] == newer
+    assert sink._suspended[key] == until
