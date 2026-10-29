@@ -382,6 +382,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.static_credentials import SETTINGS_PREFIX, static_credential_hops
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     fips_attestation,
     kex_groups_report,
     phi_read_hop_disposition,
@@ -5121,10 +5122,12 @@ def create_app(
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
                 refused = _ANCHOR_REFUSED_DETAIL
-            except WiringError as exc:
+            except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
-                # audit row. The full refusal goes to the operator log; the answer names only the
+                # audit row. BACKLOG #2193: a hop guard the connector's own constructor runs, such
+                # as the FTPS poll's revocation guard, raises InsecureHopRefused, a ValueError and
+                # not a WiringError, and is the same refusal. The full refusal goes to the operator log; the answer names only the
                 # listener, because other start gates' text can name paths and sibling bindings.
                 _log.warning(
                     "operator %s of inbound connection %r refused: %s",
