@@ -1055,9 +1055,12 @@ class UploadStore:
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
         no creation row, while the client was told the upload failed and may well retry it. A
-        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. The API writes
-        the row after this returns as an operation the request deadline cannot cancel, and a row
-        that fails there removes the pair through :meth:`discard` (vault BACKLOG #3178)."""
+        removal the filesystem refuses is logged at ERROR, and so is one still running after
+        ``_CANCELLED_REMOVAL_WAIT_SECONDS``, which goes on without the lock and may not finish
+        before the process stops (:meth:`_remove_cancelled_pair`). This covers ``save`` only. The
+        API writes the row after this returns as an operation the request deadline cannot cancel,
+        and a row that fails there removes the pair through :meth:`discard` (vault BACKLOG
+        #3178)."""
         if not uploader_id:
             raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
@@ -1510,8 +1513,16 @@ class UploadStore:
         an upload at the quota edge, but never admits one too many. Within the bound, a failure of
         the removal is raised to the caller, which logs it. Past it, an ERROR names the
         ``file_id`` at once, as a stored file with no ``upload.create`` row, since the process may
-        stop before the removal answers (vault BACKLOG #3178). A removal that then runs logs at
-        INFO, and one that fails or is refused logs a second ERROR.
+        stop before the removal answers (vault BACKLOG #3178). A removal that then takes the pair
+        away logs a WARNING withdrawing that ERROR, at a level the default log keeps; one that
+        fails or is refused logs a second ERROR.
+
+        Every removal abandoned at the bound keeps one default-executor worker until its unlink
+        returns, and nothing caps how many: on a filesystem whose unlinks hang while its writes do
+        not, repeated cancellations could fill the pool every ``asyncio.to_thread`` in the engine
+        shares. Once the lock drops, a save that scans can also hold the sidecar open while the
+        removal unlinks it; on Windows that refuses the unlink, which is logged, and the sidecar
+        stays listed until the retention prune clears it.
 
         This bounds the cancelled-save path only. :meth:`discard`'s removal, after a failed
         ``upload.create`` row, still waits on its unlink under the lock with no bound.
@@ -1523,7 +1534,7 @@ class UploadStore:
         :func:`_wait_to_completion`'s, whose bound applies only once the caller's task is marked
         cancelling: this one holds however the ``CancelledError`` reached ``save``."""
         loop = asyncio.get_running_loop()
-        removal = _submit_to_thread(self._discard_cancelled_sync, file_id)
+        removal = _submit_to_thread(self._remove_and_confirm_sync, file_id)
         deadline = loop.time() + _CANCELLED_REMOVAL_WAIT_SECONDS
         while not removal.done() and (remaining := deadline - loop.time()) > 0:
             with contextlib.suppress(asyncio.CancelledError):
@@ -1539,6 +1550,12 @@ class UploadStore:
             _CANCELLED_REMOVAL_WAIT_SECONDS,
         )
         removal.add_done_callback(functools.partial(_log_late_removal, file_id=file_id))
+
+    def _remove_and_confirm_sync(self, file_id: str) -> bool:
+        """:meth:`_discard_cancelled_sync`, then whether neither half of the pair is left, read in
+        the same thread so a late removal's log can say which way it went."""
+        self._discard_cancelled_sync(file_id)
+        return not any(path.exists() for path in self._paths(file_id))
 
     async def drain_stragglers_within(self, budget: float) -> None:
         """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
@@ -2759,9 +2776,13 @@ def _log_late_removal(done: asyncio.Future[Any], file_id: str) -> None:
     BACKLOG #3740 item 4); the ERROR at the bound said the file may still be stored."""
     if done.cancelled() or done.exception() is not None:
         _log_discard_unfinished(done, file_id)
-    else:
-        # _discard_cancelled_sync logs a refused unlink at ERROR itself; this says only that it ran.
-        _log.info("upload %s: its removal ran after the quota lock was released", file_id)
+    elif done.result():
+        _log.warning(
+            "upload %s: its removal finished after the quota lock was released, so the earlier "
+            "ERROR that it may still be stored no longer applies",
+            file_id,
+        )
+    # Otherwise _discard_cancelled_sync logged the refused unlink at ERROR itself.
 
 
 def _log_release_cancelled(done: asyncio.Future[Any], uploader_id: str) -> None:

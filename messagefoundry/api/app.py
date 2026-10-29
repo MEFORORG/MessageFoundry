@@ -3867,11 +3867,10 @@ def create_app(
     # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
     # DR activate, DR release, config reload, an upload's upload.create row and an upload delete
-    # outlive a caller the request deadline cancels (vault BACKLOG #2751, #2752, #2753, #3178). Both
-    # lifespans drain what is still running while the store is open: the managed one before
-    # engine.stop(), and the one this function gives an app built around a caller's engine, before
-    # the caller stops it (_app_drain_steps). One per app; the handlers below close over it, so /ui
-    # gets it too, and so does the approval gate's released reload.
+    # outlive a caller the request deadline cancels (vault BACKLOG #2751, #2752, #2753, #3178).
+    # Both lifespans drain what is still running; _app_drain_steps says when. One per app; the
+    # handlers below close over it, so /ui gets it too, and so does the approval gate's released
+    # reload.
     outliving = OutlivingOperations()
     app.state.outliving_operations = outliving
     if engine is not None:

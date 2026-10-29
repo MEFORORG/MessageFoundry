@@ -270,7 +270,7 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
         removed.set()
 
     monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
-    caplog.set_level(logging.INFO, logger="messagefoundry.uploads")
+    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
     a = asyncio.create_task(
         store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
     )
@@ -298,11 +298,12 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
     assert [m.filename for m in await store.list_files()] == ["b.txt"]
     assert await _settled(store), "a ledger call was left running"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    withdrawn = "its removal finished after the quota lock was released"
     for _ in range(50):  # the done callback runs one loop pass after the thread returns
-        if "its removal ran after the quota lock was released" in caplog.text:
+        if withdrawn in caplog.text:
             break
         await asyncio.sleep(0.02)
-    assert "its removal ran after the quota lock was released" in caplog.text, caplog.text
+    assert withdrawn in caplog.text, caplog.text
 
 
 async def test_the_drain_reads_its_default_waits_when_it_runs(
