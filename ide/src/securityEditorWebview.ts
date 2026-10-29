@@ -147,11 +147,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
       }
       // Unset, not each select's first option: a Yes/No that shows "Yes" before any state has said
       // so is a value nobody read, and a tristate's '' option is a real value (derived), not unset.
-      // After the loop, once every select holds its options and is on the page.
-      for (const f of FIELDS) {
-        const input = $('in-' + f.key);
-        if (input.tagName === 'SELECT') { input.selectedIndex = -1; } else { input.value = ''; }
-      }
+      // Done once every select is on the page, so no insertion can pick an option again. A new
+      // input is already empty.
+      for (const s of root.querySelectorAll('select')) { s.selectedIndex = -1; }
     }
 
     function currentValue(f) {

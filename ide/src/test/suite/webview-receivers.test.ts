@@ -569,10 +569,20 @@ const ONE_PER_TYPE: [string, string][] = [
   ["tristate", "production_instance"],
 ];
 
+function formControls(p: Page): DomNode[] {
+  return [...p.window.document.querySelectorAll("#form input, #form select")];
+}
+
 /** The live value of every control in the form, which is what Save would send. */
 function formValues(p: Page): string {
-  const controls = [...p.window.document.querySelectorAll("#form input, #form select")];
-  return JSON.stringify(controls.map((c: DomNode) => [c.id, c.value]));
+  return JSON.stringify(formControls(p).map((c) => [c.id, c.value]));
+}
+
+/** Every control in the form that is not unset: a select with an option chosen, or an input with text. */
+function setControls(p: Page): string[] {
+  return formControls(p)
+    .filter((c) => (c.tagName === "SELECT" ? c.selectedIndex !== -1 : c.value !== ""))
+    .map((c) => `${c.id}=${JSON.stringify(c.value)}`);
 }
 
 /** The text the panel is SHOWING in its error element, or "" while that element is hidden. Read
@@ -1246,29 +1256,10 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   });
 
   // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
-  // 2026-10-29, BACKLOG #1123). One case per kind of problem stateProblem() refuses, since each is a
-  // path into refuse(). Each first renders a state with insecure values, so 'loosened' is set and
-  // defaults are held, and edits two controls without saving, one of them into a loosening.
-  const REFUSE_TRIGGERS: [string, (c: Payload) => void][] = [
-    ["there is no state", (c) => delete c.state],
-    ["the state is a list", (c) => (c.state = [c.state])],
-    ["there is no values object", (c) => delete c.state.values],
-    ["defaults is not an object", (c) => (c.state.defaults = "secure")],
-    ["values has no switch", (c) => delete c.state.values.serve_web_console],
-    ["defaults has no switch", (c) => delete c.state.defaults.max_session_hours],
-    ["a value has the wrong type", (c) => (c.state.values.require_mfa = "false")],
-    ["a default has the wrong type", (c) => (c.state.defaults.production_instance = 0)],
-    ["set is not a list of text", (c) => (c.state.set = null)],
-    ["loosenings is not a list of entries", (c) => delete c.state.loosenings[0].risk],
-  ];
-
-  /** Every control in the form that is not unset: a select with an option chosen, or an input with text. */
-  function setControls(p: Page): string[] {
-    const controls = [...p.window.document.querySelectorAll("#form input, #form select")];
-    return controls
-      .filter((c: DomNode) => (c.tagName === "SELECT" ? c.selectedIndex !== -1 : c.value !== ""))
-      .map((c: DomNode) => `${c.id}=${JSON.stringify(c.value)}`);
-  }
+  // 2026-10-29, BACKLOG #1123). Every malformed state the suite already discards is a trigger, so a
+  // case added there is covered here too. Each first renders a state with insecure values, so
+  // 'loosened' is set and defaults are held, and edits two controls without saving, one of them
+  // into a loosening.
 
   /** The page's own `defaults` binding, read in the page's realm: the object collectUpdates() reads. */
   function heldDefaults(p: Page): string[] {
@@ -1279,7 +1270,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     return [...p.window.document.querySelectorAll(".loosened")].map((e: DomNode) => String(e.id)).sort();
   }
 
-  for (const [why, change] of REFUSE_TRIGGERS) {
+  for (const [why, malformed] of security.malformed.state) {
     test(`Security Settings: a discarded state clears the form, defaults and every loosened mark when ${why}`, () => {
       const p = security.load();
       const doc = p.window.document;
@@ -1300,14 +1291,16 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         ["field-allow_unencrypted_phi", "field-local_access_only", "field-require_mfa"],
         `${why}: the good state and the edit did not mark their loosenings`,
       );
-      assert.ok(FIELDS.every((f) => heldDefaults(p).includes(f.key)), `${why}: the defaults are not held`);
+      const held = heldDefaults(p);
+      assert.ok(FIELDS.every((f) => held.includes(f.key)), `${why}: the defaults are not held`);
       assert.ok(setControls(p).includes('in-max_session_hours="99"'), `${why}: the edit did not take`);
 
-      p.deliver(variant(STATE_OK, change));
+      p.deliver(malformed);
 
       assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
       assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: the state was not discarded`);
-      assert.ok(refusalShown(p).startsWith(REFUSAL), `${why}: no refusal, got "${refusalShown(p)}"`);
+      const shown = refusalShown(p);
+      assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.deepStrictEqual(setControls(p), [], `${why}: a control still holds a value from before the refusal`);
       assert.deepStrictEqual(heldDefaults(p), [], `${why}: collectUpdates() would still compare against old defaults`);
       assert.deepStrictEqual(loosenedFields(p), [], `${why}: a loosened mark outlived the refusal`);
