@@ -683,6 +683,51 @@ async def test_an_operator_start_while_the_rules_restart_waits_resolves(
         await runner.stop()
 
 
+async def test_a_queued_rule_restart_whose_start_fails_records_and_alerts(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rule's restart waits on the reload lock while an operator's start resolves the alert.
+    # The restart then stops the healthy inbound, and its start fails with an error that is not a
+    # refused CA. The inbound must read failed, with a new open connection_stopped instance: on an
+    # earlier cut only a WARNING was logged, so the stopped inbound had no record and no alert.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB", MLLP(port=0), router="r"))
+    reg.add_router("r", lambda m: [])
+    rule = AlertRule(
+        event_type="connection_stopped", connection="IB", control_action="restart_inbound"
+    )
+    sink = NotifierAlertSink([], rules=[rule], store=store)
+    runner = _runner(reg, store, sink)
+    sink.set_control_callback(_engine_control(runner))
+
+    async def _bind_fails(name: str) -> None:
+        raise OSError("cannot bind: address in use")
+
+    await runner.start()
+    try:
+        await _settle(sink)
+        async with runner._reload_lock:
+            await runner._stop_inbound_unsafe("IB")
+            sink.connection_stopped("IB", detail="router halted on internal error")
+            for _ in range(5):
+                await asyncio.sleep(0)  # the restart is now waiting for the lock
+            assert sink._control_tasks
+            await runner._resolving_start("IB", resolve=True)  # start_inbound(operator=True)
+            await _settle(sink)
+            assert await _open(store) == set()
+            monkeypatch.setattr(runner, "_start_inbound_unsafe", _bind_fails)
+        await _settle(sink, sink._control_tasks)
+        await _settle(sink)
+        assert not runner.inbound_running("IB")
+        assert runner.inbound_failed("IB")
+        (inst,) = await store.list_active_alert_instances(allowed_channels=None)
+        assert (inst.event_type, inst.connection) == ("connection_stopped", "IB")
+        # One record, one alert: the rule this alert fires again finds the record and stays quiet.
+        assert int(inst.count) == 1
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("park", ["deployed", "auto_start"])
 async def test_a_deliberately_parked_outbound_namesake_does_not_block_the_resolve(
     store: MessageStore, held_port: tuple[int, socket.socket], tmp_path: Path, park: str

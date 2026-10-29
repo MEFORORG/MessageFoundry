@@ -3298,14 +3298,27 @@ class RegistryRunner:
     async def restart_inbound(self, name: str, *, operator: bool = False) -> None:
         """Stop then start one inbound under one reload-lock span. Only an ``operator`` restart raises
         ``connection_started``; an alert rule's restart resolves nothing, so a rule-driven crash loop
-        keeps one open, escalating, throttled instance (BACKLOG #1741)."""
+        keeps one open, escalating, throttled instance (BACKLOG #1741).
+
+        An engine restart whose start fails records the inbound failed and alerts through
+        :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
+        already ran, so without the record a restart queued behind an operator's resolving start
+        could leave the inbound down with no record and no open alert. An operator's restart
+        raises to its caller instead, as before."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
             if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
-            await self._resolving_start(name, resolve=operator)
+            try:
+                await self._resolving_start(name, resolve=operator)
+            except Exception as exc:
+                # A refused CA is already recorded by _checked_inbound_start; the guard keeps a
+                # rule firing on this alert from re-alerting on every restart it drives.
+                if not operator and ("inbound", name) not in self._failed:
+                    self._record_failed(name, exc, kind="inbound")
+                raise
 
     def _dr_refuses(self, name: str, *, operator: bool) -> bool:
         """Whether a passive DR standby refuses an engine start of inbound ``name`` (vault BACKLOG
