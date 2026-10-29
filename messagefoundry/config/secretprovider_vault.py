@@ -29,6 +29,7 @@ is contained as a typed ``Any`` local here (never a repo-wide ignore).
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,21 @@ _TOKEN_UNSET = (
     f"VAULT_TOKEN or ~/.vault-token. Supply it to the service in one of those two places, and "
     f"run check-privileges with the service's environment"
 )
+#: The Windows twin, as in ``store/keyprovider_vault.py``: on Windows the token goes in the
+#: secrets directory only, never in the service's environment (owner ruling 2026-10-01).
+_TOKEN_UNSET_WINDOWS = (
+    f"{_ENV_TOKEN} is not set or is empty, so the connector-secret token is not known. On "
+    f"Windows, supply it only as the file named {_ENV_TOKEN} in the secrets directory "
+    f"MEFOR_SECRETS_DIRECTORY names, never in the service's environment. The engine never reads "
+    f"VAULT_TOKEN or ~/.vault-token in its place. Run check-privileges with "
+    f"MEFOR_SECRETS_DIRECTORY set as the service has it"
+)
+
+
+def _token_unset(platform: str | None = None) -> str:
+    """The unset-token refusal for ``platform``, this process's when ``None``. Fixed text."""
+    return _TOKEN_UNSET_WINDOWS if (platform or sys.platform) == "win32" else _TOKEN_UNSET
+
 
 #: Default field read from a KV secret when a reference omits ``#<field>``.
 _DEFAULT_FIELD = "value"
@@ -148,7 +164,7 @@ def _build_client(
     if not addr:
         raise SecretProviderError(_ADDR_UNSET)
     if not token:
-        raise SecretProviderError(_TOKEN_UNSET)
+        raise SecretProviderError(_token_unset())
     hvac = _import_hvac()
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
     # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
@@ -312,7 +328,7 @@ def secrets_vault_token() -> str:
     Raises :class:`SecretProviderError`, which the probe reports as not observed."""
     token = _token_setting()
     if not token:
-        raise SecretProviderError(_TOKEN_UNSET)
+        raise SecretProviderError(_token_unset())
     return token
 
 

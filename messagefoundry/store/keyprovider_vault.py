@@ -29,6 +29,7 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,21 @@ _TOKEN_UNSET = (
     f"or ~/.vault-token. Supply it to the service in one of those two places, and run "
     f"check-privileges with the service's environment"
 )
+#: The Windows twin. On Windows the token goes in the secrets directory only, never in the
+#: service's environment (owner ruling 2026-10-01; the environment is not refused yet), so the
+#: refusal never points a Windows operator there.
+_TOKEN_UNSET_WINDOWS = (
+    f"{_ENV_TOKEN} is not set or is empty, so the store token is not known. On Windows, supply "
+    f"it only as the file named {_ENV_TOKEN} in the secrets directory MEFOR_SECRETS_DIRECTORY "
+    f"names, never in the service's environment. The engine never reads VAULT_TOKEN or "
+    f"~/.vault-token in its place. Run check-privileges with MEFOR_SECRETS_DIRECTORY set as the "
+    f"service has it"
+)
+
+
+def _token_unset(platform: str | None = None) -> str:
+    """The unset-token refusal for ``platform``, this process's when ``None``. Fixed text."""
+    return _TOKEN_UNSET_WINDOWS if (platform or sys.platform) == "win32" else _TOKEN_UNSET
 
 
 def _import_hvac() -> Any:
@@ -154,7 +170,7 @@ def _build_client(
     if not addr:
         raise KeyProviderError(_ADDR_UNSET)
     if not token:
-        raise KeyProviderError(_TOKEN_UNSET)
+        raise KeyProviderError(_token_unset())
     hvac = _import_hvac()
     # ASVS 4.2.5: ``token`` ships as an ``X-Vault-Token`` request header on EVERY Transit
     # encrypt/decrypt/HMAC call, and ``addr`` becomes the request URL -- both from MEFOR_* env, and
@@ -488,7 +504,7 @@ def store_vault_token() -> str:
     secrets directory again, so a token file replaced there is what the next client built gets."""
     token = store_token_setting()
     if not token:
-        raise KeyProviderError(_TOKEN_UNSET)
+        raise KeyProviderError(_token_unset())
     return token
 
 

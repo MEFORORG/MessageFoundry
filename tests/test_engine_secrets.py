@@ -383,6 +383,40 @@ def test_a_vault_token_in_neither_the_directory_nor_the_environment_is_refused(
             secretprovider_vault.VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
 
 
+@pytest.mark.parametrize("hop", ["store", "secrets"])
+def test_the_windows_token_refusal_never_points_at_the_environment(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2851, owner ruling 2026-10-01: on Windows a Vault token goes in the secrets
+    directory only. The refusal for an unset token names that route and never offers the
+    service's environment; elsewhere it names both. Fixed text, so no value can appear."""
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.store import keyprovider_vault
+
+    own: type[Exception]
+    if hop == "store":
+        module: Any = keyprovider_vault
+        variable, own = "MEFOR_STORE_VAULT_TOKEN", KeyProviderError
+        read = keyprovider_vault.store_vault_token
+    else:
+        module = secretprovider_vault
+        variable, own = "MEFOR_SECRETS_VAULT_TOKEN", SecretProviderError
+        read = secretprovider_vault.secrets_vault_token
+    windows = module._token_unset("win32")
+    assert windows.startswith(f"{variable} is not set or is empty")
+    assert f"only as the file named {variable} in the secrets directory" in windows
+    assert "never in the service's environment" in windows
+    assert "one of those two places" not in windows
+    assert "one of those two places" in module._token_unset("linux")
+    # The shipped reader picks the text from the running platform.
+    monkeypatch.delenv(SECRETS_DIRECTORY_VARIABLE, raising=False)
+    monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    with pytest.raises(own) as caught:
+        read()
+    assert str(caught.value) == windows
+
+
 def test_an_unusable_directory_and_an_unset_address_are_refused_together(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
