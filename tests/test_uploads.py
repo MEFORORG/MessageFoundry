@@ -1258,11 +1258,13 @@ async def _drain_stragglers(store: UploadStore) -> None:
 
 async def _removals_settled(store: UploadStore) -> None:
     """Wait for a cancelled save's removal. Under an anyio scope the save stops waiting for it at
-    the repeat cancellation (vault BACKLOG #3740 item 4), so it can end just after the save does."""
+    the repeat cancellation (vault BACKLOG #3740 item 4), so it can end just after the save does.
+    An entry also leaves the map at its bound, still running; the bound here is the module's 5 s,
+    far past a healthy unlink."""
     if pending := set(store._pending_removals):
         await asyncio.wait(pending, timeout=10)
     await asyncio.sleep(0)  # the removal's done callback runs one loop pass after it ends
-    assert not store._pending_removals, "a cancelled save's removal was still running"
+    assert not store._pending_removals, "a cancelled save's removal was still being waited for"
 
 
 async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(

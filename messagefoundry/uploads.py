@@ -123,11 +123,10 @@ def _removal_executor() -> ThreadPoolExecutor:
 
 @dataclass(slots=True)
 class _PendingRemoval:
-    """A cancelled save's removal that later saves by the same uploader still wait for, until
-    ``deadline`` (loop time). ``flagged`` is set once an ERROR has named it as possibly stored."""
+    """A cancelled save's removal that later saves still wait for, until ``deadline`` (loop
+    time). ``flagged`` is set once an ERROR has named it as possibly stored."""
 
     file_id: str
-    uploader_id: str
     deadline: float
     flagged: bool = False
 
@@ -743,8 +742,9 @@ class UploadStore:
         # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
         # once its save sets the stop Event. See _start_heartbeat.
         self._heartbeats: set[asyncio.Future[None]] = set()
-        # Removals of cancelled saves' landed pairs still running, each mapped to the loop time
-        # until which the next save waits for it before it scans (vault BACKLOG #3740 item 4).
+        # Removals of cancelled saves' landed pairs that later saves still wait for before they
+        # scan, until each ends, passes its bound or the shutdown drain names it (vault BACKLOG
+        # #3740 item 4).
         self._pending_removals: dict[asyncio.Future[bool], _PendingRemoval] = {}
         # The heartbeat touches among the stragglers. A touch only refreshes its reservation's
         # clock, so the shutdown drain cancels one rather than waiting for it (vault BACKLOG #3740
@@ -1196,7 +1196,7 @@ class UploadStore:
         # The cases that still leak are listed once, in UploadQuotaError.
         async with self._quota_lock:
             try:
-                await self._wait_for_pending_removals(uploader_id)
+                await self._wait_for_pending_removals()
                 reserved = await self._reserve_across_shards(
                     uploader_id=uploader_id, uploader=uploader, size=len(data), reservation=file_id
                 )
@@ -1222,9 +1222,15 @@ class UploadStore:
                     # once started, and _remove_cancelled_pair logs how it ends. A failure to start
                     # it must not replace the cancellation, so it is logged and the cancel raised.
                     try:
-                        await self._remove_cancelled_pair(file_id, uploader_id)
-                    except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
-                        _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
+                        await self._remove_cancelled_pair(file_id)
+                    except RuntimeError:  # at least submit() after interpreter shutdown
+                        _log.error(
+                            "upload %s was cancelled after its file landed and has no "
+                            "upload.create audit row; its removal could not be started, so the "
+                            "file is still stored",
+                            file_id,
+                            exc_info=True,
+                        )
                 raise
 
     async def discard(self, file_id: str) -> bool:
@@ -1564,15 +1570,15 @@ class UploadStore:
 
         fut.add_done_callback(_done)
 
-    async def _remove_cancelled_pair(self, file_id: str, uploader_id: str) -> None:
+    async def _remove_cancelled_pair(self, file_id: str) -> None:
         """Start the removal of a cancelled save's landed pair, and wait for it until the next
         cancellation or ``_CANCELLED_REMOVAL_WAIT_SECONDS`` (vault BACKLOG #3740 item 4).
 
         ``save`` calls this holding ``_quota_lock``. The removal is registered in
         ``_pending_removals`` until it ends, its bound passes or the shutdown drain names it, and
-        the next save by the same uploader in this process waits for it there before it scans
-        (:meth:`_wait_for_pending_removals`), so it does not count a pair about to go. That wait
-        is the next save's, not this cancelled one's. A request
+        the next save in this process waits for it there before it scans
+        (:meth:`_wait_for_pending_removals`), so it neither counts a pair about to go nor holds
+        its sidecar open. That wait is the next save's, not this cancelled one's. A request
         deadline arrives through anyio scopes that cancel again on every loop pass, so a wait here
         that absorbed each cancellation spun the loop for the whole bound while every other upload
         queued on the lock. This wait ends at the first cancellation it meets instead. With no
@@ -1581,11 +1587,11 @@ class UploadStore:
         A thread cannot be stopped, so past the bound the removal goes on, and until it lands the
         pair is on disk and billed: a save that scans meanwhile, in this process or on a sibling
         engine shard, counts it. That can refuse an upload at the quota edge, but never admits one
-        too many. At the bound, or at the shutdown drain if that comes first, an ERROR names the
-        ``file_id`` as a stored file with no ``upload.create`` row, since the process may stop
-        before the removal answers (vault BACKLOG #3178). A removal that then takes the pair away
-        logs a WARNING withdrawing it. Any removal that fails or is refused logs an ERROR, at
-        whatever time it ends.
+        too many. At the bound, or at the end of the shutdown drain's wait if that comes first, an
+        ERROR names the ``file_id`` as a stored file with no ``upload.create`` row, since the
+        process may stop before the removal answers (vault BACKLOG #3178). A removal that then
+        takes the pair away logs a WARNING withdrawing it, from its own thread. Any removal that
+        fails or is refused logs an ERROR, at whatever time it ends.
 
         The removals run on :func:`_removal_executor`, never the default executor, so unlinks that
         hang hold at most ``_CANCELLED_REMOVAL_WORKERS`` threads, and the pool every
@@ -1601,12 +1607,12 @@ class UploadStore:
         This covers the cancelled-save path only. :meth:`discard`'s removal, after a failed
         ``upload.create`` row, still waits on its unlink under the lock with no bound."""
         loop = asyncio.get_running_loop()
+        entry = _PendingRemoval(file_id, loop.time() + _CANCELLED_REMOVAL_WAIT_SECONDS)
         # submit() can raise, at least after interpreter shutdown; save logs that and propagates
         # its cancellation.
         removal = _submit_to_thread(
-            self._remove_and_confirm_sync, file_id, executor=_removal_executor()
+            self._remove_and_report_sync, entry, executor=_removal_executor()
         )
-        entry = _PendingRemoval(file_id, uploader_id, loop.time() + _CANCELLED_REMOVAL_WAIT_SECONDS)
         self._pending_removals[removal] = entry
         overdue = loop.call_at(
             entry.deadline,
@@ -1619,7 +1625,8 @@ class UploadStore:
         def _ended(done: asyncio.Future[bool]) -> None:
             self._pending_removals.pop(done, None)
             overdue.cancel()
-            _log_removal_end(done, file_id, late=entry.flagged)
+            if done.cancelled() or done.exception() is not None:
+                _log_discard_unfinished(done, file_id)
 
         removal.add_done_callback(_ended)
         # Only for a caller already propagating a cancellation, as save's arm is: a repeat
@@ -1644,26 +1651,35 @@ class UploadStore:
             why,
         )
 
-    async def _wait_for_pending_removals(self, uploader_id: str) -> None:
-        """Wait, holding ``_quota_lock``, for ``uploader_id``'s cancelled-pair removals still
-        inside their bound before this save scans the disk, which counts that uploader's files
-        only (vault BACKLOG #3740 item 4). A cancellation of this save propagates as usual: it has
-        reserved nothing yet."""
+    async def _wait_for_pending_removals(self) -> None:
+        """Wait, holding ``_quota_lock``, for the cancelled-pair removals still inside their bound
+        before this save scans the disk (vault BACKLOG #3740 item 4). Every uploader's: the scan
+        opens every sidecar, and on Windows an open sidecar refuses its unlink. A cancellation of
+        this save propagates as usual: it has reserved nothing yet. The deadline is read here as
+        well as by the bound's timer, so an entry whose timer never ran cannot hold a save."""
         loop = asyncio.get_running_loop()
         while pending := {
             removal: entry.deadline
             for removal, entry in self._pending_removals.items()
-            if entry.uploader_id == uploader_id and not removal.done()
+            if not removal.done() and entry.deadline > loop.time()
         }:
-            await asyncio.wait(
-                pending.keys(), timeout=max(0.0, min(pending.values()) - loop.time())
-            )
+            await asyncio.wait(pending.keys(), timeout=min(pending.values()) - loop.time())
 
-    def _remove_and_confirm_sync(self, file_id: str) -> bool:
-        """:meth:`_discard_cancelled_sync`, then whether neither half of the pair is left, read in
-        the same thread so a late removal's log can say which way it went."""
-        self._discard_cancelled_sync(file_id)
-        return not any(path.exists() for path in self._paths(file_id))
+    def _remove_and_report_sync(self, entry: _PendingRemoval) -> bool:
+        """In the removal's thread: :meth:`_discard_cancelled_sync`, then whether neither half of
+        the pair is left. A removal an ERROR already named that takes the pair away withdraws it
+        here, in the thread, since a loop callback would not run once the loop has closed, as it
+        may have by then at shutdown. Reading ``entry.flagged`` from this thread races the loop
+        setting it, so a removal that lands just as it is named may leave the ERROR standing."""
+        self._discard_cancelled_sync(entry.file_id)
+        gone = not any(path.exists() for path in self._paths(entry.file_id))
+        if gone and entry.flagged:
+            _log.warning(
+                "upload %s: its removal finished after it was named at ERROR, so the earlier "
+                "ERROR that it may still be stored no longer applies",
+                entry.file_id,
+            )
+        return gone
 
     def _running(self, left: set[asyncio.Future[Any]]) -> set[asyncio.Future[Any]]:
         """What of ``left`` and the stragglers held now has not ended, for the drain's grace."""
@@ -1741,18 +1757,19 @@ class UploadStore:
             timeout = _STRAGGLER_DRAIN_SECONDS
         if grace is None:
             grace = _STRAGGLER_CANCEL_GRACE_SECONDS
-        # A cancelled save's removal still running is not a straggler, since cancelling its job
-        # could keep it from running at all. Its bound's ERROR is a loop timer the closing loop
-        # would drop, so it is named here instead (vault BACKLOG #3740 item 4).
-        for removal in list(self._pending_removals):
-            self._flag_removal(removal, "its removal was still running at shutdown")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while (waited := self._stragglers - self._touches) and (
+        # A cancelled save's removal still running is waited for here too, but it is not a
+        # straggler: cancelling its job could keep it from running at all. Its bound's ERROR is a
+        # loop timer the closing loop would drop, so one still running at the end of this wait
+        # is named here instead (vault BACKLOG #3740 item 4).
+        while (waited := (self._stragglers - self._touches) | set(self._pending_removals)) and (
             remaining := deadline - loop.time()
         ) > 0:
             self._cancel_touches()
             await asyncio.wait(waited, timeout=remaining)
+        for removal in list(self._pending_removals):
+            self._flag_removal(removal, "its removal was still running at shutdown")
         self._cancel_touches()
         left = set(self._stragglers) | set(self._heartbeats)
         if not left:
@@ -2943,20 +2960,6 @@ def _log_discard_unfinished(done: asyncio.Future[Any], file_id: str) -> None:
             file_id,
             exc_info=exc,
         )
-
-
-def _log_removal_end(done: asyncio.Future[bool], file_id: str, *, late: bool) -> None:
-    """Record how a cancelled save's removal ended (vault BACKLOG #3740 item 4). ``late`` says the
-    ERROR at its bound was logged, which said the file may still be stored."""
-    if done.cancelled() or done.exception() is not None:
-        _log_discard_unfinished(done, file_id)
-    elif late and done.result():
-        _log.warning(
-            "upload %s: its removal finished after it was named at ERROR, so the earlier "
-            "ERROR that it may still be stored no longer applies",
-            file_id,
-        )
-    # Otherwise _discard_cancelled_sync logged the refused unlink at ERROR itself.
 
 
 def _log_release_cancelled(done: asyncio.Future[Any], uploader_id: str) -> None:

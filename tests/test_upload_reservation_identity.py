@@ -27,7 +27,7 @@ from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import UploadedFileMeta, UploadStore, _Observed
-from tests.test_uploads import _GatedLedger, _hold_after_the_sidecar_lands
+from tests.test_uploads import _cancel_once_landed, _GatedLedger, _hold_after_the_sidecar_lands
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 
@@ -351,6 +351,9 @@ async def test_abandoned_removals_run_on_their_own_capped_pool(
     hung one past its cap queues there. Red before: three hung removals ran at once on the
     default executor."""
     monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
+    real_pool = getattr(uploads_mod, "_removal_executor", None)
+    if real_pool is not None:  # the real pool is capped as the constant says
+        assert real_pool()._max_workers == uploads_mod._CANCELLED_REMOVAL_WORKERS <= 4
     pool = ThreadPoolExecutor(max_workers=1)
     # raising=False, so the unfixed module, which has no such pool, fails on the count below.
     monkeypatch.setattr(uploads_mod, "_removal_executor", lambda: pool, raising=False)
@@ -379,7 +382,7 @@ async def test_abandoned_removals_run_on_their_own_capped_pool(
     monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
     try:
         for meta in metas:
-            await store._remove_cancelled_pair(meta.file_id, "u-op")
+            await store._remove_cancelled_pair(meta.file_id)
         await asyncio.sleep(0.1)  # time for a queued removal to start, were nothing capping it
         assert peak == 1, f"{peak} hung removals ran at once"
     finally:
@@ -411,7 +414,7 @@ async def test_the_drain_names_a_removal_still_running(
     monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
     caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
     try:
-        task = asyncio.create_task(store._remove_cancelled_pair(meta.file_id, "u-op"))
+        task = asyncio.create_task(store._remove_cancelled_pair(meta.file_id))
         await asyncio.sleep(0.05)
         task.cancel()  # the repeat cancellation that ends the cancelled save's wait
         await asyncio.wait_for(task, 5)
@@ -428,6 +431,27 @@ async def test_the_drain_names_a_removal_still_running(
         await asyncio.sleep(0.02)
     assert "its removal finished after it was named at ERROR" in caplog.text, caplog.text
     assert await store.list_files() == []
+
+
+async def test_a_removal_that_cannot_start_is_named_and_the_cancel_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3740 item 4: submit() can refuse the removal, at least after interpreter
+    shutdown. The cancellation still propagates, and an ERROR names the file as stored with no
+    ``upload.create`` row."""
+
+    class _Refusing(ThreadPoolExecutor):
+        def submit(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+    refusing = _Refusing(max_workers=1)
+    monkeypatch.setattr(uploads_mod, "_removal_executor", lambda: refusing, raising=False)
+    store = _uploads(tmp_path, None)
+    caplog.set_level(logging.ERROR, logger="messagefoundry.uploads")
+    await _cancel_once_landed(store, monkeypatch)  # asserts the CancelledError propagates
+    assert "its removal could not be started, so the file is still stored" in caplog.text
+    assert not store._pending_removals
+    refusing.shutdown()
 
 
 async def test_a_repeated_cancel_does_not_spin_a_cancelled_save_on_its_removal(
