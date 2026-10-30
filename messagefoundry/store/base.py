@@ -1276,7 +1276,8 @@ class QueueStore(StoreLifecycle, Protocol):
         + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
         cleanly, such as a store outage at the ingress commit)
         + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
-        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
+        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621, and
+        the REMOTEFILE source's same kinds less ``file_decompress_failed``)
         + the outbound lane transitions (``connection_lost``/``connection_restored``).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``

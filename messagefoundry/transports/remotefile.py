@@ -2703,6 +2703,11 @@ class RemoteFileSource(SourceConnector):
                 # OTHER_FORM_WARNING_SECONDS, so an operator can tell a server's listing format from
                 # an attack. One the pattern would not read is refused with no line at all: like a
                 # bare name the pattern skips, it is not a file this poller would ever read.
+                #
+                # No connection event either (BACKLOG #1621 records only the quarantine arms below).
+                # The entry stays and is refused again every poll, so an event here would write one
+                # store row per poll interval for as long as the partner leaves it, which is why the
+                # quarantine arms record only a move that completed.
                 if not entry.other_form:
                     logger.warning(
                         "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
@@ -2740,7 +2745,12 @@ class RemoteFileSource(SourceConnector):
                     size,
                     self._max_file_bytes,
                 )
-                await self._move(path, self._error_dir, name)
+                if await self._move(path, self._error_dir, name):
+                    await self._emit_event(
+                        "file_oversize",
+                        reason=f"listed at {size} bytes, exceeds max_file_bytes "
+                        f"{self._max_file_bytes}",
+                    )
                 disposed += 1
                 continue
             try:
@@ -2758,7 +2768,12 @@ class RemoteFileSource(SourceConnector):
                     safe_name(name),
                     self._max_file_bytes,
                 )
-                await self._move(path, self._error_dir, name)
+                if await self._move(path, self._error_dir, name):
+                    await self._emit_event(
+                        "file_oversize",
+                        reason=f"delivered more than max_file_bytes {self._max_file_bytes} "
+                        f"despite listing {size} bytes",
+                    )
                 disposed += 1
                 continue
             except _RemoteChanged as exc:
@@ -2796,13 +2811,18 @@ class RemoteFileSource(SourceConnector):
             if not _content_matches_declared(self.content_type, raw):
                 # Like the oversize / scan-reject cases it never became a "received message", so there
                 # is no store disposition; preserve it in .error and log it (never a silent drop).
+                declared = (self.content_type or ContentType.HL7V2).value
                 logger.warning(
                     "REMOTEFILE file %s does not match its declared content type %r "
                     "(no matching magic bytes); routing to error dir",
                     safe_name(name),
-                    (self.content_type or ContentType.HL7V2).value,
+                    declared,
                 )
-                await self._move(path, self._error_dir, name)
+                if await self._move(path, self._error_dir, name):
+                    await self._emit_event(
+                        "file_content_mismatch",
+                        reason=f"does not match declared content type {declared}",
+                    )
                 disposed += 1
                 continue
             try:
@@ -2812,12 +2832,14 @@ class RemoteFileSource(SourceConnector):
                 # entered the pipeline (ASVS 5.4.3) — the control that matters most for a remote /
                 # less-trusted drop source. Quarantine + log; like the oversize reject above it never
                 # became a "received message", so there's no store disposition.
+                scrubbed = safe_exc(exc, file_name=name)
                 logger.warning(
                     "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
                     safe_name(name),
-                    safe_exc(exc, file_name=name),
+                    scrubbed,
                 )
-                await self._move(path, self._error_dir, name)
+                if await self._move(path, self._error_dir, name):
+                    await self._emit_event("file_scan_rejected", reason=scrubbed)
                 disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
@@ -3161,8 +3183,20 @@ class RemoteFileSource(SourceConnector):
                 now,
             )
 
-    async def _move(self, path: str, dest_dir: str, name: str) -> None:
+    async def _move(self, path: str, dest_dir: str, name: str) -> bool:
+        """Rename ``path`` into ``dest_dir``; return whether it moved. A failure is logged here, so a
+        caller records a quarantine only for a file that left the poll directory (#1621)."""
         dst = posixpath.join(dest_dir, name)
+        if posixpath.normpath(dst) == posixpath.normpath(path):
+            # An error_subdir of "" or "." names the poll directory itself: the rename would be a
+            # no-op that reports success, and the file would be quarantined (and recorded) again
+            # every time it settled. It has not left, so say so.
+            logger.warning(
+                "REMOTEFILE could not move %s: %s is the poll directory itself",
+                safe_name(name),
+                dest_dir,
+            )
+            return False
         try:
             await asyncio.to_thread(self._client.rename, path, dst)
         except _RemoteError as exc:
@@ -3173,6 +3207,22 @@ class RemoteFileSource(SourceConnector):
                 dest_dir,
                 safe_exc(exc, file_name=name),
             )
+            return False
+        return True
+
+    async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
+        """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
+
+        The same kinds and rules as
+        :meth:`~messagefoundry.transports.file.FileSource._emit_event`, which states them,
+        including what a reason may carry."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, None, reason)
+        except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
+            logger.warning("REMOTEFILE source connection-event emit failed: %s", safe_exc(exc))
 
 
 register_destination(ConnectorType.REMOTEFILE, RemoteFileDestination)
