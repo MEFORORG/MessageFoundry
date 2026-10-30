@@ -1710,8 +1710,9 @@ outbound(
 `dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
-`odbc_driver`. The parameterized-`:name` binding, error classification, pooling and `[egress].allowed_db`
-gate are identical to the SQL Server preset.
+`odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
+the SQL Server preset. The `[egress].allowed_db` gate checks the same host, but reads the port
+differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1726,25 +1727,29 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 
 An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
 `server` text, in any case, and a host no entry names is refused. An entry with a port admits only
-the port the connection names, and the two dialects name it differently (vault BACKLOG #2704):
+the port the connection string sends, compared as a number (`db:05432` names port 5432). The two
+dialects send it differently (vault BACKLOG #2704):
 
 | Dialect | Port the entry is compared with |
 |---|---|
 | `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
 | `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
 
+**The check compares the port the connection string sends, not the port the driver opens.** A
+driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
+to its own default port, and the check cannot see that. Check that your driver reads the keyword.
+
 An entry with no port admits its host at any port. On the generic dialect the egress check
 **refuses** these cases for a listed host, at load like every other miss:
 
-- `server` carries a port as `host,port`, whatever the entry says. Name the host alone in
-  `server` and give the port in `PORT`. psqlODBC passes `SERVER` to libpq as a host, and libpq
-  reads a comma there as a list of hosts, so `db,6432` can name a second host. A `host:port` or
-  `[v6]:port` server is refused too: no entry can name it, because an entry splits at its first
-  colon.
+- `server` holds a comma anywhere: `db,6432`, `[db],6432`, `db,` or `db,replica`, whatever the
+  entry says. psqlODBC passes `SERVER` to libpq as a host, and libpq reads a comma there as a list
+  of hosts. Name one host in `server` and put the port in `PORT`.
+- `server` carries a port as `host:port` or `[v6]:port`. No entry can name such a `server`, because
+  an entry splits at its first colon.
 - `PORT` is given more than once, in any case.
 - No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
-  from 1 to 65535 in decimal digits counts as no port. The driver then dials a port the engine
-  does not know. Set `PORT` to the port in the entry.
+  from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
 port compared.

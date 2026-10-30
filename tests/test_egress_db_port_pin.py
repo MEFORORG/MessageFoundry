@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A port in an ``[egress].allowed_db`` entry binds the port the driver dials (vault BACKLOG #2704).
+"""A port in an ``[egress].allowed_db`` entry is compared with the port the connection string
+sends (vault BACKLOG #2704).
 
-The SQL Server preset sends ``SERVER={server},{port}``, so the ``port`` setting is what it dials.
-The generic ODBC dialect sends ``SERVER={server}`` and never reads ``port``: the driver gets its
-port from the ``PORT`` keyword in ``odbc_params``. The check used to read ``port`` for both, so on
-the generic dialect an entry pinned to one port admitted a hop to another port on the same host.
+The SQL Server preset sends ``SERVER={server},{port}``, so the ``port`` setting is the port sent.
+The generic ODBC dialect sends ``SERVER={server}`` and never reads ``port``: its connection string
+carries the ``PORT`` keyword from ``odbc_params``. The check used to read ``port`` for both, so on
+the generic dialect an entry pinned to one port admitted a connection sending another port to the
+same host. What a driver does with ``PORT`` is not something this file can see.
 
 Each case below runs the egress check and, where it says what the driver is sent, the generic
 connection-string builder. Nothing here opens a connection. The cases that describe a change name
@@ -78,14 +80,14 @@ def test_generic_port_keyword_off_the_pin_is_refused(
     # shipped code read `port` and ADMITTED this hop.
     kw = _generic(server=HOST, port=5432, odbc_params={"PORT": "6432"})
     assert "PORT={6432}" in _build_odbc_dsn(dict(Database(statement=STATEMENT, **kw).settings))
-    with pytest.raises(WiringError, match="at port 6432, the port this connection dials"):
+    with pytest.raises(WiringError, match="at port 6432, the port this connection names"):
         check(kw, PINNED)
 
 
 def test_sqlserver_preset_port_off_the_pin_is_refused(
     check: Check,
 ) -> None:
-    # Control 1: the preset dials `server,port`, so its `port` setting is still what is read.
+    # Control 1: the preset sends `server,port`, so its `port` setting is still what is read.
     with pytest.raises(WiringError, match="not in the \\[egress\\].allowed_db"):
         check({"server": HOST, "database": "d", "port": 6432}, PINNED)
 
@@ -99,12 +101,12 @@ def test_sqlserver_preset_port_on_the_pin_is_admitted(
 
 @pytest.mark.parametrize("port", [1433, 5432], ids=["port-defaulted", "port-on-the-pin"])
 def test_generic_without_port_keyword_against_a_pin_is_refused(check: Check, port: int) -> None:
-    # Control 2, and its sharper twin. With no PORT keyword the driver dials its own default port,
+    # Control 2, and its sharper twin. With no PORT keyword the driver uses its own default port,
     # which the engine does not know. The shipped code refused the defaulted case only by accident
     # (it read 1433) and ADMITTED `port=5432`, a setting the generic connection string never reads.
     kw = _generic(server=HOST, port=port)
     assert "PORT" not in _build_odbc_dsn(dict(Database(statement=STATEMENT, **kw).settings))
-    with pytest.raises(WiringError, match="set the PORT keyword in odbc_params"):
+    with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
         check(kw, PINNED)
 
 
@@ -129,10 +131,44 @@ def test_generic_server_carrying_a_port_is_refused(
     # shipped code ADMITTED every one of these on a host-only entry; it read neither port.
     server = f"{HOST},6432"
     for entry in (server, f"{server}:6432"):
-        with pytest.raises(WiringError, match="carries a port: name the host alone"):
+        with pytest.raises(
+            WiringError, match="holds a comma, read as a port suffix or a host list"
+        ):
             check(
                 _generic(server=server, odbc_params=odbc_params), EgressSettings(allowed_db=[entry])
             )
+
+
+@pytest.mark.parametrize("server", [f"[{HOST}],6432", f"{HOST},", f"{HOST},replica.test.invalid"])
+def test_generic_server_holding_a_comma_anywhere_is_refused(check: Check, server: str) -> None:
+    # libpq reads every one of these as a host list. The first two have no suffix the split reads
+    # as a port, so a check keyed on the split's port text let them through.
+    for entry in (server, f"{server}:5432"):
+        with pytest.raises(
+            WiringError, match="holds a comma, read as a port suffix or a host list"
+        ):
+            check(
+                _generic(server=server, odbc_params={"PORT": "5432"}),
+                EgressSettings(allowed_db=[entry]),
+            )
+
+
+def test_a_pin_is_read_as_a_number(check: Check) -> None:
+    # main matched `db:05432` against the text "05432"; the port is now a number on both sides.
+    pinned = EgressSettings(allowed_db=[f"{HOST}:05432"])
+    check(_generic(server=HOST, odbc_params={"PORT": "5432"}), pinned)
+    check({"server": HOST, "database": "d", "port": "05432"}, pinned)
+    with pytest.raises(WiringError, match="at port 6432"):
+        check(_generic(server=HOST, odbc_params={"PORT": "6432"}), pinned)
+
+
+def test_the_no_port_refusal_leads_with_its_remedy(check: Check) -> None:
+    # A stored failure keeps about its first 200 characters, so the remedy must sit inside them.
+    with pytest.raises(WiringError) as raised:
+        check(_generic(server="db.example.org"), EgressSettings(allowed_db=["db.example.org:5432"]))
+    message = str(raised.value)
+    assert message.index("set the PORT keyword to the pinned port") < 100
+    assert len(message) < 200, len(message)
 
 
 @pytest.mark.parametrize("server", [f"{HOST}:6432", "[::1]:6432"])
@@ -160,7 +196,7 @@ def test_generic_with_no_derivable_port_against_a_host_only_entry_is_admitted(
 def test_generic_with_an_unreadable_port_keyword_against_a_pin_is_refused(
     check: Check,
 ) -> None:
-    with pytest.raises(WiringError, match="names no port the engine can read"):
+    with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
         check(_generic(server=HOST, odbc_params={"PORT": "not-a-port"}), PINNED)
 
 
@@ -169,7 +205,7 @@ def test_no_port_never_matches_a_pin_spelled_like_none(
 ) -> None:
     # "No port" is not a value that can match a pin. An entry whose port text happens to read
     # "None" must not admit a connection whose port the engine could not read.
-    with pytest.raises(WiringError, match="names no port the engine can read"):
+    with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
         check(_generic(server=HOST), EgressSettings(allowed_db=[f"{HOST}:None"]))
 
 
@@ -184,7 +220,7 @@ def test_generic_port_keyword_given_twice_is_refused(check: Check) -> None:
 def test_generic_port_keyword_that_is_not_a_port_is_unreadable(check: Check, value: str) -> None:
     # Not a crash, and not a match: a superscript digit passes `isdigit` and fails `int()`, and
     # 70000 is not a port, even against a pin spelled the same way.
-    with pytest.raises(WiringError, match="names no port the engine can read"):
+    with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
         check(
             _generic(server=HOST, odbc_params={"PORT": value}),
             EgressSettings(allowed_db=[f"{HOST}:{value}"]),
@@ -197,7 +233,7 @@ def test_generic_port_keyword_with_leading_zeros_is_the_port(check: Check) -> No
 
 
 def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: Check) -> None:
-    # The preset's connection string sends int(port), so an env()-shaped " 5432" dials 5432.
+    # The preset's connection string sends int(port), so an env()-shaped " 5432" sends 5432.
     check({"server": HOST, "database": "d", "port": " 5432"}, PINNED)
 
 
@@ -220,9 +256,9 @@ def test_generic_server_port_suffix_does_not_loosen_the_host(
 
 @pytest.mark.parametrize("label", ["DatabaseLookup", "DATABASE reference source"])
 def test_lookup_reads_the_port_setting_whatever_the_dialect_setting_says(label: str) -> None:
-    # db_lookup and the DatabaseRef sync call the SQL Server builder directly, which dials
+    # db_lookup and the DatabaseRef sync call the SQL Server builder directly, which sends
     # `server,port` and never reads odbc_params. So a `dialect="generic"` in their settings changes
-    # nothing the check reads: the `port` setting is the port dialled.
+    # nothing the check reads: the `port` setting is the port sent.
     settings = _generic(server=HOST, port=5432, odbc_params={"PORT": "6432"})
     check_lookup_allowed("LK", settings, PINNED, label=label)
     with pytest.raises(WiringError, match=f"{label} 'LK': server .* at port 6432"):

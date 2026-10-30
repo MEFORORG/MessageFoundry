@@ -25,7 +25,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
-from messagefoundry.transports.db_endpoint import database_dial_endpoint
+from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
@@ -136,7 +136,7 @@ def check_lookup_allowed(
         )
     if egress.allowed_db:
         # Both callers build the SQL Server preset whatever `settings` say (neither DatabaseLookup
-        # nor DatabaseRef takes a dialect), so the port dialled is the `port` setting.
+        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting.
         refusal = _database_refusal(settings, egress.allowed_db, dialect="sqlserver")
         if refusal is not None:
             log.warning("connect denied: %s %r %s", label, name, refusal)
@@ -674,17 +674,17 @@ def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
 def _database_refusal(
     settings: Mapping[str, Any], allowed: list[str], *, dialect: str | None = None
 ) -> str | None:
-    """Why ``[egress].allowed_db`` refuses the hop a DATABASE connection's ``settings`` dial, or
+    """Why ``[egress].allowed_db`` refuses the hop a DATABASE connection's ``settings`` name, or
     ``None`` when it admits it: the ONE rule behind the outbound connection, the inbound poll and
     both lookups (vault BACKLOG #2704).
 
     ``dialect`` is the one the caller builds its connection string with, and defaults to the
     ``dialect`` setting. The host and port are read by
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
-    dialect dials. A host no entry names is refused as unlisted before its port is read. A port
+    dialect's connection string sends. A host no entry names is refused as unlisted before its port is read. A port
     the reading cannot settle is refused whatever the entries say. An entry that pins a port admits
-    only that port. A connection whose port the engine cannot read matches an entry that names no
-    port, and never one that pins one."""
+    only that port, compared as a number on both sides. A connection whose port the engine cannot
+    read matches an entry that names no port, and never one that pins one."""
     if dialect is None:
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)
@@ -694,22 +694,20 @@ def _database_refusal(
         return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if endpoint.conflict is not None:
         return endpoint.conflict
-    # As host_port_allowed matches, except that an unknown port matches only an entry naming none.
-    if any(not pin or (port is not None and str(port) == pin.strip()) for pin in pins):
+    # As host_port_allowed matches, except that an unknown port matches only an entry naming none,
+    # and a pin is read as a number, as the connection's port is: `db:05432` names port 5432.
+    if any(not pin or (port is not None and port_or_zero(pin) == port) for pin in pins):
         return None
     if port is None:
-        remedy = (
-            "set the PORT keyword in odbc_params to the listed port"
-            if dialect.lower() == "generic"
-            else "set the port setting to the listed port"
-        )
+        # The remedy first: a stored failure keeps about its first 200 characters.
+        where = "the PORT keyword" if dialect.lower() == "generic" else "the port setting"
         return (
-            f"server {host!r} is listed in [egress].allowed_db only at a pinned port, and "
-            f"this connection names no port the engine can read; {remedy}"
+            f"server {host!r}: set {where} to the pinned port. [egress].allowed_db pins one, and "
+            "this connection names no port the engine can read"
         )
     return (
         f"server {host!r} is not in the [egress].allowed_db allowlist at port {port}, "
-        "the port this connection dials"
+        "the port this connection names"
     )
 
 
