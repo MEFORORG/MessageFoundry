@@ -281,3 +281,119 @@ def test_two_files_of_one_name_that_refuse_are_both_reported(tmp_path, monkeypat
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", refuse)
     assert dr_backup._empty_files_in_place(staging) == ["extracted_store.db", "extracted_store.db"]
+
+
+# --- review round three -------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+def test_a_fifo_planted_at_the_lock_does_not_hold_the_teardown(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A teardown whose removal is refused puts the lock file and marker back. A FIFO planted at the
+    lock name held that open until a reader came, which may be never; it now fails at once and is
+    logged."""
+    import logging
+    import threading
+
+    staging = tmp_path / "mefor-backup-planted"
+    staging.mkdir()
+    fifo = staging / ".lock"
+    os.mkfifo(fifo)
+    # The removal refused, so the directory and its FIFO survive to the re-mark.
+    monkeypatch.setattr(dr_backup, "_discard_verify_staging", lambda path: "synthetic leftover")
+    done: list[str | None] = []
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        worker = threading.Thread(
+            target=lambda: done.append(dr_backup._teardown_staging(staging)), daemon=True
+        )
+        worker.start()
+        worker.join(10)
+        try:
+            assert not worker.is_alive(), "the re-mark open blocked on a FIFO"
+        finally:
+            if worker.is_alive():  # free the blocked open, so the red arm does not leak a thread
+                os.close(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK))
+                worker.join(10)
+    assert done == ["synthetic leftover"]
+    assert any("could not be marked" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_os_temp_sweep_is_keyed_on_the_process_owner(tmp_path, monkeypatch) -> None:
+    """On a share whose server sets the owner, this run's staging directory reports that owner, not
+    the process's. A standalone verify this account ran left its directory in the OS temp dir with
+    the process's owner, and the backup's sweep of the temp dir must still take it."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    dead_verify = _abandoned(tmp_path / "ostemp", "mefor-verify-")
+    data = (tmp_path / "data").absolute()
+    real_owner = dr_backup._owner_of
+
+    def owner(path: Path) -> object | None:
+        p = Path(path).absolute()
+        # Everything the run makes in its data dir carries the share's owner.
+        if p != data and p.is_relative_to(data):
+            return "share-owner"
+        return real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert not dead_verify.exists()
+
+
+async def test_a_backup_that_will_not_fit_opens_no_staging_directory(tmp_path, monkeypatch) -> None:
+    """The free-space check runs after the sweeps and before this run's directory is opened, so a
+    full volume fails with kind `space`, and no lock or marker is written before the refusal."""
+    import shutil
+
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+
+    class _Usage:
+        free = 1
+
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage())
+    opened: list[Path] = []
+    real_open = dr_backup._open_staging
+
+    def recording_open(root: Path, prefix: str, *, secure: bool):
+        opened.append(root)
+        return real_open(root, prefix, secure=secure)
+
+    monkeypatch.setattr(dr_backup, "_open_staging", recording_open)
+    try:
+        with pytest.raises(dr_backup.BackupError) as caught:
+            await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert opened == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="GetFinalPathNameByHandleW is Windows-only")
+def test_a_volume_without_final_paths_empties_nothing_and_says_so(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Some redirectors cannot name a handle's final path. The fail-safe then cannot show any file
+    lies inside the directory, so it empties nothing, never falling back to a path, and logs that it
+    could not run there, naming no file."""
+    import ctypes
+    import logging
+
+    staging = tmp_path / "mefor-verify-own"
+    staging.mkdir()
+    (staging / "extracted_store.db").write_bytes(b"synthetic plaintext")
+
+    def unsupported(fd: int) -> str:
+        raise ctypes.WinError(50)  # type: ignore[attr-defined]  # ERROR_NOT_SUPPORTED
+
+    monkeypatch.setattr(dr_backup, "_win_final_path", unsupported)
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == ["mefor-verify-own/ (not listed)"]
+    assert (staging / "extracted_store.db").read_bytes() == b"synthetic plaintext"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("fail-safe cannot run on the volume" in m for m in warnings)
+    assert not any("extracted_store.db" in m for m in warnings)

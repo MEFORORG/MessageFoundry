@@ -544,6 +544,27 @@ class BackupRunner:
         early_owner = await asyncio.to_thread(_process_owner)
         if early_owner is not None:
             await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
+        # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
+        # its decrypted copy there. Each backup sweeps it too, by the process's own owner: a verify
+        # this account ran there made its directory with that owner, whatever owner a share's server
+        # gives this run's staging directory.
+        await asyncio.to_thread(_sweep_os_temp, early_owner)
+        # After those sweeps, which free what dead runs left, and before this run's directory is
+        # opened or anything is written: a run that cannot fit fails here with kind `space`, naming
+        # the volume, not half-way through a multi-GB write. The sweep by this run's own directory's
+        # owner below, which runs only where that owner differs, has not run yet, so on such a share
+        # what a killed run left still counts as used here.
+        shortfall = await asyncio.to_thread(
+            self._space_shortfall,
+            staging_root,
+            dest_dir,
+            config_only=config_only,
+            config_dir=config_dir,
+        )
+        if shortfall is not None:
+            raise BackupError(
+                "space", f"not enough free space to stage this backup: it {shortfall}"
+            )
         loop = asyncio.get_running_loop()
         opening = loop.run_in_executor(
             None,
@@ -588,23 +609,6 @@ class BackupRunner:
                 )
             elif own_owner != early_owner:
                 await asyncio.to_thread(_sweep_owned, staging_root, own_owner, own=work.path)
-            # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
-            # leaves its decrypted copy there. Each backup sweeps it too, by the same owner rule.
-            await asyncio.to_thread(_sweep_os_temp, work.path)
-            # After both sweeps, which free what dead runs left, and before anything is written: a run
-            # that cannot fit fails here, naming the volume, not half-way through a multi-GB write.
-            # Inside the try, so a refusal here still releases this run's empty directory.
-            shortfall = await asyncio.to_thread(
-                self._space_shortfall,
-                staging_root,
-                dest_dir,
-                config_only=config_only,
-                config_dir=config_dir,
-            )
-            if shortfall is not None:
-                raise BackupError(
-                    "space", f"not enough free space to stage this backup: it {shortfall}"
-                )
             snap_path: Path | None = None
             if not config_only:
                 snap_path = work.path / _STORE_MEMBER
@@ -1706,6 +1710,16 @@ def _empty_files_in_place(staging: Path) -> list[str]:
         try:
             inside = _win_real_directory(staging)
         except OSError as exc:
+            if getattr(exc, "winerror", None) in _WIN_FINAL_PATH_UNSUPPORTED:
+                # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM
+                # disks) cannot name a handle's final path, so nothing here can be shown to lie
+                # inside the directory. Truncating by path instead is what BACKLOG #2420 removed,
+                # so nothing is emptied, and that is said, without any file's name.
+                log.warning(
+                    "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
+                    "cannot report a file's final path, so no file in it was emptied",
+                    staging,
+                )
             _unlisted(exc)
             return unproven
         for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
@@ -1747,6 +1761,10 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: What the fail-safe reports for something it reached through a link. Not named: it lives outside
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
+
+#: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
+#: ``ERROR_INVALID_FUNCTION`` and ``ERROR_NOT_SUPPORTED``.
+_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50})
 
 
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
@@ -1840,6 +1858,8 @@ _WIN_OPEN_REPARSE_POINT = 0x00200000
 #: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
 #: lock file or marker planted as a link. Windows has none, and follows one there.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+#: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _WIN_NAME_SURROGATE = 0x20000000
 _WIN_FILE_ATTRIBUTE_TAG_INFO = 9
 
@@ -2155,9 +2175,12 @@ def _teardown_staging(path: Path) -> str | None:
     files are all the proof needs."""
     leftover = _discard_verify_staging(path)
     if os.path.lexists(path):
+        # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
+        # otherwise hold this thread in the open until a reader came, which may be never.
+        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
         try:
             for name in (_LOCK_NAME, _HELD_MARKER_NAME):
-                os.close(os.open(path / name, os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW, 0o600))
+                os.close(os.open(path / name, flags, 0o600))
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
@@ -2386,15 +2409,20 @@ def _standalone_staging_root() -> Path:
     return Path(tempfile.gettempdir()).absolute()
 
 
-def _sweep_os_temp(owned_like: Path) -> int:
+def _sweep_os_temp(owner: object | None) -> int:
     """The backup's sweep of the OS temp dir, for what a killed standalone verify on this account
-    left there. Never raises: a temp dir that cannot be found is a reason to skip, not to fail."""
+    left there, keyed on ``owner``, the process's own as :func:`_process_owner` reads it. Never
+    raises: a temp dir that cannot be found, or an owner that could not be read, is a reason to skip,
+    not to fail."""
     try:
         root = _standalone_staging_root()
     except OSError as exc:
         log.warning("DR staging: no OS temp dir to sweep: %s", safe_exc(exc))
         return 0
-    return _sweep_abandoned_staging(root, owned_like=owned_like)
+    if owner is None:
+        log.warning("DR staging: cannot read this process's owner, so %s is not swept", root)
+        return 0
+    return _sweep_owned(root, owner, own=None)
 
 
 def _process_owner() -> object | None:
@@ -2455,10 +2483,11 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
 
     ``owned_like`` names a directory this run just created, and only a directory with its owner is a
     candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
-    standalone verify and each backup pass it for the OS temp dir, which can be shared. A backup sweeps
-    its own staging root, whose `.mefor-staging` inherits what the destination grants, with
-    :func:`_sweep_owned` by the same rule. Another account could plant a directory in either holding a
-    lock file and a marker, and the teardown must never run on a tree it controls."""
+    standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
+    temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
+    with :func:`_sweep_owned` by the same rule, keyed on the process's own owner. Another account
+    could plant a directory in either holding a lock file and a marker, and the teardown must never
+    run on a tree it controls."""
     owner = _owner_of(owned_like)
     if owner is None:
         log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
