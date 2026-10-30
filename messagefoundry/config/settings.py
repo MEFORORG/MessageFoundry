@@ -51,7 +51,7 @@ from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -1550,6 +1550,127 @@ def _split_address_list(v: object) -> object:
     return v
 
 
+_WS_ORIGIN_FORM = (
+    "list each origin exactly as a browser sends it in Origin, scheme://host[:port] with no "
+    "path, query, fragment or wildcard, as separate TOML list items "
+    '(ws_allowed_origins = ["https://a.example", "https://b.example"]) or, in '
+    "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated; docs/CONFIGURATION.md has the rules "
+    "(BACKLOG #3764)"
+)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# A registered name as a browser serializes it into Origin: ASCII, lower case, and no character the
+# WHATWG host parser forbids, decodes or rewrites (at least '%', '\', '<', '>', '^', '|').
+_WS_ORIGIN_HOST = re.compile(r"[a-z0-9._-]+")
+_WS_ORIGIN_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _whatwg_ipv6(address: ipaddress.IPv6Address) -> str:
+    """Serialize an IPv6 address as a browser writes it into ``Origin`` (the WHATWG URL standard).
+    ``IPv6Address.compressed`` already does, except on an IPv4-mapped address, which it writes
+    dotted where the standard writes two hex pieces."""
+    mapped = address.ipv4_mapped
+    if mapped is None:
+        return address.compressed
+    n = int(mapped)
+    return f"::ffff:{n >> 16:x}:{n & 0xFFFF:x}"
+
+
+def _split_origin(entry: str) -> tuple[SplitResult, int | None] | None:
+    """``urlsplit`` and ``.port``, or ``None`` where either refuses (a bad bracketed host, an
+    NFKC-unsafe netloc, a bad or out-of-range port). The caller raises once this has returned, so
+    the parser's error, which quotes the entry, is never on its refusal's chain."""
+    try:
+        parts = urlsplit(entry)
+        return parts, parts.port
+    except ValueError:
+        return None
+
+
+def _ipv6_or_none(host: str) -> ipaddress.IPv6Address | None:
+    """The IPv6 address ``host`` spells, or ``None``; returned rather than raised, as above."""
+    try:
+        return ipaddress.IPv6Address(host)
+    except ValueError:
+        return None
+
+
+def _check_ws_allowed_origin(entry: str, position: int) -> None:
+    """Raise ``ValueError`` unless one ``[api].ws_allowed_origins`` entry, the ``position``-th
+    (from 1), is an origin spelled as an ``Origin`` header carries it.
+
+    The handshake check is an exact string match against the ``Origin`` header, and a browser
+    always sends its own serialization, so an entry in another form loads and matches nothing: a
+    ``;``-joined list loads as one origin, and so does any text at all. An entry must therefore be
+    that serialization already. One that names a real origin in another spelling (case, a trailing
+    ``/``, a default port, an IPv6 literal's spelling) is refused with the spelling to list, rather
+    than rewritten, so what the file says is what matches. What is refused is listed in
+    docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it whole: a
+    pasted URL can carry a credential in its userinfo, query or path, and the message reaches the
+    log. Only the other-spelling refusal quotes anything, the scheme, host and port to list. For
+    the same reason no refusal is raised inside a handler: the caught parser error quotes the
+    entry, and ``from exc`` or ``from None`` would keep it on the chain (BACKLOG #1796)."""
+    field = f"[api].ws_allowed_origins entry {position} (the env form skips empty fields)"
+    if "@" in entry:
+        raise ValueError(f"{field} has an '@'; userinfo is refused: {_WS_ORIGIN_FORM}")
+    if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
+        raise ValueError(
+            f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
+        )
+    # Before the split: a fullwidth ':' or '@' fails urlsplit's NFKC check, and would otherwise
+    # read as a bad host or port.
+    if not entry.isascii():
+        raise ValueError(
+            f"{field} has a non-ASCII character; a non-ASCII host takes its xn-- form: "
+            f"{_WS_ORIGIN_FORM}"
+        )
+    split = _split_origin(entry)
+    if split is None:
+        raise ValueError(f"{field} has a bad host or port: {_WS_ORIGIN_FORM}")
+    parts, port = split
+    scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
+    host = parts.hostname
+    if (
+        scheme not in _DEFAULT_PORTS
+        or not host
+        or parts.path not in ("", "/")
+        # urlsplit drops an empty "?" or "#", so read the raw text for them.
+        or "?" in entry
+        or "#" in entry
+    ):
+        raise ValueError(f"{field} is not a bare origin: {_WS_ORIGIN_FORM}")
+    if port == 0:
+        raise ValueError(f"{field} has port 0, which a browser blocks: {_WS_ORIGIN_FORM}")
+    if parts.netloc.startswith("["):
+        literal = _ipv6_or_none(host)
+        if literal is None:  # urlsplit passes an IPvFuture literal such as [v1.x]
+            raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}")
+        if literal.scope_id is not None:
+            raise ValueError(f"{field} has an IPv6 zone, which no browser sends: {_WS_ORIGIN_FORM}")
+        host = f"[{_whatwg_ipv6(literal)}]"
+    elif not _WS_ORIGIN_HOST.fullmatch(host):
+        raise ValueError(
+            f"{field} has a host character no browser Origin carries: {_WS_ORIGIN_FORM}"
+        )
+    else:
+        # A browser reads a host whose last label is numeric as IPv4 and rewrites it to four
+        # decimal parts (127.1, 0x7f.0.0.1, 010.0.0.1 and 127.0.0.1. all become another string).
+        labels = host.split(".")
+        last = labels[-2] if len(labels) > 1 and not labels[-1] else labels[-1]
+        if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last) and not is_canonical_ipv4(host):
+            raise ValueError(
+                f"{field} is not an IPv4 address a browser sends as written; write it as four "
+                f"decimal parts from 0 to 255 with no leading zeros: {_WS_ORIGIN_FORM}"
+            )
+    suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
+    canonical = f"{scheme}://{host}{suffix}"
+    if canonical != entry:
+        # Quoting the canonical form is safe: it is built from the scheme, host and port alone.
+        raise ValueError(
+            f"{field} is not spelled as a browser sends it in Origin; list {canonical!r}: "
+            f"{_WS_ORIGIN_FORM}"
+        )
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1824,6 +1945,15 @@ class ApiSettings(_Section):
         # rather than discover them from a poisoned audit trail (BACKLOG #2488, #3042).
         for entry in v:
             _parse_trusted_proxy(entry)
+        return v
+
+    @field_validator("ws_allowed_origins", mode="after")
+    @classmethod
+    def _check_ws_allowed_origins(cls, v: list[str]) -> list[str]:
+        # An entry not spelled as an Origin header loads and matches no handshake, so a client the
+        # operator meant to allow is refused with nothing naming why (BACKLOG #3764).
+        for position, entry in enumerate(v, 1):
+            _check_ws_allowed_origin(entry, position)
         return v
 
     @field_validator("tls_client_cert_identities", mode="before")
