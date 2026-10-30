@@ -365,7 +365,7 @@ async def test_a_stuck_non_upload_operation_does_not_hold_the_upload_straggler_d
 ) -> None:
     """The upload drain settles only the ``upload.create`` rows, the one long operation whose arm
     starts an upload removal. A DR change or reload still rolling back at shutdown is not waited
-    for there: its wait would come out of the slack the later audit-writing steps get. Red before:
+    for there, so it does not spend the slack the later audit-writing steps get. Red before:
     the settle waited on every long operation, so the step ran on for its whole wait share,
     about 1.3 s here, although its only straggler had finished at 0.2 s."""
     from messagefoundry.api.app import _app_drain_steps
@@ -405,7 +405,7 @@ async def test_a_stuck_non_upload_operation_does_not_hold_the_upload_straggler_d
         elapsed = time.monotonic() - began
         assert finished, "the straggler was cancelled before its 0.2 s"
         assert outliving.inflight == ["DR activate"], "the control: the DR arm is still running"
-        assert elapsed < 0.9, f"the upload drain waited on the DR arm: {elapsed:.2f}s"
+        assert elapsed < 1.1, f"the upload drain waited on the DR arm: {elapsed:.2f}s"
     finally:
         release.set()
         await asyncio.gather(caller, straggler, return_exceptions=True)

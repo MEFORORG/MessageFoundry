@@ -1237,8 +1237,9 @@ _CUT_GRACE_SECONDS: Final = 0.1
 #: budget, and cancel a reload, DR change or ``upload.create`` row that would have finished in it.
 _OUTLIVING_WAIT_SHARE: Final = 0.25
 #: The label the upload route runs its ``upload.create`` row under as an outliving operation. The
-#: upload straggler drain settles these operations only, since only their arms start a removal
-#: (vault BACKLOG #3740 item 6).
+#: upload straggler drain settles these operations only: at least their arms start a removal, and
+#: a path that runs ``_record_upload_create`` under another label drops out of that wait (vault
+#: BACKLOG #3740 item 6).
 _UPLOAD_CREATE_OPERATION: Final = "upload.create audit"
 
 #: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
@@ -1398,8 +1399,9 @@ def _app_drain_steps(
        cancellation arm. The arm can still be running when the long-operations drain stops
        waiting, as when the cancelled row's own unwind outlasts that drain's grace, so this step
        first waits, within its own wait, for the ``upload.create`` operations still running,
-       and no other (vault BACKLOG #3740 item 6). A removal those start is then held as a straggler before the drain looks. One
-       whose operation is still running when that wait ends can start after the drain returned.
+       and no other (vault BACKLOG #3740 item 6). A removal those start is then held as a
+       straggler before the drain looks. One whose operation is still running when that wait
+       ends can start after the drain returned.
        Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
        counted it as still rolling back.
     3. Every approval write the gate still has running (BACKLOG #2087), at least the outcome writes
@@ -1435,8 +1437,10 @@ def _app_drain_steps(
         # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
         # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
         # its bound, so it cancels what it owns before the cut. It settles the upload.create rows
-        # first, as item 2 above says, and no other long operation: a DR change or reload still
-        # rolling back would only spend the slack the later audit-writing steps get.
+        # first, as item 2 above says, and no other long operation, so a DR change or reload
+        # still rolling back does not spend the slack the later audit-writing steps get. The
+        # cost: that rollback no longer gets this wait too, so a DR arm still in its hook reap
+        # has a little less time to land its 'interrupted' row before the store closes.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
