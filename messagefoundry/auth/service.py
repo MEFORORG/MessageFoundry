@@ -6373,12 +6373,14 @@ class AuthService:
     async def _redeem_step_up_flow(
         self, flow_id: str, state: str | None, *, client: str | None
     ) -> PendingFlow | OidcStepUp:
-        """The staged flow, consumed because ``state`` matched, or the audited refusal: the step-up
+        """The staged flow, consumed because ``state`` matched, or the refusal: the step-up
         leg's twin of :meth:`_redeem_sign_in_flow` (BACKLOG #3198).
 
         Both refusals are filed under the NEUTRAL actor: nothing has been verified, and any page can
         send this callback, so naming the account would let a stranger fill that person's security
-        events with step-ups they never attempted. The sign-in leg does the same."""
+        events with step-ups they never attempted. The sign-in leg does the same. A ``state_mismatch``
+        on a step-up flow writes its row only within :meth:`allow_step_up_return_audit`'s budget
+        and is logged instead past it (BACKLOG #3965)."""
         flows = self._oidc_flows
         flow, consumed = (
             flows.pop_if_state_matches(flow_id, state) if flows is not None else (None, False)

@@ -1467,9 +1467,10 @@ async def test_state_mismatch_rows_on_step_up_returns_stop_at_a_global_ceiling(
         # Refused as before: no flow was consumed, so each still waits for its real IdP return.
         assert all(service.oidc_step_up_flow(f) is not None for f in flows.values())
         assert "its audit budget is spent" in caplog.text
-        # The budget is its own: neither the ceremony keys nor the sign-in window were drawn.
-        assert all(service.allow_reauth_attempt(user) for user in flows)
-        assert service.allow_login_attempt("203.0.113.9")
+        # The budget is its own: no ceremony key and no sign-in bucket recorded a single hit.
+        assert service._reauth_limiter is not None and service._login_limiter is not None
+        assert not service._reauth_limiter._hits, "a forged return drew the ceremony limiter"
+        assert not service._login_limiter._hits and not service._login_limiter._global_hits
     finally:
         await store.close()
 

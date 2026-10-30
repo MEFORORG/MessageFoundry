@@ -519,7 +519,7 @@ async def _fetch_return(c: httpx.AsyncClient, location: str) -> httpx.Response:
 
 @pytest.mark.parametrize("spent", [False, True])
 async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_budget(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, spent: bool
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, spent: bool
 ) -> None:
     """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row has no global
     ceiling. Within the budget the row is written. With the ceiling spent by other users it is
@@ -539,6 +539,9 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
         rows = await service.store.count_audit(limit=None, action="auth.login_failed")
         assert rows - rows_before == (0 if spent else 1)
+        # Past the budget the refusal still leaves a trace: the line, in place of the row.
+        logged = "refused (non_navigation_fetch)" in caplog.text
+        assert logged is spent, caplog.text
         assert service.oidc_step_up_flow(flow_id) is not None and _flow_id(c) == flow_id
 
 
