@@ -1,6 +1,10 @@
 # 0088 — Extract a Qt-free `apiclient/` library + a `messagefoundry service` CLI
 
 - **Status:** Accepted
+  > **Amended by [ADR 0215](0215-the-web-console-calls-the-json-routes-in-process-through-the-asgi-app-so-one-gate-family-authorizes-both-planes.md)
+  > (accepted 2026-10-30):** `apiclient` will gain an async client and an in-process ASGI transport
+  > beside `EngineClient`, for the web console. Its acceptance criteria stand, AC-1 included. This
+  > body still describes the shipped code; ADR 0215's build slice 3 rewrites it when it lands.
 - **Date:** 2026-07-10
 - **Related:** [ADR 0032](0032-console-desktop-launch.md) · [CLAUDE.md §2 / §10](../../CLAUDE.md) · BACKLOG #103 · MULTISESSION-PLAN-9
 
