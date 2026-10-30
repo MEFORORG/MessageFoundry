@@ -633,15 +633,6 @@ def test_a_lookup_with_long_arguments_round_trips(kind: str) -> None:
     assert answer.connection == "C" * 5000 and answer.params == params
 
 
-def _join_lookup_helpers(*, exclude_hung: bool = False, timeout: float = 15.0) -> None:
-    """Wait for the broker's lookup helper threads to finish, so a count read next is final. With
-    ``exclude_hung``, a helper still inside a runner the test holds is left running."""
-    for thread in threading.enumerate():
-        if not thread.name.startswith("mf-sandbox-lookup-"):
-            continue
-        thread.join(3.0 if exclude_hung else timeout)
-
-
 def _new_lookup_helpers(earlier: set[threading.Thread]) -> list[threading.Thread]:
     """The broker's lookup helper threads started since ``earlier`` was taken."""
     return [
@@ -993,22 +984,26 @@ def test_an_unexpected_engine_fault_fails_the_dispatch_promptly(
     assert any("RuntimeError" in r.getMessage() for r in caplog.records)
 
 
-def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
+def test_cut_off_waiters_never_start_a_second_call_on_a_hung_connection(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Dispatch B's helper is still building its refusal when B's cap fires, and C then finds the
-    # hung lookup still recorded. Neither may start a second call on the hung connection.
+    # A's lookup hangs and stays recorded. Dispatch B's helper is still building its refusal when
+    # B's cap fires, and C then finds A's record too. Neither may start a second call on it.
     release = threading.Event()
     calls: list[str] = []
+    hung_helpers: list[threading.Thread] = []
+    refusing_helpers: list[threading.Thread] = []
 
     def hung(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
         calls.append(statement)
+        hung_helpers.append(threading.current_thread())
         release.wait(60)
         return [{"v": "late", "d": Decimal(0)}]
 
     real_refusal = SandboxSession._busy_refusal
 
     def slow_refusal(lookup: codec.LookupRequest) -> str:
+        refusing_helpers.append(threading.current_thread())
         time.sleep(2.0)  # past the 1 s margin at wall_seconds=4
         return real_refusal(lookup)
 
@@ -1026,8 +1021,14 @@ def test_a_cut_off_waiter_does_not_replace_the_hung_lookups_record(
             for _ in range(3):  # A hangs; B and C each find the connection busy
                 with pytest.raises(SandboxError, match="exceeded the 4.0s wall cap"):
                     _bodies(registry, "h_db", session)
-            _join_lookup_helpers(exclude_hung=True)
+            # B's and C's helpers must be over before the count is read, or a late call could land
+            # after it. Each named itself in the refusal it was building when its cap fired.
+            assert len(refusing_helpers) == 2
+            for thread in refusing_helpers:
+                thread.join(10)
+                assert not thread.is_alive()
         assert len(calls) == 1
+        assert hung_helpers[0].is_alive()  # control: A really is still inside the runner
     finally:
         release.set()
         session.close()
@@ -1100,4 +1101,40 @@ def test_a_helper_past_its_deadline_never_calls_the_runner(
         release_a.set()
         release_all.set()
         go.set()
+        session.close()
+
+
+@pytest.mark.parametrize("over", ["deadline", "abandoned"])
+def test_each_late_runner_check_stops_the_call_alone(tmp_path: Path, over: str) -> None:
+    # The test above meets both checks at once, so it passes with either one deleted. Here only one
+    # says the dispatch is over: a deadline already past with nobody gone, or an abandoned dispatch
+    # with time left. The window between the deadline and abandoned.set() is the first case.
+    calls: list[str] = []
+
+    def runner(connection: str, statement: str, params: Any) -> list[dict[str, Any]]:
+        calls.append(statement)
+        return []
+
+    session = _session(str(tmp_path), SandboxMode.ISOLATED)
+    lookup = codec.LookupRequest(
+        seq=1, kind=codec.LOOKUP_DB, connection="LK", target="SELECT 1", params=None
+    )
+    abandoned = threading.Event()
+    if over == "abandoned":
+        abandoned.set()
+        deadline = time.monotonic() + 30
+    else:
+        deadline = time.monotonic() - 0.01
+    try:
+        with db_lookup_mod.activated(runner):
+            ok, _, error = session._serve_lookup("transform", lookup, deadline, abandoned)
+            assert (ok, calls) == (False, [])
+            assert "wall cap ran out" in error
+            # Control: the same lookup, with time left and its dispatch still waiting, is served.
+            ok, _, _ = session._serve_lookup(
+                "transform", lookup, time.monotonic() + 30, threading.Event()
+            )
+            assert (ok, calls) == (True, ["SELECT 1"])
+        assert session._running_lookups == {}
+    finally:
         session.close()
