@@ -284,8 +284,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # classifier does not follow (BACKLOG #1799). A regression arrives as a
         # messagefoundry/store/sqlserver.py diff, which the tooling path gate does not see.
         "test_adr0075_rt_count_gate.py",
-        #   install_instruction_provenance -> globs messagefoundry/**/*.py
-        "test_install_instruction_provenance.py",
+        # install_instruction_provenance left this list when it began importing the engine's
+        # published-distribution record (BACKLOG #3786), which classifies it as an engine test.
         #   sds_rule_ids_are_stable -> :397 rglobs messagefoundry/**/*.py. Milder than the four above
         #     (it catches a dangling SDS-N.N citation in an engine docstring, not a correctness bug),
         #     and it is listed here anyway: the value of this list is that it is exhaustive for its

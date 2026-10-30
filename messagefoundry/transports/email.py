@@ -12,6 +12,9 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
 - **a body that cannot be encoded for the configured ``encoding``** maps to the permanent, content-free
   :class:`~messagefoundry.transports.base.NegativeAckError` that
   :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
+- **a relay that refuses some recipients and accepts the rest** maps to a permanent
+  ``partial-refusal`` :class:`~messagefoundry.transports.base.NegativeAckError` naming two counts
+  and no address (:meth:`CheckedEnvelope.send`; dead-lettered, never retried).
 
 Standard library only (``smtplib`` + ``email.message``) — no new dependency (ADR 0029 §"What this
 must not break"; CLAUDE.md §7). The synchronous SMTP core is **lifted** from
@@ -91,10 +94,12 @@ from messagefoundry.transports.mllp import InsecureHopGuard
 __all__ = [
     "CheckedEnvelope",
     "EmailDestination",
+    "PARTIAL_REFUSAL_CODE",
     "checked_envelope",
     "checked_sender",
     "envelope_address_problem",
     "envelope_recipients",
+    "partial_refusal_under",
 ]
 
 logger = logging.getLogger(__name__)
@@ -269,9 +274,66 @@ class CheckedEnvelope:
         msg["From"] = list(self.from_header)
         msg["To"] = list(self.to_header)
 
-    def send(self, smtp: smtplib.SMTP, msg: EmailMessage) -> None:
-        """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses."""
-        smtp.send_message(msg, from_addr=self.sender, to_addrs=list(self.recipients))
+    def send(self, smtp: smtplib.SMTP, msg: EmailMessage, *, cell: str) -> None:
+        """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses.
+
+        ``smtplib`` raises when the relay refuses every recipient, or drops the session. When it
+        refuses some, the send succeeds and ``send_message`` returns the refused ones in a dict, so
+        a message one of two recipients never got would read as delivered. A non-empty dict is
+        therefore a failed delivery: a permanent
+        :class:`~messagefoundry.transports.base.NegativeAckError` with code ``partial-refusal``,
+        which the delivery worker dead-letters at once (vault BACKLOG #2924). Permanent because the
+        relay already accepted the message for the other recipients, so a retry would send them a
+        duplicate every attempt; a replay of the dead-lettered row is the operator's choice and
+        re-sends to every recipient. Neither fault flag is set: one mailbox refused is not a fault
+        in the connection, and a config fault would stop the lane.
+
+        Each identical entry gets one ``RCPT``. smtplib decides "every recipient refused" by
+        comparing the dict's size with the list's, so a listed-twice address refused would
+        otherwise read as a partial refusal of a message nobody received. Entries differing only
+        in case stay apart, as the ``To:`` header keeps them.
+
+        The text is ``cell`` and two counts. It holds no address, and none of the relay's reply
+        codes or texts, because a reply text can echo the address, and the raise is in no
+        ``except`` block, so the chain carries nothing either. A caller that sends ``QUIT`` after
+        this raises recovers the refusal with :func:`partial_refusal_under`."""
+        to_addrs = list(dict.fromkeys(self.recipients))
+        refused = smtp.send_message(msg, from_addr=self.sender, to_addrs=to_addrs)
+        if not refused:
+            return
+        raise NegativeAckError(
+            f"{cell}: {len(refused)} of {len(to_addrs)} recipients refused",
+            code=PARTIAL_REFUSAL_CODE,
+            permanent=True,
+            credential_fault=False,
+            config_fault=False,
+        )
+
+
+#: The :class:`~messagefoundry.transports.base.NegativeAckError` code of a partial RCPT refusal.
+PARTIAL_REFUSAL_CODE = "partial-refusal"
+
+
+def partial_refusal_under(exc: BaseException) -> NegativeAckError | None:
+    """The partial refusal :meth:`CheckedEnvelope.send` raised, when ``exc`` replaced it on the way
+    out of a ``with smtplib.SMTP(...)`` block, or ``None``.
+
+    The block's exit sends ``QUIT`` and raises ``SMTPResponseException`` on any reply but ``221``.
+    That exception then carries the refusal only as its ``__context__``, and a caller's
+    ``SMTPException`` arm would turn a permanent refusal into a transient retry, re-sending to the
+    recipients that already have the message. Every caller of :meth:`CheckedEnvelope.send` checks
+    this first and raises the refusal instead, outside its handler. The dropped ``QUIT`` failure
+    is logged here, by class and reply code only, since a reply text can echo an address."""
+    context = exc.__context__
+    if not (isinstance(context, NegativeAckError) and context.code == PARTIAL_REFUSAL_CODE):
+        return None
+    logger.info(
+        "%s; the relay then refused QUIT (%s %s), and the partial refusal stands",
+        context,
+        type(exc).__name__,
+        getattr(exc, "smtp_code", "-"),
+    )
+    return context
 
 
 def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope:
@@ -622,6 +684,7 @@ class EmailDestination(DestinationConnector):
             # captured cleartext decision so a reload can't route PHI around the construction-only gate.
             self._hop_guard.assert_send()
         msg = self._build_message(payload)
+        partial: NegativeAckError | None = None
         try:
             with self._connect() as smtp:
                 if self.username is not None:
@@ -641,7 +704,9 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                self._envelope.send(smtp, msg)
+                # A partial RCPT refusal raises NegativeAckError, which no arm below catches, so it
+                # reaches the delivery worker as the permanent refusal it is (vault BACKLOG #2924).
+                self._envelope.send(smtp, msg, cell=f"Email {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --
@@ -655,13 +720,19 @@ class EmailDestination(DestinationConnector):
             # operator needs and it contains no message content.
             raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
-            raise DeliveryError(
-                f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
-            ) from exc
+            # A QUIT refused after a partial refusal must not turn it into a retry. The refusal is
+            # raised below, outside this handler, so its own chain stays empty.
+            partial = partial_refusal_under(exc)
+            if partial is None:
+                raise DeliveryError(
+                    f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
+                ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} unreachable: {type(exc).__name__}"
             ) from exc
+        if partial is not None:
+            raise partial
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)

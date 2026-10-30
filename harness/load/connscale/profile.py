@@ -216,6 +216,20 @@ class ConnScaleProfile:
     # operator sweeps (N=1500, long holds) can turn it off.
     intake_audit: bool = True
 
+    def ab_axes(self) -> tuple[str, ...]:
+        """The A/B axes this profile runs with more than one arm, in a fixed order. ``_validate``
+        allows at most one; the runner swallows a pooled step's startup failure only where one exists,
+        since only an A/B has a comparison to report the miss in (BACKLOG #3132)."""
+        return tuple(
+            name
+            for name, axis in (
+                ("claim_modes", self.claim_modes),
+                ("fuse_modes", self.fuse_modes),
+                ("batch_modes", self.batch_modes),
+            )
+            if len(axis) > 1
+        )
+
     def modes(self) -> tuple[str, ...]:
         """The sweep modes to run (``both`` expands to both, in a stable order)."""
         if self.sweep_mode == "both":
@@ -379,15 +393,7 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
     # pooled/SQL-Server-only and don't compose (ADR 0075), so the supported shape is EXACTLY ONE multi-
     # arm boolean axis paired with claim_modes = ["pooled"] (or a multi-arm claim_modes A/B alone). Fail
     # loud if more than one axis is multi-arm.
-    multi_arm = [
-        name
-        for name, axis in (
-            ("claim_modes", profile.claim_modes),
-            ("fuse_modes", profile.fuse_modes),
-            ("batch_modes", profile.batch_modes),
-        )
-        if len(axis) > 1
-    ]
+    multi_arm = profile.ab_axes()
     if len(multi_arm) > 1:
         raise ConnScaleProfileError(
             f"{where}: {' and '.join(multi_arm)} cannot BOTH be multi-arm in one profile — each A/B "

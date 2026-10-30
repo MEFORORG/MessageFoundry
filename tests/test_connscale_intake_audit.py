@@ -658,14 +658,16 @@ def test_ledger_requires_expect_ack() -> None:
 
 
 def _sample(read: int) -> EngineSample:
+    # `written` follows `read`: each connscale inbound delivers to one outbound, and the reconcile
+    # fails a step that read more than it wrote (BACKLOG #3132), which these tests do not exercise.
     return EngineSample(
         elapsed_s=0.0,
         pending=0,
         inflight=0,
-        done=0,
+        done=read,
         dead=0,
         read=read,
-        written=0,
+        written=read,
         out_dead=0,
         queue_depth=0,
         in_pipeline=0,
@@ -716,7 +718,8 @@ def _record_with(audit: IntakeAudit, *, read: int, sent: int) -> ConnScaleRecord
         mode="fixed_aggregate",
         count=4,
         aggregate_rate=10.0,
-        metrics_counters=Counters(sent=sent),
+        # Every message the engine read reached the sink, so only the intake terms can fail.
+        metrics_counters=Counters(sent=sent, sink_received=read),
         ack_hist=Histogram(),
         poller=poller,
         samples=[],
@@ -756,14 +759,17 @@ def test_a_failing_reconcile_carries_the_audit_verdict_into_its_own_message() ->
 
 def test_a_passing_reconcile_is_left_byte_identical() -> None:
     """No verdict is appended to a detail that reports no problem: the audit rides in its own field
-    and on the console, and a clean step's ``no_loss`` string is unchanged from pre-#1292."""
+    and on the console, and a clean step's ``no_loss`` string is exactly the reconcile's all-clear.
+    That all-clear gained ``written>=read`` with BACKLOG #3132, not with the audit."""
     led = _ledger(accepted=4)
     audit = judge(
         led, StoreSnapshot(_all_ids(led), 4), moment=MOMENT_POST_MORTEM, sent=4, read_short=0
     )
     rec = _record_with(audit, read=4, sent=4)
     assert rec.no_loss.ok
-    assert rec.no_loss.detail == "read>=sent, sink_received>=written, backlog drained"
+    assert (
+        rec.no_loss.detail == "read>=sent, written>=read, sink_received>=written, backlog drained"
+    )
 
 
 # --- the SLO: a green must not be earned by an audit that never ran ------------------------------

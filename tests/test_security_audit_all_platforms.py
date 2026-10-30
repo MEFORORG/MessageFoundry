@@ -22,7 +22,9 @@ import pytest
 
 from messagefoundry.childenv import python_module_argv
 from messagefoundry.security.audit_all_platforms import (
+    PUBLISHED_DISTRIBUTIONS,
     _run,
+    _skip_private_refusal,
     continued_requirement_lines,
     main,
     option_lines,
@@ -184,7 +186,7 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert audit[-2:] == ["--ignore-vuln", "PYSEC-0"]
     assert audited == STRIPPED
     out = capsys.readouterr().out
-    assert "3 pinned requirements, 2 un-gated" in out
+    assert "3 pinned requirements audited, 2 un-gated" in out
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in out
 
 
@@ -197,6 +199,93 @@ def test_a_pip_option_line_is_refused(line: str, tmp_path: Path) -> None:
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 2
     assert not ran
+
+
+def _seen_by(tmp_path: Path, argv: list[str]) -> tuple[int, list[tuple[list[str], str]]]:
+    """Run ``main`` on ``LOCK`` with ``argv`` before the lock path; each command and its -r file."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    seen: list[tuple[list[str], str]] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        return 0
+
+    return main([*argv, str(src)], run=run), seen
+
+
+def test_a_private_pin_the_adopter_names_is_left_out_of_the_audit_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3786 finding 1: ``--strict`` fails a pin no index can look up, such as a
+    private package, and ``--ignore-vuln`` cannot clear that. Naming the package leaves it out of
+    the audit, by its canonical name, and nothing else: every other pin is still looked up under
+    ``--strict``, and the install check still covers the private one."""
+    status, [(_, checked), (audit, audited)] = _seen_by(tmp_path, ["--skip-private", "IDNA"])
+    assert status == 0
+    assert checked == LOCK
+    assert audited == STRIPPED.replace("idna==3.20 \\\n    --hash=sha256:cccc\n", "")
+    assert "--strict" in audit
+    out = capsys.readouterr().out
+    assert "not audited, named by --skip-private: idna==3.20" in out
+    # Neither counted nor listed as audited.
+    assert "2 pinned requirements audited, 2 un-gated" in out
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        (["not-in-the-lock"], "names a package the lock does not pin"),
+        (["colorama", "idna", "uvloop"], "leaves no pin to audit"),
+        (["MessageFoundry"], "may not name the engine"),
+    ],
+    ids=["unpinned-name", "every-pin", "the-engine"],
+)
+def test_a_skip_private_that_is_stale_total_or_the_engine_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], names: list[str], message: str
+) -> None:
+    """A stale name would read as an opt-out that still does something; skipping every pin would
+    read as a clean audit of nothing; the engine is the pin the tripwire exists to audit."""
+    argv = [arg for name in names for arg in ("--skip-private", name)]
+    status, seen = _seen_by(tmp_path, argv)
+    assert (status, seen) == (2, [])
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(PUBLISHED_DISTRIBUTIONS | {"MessageFoundry_WebConsole", "MESSAGEFOUNDRY.harness"}),
+)
+def test_a_skip_private_naming_a_published_package_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    """A published MessageFoundry package is no private package: an advisory can name it (BACKLOG
+    #3786). The two mixed spellings check the PEP 503 fold. The install-instruction provenance
+    test keeps the set honest: a ``packaging/<name>/`` must be classified published or not."""
+    status, seen = _seen_by(tmp_path, ["--skip-private", name])
+    assert (status, seen) == (2, [])
+    assert "may not name the engine or a published MessageFoundry package" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("name", ["messagefoundry-acme-plugins", "acme-messagefoundry", "idna"])
+def test_a_private_name_beside_the_published_ones_is_not_refused_as_published(name: str) -> None:
+    """The control: the refusal is the record, not a prefix, so an adopter's own
+    ``messagefoundry-*`` package may still be skipped as private."""
+    assert _skip_private_refusal({name}, []) is None
+
+
+def test_a_skip_private_after_the_lock_is_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After the lock, argparse would hand it to pip-audit, which fails with a usage error."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--skip-private", "idna"], run=run) == 2
+    assert not ran
+    assert "goes before the lock" in capsys.readouterr().err
 
 
 def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:
