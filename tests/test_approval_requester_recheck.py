@@ -347,7 +347,8 @@ async def test_a_listing_that_shows_a_lost_standing_writes_one_row_each_time(
     for row in rows:
         assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
         detail = json.loads(str(row["detail"]))
-        assert set(detail) == {"approval_ids"}
+        assert list(detail) == ["count", "approval_ids"]  # the order: see record_standing_shown
+        assert detail["count"] == 2
         assert sorted(detail["approval_ids"]) == sorted([lost, lost_too])
     assert sink.events == []
 

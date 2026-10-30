@@ -2373,7 +2373,10 @@ a request with no requester id, or for an operation no longer registered, still 
 **A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
 listing, on `GET /approvals` or on the console's `/ui/approvals`, that marks at least one request
 with that value writes one `approval.standing_shown` row against the caller. The row carries the
-caller's `client` address (ADR 0150) and those requests' ids in `approval_ids`. A listing that
+caller's `client` address (ADR 0150), then `count` and those requests' ids in `approval_ids`, in
+that order. The off-box copy of the row holds `detail` to 200 characters, so from about five
+requests it is cut: it keeps `count`, may lose the ids past about the fourth, and is no longer valid
+JSON. The on-box row keeps every id, so read the ids there. A listing that
 shows no such value writes no row. Repeats are not folded together, because a held request may have
 no expiry, so a de-dup key or a throttle would hide months of views. Nothing paces the listing, so
 a client that polls it while such a request is held writes one row per poll. On the console this

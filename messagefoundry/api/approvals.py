@@ -1049,7 +1049,9 @@ class ApprovalGate:
             "listing",
             "approval.standing_shown",
             actor=actor,
-            detail=json.dumps({"approval_ids": approval_ids}),
+            # `count` first: the off-box copy cuts this detail at a length limit and keeps its front,
+            # so a long listing's copy would otherwise lose how many requests it showed.
+            detail=json.dumps({"count": len(approval_ids), "approval_ids": approval_ids}),
             client=client,  # ADR 0150: the caller's address, matching this row's actor
             context=(
                 f"the queue was listed by {scrub_log_argument(actor)} "

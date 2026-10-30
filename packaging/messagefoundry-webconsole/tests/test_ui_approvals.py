@@ -161,7 +161,8 @@ async def test_a_listing_that_shows_a_lost_standing_writes_one_row(engine: Engin
     assert len(rows) == 2
     for row in rows:
         assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
-        assert json.loads(str(row["detail"])) == {"approval_ids": [approval_id]}
+        # The text, not the parsed object, because the key order is the contract.
+        assert str(row["detail"]) == json.dumps({"count": 1, "approval_ids": [approval_id]})
 
 
 async def test_the_page_still_answers_when_the_store_refuses_every_audit_write(
