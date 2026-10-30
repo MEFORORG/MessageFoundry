@@ -31,6 +31,18 @@ this line.**
 
 ### Security
 
+- **The passkey registration finish no longer spends the ceremony budget on a session the factor
+  rule refuses, and its 429 sends `Retry-After: 30`.** `POST /ui/account/webauthn/verify` asks
+  `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, and skips
+  the draw for a refused session, logging a WARNING for each such request instead. It passes that
+  reading on as `finish_webauthn_registration(factor_refused=True)`, and the finish refuses on it,
+  so the account losing its factor between the two reads cannot let a request nothing charged
+  finish. This route
+  no longer spends the real user's budget for such a session; at least `POST /ui/mfa`,
+  `POST /ui/reauth` and `POST /ui/reauth/webauthn`, which a pending session also reaches, still
+  draw it, and the admin-write floor this route's gate charges first is unchanged. Its 429 now
+  sends the constant `POST /ui/mfa`, `/ui/reauth` and `/ui/reauth/webauthn` send. Seam change:
+  `AuthService.finish_webauthn_registration` gains the `factor_refused` keyword. (BACKLOG #3690)
 - **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
   and still clears the cookie when the sign-out's audit row fails.** A retired cookie that
   sign-out sends now ends the session it became, with the owner as the row's actor, rather
