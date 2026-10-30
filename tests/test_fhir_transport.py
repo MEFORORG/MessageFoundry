@@ -948,10 +948,11 @@ async def test_a_reply_the_keep_first_read_cannot_take_is_dead_lettered(
     # trigger is a raised RecursionError, since the real depth is a property of the runner.
     import messagefoundry.transports.fhir as fhir_module
 
-    def _too_deep(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        raise RecursionError("simulated deep nesting")
+    class _TooDeep(fhir_module._KeepFirstKey):
+        def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(fhir_module, "_keep_first_key", _too_deep)
+    monkeypatch.setattr(fhir_module, "_KeepFirstKey", _TooDeep)
     dest = _dest(interaction="update")
     reply = _reply_with('{"status": "404 Not Found"}', meta='{"tag": 1, "tag": 1}')
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
@@ -996,6 +997,192 @@ async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
     dest = _dest(interaction="update")
     dest._opener = _FakeOpener(body=b"")  # type: ignore[assignment]
     assert await dest.send(UPDATE_1965) is None
+
+
+# --- vault BACKLOG #3796: every occurrence of a repeated key is compared as a canonical JSON node,
+# so a nested occurrence that reads two ways, and 1 against true, 1 against 1.0 or 0.0 against
+# -0.0, fail closed as reply-repeats-a-key (ADR 0095 Amendment B.1). Synthetic replies only.
+
+
+def _entry_with(entry: str) -> bytes:
+    """A transaction-response whose one entry is written by hand, so it can repeat ``response``."""
+    return (
+        '{"resourceType": "Bundle", "type": "transaction-response", "entry": [' + entry + "]}"
+    ).encode()
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The middle response reads 200 keeping the first key and 404 keeping the last. Both
+        # readings of the whole reply take an outer 200, so before #3796 it was delivered.
+        _entry_with(
+            '{"response": {"status": "200 OK"}, '
+            '"response": {"status": "200 OK", "status": "404 Not Found"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # The same with two occurrences: the first reads two ways itself.
+        _entry_with(
+            '{"response": {"status": "200 OK", "status": "404 Not Found"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # A repeat that reads two ways three objects below the occurrence.
+        _reply_with(
+            '{"status": "200 OK"}',
+            meta='{"a": {"b": {"c": 1}}, "a": {"b": {"c": 1, "c": 2}}, "a": {"b": {"c": 1}}}',
+        ),
+        # 1 against true, below the top level: Python reads 1 == True.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": true, "tag": 1}'),
+        _entry_with(
+            '{"response": {"status": "200 OK", "x": 1}, '
+            '"response": {"status": "200 OK", "x": true}, '
+            '"response": {"status": "200 OK", "x": 1}}'
+        ),
+        _reply_with(
+            '{"status": "200 OK"}', meta='{"a": [{"b": 1}], "a": [{"b": true}], "a": [{"b": 1}]}'
+        ),
+        # The same in a value the delivery takes, where the two readings are compared.
+        _reply_with('{"status": "200 OK", "etag": 1, "etag": true}'),
+        # int against float, and 0.0 against -0.0, which Python also reads as equal.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": 1.0, "tag": 1}'),
+        _reply_with('{"status": "200 OK", "etag": 1, "etag": 1.0}'),
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 0.0, "tag": -0.0, "tag": 0.0}'),
+        _reply_with('{"status": "200 OK", "location": 0.0, "location": -0.0}'),
+    ],
+    ids=[
+        "middle-response-404-under-keep-last",
+        "first-response-reads-two-ways",
+        "two-ways-three-levels-below",
+        "one-against-true-in-meta",
+        "one-against-true-in-a-middle-response",
+        "one-against-true-in-a-list",
+        "one-against-true-in-etag",
+        "int-against-float-in-meta",
+        "int-against-float-in-etag",
+        "zero-against-negative-zero-in-meta",
+        "zero-against-negative-zero-in-location",
+    ],
+)
+async def test_a_repeated_key_that_differs_as_a_json_node_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    # Each of these was delivered before #3796, so each fails on the unfixed code.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Control: every occurrence is one node, so the reply reads one way (ADR 0095 B.1).
+        _entry_with(
+            '{"response": {"status": "200 OK"}, "response": {"status": "200 OK"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # Key order inside an object is not part of what it is.
+        _reply_with(
+            '{"status": "200 OK"}',
+            meta='{"a": {"x": 1, "y": true}, "a": {"y": true, "x": 1}, "a": {"x": 1, "y": true}}',
+        ),
+        # A two-way repeat that is not itself an occurrence of a repeated key: judged as B.1 says.
+        _entry_with('{"response": {"status": "200 OK", "status": "201 Created"}}'),
+        # Every NaN token is one value here, unlike Python's float comparison (ADR 0095 B.1).
+        _reply_with('{"status": "200 OK"}', meta='{"tag": NaN, "tag": NaN, "tag": NaN}'),
+        _reply_with('{"status": "200 OK"}', meta='{"n": NaN, "tag": 1, "tag": 1}'),
+    ],
+    ids=[
+        "one-node-three-times",
+        "key-order",
+        "two-ways-not-repeated",
+        "nan-repeated",
+        "nan-beside",
+    ],
+)
+async def test_a_repeated_key_that_is_one_json_node_is_delivered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize(
+    "meta",
+    ['{"tag": NaN, "tag": 1, "tag": NaN}', '{"tag": NaN, "tag": Infinity, "tag": NaN}'],
+    ids=["nan-against-a-number", "nan-against-infinity"],
+)
+async def test_a_nan_against_another_value_is_dead_lettered(meta: str) -> None:
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}', meta=meta))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key"
+
+
+def _deep_and_wide(depth: int, width: int, leaf: str) -> bytes:
+    """A reply whose ``meta`` repeats a key three times, each occurrence a chain ``depth`` objects
+    deep, the middle one ending in ``leaf``, beside a list of ``width`` objects that each repeat a
+    key. Comparing two occurrences by recursion would pass Python's recursion limit here, and one
+    that compares both readings at every level, as the reverted 78dd64a5 did, takes 2**depth."""
+
+    def chain(end: str) -> str:
+        return '{"a": ' * depth + end + "}" * depth
+
+    wide = ", ".join('{"k": [[1, {"u": 2}]], "k": [[1, {"u": 2}]]}' for _ in range(width))
+    meta = (
+        '{"c": '
+        + chain("1")
+        + ', "c": '
+        + chain(leaf)
+        + ', "c": '
+        + chain("1")
+        + ', "w": ['
+        + wide
+        + "]}"
+    )
+    return _reply_with('{"status": "200 OK"}', meta=meta)
+
+
+async def test_a_deep_wide_reply_is_judged_in_linear_work_without_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    calls = 0
+    intern = fhir_module._NodeIds._intern
+
+    def _counting(self: Any, key: object) -> int:
+        nonlocal calls
+        calls += 1
+        return intern(self, key)
+
+    monkeypatch.setattr(fhir_module._NodeIds, "_intern", _counting)
+    # 3000 levels is three times Python's default recursion limit and well inside the depth json
+    # itself parses.
+    reply = _deep_and_wide(3000, 5000, "1")
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+    # Each JSON value is interned a bounded number of times, so the work is linear in the body: no
+    # pairwise or per-reading compare. Every value takes at least one byte.
+    assert 0 < calls <= len(reply)
+
+
+async def test_one_against_true_at_the_bottom_of_a_deep_occurrence_is_dead_lettered() -> None:
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_deep_and_wide(3000, 10, "true"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key"
 
 
 async def test_dynamic_if_match_on_plain_update_moves_into_the_entry() -> None:
