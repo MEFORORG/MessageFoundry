@@ -47,6 +47,13 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._keyed_reopen_contract import (
+    CONTROL_CELL,
+    KeyedReopenReport,
+    assert_names_the_control_cell_alone,
+    remove_seal_passes,
+    server_keyed_reopen_report,
+)
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -2067,117 +2074,24 @@ async def test_keyless_open_of_encrypted_state_fails_closed(store) -> None:
 
 
 async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
-    """BACKLOG #1723: a no-key -> key restart must seal legacy plaintext IN PLACE on this backend, and
-    until now nothing on the ``postgres-store`` leg proved it at runtime.
+    """BACKLOG #1723: a no-key -> key restart must seal every written cell IN PLACE on this backend,
+    and each must then read back through its real read path.
 
-    ``_encrypt_existing_rows`` reaches its cells three different ways — the id-keyed ``_CIPHER_COLUMNS``
-    loop (``messages.raw``/``messages.error``, ``queue.last_error``), a composite-PK pass
-    (``state.value``, ``reference.value``) and an ``id_keyed=True`` composite pass
-    (``message_events.detail``). One cell per shape, so a pass dropped from any of the three reds here
-    rather than only in the static scan. The SQL Server twin is
-    ``test_legacy_plaintext_error_detail_migrated_on_open`` plus
-    ``test_state_plaintext_migrated_on_keyed_reopen`` in ``tests/test_sqlserver_store.py``; the static
-    both-backends-name-every-cell check is ``tests/test_store_cipher_sweep_parity.py``, which is what
-    covers the cells this test does not name.
-
-    Every assertion that a value is PLAINTEXT excludes the marker prefix outright rather than a single
-    marker version — a ``v1``-only spelling passes on an encrypted ``v2`` value and would make the
-    setup half of this test vacuous.
+    The cells are the ones ``tests/test_store_cipher_sweep_parity.py`` finds written in
+    ``postgres.py``, and the writers and readers are ``tests/_keyed_reopen_contract.py``, which the
+    ``sqlserver-store`` leg and the plain leg share. A pass dropped from any of the sweep's shapes
+    reds here by cell name.
     """
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.postgres import PostgresStore
+    assert await server_keyed_reopen_report(store) == KeyedReopenReport()
 
-    settings = load_settings(environ=os.environ).store
-    k = generate_key()
-    err, fail = "legacy bad parse", "legacy delivery failure"
 
-    def probes(eid: str, qid: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        """One at-rest read per cell, asked IDENTICALLY before and after the keying — a second copy
-        of this list is how the two halves drift until the 'plaintext' half checks a cell the
-        'sealed' half does not. ``detail <> ''`` mirrors the sweep's own skip-blank predicate, so a
-        legitimately empty value cannot read as an unmigrated one."""
-        return (
-            ("SELECT error AS v FROM messages WHERE id=$1", (eid,)),
-            ("SELECT raw AS v FROM messages WHERE id=$1", (qid,)),
-            ("SELECT last_error AS v FROM queue WHERE message_id=$1", (qid,)),
-            ("SELECT value AS v FROM state", ()),
-            ("SELECT value AS v FROM reference", ()),
-            (
-                "SELECT detail AS v FROM message_events WHERE detail IS NOT NULL AND detail <> ''",
-                (),
-            ),
-        )
-
-    try:
-        # (1) KEYLESS: every value below lands as plaintext at rest.
-        plain = await PostgresStore.open(settings)
-        try:
-            eid = await plain.record_received(
-                channel_id="IB", raw=RAW, status=MessageStatus.ERROR, error=err
-            )
-            qid = await plain.enqueue_message(
-                channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
-            )
-            item = (await plain.claim_ready(now=100.0))[0]
-            await plain.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)
-            mid, routed = await _route_and_claim_routed(plain, "IB", now=200.0)
-            await plain.transform_handoff(
-                routed_id=routed.id,
-                message_id=mid,
-                channel_id="IB",
-                deliveries=[("OB1", "x")],
-                state_ops=[("ns", "k", {"mrn": "M-LEGACY-STATE"})],
-                now=210.0,
-            )
-            await plain.write_reference_snapshot(
-                name="providers", version="v1", rows={"P1": {"mrn": "M-LEGACY-REF"}}
-            )
-            for sql, args in probes(eid, qid):
-                rows = await plain._fetchall(sql, *args)
-                assert rows, f"nothing written for {sql} — the keyless setup wrote no row"
-                assert all(not r["v"].startswith(MARKER_PREFIX) for r in rows), sql
-        finally:
-            await plain.close()
-
-        # (2) Re-open WITH a key: open() runs _encrypt_existing_rows over the legacy plaintext.
-        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
-        try:
-            for sql, args in probes(eid, qid):
-                rows = await keyed._fetchall(sql, *args)
-                assert rows and all(r["v"].startswith(MARKER_PREFIX) for r in rows), (
-                    f"still plaintext at rest after the keyed reopen: {sql}"
-                )
-            # ... and the read paths still return the original cleartext through the new key.
-            fetched = await keyed.get_message(eid)
-            assert fetched is not None
-            assert fetched["error"] == err
-            fetched = await keyed.get_message(qid)
-            assert fetched is not None
-            assert fetched["raw"] == RAW
-            assert (await keyed.list_dead(allowed_channels=None))[0]["last_error"] == fail
-            assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
-            assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
-        finally:
-            await keyed.close()
-    finally:
-        # Shared-DB hygiene, even on assertion failure: rows sealed under this test's key make the
-        # next KEYLESS fixture open fail closed in _load_state_cache / _load_reference_cache, which
-        # cascades setup errors across every later test in the run.
-        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
-        try:
-            async with cleanup._pool.acquire() as conn:
-                for table in (
-                    "message_events",
-                    "state",
-                    "reference",
-                    "reference_version",
-                    "response",
-                    "queue",
-                    "messages",
-                ):
-                    await conn.execute(f"DELETE FROM {table}")
-        finally:
-            await cleanup.close()
+async def test_removing_a_cells_on_open_pass_reds_the_keyed_reopen_contract(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control on this backend's own sweep, so the test above is shown able to fail
+    here and not only on SQLite."""
+    remove_seal_passes(monkeypatch, type(store), {CONTROL_CELL})
+    assert_names_the_control_cell_alone(await server_keyed_reopen_report(store))
 
 
 async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -> None:
