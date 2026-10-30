@@ -977,6 +977,8 @@ def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
     assert done.returncode == step_rc, done.stdout + done.stderr
     assert ("::warning" in done.stdout) is warns, done.stdout
     assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
+    if warns:
+        assert f"title=Step margin advisory ({event})::" in done.stdout, done.stdout
     argv = calls.read_text(encoding="utf-8").splitlines()
     # push and merge_group never make a second call
     assert len(argv) == len(script_rcs.split()), argv
@@ -986,12 +988,62 @@ def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
         assert argv[1].endswith("--min-margin 1.20"), argv[1]
 
 
+def _pull_request_floor() -> str:
+    """The floor the engine step's run body passes, read from the step rather than restated."""
+    found = re.search(r"^\s*pr_floor=(\S+)$", str(_margin_check("test")["run"]), re.MULTILINE)
+    assert found, "the engine margin step no longer names pr_floor"
+    return found.group(1)
+
+
+@pytest.mark.parametrize(
+    ("margin", "want_rc"),
+    [(1.25, 0), (1.15, 1)],
+)
+def test_the_real_script_runs_at_the_pull_request_floor(
+    tmp_path: Path, margin: float, want_rc: int
+) -> None:
+    """The stubbed test above proves the step's branches, and this one proves the second call can
+    work. That call only runs after a slow step, so nothing else would exercise it: if the self-check
+    stopped holding at this floor, the first slow PR would get exit 2 instead of a warning.
+
+    Falsified by setting pr_floor to 1.10 in ci.yml: RED, the script exits 2. Restored.
+    """
+    cap_minutes = 46
+    baseline = tmp_path / "baseline.toml"
+    baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
+    rc = main(
+        [
+            "--step",
+            "<fixture step>",
+            "--leg",
+            "<fixture leg>",
+            "--cap-minutes",
+            str(cap_minutes),
+            "--outcome",
+            "success",
+            "--elapsed-seconds",
+            str(cap_minutes * 60 / margin),
+            "--baseline",
+            str(baseline),
+            "--summary-file",
+            str(tmp_path / "summary.md"),
+            "--min-margin",
+            _pull_request_floor(),
+        ]
+    )
+    print(f"[step-margin] floor {_pull_request_floor()}, margin {margin}x: exit {rc}")
+    assert rc == want_rc
+
+
 def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
-    """The ruling names the engine suite's check only. Falsified by adding a merge_group branch or
-    a `continue-on-error` to this step: RED. Restored."""
+    """The ruling and the 1.20x floor name the engine suite's check only. Falsified by adding a
+    merge_group branch, a pull_request branch or a `continue-on-error` to this step: RED. Restored."""
     check = _margin_check("webconsole")
     assert "continue-on-error" not in check, check.get("continue-on-error")
-    assert "merge_group" not in str(check.get("run", ""))
+    run = str(check.get("run", ""))
+    assert "merge_group" not in run
+    assert "pull_request" not in run
+    assert "--min-margin" not in run
 
 
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:

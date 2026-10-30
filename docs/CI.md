@@ -402,8 +402,10 @@ Two limits, stated so nobody reads more into a green than it carries:
 - **A step's wall-clock cap is now checked against the step, and a low margin reds the leg** --
   except the engine `test` leg until BACKLOG #3515 re-measures the cap. In `merge_group` a low margin
   is a warning (owner ruling 2026-10-29). On `pull_request` it is a warning from 1.30x down to 1.20x
-  and reds below 1.20x (decided under the owner's delegation of 2026-10-30). The margin step in
-  `ci.yml` says what each gives up. The ruling of 2026-10-29 also moved the recurring timing tests
+  and reds below 1.20x (decided under the owner's delegation of 2026-10-30). Every other event on
+  that leg still reds below 1.30x, including the push run on `main`, so a change that lands between
+  the two floors can red `main` with every test passed. The margin step in `ci.yml` says what each
+  gives up. The ruling of 2026-10-29 also moved the recurring timing tests
   listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job (BACKLOG #4773). Each
   gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
