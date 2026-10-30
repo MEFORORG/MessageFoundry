@@ -3236,6 +3236,18 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     )
     reg.add_outbound(
         build_outbound_connection(
+            "OB_PG_CERT_ONLY",
+            Database(
+                server="cert.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"sslcert": "client.pem"},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
             "OB_SQLSERVER",
             Database(
                 server="ss.example",
@@ -3260,8 +3272,10 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     hops = dict(unverified_generic_db_hops(reg))
     # The sqlserver dialect is NOT here: it keeps the byte-identical posture-keyed refusal, so it is
     # gated rather than merely reported, and listing it would be noise.
-    assert set(hops) == {"OB_PG_BARE", "inbound:IB_PG_ORDERS"}
+    assert set(hops) == {"OB_PG_BARE", "OB_PG_CERT_ONLY", "inbound:IB_PG_ORDERS"}
     assert "no TLS keyword" in hops["OB_PG_BARE"]
+    # BACKLOG #2483: a certificate path sets no mode, so it is reported beside the bare hop.
+    assert "neither sslmode nor encrypt has a value" in hops["OB_PG_CERT_ONLY"]
     # The value-blind detector fixed in step 1 is what makes this arm real: `SSLmode=disable` used to
     # read as "the operator has taken TLS ownership".
     assert "SSLmode=disable" in hops["inbound:IB_PG_ORDERS"]

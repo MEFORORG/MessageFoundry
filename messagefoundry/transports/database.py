@@ -17,7 +17,7 @@ list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), none of which names a host, so
 the driver a host other than the ``server`` that ``[egress].allowed_db`` checks (vault BACKLOG #2577). On the generic
 path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
-Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
+Construction logs the delegation as a fail-safe (a WARNING when no TLS mode is set — see
 :func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
 required goes through the shared cleartext-hop authority like every other cleartext transport, so an
 enforcing instance refuses it off-loopback rather than crossing in the clear (BACKLOG #1178 — see
@@ -328,10 +328,22 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# A best-effort hint that the operator configured driver-level TLS via an odbc_params keyword (anything
-# ssl/tls/encrypt-ish — psqlODBC `SSLmode`, MySQL `SSLMODE`, some drivers' `Encrypt`). Used ONLY to tune
-# the severity of the generic-path construction-time TLS reminder (WARNING vs DEBUG) — never to gate or
-# alter the connection. It cannot prove the value *verifies* the cert, only that TLS was addressed.
+# The ONLY keywords whose value can set a generic hop's TLS mode, in the form
+# :func:`_odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
+# as the operator owning TLS. A key, certificate or CA file, or a cipher list, sets no mode: on its
+# own it leaves libpq at its default, `sslmode=prefer`, which falls back to plaintext without a word.
+#
+# `encrypt` IS UNPROVEN. It is here for a driver that reads it, and no test shows that psqlODBC or a
+# MySQL driver does. On a driver that ignores it, `Encrypt=yes` would clear this gate and leave the
+# driver at its own default, so treat that spelling as the operator's claim, not a tested control.
+# The drivers' own `sslmode` spellings are the ones this path documents.
+_ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
+
+# Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
+# about the hop, so presence is never ownership: this picks which keywords' values are read against
+# :data:`_ODBC_NO_TLS_VALUES`, and tells "no TLS keyword" from "no TLS mode" in the reason an operator
+# reads. Since BACKLOG #1178 a no-TLS value found this way also gates the hop, so this is not
+# report-only. It can never clear a hop.
 _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 
 # The VALUES of a TLS-ish keyword that mean TLS is NOT REQUIRED on the hop, so the connection may cross
@@ -383,10 +395,18 @@ _ODBC_SECRET_KEY_RE = re.compile(
 )
 
 
-def _is_tls_mode_keyword(name: str) -> bool:
-    """True for an ``odbc_params`` keyword that may set the hop's TLS mode: it matches the TLS hint
-    and is not a secret-bearing keyword."""
+def _is_tls_keyword(name: str) -> bool:
+    """True for an ``odbc_params`` keyword about TLS: it matches the TLS hint and is not a
+    secret-bearing keyword. Being one sets no mode; :func:`_sets_tls_mode` asks that."""
     return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
+
+
+def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
+    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a value. A blank or ``None`` one
+    sets nothing, and the engine has no evidence of how a driver reads it. Whether the value is a
+    good one is :func:`generic_odbc_no_tls_params`'s question, not this one."""
+    modes = (_odbc_param(params, keyword) for keyword in _ODBC_TLS_MODE_KEYWORDS)
+    return any(mode is not None and str(mode).strip() for mode in modes)
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -407,7 +427,7 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     found: list[str] = []
     for key, value in params.items():
         name = str(key)
-        if not _is_tls_mode_keyword(name):
+        if not _is_tls_keyword(name):
             continue
         label = _no_tls_label(value)
         if label is not None:
@@ -416,13 +436,17 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when the operator addressed TLS.
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when a mode keyword has a value
+    the deny-list does not name.
 
-    Two ways to be at risk, and they read differently to an operator, so they are reported differently:
-    no TLS keyword at all, or a TLS keyword pinned to a no-TLS value (the latter names the offenders).
-    Shares :func:`generic_odbc_no_tls_params` with the construction reminder — see that docstring for
-    why a value deny-list, and for the encrypted-but-unverified residual this deliberately does not
-    classify.
+    Three ways to be at risk, and they read differently to an operator, so they are reported
+    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
+    no mode beside it, such as a lone ``sslcert`` or a blank ``sslmode`` (BACKLOG #2483), or no TLS
+    keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
+    :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
+    :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
+    this deliberately does not classify. An unrecognized mode value stays delegated for the same
+    reason.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
@@ -432,8 +456,10 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if any(_is_tls_mode_keyword(str(k)) for k in params):
+    if _sets_tls_mode(params):
         return None
+    if any(_is_tls_keyword(str(k)) for k in params):
+        return "a TLS keyword is set in odbc_params, but neither sslmode nor encrypt has a value"
     return "no TLS keyword is set in odbc_params"
 
 
@@ -859,13 +885,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     weakened-TLS refusal (:func:`_build_dsn`) does not apply here — configure verifying TLS via the
     driver's own keyword in ``odbc_params`` (e.g. psqlODBC ``SSLmode=verify-full``, MySQL
     ``SSLMODE=VERIFY_IDENTITY``). Because that delegation is otherwise invisible, construction logs it
-    (:func:`_warn_generic_tls_unenforced`): a **WARNING** when no TLS keyword is present, DEBUG when one
-    is.
+    (:func:`_warn_generic_tls_unenforced`): a **WARNING** when ``odbc_params`` set no TLS mode, DEBUG
+    when they do.
 
     Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
-    TLS is **not required** is refused off-loopback on an enforcing instance by
+    TLS is **not required**, or set no mode at all, is refused off-loopback on an enforcing instance by
     :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
-    What stays delegated is the case this path genuinely cannot judge: a driver keyword IS set, and the
+    What stays delegated is the case this path genuinely cannot judge: a mode keyword IS set, and the
     engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
@@ -949,9 +975,8 @@ def _warn_generic_tls_unenforced(
     is a deliberate operator-owned-TLS model, and it must not be *silent*.
 
     So at construction we log the delegation loudly: a **WARNING** when :func:`generic_odbc_tls_unenforced`
-    says the hop may cross in plaintext — no ssl/tls/encrypt-ish keyword in ``odbc_params``, or one
-    pinned to a no-TLS value like ``SSLmode=disable`` — dropped to **DEBUG** when the operator has taken
-    TLS ownership.
+    says the hop may cross in plaintext — no TLS mode in ``odbc_params``, or one pinned to a no-TLS
+    value like ``SSLmode=disable`` — dropped to **DEBUG** when a mode keyword has any other value.
 
     **This line is visibility, not the control.** It never gates or changes the connection, and until
     BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
@@ -972,7 +997,7 @@ def _warn_generic_tls_unenforced(
     reason = generic_odbc_tls_unenforced(params)
     if reason is None:
         logger.debug(
-            "%s: TLS is delegated to the driver (a TLS keyword is set in odbc_params); "
+            "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
             "MessageFoundry does not enforce or verify it on this path",
             where,
         )
@@ -1061,10 +1086,10 @@ def generic_cleartext_hop_guard(
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
     Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
-    connection whose ``odbc_params`` addressed TLS returns ``None`` because
+    connection whose ``odbc_params`` set a TLS mode returns ``None`` because
     :func:`generic_odbc_tls_unenforced` found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
-    written down in :func:`generic_odbc_no_tls_params`.
+    written down above :data:`_ODBC_NO_TLS_VALUES`.
 
     Otherwise the hop is decided by the one shared authority, identically to every other cleartext
     transport: an on-box hop ALLOWs, a per-connection ``tls_hop_attested`` ALLOWs (audited),

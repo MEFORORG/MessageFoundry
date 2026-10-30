@@ -22,6 +22,7 @@ SQLite + pure logic only (no optional extras).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ from messagefoundry.transports.database import (
     _weakened_tls_permitted,
     generic_cleartext_hop_guard,
 )
+from tests.test_database_transport import _NO_MODE_REASON, _TLS_KEYWORDS_WITH_NO_MODE
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -582,6 +584,41 @@ def test_generic_disabling_tls_value_refused_when_enforcing() -> None:
     # The other half of the classifier: a TLS keyword pinned to a value that means "not required".
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="SSLmode=disable"):
         DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "disable"}))
+
+
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
+@pytest.mark.parametrize(
+    ("connector", "config"),
+    [(DatabaseDestination, _generic_dest), (DatabaseSource, _generic_source)],
+)
+def test_generic_lone_tls_keyword_refused_when_enforcing(
+    keyword: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    # BACKLOG #2483: a key or certificate path sets no mode, and libpq defaults to sslmode=prefer.
+    with (
+        active_hop_posture(PROD_PHI),
+        pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
+    ):
+        connector(config(odbc_params={keyword: "fixture"}))
+
+
+@pytest.mark.parametrize("mode", ["require", "verify-full"])
+def test_generic_certificate_beside_an_enforcing_mode_is_not_gated(mode: str) -> None:
+    # The control for the test above: the same keyword crosses once a mode is set beside it.
+    params = {"sslcert": "fixture", "sslmode": mode}
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(_generic_dest(odbc_params=params))
+        assert DatabaseSource(_generic_source(odbc_params=params))
+
+
+@pytest.mark.parametrize("params", [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}])
+def test_generic_blank_mode_refused_when_enforcing(params: dict[str, str]) -> None:
+    # The DSN would go out as sslmode={}, which is no evidence of a mode.
+    with (
+        active_hop_posture(PROD_PHI),
+        pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
+    ):
+        DatabaseDestination(_generic_dest(odbc_params=params))
 
 
 def test_generic_inbound_poll_refused_when_enforcing() -> None:
