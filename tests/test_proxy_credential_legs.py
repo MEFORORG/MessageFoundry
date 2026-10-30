@@ -474,12 +474,16 @@ def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
     proxy for ``https``, because with none the shared opener goes direct whatever ``NO_PROXY``
     says. The header is refused before the dial (vault BACKLOG #3417). Measured 2026-10-30: with
     ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the dial was
-    reached with the header on the request and this test failed. Control: with no ``NO_PROXY`` the
-    request goes to the proxy, and the header is refused on that leg."""
+    reached with the header on the request and this test failed. Controls: with no header the same
+    send reaches the dial, and with no ``NO_PROXY`` the request goes to the proxy, where the header
+    is refused on that leg."""
     monkeypatch.setenv("HTTPS_PROXY", f"http://{_MARKER}")
     monkeypatch.setenv("NO_PROXY", "partner.example.test")
     dest = _rest(_HTTPS_TARGET, proxy_url=proxy_url, headers=_STATIC_PROXY_HEADER)
     _send_refused(dest, "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, proxy_url=proxy_url).send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
     monkeypatch.delenv("NO_PROXY")  # urllib reads its list on every request
     _send_refused(dest, "#3416")
 

@@ -2147,14 +2147,18 @@ def hop_reaches_a_proxy(
     handlers: Sequence[urllib.request.BaseHandler],
     url: str,
 ) -> bool:
-    """Whether a request to ``url`` goes to a web proxy, not direct, on an opener built with
-    ``proxy_dest`` and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
+    """Whether a request to ``url`` goes to a web proxy the connection itself holds, on an opener
+    built with ``proxy_dest`` and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine
+    PR 2576).
 
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
     what its ``opener_handlers()`` built. ``None`` is no proxy, a ``proxy_no_proxy`` match or a
-    loopback host; an uncredentialed one is a host urllib's own bypass list names. All of those
-    go direct. Otherwise the proxy for ``url``'s scheme is read off the built handler, so
-    ``proxy_url = "default"`` with no system proxy for the scheme goes direct too. The handler
+    loopback host; an uncredentialed one is a host urllib's own bypass list names. This answers
+    ``False`` for all of those. A loopback host and a host on urllib's list go direct. Any other
+    host with ``None`` skips the connection's ``proxy_url`` and still follows a proxy from the
+    environment, which this does not read, so there ``False`` means no proxy of the connection's
+    own, not a direct hop. Otherwise the proxy for ``url``'s scheme is read off the built handler,
+    so ``proxy_url = "default"`` with no system proxy for the scheme goes direct too. The handler
     took the system map when it was built, so this reads the map the opener holds, not a later
     one. An explicit ``proxy_url`` serves both schemes."""
     if proxy_dest is None or not proxy_dest.credentialed:

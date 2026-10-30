@@ -2102,24 +2102,24 @@ class HopPosture:
 
 def is_loopback_hop_host(host: str) -> bool:
     """Whether ``host`` names the local box (loopback), so a cleartext hop to it is on-box, not a
-    network exposure. Hoisted verbatim from ``transports.rest._is_loopback_egress_host`` so the
-    HTTP-egress cell and this authority agree on exactly one definition.
+    network exposure. Hoisted here from the REST transport by ADR 0092, so the HTTP-egress cell and
+    this authority agree on exactly one definition.
 
     Covers all of ``127.0.0.0/8`` and ``::1`` via :mod:`ipaddress` (not just the literal
     ``127.0.0.1``), plus the ``localhost`` name and an empty host. It **never resolves DNS**: any other
-    name cannot be *proven* loopback, so it is treated as remote (fail-closed) — a name that happens to
-    resolve to a loopback address is still refused, because resolution is attacker-influenceable and
-    would let a hostname smuggle an off-box hop past the on-box carve-out.
+    name cannot be *proven* loopback, so it is treated as remote, which fails closed at the cleartext
+    guards — a name that happens to resolve to a loopback address is still refused, because
+    resolution is attacker-influenceable and would let a hostname smuggle an off-box hop past the
+    on-box carve-out.
 
     **A limit (vault BACKLOG #2706): apart from case, a name is read as written, and a host is an
     address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``
     and ``%6cocalhost`` read as remote here, though a resolver may take the first two as this box,
     and urllib decodes the third to ``localhost`` before it dials. The cleartext guards judge them
     as they judge any remote hop, and a proxy that applies takes them with the connection's proxy
-    credential, so a hop spelled this way can leave the box through a proxy. What the limit rules
-    out is the reverse: it lets no hop the engine judged on-box leave the host. Where remote is
-    the permissive answer this reading is not enough, as ``config.settings._names_this_host``
-    records.
+    credential, so a hop spelled this way can leave the box through a proxy. This limit only ever
+    reads a spelling as remote, so it adds no hop to the ones judged on-box. Where remote is the
+    permissive answer this reading is not enough, as ``config.settings._names_this_host`` records.
 
     ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
     ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.

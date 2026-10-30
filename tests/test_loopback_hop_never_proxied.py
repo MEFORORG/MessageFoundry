@@ -13,8 +13,8 @@ cleartext guard accepts as loopback is dialled direct, whatever proxy the opener
 replaces it with a recorder. So the whole opener runs as shipped, request processors and proxy
 handler included, and the test reads the host the request would have gone to.
 
-Each rule is paired with a control on the same opener: an off-box host still goes to the proxy. The
-alert webhook, the OIDC legs and the AI broker have no proxy setting of their own, so the
+Each rule is paired with a control on the same opener: a host the guard does not accept still goes
+to the proxy. The alert webhook, the OIDC legs and the AI broker have no proxy setting of their own, so the
 environment proxy is their only route out on a network that requires one.
 
 Synthetic data only: every host name is reserved or made up.
@@ -68,8 +68,10 @@ _LOOPBACK_URLS = (
     "https://[::1]/x",
 )
 
-#: Hosts the guard does not accept. Three of them only look like loopback. The last five spell a
-#: loopback host in a form the predicate does not normalise (vault BACKLOG #2706).
+#: Hosts the guard does not accept, so the opener hands them to a proxy. Three of them only look
+#: like loopback. The last five spell a loopback host the predicate reads as remote, so they are
+#: off-box to the guard and the proxy handler, and a direct leg could still land on this box: at
+#: least ``%6cocalhost`` does (vault BACKLOG #2706).
 _OFF_BOX_URLS = (
     "http://partner.invalid/x",
     "https://partner.invalid/x",
@@ -171,8 +173,9 @@ def test_a_loopback_hop_is_dialled_direct_under_an_environment_proxy(
 def test_an_off_box_hop_still_goes_through_the_environment_proxy(
     environment_proxy: None, family: str, url: str
 ) -> None:
-    """CONTROL for the test above, on the same openers: the rule removes the proxy from a loopback
-    hop only. A name that merely starts or ends like a loopback one is off-box."""
+    """CONTROL for the test above, on the same openers: the rule removes the proxy only from a hop
+    the guard accepts as on-box. A name that merely starts or ends like a loopback one is not
+    accepted, and nor is a spelling the predicate reads as remote."""
     assert _dialled(_FAMILIES[family](), url) == _PROXY_HOST
 
 
@@ -445,10 +448,10 @@ def test_the_three_predicates_agree_on_each_spelling(host: str, on_box: bool) ->
 
 
 def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
-    """The proxy takes ``localhost.``, so the pre-emptive header goes with the request, to the
-    proxy and not to the destination (vault BACKLOG #2706). CONTROL: ``localhost`` goes direct,
-    with no proxy and no credential. The proxy is on the box, so the guard admits the credential
-    in every posture."""
+    """``for_host`` keeps the pre-emptive header for ``localhost.``, and a request carrying it is
+    dialled to the proxy, not refused (vault BACKLOG #2706). CONTROL: ``for_host`` resolves
+    ``localhost`` to no proxy and no credential. The proxy is on the box, so the guard admits the
+    credential in every posture."""
     settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
     config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
     assert config is not None
