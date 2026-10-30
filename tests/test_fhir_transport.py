@@ -1033,7 +1033,7 @@ def _entry_with(entry: str) -> bytes:
             '{"status": "200 OK"}',
             meta='{"a": {"b": {"c": 1}}, "a": {"b": {"c": 1, "c": 2}}, "a": {"b": {"c": 1}}}',
         ),
-        # 1 against true, below the top level: Python reads 1 == True.
+        # 1 against true, as at every level: Python reads 1 == True.
         _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": true, "tag": 1}'),
         _entry_with(
             '{"response": {"status": "200 OK", "x": 1}, '
@@ -1216,13 +1216,14 @@ _KEY_HASHES = """
 import json, sys
 from messagefoundry.transports.fhir import _KeepFirstKey
 hook = _KeepFirstKey()
-json.loads('{"a": [1, [2.5, "x"]], "b": {"c": 1, "d": [true]}, "b": {"c": 1, "d": [true]}}',
-           object_pairs_hook=hook)
-print(json.dumps([[getattr(k[0], "__name__", "?"), hash(k[1])] for k in hook.ids._table]))
+json.loads('{"a": [1, [2.5, "x"]], "b": {"c": 1, "d": [true]}, "b": {"c": 1, "d": [true]},'
+           ' "e": ["", {}, [], null]}', object_pairs_hook=hook)
+fixed = lambda v: type(v) in (bool, type(None)) or v in ("", b"")
+print(json.dumps([[getattr(k[0], "__name__", "?"), hash(k[1]), fixed(k[1])] for k in hook.ids._table]))
 """
 
 
-def test_every_interning_key_but_true_false_and_null_hashes_by_the_process_seed() -> None:
+def test_every_interning_key_but_six_fixed_ones_hashes_by_the_process_seed() -> None:
     # A reply's lists and objects get ids from the ids below them, which are small ints the reply
     # orders. A key whose hash is a fixed function of them (a tuple of ints, as at b7b82b02) could
     # be built offline to collide, and each lookup would then scan every earlier key: quadratic.
@@ -1231,11 +1232,16 @@ def test_every_interning_key_but_true_false_and_null_hashes_by_the_process_seed(
     import os
     import subprocess
     import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
 
     def hashes(seed: str) -> list[list[Any]]:
-        env = {**os.environ, "PYTHONHASHSEED": seed}
+        # This checkout, whatever directory pytest runs from or the venv installed.
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": str(root)}
         out = subprocess.run(
             [sys.executable, "-c", _KEY_HASHES],
+            cwd=root,
             env=env,
             check=True,
             capture_output=True,
@@ -1245,13 +1251,18 @@ def test_every_interning_key_but_true_false_and_null_hashes_by_the_process_seed(
         return list(json.loads(out))
 
     one, two = hashes("1"), hashes("2")
-    kinds = [kind for kind, _ in one]
-    assert kinds == [kind for kind, _ in two]
-    assert {"list", "dict", "int", "float", "str", "bool"} <= set(kinds)  # every kind was reached
-    for (kind, first), (_, second) in zip(one, two, strict=True):
-        if kind == "bool":
-            continue  # true and false are two keys at most
-        assert first != second, kind
+    kinds = [kind for kind, _, _ in one]
+    assert kinds == [kind for kind, _, _ in two]
+    assert {"list", "dict", "int", "float", "str", "bool", "NoneType"} <= set(kinds)  # all reached
+    fixed = 0
+    for (kind, first, is_fixed), (_, second, _) in zip(one, two, strict=True):
+        if is_fixed:
+            # true, false, null and the empty string, object and list: six keys at most.
+            fixed += 1
+            assert first == second, kind
+        else:
+            assert first != second, kind
+    assert fixed == 5  # true, null, "", {} and []: the six less false, which this reply lacks
 
 
 def _with_many_values(count: int) -> bytes:
@@ -1261,16 +1272,20 @@ def _with_many_values(count: int) -> bytes:
     )
 
 
-async def test_a_reply_past_the_node_budget_is_dead_lettered() -> None:
+async def test_a_reply_past_the_node_budget_is_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # At the 16 MiB read cap a reply took about 1.5 GiB and most of a minute to judge here, so the
     # id work is bounded and fails closed past it (ADR 0095 B.1).
     import messagefoundry.transports.fhir as fhir_module
 
     dest = _dest(interaction="update")
     dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET))  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError) as ei:
+    with caplog.at_level("WARNING"), pytest.raises(NegativeAckError) as ei:
         await dest.send(UPDATE_1965)
     assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    # The budget ran out inside the keep-first parse, and the refusal says so in the log.
+    assert any("too large to judge (_TooManyNodes)" in r.getMessage() for r in caplog.records)
     # Control: the same shape, well inside the budget, is delivered.
     dest._opener = _FakeOpener(body=_with_many_values(1000))  # type: ignore[assignment]
     assert await dest.send(UPDATE_1965) is None
@@ -1279,8 +1294,9 @@ async def test_a_reply_past_the_node_budget_is_dead_lettered() -> None:
 async def test_the_node_budget_also_bounds_the_compare_of_the_two_readings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The plain reading's compared values are interned after the keep-first parse, so the budget
-    # must hold there too: set it just past what the keep-first parse took.
+    # The plain reading's compared values are interned after the keep-first parse and after the
+    # keep-first reading's, so the budget must hold there too: set it just past both, so that it
+    # runs out inside the walk of the plain reading's etag.
     import messagefoundry.transports.fhir as fhir_module
 
     reply = _reply_with('{"status": "200 OK", "etag": [[0, 1, 2, 3]], "etag": [[0, 1, 2, 3]]}')
@@ -1288,9 +1304,14 @@ async def test_the_node_budget_also_bounds_the_compare_of_the_two_readings(
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
     assert await dest.send(UPDATE_1965) is None  # control: the readings agree
     hook = fhir_module._KeepFirstKey()
-    _, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=hook)
+    first, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=hook)
     assert hint is None
-    monkeypatch.setattr(fhir_module, "_NODE_BUDGET", hook.ids._interned + 3)
+    fhir_module._reply_reading(first, hook.ids)
+    before_plain = hook.ids._interned
+    last = json.loads(reply)
+    fhir_module._reply_reading(last, hook.ids)
+    assert hook.ids._interned - before_plain > 6  # the plain etag walk takes more than 3 steps
+    monkeypatch.setattr(fhir_module, "_NODE_BUDGET", before_plain + 3)
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(UPDATE_1965)
     assert ei.value.code == "reply-repeats-a-key" and ei.value.__context__ is None

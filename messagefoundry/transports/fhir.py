@@ -416,8 +416,9 @@ class _TooManyNodes(ValueError):
     value."""
 
 
-#: The most ids, one per key, value and container, that one judgment of a repeated-key reply
-#: interns (:meth:`_NodeIds._intern`), across both readings, before it fails closed. Without it a reply at the 16 MiB read cap took about 1.5
+#: The most interning steps (:meth:`_NodeIds._intern`), one per key, value and container, repeats
+#: included, that one judgment of a repeated-key reply takes across both readings before it fails
+#: closed. Without it a reply at the 16 MiB read cap took about 1.5
 #: GiB and most of a minute here (measured 2026-10-30, vault BACKLOG #3796); a one-entry
 #: transaction-response, even one carrying the updated resource, holds far fewer.
 _NODE_BUDGET = 250_000
@@ -433,11 +434,12 @@ class _NodeIds:
     Ids are interned bottom-up, each container once, by walking with a stack rather than by
     recursion, so nothing recurses at any depth ``json`` parses (vault BACKLOG #3796 records a
     compare, reverted in engine PR 2356, that recursed and was exponential). Every interning key
-    other than ``true``, ``false`` and ``null`` hashes through a ``str`` or ``bytes`` value, whose
-    hash Python seeds per process, so while ``PYTHONHASHSEED`` is unset or random a reply cannot be
-    built offline to make the keys collide. An object's pairs are sorted, so the expected work is at
-    most the value's size times the log of its widest object. At most :data:`_NODE_BUDGET` ids are
-    interned, else :class:`_TooManyNodes`.
+    hashes through a ``str`` or ``bytes`` value, whose hash Python seeds per process, except six
+    whose hash is fixed: ``true``, ``false``, ``null``, and the empty string, object and list. So
+    while ``PYTHONHASHSEED`` is unset or random a reply cannot be built offline to make the keys
+    collide. An object's pairs are sorted, so the expected work is at most the value's size times
+    the log of its widest object. At most :data:`_NODE_BUDGET` interning steps run, one per key,
+    value and container, repeats included, else :class:`_TooManyNodes`.
 
     Each container is held (``_memo``) for as long as this lives, so the ``id()`` it is looked up
     by cannot be reused by another object meanwhile. Whether a value reads two ways (some object at
@@ -493,6 +495,9 @@ class _NodeIds:
             while stack:
                 container = stack.pop()
                 order.append(container)
+                if len(order) > _NODE_BUDGET:
+                    raise _TooManyNodes  # before walking a subtree the budget could not take
+
                 items = container.values() if isinstance(container, dict) else container
                 # A plain loop, for the reason :meth:`_KeepFirstKey.__call__` gives.
                 for child in items:
@@ -655,6 +660,11 @@ def _agreed_reading(body: str) -> dict[str, Any] | None:
         ids = keep_first.ids
         if hint is None and _reply_reading(first, ids) == _reply_reading(last, ids):
             return last
+        if hint == _TooManyNodes.__name__:
+            # The budget ran out inside the parse, where json_loads_or_refusal took the error.
+            logger.warning(
+                "a FHIR 2xx reply that repeats a JSON key is too large to judge (%s)", hint
+            )
     except (_TooManyNodes, MemoryError) as exc:
         # Too large to judge, so it fails closed below, outside this handler (BACKLOG #2048). The
         # class name is content-free.
