@@ -4602,7 +4602,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   #2738). Each of these raises the account's session epoch in the same transaction, and a
   rotation keeps the epoch the session was sealed under. So the next time the session is
   presented it is refused and ended, and the user's own session list hides it and ends it the
-  same way. **Three things are still wrong about it.** Its ending is reported as a seal
+  same way. **At least three things are still wrong about it.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. **That is a known false alarm, not intended behaviour:** nothing was altered, and
   neither the alert nor the audit row says which case it is, so an operator cannot tell it
@@ -4613,15 +4613,16 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   store runs one writer at a time, so neither has this limit. The skip and the refusal were
   read from the code; the skip has not been reproduced against a server. A bind ends sessions
   only: an engine factor already enrolled on the account stays.
-- **A bind and a user delete take one lock order on every store** (BACKLOG #2738). A bind, an
-  unbind and a whole-account revoke lock the account's row and then its sessions. Deleting a
-  user now takes the account's row first too, on SQL Server since BACKLOG #2733 and on
-  Postgres since #2738, so the two cannot deadlock against one account. The order was read
-  from the code, and `test_bind_and_user_delete_take_one_lock_order` checks it on both server
-  legs: it pauses a bind while it holds the row and checks that the delete waits for it. Nothing in
-  the engine retries a deadlock, so a deadlock from another pair of writes still fails one
-  administrator request, which the administrator repeats by hand. The SQLite store runs one
-  writer at a time and has no lock order to get wrong.
+- **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
+  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  on Postgres since #2738, so the two cannot deadlock against one account. The order was read
+  from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
+  pauses a bind while it holds the row, waits until the delete is queued behind it, then
+  releases the bind and requires both to finish. Under the old Postgres order, by the same
+  reading, the database would end one of them as a deadlock. Nothing in the engine retries a deadlock, so a deadlock from
+  another pair of writes still fails one administrator request, which the administrator repeats
+  by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.

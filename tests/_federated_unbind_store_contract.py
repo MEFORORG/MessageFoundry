@@ -405,7 +405,9 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
             await asyncio.sleep(_PROBE_INTERVAL)
         # The race actually exercised: without this the test would pass on a delete that never met
         # the bind, which proves nothing about the order.
-        assert not delete.done(), "delete_user finished while the bind held the account's row"
+        if delete.done():
+            delete.result()  # a delete that failed fast raises its own error here
+            raise AssertionError("delete_user finished while the bind held the account's row")
         assert queued, "delete_user never queued behind the bind, so the interleaving did not run"
 
         release.set()

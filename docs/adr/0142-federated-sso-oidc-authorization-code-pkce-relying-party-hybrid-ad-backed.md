@@ -596,8 +596,8 @@ sessions and no user is left half deleted.
 record for both.
 
 **CORRECTED 2026-10-30 (BACKLOG #2738).** The paragraph above is kept as written, and three of
-its claims are wrong. A missed session does not last until it expires: the session epoch refuses
-it the next time it is presented (BACKLOG #2592). The deadlock with a user delete is closed on
+its claims are wrong. A missed session cannot be used until it expires: the session epoch refuses
+it the next time it is presented (BACKLOG #2592), though the store holds it as live until then. The deadlock with a user delete is closed on
 both server stores (BACKLOG #2733, #2738). And nothing retries a deadlock. It also did not say
 that both limits were read from the code and not run. The SQL Server sweep can still miss a
 rotated session; SECURITY.md, linked above, states what that still costs.

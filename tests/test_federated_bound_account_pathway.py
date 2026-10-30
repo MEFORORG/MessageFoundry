@@ -551,7 +551,7 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     assert "fails and is retried" not in text
     assert "lasts until it expires" not in text
     assert "**That is a known false alarm, not intended behaviour:**" in text
-    assert "**A bind and a user delete take one lock order on every store**" in text
+    assert "**A bind and a user delete take one lock order on both server stores**" in text
 
 
 def test_the_security_doc_says_a_bound_administrator_does_not_block_provision_admin() -> None:
