@@ -876,6 +876,25 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #2614. DELETE /sessions ends every session through the API; this is the same act from
+    # the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
+    admin_revoke_sessions = sub.add_parser(
+        "admin-revoke-sessions",
+        help="end every account's sessions from the host (offline; the API is not needed)",
+        description="Revoke every session of every account, directly against the store, on the "
+        "same host gate as admin-unlock. Every signed-in user, administrators included, must sign "
+        "in again. Audited. The engine may be running or stopped.",
+    )
+    admin_revoke_sessions.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_revoke_sessions.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    admin_revoke_sessions.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
     # this is how an install gets its first administrator. There is deliberately no --password and no
     # --password-file -- see `_provision_admin`.
@@ -10975,6 +10994,65 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     return code
 
 
+def _admin_revoke_sessions(args: argparse.Namespace) -> int:
+    """End every account's sessions from the host (BACKLOG #2614).
+
+    ``DELETE /sessions`` does the same through the API, and this exists for when the API is the
+    thing not trusted, such as a suspected compromise of the engine's own host process. The gate
+    is host access, as for ``admin-unlock``, whose docstring says why that gate is a real one.
+    It keeps no session: the shell that runs it holds none.
+
+    The audit row is written after the revoke, as ``admin-unlock`` writes its own, and the audit
+    append is checked for a refusal before the revoke, so a refused row cannot follow a change
+    that already landed."""
+    import getpass
+
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import KeylessAuditChainRefused, StoreNotFoundError, open_store
+
+    settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
+    if isinstance(settings, int):
+        return settings
+
+    async def run() -> int:
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            _refuse_an_unauditable_write(store)
+            revoked = await store.revoke_all_sessions()
+            await store.record_audit(
+                "auth.session_revoked",
+                actor=f"cli:{getpass.getuser()}",
+                detail=json.dumps({"scope": "all", "count": revoked}),
+            )
+            return revoked
+        finally:
+            await store.close()
+
+    try:
+        revoked = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreKeyUnresolved,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if args.json:
+        print(json.dumps({"ok": True, "revoked": revoked}))
+    else:
+        print(f"OK: revoked {revoked} session(s); every signed-in user must sign in again")
+    return 0
+
+
 def _restore(args: argparse.Namespace) -> int:
     """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
 
@@ -12281,6 +12359,7 @@ _DISPATCH = {
     "service": _service,
     "admin-set-notify-email": _admin_set_notify_email,
     "admin-reset-totp": _admin_reset_totp,
+    "admin-revoke-sessions": _admin_revoke_sessions,
 }
 
 

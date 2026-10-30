@@ -857,6 +857,11 @@ STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 # that ends nobody's session of the caller's keeps the session window. Its own id and not
 # `session_terminate`, so a grant minted for DELETE /me/sessions cannot be spent on a map save.
 STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS = "save_ends_own_sessions"
+# BACKLOG #2614. `DELETE /sessions` ends every account's sessions, the caller's other ones included,
+# so it takes a proof bound to its own action, single-use and MFA-gated. Not `session_terminate` or
+# the map saves' id, so a grant minted to end the caller's own other sessions, or for a map save,
+# cannot be spent on ending everyone's.
+STEP_UP_ACTION_REVOKE_ALL_SESSIONS = "revoke_all_sessions"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -11557,6 +11562,36 @@ class AuthService:
         )
         return revoked
 
+    async def revoke_every_session(
+        self, *, actor: str, keep_token_hash: str | None = None, client: str | None = None
+    ) -> tuple[int, bool]:
+        """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
+        compromise where walking the accounts one by one would leave the rest live meanwhile.
+        ``keep_token_hash`` keeps the caller's own session, so the administrator who ran it is not
+        signed out mid-response; ``None`` keeps nothing. Returns the count and whether a session
+        was kept. Audited even when the count is zero, because the act itself is the record an
+        investigator looks for.
+
+        A kept session whose seal fails makes the store write nothing. The caller's own session is
+        then suspect, so it is ended with the rest, and the audit row's scope says so, as
+        :meth:`revoke_other_sessions` does."""
+        kept = keep_token_hash is not None
+        try:
+            revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+        except RowSealError:
+            if keep_token_hash is None:
+                raise
+            await self._session_seal_failed(keep_token_hash)
+            revoked = await self._store.revoke_all_sessions()
+            kept = False
+        await self._audit(
+            "auth.session_revoked",
+            actor=actor,
+            detail=_json({"scope": "all_but_caller" if kept else "all", "count": revoked}),
+            client=client,
+        )
+        return revoked, kept
+
     async def _custom_permissions_for_ids(self, role_ids: Iterable[str]) -> frozenset[Permission]:
         """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
         (ADR 0045 D3). Each is looked up in the ``roles`` table and its persisted ``permissions`` JSON
@@ -12214,6 +12249,7 @@ class AuthService:
     #: session never reaches its routes. It is listed anyway, for the owner's #1149 Reading B: a
     #: password re-proof from an MFA-pending session does not count as authenticating again, so
     #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
+    #: ``revoke_all_sessions`` (BACKLOG #2614) is listed for the same reason.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
@@ -12221,6 +12257,7 @@ class AuthService:
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
             STEP_UP_ACTION_SESSION_TERMINATE,
             STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
         }
     )
 
