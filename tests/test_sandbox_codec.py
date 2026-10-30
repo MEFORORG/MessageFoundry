@@ -787,6 +787,17 @@ def test_parent_rebuild_wraps_constructor_faults() -> None:
     assert isinstance(excinfo.value, SandboxError)  # the documented contract still holds
 
 
+@pytest.mark.parametrize(("ns", "key"), [("MRN-NS ", "k"), ("n", "MRN-KEY ")])
+def test_parent_rebuild_wraps_a_trailing_space_refusal(ns: str, key: str) -> None:
+    """BACKLOG #1588: the trailing-space refusal in ``SetState.__post_init__`` reaches the parent's
+    rebuild as the same codec rejection as the non-empty check above, and names no value."""
+    with pytest.raises(SandboxCodecError) as excinfo:
+        _dec_item({"o": "state", "ns": ns, "key": key, "v": 1}, _Reader(()))
+    assert isinstance(excinfo.value.__cause__, WiringError)
+    assert "must not end with a space" in str(excinfo.value)
+    assert "MRN" not in str(excinfo.value)
+
+
 # --- (9) the Send rebuild is a provable copy-on-Send no-op --------------------
 
 
