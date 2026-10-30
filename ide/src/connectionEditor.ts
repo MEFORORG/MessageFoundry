@@ -6,8 +6,9 @@
 // A connection authored in .py is read-only here (it isn't in `connection list`) — the gear opens its
 // source instead. After a save the graph refreshes and a Promote is offered.
 import * as vscode from "vscode";
-import { configDir, runJson, workspaceDir } from "./cli";
+import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
+import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
@@ -195,10 +196,7 @@ async function save(
     return;
   }
   try {
-    await runJson(
-      ["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(plan.conn)],
-      ws,
-    );
+    await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), plan.conn), ws);
   } catch (e) {
     // Surface the validation/egress error inline so the user can fix the form (file was not changed).
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -229,7 +227,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
     return;
   }
   try {
-    await runJson(["connection", "remove", "--config", configDir(), "--name", name], ws);
+    await runJson(connectionRemoveArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), name), ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;

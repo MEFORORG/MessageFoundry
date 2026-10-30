@@ -1366,8 +1366,9 @@ jobs:
     # `webconsole-v*` run of this job created the project on 2026-07-29 -- so this job now republishes a
     # name the project owns, and shipped text may name it in a bare-name install. The pre-claim wording
     # that stood here is retired rather than restated as a retraction (BACKLOG #1193).
-    # tests/test_install_instruction_provenance.py holds the classification (`_PUBLISHED_DISTRIBUTIONS`)
-    # and fails if any tracked text drifts back to the pre-claim claim.
+    # messagefoundry/security/audit_all_platforms.py holds the classification (`PUBLISHED_DISTRIBUTIONS`),
+    # and tests/test_install_instruction_provenance.py fails if any tracked text drifts back to the
+    # pre-claim claim.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
     # The provenance gate only, never `release`: the console's cadence is its own (see above), but a
     # console tag must name a commit on main as much as an engine tag must.
