@@ -146,11 +146,13 @@ def _is_strict_host(host: str) -> bool:
 def parse_proxy_url(value: str) -> ProxyAddress:
     """Parse a configured ``http(s)`` proxy URL once, or raise ``ValueError`` with fixed text.
 
-    Refused: a value either parser cannot read; a scheme other than ``http`` or ``https``; a
-    path other than one bare ``/``; any ``?`` or ``#``; a host that is not a DNS name, an IPv4
-    address or a bracketed IPv6 address; a port that is not a number from 1 to 65535; and any
-    value on which ``urlsplit`` and urllib's ``_parse_proxy`` read a different scheme, userinfo,
-    host or port. A userinfo stays allowed. The caller strips the value and handles ``"default"``
+    Refused, at least: a value either parser cannot read; a scheme other than ``http`` or
+    ``https``, or one not followed by ``://``; a path other than one bare ``/``; any ``?`` or
+    ``#``; a host that is not an ASCII DNS name, a canonical dotted-quad IPv4 address or a
+    bracketed IPv6 address with no zone; a port outside 1 to 65535 or written with a leading
+    zero; and any value on which ``urlsplit`` and urllib's ``_parse_proxy`` read a different
+    scheme, userinfo, host or port. The code below is the full rule; this list is a guide to it.
+    A userinfo stays allowed. The caller strips the value and handles ``"default"``
     first. Neither the message nor the exception chain carries any part of the value."""
     try:
         parts = _UNCACHED_URLSPLIT(value)

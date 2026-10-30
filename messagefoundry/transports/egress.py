@@ -243,7 +243,15 @@ def _check_forward_proxy_egress(
     credentials, so that path mints no ``Proxy-Authorization``. ``settings`` are the already-``env()``-
     resolved settings with the ``[egress]`` site-wide default merged in by
     :func:`_apply_egress_proxy_default`, so this sees the EFFECTIVE proxy either way. An unset
-    ``proxy_url`` is a no-op."""
+    ``proxy_url`` is a no-op.
+
+    **The gate judges the host that is dialled (vault BACKLOG #2965).** Before the allow-list is
+    read, at least these are refused, each in text that names no part of the value: a URL
+    ``urlsplit`` cannot parse, a scheme other than ``http`` or ``https``, and any value
+    :func:`~messagefoundry.transports.proxy_address.parse_proxy_url` refuses, such as one with a
+    path, query or fragment, or one urllib's proxy parser would read as naming another host. The
+    allow-list then matches the parsed host and port, which are what the connector dials, because
+    ``proxy_config_from_settings`` rebuilds the URL from the same parse."""
     proxy_url = str(settings.get("proxy_url", "") or "").strip()
     if not proxy_url or proxy_url.lower() == PROXY_DEFAULT:
         return

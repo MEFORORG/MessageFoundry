@@ -223,6 +223,8 @@ def test_userinfo_is_kept_in_the_rebuilt_url() -> None:
         "http://2130706433:3128",  # a bare integer address
         "http://127.1:3128",  # fewer than four parts
         "http://0x7f.1:3128",  # a hex label
+        f"http://{LISTED}:03128",  # a leading zero, which urllib keeps in the port it dials
+        f"https://{LISTED}:0443",
     ],
 )
 def test_strict_shape_refusals(proxy_url: str) -> None:
@@ -252,9 +254,15 @@ def test_accepted_shapes(proxy_url: str, hostname: str, port: int | None) -> Non
 
 def _dialled_by_http_client(proxy: str) -> tuple[str, int]:
     """The host and port ``http.client`` would dial for ``proxy``, read as urllib's handler reads
-    it: ``_parse_proxy``, then ``unquote``, then ``set_proxy`` hands the result to the connection."""
-    hostport = urllib.parse.unquote(read_like_urllib(proxy)[3])
-    conn = http.client.HTTPConnection(hostport)
+    it: ``_parse_proxy``, then ``unquote``, then ``set_proxy`` hands the result to the connection.
+    An ``https`` proxy is dialled through ``HTTPSConnection``, whose default port is 443."""
+    scheme, _, _, hostport = read_like_urllib(proxy)
+    connection = (
+        http.client.HTTPSConnection
+        if (scheme or "").lower() == "https"
+        else http.client.HTTPConnection
+    )
+    conn = connection(urllib.parse.unquote(hostport))
     return conn.host, conn.port
 
 
@@ -274,7 +282,8 @@ def test_every_accepted_value_dials_the_host_it_is_judged_on() -> None:
             refused += 1
             continue
         accepted += 1
-        expected = (address.hostname, address.port or 80)
+        default_port = 443 if address.scheme == "https" else 80
+        expected = (address.hostname, address.port or default_port)
         for form in (value, address.url):
             host, port = _dialled_by_http_client(form)
             assert (host.lower(), port) == expected, value
@@ -314,3 +323,19 @@ def test_the_static_hop_label_names_the_dialled_host() -> None:
         hop = _proxy_hop("OB", {"proxy_url": proxy_url, **keyed}, None)
         assert hop is not None and _WITHHELD_PEER in hop.detail, proxy_url
         _assert_names_no_part(hop.detail)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        # urlsplit deletes a tab, CR or LF anywhere in the URL, and urllib's proxy parser keeps
+        # them, so the two read a different user or password from the same text. The host and
+        # port agree, so only a userinfo comparison can refuse these.
+        f"http://u\t:p@{LISTED}:3128",
+        f"http://u:p\n@{LISTED}:3128",
+        f"https://u\r:p@{LISTED}:3128/",
+    ],
+)
+def test_a_userinfo_the_two_parsers_read_differently_is_refused(proxy_url: str) -> None:
+    with pytest.raises(ValueError, match="2965"):
+        parse_proxy_url(proxy_url)
