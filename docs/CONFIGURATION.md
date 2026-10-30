@@ -2748,8 +2748,11 @@ worst-case transition window is bounded by the lease timing: a partitioned leade
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
 For a
-`database` source the row-claim atomicity is the operator's `poll_statement`/`mark_statement` (claim
-with a status flag or `UPDATE ... RETURNING`); the engine owns the atomic rename only for file sources.
+`database` source the row claim is the operator's `mark_statement`, run per row after the handler
+returns, so a row read twice in the transition window is a duplicate. `poll_statement` must be a
+read-only `SELECT` or `WITH`: a poll that writes, such as `UPDATE ... RETURNING`, marks rows it never
+hands off, so it is refused at build, and so is a stored-procedure poll (BACKLOG #2178). The engine
+owns the atomic rename only for file sources.
 
 If the leader stops cleanly it expires its lease so a follower acquires leadership at once; if it
 crashes or is partitioned, the lease ages out and a follower acquires after at most

@@ -2197,12 +2197,40 @@ class _PolledBatch(NamedTuple):
     skip_budget_spent: bool
 
 
+def _require_read_only_poll(statement: str) -> None:
+    """Refuse a DATABASE source ``poll_statement`` that could write (BACKLOG #2178).
+
+    The poll runs on the autocommit pool, so a write in it commits at execute, before any row reaches
+    the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, marks every row it matches,
+    but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the rows past
+    the ceiling are marked and never ingested. The rows a failed handler or a stop leaves behind are
+    lost the same way. That is accept-and-drop. Only the per-row ``mark_statement``, run after the
+    handler returns, may mark a row. The test is :func:`_require_read_only`, the one ``db_lookup``
+    uses, applied whatever ``poll_max_rows`` is. Raises :class:`ValueError`, as the source's other
+    setting refusals do, and never echoes statement text. Raised outside the handler, as the
+    ``DatabaseRef`` gate in ``config/wiring.py`` does, so no ``__context__`` rides along."""
+    refusal: str | None = None
+    try:
+        _require_read_only(statement, subject="DATABASE source poll_statement")
+    except DbLookupError as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise ValueError(
+            f"{refusal}. The poll runs on an autocommit connection, so a write in it, such as "
+            "UPDATE ... RETURNING or OUTPUT, commits before any row is handed off, and the rows it "
+            "marks past poll_max_rows, or behind a failed hand-off or a stop, are never ingested. "
+            "Poll with a SELECT and mark each handled row with mark_statement. A stored-procedure "
+            "poll (EXEC, {CALL ...}) is refused too, because its body cannot be tested"
+        )
+
+
 class DatabaseSource(SourceConnector):
     """Poll a SQL table on an interval, hand each row to the pipeline handler, then mark it processed.
 
     The File source's *process-then-mark-done* shape (at-least-once), with a query instead of a
     directory: a cooperatively-cancellable background loop runs the operator-declared ``poll_statement``
-    (a ``SELECT`` of the next batch), hands each row to the handler as a body, and — **only after the
+    (a read-only ``SELECT`` of the next batch; a writing poll is refused at construction, BACKLOG
+    #2178), hands each row to the handler as a body, and — **only after the
     handler returns** — runs the optional ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that
     row's columns) so the row isn't re-read. A crash before the mark re-emits the row next poll
     (at-least-once); the downstream pipeline must tolerate duplicates. Poll errors are logged-not-fatal
@@ -2216,9 +2244,10 @@ class DatabaseSource(SourceConnector):
     **Under ``[cluster].enabled`` (multi-node)** this source is leader-gated (only the leader polls,
     Track B Step 4b) — but unlike the File/RemoteFile sources, where the engine owns the atomic rename
     that bounds the leadership-transition duplicate window, the engine can't enforce row claim/mark
-    atomicity here: it's on the operator's SQL. Write ``poll_statement``/``mark_statement`` to claim
-    rows atomically (a status flag, or ``UPDATE ... RETURNING`` that both selects and marks) so the
-    brief transition window stays at the same at-least-once duplicate class as a crash mid-poll.
+    atomicity here: it's on the operator's SQL. The claim is ``mark_statement``, run per row after the
+    handler returns, so a row both nodes read in the brief transition window is a duplicate, the same
+    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` cannot claim; see
+    :func:`_require_read_only_poll`.
     """
 
     polls_shared_resource = True  # a DB table is a shared external resource — leader-gate it
@@ -2258,6 +2287,7 @@ class DatabaseSource(SourceConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._poll_sql = str(s["poll_statement"])
+        _require_read_only_poll(self._poll_sql)
         mark = s.get("mark_statement")
         # mark_statement is optional (a read-only/idempotent feed may omit it); its :name params bind
         # from the polled row's columns, reusing the destination's named-parameter translation.
@@ -2296,6 +2326,8 @@ class DatabaseSource(SourceConnector):
         # its rows. None = always poll (single-node / direct callers / tests) — byte-identical.
         self._leader_gate: Callable[[], bool] | None = None
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
+        # Whether this run of full polls with no mark_statement has already been warned about.
+        self._unmarked_ceiling_warned = False
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         # The poll task inside a row's hand-off and mark; a cancelled stop() gives it a grace.
@@ -2580,7 +2612,9 @@ class DatabaseSource(SourceConnector):
         the next batch; nothing is dropped, errored or marked. Progress depends on the ``mark_statement``
         removing a handled row from ``poll_statement``'s own predicate, which is the shape this connector
         already documents and requires — without a mark the same rows re-emit every poll, ceiling or no
-        ceiling.
+        ceiling, and the rows past a full ceiling are not reached at all, so that case logs a WARNING
+        once per run of full polls rather than the deferral line. "Untouched" holds only because
+        ``poll_statement`` cannot write (:func:`_require_read_only_poll`).
 
         A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``; the skip
         budget still applies there, bounding this poll's log and event volume the same way."""
@@ -2636,10 +2670,24 @@ class DatabaseSource(SourceConnector):
                     # A short batch means the driver is out of rows, so there is nothing to top up
                     # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
                     break
-            if ceiling is not None and len(rows) == ceiling:
+            if ceiling is None or len(rows) < ceiling:
+                self._unmarked_ceiling_warned = False  # the run of full polls, if any, is over
+            elif self._mark_sql is not None:
                 logger.info(
                     "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
                     "left for the next poll (deferred, not dropped)",
+                    ceiling,
+                )
+            elif not self._unmarked_ceiling_warned:
+                # With no mark, nothing takes a handled row out of poll_statement's result, so the
+                # next poll selects the same first rows again: "deferred" would be false. Once per
+                # run of full polls, so a snapshot feed that always fills does not warn every poll.
+                self._unmarked_ceiling_warned = True
+                logger.warning(
+                    "DATABASE source filled poll_max_rows (%s) and has no mark_statement, so each "
+                    "poll can select the same first rows again and rows past the ceiling are not "
+                    "reached; add a mark_statement, or raise or disable poll_max_rows. Logged once "
+                    "until a poll returns fewer rows than the ceiling",
                     ceiling,
                 )
         finally:

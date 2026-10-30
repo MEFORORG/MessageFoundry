@@ -1275,6 +1275,14 @@ At least these, read 2026-10-26:
   status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
   stop check between rows, leaves claimed rows that never reached the store. That was true of the
   serial loop too.
+
+  *Amended 2026-10-30 (BACKLOG #2178):* this case is now refused rather than left uncovered. A
+  `DatabaseSource` refuses at construction any `poll_statement` that fails the `db_lookup`
+  read-only test, so an `UPDATE ... RETURNING` or status-flag claim in the poll, and a
+  stored-procedure poll, cannot be configured. The same shape also lost the rows past
+  `poll_max_rows` on every full poll, and the rows behind a failed hand-off. A row is now marked
+  only by `mark_statement`, after its hand-off, so a cut in the select or at the stop check leaves
+  the row unmarked, and the next poll reads it again.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
