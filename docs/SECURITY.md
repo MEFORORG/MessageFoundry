@@ -2575,7 +2575,8 @@ engine shard. It cancels nothing, writes no
 skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
 off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail
 puts the request id, the operation, the requester and the count before the reason. So the copy may
-lose the reason, and a long outbound name can leave almost none of it. Read the reason on-box. A held purge whose stored scope
+lose the reason. The requester's name is the field that can use up the bound, so a long requester
+name can leave no reason at all. Read the reason on-box. A held purge whose stored scope
 is neither `top` nor `all`, or whose stored name the route would not admit, cancels nothing either.
 No request files one and no operator act clears it, so it answers 422, moves to `failed`, and
 `approval.failed` names the error type; a WARNING in the engine log says why. The queue does not predict this refusal: `release_blocked` stays `null`, as
