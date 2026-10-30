@@ -247,6 +247,11 @@ async def run_connscale(
     # for the batch comparison too, so a swallowed B0/B1 batching arm is never silently compared against
     # nothing.
     batch_missing_detail: dict[tuple[str, str, int], str] = {}
+    # Whether an A/B exists to report a swallowed pooled miss, and how many steps were swallowed.
+    # Counted at the swallow itself, so the run-level gate below does not depend on which of the
+    # detail dicts above a later change keeps writing.
+    ab_axis = bool(profile.ab_axes())
+    steps_missed = 0
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
     # fuse_mode (ADR 0071 B5) nests just inside claim_mode: each (claim_mode, count) cell runs each
@@ -307,8 +312,16 @@ async def run_connscale(
                                 # ConnScaleError carrying the engine log tail — defense in depth). Fusion
                                 # and statement-batching never cause a miss (each fails OPEN / no-ops to
                                 # the async path), so the miss gate stays keyed on claim_mode.
+                                #
+                                # Swallowed only where an A/B exists to report the miss (BACKLOG
+                                # #3132). A single-arm profile has no comparison, so a pooled-only
+                                # sweep such as connscale.toml re-raises a setup fault exactly as
+                                # per_lane does: exit 2 at once, not a miss per cell and a late exit 1.
+                                # It keeps the RCSI attribution the miss note would have carried.
                                 if claim_mode != "pooled":
                                     raise
+                                if not ab_axis:
+                                    raise ConnScaleError(_pooled_miss_reason(str(exc))) from exc
                                 # Only attribute the miss to the RCSI fail-closed gate when the engine
                                 # log actually shows it; otherwise surface the REAL failure (OOM at 1500
                                 # conns, a DB-connect fault, a config error, a port-bind clash) so an
@@ -324,6 +337,7 @@ async def run_connscale(
                                 missing_detail[(mode, count)] = reason
                                 fuse_missing_detail[(claim_mode, mode, count)] = reason
                                 batch_missing_detail[(claim_mode, mode, count)] = reason
+                                steps_missed += 1
                                 step += 1
                                 # A pooled-arm miss is a DETERMINISTIC RCSI/startup refusal, identical
                                 # for every trial of this cell — record it ONCE and stop retrying (don't
@@ -347,11 +361,17 @@ async def run_connscale(
         records, profile.batch_modes, missing_detail=batch_missing_detail
     )
     # A multi-arm run additionally fails on a throughput regression, a NO-collapse, or a missing pooled
-    # arm (comparison.ok folds those in). A single-arm run has no comparison ⇒ unchanged verdict. The
-    # fusion/batching A/Bs fold ONLY their correctness gate (.ok = every B1 arm held zero-loss +
-    # present) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate measurement, not a red build.
+    # arm (comparison.ok folds those in). A single-arm run has no comparison and never swallows a miss
+    # (the loop re-raises), so its verdict is the SLOs alone. The fusion/batching A/Bs fold ONLY their
+    # correctness gate (.ok = every B1 arm held zero-loss + present) — a NO-GO/INCONCLUSIVE throughput
+    # verdict is a legitimate measurement, not a red build.
+    #
+    # A swallowed miss also fails the run on its own (BACKLOG #3132). A comparison sees only the
+    # misses it can pair against a present arm: in a fusion A/B, a cell whose B0 and B1 both failed to
+    # start leaves no row and no baseline gap, so nothing else would fail it.
     result_ok = (
-        all(c.ok for c in slos)
+        steps_missed == 0
+        and all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
         and (batch_comparison is None or batch_comparison.ok)
@@ -791,7 +811,8 @@ def _node_env(
     # Administrator the poller signs in as (harness.load.rigadmin).
     # ADR 0066 A/B seam: settings.py parses MEFOR_PIPELINE_CLAIM_MODE into PipelineSettings.claim_mode,
     # which threads __main__ -> api/app -> engine -> RegistryRunner.start() (pooled builds
-    # StageDispatchers). "per_lane" is the engine default, so a per_lane arm is behaviorally unchanged.
+    # StageDispatchers). The ENGINE default is "pooled" (ADR 0066); the harness profile default is
+    # "per_lane", and this line pins whichever the arm names, so the engine default never decides it.
     env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
     # ADR 0061 seam, PINNED rather than inherited (BACKLOG #1211). settings.py parses
     # MEFOR_PIPELINE_PER_LANE_WAKE into PipelineSettings.per_lane_wake, whose default is already False,
@@ -1802,6 +1823,21 @@ def _reconcile(
     # `test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` asserts.
     floor_short = population // 2 - read
     deliver_short = written - sink_received
+    # Every message the engine READ must be WRITTEN (BACKLOG #3132). Each connscale inbound routes to
+    # exactly one outbound, so after the drain `written >= read`. `written` counts DONE outbound rows,
+    # one per message per destination, so a redelivery does not raise it (that shows as
+    # `sink_received > written`); it exceeds `read` only by rows that predate the baseline or by a
+    # duplicated handoff row.
+    # Without this term a dead-lettered or refused message passed: it is read, never written, never
+    # reaches the sink, and leaves no backlog, so the intake, delivery and drain checks all hold. No
+    # excusal applies: `read` counts rows the engine holds, not sends that may never have arrived.
+    #
+    # KNOWN LIMITS, stated rather than hidden. A message the listener NAKed is recorded as an ERROR
+    # row, so it counts in `read` and fails this term; the corpus is valid synthetic HL7, so a NAK is
+    # a defect in the run, and excusing NAKs would let a dead-letter hide behind one. And these are
+    # COUNTS: one duplicated outbound row, or one row carried over from before the baseline, cancels
+    # one lost message. Only a per-message audit separates them.
+    write_short = read - written
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
     # applies to a step that offered nothing at all (`sent == 0`, e.g. a zero-rate lane).
@@ -1821,6 +1857,7 @@ def _reconcile(
         read_short <= 0
         and floor_short <= 0
         and deliver_short <= 0
+        and write_short <= 0
         and drained
         and not over_budget
         and not (not_back or no_sends or no_reply)
@@ -1843,6 +1880,17 @@ def _reconcile(
     if deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
+        )
+    if write_short > 0:
+        naked = (
+            f"; {c.nak} send(s) were NAKed, and a NAK counts here only where its row was recorded"
+            if c.nak
+            else ""
+        )
+        parts.append(
+            f"engine_written {written} < engine_read {read} ({write_short} read but never "
+            f"delivered; causes include a dead-letter, a worker refusal, a rejection recorded "
+            f"before its NAK, and a message still in an earlier stage{naked})"
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
@@ -1887,7 +1935,11 @@ def _reconcile(
             f"{reload.aged} send(s) the reload's close found already waiting more than "
             f"{reload.lookback_s:.3g}s for an ACK -- not excused as stranding, counted as unconfirmed"
         )
-    detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
+    detail = (
+        "; ".join(parts)
+        if parts
+        else "read>=sent, written>=read, sink_received>=written, backlog drained"
+    )
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
 
 

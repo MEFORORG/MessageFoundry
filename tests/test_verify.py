@@ -18,11 +18,12 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Final
 
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.base import open_store
 from messagefoundry.store.store import MessageStatus
 from messagefoundry.verify import checks, cipher_policy, smoke
@@ -1003,8 +1004,8 @@ def test_disposition_helpers_never_create_the_store(tmp_path: Path) -> None:
 
 def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
     """The gate fires only where a *file* would be created. ``:memory:`` writes none, and the server
-    backends are out of its reach — see :func:`smoke.missing_sqlite_store` for what that leaves
-    open on Postgres and SQL Server, which is a real limit rather than a clean bill."""
+    backends are out of its reach. There the read-only open is what stops a build, as
+    :func:`smoke.missing_sqlite_store` says."""
     assert smoke.missing_sqlite_store(StoreSettings(path=":memory:")) is None
     for backend in (StoreBackend.SQLSERVER, StoreBackend.POSTGRES):
         settings = StoreSettings(
@@ -1017,43 +1018,296 @@ def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
         assert smoke.missing_sqlite_store(settings) is None
 
 
+#: Every function in ``messagefoundry/verify`` that opens a store. Both AST tests below check this
+#: list as their positive control: an instrument that finds no open at all would pass vacuously.
+_VERIFY_STORE_OPENERS: Final = [
+    # ADR 0197 Amendment A, AC-A9: the lockable-account census, gated like the rest.
+    "checks.py::check_lockable_accounts",
+    "smoke.py::check_smoke_disposition",
+    "smoke.py::check_store_connectivity",
+    "smoke.py::newest_message_id",
+]
+
+#: The store openers a verify check must not call directly: ``open_store`` is the one seam, and a
+#: backend's own ``open`` would skip both the gate and the read-only keyword.
+_BACKEND_OPENERS: Final = frozenset({"MessageStore", "PostgresStore", "SqlServerStore"})
+
+
+def _attribute_tail(node: ast.expr) -> str | None:
+    """The last name of a bare name or an attribute chain (``a.b.open_store`` reads ``open_store``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _callee(call: ast.Call) -> str | None:
+    """The called name, bare or as an attribute (``base.open_store`` reads ``open_store``)."""
+    return _attribute_tail(call.func)
+
+
+def _verify_functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Each top-level function and each top-level class's method in ``messagefoundry/verify``,
+    named ``file::function``. A nested function is walked inside its enclosing one."""
+    found: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for source_file in sorted(Path(smoke.__file__).parent.glob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        for node in tree.body:
+            members = node.body if isinstance(node, ast.ClassDef) else [node]
+            for member in members:
+                if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                    found.append((f"{source_file.name}::{member.name}", member))
+    return found
+
+
+def _open_store_calls_in_verify() -> list[tuple[str, ast.Call, set[str]]]:
+    """Every ``open_store(...)`` call in ``messagefoundry/verify``, with its function's name and
+    every name that function calls."""
+    calls: list[tuple[str, ast.Call, set[str]]] = []
+    for where, node in _verify_functions():
+        subs = [sub for sub in ast.walk(node) if isinstance(sub, ast.Call)]
+        called = {name for sub in subs if (name := _callee(sub)) is not None}
+        calls += [(where, sub, called) for sub in subs if _callee(sub) == "open_store"]
+    return calls
+
+
+def test_verify_opens_a_store_only_through_open_store_by_its_own_name() -> None:
+    """The two AST tests below find opens by the name ``open_store``. An import under another name,
+    or a backend's own ``open``, would hide an open from both, so neither may appear."""
+    # Floors first, so a walk that finds nothing fails here instead of passing every absence
+    # assertion below on nothing: the source files and the function walk must each reach every
+    # pinned opener. These floors do not widen what the walks see (``_verify_functions`` says which
+    # functions that is). The ``len`` floor is the shape the vacuous-absence lint reads as a guard.
+    sources = sorted(Path(smoke.__file__).parent.glob("*.py"))
+    opener_files = {where.split("::")[0] for where in _VERIFY_STORE_OPENERS}
+    assert opener_files <= {p.name for p in sources}, "the verify source glob is blind"
+    functions = _verify_functions()
+    assert len(functions) >= len(_VERIFY_STORE_OPENERS), "the verify function walk is blind"
+    assert set(_VERIFY_STORE_OPENERS) <= {where for where, _ in functions}, (
+        "the verify function walk misses a pinned opener"
+    )
+    renamed: list[str] = []
+    for source_file in sources:
+        for node in ast.walk(ast.parse(source_file.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom | ast.Import):
+                renamed += [
+                    f"{source_file.name}: {alias.name} as {alias.asname}"
+                    for alias in node.names
+                    if alias.name.rsplit(".", 1)[-1] == "open_store" and alias.asname
+                ]
+    direct = [
+        where
+        for where, node in functions
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call)
+        and isinstance(sub.func, ast.Attribute)
+        and sub.func.attr == "open"
+        and _attribute_tail(sub.func.value) in _BACKEND_OPENERS
+    ]
+    # ``open_store`` named anywhere but as a callee -- ``partial(open_store, ...)``, or bound to a
+    # local and called by that name -- would hide the call's keywords from the tests below.
+    passed_on: list[str] = []
+    for source_file in sources:
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        called_at = {id(sub.func) for sub in ast.walk(tree) if isinstance(sub, ast.Call)}
+        passed_on += [
+            f"{source_file.name}:{sub.lineno}"
+            for sub in ast.walk(tree)
+            if isinstance(sub, ast.Name | ast.Attribute)
+            and _attribute_tail(sub) == "open_store"
+            and id(sub) not in called_at
+        ]
+    assert not renamed, f"{renamed} import open_store under another name (#1708)"
+    assert not direct, f"{direct} open a backend directly, past open_store (#1708)"
+    assert not passed_on, f"open_store is referenced, not called, at {passed_on} (#1708)"
+
+
 def test_every_open_store_in_verify_goes_through_the_gate() -> None:
     """#1708's invariant, pinned structurally instead of asserted in a docstring.
 
-    The three call sites are correct today and one PR away from being false again, with nothing to
+    The call sites are correct today and one PR away from being false again, with nothing to
     notice — which is the same failure shape #1713 fixes in this very change: a check that stays
     green through the regression it names. An AST walk, in the pattern
     :func:`test_verify_does_not_import_the_generators` already uses on this package."""
-    verify_dir = Path(smoke.__file__).parent
-    gated: list[str] = []
-    ungated: list[str] = []
-    for source_file in sorted(verify_dir.glob("*.py")):
-        tree = ast.parse(source_file.read_text(encoding="utf-8"))
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            called = {
-                sub.func.id
-                for sub in ast.walk(node)
-                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-            }
-            if "open_store" not in called:
-                continue
-            where = f"{source_file.name}::{node.name}"
-            (gated if "missing_sqlite_store" in called else ungated).append(where)
-
+    calls = _open_store_calls_in_verify()
+    # The equality at the end also fails on an empty walk, but only after the absence assertion has
+    # passed on nothing; this floor says it first, where the vacuous-absence lint reads a guard.
+    assert len(calls) >= len(_VERIFY_STORE_OPENERS), "the open_store call walk is blind"
+    ungated = sorted({where for where, _, called in calls if "missing_sqlite_store" not in called})
     assert not ungated, (
         f"{ungated} call open_store without missing_sqlite_store first, so verify would create the "
         "SQLite store it reports on (#1708)"
     )
-    # Positive control: an instrument that finds no open_store at all would pass vacuously.
-    assert sorted(gated) == [
-        # ADR 0197 Amendment A, AC-A9: the lockable-account census, gated like the rest.
-        "checks.py::check_lockable_accounts",
-        "smoke.py::check_smoke_disposition",
-        "smoke.py::check_store_connectivity",
-        "smoke.py::newest_message_id",
+    assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
+
+
+#: The one verify open allowed a computed ``read_only`` (BACKLOG #1708, Manager decision
+#: 2026-10-27), and the only call its value may be: ``store.connect`` keeps main's writable open on
+#: a server backend under ``external`` schema management, as ``connect_opens_read_only`` decides.
+_WRITABLE_EXCEPTION: Final = ("smoke.py::check_store_connectivity", "connect_opens_read_only")
+
+
+def _read_only_keyword_allowed(where: str, kw: ast.keyword) -> bool:
+    """``read_only=True`` literally, or, at the one exception, the helper's call written inline,
+    so no local can be rebound or shadowed between the decision and the open."""
+    if kw.arg != "read_only":
+        return False
+    if isinstance(kw.value, ast.Constant) and kw.value.value is True:
+        return True
+    return isinstance(kw.value, ast.Call) and (where, _callee(kw.value)) == _WRITABLE_EXCEPTION
+
+
+def test_every_open_store_in_verify_is_read_only_but_the_one_exception() -> None:
+    """#1708's second half: the gate above stops verify CREATING a store, and a writable open of a
+    store that does exist still ran the schema-ensure and migrations as the calling user. Every
+    verify open passes the literal ``read_only=True``, as the support bundle's census open does,
+    with ONE exception: ``_WRITABLE_EXCEPTION``, whose value must be the helper's call inline. Any
+    other computed value would let a later change pass ``False`` through a variable."""
+    calls = _open_store_calls_in_verify()
+    # The same floor as the gate test above, for the same reason.
+    assert len(calls) >= len(_VERIFY_STORE_OPENERS), "the open_store call walk is blind"
+    refused = [
+        where
+        for where, call, _ in calls
+        if not any(_read_only_keyword_allowed(where, kw) for kw in call.keywords)
     ]
+    assert not refused, (
+        f"{refused} open the store neither with read_only=True nor through the one allowed "
+        "exception, so verify could schema-ensure and migrate the store it reports on (#1708)"
+    )
+    assert sorted({where for where, _, _ in calls}) == _VERIFY_STORE_OPENERS
+
+
+def test_the_writable_exception_pin_takes_only_the_inline_helper_call() -> None:
+    """Positive controls: the shipped shape passes, and a local, a constant ``False``, another call,
+    or the helper at another site each fail."""
+
+    def keyword(source: str) -> ast.keyword:
+        call = ast.parse(source).body[0]
+        assert isinstance(call, ast.Expr) and isinstance(call.value, ast.Call)
+        return call.value.keywords[0]
+
+    site = _WRITABLE_EXCEPTION[0]
+    assert _read_only_keyword_allowed(site, keyword("f(read_only=connect_opens_read_only(s))"))
+    assert not _read_only_keyword_allowed(site, keyword("f(read_only=read_only)"))
+    assert not _read_only_keyword_allowed(site, keyword("f(read_only=False)"))
+    assert not _read_only_keyword_allowed(site, keyword("f(read_only=bool(s))"))
+    assert not _read_only_keyword_allowed(
+        "smoke.py::newest_message_id", keyword("f(read_only=connect_opens_read_only(s))")
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "schema_management", "read_only"),
+    [
+        (StoreBackend.SQLITE, None, True),
+        # A server backend with the field unset RESOLVES to external, so it is writable too.
+        (StoreBackend.POSTGRES, None, False),
+        (StoreBackend.POSTGRES, SchemaManagement.EXTERNAL, False),
+        (StoreBackend.POSTGRES, SchemaManagement.AUTO, True),
+        (StoreBackend.SQLSERVER, None, False),
+        (StoreBackend.SQLSERVER, SchemaManagement.EXTERNAL, False),
+        (StoreBackend.SQLSERVER, SchemaManagement.AUTO, True),
+    ],
+)
+def test_store_connect_keeps_the_writable_open_only_for_an_external_server_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: StoreBackend,
+    schema_management: SchemaManagement | None,
+    read_only: bool,
+) -> None:
+    """BACKLOG #1708, Manager decision 2026-10-27. Under ``external`` schema management a server
+    open runs no DDL, and its writable form runs the grant and database-option checks ``serve``
+    runs, so store.connect keeps it. Under ``auto`` a writable open would run DDL, and on SQLite it
+    would migrate, so both open read-only. Keyed on the RESOLVED mode: the field defaults to
+    ``None``, which a server backend resolves to ``external``."""
+    import messagefoundry.store.base as store_base
+
+    seen: list[bool] = []
+
+    class _Handle:
+        async def close(self) -> None:
+            return None
+
+    async def fake_open_store(
+        _settings: StoreSettings, *, read_only: bool = False, **_kw: object
+    ) -> _Handle:
+        seen.append(read_only)
+        return _Handle()
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    path = tmp_path / "store.db"
+    path.write_bytes(b"")  # past the absent-file gate; the fake opens nothing
+    settings = StoreSettings(
+        backend=backend,
+        path=str(path),
+        server="db.example.invalid",
+        database="mefor",
+        username="mefor_svc",
+        schema_management=schema_management,
+    )
+
+    assert smoke.connect_opens_read_only(settings) is read_only
+    r = smoke.check_store_connectivity(settings)
+
+    assert r.status is Status.PASS, r.detail
+    assert seen == [read_only]
+    assert ("read-only" in r.detail) is read_only
+
+
+def test_an_in_memory_store_is_a_skip_not_a_failed_open() -> None:
+    """A read-only open refuses ``:memory:``: another process's in-memory database cannot be
+    reached, and a new one is always empty. The store rows SKIP and say why, rather than FAIL or
+    ERROR on the refusal's own text (BACKLOG #1708)."""
+    from messagefoundry.config.settings import AuthSettings
+
+    memory = StoreSettings(path=":memory:")
+    for r in (
+        smoke.check_store_connectivity(memory),
+        checks.check_lockable_accounts(memory, AuthSettings()),
+    ):
+        assert r.status is Status.SKIP, r
+        assert "in-memory" in r.detail
+
+
+def _sqlite_tables(path: Path) -> set[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    finally:
+        conn.close()
+    return {str(name) for (name,) in rows}
+
+
+def _make_foreign_sqlite(path: Path) -> None:
+    """A SQLite database another application owns: one table, no MessageFoundry schema."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE other_app_rows (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _sqlite_tables(path) == {"other_app_rows"}
+
+
+def test_store_connectivity_never_builds_a_store_into_another_database(tmp_path: Path) -> None:
+    """#1708, the defect one level up from the absent file: a ``[store].path`` that names an
+    EXISTING SQLite database that is not a MessageFoundry store. A writable open built the whole
+    schema into it and reported PASS. The read-only open builds nothing, so the check FAILs and the
+    database holds only what it held before."""
+    foreign = tmp_path / "other-app.db"
+    _make_foreign_sqlite(foreign)
+
+    r = smoke.check_store_connectivity(StoreSettings(path=str(foreign)))
+
+    assert r.status is Status.FAIL, r.detail
+    assert _sqlite_tables(foreign) == {"other_app_rows"}
 
 
 # ---- report -----------------------------------------------------------------------------------
@@ -1182,6 +1436,42 @@ def test_run_verify_check_disposition_skips_without_settings() -> None:
     )
     disp = [r for r in results if r.id == "smoke.disposition"]
     assert disp and disp[0].status is Status.SKIP
+
+
+def test_a_baseline_read_the_store_refuses_is_an_error_row_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1708: the read-only open refuses a SQLite file that is not a MessageFoundry store, where the
+    writable open built one into it. The pre-send baseline read then raised out of the whole verify
+    run. It is an ERROR row now, and the disposition is not polled: with no baseline, a prior run's
+    message carrying the same fixed synthetic control id could read as this run's."""
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.verify import runner as runner_mod
+
+    foreign = tmp_path / "other-app.db"
+    _make_foreign_sqlite(foreign)
+    polled: list[str] = []
+    monkeypatch.setattr(
+        smoke,
+        "smoke_live",
+        lambda **_kw: CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.PASS, "AA"),
+    )
+    monkeypatch.setattr(smoke, "check_smoke_disposition", lambda *a, **k: polled.append("x"))
+
+    results = runner_mod._run_live_smoke(
+        smoke.synthetic_message(),
+        host="127.0.0.1",
+        port=59999,
+        settings=ServiceSettings(store=StoreSettings(path=str(foreign))),
+        check_disposition=True,
+        disposition_timeout=1,
+    )
+
+    disp = [r for r in results if r.id == "smoke.disposition"]
+    assert disp and disp[0].status is Status.ERROR, results
+    assert "baseline" in disp[0].detail
+    assert polled == []
+    assert _sqlite_tables(foreign) == {"other_app_rows"}
 
 
 # ---- settings-load failures are reported, not disguised as "no settings" -----------------------

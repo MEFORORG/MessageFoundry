@@ -1289,12 +1289,14 @@ def test_a_service_config_that_cannot_be_read_exits_2(
 
 # --- the source guard ----------------------------------------------------------------------------------
 
-#: Product callers that may pass ``keyless_chain_refusal=None`` without computing it, and why. Each is
-#: read-only against the audit log, or is not a path a service opens its store through.
+#: Product callers that may pass ``keyless_chain_refusal=None`` without computing it, and why. Each
+#: starts no keyless chain: it is read-only against the audit log, appends nothing itself, or is not
+#: a path a service opens its store through.
 _MAY_PASS_NONE = {
     # read-only: db_status() for the support bundle
     ("messagefoundry/support/bundle.py", "_db_info"),
-    # read-only: open and close, or list_messages, for the deployment verifier
+    # read-only: open and close, or list_messages, for the deployment verifier. One exception,
+    # which appends nothing itself: smoke.connect_opens_read_only names it (BACKLOG #1708).
     ("messagefoundry/verify/smoke.py", "check_store_connectivity._open_close"),
     ("messagefoundry/verify/smoke.py", "newest_message_id._newest"),
     ("messagefoundry/verify/smoke.py", "check_smoke_disposition._poll"),

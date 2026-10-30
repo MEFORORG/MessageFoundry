@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,19 +28,31 @@ from messagefoundry.pipeline import Engine
 from tests.test_dr_running_config_dir import _BOTH_OUTBOUNDS, _CRIT, _NORM, _free_ports
 from tests.test_dr_running_config_dir import _write_tiered_graph as _write_graph
 
+# A ceiling, not a speed assertion: a probe returns as soon as the connect lands or is refused
+# (Windows takes about 2s to refuse on loopback). It used to be a 2s bound whose timeout read as
+# "not bound", so a starved runner turned a bound port into an unbound one: a positive control
+# went red, and a negative assertion could pass with the port bound (BACKLOG #3456).
+_PROBE_CEILING_SECONDS = 20.0
+
 
 async def _accepts(port: int) -> bool:
     """Whether anything on this box accepts a TCP connection on ``port``: what an L4 health check
-    asks."""
+    asks. True when the connect lands and False only when it is refused. A connect that does
+    neither within the ceiling is no answer, so it fails the test instead of reading as either."""
     try:
         _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", port), timeout=2.0
+            asyncio.open_connection("127.0.0.1", port), timeout=_PROBE_CEILING_SECONDS
         )
-    except (OSError, TimeoutError):
+    except ConnectionRefusedError:
         return False
+    except TimeoutError as exc:
+        # An OS connect timeout is a TimeoutError too, and carries an errno; the ceiling's has none.
+        why = f"the OS timed out the connect ({exc})" if exc.errno else "the probe's ceiling passed"
+        raise AssertionError(f"port {port} neither accepted nor refused: {why}") from exc
     writer.close()
-    with contextlib.suppress(OSError):
-        await writer.wait_closed()
+    # Bounded: on the Windows proactor an unbounded wait_closed can stall (mllp.py, _close_bounded).
+    with contextlib.suppress(OSError, TimeoutError):
+        await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
     return True
 
 
@@ -70,6 +83,43 @@ async def test_a_box_that_is_not_a_dr_standby_binds_both_listeners(tmp_path: Pat
     crit_port, norm_port = _write_graph(cfg, tmp_path)
     async with _served(tmp_path, cfg, DrSettings()):
         assert await _accepts(crit_port) and await _accepts(norm_port)
+
+
+async def test_a_slow_connect_to_a_bound_port_reads_as_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's own control (BACKLOG #3456). Red with the old 2s bound, whose timeout read as
+    "not bound": this connect lands after it, the way one does on a starved runner."""
+    server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    real_open = asyncio.open_connection
+
+    async def slow_open(host: str, to: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        await asyncio.sleep(2.5)
+        return await real_open(host, to)
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open)
+    try:
+        assert await _accepts(port)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_connect_that_never_answers_fails_rather_than_reading_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the probe's control (BACKLOG #3456): no answer is not a False, which a
+    negative assertion would pass on with the port bound."""
+
+    async def never_open(host: str, to: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(asyncio, "open_connection", never_open)
+    monkeypatch.setattr(sys.modules[__name__], "_PROBE_CEILING_SECONDS", 0.2)
+    with pytest.raises(AssertionError, match="neither accepted nor refused"):
+        await _accepts(1)
 
 
 async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_critical_feed(
@@ -326,7 +376,9 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
         assert rr is not None
         if not norm_auto_start:
             await rr.start_inbound(_NORM, operator=True)
-            assert await _accepts(norm_port)  # control: the probe sees a bound feed
+            # control: the probe sees a bound feed. A refusal here names whether the runner
+            # still holds the listener, which the 2026-10-13 failure could not say.
+            assert await _accepts(norm_port), f"running={rr.inbound_running(_NORM)}"
             await engine.reload_detail(cfg)
         assert rr.inbound_filtered(_NORM) is not None and not await _accepts(norm_port)
 

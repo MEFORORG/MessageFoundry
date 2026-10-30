@@ -10,6 +10,7 @@ address rule, and MAIL FROM and RCPT TO carry exactly the checked text (vault BA
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from collections.abc import Iterator
 from email.message import EmailMessage
@@ -20,6 +21,7 @@ from pydantic import ValidationError
 
 from messagefoundry.config.settings import AlertRule, AlertsSettings, EscalationTier
 from messagefoundry.pipeline.alert_sinks import (
+    ALERTS_SMTP_CELL,
     AlertRuleSet,
     EmailTransport,
     NotifierAlertSink,
@@ -28,15 +30,19 @@ from messagefoundry.pipeline.alert_sinks import (
     send_plain_email,
 )
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.transports.base import NegativeAckError
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _DOMAIN_ON_THE_WIRE,
     _ENCODED_LOCAL,
     _NORMALISED_RECIPIENTS,
+    _PARTIAL_RECIPIENTS,
+    _PARTIAL_REFUSED,
     _REFUSED_ADDRESS_IDS,
     _REFUSED_ADDRESSES,
     _SENDER_SHAPES,
     _WireCapture,
+    assert_partial_refusal,
 )
 
 
@@ -247,6 +253,88 @@ def test_a_rule_override_reaches_rcpt_to_through_the_email_transport(wire: _Wire
     assert wire.rcpt_lines == [b"rcpt to:<a@hospital.example>", b"rcpt to:<b@hospital.example>"]
     [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
     assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b@hospital.example"
+
+
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+def test_a_partial_rcpt_refusal_fails_the_alert_send(wire: _WireCapture, quit_ok: bool) -> None:
+    # One of two recipients refused (vault BACKLOG #2924): the send raises rather than returning as
+    # though both got the alert, and a QUIT refused after it does not hide the refusal.
+    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    if not quit_ok:
+        wire.quit_reply = b"500 no\r\n"
+    with pytest.raises(NegativeAckError) as caught:
+        _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
+    assert_partial_refusal(caught.value, ALERTS_SMTP_CELL, wire)
+
+
+async def test_the_notifier_logs_a_partial_refusal_without_an_address(
+    wire: _WireCapture, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The notifier logs a failed transport with exc_info, so the refusal's text and traceback are
+    # what reach the log. Neither may name a recipient.
+    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    email = EmailTransport(
+        host="127.0.0.1",
+        port=wire.port,
+        sender="engine@hospital.example",
+        recipients=_PARTIAL_RECIPIENTS,
+        use_tls=False,
+        timeout=5.0,
+    )
+    sink = NotifierAlertSink([email])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        sink.connection_stopped("OB_X", detail="boom")
+        sink.start()
+        for _ in range(500):
+            if any(r.exc_info for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        await sink.aclose()
+    [record] = [r for r in caplog.records if r.exc_info]
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], NegativeAckError)
+    logged = caplog.text.lower()
+    assert "1 of 2 recipients refused" in logged
+    for address in _PARTIAL_RECIPIENTS:
+        assert address not in logged
+
+
+#: A body part holding a lone surrogate, which no codec encodes. Synthetic text only.
+_UNENCODABLE = "synthetic alert detail \udc80 tail"
+
+
+#: A lone surrogate the Subject header refuses as it is set. ``\udc80`` sets, and the generator
+#: writes it as an ``unknown-8bit`` encoded word without raising.
+_UNENCODABLE_SUBJECT = "synthetic alert detail \ud800 tail"
+
+
+@pytest.mark.parametrize("part", ["plain", "html", "subject"])
+def test_an_unencodable_alert_body_fails_content_free(wire: _WireCapture, part: str) -> None:
+    # set_content(), add_alternative() and the Subject header raise a UnicodeEncodeError whose text
+    # names the character and whose `.object` is the whole value; the notifier logs that with
+    # exc_info (vault BACKLOG #3011). The refusal keeps the type name only, with no chain, names the
+    # part that failed, and nothing is sent.
+    which = "subject" if part == "subject" else "body"
+    with pytest.raises(ValueError, match=f"the alert {which} could not be encoded") as caught:
+        send_plain_email(
+            host="127.0.0.1",
+            port=wire.port,
+            sender="engine@hospital.example",
+            recipients=["ops@hospital.example"],
+            subject=_UNENCODABLE_SUBJECT if part == "subject" else "synthetic",
+            body=_UNENCODABLE if part == "plain" else "synthetic alert",
+            html_body=f"<p>{_UNENCODABLE}</p>" if part == "html" else None,
+            use_tls=False,
+            timeout=5.0,
+        )
+    exc = caught.value
+    assert not isinstance(exc, UnicodeError)
+    rendered = f"{exc} | {exc!r}".lower()
+    for ch in ("dc80", "d800", "\udc80", "\ud800"):
+        assert ch not in rendered
+    assert "synthetic alert detail" not in rendered
+    assert exc.__cause__ is None and exc.__context__ is None
+    assert wire.connections == 0
 
 
 @pytest.mark.parametrize("field, value", _REFUSED_ADDRESSES, ids=_REFUSED_ADDRESS_IDS)
