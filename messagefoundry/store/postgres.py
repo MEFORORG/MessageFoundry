@@ -9259,6 +9259,7 @@ class PostgresStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -9271,6 +9272,7 @@ class PostgresStore:
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
+            expected_secret_cell=expected_secret_cell,
             now=now,
         )
         # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.

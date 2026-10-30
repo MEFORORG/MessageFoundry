@@ -261,7 +261,7 @@ async def test_a_referred_kerberos_sign_in_is_audited_as_a_login_error(
     monkeypatch.setattr("messagefoundry.auth.service._sleep_until", no_sleep)
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "jsmith")
     primary, referred = dcs
-    settings = _settings(primary, kerberos_enabled=True)
+    settings = _settings(primary, kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, settings, ldap=_over_plain_loopback(settings))
