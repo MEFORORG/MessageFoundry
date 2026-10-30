@@ -1988,6 +1988,42 @@ def test_a_builtin_exception_raised_from_a_unicode_error_keeps_its_own_message()
         assert redaction.codec_safe_str(error) == str(error)
 
 
+class _Batch(Exception):
+    """Its own ``__str__``, so what it holds is read the deep way beneath it."""
+
+    def __str__(self) -> str:
+        return "batch failed"
+
+
+@dataclasses.dataclass
+class _Held:
+    err: object
+
+
+def test_a_deep_re_read_does_not_spend_the_budget_a_later_argument_needs() -> None:
+    # Review of vault BACKLOG #3340: re-following a list's scalars beneath an exception's own code
+    # charged the budget for each one, so a codec error held by attribute later printed raw.
+    batch = _Batch("bad", [f"seg{i}" for i in range(5000)])
+    record = _record("got %r", ([batch, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_an_object_read_twice_is_charged_only_for_what_the_second_read_adds() -> None:
+    # Read plainly, then again beneath a holder whose own code renders it: the second read charged
+    # every attribute again, so a codec error held after both printed raw.
+    shared = types.SimpleNamespace(**{f"a{i}": i for i in range(1900)})
+    record = _record("got %r", ([_Held(shared), _Batch("bad", shared), _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

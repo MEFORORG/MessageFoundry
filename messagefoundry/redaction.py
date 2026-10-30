@@ -2777,7 +2777,8 @@ _BUILTIN_EXC_RENDERS = frozenset(
     for kind in vars(builtins).values()
     if isinstance(kind, type) and issubclass(kind, BaseException)
     for name in ("__str__", "__repr__")
-    if (method := vars(kind).get(name)) is not None
+    if name in vars(kind)  # no walrus: at module level it would leave a stray global behind
+    for method in (vars(kind)[name],)
 )
 
 
@@ -3151,22 +3152,29 @@ class _Scan:
             # Everything an object's own code renders from, at any depth, is read the deep way:
             # that code may print any attribute of what it reaches (vault BACKLOG #3340, item 2).
             inner = deep or opens
+            read[key] = inner  # its own code reads it as deep as a holder above it would
             try:
                 if known is not None:
                     children = known[1] or []
-                    # Its elements were followed when it was met; again only to read them deeper.
-                    found = children[:budget] if inner else []
+                    # Its elements were followed when it was met; again only to read them deeper,
+                    # and a scalar has nothing deeper, so it is not charged a second time.
+                    found = (
+                        [c for c in children if type(c) not in _ARG_SCALARS][:budget]
+                        if inner
+                        else []
+                    )
                 elif issubclass(kind, _ARG_WALKED):
                     children = found = _children(arg, kind, budget)
                 else:
                     children, found = [], []
                 budget -= 1 + len(found)
-                if slots is not None and budget > 0:
+                # Read once already through the same slots: nothing new to read by attribute.
+                if slots is not None and budget > 0 and (before is None or slots is not shallow):
                     held = _attribute_values(arg, slots, budget)
-                    budget -= len(held)
                     if before is not None and held:  # read once already: add only what is new
                         have = {id(child) for child in children}
                         held = [value for value in held if id(value) not in have]
+                    budget -= len(held)
                     children, found = children + held, found + held
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)
