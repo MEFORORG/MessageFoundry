@@ -43,14 +43,16 @@ def port_or_zero(text: str) -> int:
     """``text`` as a port number, or 0 when it is not one: the ONE definition of "is this a port",
     used by every reading in this module.
 
-    A port is 1 to 65535, written in ASCII decimal digits. ``isdigit`` alone also passes a superscript
-    digit, which ``int()`` then refuses with a ValueError. The five-character bound keeps ``int()``
-    away from CPython's string-to-int digit limit on an absurd operator value, which would turn a
-    log detail into a crash."""
+    A port is 1 to 65535, written in ASCII decimal digits, leading zeros allowed as drivers allow
+    them. ``isdigit`` alone also passes a superscript digit, which ``int()`` then refuses with a
+    ValueError. The five-digit bound, counted after the leading zeros, keeps ``int()`` away from
+    CPython's string-to-int digit limit on an absurd operator value, which would turn a log detail
+    into a crash."""
     text = text.strip()
-    if not (text.isascii() and text.isdecimal() and len(text) <= 5):
+    digits = text.lstrip("0")
+    if not (text.isascii() and text.isdecimal() and len(digits) <= 5):
         return 0
-    port = int(text)
+    port = int(digits or "0")
     return port if port <= 65535 else 0
 
 
@@ -91,8 +93,7 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     are the ones :func:`database_dial_endpoint` reads for ``[egress].allowed_db``, through
     :func:`split_generic_server` and :func:`port_or_zero`. A change to either changes what that
     allowlist admits, so it is reviewed as a change to a control, not to a log line. This function
-    alone lets a port in the ``server`` text win; the egress reading takes the port from the
-    keyword only, and refuses a ``server`` port that disagrees with it."""
+    alone reads a port in the ``server`` text; the egress reading refuses such a ``server``."""
     host, in_server = split_generic_server(server)
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
@@ -108,9 +109,8 @@ class DialEndpoint(NamedTuple):
     #: The port the driver is sent, or ``None`` when the engine cannot read one. ``None`` matches an
     #: entry that names no port, and never one that pins a port.
     port: object | None
-    #: Why the port reading itself refuses the hop, or ``None``. Set when the generic dialect is
-    #: given the ``PORT`` keyword more than once, or a port in ``server`` that ``PORT`` does not
-    #: name.
+    #: Why the port reading itself refuses the hop, or ``None``. Set when a generic ``server``
+    #: carries a port, or ``odbc_params`` gives the ``PORT`` keyword more than once.
     conflict: str | None = None
 
 
@@ -122,24 +122,27 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     Server preset, whatever ``settings`` say.
 
     **The SQL Server preset** sends ``SERVER={server},{port}``, so the ``port`` setting is what is
-    dialled, defaulting to 1433 as the connection string does.
+    dialled, defaulting to 1433 as the connection string does, and read as a number as the
+    connection string's ``int()`` reads it. That holds for a driver that reads ``,port`` in
+    ``SERVER``, as ODBC Driver 18 does; what another ``odbc_driver`` on the preset does with it is
+    not measured.
 
     **The generic dialect** sends ``SERVER={server}`` and never reads the ``port`` setting, so it is
     ignored here. The port is the ``PORT`` keyword's, the one value the connection string sends as a
-    port. A port in the ``server`` text is not read as the port: psqlODBC passes ``SERVER`` to libpq
-    as a host and does not parse a ``,port`` in it, so the driver may dial its default port instead.
-    Where ``server`` carries one, ``PORT`` must name the same port, or the reading refuses: which
-    one the driver honours is not measured. ``PORT`` given twice, in any case, is refused too, as
-    the build refuses it. With no usable ``PORT`` the port is ``None``: the driver's default port is
-    not known to the engine.
+    port. A ``server`` that carries a port (``host,port``, ``host:port``, ``[v6]:port``) is refused:
+    psqlODBC passes ``SERVER`` to libpq as a host, and libpq reads a comma there as a list of hosts,
+    so ``db,6432`` can name a second host, ``6432``, and whether the driver dials the suffix as a
+    port is not measured. ``PORT`` given twice, in any case, is refused too, as the build refuses
+    it. With no usable ``PORT`` the port is ``None``: the driver's default port is not known to the
+    engine.
 
-    The host is the whole ``server`` text on both dialects, as the check read it before this change.
-    A port suffix is not taken off the host here. libpq reads a comma in a host as a list of hosts,
-    so ``db,6432`` can name a second host, and admitting it on an entry for ``db`` would loosen the
-    host binding (an entry is matched on host as written)."""
+    The host is the whole ``server`` text on both dialects, as the check read it before this
+    change, so an entry is matched on its host as written."""
     host = str(settings.get("server", ""))
     if dialect.lower() != "generic":
-        return DialEndpoint(host, settings.get("port", SQLSERVER_DEFAULT_PORT))
+        return DialEndpoint(
+            host, port_or_zero(str(settings.get("port", SQLSERVER_DEFAULT_PORT))) or None
+        )
     params = settings.get("odbc_params")
     # A table that is not a mapping is the build's own refusal; read it as giving no keyword.
     keywords = [
@@ -151,16 +154,14 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
         return DialEndpoint(
             host, None, conflict="odbc_params gives the PORT keyword more than once; give it once"
         )
-    keyword = port_or_zero(str(keywords[0])) if keywords else None
-    in_server = split_generic_server(host)[1]
-    if in_server and keyword is not None and port_or_zero(in_server) != keyword:
+    if split_generic_server(host)[1]:
+        # Short, remedy early: a stored failure keeps about its first 200 characters.
         return DialEndpoint(
             host,
             None,
             conflict=(
-                f"server {host!r} names a port in its text and the PORT keyword in odbc_params "
-                "names another, or one of them is not a port; the engine cannot tell which one "
-                "the driver dials, so give the port once, in the PORT keyword"
+                f"server {host!r} carries a port: name the host alone and give the port as the "
+                "PORT keyword in odbc_params"
             ),
         )
-    return DialEndpoint(host, keyword or None)
+    return DialEndpoint(host, (port_or_zero(str(keywords[0])) or None) if keywords else None)

@@ -1731,21 +1731,20 @@ the port the connection names, and the two dialects name it differently (vault B
 | Dialect | Port the entry is compared with |
 |---|---|
 | `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
-| `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. A port in the `server` text is not read as the port either: psqlODBC passes `SERVER` to libpq as a host, and does not read a `,port` in it. |
+| `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
 
-An entry with no port admits its host at any port, with one exception below. On the generic dialect
-the egress check **refuses** these cases, at load like every other miss:
+An entry with no port admits its host at any port. On the generic dialect the egress check
+**refuses** these cases for a listed host, at load like every other miss:
 
-- `server` carries a port and `PORT` names another, or one of them is not a port. Which one the
-  driver honours is not known. This is refused whatever the entry says. Give the port once, in
-  `PORT`.
+- `server` carries a port as `host,port`, whatever the entry says. Name the host alone in
+  `server` and give the port in `PORT`. psqlODBC passes `SERVER` to libpq as a host, and libpq
+  reads a comma there as a list of hosts, so `db,6432` can name a second host. A `host:port` or
+  `[v6]:port` server is refused too: no entry can name it, because an entry splits at its first
+  colon.
 - `PORT` is given more than once, in any case.
-- No port can be read, and the entry for that host pins one. A port in `server` alone counts as no
-  port, and so does a `PORT` value that is not 1 to 65535 in decimal digits. The driver then dials
-  a port the engine does not know. Set `PORT` to the port in the entry.
-
-A port written into `server` does not come off the host. `server = "db,6432"` matches only an
-entry for `db,6432`, never one for `db`: libpq reads a comma in a host as a list of hosts.
+- No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
+  from 1 to 65535 in decimal digits counts as no port. The driver then dials a port the engine
+  does not know. Set `PORT` to the port in the entry.
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
 port compared.

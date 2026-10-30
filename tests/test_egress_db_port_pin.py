@@ -119,28 +119,32 @@ def test_generic_port_keyword_on_the_pin_is_admitted(
 # --- a port given twice, and a host-only entry --------------------------------------------------
 
 
-@pytest.mark.parametrize("keyword", ["5432", "not-a-port"])
-def test_generic_server_port_and_port_keyword_disagreeing_is_refused(
-    check: Check, keyword: str
+@pytest.mark.parametrize("odbc_params", [None, {"PORT": "6432"}, {"PORT": "5432"}])
+def test_generic_server_carrying_a_port_is_refused(
+    check: Check, odbc_params: dict[str, str] | None
 ) -> None:
     # The host is matched as written, so only an entry naming the whole `server` text reaches the
-    # port question. Refused even though the entry names no port: the reading never picks a winner.
-    # The shipped code ADMITTED both of these on that entry: it never read either port.
+    # port question. A port in `server` is refused whatever the entry says and whatever PORT says:
+    # psqlODBC does not read it as a port, and libpq reads a comma there as a second host. The
+    # shipped code ADMITTED every one of these on a host-only entry; it read neither port.
     server = f"{HOST},6432"
-    with pytest.raises(WiringError, match="give the port once"):
-        check(
-            _generic(server=server, odbc_params={"PORT": keyword}),
-            EgressSettings(allowed_db=[server]),
-        )
+    for entry in (server, f"{server}:6432"):
+        with pytest.raises(WiringError, match="carries a port: name the host alone"):
+            check(
+                _generic(server=server, odbc_params=odbc_params), EgressSettings(allowed_db=[entry])
+            )
 
 
-def test_generic_server_port_and_port_keyword_agreeing_is_admitted(
-    check: Check,
-) -> None:
-    server = f"{HOST},6432"
-    check(
-        _generic(server=server, odbc_params={"PORT": "6432"}), EgressSettings(allowed_db=[server])
-    )
+@pytest.mark.parametrize("server", [f"{HOST}:6432", "[::1]:6432"])
+def test_generic_server_with_a_colon_port_matches_no_entry(check: Check, server: str) -> None:
+    # An entry splits at its first colon, so no entry names a `host:port` server whole: refused as
+    # unlisted, as the shipped code refused it.
+    for entry in (server, HOST, "[::1]"):
+        with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
+            check(
+                _generic(server=server, odbc_params={"PORT": "6432"}),
+                EgressSettings(allowed_db=[entry]),
+            )
 
 
 @pytest.mark.parametrize(
@@ -169,14 +173,6 @@ def test_no_port_never_matches_a_pin_spelled_like_none(
         check(_generic(server=HOST), EgressSettings(allowed_db=[f"{HOST}:None"]))
 
 
-def test_generic_server_port_alone_is_not_read_as_the_port(check: Check) -> None:
-    # psqlODBC does not parse a `,port` in SERVER, so with no PORT keyword the driver may dial its
-    # default port. A pin on the suffix's port must not admit that.
-    server = f"{HOST},6432"
-    with pytest.raises(WiringError, match="names no port the engine can read"):
-        check(_generic(server=server), EgressSettings(allowed_db=[f"{server}:6432"]))
-
-
 def test_generic_port_keyword_given_twice_is_refused(check: Check) -> None:
     # The build refuses a keyword given twice in any case; the check must not judge one copy, or its
     # verdict would depend on the order of the table.
@@ -193,6 +189,16 @@ def test_generic_port_keyword_that_is_not_a_port_is_unreadable(check: Check, val
             _generic(server=HOST, odbc_params={"PORT": value}),
             EgressSettings(allowed_db=[f"{HOST}:{value}"]),
         )
+
+
+def test_generic_port_keyword_with_leading_zeros_is_the_port(check: Check) -> None:
+    # Drivers read 005432 as 5432, so the check must too; the digit bound counts after the zeros.
+    check(_generic(server=HOST, odbc_params={"PORT": "005432"}), PINNED)
+
+
+def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: Check) -> None:
+    # The preset's connection string sends int(port), so an env()-shaped " 5432" dials 5432.
+    check({"server": HOST, "database": "d", "port": " 5432"}, PINNED)
 
 
 def test_unlisted_host_is_refused_as_unlisted_before_its_port_is_read(check: Check) -> None:
@@ -233,16 +239,14 @@ def test_lookup_reads_the_port_setting_whatever_the_dialect_setting_says(label: 
         (HOST, {"PORT": "5432"}),
         (HOST, {"port": " 5432 "}),  # matched in any case, as the build matches it
         (HOST, {"PORT": "not-a-port"}),
-        (f"{HOST},6432", {"PORT": "6432"}),
-        (f"{HOST}:6432", {"PORT": "6432"}),
-        ("[::1]:5432", {"PORT": "5432"}),
-        ("fe80::1", {"PORT": "5432"}),
+        (HOST, {"PORT": "005432"}),
+        ("fe80::1", {"PORT": "5432"}),  # a bare v6 literal carries no port
     ],
 )
 def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[str, str]) -> None:
     # Where the PORT keyword settles the port, the egress reading and the hop guard read the same
-    # one: the hop guard's 0 is the egress reading's None. A port in `server` alone is the one case
-    # they part on: the hop guard reports it, and the egress reading does not trust it.
+    # one: the hop guard's 0 is the egress reading's None. A `server` carrying a port is where they
+    # part: the hop guard reports that port, and the egress reading refuses the `server`.
     endpoint = database_dial_endpoint(
         {"server": server, "port": 1433, "odbc_params": params}, dialect="generic"
     )

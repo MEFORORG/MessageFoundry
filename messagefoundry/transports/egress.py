@@ -661,7 +661,8 @@ def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
 
 def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
     """The port text of each ``host`` / ``host:port`` entry whose host is ``host``, in any case:
-    ``""`` for an entry that names no port. The one parse of an allowlist entry's grammar."""
+    ``""`` for an entry that names no port. The parse :func:`host_port_allowed` and the DATABASE
+    check share; at least ``transports.ai_broker.endpoint_host_allowed`` keeps its own copy."""
     host = host.lower()
     return [
         allow_port
