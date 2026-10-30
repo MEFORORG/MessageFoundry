@@ -1659,7 +1659,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
-| `port` | `1433` | server port |
+| `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
 | `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on the **SQL Server preset only**, where it reaches ODBC Driver 18 as pyodbc's `timeout=` (the driver ignores a DSN keyword for it). `generic` gets no login timeout from the engine and uses its driver's default |
@@ -1721,6 +1721,32 @@ gate are identical to the SQL Server preset.
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
 The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+
+##### The port an `allowed_db` entry binds
+
+An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
+`server` text, in any case. An entry with no port admits that host at any port. An entry with a
+port admits only the port the driver is sent, and the two dialects send it differently (vault
+BACKLOG #2704):
+
+| Dialect | Port the entry is compared with |
+|---|---|
+| `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
+| `generic` | A port in the `server` text, else the `PORT` keyword in `odbc_params`. The `port` setting is ignored, because the generic connection string never carries it. |
+
+On the generic dialect, the egress check **refuses** two cases, at load like every other miss:
+
+- `server` carries a port and the `PORT` keyword names another, or one of them is not a port.
+  Which one the driver honours is not known, and psqlODBC does not read a `,port` in `SERVER`.
+  Give the port once, in `PORT`.
+- No port can be read, and the matching entry pins one. The driver then dials its own default
+  port, which the engine does not know. Set `PORT` to the port in the entry.
+
+A port written into `server` does not come off the host. `server = "db,6432"` matches only an
+entry for `db,6432`, never one for `db`: libpq reads a comma in a host as a list of hosts.
+
+`db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
+port compared.
 
 ##### Accepted `odbc_params` keywords
 
