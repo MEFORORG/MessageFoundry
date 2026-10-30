@@ -2799,12 +2799,15 @@ def _live_columns_sql(count: int) -> str:
 def _live_indexes_sql(count: int) -> str:
     """The key columns of ``count`` (table, index) pairs, bound as parameters (BACKLOG #1720). An
     index name is unique only within its table here, so each is looked up on the table the batch
-    declared it on, as its ``INDEXPROPERTY`` guard did. ``key_ordinal`` is 0 for an INCLUDE column."""
+    declared it on, as its ``INDEXPROPERTY`` guard did. ``key_ordinal`` is 0 for an INCLUDE column.
+    ``INDEXPROPERTY`` also answers for a statistics object of the name, so ``sys.stats`` is read
+    too: a name it holds with no index behind it is taken, and the refusal says by what."""
     values = ", ".join(["(?, ?)"] * count)
     return (
-        "SELECT v.idx, i.index_id, i.is_unique, i.has_filter, ic.key_ordinal, c.name,"
-        " ic.is_descending_key"
+        "SELECT v.idx, i.index_id, i.is_unique, i.has_filter, i.is_disabled, i.is_hypothetical,"
+        " s.stats_id, ic.key_ordinal, c.name, ic.is_descending_key"
         f" FROM (VALUES {values}) AS v(tbl, idx)"
+        " LEFT JOIN sys.stats AS s ON s.object_id = OBJECT_ID(v.tbl) AND s.name = v.idx"
         " LEFT JOIN sys.indexes AS i ON i.object_id = OBJECT_ID(v.tbl) AND i.name = v.idx"
         " LEFT JOIN sys.index_columns AS ic ON ic.object_id = i.object_id"
         " AND ic.index_id = i.index_id AND ic.key_ordinal > 0"
@@ -4815,17 +4818,27 @@ class SqlServerStore:
         expected = _declared_schema()
         tables = sorted(expected.columns)
         await cur.execute(_live_columns_sql(len(tables)), tables)
+        # Lower-cased, as the DDL reader spells a name for this backend's default collations.
         column_rows = [
-            (table, _object_kind_label(kind), column)
+            (table, _object_kind_label(kind), None if column is None else str(column).lower())
             for table, kind, column in await cur.fetchall()
         ]
         names = sorted(expected.named_indexes)
         pairs = [v for name in names for v in (expected.named_indexes[name].table, name)]
         await cur.execute(_live_indexes_sql(len(names)), pairs)
+        taken: dict[str, str] = {}
+        unusable: dict[str, str] = {}
         found: dict[str, tuple[bool, bool, dict[int, str]]] = {}
-        for name, index_id, unique, has_filter, ordinal, column, desc in await cur.fetchall():
+        for row in await cur.fetchall():
+            name, index_id, unique, has_filter, disabled, hypothetical, stats_id = row[:7]
+            ordinal, column, desc = row[7:]
             if index_id is None:
-                continue  # no index of that name on its table
+                if stats_id is not None:
+                    taken[name] = "statistics object"  # INDEXPROPERTY answered for it
+                continue  # otherwise no index of that name on its table
+            if disabled or hypothetical:
+                # The guard skips either, and neither enforces a key nor serves a read.
+                unusable[name] = "disabled" if disabled else "hypothetical"
             entry = found.setdefault(name, (bool(unique), bool(has_filter), {}))
             if ordinal is not None:
                 entry[2][int(ordinal)] = str(column).lower() + (" DESC" if desc else "")
@@ -4838,9 +4851,14 @@ class SqlServerStore:
             )
             for name, (unique, partial, keys) in found.items()
         }
-        # Index names are per table here, so no other kind of object can hold one: nothing taken.
         refuse_short_schema(
-            self.backend.value, self._settings.database, expected, column_rows, indexes, {}
+            self.backend.value,
+            self._settings.database,
+            expected,
+            column_rows,
+            indexes,
+            taken,
+            unusable,
         )
 
     async def _reset_schema_lock_timeout(self, conn: Any) -> None:

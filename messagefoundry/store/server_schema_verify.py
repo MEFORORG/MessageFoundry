@@ -18,9 +18,17 @@ The EXPECTED shape is read from the DDL text itself, because no scratch database
 it on as the SQLite check does: the columns of every ``CREATE TABLE``, every ``ADD COLUMN`` (less any
 ``DROP COLUMN`` after it), and every named ``CREATE INDEX`` with its table, key columns, uniqueness and
 whether it has a ``WHERE``. Statements are read in order, so a later ``DROP TABLE`` or ``DROP INDEX``
-removes what an earlier one created. A key column that is not a plain name reads as ``<expr>``, on both
-sides. Constraint indexes (a ``PRIMARY KEY`` or ``UNIQUE`` declared on the table) are not compared, and
-neither are column types, collations or an index's ``INCLUDE`` list.
+removes what an earlier one created. A key column that is an expression reads as ``<expr>``, on both
+sides. DDL the reader cannot place raises ``ValueError`` rather than being skipped or misread, at least:
+a ``CREATE ... INDEX`` or ``CREATE TABLE`` its patterns do not match, a ``USING`` access method, and a
+key column carrying a collation, an operator class or a ``NULLS`` order. A unit test reads each shipped
+batch, so a new form fails there before it can reach an open.
+
+What is NOT compared includes at least: column types, constraint indexes (a ``PRIMARY KEY`` or
+``UNIQUE`` declared on the table), an index's ``INCLUDE`` list and storage options, and a partial
+index's predicate, of which only its presence is compared. An index that exists but cannot serve, such
+as an invalid or non-btree one on PostgreSQL or a disabled one on SQL Server, is reported by the
+backend that reads it.
 
 The rule is one-sided, as on SQLite: a missing table, column or index refuses, and so does an index
 whose name matches but whose table, key columns, direction, uniqueness or partial flag differ, and a
@@ -56,8 +64,16 @@ _CREATE_TABLE = re.compile(
 )
 _CREATE_INDEX = re.compile(
     rf"\bCREATE\s+(?P<unique>UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-    rf"(?P<name>{_NAME})\s+ON\s+(?P<table>{_NAME})\s*\(",
+    rf"(?P<name>{_NAME})\s+ON\s+(?:ONLY\s+)?(?P<table>{_NAME})\s*(?P<using>USING\s+\w+\s*)?\(",
     re.I,
+)
+#: Every place a table or an index is created, read loosely, so a form the patterns above miss is
+#: counted and refused rather than silently left unchecked. A ``#`` temporary table is not the store's.
+_ANY_CREATE_TABLE = re.compile(r"\bCREATE\s+TABLE\s+(?!#)", re.I)
+_ANY_CREATE_INDEX = re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.I)
+#: The clauses PostgreSQL and SQL Server allow between an index's key list and its WHERE.
+_INDEX_TAIL = re.compile(
+    r"\s*(?:INCLUDE\s*\(|WITH\s*\(|NULLS\s+(?:NOT\s+)?DISTINCT\b|TABLESPACE\s+\S+)", re.I
 )
 _ADD_COLUMN = re.compile(
     rf"\bALTER\s+TABLE\s+(?P<table>{_NAME})\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -78,11 +94,22 @@ _NOT_A_COLUMN = frozenset(
     {"constraint", "primary", "unique", "check", "foreign", "exclude", "default", "period", "index"}
 )
 _COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
-_PLAIN_KEY = re.compile(r'^[\["]?([A-Za-z_][\w$]*)[\]"]?(?:\s+(ASC|DESC))?$', re.I)
+_PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
+#: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
+_EXPR_KEY = re.compile(r'^(?:"?\w+"?\s*)?\(')
+
+
+def _ident(name: str) -> str:
+    """One identifier as the server stores it: a double-quoted one exactly, any other lower-cased.
+    PostgreSQL folds an unquoted name to lower case and keeps a quoted one; SQL Server's brackets and
+    names compare case-insensitively under its default collations, so lower case serves both."""
+    if len(name) > 1 and name.startswith('"') and name.endswith('"'):
+        return name[1:-1]
+    return name.strip("[]").lower()
 
 
 def _bare(name: str) -> str:
-    return name.rsplit(".", 1)[-1].strip('[]"').lower()
+    return _ident(name.rsplit(".", 1)[-1])
 
 
 def _balanced(text: str, start: int) -> tuple[str, int]:
@@ -131,14 +158,23 @@ def _top_level_items(body: str) -> list[str]:
 
 
 def key_column(text: str) -> str:
-    """One index key column as both sides of the compare spell it: a plain name lower-cased, with
-    `` DESC`` when descending, and ``<expr>`` for anything else (an expression, or a collation)."""
+    """One index key column as both sides of the compare spell it: a name as :func:`_ident` reads
+    it, with `` DESC`` when descending, and ``<expr>`` for anything else."""
     match = _PLAIN_KEY.match(text.strip())
     if match is None:
         desc = text.strip().upper().endswith(" DESC")
         return "<expr>" + (" DESC" if desc else "")
     name, direction = match.groups()
-    return name.lower() + (" DESC" if direction and direction.upper() == "DESC" else "")
+    return _ident(name) + (" DESC" if direction and direction.upper() == "DESC" else "")
+
+
+def _declared_key(text: str) -> str:
+    """:func:`key_column` for a key in the DDL, refusing one whose live spelling would differ: a
+    column with a collation, an operator class or a ``NULLS`` order prints as its bare name in the
+    PostgreSQL catalog read, so it could never compare equal."""
+    if _PLAIN_KEY.match(text.strip()) is None and _EXPR_KEY.match(text.strip()) is None:
+        raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
+    return key_column(text)
 
 
 @cache
@@ -152,6 +188,12 @@ def declared_schema(statements: tuple[str, ...]) -> SchemaShape:
     indexes: dict[str, IndexShape] = {}
     for raw in statements:
         text = _COMMENT.sub(" ", raw)
+        for loose, strict in (
+            (_ANY_CREATE_TABLE, _CREATE_TABLE),
+            (_ANY_CREATE_INDEX, _CREATE_INDEX),
+        ):
+            if len(loose.findall(text)) != len(strict.findall(text)):
+                raise ValueError(f"DDL the live-schema check cannot read: {text.strip()[:120]!r}")
         events: list[tuple[int, str, re.Match[str]]] = []
         for kind, pattern in (
             ("table", _CREATE_TABLE),
@@ -171,17 +213,18 @@ def declared_schema(statements: tuple[str, ...]) -> SchemaShape:
                     if first.lower() not in _NOT_A_COLUMN:
                         cols.add(_bare(first))
             elif kind == "index":
+                if m["using"]:
+                    raise ValueError(f"index access method not compared: {m.group(0)!r}")
                 body, end = _balanced(text, m.end())
-                tail = text[end:].lstrip()
-                if tail.upper().startswith("INCLUDE"):
-                    paren = tail.find("(")
-                    _include, after = _balanced(tail, paren + 1)
-                    tail = tail[after:].lstrip()
+                while clause := _INDEX_TAIL.match(text, end):
+                    end = clause.end()
+                    if text[end - 1] == "(":
+                        end = _balanced(text, end)[1]
                 indexes[_bare(m["name"])] = IndexShape(
                     _bare(m["table"]),
-                    tuple(key_column(item) for item in _top_level_items(body)),
+                    tuple(_declared_key(item) for item in _top_level_items(body)),
                     bool(m["unique"]),
-                    tail.upper().startswith("WHERE"),
+                    text[end:].lstrip().upper().startswith("WHERE"),
                 )
             elif kind == "add":
                 if _bare(m["col"]) not in _NOT_A_COLUMN:
@@ -203,29 +246,45 @@ def declared_schema(statements: tuple[str, ...]) -> SchemaShape:
     )
 
 
+def _a(noun: str) -> str:
+    return ("an " if noun[:1].lower() in "aeiou" else "a ") + noun
+
+
 def server_schema_differences(
-    expected: SchemaShape, live: SchemaShape, taken: Mapping[str, str]
+    expected: SchemaShape,
+    live: SchemaShape,
+    taken: Mapping[str, str],
+    unusable: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Every way ``live`` falls short of ``expected``, one clause each. Extras are not listed.
 
     ``taken`` maps an expected table or index name to the kind of object that holds it instead (a
     table holding an index's name, a view holding a table's). Such a name gets its own clause, which
-    says why the guarded ``CREATE`` skipped it, in place of a bare "is missing"."""
+    says why the guarded ``CREATE`` skipped it, in place of a bare "is missing". ``unusable`` maps an
+    expected index that exists under its name to why it cannot serve, such as ``disabled``."""
+    unusable = unusable or {}
     problems: list[str] = []
     for name in sorted(taken):
         if name in expected.columns:
             problems.append(
-                f"table {name!r} was never created: the name is taken by a {taken[name]}"
+                f"table {name!r} was never created: the name is taken by {_a(taken[name])}"
             )
         elif name in expected.named_indexes:
             problems.append(
-                f"index {name!r} was never built: the name is taken by a {taken[name]}"
+                f"index {name!r} was never built: the name is taken by {_a(taken[name])}"
                 f" (expected {expected.named_indexes[name].describe()})"
             )
+    for name in sorted(unusable):
+        if name in expected.named_indexes and name not in taken:
+            problems.append(
+                f"index {name!r} exists but is {unusable[name]}"
+                f" (expected {expected.named_indexes[name].describe()})"
+            )
+    skip = set(taken) | set(unusable)
     rest = SchemaShape(
-        MappingProxyType({t: c for t, c in expected.columns.items() if t not in taken}),
+        MappingProxyType({t: c for t, c in expected.columns.items() if t not in skip}),
         expected.rowid_columns,
-        MappingProxyType({n: s for n, s in expected.named_indexes.items() if n not in taken}),
+        MappingProxyType({n: s for n, s in expected.named_indexes.items() if n not in skip}),
         expected.constraint_indexes,
     )
     problems.extend(schema_differences(rest, live))
@@ -235,13 +294,15 @@ def server_schema_differences(
 def live_shape(
     columns: Mapping[str, Iterable[str]], indexes: Mapping[str, IndexShape]
 ) -> SchemaShape:
-    """A :class:`SchemaShape` from what a backend read: columns per table and indexes by name."""
+    """A :class:`SchemaShape` from what a backend read: columns per table and indexes by name.
+
+    Names are taken as given. The backend spells them as :func:`_ident` does: PostgreSQL's catalog
+    already holds an unquoted name in lower case and a quoted ``"ID"`` as ``ID``, which must not
+    pass for ``id``; SQL Server lower-cases its own, as its default collations compare."""
     return SchemaShape(
-        MappingProxyType(
-            {t.lower(): frozenset(c.lower() for c in cols) for t, cols in columns.items()}
-        ),
+        MappingProxyType({t: frozenset(cols) for t, cols in columns.items()}),
         MappingProxyType({}),
-        MappingProxyType({n.lower(): s for n, s in indexes.items()}),
+        MappingProxyType(dict(indexes)),
         frozenset(),
     )
 
@@ -268,6 +329,10 @@ class ServerSchemaMismatchError(RuntimeError):
             " the batch again. Differences: " + "; ".join(self.differences) + "."
         )
 
+    def __reduce__(self) -> tuple[type[ServerSchemaMismatchError], tuple[object, ...]]:
+        # args holds only the message, so the default would call __init__ with it alone.
+        return (type(self), (self.backend, self.database, self.differences))
+
 
 def refuse_short_schema(
     backend: str,
@@ -276,13 +341,15 @@ def refuse_short_schema(
     column_rows: Iterable[tuple[str, str | None, str | None]],
     indexes: Mapping[str, IndexShape],
     taken: Mapping[str, str],
+    unusable: Mapping[str, str] | None = None,
 ) -> None:
     """Raise :class:`ServerSchemaMismatchError`, logged at ERROR first, when the live schema falls
     short of ``expected``. The one place both backends turn what they read into a refusal.
 
     ``column_rows`` is ``(table, kind, column)`` per live column: ``kind`` is ``None`` for a name
     nothing holds, ``"table"`` for a table, and otherwise the kind of object that holds the name.
-    ``taken`` names the indexes another kind of object holds; the tables are added to it here."""
+    ``taken`` names the indexes another kind of object holds; the tables are added to it here.
+    ``unusable`` is :func:`server_schema_differences`'."""
     taken = dict(taken)
     columns: dict[str, set[str]] = {}
     for table, kind, column in column_rows:
@@ -292,7 +359,7 @@ def refuse_short_schema(
             taken[table] = kind
         elif column is not None:
             columns.setdefault(table, set()).add(column)
-    problems = server_schema_differences(expected, live_shape(columns, indexes), taken)
+    problems = server_schema_differences(expected, live_shape(columns, indexes), taken, unusable)
     if problems:
         exc = ServerSchemaMismatchError(backend, database, problems)
         log.error("%s: %s", backend, exc)

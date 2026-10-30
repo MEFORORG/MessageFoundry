@@ -35,10 +35,12 @@ def pg_live_rows(
     args: Sequence[Any],
     shape: SchemaShape | None = None,
     kinds: Mapping[str, str] | None = None,
+    overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The rows one of PostgreSQL's two verify reads returns, and none for any other statement.
 
-    ``kinds`` maps a name to the relkind that holds it in place of the table or index ``shape`` has."""
+    ``kinds`` maps a name to the relkind that holds it in place of the table or index ``shape`` has.
+    ``overrides`` replaces fields of one index's row, such as ``{"usable": False}``."""
     from messagefoundry.store import postgres
 
     live = pg_declared() if shape is None else shape
@@ -66,6 +68,9 @@ def pg_live_rows(
                     "uniq": got and got.unique,
                     "partial": got and got.partial,
                     "cols": list(got.columns) if got else [],
+                    "usable": True,
+                    "method": "btree",
+                    **(overrides or {}).get(name, {}),
                 }
             )
         return rows
@@ -77,10 +82,13 @@ def mssql_live_rows(
     params: Sequence[Any] | None,
     shape: SchemaShape | None = None,
     kinds: Mapping[str, str] | None = None,
+    flags: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[tuple[Any, ...]]:
     """The rows one of SQL Server's two verify reads returns, and none for any other statement.
 
-    ``kinds`` maps a table name to the ``type_desc`` of the object that holds it."""
+    ``kinds`` maps a table name to the ``type_desc`` of the object that holds it. ``flags`` sets an
+    index's ``disabled`` or ``hypothetical`` flag, or with ``stats_only`` leaves a statistics object
+    of its name and no index."""
     from messagefoundry.store import sqlserver
 
     live = mssql_declared() if shape is None else shape
@@ -100,13 +108,15 @@ def mssql_live_rows(
         rows = []
         for table, name in zip(params[::2], params[1::2], strict=True):
             got = live.named_indexes.get(name)
-            if got is None or got.table != table:
-                rows.append((name, None, None, None, None, None, None))
+            flag = (flags or {}).get(name, {})
+            if flag.get("stats_only") or got is None or got.table != table:
+                stats = 3 if flag.get("stats_only") else None
+                rows.append((name, None, None, None, None, None, stats, None, None, None))
                 continue
+            disabled, hypothetical = flag.get("disabled", False), flag.get("hypothetical", False)
+            head = (name, 2, got.unique, got.partial, disabled, hypothetical, 2)
             for ordinal, col in enumerate(got.columns, start=1):
                 desc = col.endswith(" DESC")
-                rows.append(
-                    (name, 2, got.unique, got.partial, ordinal, col.removesuffix(" DESC"), desc)
-                )
+                rows.append((*head, ordinal, col.removesuffix(" DESC"), desc))
         return rows
     return []

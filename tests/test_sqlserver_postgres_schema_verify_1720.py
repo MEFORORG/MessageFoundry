@@ -17,10 +17,13 @@ database of its own that it drops afterwards. The ``postgres-store`` and ``sqlse
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import inspect
 import os
+import pickle
 import re
+import textwrap
 import types
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -123,7 +126,19 @@ def test_every_index_the_postgres_migration_builds_is_one_the_check_reads() -> N
     from messagefoundry.store import postgres
 
     source = inspect.getsource(postgres.PostgresStore._migrate_lease_columns)
-    assert not re.search(r'execute\(\s*f?"[^"]*CREATE (UNIQUE )?INDEX', source)
+    tree = ast.parse(textwrap.dedent(source))
+    func = tree.body[0]
+    assert isinstance(func, ast.AsyncFunctionDef)
+    docstring = func.body[0]
+    # Every string in the body but the docstring, whatever its quoting, and every f-string part.
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        if not (isinstance(docstring, ast.Expr) and node is docstring.value)
+    ]
+    assert literals  # positive control: the walk sees the migration's ALTER literals
+    assert not [s for s in literals if re.search(r"CREATE\s+(UNIQUE\s+)?INDEX", s, re.I)]
     built = set(re.findall(r"execute\(\s*(_[A-Z_]+_DDL)\b", source))
     declared = {
         name
@@ -155,9 +170,49 @@ def test_the_parser_reads_ddl_in_order() -> None:
     assert dict(shape.named_indexes) == {"ix_t": IndexShape("t", ("amount DESC", "id"), True, True)}
 
 
-def test_the_parser_refuses_ddl_it_cannot_read() -> None:
-    with pytest.raises(ValueError, match="unbalanced"):
-        declared_schema(("CREATE TABLE broken (id INT",))
+def test_the_parser_reads_clauses_between_the_keys_and_the_where() -> None:
+    for tail in (
+        "WITH (fillfactor = 70)",
+        "TABLESPACE fast",
+        "NULLS NOT DISTINCT",
+        "INCLUDE (b) NULLS DISTINCT WITH (deduplicate_items = off) TABLESPACE fast",
+    ):
+        shape = declared_schema((f"CREATE INDEX ix_w ON t (a) {tail} WHERE a > 0",))
+        assert shape.named_indexes["ix_w"].partial, tail
+    assert (
+        not declared_schema(("CREATE INDEX ix_w ON t (a) WITH (fillfactor = 70)",))
+        .named_indexes["ix_w"]
+        .partial
+    )
+
+
+@pytest.mark.parametrize(
+    ("statement", "match"),
+    [
+        ("CREATE TABLE broken (id INT", "unbalanced"),
+        ("CREATE INDEX ix_g ON t USING gin (a)", "access method"),
+        ('CREATE INDEX ix_c ON t (name COLLATE "C")', "options"),
+        ("CREATE INDEX ix_n ON t (seq DESC NULLS LAST)", "options"),
+        ("CREATE INDEX ix_o ON t (body text_pattern_ops)", "options"),
+        ("CREATE INDEX CONCURRENTLY ix_k ON t (a)", "cannot read"),
+        ("CREATE TABLE IF NOT EXISTS public . odd (a INT)", "cannot read"),
+    ],
+)
+def test_the_parser_refuses_ddl_it_would_misread(statement: str, match: str) -> None:
+    """Each of these would otherwise be skipped or read wrong, and so go unchecked or refuse a
+    correct schema on every open."""
+    with pytest.raises(ValueError, match=match):
+        declared_schema((statement,))
+
+
+def test_a_quoted_name_keeps_its_case_and_an_unquoted_one_folds() -> None:
+    """PostgreSQL folds an unquoted name and keeps a quoted one, so a live ``"ID"`` is not ``id``."""
+    shape = declared_schema(('CREATE TABLE T ("Mixed" INT, Plain INT)',))
+    assert dict(shape.columns) == {"t": frozenset({"Mixed", "plain"})}
+    assert key_column('"ID"') == "ID"
+    live = live_shape({"t": {"ID"}}, {})
+    expected = live_shape({"t": {"id"}}, {})
+    assert server_schema_differences(expected, live, {}) == ["table 't' is missing column 'id'"]
 
 
 def test_key_columns_normalise_the_same_way_on_both_sides() -> None:
@@ -191,10 +246,19 @@ def test_the_compare_names_each_shortfall_and_tolerates_extras() -> None:
 def test_a_name_held_by_another_kind_of_object_says_so() -> None:
     expected = live_shape({"queue": {"seq"}, "messages": {"id"}}, {_FIFO: _FIFO_SHAPE})
     live = live_shape({"queue": {"seq"}}, {})
-    assert server_schema_differences(expected, live, {_FIFO: "table", "messages": "view"}) == [
+    assert server_schema_differences(expected, live, {_FIFO: "table", "messages": "index"}) == [
         f"index {_FIFO!r} was never built: the name is taken by a table"
         " (expected on queue(stage, channel_id, status, seq))",
-        "table 'messages' was never created: the name is taken by a view",
+        "table 'messages' was never created: the name is taken by an index",
+    ]
+
+
+def test_an_index_that_exists_but_cannot_serve_says_why() -> None:
+    expected = live_shape({"queue": {"seq"}}, {_FIFO: _FIFO_SHAPE})
+    live = live_shape({"queue": {"seq"}}, {_FIFO: _FIFO_SHAPE})
+    assert server_schema_differences(expected, live, {}, {_FIFO: "disabled"}) == [
+        f"index {_FIFO!r} exists but is disabled"
+        " (expected on queue(stage, channel_id, status, seq))"
     ]
 
 
@@ -206,6 +270,8 @@ def test_the_refusal_leads_with_the_remedy_and_is_an_engine_refusal() -> None:
     assert text.index("Rename or drop") < text.index("Differences:")
     assert text.endswith("table 'queue' is missing column 'seq'.")
     assert exc.differences == ("table 'queue' is missing column 'seq'",)
+    copied = pickle.loads(pickle.dumps(exc))
+    assert (str(copied), copied.differences, copied.database) == (text, exc.differences, "mf")
 
 
 # --- PostgreSQL _ensure_schema, through a fake connection ------------------------------------------
@@ -215,12 +281,17 @@ class _PgConn:
     """The schema transaction's connection. The marker reads stale, every statement is recorded, and
     the two live-schema reads answer from ``shape`` and ``kinds``."""
 
-    def __init__(self, shape: SchemaShape | None = None, kinds: Mapping[str, str] | None = None):
-        self.shape, self.kinds = shape, kinds
+    def __init__(
+        self,
+        shape: SchemaShape | None = None,
+        kinds: Mapping[str, str] | None = None,
+        overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    ):
+        self.shape, self.kinds, self.overrides = shape, kinds, overrides
         self.executed: list[str] = []
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
-        return pg_live_rows(sql, args, self.shape, self.kinds)
+        return pg_live_rows(sql, args, self.shape, self.kinds, self.overrides)
 
     async def execute(self, sql: str, *args: Any, timeout: object = None) -> str:
         self.executed.append(sql)
@@ -300,6 +371,27 @@ async def test_postgres_refuses_a_table_missing_a_column() -> None:
     assert not conn.marker_written()
 
 
+@pytest.mark.parametrize(
+    ("override", "why"),
+    [
+        ({"usable": False}, "invalid: a build that never finished"),
+        ({"method": "brin"}, "a brin index, not btree"),
+    ],
+)
+async def test_postgres_refuses_a_right_shaped_index_that_cannot_serve(
+    override: dict[str, Any], why: str
+) -> None:
+    """A failed CREATE INDEX CONCURRENTLY, or an index of another method, with the declared name,
+    table and keys: the guarded CREATE skips it and the shape compare alone would pass it."""
+    conn = _PgConn(overrides={_FIFO: override})
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        await _pg_store(conn)._ensure_schema()
+    assert caught.value.differences == (
+        f"index {_FIFO!r} exists but is {why} (expected on queue(stage, channel_id, status, seq))",
+    )
+    assert not conn.marker_written()
+
+
 # --- SQL Server _ensure_schema, through a fake cursor ----------------------------------------------
 
 
@@ -319,7 +411,7 @@ class _MsCursor:
 
     async def fetchall(self) -> list[object]:
         sql, params, _timeout = self._conn.executed[-1]
-        rows = mssql_live_rows(sql, params, self._conn.shape)  # type: ignore[arg-type]
+        rows = mssql_live_rows(sql, params, self._conn.shape, flags=self._conn.flags)  # type: ignore[arg-type]
         return list(rows)
 
     async def close(self) -> None:
@@ -327,8 +419,12 @@ class _MsCursor:
 
 
 class _MsConn:
-    def __init__(self, shape: SchemaShape | None = None) -> None:
-        self.shape = shape
+    def __init__(
+        self,
+        shape: SchemaShape | None = None,
+        flags: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.shape, self.flags = shape, flags
         self.executed: list[tuple[str, object, object]] = []
         self._conn = types.SimpleNamespace(timeout=None)
         self.committed = 0
@@ -420,6 +516,27 @@ async def test_sqlserver_refuses_a_missing_index_and_a_missing_column() -> None:
     assert not conn.marker_written()
 
 
+@pytest.mark.parametrize(
+    ("flag", "clause"),
+    [
+        ({"disabled": True}, "exists but is disabled"),
+        ({"hypothetical": True}, "exists but is hypothetical"),
+        ({"stats_only": True}, "was never built: the name is taken by a statistics object"),
+    ],
+)
+async def test_sqlserver_refuses_a_name_its_guard_skips_for_an_index_that_does_not_serve(
+    flag: dict[str, Any], clause: str
+) -> None:
+    """``INDEXPROPERTY(..., 'IndexID')`` is non-NULL for each, so the guarded CREATE skips it. A
+    disabled unique index enforces nothing, so its keys alone must not pass the check."""
+    conn = _MsConn(flags={"ux_users_federated_subject": flag})
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        await _ms_store(conn)._ensure_schema()
+    [difference] = caught.value.differences
+    assert difference.startswith(f"index 'ux_users_federated_subject' {clause}")
+    assert not conn.marker_written()
+
+
 # --- the live legs ---------------------------------------------------------------------------------
 
 
@@ -453,7 +570,8 @@ async def test_live_postgres_open_refuses_and_marks_nothing(setup: str, expected
         await admin._execute(f"CREATE SCHEMA {schema}")
         await admin._execute(setup.format(schema=schema))
         with pytest.raises(ServerSchemaMismatchError) as caught:
-            await PostgresStore.open(scratch)
+            # Closed if it opens after all, so the pool does not outlive its schema's teardown.
+            await (await PostgresStore.open(scratch)).close()
         assert expected in str(caught.value)
         row = await admin._fetchone(
             "SELECT pg_catalog.to_regclass($1) IS NULL AS absent", f"{schema}.schema_meta"
@@ -519,7 +637,10 @@ async def test_live_sqlserver_open_refuses_a_same_named_index_and_marks_nothing(
     await admin.run_in(db, f"CREATE INDEX {_FIFO} ON queue(created_at)")
     await admin.run_in(db, "DELETE FROM schema_meta")
     with pytest.raises(ServerSchemaMismatchError) as caught:
-        await bounded(sa, "reopen over the wrong index", SqlServerStore.open(scratch))
+        # Closed if it opens after all, so no session holds the database at its teardown.
+        await (
+            await bounded(sa, "reopen over the wrong index", SqlServerStore.open(scratch))
+        ).close()
     assert f"index {_FIFO!r} is on queue(created_at)" in str(caught.value)
     assert await _sqlserver_marker_rows(admin, db) == 0
     await admin.run_in(db, f"DROP INDEX {_FIFO} ON queue")
@@ -540,6 +661,7 @@ async def test_live_sqlserver_open_refuses_a_table_missing_a_column(
     assert db is not None
     await admin.run_in(db, "CREATE TABLE transit_bound_attestation (id INT PRIMARY KEY)")
     with pytest.raises(ServerSchemaMismatchError) as caught:
-        await bounded(admin.settings, "open over the short table", SqlServerStore.open(scratch))
+        opened = SqlServerStore.open(scratch)
+        await (await bounded(admin.settings, "open over the short table", opened)).close()
     assert "table 'transit_bound_attestation' is missing column 'audit_hash'" in str(caught.value)
     assert await _sqlserver_marker_rows(admin, db) == 0

@@ -1277,6 +1277,7 @@ _LIVE_COLUMNS_SQL = (
 _LIVE_INDEXES_SQL = (
     "SELECT q.name AS idx, c.relkind::text AS kind, t.relname::text AS tbl,"
     " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
+    " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
     "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
     "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
@@ -1286,6 +1287,7 @@ _LIVE_INDEXES_SQL = (
     "    WHERE w.oid = pg_catalog.to_regclass(q.tbl))"
     " LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid"
     " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
+    " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 )
 _RELKINDS: Final = MappingProxyType(
     {
@@ -2269,6 +2271,7 @@ class PostgresStore:
         names = sorted(expected.named_indexes)
         tables = [expected.named_indexes[name].table for name in names]
         taken: dict[str, str] = {}
+        unusable: dict[str, str] = {}
         indexes: dict[str, IndexShape] = {}
         for r in await conn.fetch(_LIVE_INDEXES_SQL, names, tables):
             kind = _relkind_label(r["kind"], ("i", "I"), "index")
@@ -2277,6 +2280,12 @@ class PostgresStore:
             if kind != "index":
                 taken[r["idx"]] = kind
                 continue
+            # A failed CREATE INDEX CONCURRENTLY leaves an invalid index under the name, and the
+            # batch builds btree only (the DDL reader refuses USING), so either one serves nothing.
+            if not r["usable"]:
+                unusable[r["idx"]] = "invalid: a build that never finished"
+            elif r["method"] != "btree":
+                unusable[r["idx"]] = f"a {r['method']} index, not btree"
             indexes[r["idx"]] = IndexShape(
                 str(r["tbl"]),
                 tuple(key_column(str(col)) for col in r["cols"]),
@@ -2284,7 +2293,13 @@ class PostgresStore:
                 bool(r["partial"]),
             )
         refuse_short_schema(
-            self.backend.value, self._settings.database, expected, column_rows, indexes, taken
+            self.backend.value,
+            self._settings.database,
+            expected,
+            column_rows,
+            indexes,
+            taken,
+            unusable,
         )
 
     async def _migrate_lease_columns(self, conn: Any) -> None:
