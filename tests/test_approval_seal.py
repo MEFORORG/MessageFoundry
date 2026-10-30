@@ -27,22 +27,29 @@ import pytest
 
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth.permissions import Permission
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import RowSealer, RowSealError
 from messagefoundry.store.store import (
     APPROVAL_SEAL_EXCLUDED,
     ApprovalRow,
     MessageStore,
     approval_seal_ok,
+    approval_tombstone,
+    held_approval_tombstone,
 )
 from tests._approval_seal_contract import (
     _Hooked,
     _Sink,
     assert_approval_columns,
     assert_approval_seal_contract,
+    assert_tombstone_reseal_contract,
 )
 from tests._pending_approval_store_contract import _resolve, _StandingStore
+from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_role_seal import _literal_text, _raw_for
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -60,7 +67,7 @@ async def keyed(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, Path]]:
         await store.close()
 
 
-def _gate(store: Any) -> ApprovalGate:
+def _gate(store: Any, sink: AlertSink | None = None) -> ApprovalGate:
     async def run(_params: Any) -> dict[str, Any]:
         return {}
 
@@ -68,6 +75,7 @@ def _gate(store: Any) -> ApprovalGate:
         _StandingStore(store),
         ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
         resolve_identity=_resolve,
+        alert_sink=sink,
     )
     gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
     return gate
@@ -204,6 +212,61 @@ async def test_rotation_leaves_a_failing_request_as_it_is(
     assert good_row is not None and approval_seal_ok(sealer, ApprovalRow.from_mapping(good_row))
 
 
+async def test_rotation_moves_a_tombstone_to_the_active_key(tmp_path: Path) -> None:
+    """BACKLOG #3638: a rejected request's tombstone fails its approval seal by design, so the
+    re-seal pass checks it as a tombstone and moves it to the active key rather than count it
+    refused on every rotation. A tombstone or a rejected row changed outside the store is still
+    refused. The control is the request rejected the ordinary way, re-sealed beside them."""
+    path = tmp_path / "tombstone.db"
+
+    async def open_store(key: str, retired: tuple[str, ...]) -> MessageStore:
+        return await MessageStore.open(path, cipher=make_cipher(key, list(retired), write_v2=True))
+
+    first, second = await assert_tombstone_reseal_contract(open_store, lambda _s: _raw_for(path))
+    # The sound request and the tombstone are re-sealed; the forged tombstone and the changed
+    # rejected row are refused, on this pass and on the next, which has nothing else to do.
+    assert first == (2, 2) and second == (0, 2)
+
+
+def test_a_tombstone_holds_only_as_rejected_under_a_held_key() -> None:
+    """BACKLOG #3638: what :func:`held_approval_tombstone` accepts. The control is the tombstone as
+    written, under the active key and under a retired one the sealer holds; each change after it is
+    one a writer outside the store could make, or one no honest write leaves."""
+    old, new, gone = generate_key(), generate_key(), generate_key()
+    writer = RowSealer.for_cipher(make_cipher(old, write_v2=True))
+    reader = RowSealer.for_cipher(make_cipher(new, [old], write_v2=True))
+    stranger = RowSealer.for_cipher(make_cipher(gone, write_v2=True))
+    assert writer is not None and reader is not None and stranger is not None
+    row = {
+        "id": "a" * 32,
+        "status": "rejected",
+        "approver": "ap",
+        "decided_at": 5.0,
+        "seal": approval_tombstone(writer, "a" * 32, approver="ap", decided_at=5.0),
+    }
+    assert held_approval_tombstone(writer, row) == ("ap", 5.0)  # control, the active key
+    assert held_approval_tombstone(reader, row) == ("ap", 5.0)  # control, a retired held key
+    assert held_approval_tombstone(stranger, row) is None  # a key this process does not hold
+    assert held_approval_tombstone(None, row) is None
+    for column, value in (
+        ("status", "pending"),
+        ("status", "approved"),
+        ("approver", "someone-else"),
+        ("approver", None),
+        ("decided_at", 6.0),
+        ("decided_at", True),
+        ("decided_at", "5.0"),
+        ("id", "b" * 32),
+        ("seal", b"not-text"),
+    ):
+        assert held_approval_tombstone(reader, {**row, column: value}) is None, (column, value)
+    missing = {k: v for k, v in row.items() if k != "approver"}
+    assert held_approval_tombstone(reader, missing) is None
+    # A row sealed as a request is not a tombstone, whatever its status.
+    sealed = {**row, "seal": writer.seal("approval", (("id", "a" * 32),))}
+    assert held_approval_tombstone(reader, sealed) is None
+
+
 async def test_a_request_written_before_the_seal_is_named_at_open_and_refused(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -246,7 +309,12 @@ async def test_a_value_no_honest_write_leaves_is_a_failed_seal_not_a_crash(
     await _raw_for(path)(
         "UPDATE pending_approvals SET requested_at=? WHERE id=?", ("not-a-time", broken)
     )
-    assert [e["id"] for e in await gate.list_pending()] == [sound]
+    listing = await gate.list_pending()
+    assert [(e["id"], e["release_blocked"]) for e in listing] == [
+        (sound, None),
+        (broken, "seal_failed"),  # BACKLOG #3639: listed flagged, not failing the page
+    ]
+    assert listing[1]["params"] is None and listing[1]["requested_at"] == 0.0
     with pytest.raises(ApprovalError) as refusal:
         await gate.approve(broken, approver="a", approver_user_id="a-id")
     assert refusal.value.status == 409
@@ -257,6 +325,11 @@ async def test_a_value_no_honest_write_leaves_is_a_failed_seal_not_a_crash(
         )
     released = await gate.approve(sound, approver="a", approver_user_id="a-id")  # control
     assert released["operation"] == "dead_letter_replay"
+    # BACKLOG #3638: the reject still closes it, leaving the value no reader can type as it was.
+    assert (await gate.reject(broken, approver="a"))["rejected_by"] == "a"
+    found = await store.get_pending_approval(broken)
+    assert found is not None and found["status"] == "rejected"
+    assert found["requested_at"] == "not-a-time"
 
 
 class _PagingSink(_Sink):
@@ -307,6 +380,225 @@ async def test_a_cancelled_claim_the_store_refuses_on_its_seal_is_reported_not_p
         assert sink.lost == [] and len(sink.reasons) == 1
     else:
         assert sink.lost == ["approval.release_attempted"] and sink.reasons == []
+
+
+@pytest.mark.parametrize("planted", ["nan", "1e999", -5.0, 1e20])
+async def test_a_seal_failed_time_no_page_can_render_does_not_break_the_queue(
+    keyed: tuple[MessageStore, Path], planted: object
+) -> None:
+    """BACKLOG #3639: a failing row's times are shown as stored only when a page can render them.
+    NaN and infinity would fail the JSON reply, and a negative or far-future time fails the
+    console's time conversion on Windows. Each is replaced: the request time by the epoch, the
+    expiry by none. The control is the sound request beside it, whose time is its own."""
+    from messagefoundry.api.models import PendingApprovalInfo
+
+    store, path = keyed
+    gate = _gate(store)
+    sound = await _request(gate, "sound")
+    failing = await _request(gate, "failing")
+    # The expiry is a far-future time, so the queue's own unexpired filter still keeps the row.
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET requested_at=?, expires_at=? WHERE id=?",
+        (planted, 1e20, failing),
+    )
+    listing = await gate.list_pending()
+    by_id = {e["id"]: e for e in listing}
+    assert by_id[sound]["requested_at"] > 0  # control
+    entry = by_id[failing]
+    assert entry["release_blocked"] == "seal_failed"
+    assert entry["requested_at"] == 0.0 and entry["expires_at"] is None
+    PendingApprovalInfo(**entry).model_dump_json()  # the reply encodes
+
+
+async def test_a_seal_failed_reject_whose_audit_append_fails_moves_nothing(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3638: the move and its two audit rows are one transaction. With the
+    ``approval.rejected`` append refused the reject answers 503, pages the lost row, raises no
+    rejection alert and leaves the request pending and unchanged. The control is the same reject
+    once the append works, which moves it."""
+    store, path = keyed
+    sink = _PagingSink()
+    gate = ApprovalGate(
+        _StandingStore(store),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, "rollback")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 1}', approval_id)
+    )
+    before = await store.get_pending_approval(approval_id)
+    real = store._append_audits
+
+    async def refuse(audits: Any, *, now: float) -> Any:
+        if any(a.action == "approval.rejected" for a in audits):
+            raise sqlite3.OperationalError("audit append refused")
+        return await real(audits, now=now)
+
+    monkeypatch.setattr(store, "_append_audits", refuse)
+    with pytest.raises(ApprovalError) as fault:
+        await gate.reject(approval_id, approver="a")
+    assert fault.value.status == 503 and sink.lost == ["approval.rejected"]
+    monkeypatch.undo()
+    after = await store.get_pending_approval(approval_id)
+    assert before is not None and after is not None and dict(after) == dict(before)
+    assert not any("rejected" in r for r in sink.reasons)
+    rejected = await store.list_audit(action="approval.rejected")
+    assert all(approval_id not in str(r["detail"]) for r in rejected)
+    assert (await gate.reject(approval_id, approver="a"))["rejected_by"] == "a"  # control
+    assert [
+        approval_id in str(r["detail"]) for r in await store.list_audit(action="approval.rejected")
+    ] == [True]
+
+
+async def _seal_failed_rows(store: MessageStore, approval_id: str) -> int:
+    rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=50)
+    return sum(approval_id in str(r["detail"]) for r in rows)
+
+
+async def test_a_seal_failed_reject_writes_one_row_and_raises_one_alert(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """BACKLOG #3638: with no listing in the report interval, the reject used to report on its read
+    and again in its write, so one reject counted twice. It writes one row and raises one alert,
+    which says it was rejected. The control is a sound request, whose reject raises neither."""
+    store, path = keyed
+    sink = _Sink()
+    gate = _gate(store, sink)
+    sound = await _request(gate, "sound")
+    await gate.reject(sound, approver="a")
+    assert sink.reasons == [] and await _seal_failed_rows(store, sound) == 0  # control
+    approval_id = await _request(gate, "once")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 3}', approval_id)
+    )
+    await gate.reject(approval_id, approver="a")
+    assert await _seal_failed_rows(store, approval_id) == 1
+    assert len(sink.reasons) == 1 and "was rejected" in sink.reasons[0]
+
+
+@pytest.mark.parametrize("listed_first", [False, True])
+async def test_the_was_rejected_alert_is_not_held_back_by_the_cooldown(
+    keyed: tuple[MessageStore, Path], listed_first: bool
+) -> None:
+    """BACKLOG #3638: every authority seal failure shares one notifier key, so a report inside the
+    cooldown swallowed the 'was rejected' page. Through the real notifier, each reject pages once,
+    whether or not the queue reported the request first, and two rejects inside the cooldown page
+    twice. The control is the listing's own report, which still pages once under its own subject."""
+    store, path = keyed
+    transport = _RecordingTransport("t")
+    sink = NotifierAlertSink([transport], realert_seconds=10_000.0)
+    gate = _gate(store, sink)
+    ids = [await _request(gate, nonce) for nonce in ("first", "second")]
+    for approval_id in ids:
+        await _raw_for(path)(
+            "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 4}', approval_id)
+        )
+    if listed_first:
+        await gate.list_pending()
+    for approval_id in ids:
+        await gate.reject(approval_id, approver="a")
+    await _drain(sink)
+    reasons = [str(e["reason"]) for e in transport.events if e["type"] == "integrity_drift"]
+    assert [
+        i for i in ids for r in reasons if f"(approval {i})" in r and "was rejected" in r
+    ] == ids
+    assert sum("acts on nothing" in r for r in reasons) == (1 if listed_first else 0)
+    assert len(reasons) == (3 if listed_first else 2)
+
+
+@pytest.mark.parametrize(
+    ("fault", "answer"), [(TypeError("a defect"), None), (OSError("store down"), 503)]
+)
+async def test_a_seal_failed_reject_whose_write_raises_still_reports_it(
+    keyed: tuple[MessageStore, Path], fault: Exception, answer: int | None
+) -> None:
+    """BACKLOG #3638, the Lander's decision of 2026-10-26: a reject whose write raises committed no
+    row, so it writes the report instead: one row and one alert that does not claim a rejection. A
+    defect is raised as it is, and a store fault answers 503 and pages the lost row first. The
+    request stays pending. The control is the same reject once the write works."""
+    store, path = keyed
+    sink = _PagingSink()
+    raising = True
+
+    class _Raising:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(store, name)
+
+        async def reject_seal_failed_approval(self, approval_id: str, **kw: Any) -> bool:
+            if raising:
+                raise fault
+            return bool(await store.reject_seal_failed_approval(approval_id, **kw))
+
+    gate = _gate(_Raising(), sink)
+    approval_id = await _request(gate, "raises")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 5}', approval_id)
+    )
+    if answer is None:
+        with pytest.raises(TypeError):
+            await gate.reject(approval_id, approver="a")
+        assert sink.lost == []
+    else:
+        with pytest.raises(ApprovalError) as refused:
+            await gate.reject(approval_id, approver="a")
+        assert refused.value.status == answer and sink.lost == ["approval.rejected"]
+    assert await _seal_failed_rows(store, approval_id) == 1
+    assert len(sink.reasons) == 1 and "acts on nothing" in sink.reasons[0]
+    found = await store.get_pending_approval(approval_id)
+    assert found is not None and found["status"] == "pending"
+    raising = False
+    assert (await gate.reject(approval_id, approver="a"))["rejected_by"] == "a"  # control
+    assert await _seal_failed_rows(store, approval_id) == 2
+    assert len(sink.reasons) == 2 and "was rejected" in sink.reasons[1]
+
+
+async def test_a_seal_failed_reject_that_loses_its_write_still_reports_it(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """BACKLOG #3638, the Lander's decision of 2026-10-26: a reject whose write moves nothing
+    (another writer changed the row between the read and the write) committed no row, so it writes
+    the report instead, throttled as a read's report is: the audit row and the alert. The control
+    is the second reject in the interval, which reports nothing new."""
+    store, path = keyed
+    sink = _Sink()
+    raw = _raw_for(path)
+
+    class _Racing:
+        """``store``, except that the seal-failed reject finds the row changed again first."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(store, name)
+
+        async def reject_seal_failed_approval(self, approval_id: str, **kw: Any) -> bool:
+            await raw(
+                "UPDATE pending_approvals SET seal=? WHERE id=?",
+                (f"moved-{time.time_ns()}", approval_id),
+            )
+            return bool(await store.reject_seal_failed_approval(approval_id, **kw))
+
+    gate = _gate(_Racing(), sink)
+    approval_id = await _request(gate, "race")
+    await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 2}', approval_id))
+
+    async def reported() -> int:
+        rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=50)
+        return sum(approval_id in str(r["detail"]) for r in rows)
+
+    for _ in range(2):
+        with pytest.raises(ApprovalError) as lost:
+            await gate.reject(approval_id, approver="a")
+        assert lost.value.status == 409
+        assert await reported() == 1 and len(sink.reasons) == 1  # once, throttled
+    found = await store.get_pending_approval(approval_id)
+    assert found is not None and found["status"] == "pending"
 
 
 # --- static guards --------------------------------------------------------------------------
@@ -379,20 +671,28 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
 
 
 #: Where each backend may write ``pending_approvals``: each module-level statement and the one
-#: function that may use it. Every other INSERT, UPDATE, MERGE or DELETE of the table is a problem.
+#: function that may use it. The tombstone is the seal-failed reject's narrow write, and the
+#: tombstone re-seal is ``rotate-key``'s move of one to the active key (BACKLOG #3638). Every other
+#: INSERT, UPDATE, MERGE or DELETE of the table is a problem.
 _SEALING: dict[str, dict[str, frozenset[str]]] = {
     "store.py": {
         "_SQLITE_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_INSERT_UNLESS_OPEN": frozenset({"_write_approval"}),
         "_SQLITE_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_SQLITE_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_SQLITE_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
     "postgres.py": {
         "_PG_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_PG_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_PG_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_PG_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
     "sqlserver.py": {
         "_MSSQL_APPROVAL_INSERT": frozenset({"_write_approval"}),
         "_MSSQL_APPROVAL_UPDATE": frozenset({"_write_approval"}),
+        "_MSSQL_APPROVAL_TOMBSTONE": frozenset({"_tombstone_approval"}),
+        "_MSSQL_APPROVAL_TOMBSTONE_RESEAL": frozenset({"_reseal_tombstone"}),
     },
 }
 

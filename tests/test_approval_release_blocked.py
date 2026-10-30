@@ -101,7 +101,15 @@ async def _row(
 
 async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
     """One request per reason, and one the gate would release, mapped to the reason expected."""
+    # BACKLOG #3639: a row no reader can type fails its seal even on this keyless store, and the
+    # queue lists it flagged. Written straight to the table, as no honest write leaves it.
+    broken = await _row(store)
+    await store._db.execute(
+        "UPDATE pending_approvals SET requested_at=? WHERE id=?", ("not-a-time", broken)
+    )
+    await store._db.commit()
     return {
+        broken: "seal_failed",
         await _row(store, requester_user_id=""): "no_requester_id",
         await _row(store, operation=_RELOAD): "operation_unavailable",
         await _row(store, operation=_PURGE): "not_gated",
