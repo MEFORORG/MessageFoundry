@@ -2,13 +2,22 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Verify a server-DB store's live schema before its marker is written (BACKLOG #1720).
 
-The PostgreSQL and SQL Server DDL batches are additive and guarded, as SQLite's is: ``CREATE TABLE IF
-NOT EXISTS``, ``CREATE INDEX IF NOT EXISTS``, ``IF OBJECT_ID(...) IS NULL CREATE``, ``IF
-INDEXPROPERTY(...) IS NULL CREATE``, and ``ADD COLUMN`` behind an existence test. Each one SKIPS an
-object that already exists under the expected name, whatever its shape. On PostgreSQL a relation of
-any kind named ``ix_queue_fifo_in_seq`` makes the index build a no-op; a table left by an incompatible
-version keeps its old columns. The batch then wrote the ``schema_meta`` marker, and every later open
-took the ADR 0064 fast path past a schema that was never built.
+The PostgreSQL and SQL Server DDL batches are additive and guarded, as SQLite's is, and each guard
+skips a CREATE on a name already held, whatever the shape of what holds it. What counts as held
+differs by backend:
+
+* PostgreSQL's ``CREATE TABLE IF NOT EXISTS`` and ``CREATE INDEX IF NOT EXISTS`` skip a name any
+  relation holds in the creation schema: a table, an index, a view, a sequence or another kind. So a
+  relation of any kind named ``ix_queue_fifo_in_seq`` makes the index build a no-op.
+* SQL Server's ``IF OBJECT_ID('<name>', 'U') IS NULL CREATE TABLE`` skips only a user table of that
+  name. Another kind of object holding it lets the ``CREATE TABLE`` run, and the batch then fails on
+  that statement's own error. ``IF INDEXPROPERTY(OBJECT_ID('<table>'), '<name>', 'IndexID') IS NULL``
+  skips an index of that name on that table, or a statistics object of it there.
+* On both, ``ADD COLUMN`` runs behind a test that the column is absent.
+
+On either backend a table left by an incompatible version keeps its old columns. The batch then wrote
+the ``schema_meta`` marker, and every later open took the ADR 0064 fast path past a schema that was
+never built.
 
 This module is the check each backend runs after its batch and migrations and BEFORE its marker
 write, inside the same transaction, so a refusal rolls the batch back and leaves no marker. It is the
@@ -314,24 +323,43 @@ class ServerSchemaMismatchError(RuntimeError):
     A ``RuntimeError`` the engine defines, so the CLI prints it whole as an engine refusal. Not the
     SQLite :class:`~messagefoundry.store.schema_verify.SchemaMismatchError`: that is a
     ``sqlite3.DatabaseError``, which the CLI reports against the SQLite store path, and its remedy
-    moves a file aside. ``differences`` lists what was found, one clause each."""
+    moves a file aside. ``differences`` lists what was found, one clause each. ``database`` is the
+    configured database, ``None`` when the setting is unset; ``schema`` is the schema the store's
+    tables resolve into, which PostgreSQL names and SQL Server leaves ``None``."""
 
-    def __init__(self, backend: str, database: str | None, differences: Iterable[str]) -> None:
+    def __init__(
+        self,
+        backend: str,
+        database: str | None,
+        differences: Iterable[str],
+        schema: str | None = None,
+    ) -> None:
         self.backend = backend
         self.database = database
+        self.schema = schema
         self.differences = tuple(differences)
+        where = (
+            f"database {database!r}"
+            if database is not None
+            else "the connection's default database"
+        )
+        if schema is not None:
+            where = f"schema {schema!r} of {where}"
         # The remedy leads, ahead of the differences, as the SQLite refusal's does: a path that cuts
-        # an uncaught error's text keeps the part an operator acts on.
+        # an uncaught error's text keeps the part an operator acts on. It is split by kind of
+        # difference, so a table that only lacks a column is not told to give up its rows.
         super().__init__(
-            f"the {backend} store schema in database {database!r} is not what this build creates, so"
-            " the open refused and marked nothing current. Rename or drop each object named below,"
-            " or build the store in an empty database or schema, then restart: the next open runs"
-            " the batch again. Differences: " + "; ".join(self.differences) + "."
+            f"the {backend} store's tables in {where} are not what this build creates, so the open"
+            " refused and marked nothing current. Where a name below is taken by another object, or"
+            " an index has another shape or cannot serve, rename or drop that object. Where a table"
+            " lacks a column, add the column as this build's DDL declares it. Or build the store in"
+            " an empty database or schema. Then restart: the next open runs the batch again."
+            " Differences: " + "; ".join(self.differences) + "."
         )
 
     def __reduce__(self) -> tuple[type[ServerSchemaMismatchError], tuple[object, ...]]:
         # args holds only the message, so the default would call __init__ with it alone.
-        return (type(self), (self.backend, self.database, self.differences))
+        return (type(self), (self.backend, self.database, self.differences, self.schema))
 
 
 def refuse_short_schema(
@@ -342,6 +370,7 @@ def refuse_short_schema(
     indexes: Mapping[str, IndexShape],
     taken: Mapping[str, str],
     unusable: Mapping[str, str] | None = None,
+    schema: str | None = None,
 ) -> None:
     """Raise :class:`ServerSchemaMismatchError`, logged at ERROR first, when the live schema falls
     short of ``expected``. The one place both backends turn what they read into a refusal.
@@ -349,7 +378,8 @@ def refuse_short_schema(
     ``column_rows`` is ``(table, kind, column)`` per live column: ``kind`` is ``None`` for a name
     nothing holds, ``"table"`` for a table, and otherwise the kind of object that holds the name.
     ``taken`` names the indexes another kind of object holds; the tables are added to it here.
-    ``unusable`` is :func:`server_schema_differences`'."""
+    ``unusable`` is :func:`server_schema_differences`'. ``schema`` is
+    :class:`ServerSchemaMismatchError`'s."""
     taken = dict(taken)
     columns: dict[str, set[str]] = {}
     for table, kind, column in column_rows:
@@ -361,6 +391,6 @@ def refuse_short_schema(
             columns.setdefault(table, set()).add(column)
     problems = server_schema_differences(expected, live_shape(columns, indexes), taken, unusable)
     if problems:
-        exc = ServerSchemaMismatchError(backend, database, problems)
+        exc = ServerSchemaMismatchError(backend, database, problems, schema)
         log.error("%s: %s", backend, exc)
         raise exc

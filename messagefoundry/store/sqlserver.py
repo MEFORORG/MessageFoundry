@@ -2775,7 +2775,13 @@ def _declared_schema() -> SchemaShape:
 
 def _object_kind_label(type_desc: object) -> str | None:
     """``sys.objects.type_desc`` as the compare words it: ``table`` for a user table, the type in
-    lower-case words otherwise, ``None`` where nothing holds the name."""
+    lower-case words otherwise, ``None`` where nothing holds the name.
+
+    Through ``_ensure_schema`` a label other than ``table`` cannot reach the refusal: every
+    ``CREATE TABLE`` in the batch is guarded by ``OBJECT_ID('<name>', 'U')``, which skips only a user
+    table, so another kind of object holding the name lets that ``CREATE TABLE`` run and fail with
+    the server's own error before the check reads anything. Kept so the check names such an object
+    should a guard ever stop being type-scoped, rather than reporting the table missing."""
     if type_desc is None:
         return None
     return "table" if type_desc == "USER_TABLE" else str(type_desc).lower().replace("_", " ")

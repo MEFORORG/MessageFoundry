@@ -105,16 +105,22 @@ def test_sqlserver_declares_what_its_guarded_batch_builds() -> None:
     assert "ix_queue_fifo_in" not in declared.named_indexes
 
 
-def test_every_column_the_postgres_migration_adds_is_in_the_batch() -> None:
-    """The check reads columns from the batch alone, which holds because every column
-    ``_migrate_lease_columns`` adds to an older table is also in that table's CREATE TABLE. A new
-    migration column that is not would go unchecked, so this pins the premise."""
+def _migration_added_columns() -> set[tuple[str, str]]:
+    """Every ``(table, column)`` ``_migrate_lease_columns`` adds, read from its source."""
     from messagefoundry.store import postgres
 
     source = inspect.getsource(postgres.PostgresStore._migrate_lease_columns)
     added = set(re.findall(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", source))
     added |= {("users", col) for col in re.findall(r'^\s+\("(\w+)", "', source, re.M)}
     assert len(added) >= 20  # positive control: the reads above found the migration's columns
+    return added
+
+
+def test_every_column_the_postgres_migration_adds_is_in_the_batch() -> None:
+    """The check reads columns from the batch alone, which holds because every column
+    ``_migrate_lease_columns`` adds to an older table is also in that table's CREATE TABLE. A new
+    migration column that is not would go unchecked, so this pins the premise."""
+    added = _migration_added_columns()
     declared = pg_declared()
     missing = sorted(f"{t}.{c}" for t, c in added if c not in declared.columns.get(t, ()))
     assert not missing, missing
@@ -267,11 +273,31 @@ def test_the_refusal_leads_with_the_remedy_and_is_an_engine_refusal() -> None:
     assert isinstance(exc, RuntimeError)
     assert type(exc).__module__.startswith("messagefoundry.")  # printed whole by the CLI
     text = str(exc)
-    assert text.index("Rename or drop") < text.index("Differences:")
+    assert text.index("rename or drop that object") < text.index("Differences:")
     assert text.endswith("table 'queue' is missing column 'seq'.")
     assert exc.differences == ("table 'queue' is missing column 'seq'",)
     copied = pickle.loads(pickle.dumps(exc))
     assert (str(copied), copied.differences, copied.database) == (text, exc.differences, "mf")
+
+
+def test_the_refusal_names_where_it_looked_and_scopes_its_remedy() -> None:
+    """The Postgres schema is named, an unset database setting never prints as ``None``, and a table
+    that only lacks a column is told to gain it, never to be renamed or dropped."""
+    exc = ServerSchemaMismatchError("postgres", "mf", ["x"], "tenant_b")
+    assert "store's tables in schema 'tenant_b' of database 'mf' are not" in str(exc)
+    copied = pickle.loads(pickle.dumps(exc))
+    assert (str(copied), copied.schema) == (str(exc), "tenant_b")
+    unset = ServerSchemaMismatchError("sqlserver", None, ["x"])
+    assert "None" not in str(unset)
+    assert "store's tables in the connection's default database are not" in str(unset)
+    text = str(ServerSchemaMismatchError("postgres", "mf", ["x"]))
+    assert "store's tables in database 'mf' are not" in text
+    remedy = text[: text.index("Differences:")]
+    assert "Where a table lacks a column, add the column as this build's DDL declares it." in remedy
+    # The rename-or-drop remedy is scoped to a taken name or an index, never to a whole table.
+    rename = remedy[: remedy.index("rename or drop that object")]
+    assert rename.endswith("an index has another shape or cannot serve, ")
+    assert "Rename or drop each object" not in remedy
 
 
 # --- PostgreSQL _ensure_schema, through a fake connection ------------------------------------------
@@ -367,7 +393,7 @@ async def test_postgres_refuses_a_table_missing_a_column() -> None:
     assert caught.value.differences == (
         "table 'transit_bound_attestation' is missing column 'audit_hash'",
     )
-    assert "'mf_test'" in str(caught.value)
+    assert "schema 'public' of database 'mf_test'" in str(caught.value)
     assert not conn.marker_written()
 
 
@@ -390,6 +416,60 @@ async def test_postgres_refuses_a_right_shaped_index_that_cannot_serve(
         f"index {_FIFO!r} exists but is {why} (expected on queue(stage, channel_id, status, seq))",
     )
     assert not conn.marker_written()
+
+
+class _TwoSchemaPgConn(_PgConn):
+    """Two stores in one PostgreSQL database, in different schemas. The other schema holds every
+    table with every column. This one holds the same tables less each column the migration adds,
+    until the migration's ``ADD`` runs here. A catalog read scoped to ``current_schema()`` sees this
+    schema alone; an unscoped one sees the other schema's columns too, as ``information_schema``
+    does for a role that can read both."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.other = pg_declared()
+        self.missing = _migration_added_columns()
+        self.unscoped: list[str] = []
+
+    def here(self) -> SchemaShape:
+        return live_shape(
+            {
+                table: cols - {c for t, c in self.missing if t == table}
+                for table, cols in self.other.columns.items()
+            },
+            self.other.named_indexes,
+        )
+
+    async def fetch(self, sql: str, *args: Any) -> list[Any]:
+        if "information_schema.columns" not in sql:
+            return pg_live_rows(sql, args, self.here())
+        table = re.search(r"table_name\s*=\s*'(\w+)'", sql)
+        assert table is not None, sql
+        scoped = "table_schema = current_schema()" in sql
+        if not scoped:
+            self.unscoped.append(sql)
+        holders = [self.here()] if scoped else [self.here(), self.other]
+        present = {c for shape in holders for c in shape.columns.get(table[1], ())}
+        named = re.search(r"column_name\s*=\s*'(\w+)'", sql)
+        wanted = set(args[0]) if args else ({named[1]} if named else present)
+        return [{"column_name": c} for c in sorted(present & wanted)]
+
+    async def execute(self, sql: str, *args: Any, timeout: object = None) -> str:
+        if added := re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", sql):
+            self.missing.discard((added[1], added[2]))
+        return await super().execute(sql, *args, timeout=timeout)
+
+
+async def test_postgres_migration_reads_only_its_own_schema() -> None:
+    """A second store in another schema of the same database must not answer for this one. With the
+    migration's catalog reads unscoped, the other schema's columns made every guarded ``ADD`` skip,
+    and the live-schema check then refused the open for the columns the migration never added."""
+    conn = _TwoSchemaPgConn()
+    assert conn.missing  # positive control: this schema starts short of the migration's columns
+    assert await _pg_store(conn)._ensure_schema() is True
+    assert conn.unscoped == []
+    assert conn.missing == set()
+    assert conn.marker_written()
 
 
 # --- SQL Server _ensure_schema, through a fake cursor ----------------------------------------------
@@ -583,6 +663,39 @@ async def test_live_postgres_open_refuses_and_marks_nothing(setup: str, expected
         await store.close()
     finally:
         await postgres_teardown(admin, database=None, schemas=[schema])
+        await admin.close()
+
+
+@pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
+async def test_live_postgres_migration_adds_a_column_another_schema_holds() -> None:
+    """Two stores in one database: schema A's ``queue`` keeps ``owner``, schema B's has lost it and
+    its marker. Reopening B must ADD the column in B and open, not read A's column as B's and
+    refuse."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._live_scratch import postgres_teardown, scratch_name
+
+    base = load_settings(environ=os.environ).store
+    schemas = [scratch_name("mefor_b1720a"), scratch_name("mefor_b1720b")]
+    mine = schemas[1]
+    admin = await PostgresStore.open(base)
+    try:
+        for schema in schemas:
+            await admin._execute(f"CREATE SCHEMA {schema}")
+            await (await PostgresStore.open(base.model_copy(update={"db_schema": schema}))).close()
+        await admin._execute(f"ALTER TABLE {mine}.queue DROP COLUMN owner")
+        await admin._execute(f"DELETE FROM {mine}.schema_meta")
+        store = await PostgresStore.open(base.model_copy(update={"db_schema": mine}))
+        await store.close()
+        rows = await admin._fetchall(
+            "SELECT table_schema FROM information_schema.columns"
+            " WHERE table_name = 'queue' AND column_name = 'owner'"
+            " AND table_schema = ANY($1::text[])",
+            schemas,
+        )
+        assert sorted(str(r["table_schema"]) for r in rows) == sorted(schemas)
+    finally:
+        await postgres_teardown(admin, database=None, schemas=schemas)
         await admin.close()
 
 

@@ -37,7 +37,8 @@ def pg_live_rows(
     kinds: Mapping[str, str] | None = None,
     overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """The rows one of PostgreSQL's two verify reads returns, and none for any other statement.
+    """The rows one of PostgreSQL's verify reads returns, and none for any other statement. The
+    schema read answers ``public``.
 
     ``kinds`` maps a name to the relkind that holds it in place of the table or index ``shape`` has.
     ``overrides`` replaces fields of one index's row, such as ``{"usable": False}``."""
@@ -45,6 +46,8 @@ def pg_live_rows(
 
     live = pg_declared() if shape is None else shape
     kinds = kinds or {}
+    if sql == postgres._CURRENT_SCHEMA_SQL:
+        return [{"schema_name": "public"}]
     if sql == postgres._LIVE_COLUMNS_SQL:
         rows: list[dict[str, Any]] = []
         for table in args[0]:

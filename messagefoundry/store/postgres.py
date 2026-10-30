@@ -1289,6 +1289,7 @@ _LIVE_INDEXES_SQL = (
     " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
     " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 )
+_CURRENT_SCHEMA_SQL = "SELECT pg_catalog.current_schema()::text AS schema_name"
 _RELKINDS: Final = MappingProxyType(
     {
         "r": "table",
@@ -2292,6 +2293,10 @@ class PostgresStore:
                 bool(r["uniq"]),
                 bool(r["partial"]),
             )
+        # The schema the batch's unqualified DDL resolved into, for the refusal to name: with
+        # [store].db_schema unset that is the search path's first schema, which the settings omit.
+        schema_rows = await conn.fetch(_CURRENT_SCHEMA_SQL)
+        schema = schema_rows[0]["schema_name"] if schema_rows else None
         refuse_short_schema(
             self.backend.value,
             self._settings.database,
@@ -2300,6 +2305,7 @@ class PostgresStore:
             indexes,
             taken,
             unusable,
+            schema=None if schema is None else str(schema),
         )
 
     async def _migrate_lease_columns(self, conn: Any) -> None:
@@ -2312,12 +2318,17 @@ class PostgresStore:
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
         would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
         builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
-        ix_messages_received), which the _SCHEMA loop cannot give per statement."""
+        ix_messages_received), which the _SCHEMA loop cannot give per statement.
+
+        Every catalog read here is scoped to ``current_schema()``, the schema the unqualified DDL
+        resolves into (BACKLOG #1720). Unscoped, a second store in another schema of the same database
+        answered for this one: its column made the guard skip an ADD this schema still needed, and
+        the live-schema check then refused the open for a column the migration never added."""
         present = {
             r["column_name"]
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
-                " WHERE table_name='queue' AND column_name = ANY($1::text[])",
+                " WHERE table_schema = current_schema() AND table_name='queue' AND column_name = ANY($1::text[])",
                 ["owner", "lease_expires_at", "body_ref"],
             )
         }
@@ -2354,7 +2365,7 @@ class PostgresStore:
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='reauth_at'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='reauth_at'"
         )
         if not sessions_has_reauth:
             await conn.execute("ALTER TABLE sessions ADD COLUMN reauth_at DOUBLE PRECISION")
@@ -2363,7 +2374,8 @@ class PostgresStore:
         users_cols = {
             r["column_name"]
             for r in await conn.fetch(
-                "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name='users'"
             )
         }
         # Federated (issuer, sub) identity keying (BACKLOG #1015): NULL on existing rows = "not yet
@@ -2424,7 +2436,7 @@ class PostgresStore:
             await conn.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='mfa_verified_at'"
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
@@ -2432,7 +2444,7 @@ class PostgresStore:
         # above; pre-existing rows get NULL, which takes the non-federated step-up.
         sessions_has_mechanism = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='auth_mechanism'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='auth_mechanism'"
         )
         if not sessions_has_mechanism:
             await conn.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
@@ -2443,7 +2455,7 @@ class PostgresStore:
             r["column_name"]
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
-                " WHERE table_name='response' AND column_name = ANY($1::text[])",
+                " WHERE table_schema = current_schema() AND table_name='response' AND column_name = ANY($1::text[])",
                 ["kind", "ack_code", "ack_phase", "resp_headers"],
             )
         }
@@ -2468,7 +2480,7 @@ class PostgresStore:
         # pre-existing DB. information_schema-gated like the others; NULL on existing rows = never pruned.
         messages_has_pruned = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='messages' AND column_name='documents_pruned'"
+            " WHERE table_schema = current_schema() AND table_name='messages' AND column_name='documents_pruned'"
         )
         if not messages_has_pruned:
             await conn.execute("ALTER TABLE messages ADD COLUMN documents_pruned DOUBLE PRECISION")
@@ -2476,7 +2488,7 @@ class PostgresStore:
         # gated like the others; NULL on existing built-in rows = resolves from code (byte-identical).
         roles_has_perms = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='roles' AND column_name='permissions'"
+            " WHERE table_schema = current_schema() AND table_name='roles' AND column_name='permissions'"
         )
         if not roles_has_perms:
             await conn.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
