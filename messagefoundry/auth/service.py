@@ -14631,6 +14631,7 @@ class AuthService:
         client: str | None = None,
         rp_id: str,
         origin: str,
+        factor_refused: bool = False,
     ) -> Elevation:
         """Verify an attestation response and persist the passkey. Returns a not-``ok``
         :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
@@ -14664,7 +14665,13 @@ class AuthService:
         server did not store it. ``docs/SECURITY.md``, *A refused registration can leave a passkey
         on the authenticator*, states which refusals and how the finish can still fail after the
         passkey was stored, and that the console sends the user to the account's passkey list
-        before deleting anything."""
+        before deleting anything.
+
+        ``factor_refused`` is the caller saying its own :meth:`factor_binding_is_blocked` read
+        refused this session, so it drew nothing from its ceremony budget. The first factor check
+        then refuses on that read rather than its own (BACKLOG #3690): otherwise a factor proven
+        between the two reads would let a request nothing charged finish. A dead session is still
+        answered lost first, as the rule's fail-closed read predicted."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -14694,7 +14701,9 @@ class AuthService:
         ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             return Elevation(session_lost=True)
-        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+        if factor_refused or await self._factor_binding_is_blocked(
+            token, STEP_UP_ACTION_WEBAUTHN_ENROLL
+        ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
             raise ValueError(self._FACTOR_PRESENT)

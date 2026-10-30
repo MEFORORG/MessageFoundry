@@ -144,10 +144,67 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     assert paths == ["finish_webauthn_registration"]
 
 
+async def test_a_finish_the_route_left_uncharged_never_completes(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the skip opens: the route reads the session as refused and draws nothing, then the
+    rule stops refusing before the service reads it (the factor proven in another tab, say). Here
+    the route's read is stubbed to answer refused and the service's own reads stay real, and owe
+    nothing. RED when: that request stores a passkey or stamps the session, so one finish per
+    race window costs the budget nothing (BACKLOG #3690). The refusal is the one the route's read
+    predicted, so it ends the ceremony and is audited as that refusal is."""
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    body = await _staged_body(service, identity, token)
+    calls = _spy_ceremony_budget(service, monkeypatch)
+
+    async def refused_at_the_route(_token: str | None, _action: str) -> bool:
+        return True
+
+    monkeypatch.setattr(service, "factor_binding_is_blocked", refused_at_the_route)
+
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        raced = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+    assert raced.status_code == 400 and raced.json()["ok"] is False, raced.text
+    assert "already has a second factor" in raced.json()["error"]
+    assert calls == []
+    assert await service.store.list_webauthn_credentials(identity.user_id) == []
+    assert await service.mfa_satisfied(token) is False
+
+
+async def test_the_route_does_not_charge_a_session_that_died_before_its_read(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule fails closed on a dead session, so the route skips the draw for one that died
+    between the gate and its read, and the service answers it lost. RED when: that request is
+    charged, or answered as anything but the 401 a lost session gets (BACKLOG #3690 critic note 8).
+    """
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    body = await _staged_body(service, identity, token)
+    calls = _spy_ceremony_budget(service, monkeypatch)
+    real = service.factor_binding_is_blocked
+
+    async def revoked_then_read(token_: str | None, action: str) -> bool:
+        await service.store.revoke_session(hash_token(token))
+        return await real(token_, action)
+
+    monkeypatch.setattr(service, "factor_binding_is_blocked", revoked_then_read)
+
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        lost = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+    assert lost.status_code == 401 and lost.json()["error"] == "session expired", lost.text
+    assert calls == []
+    assert await service.store.list_webauthn_credentials(identity.user_id) == []
+
+
 async def test_the_route_still_charges_a_finish_it_lets_through(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the test above. RED when: the charge is skipped for everyone, or the spy is
+    """The control for ``test_the_route_refuses_a_finish_after_the_account_gained_a_factor``. RED
+    when: the charge is skipped for everyone, or the spy is
     not wired, which would let an empty list there mean "not observed" rather than "not charged"."""
     service = await _service(engine)
     identity, token = await _sign_in(service)

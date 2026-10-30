@@ -770,13 +770,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Not drawn for a session the factor rule refuses (item 6, the #1973 rule), which the
         # service then answers without verifying anything. The rule fails closed on a dead session,
-        # so that is skipped too, and a state change between this read and the service's own (a
-        # factor proven in another tab) can let one uncharged request finish. Skipping the draw
-        # skips _rate_limited's WARNING, so each such request writes one of its own: a log line,
-        # not an audit row, for _rate_limited's reason (a flood must not grow the audit log). The
-        # service still audits the refusal that ends a staged ceremony.
+        # so that is skipped too. The service is told this read refused, and refuses on it rather
+        # than on its own later read, so a state change between the two (a factor proven in another
+        # tab) cannot let an uncharged request finish. Skipping the draw skips _rate_limited's
+        # WARNING, so each such request writes one of its own: a log line, not an audit row, for
+        # _rate_limited's reason (a flood must not grow the audit log). The service still audits
+        # the refusal that ends a staged ceremony.
         client = client_ip(request)
-        if await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+        factor_refused = await service.factor_binding_is_blocked(
+            token, STEP_UP_ACTION_WEBAUTHN_ENROLL
+        )
+        if factor_refused:
             _log.warning("factor-refused passkey-enroll attempt from client=%s", client)
         elif not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
@@ -794,6 +798,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 client=client,
                 rp_id=rp[0],
                 origin=rp[1],
+                factor_refused=factor_refused,
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or
