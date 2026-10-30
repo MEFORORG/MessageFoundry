@@ -759,11 +759,13 @@ checking". The record says more than happened and loses nothing. A one-condition
 reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
 and the attestation, where the line was the only record of the attestation.
 
-**CORRECTED 2026-10-30 (BACKLOG #2193):** the over-statement above is gone. The guard's
-`crl_is_a_check` reads the context's time-check flag as well as its CRL flag, so a hop whose CRL is
-a real check logs no such line, and the MLLP hop above keeps it. That hop's own disposition is not
-changed. The attestation stays visible where the line no longer fires: `messagefoundry check` lists
-a connection's, and `security_loosenings()` names an `[alerts]` pair.
+**CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
+time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
+line. A hop with `tls_allow_expired`, a CRL and the attestation, at least MLLP and DICOM SCU, keeps
+it, and the over-statement stands there: that hop is admitted on its CRL flag, and a certificate the
+CRL lists is still refused. Neither hop's disposition changed. Where the line no longer fires, the
+attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
+`security_loosenings()` names an `[alerts]` pair.
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.

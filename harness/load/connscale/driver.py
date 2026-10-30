@@ -120,8 +120,8 @@ class ConnScaleDriver:
 
     def send_one_each(self, *, corpus: Corpus, mix: TypeMix) -> list[int]:
         """Queue exactly one send on EVERY connection, for the warm-up (BACKLOG #3132), and return
-        the seq of each queued send, so a delivery can be pinned to the connection that sent it. A
-        full buffer counts deferred, as in :meth:`_emit_one`; it cannot happen on a fresh connection,
+        the seq of each queued send, so each one's first delivery can be tracked. A full buffer
+        counts deferred, as in :meth:`_emit_one`; it cannot happen on a fresh connection,
         but a warm-up that queued fewer than N must say so rather than wait for deliveries that were
         never sent."""
         sampler = corpus.sampler(mix)

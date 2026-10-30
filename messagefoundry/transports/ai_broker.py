@@ -249,6 +249,7 @@ def _refuse_an_unrevoked_ai_hop(
         context=context,
         posture=held,
         connection=None,  # the [ai] endpoint, not a connection
+        declaration="[ai].endpoint_revocation_attested",
     )
     disposition = guard.disposition()
     enforcing = held.enforcing
@@ -257,7 +258,7 @@ def _refuse_an_unrevoked_ai_hop(
         "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
     )
     if disposition is HopDisposition.ALLOW:
-        # Not when the context checks a CRL: that hop crossed on a real check, not on the
+        # Not when the context's CRL is a real check: that hop crossed on it, not on the
         # attestation, and the line would be a false record. No CRL reaches it today; a later CRL
         # lever must revisit this arm and the refusal's lever text together.
         crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_is_a_check
@@ -268,7 +269,7 @@ def _refuse_an_unrevoked_ai_hop(
                 connection=None,
                 detail=f"{_AI_HOP_CELL}: {detail}",
                 reason=revocation_reason,
-                declaration="[ai].endpoint_revocation_attested",
+                declaration=guard.declaration,
             )
         return
     if disposition is HopDisposition.WARN:

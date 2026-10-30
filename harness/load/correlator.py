@@ -51,7 +51,8 @@ class Correlator:
     def await_first_deliveries(self, seqs: Iterable[int]) -> None:
         """Track ``seqs`` until each has arrived once, for :attr:`undelivered`. A count of arrivals
         cannot say this: an at-least-once redelivery of one message stands in for another that
-        never arrived. The set is only as large as ``seqs``, so memory stays bounded."""
+        never arrived. The set is only as large as ``seqs``, so memory stays bounded. Call it
+        before anything awaits after those sends are queued: an earlier arrival is not recorded."""
         self._undelivered = set(seqs)
 
     @property
