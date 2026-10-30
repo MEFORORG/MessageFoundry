@@ -7680,8 +7680,11 @@ def _check_privileges(args: argparse.Namespace) -> int:
     probe could not observe its principal. 3 wins when both apply.
 
     A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
-    store observation under these settings (ADR 0199). Only the store finding gates a start; the
-    line says so when another hop is over-granted. The exit code does not follow it."""
+    store and Vault observations under these settings (ADR 0199, ADR 0216). The store finding and a
+    Vault grant in the refusing class gate a start; the line names a Vault finding that only warns
+    and an LDAP over-grant, which do not, and a Vault probe failure that is not a network failure,
+    a timeout or a 403, which gates serve's start only where serve's own probe meets it. The exit
+    code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (

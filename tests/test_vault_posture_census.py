@@ -315,6 +315,8 @@ _CENSUS: list[Row] = sorted(
         ("pipeline/dr.py", "DrCoordinator._verify_seed", "run_restore_verify", "self._hop_posture"),
         ("pipeline/engine.py", "Engine.dr_coordinator", "DrCoordinator", "self._hop_posture"),
         ("api/app.py", "create_managed_app.lifespan", "open_store", "_hop_posture"),
+        # BACKLOG #2903: the startup Vault privilege preflight probes with the serve posture.
+        ("api/app.py", "create_managed_app.lifespan", "probe_vault", "_hop_posture"),
         ("api/app.py", "create_managed_app.lifespan", "resolve_secret_provider", "_hop_posture"),
         ("config/secretprovider.py", "_load_external_provider", "build_provider", "posture"),
         (

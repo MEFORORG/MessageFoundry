@@ -19,12 +19,15 @@ attestation and the command's posture (vault BACKLOG #2983):
 
 **A probe never raises.** Anything that stops it -- no extra, no address, a refused cleartext
 address, an unreachable server, a 403 on the lookup -- comes back as a problem string, which the
-read-out reports as ``unobservable``. **Nothing secret is kept:** never the token, its accessor or
-its id, and never a bind password. A problem names the exception type, or the engine's own fixed
-refusal text, or the first 200 characters of a plain ``ValueError`` raised from engine code (the
-probe's own shape checks and the TLS-suite assertion raise those). It never carries a server's
-error body: a subclass of ``ValueError``, such as a JSON decode error, keeps its type name alone,
-and so does a plain ``ValueError`` a library raised, such as a URL parser's (vault BACKLOG #3454).
+read-out reports as ``unobservable``. Only a network failure, a timeout or a 403 is excused
+(:func:`excused_failure`, ADR 0216); a Vault reading also names every other failure, so the
+startup preflight can refuse on one under ``enforce``. **Nothing secret is kept:** never the
+token, its accessor or its id, and never a bind password. A problem names the exception type, or
+the engine's own fixed refusal text, or the first 200 characters of a plain ``ValueError`` raised
+from engine code (the probe's own shape checks and the TLS-suite assertion raise those). It never
+carries a server's error body: a subclass of ``ValueError``, such as a JSON decode error, keeps
+its type name alone, and so does a plain ``ValueError`` a library raised, such as a URL parser's
+(vault BACKLOG #3454).
 """
 
 from __future__ import annotations
@@ -32,12 +35,14 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
-from collections.abc import Callable, Mapping
+import socket
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.privilege_check import vault_admin_paths
+from messagefoundry.transports.bounded_read import TruncatedResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +54,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "VaultTokenReading",
+    "excused_failure",
     "probe_vault",
     "read_ldap_bind",
     "read_vault_token",
+    "unexcused_cause",
 ]
 
 
@@ -63,6 +70,9 @@ class VaultTokenReading:
     when the paths could not be named. ``admin_paths`` is every path asked about that the engine
     never calls (:func:`~messagefoundry.privilege_check.vault_admin_paths`). ``capabilities`` is
     Vault's answer for both sets. ``problems`` names every part that could not be read.
+    ``unexcused`` names each failure behind a problem that :func:`excused_failure` does not
+    excuse, by the exception's type name, or in words for an answer that named no capabilities for
+    a path; the startup preflight refuses on one under ``enforce``.
 
     ``token_ref`` is a SHA-256 digest of the token, kept only so :meth:`same_token_as` can tell
     when two hops hold one token, whatever the token type and whether or not lookup-self answered.
@@ -77,6 +87,7 @@ class VaultTokenReading:
     admin_paths: tuple[str, ...] = ()
     capabilities: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     problems: tuple[str, ...] = ()
+    unexcused: tuple[str, ...] = ()
     token_ref: str | None = field(default=None, repr=False, compare=False)
 
     def same_token_as(self, other: VaultTokenReading) -> bool:
@@ -90,8 +101,81 @@ def _problem(text: str) -> str:
     is logged with every character in ``CONTROL_CATEGORIES`` escaped visibly, by the log's own
     rule, as the terminal escapes them (``privilege_check.render_text``), so neither deletes a
     character the server sent (BACKLOG #2891)."""
-    logger.warning("check-privileges: %s", scrub_log_argument(text))
+    # Not "check-privileges:": serve runs these probes at every start too (BACKLOG #2903).
+    logger.warning("privilege probe: %s", scrub_log_argument(text))
     return text
+
+
+def _is_forbidden(exc: BaseException) -> bool:
+    """Whether ``exc`` is Vault's 403. hvac maps a 403 to ``Forbidden``; it is read by name so this
+    module never imports hvac."""
+    return type(exc).__name__ == "Forbidden"
+
+
+def excused_failure(exc: BaseException) -> bool:
+    """Whether a Vault probe failure is one the owner ruling of 2026-10-04 lets only warn (ADR
+    0216): a network failure, a timeout, or a 403 (:func:`_is_forbidden`).
+
+    A network failure or a timeout is a refused, reset or dropped connection, a name that did not
+    resolve, a connect or read timeout, a TLS handshake the peer cut off, or a reply cut short of
+    its declared length. That is the builtin ``ConnectionError`` and ``TimeoutError``,
+    ``socket.gaierror``, requests' ``ConnectionError``, ``Timeout`` and ``ChunkedEncodingError``,
+    and the strict reply adapter's ``TruncatedResponseError``. It is not every ``OSError``:
+    requests' ``InvalidHeader`` and ``InvalidURL``, a missing CA file and a TLS failure other than
+    a cut-off handshake are configuration. A TLS failure is looked for in the whole chain, because
+    requests reports one on the proxy leg as a ``ProxyError``, and on either leg the wrapped
+    ``ssl.SSLError`` is what tells a verification failure from a dropped handshake.
+
+    Any other failure left the token unjudged for a reason the ruling does not excuse. At least
+    these are in that class: a ``TypeError`` or ``AttributeError`` after an hvac rename or a
+    signature drift, an engine refusal such as an unset token variable, and any other Vault error
+    status. The startup preflight refuses on one under ``enforce``
+    (:func:`~messagefoundry.privilege_check.vault_preflight_outcome`)."""
+    if _is_forbidden(exc):
+        return True
+    chain = list(_chain(exc))
+    if any(_is_ssl(e, "SSLError") and not _is_ssl(e, "SSLEOFError") for e in chain):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):
+        return True
+    try:
+        from requests import exceptions as rex
+    except ImportError:  # no requests, so none of its errors can be the one raised
+        return False
+    if isinstance(exc, rex.SSLError):
+        # Excused only where the chain shows a handshake the peer cut off.
+        return any(_is_ssl(e, "SSLEOFError") for e in chain)
+    return isinstance(exc, (rex.ConnectionError, rex.Timeout, rex.ChunkedEncodingError))
+
+
+def _is_ssl(exc: BaseException, name: str) -> bool:
+    """Whether ``exc`` is the stdlib ``ssl`` module's class ``name`` or a subclass of it. Read off
+    the class's MRO, so this module reads an exception's type without importing ``ssl``, which the
+    crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
+    return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
+
+
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and every exception it wraps: its cause and context, and the exceptions urllib3 and
+    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once."""
+    seen: set[int] = set()
+    todo: list[BaseException] = [exc]
+    while todo:
+        e = todo.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        inner: list[object] = [e.__cause__, e.__context__, *e.args]
+        inner += [getattr(e, "reason", None), getattr(e, "original_error", None)]
+        todo += [i for i in inner if isinstance(i, BaseException)]
+
+
+def unexcused_cause(exc: BaseException) -> str | None:
+    """How a reading names ``exc`` in ``unexcused``: its type name, or ``None`` when
+    :func:`excused_failure` excuses it. The one spelling for a failure the probe caught and one
+    the preflight caught."""
+    return None if excused_failure(exc) else type(exc).__name__
 
 
 def _why(exc: BaseException) -> str:
@@ -108,8 +192,7 @@ def _why(exc: BaseException) -> str:
     if isinstance(exc, (KeyProviderError, SecretProviderError, LdapError, InsecureHopRefused)):
         return strip_control_chars(str(exc))
     name = type(exc).__name__
-    # hvac maps a 403 to Forbidden; say what it means without importing hvac here.
-    if name == "Forbidden":
+    if _is_forbidden(exc):
         return f"permission denied ({name})"
     # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
     # assertion raise it with engine-written text. A subclass, such as a JSON decode error, can
@@ -147,7 +230,7 @@ def _strings(value: object) -> tuple[str, ...]:
     return tuple(v for v in value if isinstance(v, str))
 
 
-def _unset(*sources: Callable[[], object]) -> list[str]:
+def _unset(*sources: Callable[[], object], why: Callable[[BaseException], str] = _why) -> list[str]:
     """Ask each source, and return why each one that refused did. Asking all of them before
     returning means one run names every missing variable, not the first."""
     out: list[str] = []
@@ -155,7 +238,7 @@ def _unset(*sources: Callable[[], object]) -> list[str]:
         try:
             source()
         except Exception as exc:  # a refusal is this hop's finding, reported, never raised
-            out.append(_why(exc))
+            out.append(why(exc))
     return out
 
 
@@ -173,20 +256,35 @@ def read_vault_token(
     constructor, and ``required`` names the paths the engine calls on it; all of them live beside
     the calls they describe (``store/keyprovider_vault.py``, ``store/crypto_transit.py``,
     ``config/secretprovider_vault.py``). The variables and the paths are all read before anything
-    is returned, so one run names every one that is missing."""
+    is returned, so one run names every one that is missing.
+
+    Every failure is recorded as a problem. One that :func:`excused_failure` does not excuse is
+    also named in ``unexcused``, so a code defect swallowed here still refuses an enforcing start."""
     problems: list[str] = []
+    unexcused: list[str] = []
+
+    def unjudged(cause: str) -> None:
+        if cause not in unexcused:
+            unexcused.append(cause)
+
+    def why(exc: BaseException) -> str:
+        if (cause := unexcused_cause(exc)) is not None:
+            unjudged(cause)
+        return _why(exc)
+
     needed: dict[str, frozenset[str]] = {}
     try:
         needed = dict(required())
     except Exception as exc:  # an unset key name or a malformed reference
-        problems.append(_why(exc))
-    unset = _unset(token, address)
+        problems.append(why(exc))
+    unset = _unset(token, address, why=why)
     if unset:
         return VaultTokenReading(
             required=needed,
             problems=tuple(
                 _problem(p) for p in [*(f"no Vault client: {u}" for u in unset), *problems]
             ),
+            unexcused=tuple(unexcused),
         )
     named = token()
     try:
@@ -194,7 +292,8 @@ def read_vault_token(
     except Exception as exc:  # a refused client: reported, never raised
         return VaultTokenReading(
             required=needed,
-            problems=tuple(_problem(p) for p in [f"no Vault client: {_why(exc)}", *problems]),
+            problems=tuple(_problem(p) for p in [f"no Vault client: {why(exc)}", *problems]),
+            unexcused=tuple(unexcused),
         )
     for p in problems:
         _problem(p)
@@ -225,10 +324,15 @@ def read_vault_token(
         # the same timeout against the same server, so it is not sent. A refusal of the hop itself,
         # such as a proxy-leg CA the TLS library would not load (BACKLOG #3090), would refuse that
         # read the same way, so it is not sent either.
-        problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
-        return VaultTokenReading(required=needed, problems=tuple(problems), token_ref=token_ref)
+        problems.append(_problem(f"token lookup-self failed: {why(exc)}"))
+        return VaultTokenReading(
+            required=needed,
+            problems=tuple(problems),
+            unexcused=tuple(unexcused),
+            token_ref=token_ref,
+        )
     except Exception as exc:  # Vault answered and refused, or answered in an unexpected shape
-        problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
+        problems.append(_problem(f"token lookup-self failed: {why(exc)}"))
 
     from messagefoundry.store.keyprovider_vault import TRANSIT_MOUNT
 
@@ -249,9 +353,11 @@ def read_vault_token(
                 # invisible character read as deny, and so err toward a clean result.
                 capabilities[path] = _strings(caps)
             else:
+                # Not a network, timeout or 403 failure either: this path went unjudged.
+                unjudged("an answer naming no capabilities for a path")
                 problems.append(_problem(f"capabilities-self returned nothing for {path}"))
     except Exception as exc:  # Vault refused or could not be reached: reported, never raised
-        problems.append(_problem(f"capabilities-self failed: {_why(exc)}"))
+        problems.append(_problem(f"capabilities-self failed: {why(exc)}"))
 
     return VaultTokenReading(
         looked_up=looked_up,
@@ -262,6 +368,7 @@ def read_vault_token(
         admin_paths=admin,
         capabilities=capabilities,
         problems=tuple(problems),
+        unexcused=tuple(unexcused),
         token_ref=token_ref,
     )
 

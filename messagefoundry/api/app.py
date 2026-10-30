@@ -472,6 +472,7 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
+from messagefoundry.privilege_probes import probe_vault
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
     RemoteDebugPosture,
@@ -536,6 +537,7 @@ from messagefoundry.uploads import (
     browse_messages,
     split_uploaded,
 )
+from messagefoundry.vault_preflight import run_vault_privilege_preflight
 
 __all__ = ["create_app", "create_managed_app"]
 
@@ -11365,7 +11367,9 @@ def create_managed_app(
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it.
+    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
+    Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
     (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
@@ -11610,25 +11614,40 @@ def create_managed_app(
         # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
         # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
         # server principal), so the default single-node path is a log line and nothing else.
+        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
+        # probe check-privileges runs and a client from the provider's own constructor, in the same
+        # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+        # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
+        # it (audited), and so does a probe failure that is not a network failure, a timeout or a
+        # 403, which the opt-out does not lift; every other finding warns and audits
+        # (vault_preflight_outcome). It names the consumers from the
+        # resolved service settings, which serve always passes; an embedding that passes none has
+        # no Vault consumer this lifespan could name.
+        _security = security_settings or SecuritySettings()
+        # The dial falls back to [security].enforcement when no explicit one was passed, so an
+        # embedder that sets only security_settings gets its own dial.
+        _enforcing = (security_enforcement or _security.enforcement) is SecurityEnforcement.ENFORCE
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    # The dial falls back to [security].enforcement when no explicit one was
-                    # passed, so an embedder that sets only security_settings gets its own dial.
-                    enforcing=(
-                        security_enforcement
-                        or (security_settings or SecuritySettings()).enforcement
-                    )
-                    is SecurityEnforcement.ENFORCE,
-                    over_grant_accepted=(
-                        security_settings or SecuritySettings()
-                    ).allow_over_granted_store_principal,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
+            if static_credential_settings is not None:
+                await run_vault_privilege_preflight(
+                    static_credential_settings,
+                    store,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_vault_token,
+                    probe=partial(
+                        probe_vault, settings=static_credential_settings, posture=_hop_posture
+                    ),
+                )
         except BaseException:
             if notifier is not None:
                 await notifier.aclose()

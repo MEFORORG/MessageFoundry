@@ -974,7 +974,8 @@ except that a Vault token missing a capability the engine calls is noted.
 
 - **The store principal.** The engine reads its roles and permissions at every start, and the
   command runs the same read on demand.
-- **Each Vault token.** The command reads the token's own policies, TTL and renewability
+- **Each Vault token.** The engine reads it at every start, and the command runs the same read on
+  demand ([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md)). The probe reads the token's own policies, TTL and renewability
   (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
   calls and on administrative paths it never calls. The token, its id and its accessor are
   never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`,
@@ -998,9 +999,9 @@ backend hops that present a static credential or none (the *Delegated identity* 
 | Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
-| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.secrets`); reported only, never gates a start |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.store`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.store`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.secrets`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
 | LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | **Partly**, by `check-privileges`: identity and administrative groups; delegated ACLs not read; never gates a start |
 | SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
 | IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
@@ -1008,9 +1009,9 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
 more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
-one key does both jobs. The two `check-privileges` paths are in Vault's `default` policy. A token
-made with `-no-default-policy` needs them granted, or its hop reads as not observed. Neither path
-lets a token change anything.
+one key does both jobs. The two paths the probe reads are in Vault's `default` policy. A token
+made with `-no-default-policy` needs them granted, or its hop reads as not observed, at every
+`serve` start as well as in `check-privileges`. Neither path lets a token change anything.
 
 A Vault token is **over-granted** when any of these holds:
 
@@ -1083,9 +1084,11 @@ engine's own:
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when a probe
 could not read its principal, and 1 when the settings do not load. Clean means no grant beyond the
 documented set. A hop marked not probed never changes the exit code. Its last line, `serve:`, says
-what `serve` would do with the store observation. **Only the store finding gates a start**; a Vault
-or LDAP over-grant is reported, and the `serve:` line says it does not gate a start. The runbook step
-that runs it for the gMSA is [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+what `serve` would do with the store and Vault observations. **The store finding and a Vault grant
+in the refusing class gate a start** (the two paragraphs below); a Vault finding that only warns and
+an LDAP over-grant are named after the verdict, and the `serve:` line says they do not refuse a
+start. The runbook step that runs it for the gMSA is [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md)
+§1.1 step 6.
 
 **What `serve` does with the store finding ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27).** Under
 the shipped `[security].enforcement = enforce`, an over-granted store login **refuses to start**. The
@@ -1095,6 +1098,35 @@ marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is na
 `[store].require_least_privilege = true` refuses on that too, and outranks the opt-out. Under
 `enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
 is a PHI instance. SQLite has no login, so nothing here applies to it.
+
+**What `serve` does with a Vault finding ([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-10-04).** At every
+start, after the store preflight and before any listener binds, `serve` probes each Vault token it
+uses with the probe `check-privileges` runs. It builds its client with the provider's own
+constructor and reads the token from the same variable or secrets-directory file the provider reads,
+at that moment. The over-grants above fall in two classes:
+
+- **The refusing class:** the `root` policy, and any grant on an administrative path the probe asks
+  about, which includes a write of the token's own policies and a Transit key's `config`, `rotate`,
+  `export` and `backup`. Under the shipped `enforcement = enforce` such a token **refuses to start**.
+  The audited opt-out is `[security].allow_over_granted_vault_token = true`: it logs an `AUDIT:`
+  line, marks the `vault_privilege_preflight` audit row `over_grant_accepted`, and is named on
+  `GET /security/posture`.
+- **The warning class:** everything else the probe calls over-granted, at least one token serving
+  both hops, an extra capability on a path the engine calls, and a policy name the probe cannot tell
+  apart from `root` by reading it. These log a warning and write the audit row; they never refuse.
+
+A probe that could not read the token because of a network failure, a timeout or a 403 also only
+warns. Any other failure leaves the token unjudged for a reason the ruling does not excuse: at
+least a code defect such as a `TypeError` after an hvac change, an engine refusal such as an unset
+token variable, another Vault error status, and an answer that names no capabilities for a path.
+Under `enforce` such a failure **refuses to start**, the audit row names it under `unexcused`, and
+the opt-out does not lift it.
+
+Under `enforcement = warn` nothing refuses. The probe's limits stay: it asks about exact paths only,
+so a wildcard grant such as `secret/data/*` would read clean, and a token made with `-no-default-policy` reads
+as not observed at every start unless its policy grants the two paths the probe reads. Neither
+limit was measured against a live Vault. No alert is raised for a Vault finding yet; the log line
+and the audit row are the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 
