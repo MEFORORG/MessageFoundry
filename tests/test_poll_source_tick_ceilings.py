@@ -694,6 +694,8 @@ async def test_db_full_poll_with_no_mark_warns_once_per_run_of_full_polls(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "no mark_statement" in warnings[0].getMessage()
+    assert "add a mark_statement" in warnings[0].getMessage()
+    assert "Do not disable poll_max_rows" in warnings[0].getMessage()
     assert "deferred, not dropped" not in caplog.text
     # The row past the ceiling was never handed off: the same first two rows came back each poll.
     assert {b.decode() for b in handler.bodies} == {_ADT.format(n=0), _ADT.format(n=1)}

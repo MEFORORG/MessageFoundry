@@ -60,7 +60,7 @@ _WRITING_POLLS = [
     pytest.param("{CALL dbo.claim_next_batch}", id="odbc-call"),
     pytest.param("SELECT id, payload FROM mf_inbox; UPDATE mf_inbox SET status='X'", id="chained"),
     # Decided, not accidental: the lock ends with the statement on the autocommit pool, so refusing a
-    # locking read loses nothing, and the message says so.
+    # FOR UPDATE locking read loses nothing, and the message says so.
     pytest.param(
         "SELECT id, payload FROM mf_inbox WHERE status='NEW' FOR UPDATE SKIP LOCKED",
         id="for-update",
@@ -73,15 +73,15 @@ def _assert_refusal_text(message: str) -> None:
     assert "mark_statement" in message  # points at the pattern that works
     assert "EXEC" in message and "{CALL" in message  # stored procedures are refused too,
     assert "even when the procedure only reads" in message  # a read-only one included, with why
-    assert "FOR UPDATE" in message  # and a locking read, with the reason
+    assert "FOR UPDATE" in message  # and a FOR UPDATE locking read, with the reason
     assert "mf_inbox" not in message  # PHI-free: never echoes the statement
 
 
 @pytest.mark.parametrize("poll", _WRITING_POLLS)
 @pytest.mark.parametrize("ceiling", [500, 0], ids=["ceiling-on", "ceiling-off"])
 def test_a_writing_poll_statement_is_refused_at_construction(poll: str, ceiling: int) -> None:
-    """Refused whether or not the ceiling is on: with it off, a failed hand-off or a stop still left
-    marked rows behind.
+    """Refused whether or not the ceiling is on: with it off, a row whose hand-off failed and the rows
+    behind a stop would still be marked and never ingested.
 
     Red mutation: drop the refusal from ``DatabaseSource.__init__`` and the source builds."""
     with pytest.raises(ValueError) as info:
@@ -105,7 +105,10 @@ def test_the_refusal_comes_before_the_hop_is_built(caplog: pytest.LogCaptureFixt
 
     Red mutation: move the refusal after ``_build_connection`` and the generic hop's TLS warning is
     logged first."""
-    with caplog.at_level(logging.DEBUG, logger="messagefoundry"), pytest.raises(ValueError):
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry"),
+        pytest.raises(ValueError, match="A poll must only read"),
+    ):
         _build_raw(
             "UPDATE mf_inbox SET status='CLAIMED' RETURNING id",
             dialect="generic",

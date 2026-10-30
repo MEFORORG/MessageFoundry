@@ -1280,8 +1280,8 @@ At least these, read 2026-10-26:
   `DatabasePoll` when declared, and `DatabaseSource` when built, refuse any `poll_statement` that
   fails the `db_lookup` read-only test, so at least an `UPDATE ... RETURNING` or status-flag claim
   in the poll, and a stored-procedure poll, are refused. In the shipped code the same shape would
-  also have lost the rows past `poll_max_rows` on every full poll, and the rows behind a failed
-  hand-off. With a poll that does
+  also have lost the rows past `poll_max_rows` on every full poll, and at least a row whose hand-off
+  failed. With a poll that does
   not write, a row is marked only by `mark_statement`, after its hand-off, so a cut in the select or
   at the stop check leaves the row unmarked, and the next poll reads it again. The test reads only
   the statement's shape, so a poll it does not catch can still claim at the select;

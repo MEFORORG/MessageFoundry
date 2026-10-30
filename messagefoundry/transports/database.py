@@ -2203,8 +2203,9 @@ def _read_only_poll_refusal(statement: str) -> str | None:
     The poll runs on the autocommit pool, so a write in it commits at execute, before any row reaches
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
     matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
-    rows past the ceiling would be marked and never ingested, and so would the rows a failed handler
-    or a stop leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
+    rows past the ceiling would be marked and never ingested, and so would at least a row whose
+    handler failed (:meth:`DatabaseSource._poll_once` goes on to the next row) and the rows a stop
+    leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
     the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
@@ -2225,12 +2226,12 @@ def _read_only_poll_refusal(statement: str) -> str | None:
         return (
             f"{exc}. A poll must only read: it runs on an autocommit connection, so a write in it, "
             "such as UPDATE ... RETURNING or OUTPUT, would commit before any row is handed off, "
-            "and the rows it marked past poll_max_rows, or behind a failed hand-off or a stop, "
-            "would never be ingested. Poll with a SELECT and mark each handled row with "
-            "mark_statement. A stored-procedure poll (EXEC, {CALL ...}) is refused even when the "
-            "procedure only reads, because this test cannot see its body. At least a second "
-            "statement and a locking read (FOR UPDATE, whose lock ends with the statement here) "
-            "are refused too"
+            "and at least the rows it marked past poll_max_rows, a row whose hand-off failed, "
+            "and the rows left behind a stop would never be ingested. Poll with a SELECT and mark "
+            "each handled row with mark_statement. A stored-procedure poll (EXEC, {CALL ...}) is "
+            "refused even when the procedure only reads, because this test cannot see its body. "
+            "At least a second statement and a FOR UPDATE locking read (whose lock ends with the "
+            "statement here) are refused too"
         )
     return None
 
@@ -2700,9 +2701,11 @@ class DatabaseSource(SourceConnector):
                 logger.warning(
                     "DATABASE source filled poll_max_rows (%s) and has no mark_statement, so each "
                     "poll can select the same first rows again and any rows past the ceiling may "
-                    "never be reached; add a mark_statement, or raise or disable poll_max_rows. "
-                    "Logged once "
-                    "until a poll returns fewer rows than the ceiling",
+                    "never be reached; add a mark_statement that takes each handled row out of "
+                    "poll_statement's result. Do not disable poll_max_rows for this: with no mark, "
+                    "every poll would then re-read and re-ingest the whole table, with no bound on "
+                    "the rows held in memory. Logged once until a poll returns fewer rows than the "
+                    "ceiling",
                     ceiling,
                 )
         finally:
