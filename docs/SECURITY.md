@@ -2370,6 +2370,22 @@ as `params_no_requester` writes an `approval.params_no_requester` row against th
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
+**A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
+listing, on `GET /approvals` or on the console's `/ui/approvals`, that marks at least one request
+with that value writes one `approval.standing_shown` row against the caller. The row carries the
+caller's `client` address (ADR 0150) and those requests' ids in `approval_ids`. A listing that
+shows no such value writes no row. Repeats are not folded together, because a held request may have
+no expiry, so a de-dup key or a throttle would hide months of views. On the console this row is the
+listing's only record, because the console's gates write no grant row. On the JSON route it sits
+beside `auth.permission_granted`. A failed write leaves the listing answering 200, and is logged and
+paged, as below. The value itself still needs no step-up.
+
+This row records what that listing disclosed, and only that. It does not record every route to the
+fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
+and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope. The
+console's user pages write no grant row. So a missing `approval.standing_shown` row does not show
+that a caller never learned a requester's standing.
+
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
 together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
@@ -2565,10 +2581,13 @@ error, as stated for the claim above.
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name. A
 resolution's lost `approval.approver_provenance` row is keyed `approval:<id>:resolve` instead, so it
-cannot fold into a lost release flag on the same request (vault BACKLOG #3438).
+cannot fold into a lost release flag on the same request (vault BACKLOG #3438). A lost
+`approval.standing_shown` row is keyed `approval:listing`, because it belongs to a listing rather
+than to one request.
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
+- the `approval.standing_shown` row a listing writes. The log line carries the row's detail;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
 - the request or repeat write, including one that reads back as held, as below. The log line names

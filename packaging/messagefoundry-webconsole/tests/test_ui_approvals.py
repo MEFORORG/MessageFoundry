@@ -11,6 +11,7 @@ is built through the store's own transitions, the way ``tests/test_approvals.py`
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import get_args
@@ -136,6 +137,31 @@ async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: En
         r = await checker.post(f"/ui/approvals/{approval_id}/reject", headers=SAME_ORIGIN)
     assert r.status_code == 303
     assert await _status(engine, approval_id) == "rejected"
+
+
+async def test_a_listing_that_shows_a_lost_standing_writes_one_row(engine: Engine) -> None:
+    """Vault BACKLOG #3747, the console plane: this route calls the JSON handler directly, past its
+    ``require``, and the console's gates write no grant row, so the handler's own row is the only
+    record that this listing told the caller a requester lost their authority. Reached through
+    the real route and the seam, and each listing writes its own."""
+    service, maker_id, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        # The control: the same queue, nothing withdrawn, no row.
+        assert (await checker.get("/ui/approvals")).status_code == 200
+        assert await engine.store.list_audit(action="approval.standing_shown") == []
+        await service.set_roles(maker_id, [Role.VIEWER.value], actor="test")
+        for _ in range(2):
+            r = await checker.get("/ui/approvals")
+            assert r.status_code == 200
+            assert f'action="/ui/approvals/{approval_id}/approve"' not in r.text
+    rows = await engine.store.list_audit(action="approval.standing_shown")
+    assert len(rows) == 2
+    for row in rows:
+        assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
+        assert json.loads(str(row["detail"])) == {"approval_ids": [approval_id]}
 
 
 def _row(aid: str, **update: object) -> PendingApprovalInfo:

@@ -470,7 +470,9 @@ async def test_a_released_purge_whose_audit_row_fails_cancels_nothing(
     assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
 
 
-async def _stored_purge_hold(engine: Engine, requester_user_id: str, params: dict[str, Any]) -> str:
+async def _stored_purge_hold(
+    engine: Engine, requester_user_id: str, params: dict[str, Any], *, requester: str = "op"
+) -> str:
     """A hold written through the store, for the rows the route cannot file: it refuses a purge
     with no graph, a purge of an outbound outside the graph, and any scope but the two it admits."""
     approval_id = uuid4().hex
@@ -478,12 +480,19 @@ async def _stored_purge_hold(engine: Engine, requester_user_id: str, params: dic
         approval_id=approval_id,
         operation="connection_purge",
         params=json.dumps(params),
-        requester="op",
+        requester=requester,
         requester_user_id=requester_user_id,
         requested_at=time.time(),
         expires_at=None,
     )
     return approval_id
+
+
+async def _assert_nothing_purged(engine: Engine, message_id: str) -> None:
+    assert await engine.store.list_audit(action="connection_purge") == []
+    assert {r["status"] for r in await engine.store.outbox_for(message_id)} == {
+        OutboxStatus.PENDING.value
+    }
 
 
 async def test_a_released_purge_with_no_graph_loaded_cancels_nothing(engine: Engine) -> None:
@@ -507,10 +516,7 @@ async def test_a_released_purge_with_no_graph_loaded_cancels_nothing(engine: Eng
         "cancelled": 0,
         "skipped": "no graph is loaded, so no outbound connection: OB",
     }
-    assert await engine.store.list_audit(action="connection_purge") == []
-    assert {r["status"] for r in await engine.store.outbox_for(str(mid))} == {
-        OutboxStatus.PENDING.value
-    }
+    await _assert_nothing_purged(engine, str(mid))
 
 
 async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothing(
@@ -536,8 +542,7 @@ async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothi
         "cancelled": 0,
         "skipped": "no such outbound connection: OB",
     }
-    assert await engine.store.list_audit(action="connection_purge") == []
-    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+    await _assert_nothing_purged(engine, mid)
 
 
 @pytest.mark.parametrize(
@@ -566,10 +571,8 @@ async def test_a_released_purge_with_an_unknown_scope_is_refused_and_fails(
         refused = await c.post(f"/approvals/{held}/approve", headers=await _token(c, "approver"))
     assert refused.status_code == 422, refused.text
     assert "records no valid scope" in refused.json()["detail"]
-    row = await engine.store.get_pending_approval(held)
-    assert row is not None and str(row["status"]) == "failed"
-    assert await engine.store.list_audit(action="connection_purge") == []
-    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+    assert await _status_of(engine, held) == "failed"
+    await _assert_nothing_purged(engine, mid)
 
 
 async def test_a_released_purge_with_no_requester_is_refused_before_it_cancels(

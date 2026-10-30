@@ -1126,6 +1126,11 @@ def _reload_refusal(identity: Identity) -> str | None:
     return None if _cross_channel_in_scope(identity) else RELOAD_REFUSED_CHANNEL_SCOPED
 
 
+#: The scopes a purge admits. The route's pattern is built from it and the ``_purge`` approval
+#: executor refuses any other, so a release cannot disagree with the request (vault BACKLOG #3798).
+_PURGE_SCOPES = ("top", "all")
+
+
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
     """What a held purge captures. The route's guard and both its rejoins read it. A repeat is
     recognised when the two are identical (vault BACKLOG #2625 with #2445), or differ only in
@@ -1176,8 +1181,7 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
-    # so purge must wait until the lane is paused AND fully quiesced. The release path never
-    # re-enters the route, so the `_purge` approval executor reads this function for itself.
+    # so purge must wait until the lane is paused AND fully quiesced.
     if not rr.outbound_quiesced(name):
         return HTTPException(409, "stop the outbound and let it quiesce before purging its queue")
     return None
@@ -1714,11 +1718,11 @@ def _build_approval_gate(
                 "this purge request records no requester, so its connection_purge row could not "
                 "name who ran it; it was not run",
             )
-        # Vault BACKLOG #3798: the route admits only these two, so any other scope is a stored row
-        # no request filed. No operator act clears it, and reading it as "all" would cancel every
-        # queued row, so it raises. 422 is the approve route's "the released operation was refused".
+        # Vault BACKLOG #3798: any scope the route does not admit is a stored row no request filed.
+        # No operator act clears it, and reading it as "all" would cancel every queued row, so it
+        # raises. 422 is the approve route's "the released operation was refused".
         scope = p.get("scope")
-        if scope not in ("top", "all"):
+        if scope not in _PURGE_SCOPES:
             raise ApprovalError(
                 422,
                 "this purge request records no valid scope, so what it would cancel is not "
@@ -1726,9 +1730,7 @@ def _build_approval_gate(
             )
         name = str(p["name"])
         # A retryable miss, so it skips fail-closed and records cancelled=0/skipped in the approval
-        # audit: the operator loads the graph, or restores or stops the outbound and lets it
-        # quiesce, then re-requests. A non-quiesced outbound could have an INFLIGHT row
-        # cancel_queued cannot cancel, and a non-owning shard's quiesced signal is vacuous (ADR 0073).
+        # audit: the operator clears the cause the refusal names, then re-requests.
         refusal = _purge_target_refusal(engine.registry_runner, name)
         if refusal is not None:
             return {"cancelled": 0, "skipped": str(refusal.detail)}
@@ -5632,7 +5634,7 @@ def create_app(
         response: Response,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        scope: str = Query("all", pattern="^(top|all)$"),
+        scope: str = Query("all", pattern=f"^({'|'.join(_PURGE_SCOPES)})$"),
         identity: Identity = Depends(
             require_step_up_action(
                 STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE, proof_in_route=True
@@ -6514,12 +6516,14 @@ def create_app(
 
     @app.get("/approvals", response_model=ApprovalList)
     async def list_approvals(
+        request: Request,
         identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
         """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
         releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``, and
-        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460)."""
+        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460). A listing that
+        shows ``requester_not_authorized`` writes one ``approval.standing_shown`` row."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:
@@ -6532,6 +6536,15 @@ def create_app(
         # settled between the reads still shows as pending; approving it then answers 409.
         cut_off = {a["id"] for a in interrupted}
         rows = [a for a in pending if a["id"] not in cut_off] + interrupted
+        # Vault BACKLOG #3747: here and not in a gate, because the console calls this handler
+        # directly, past `require`, and on /ui this row is the only record of the listing. Every
+        # listing writes its own: a held request may have no expiry, so a de-dup key or a throttle
+        # would hide months of views.
+        shown = [a["id"] for a in rows if a["release_blocked"] == "requester_not_authorized"]
+        if shown:
+            await gate.record_standing_shown(
+                shown, actor=identity.username, client=client_ip(request)
+            )
         return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)

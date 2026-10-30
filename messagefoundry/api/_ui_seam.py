@@ -729,6 +729,12 @@ from typing import Any
 #: pair, and an older console on this engine, at mount. The digest moved from
 #: ``9cd9fe02e6e90c18`` (derived with ``--digest``).
 #:
+#: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
+#: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
+#: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
+#: which the handshake does not catch: an older console omits ``request``, and a newer console
+#: passes it to an engine that lacks it.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
