@@ -29,6 +29,7 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import RowSealer, RowSealError
 from messagefoundry.store.store import (
@@ -47,6 +48,7 @@ from tests._approval_seal_contract import (
     assert_tombstone_reseal_contract,
 )
 from tests._pending_approval_store_contract import _resolve, _StandingStore
+from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_role_seal import _literal_text, _raw_for
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -454,13 +456,145 @@ async def test_a_seal_failed_reject_whose_audit_append_fails_moves_nothing(
     ] == [True]
 
 
-async def test_a_seal_failed_reject_that_loses_its_write_still_reports_the_read(
+async def _seal_failed_rows(store: MessageStore, approval_id: str) -> int:
+    rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=50)
+    return sum(approval_id in str(r["detail"]) for r in rows)
+
+
+async def test_a_seal_failed_reject_writes_one_row_and_raises_one_alert(
     keyed: tuple[MessageStore, Path],
 ) -> None:
-    """BACKLOG #3638, the Lander's decision of 2026-10-26: the reject's read reports a failing
-    request, throttled, as main's read does, so a reject whose write then moves nothing (another
-    writer changed the row between the read and the write) still leaves the audit row and the
-    alert. The control is the second reject in the interval, whose read reports nothing new."""
+    """BACKLOG #3638: with no listing in the report interval, the reject used to report on its read
+    and again in its write, so one reject counted twice. It writes one row and raises one alert,
+    which says it was rejected. The control is a sound request, whose reject raises neither."""
+    store, path = keyed
+    sink = _Sink()
+    gate = ApprovalGate(
+        _StandingStore(store),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    sound = await _request(gate, "sound")
+    await gate.reject(sound, approver="a")
+    assert sink.reasons == [] and await _seal_failed_rows(store, sound) == 0  # control
+    approval_id = await _request(gate, "once")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 3}', approval_id)
+    )
+    await gate.reject(approval_id, approver="a")
+    assert await _seal_failed_rows(store, approval_id) == 1
+    assert len(sink.reasons) == 1 and "was rejected" in sink.reasons[0]
+
+
+@pytest.mark.parametrize("listed_first", [False, True])
+async def test_the_was_rejected_alert_is_not_held_back_by_the_cooldown(
+    keyed: tuple[MessageStore, Path], listed_first: bool
+) -> None:
+    """BACKLOG #3638: every authority seal failure shares one notifier key, so a report inside the
+    cooldown swallowed the 'was rejected' page. Through the real notifier, each reject pages once,
+    whether or not the queue reported the request first, and two rejects inside the cooldown page
+    twice. The control is the listing's own report, which still pages once under its own subject."""
+    store, path = keyed
+    transport = _RecordingTransport("t")
+    sink = NotifierAlertSink([transport], realert_seconds=10_000.0)
+    gate = ApprovalGate(
+        _StandingStore(store),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    ids = [await _request(gate, nonce) for nonce in ("first", "second")]
+    for approval_id in ids:
+        await _raw_for(path)(
+            "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 4}', approval_id)
+        )
+    if listed_first:
+        await gate.list_pending()
+    for approval_id in ids:
+        await gate.reject(approval_id, approver="a")
+    await _drain(sink)
+    reasons = [str(e["reason"]) for e in transport.events if e["type"] == "integrity_drift"]
+    assert [
+        i for i in ids for r in reasons if f"(approval {i})" in r and "was rejected" in r
+    ] == ids
+    assert sum("acts on nothing" in r for r in reasons) == (1 if listed_first else 0)
+    assert len(reasons) == (3 if listed_first else 2)
+
+
+@pytest.mark.parametrize(
+    ("fault", "answer"), [(TypeError("a defect"), None), (OSError("store down"), 503)]
+)
+async def test_a_seal_failed_reject_whose_write_raises_still_reports_it(
+    keyed: tuple[MessageStore, Path], fault: Exception, answer: int | None
+) -> None:
+    """BACKLOG #3638, the Lander's decision of 2026-10-26: a reject whose write raises committed no
+    row, so it writes the report instead: one row and one alert that does not claim a rejection. A
+    defect is raised as it is, and a store fault answers 503 and pages the lost row first. The
+    request stays pending. The control is the same reject once the write works."""
+    store, path = keyed
+    sink = _PagingSink()
+    raising = True
+
+    class _Raising:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(store, name)
+
+        async def reject_seal_failed_approval(self, approval_id: str, **kw: Any) -> bool:
+            if raising:
+                raise fault
+            return bool(await store.reject_seal_failed_approval(approval_id, **kw))
+
+    gate = ApprovalGate(
+        _StandingStore(_Raising()),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, "raises")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 5}', approval_id)
+    )
+    if answer is None:
+        with pytest.raises(TypeError):
+            await gate.reject(approval_id, approver="a")
+        assert sink.lost == []
+    else:
+        with pytest.raises(ApprovalError) as refused:
+            await gate.reject(approval_id, approver="a")
+        assert refused.value.status == answer and sink.lost == ["approval.rejected"]
+    assert await _seal_failed_rows(store, approval_id) == 1
+    assert len(sink.reasons) == 1 and "acts on nothing" in sink.reasons[0]
+    found = await store.get_pending_approval(approval_id)
+    assert found is not None and found["status"] == "pending"
+    raising = False
+    assert (await gate.reject(approval_id, approver="a"))["rejected_by"] == "a"  # control
+    assert await _seal_failed_rows(store, approval_id) == 2
+    assert len(sink.reasons) == 2 and "was rejected" in sink.reasons[1]
+
+
+async def test_a_seal_failed_reject_that_loses_its_write_still_reports_it(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """BACKLOG #3638, the Lander's decision of 2026-10-26: a reject whose write moves nothing
+    (another writer changed the row between the read and the write) committed no row, so it writes
+    the report instead, throttled as a read's report is: the audit row and the alert. The control
+    is the second reject in the interval, which reports nothing new."""
     store, path = keyed
     sink = _Sink()
     raw = _raw_for(path)

@@ -31,7 +31,11 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
-from messagefoundry.pipeline.alerts import AUTHORITY_SEAL_SUBJECT, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    AUTHORITY_SEAL_REJECTED_SUBJECT,
+    AUTHORITY_SEAL_SUBJECT,
+    LoggingAlertSink,
+)
 from messagefoundry.store.row_seal import APPROVAL_TOMBSTONE_KIND, SEAL_PREFIX, RowSealError
 from messagefoundry.store.store import (
     ApprovalRow,
@@ -64,14 +68,14 @@ _SEALED_CHANGES: tuple[tuple[str, Any], ...] = (
 
 
 class _Sink(LoggingAlertSink):
-    """Records each ``integrity_drift`` reason the authority-seal subject raises."""
+    """Records each ``integrity_drift`` reason the authority-seal subjects raise."""
 
     def __init__(self) -> None:
         super().__init__()
         self.reasons: list[str] = []
 
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
-        if name == AUTHORITY_SEAL_SUBJECT:
+        if name == AUTHORITY_SEAL_SUBJECT or name.startswith(f"{AUTHORITY_SEAL_REJECTED_SUBJECT}:"):
             self.reasons.append(reason)
 
 
@@ -443,6 +447,12 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     assert await store.reject_seal_failed_approval(  # control: the seal it now carries
         moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=""
     )
+
+    # --- a reject no listing reported first still writes one row and raises one alert ----------
+    unlisted = await h.request()
+    await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"z": 1}', unlisted))
+    await h.gate.reject(unlisted, approver=_APPROVER)
+    assert await h.seal_failures(unlisted) == 1 and h.alerted(unlisted) == 1
 
     # --- every other shape the main contract plants is rejectable too --------------------------
     for shape, column, value in (

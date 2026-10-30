@@ -2748,9 +2748,14 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
   holding only the id and `seal_failed` commit in one transaction. The first keeps the
   `approver`, `decided_at` and seal the tombstone overwrote, as read, under `prior`. The
   `integrity_drift` alert is raised after the commit, because an alert sink cannot join a
-  transaction. The reject's read has already reported the failure, throttled per request, as the
-  queue listing and an approve do, so a reject whose write then moves nothing still leaves a
-  report.
+  transaction. A crash in that gap leaves the audit rows and no page, and nothing raises it again.
+  The alert's subject is `authority-seal-rejected:<approval id>`, apart from `authority-seal`, so
+  a report inside the notifier's cooldown cannot hold it back. One reject writes one such row and
+  raises one such alert.
+- A reject whose write commits nothing (the row moved or changed since the read, a store fault, or
+  a defect in the write) writes the ordinary report instead, throttled per request as the queue
+  listing and an approve do: an `integrity.authority_seal_failed` row and an `integrity_drift`
+  alert under `authority-seal`.
 - `rotate-key`'s re-seal pass checks a row that fails its approval seal as a tombstone, under the
   key the tombstone names. One that holds gets a tombstone under the active key and is counted
   re-sealed. One that fails, like any other failing row, is left as it is, counted and logged.

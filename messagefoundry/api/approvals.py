@@ -67,7 +67,12 @@ from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, authority_seal_alert
+from messagefoundry.pipeline.alerts import (
+    AUTHORITY_SEAL_REJECTED_SUBJECT,
+    AlertSink,
+    LoggingAlertSink,
+    authority_seal_alert,
+)
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.base import Store
 from messagefoundry.store.row_seal import (
@@ -2045,10 +2050,10 @@ class ApprovalGate:
 
         A pending request that fails its integrity seal is rejected too (BACKLOG #3638; owner
         ruling 2026-10-26), by :meth:`_reject_seal_failed`, since nothing else would ever close
-        it once ``[approvals].expiry_hours`` is 0. The read reports it first, throttled per request
-        (:meth:`_approval_seal_failed`), so a reject that then answers 409 still leaves a report."""
+        it once ``[approvals].expiry_hours`` is 0. The read does not report it, because that
+        method reports it once for each outcome of the write."""
         try:
-            row = await self._require_pending(approval_id)
+            row = await self._require_pending(approval_id, report=False)
         except _SealRefusal as refusal:
             return await self._reject_seal_failed(
                 approval_id, refusal.found, approver=approver, client=client
@@ -2299,8 +2304,11 @@ class ApprovalGate:
         reject is an operator's act on one request, not a read repeated by every page load. The
         ``integrity_drift`` alert is raised once the write has committed. It cannot join the
         transaction, because an alert sink is not a store; raised after, it never reports a
-        rejection that rolled back. The write and the alert run as one shielded unit, so a
-        cancelled caller cannot leave a committed rejection without its alert.
+        rejection that rolled back. It goes under a subject of its own, one per request
+        (:data:`~messagefoundry.pipeline.alerts.AUTHORITY_SEAL_REJECTED_SUBJECT`), so a report
+        inside the notifier's cooldown cannot hold it back, and a reject counts once toward
+        escalation. The write and the alert run as one shielded unit, so a cancelled caller cannot
+        leave a committed rejection without its alert.
 
         The expiry is not tested, because ``expires_at`` is one of the unverified values. The
         store moves only a row it reads ``pending`` and failing that still carries the seal this
@@ -2311,13 +2319,15 @@ class ApprovalGate:
         ``seal_failed`` only. The answer names the stored operation and requester, unverified,
         for the caller's page.
 
-        A row that moved, was settled or changed since the read answers 409 and reports nothing
-        more: the gate's read reported it, throttled, before this write. A store fault answers
-        503, logs and pages ``audit_write_failed`` for ``approval.rejected`` as any decision's
-        fault does (:meth:`_store_fault`). The gate's read has reported the seal failure already,
-        throttled, so the report here, inside the shielded unit, adds one only once that interval
-        has passed. A defect in the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is
-        not answered as an outage to retry."""
+        One reject writes one seal-failure row and raises one alert, so the gate's read does not
+        report (BACKLOG #3638). A write that commits nothing has written no row, so each such
+        outcome reports through :meth:`_approval_seal_failed` instead, throttled as a read's
+        report is, inside the shielded unit (the Lander's decision of 2026-10-26). A row that
+        moved, was settled or changed since the read answers 409. A store fault answers 503, logs
+        and pages ``audit_write_failed`` for ``approval.rejected`` as any decision's fault does
+        (:meth:`_store_fault`), before the report, whose own audit write may wait out a store
+        timeout. A defect in the call (:data:`_READ_DEFECTS`) is raised as it is, so a bug is not
+        answered as an outage to retry."""
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and was rejected"
             f" (approval {scrub_log_argument(approval_id)})"
@@ -2355,20 +2365,25 @@ class ApprovalGate:
                     audits=audits,
                 )
             except _READ_DEFECTS:
+                await self._approval_seal_failed(approval_id)
                 raise  # a defect in the write path, not an outage
             except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
-                await self._approval_seal_failed(approval_id)
-                raise self._store_fault(
+                fault = self._store_fault(
                     approval_id,
                     exc,
                     what="rejection",
                     action="approval.rejected",
                     retry="If the request still reads pending, reject it again once the store "
                     "accepts writes",
-                ) from exc
+                )
+                await self._approval_seal_failed(approval_id)
+                raise fault from exc
             if moved:
                 log.warning("%s", reason)
-                authority_seal_alert(self._alert_sink)(reason)
+                subject = f"{AUTHORITY_SEAL_REJECTED_SUBJECT}:{scrub_log_argument(approval_id)}"
+                authority_seal_alert(self._alert_sink, subject=subject)(reason)
+            else:
+                await self._approval_seal_failed(approval_id)
             return moved
 
         moved = await self._shielded(_write_then_alert(), approval_id)
@@ -2380,9 +2395,12 @@ class ApprovalGate:
             "rejected_by": approver,
         }
 
-    async def _require_pending(self, approval_id: str) -> ApprovalRow:
+    async def _require_pending(self, approval_id: str, *, report: bool = True) -> ApprovalRow:
         row = await self._load(
-            approval_id, status="pending", wrong=lambda current: f"request is already {current}"
+            approval_id,
+            status="pending",
+            wrong=lambda current: f"request is already {current}",
+            report=report,
         )
         if row.expires_at is not None and row.expires_at <= self._clock():
             raise ApprovalError(409, "request has expired")
@@ -2391,7 +2409,7 @@ class ApprovalGate:
     # --- the request loaders (BACKLOG #2592) -------------------------------------------------------
 
     async def _load(
-        self, approval_id: str, *, status: str, wrong: Callable[[str], str]
+        self, approval_id: str, *, status: str, wrong: Callable[[str], str], report: bool = True
     ) -> ApprovalRow:
         """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
         :meth:`_verified_rows` and :meth:`_read_back_request`, which checks what it reads through
@@ -2406,7 +2424,8 @@ class ApprovalGate:
         that reads as wanted is still checked whole.
 
         The seal refusal is a :class:`_SealRefusal` carrying the row read, so :meth:`reject` can
-        close it (BACKLOG #3638)."""
+        close it (BACKLOG #3638). ``report=False`` leaves the report to that caller, which then
+        owes one on every path that does not end in its own (:meth:`_reject_seal_failed`)."""
         found = await self._read(
             self._store.get_pending_approval(approval_id), what="this approval request"
         )
@@ -2414,7 +2433,7 @@ class ApprovalGate:
             raise ApprovalError(404, "no such approval request")
         if str(found["status"]) != status:
             raise ApprovalError(409, wrong(scrub_log_argument(str(found["status"]))))
-        row = await self._verified(found)
+        row = await self._verified(found, report=report)
         if row is None:
             raise _SealRefusal(found)
         return row
@@ -2434,18 +2453,21 @@ class ApprovalGate:
                 failed.append(each)
         return out
 
-    async def _verified(self, found: Any) -> ApprovalRow | None:
+    async def _verified(self, found: Any, *, report: bool = True) -> ApprovalRow | None:
         """``found`` as a checked :class:`ApprovalRow`, or ``None`` when its seal fails, which is
-        reported. Its params and requester id are what a release acts on and what the
-        self-approval refusal compares, so a row changed outside the store acts on nothing."""
+        reported unless ``report`` is False. Its params and requester id are what a release acts on
+        and what the self-approval refusal compares, so a row changed outside the store acts on
+        nothing."""
         try:
             row = ApprovalRow.from_mapping(found)
         except RowSealError:
-            await self._approval_seal_failed(str(found["id"]))
+            if report:
+                await self._approval_seal_failed(str(found["id"]))
             return None
         if approval_seal_ok(self._store.row_sealer(), row):
             return row
-        await self._approval_seal_failed(row.id)
+        if report:
+            await self._approval_seal_failed(row.id)
         return None
 
     async def _approval_seal_failed(self, approval_id: str) -> None:
