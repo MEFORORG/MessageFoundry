@@ -6586,6 +6586,10 @@ class AuthService:
         # refusing a move, or anchoring to the start address, would change ADR 0142 Amendment B
         # and needs a ruling first.
         detail: dict[str, object] = {
+            # BACKLOG #2388, #3728: present only when the floor was deferred or the exemption let a
+            # too-early callback through, holding only configured values, never the token's own.
+            # First, so it can never overwrite a field this row sets, as on the refusal rows.
+            **floor_fields,
             "ok": elevation.ok,
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
@@ -6595,9 +6599,6 @@ class AuthService:
             "session_revoked": False,
             **self._step_up_address_fields(flow, client),
         }
-        # BACKLOG #2388: present only when the exemption let a too-early callback through, and
-        # holding only configured values, never the token's own.
-        detail.update(floor_fields)
         await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
