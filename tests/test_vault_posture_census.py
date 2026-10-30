@@ -274,6 +274,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
+        ("__main__.py", "_cipher_audit", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
@@ -474,6 +475,7 @@ _SERVE_DIAL = "(security_settings or SecuritySettings()).enforcement"
 _DERIVATIONS = sorted(
     [
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
+        ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
         ("__main__.py", "_provision_admin", "settings.security.enforcement"),
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),

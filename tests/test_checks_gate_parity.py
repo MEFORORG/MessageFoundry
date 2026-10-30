@@ -975,13 +975,15 @@ def test_connection_exposure_refusal_names_service_config(
     assert "`messagefoundry connection` has no --allow-insecure-bind" in out
     assert "No --service-config was given" in out and "--service-config <path" in out
     assert not (cfg / "connections.toml").exists()
-    # Named settings: the flag note stays, and the account of a missing --service-config goes.
+    # Named settings: the flag note stays, the account of a missing --service-config goes, and the
+    # refusal still says which file the escape was read from (vault BACKLOG #2908).
     svc = tmp_path / "svc.toml"
     svc.write_text("", encoding="utf-8")
     rc = main([*argv, "--service-config", str(svc)])
     out = capsys.readouterr().out
     assert rc == 1 and "`messagefoundry connection` has no --allow-insecure-bind" in out
     assert "No --service-config was given" not in out
+    assert "the cleartext escape is read from that file's [security] settings" in out
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

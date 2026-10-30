@@ -117,6 +117,12 @@ def test_claim_modes_defaults_to_single_per_lane() -> None:
     assert p.claim_modes == ("per_lane",)
 
 
+def test_operator_sweep_pins_the_pooled_claim_mode() -> None:
+    # BACKLOG #3132: the operator sweep is the N=1500 profile, and the engine default claim mode is
+    # pooled. Pinned so the claim mode is the shipped one and never a second variable between arms.
+    assert get_connscale_profile("connscale").claim_modes == ("pooled",)
+
+
 def test_claim_modes_ab_axis_parses_and_dedups() -> None:
     p = load_connscale_profile_text("""
 [connscale]

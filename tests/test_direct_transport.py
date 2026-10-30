@@ -65,9 +65,12 @@ from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _DOMAIN_ON_THE_WIRE,
     _NORMALISED_RECIPIENTS,
+    _PARTIAL_RECIPIENTS,
+    _PARTIAL_REFUSED,
     _REFUSED_ADDRESS_IDS,
     _REFUSED_ADDRESSES,
     _WireCapture,
+    assert_partial_refusal,
 )
 
 # A synthetic (never-real-PHI) HL7 body for the crypto round-trip (CLAUDE.md §9).
@@ -520,6 +523,21 @@ async def test_direct_envelope_does_not_follow_the_headers(
     assert headers == [b"From: another@partner.example", b"To: another@partner.example"]
     assert wire.mail_lines == [b"mail from:<sender@hisp.example>"]
     assert wire.rcpt_lines == [b"rcpt to:<recipient@hisp.example>"]
+
+
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+async def test_a_partial_rcpt_refusal_fails_the_direct_delivery(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], wire: _WireCapture, quit_ok: bool
+) -> None:
+    # One of two recipients refused (vault BACKLOG #2924): a permanent refusal, never a delivery,
+    # and a QUIT refused after it does not turn it into a retry.
+    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    if not quit_ok:
+        wire.quit_reply = b"500 no\r\n"
+    d = _wire_direct(monkeypatch, pki, wire.port, recipients=_PARTIAL_RECIPIENTS)
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert_partial_refusal(caught.value, f"Direct 127.0.0.1:{wire.port}", wire)
 
 
 @pytest.mark.parametrize(

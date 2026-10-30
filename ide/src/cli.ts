@@ -7,6 +7,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import { UNTRUSTED_WORKSPACE_STDERR, parseJsonResult, type CliResult } from "./cliJson";
+import { settingIsSet } from "./connectionWizardModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 
@@ -77,6 +78,12 @@ export function configDir(): string {
  *  the `alert` CLI creates it on first `add` if absent. */
 export function serviceConfig(): string {
   return config().get<string>("serviceConfig", "messagefoundry.toml");
+}
+
+/** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
+ *  `settingIsSet` and `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). */
+export function serviceConfigIsSet(): boolean {
+  return settingIsSet(config().inspect("serviceConfig"));
 }
 
 /**
