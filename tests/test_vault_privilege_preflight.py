@@ -122,7 +122,7 @@ def test_an_extra_capability_on_a_path_the_engine_calls_only_warns() -> None:
 
 def test_a_policy_name_the_probe_cannot_judge_only_warns() -> None:
     """The row's third ordinary setup: a name the probe cannot tell from root means cannot judge."""
-    hop = _hop(caps=_least_caps(), policies=("default", "rоot"))  # a Cyrillic o
+    hop = _hop(caps=_least_caps(), policies=("default", "r\u043eot"))  # a Cyrillic o
     assert hop.state is HopState.OVER_GRANTED
     assert hop.refusing == ()
     assert "cannot be told apart from root" in hop.detail
@@ -134,7 +134,7 @@ def test_a_policy_name_the_probe_cannot_judge_only_warns() -> None:
 def test_a_name_that_reads_as_root_only_once_stripped_only_warns() -> None:
     """A lookalike is a name the probe cannot tell from root by reading it, so it is reported as
     over-granted but is in the warning class, and the refusal never says the token holds root."""
-    hop = _hop(caps=_least_caps(), policies=("default", "r​oot"))
+    hop = _hop(caps=_least_caps(), policies=("default", "r\u200boot"))
     assert hop.state is HopState.OVER_GRANTED
     assert hop.refusing == ()
     assert "as far as reading it can tell" in hop.detail
@@ -392,7 +392,7 @@ def test_serve_verdict_keeps_an_accepted_store_over_grant_beside_a_vault_refusal
     over = StorePrivilegeReport(
         backend=StoreBackend.SQLSERVER,
         status=StorePrivilegeStatus.OBSERVED,
-        principal="CORP\mefor-svc$",
+        principal=r"CORP\mefor-svc$",
         database="MessageFoundry",
         excess=("server role sysadmin",),
     )
@@ -418,6 +418,14 @@ def test_serve_verdict_says_a_warning_class_grant_does_not_refuse() -> None:
     verdict = serve_verdict(_sqlite_report(), _VAULT_SETTINGS, [_hop(caps=caps)])
     assert verdict.startswith("would start")
     assert "vault.store warns only" in verdict
+
+
+def test_serve_verdict_never_calls_an_unread_vault_hop_a_warning() -> None:
+    """A run without the token (a scheduled task) says nothing about the token serve will read."""
+    blind = _hop(lookup_error=ConnectionError("vault.invalid"))
+    verdict = serve_verdict(_sqlite_report(), _VAULT_SETTINGS, [blind])
+    assert "vault.store could not be read here" in verdict
+    assert "warns only" not in verdict
 
 
 def test_serve_verdict_under_warn_refuses_nothing() -> None:

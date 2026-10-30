@@ -6,8 +6,10 @@ ADR 0216, ASVS 13.2.2).
 ``serve`` runs it after the store opens and before any listener binds, beside the store privilege
 preflight (:mod:`messagefoundry.store.privilege`, ADR 0199) and under the same teardown discipline.
 It probes each Vault consumer with the probe ``check-privileges`` runs
-(:func:`messagefoundry.privilege_probes.probe_vault`), through the client and the token the provider
-itself uses, and judges the readings with :func:`messagefoundry.privilege_check.vault_hops`.
+(:func:`messagefoundry.privilege_probes.probe_vault`): a client built by the provider's own
+constructor, with the token read again from the source the provider reads it from, so a token
+replaced between the store open and this read is the one judged. It judges the readings with
+:func:`messagefoundry.privilege_check.vault_hops`.
 
 **What it refuses is** :func:`~messagefoundry.privilege_check.vault_preflight_outcome` **and nothing
 else.** Under ``[security].enforcement = enforce`` a grant in the refusing class -- the root policy,

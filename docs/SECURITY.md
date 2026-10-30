@@ -1060,8 +1060,9 @@ is a PHI instance. SQLite has no login, so nothing here applies to it.
 
 **What `serve` does with a Vault finding ([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-10-04).** At every
 start, after the store preflight and before any listener binds, `serve` probes each Vault token it
-uses with the probe `check-privileges` runs, through the same client and the same token the
-provider uses. The over-grants above fall in two classes:
+uses with the probe `check-privileges` runs. It builds its client with the provider's own
+constructor and reads the token from the same variable or secrets-directory file the provider reads,
+at that moment. The over-grants above fall in two classes:
 
 - **The refusing class:** the `root` policy, and any grant on an administrative path the probe asks
   about, which includes a write of the token's own policies and a Transit key's `config`, `rotate`,

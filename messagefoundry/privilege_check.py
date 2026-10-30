@@ -759,28 +759,33 @@ def serve_verdict(
     not serve would start, because the grant is still wider than the runbook's.
 
     The store finding and a Vault grant in the refusing class gate a start. A Vault finding that
-    only warns, an accepted Vault over-grant, and an LDAP over-grant are named after the verdict, so
-    nobody reads one as a refusal."""
+    only warns, an accepted Vault over-grant, a Vault hop this run could not read, and an LDAP
+    over-grant are named after the verdict, so nobody reads one as a refusal or as a clean start."""
     hops = list(hops)
     security = settings.security
     enforcing = security.enforcement is SecurityEnforcement.ENFORCE
     vault: dict[PreflightOutcome, list[str]] = {}
+    unread: list[str] = []
     for h in hops:
-        if h.hop.startswith("vault"):
-            outcome = vault_preflight_outcome(
-                h,
-                enforcing=enforcing,
-                over_grant_accepted=security.allow_over_granted_vault_token,
-            )
-            vault.setdefault(outcome, []).append(h.hop)
-    store = _store_verdict(report, settings)
+        if not h.hop.startswith("vault"):
+            continue
+        if h.state is HopState.UNOBSERVABLE:
+            # Not "warns only": what this run could not read says nothing about the token serve
+            # will read, which may be a different one (a scheduled task often lacks it).
+            unread.append(h.hop)
+            continue
+        outcome = vault_preflight_outcome(
+            h, enforcing=enforcing, over_grant_accepted=security.allow_over_granted_vault_token
+        )
+        vault.setdefault(outcome, []).append(h.hop)
+    store_outcome, store = _store_verdict(report, settings)
     refused = vault.get(PreflightOutcome.REFUSE, [])
     notes: list[str] = []
-    if refused and store.startswith("would REFUSE"):
+    if refused and store_outcome is PreflightOutcome.REFUSE:
         verdict = f"{store}; and {vault_refusal_reason(refused)}"
     elif refused:
         verdict = f"would REFUSE to start: {vault_refusal_reason(refused)}"
-        if store != _STORE_CLEAN:
+        if store_outcome is not PreflightOutcome.CLEAN:
             # An accepted or warned store finding must not drop out of the line because a Vault
             # token refuses first.
             notes.append(f"the store alone {store}")
@@ -793,6 +798,11 @@ def serve_verdict(
         )
     if warned := vault.get(PreflightOutcome.WARN):
         notes.append(f"{', '.join(warned)} warns only; it does not refuse a start")
+    if unread:
+        notes.append(
+            f"{', '.join(unread)} could not be read here, so this line cannot say what serve "
+            "would do with it; serve reads the token again at start"
+        )
     ungated = [
         h.hop
         for h in hops
@@ -805,10 +815,9 @@ def serve_verdict(
     return verdict + "".join(f" ({n})" for n in notes)
 
 
-_STORE_CLEAN = "would start: the store probe found nothing to refuse"
-
-
-def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> str:
+def _store_verdict(
+    report: StorePrivilegeReport, settings: ServiceSettings
+) -> tuple[PreflightOutcome, str]:
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     rlp = settings.store.require_least_privilege
     outcome = preflight_outcome(
@@ -818,13 +827,15 @@ def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> s
         over_grant_accepted=settings.security.allow_over_granted_store_principal,
     )
     if outcome is PreflightOutcome.REFUSE:
-        return f"would REFUSE to start: {refusal_reason(require_least_privilege=rlp)}"
-    if outcome is PreflightOutcome.ACCEPTED:
-        return f"would start: the over-grant is accepted by {OVER_GRANT_OPT_OUT} (audited)"
-    if outcome is PreflightOutcome.WARN:
+        text = f"would REFUSE to start: {refusal_reason(require_least_privilege=rlp)}"
+    elif outcome is PreflightOutcome.ACCEPTED:
+        text = f"would start: the over-grant is accepted by {OVER_GRANT_OPT_OUT} (audited)"
+    elif outcome is PreflightOutcome.WARN:
         why = "the probe could not observe the principal" if enforcing else "enforcement is 'warn'"
-        return f"would start with a warning ({why})"
-    return _STORE_CLEAN
+        text = f"would start with a warning ({why})"
+    else:
+        text = "would start: the store probe found nothing to refuse"
+    return outcome, text
 
 
 def render_text(hops: Iterable[HopPrivilege]) -> list[str]:

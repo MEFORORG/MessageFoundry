@@ -11663,8 +11663,8 @@ def create_managed_app(
         # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
         # server principal), so the default single-node path is a log line and nothing else.
         # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
-        # probe check-privileges runs and through the provider's own client, in the same try and so
-        # under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+        # probe check-privileges runs and a client from the provider's own constructor, in the same
+        # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
         # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
         # it (audited); every other finding warns and audits. It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has

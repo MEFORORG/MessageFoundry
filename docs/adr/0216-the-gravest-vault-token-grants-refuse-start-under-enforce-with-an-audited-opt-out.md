@@ -68,11 +68,13 @@ preflight and `check-privileges` both call it, and it returns the store prefligh
 **The preflight runs at every `serve` start**, in `messagefoundry/vault_preflight.py`, called from
 the managed lifespan in `api/app.py` after the store privilege preflight and before any listener
 binds, with the same teardown on a refusal. It names the consumers from the resolved service
-settings (`vault_consumers`), probes each through `probe_vault` -- the provider's own client, the
-provider's own token and address, the instance hop posture and the hop's revocation attestation --
-and runs the probe off the event loop. Since BACKLOG #2851 the providers refuse an unset
-`MEFOR_*_VAULT_TOKEN` rather than fall back to `VAULT_TOKEN`, so the probe reads the token the
-provider uses, and the row's first closing point needs no change of its own. Each probed hop writes
+settings (`vault_consumers`), probes each through `probe_vault` -- a client from the provider's own
+constructor, the token and address read from the provider's own sources, the instance hop posture
+and the hop's revocation attestation -- and runs the probe off the event loop. Since BACKLOG #2851
+the providers refuse an unset `MEFOR_*_VAULT_TOKEN` rather than fall back to `VAULT_TOKEN`, so the
+probe reads the token from the source the provider reads, and the row's first closing point needs no
+change of its own. The probe reads it again rather than sharing the provider's client, so a token
+replaced between the store open and the probe is the one judged. Each probed hop writes
 one `vault_privilege_preflight` audit row, best effort, before any refusal. With no Vault consumer
 configured nothing is probed and no row is written.
 
