@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -1950,6 +1950,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
+    # BACKLOG #3756: the waits between an inverse's resolve attempts, so it is tried one more time
+    # than there are waits before the sink gives up and logs an ERROR. Each wait runs while the
+    # retry holds the key's lock, so a later write for that key waits it out. They add up to
+    # 1.75 s, well inside the 5 s the engine gives drain_state at stop
+    # (engine._ALERT_STATE_DRAIN_SECONDS).
+    _INVERSE_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+
     def _record_state(
         self,
         event: dict[str, Any],
@@ -1962,15 +1969,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
         store. A no-op when no store is wired (state tracking off). The store write never raises into the
         ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker.
-        ``on_settled`` is called once: True when the write lands, False when it fails, is cancelled, or
-        never runs (no loop, or cancelled before its first step)."""
+        An inverse's resolve is retried there a bounded number of times (BACKLOG #3756); an upsert is
+        tried once. ``on_settled`` is called once: True when the write lands, False when its last
+        attempt fails, it is cancelled, or it never runs (no loop, or cancelled before its first
+        step)."""
         store = self._store
         if store is None:
             return
         etype = str(event.get("type", ""))
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
-        coro: Coroutine[Any, Any, Any]
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
         # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
@@ -1984,21 +1992,29 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # escalation_tier were on the now-resolved row and never return via list_active).
             self._suspended.pop(key, None)
             self._occurrences.pop(key, None)
-            coro = store.resolve_alert_instances_for(
-                event_type=inverse_of, connection=connection, now=now
-            )
+
+            # A factory, not a built coroutine: a coroutine can be awaited only once, and a retry
+            # needs a fresh one. Nothing is built until the background task runs.
+            def write() -> Awaitable[Any]:
+                return store.resolve_alert_instances_for(
+                    event_type=inverse_of, connection=connection, now=now
+                )
+
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
-            coro = store.upsert_alert_instance(
-                event_type=etype,
-                connection=connection,
-                severity=severity,
-                reason=reason,
-                escalation_tier=escalation_tier,
-                now=now,
-            )
+
+            def write() -> Awaitable[Any]:
+                return store.upsert_alert_instance(
+                    event_type=etype,
+                    connection=connection,
+                    severity=severity,
+                    reason=reason,
+                    escalation_tier=escalation_tier,
+                    now=now,
+                )
+
         settle: Callable[[bool], None] | None = None
         if on_settled is not None:
             settled = False
@@ -2012,15 +2028,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     except Exception:
                         log.exception("alert-instance settle callback failed")
 
-        wrapper = self._run_state(coro, key, settle)
+        wrapper = self._run_state(write, key, settle, resolves=inverse_of, connection=connection)
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
-            # so drop it rather than raise into the caller. The notification path is unaffected.
-            # Close both coroutines so neither warns "never awaited".
+            # so drop it rather than raise into the caller. The notification path is unaffected, and
+            # no retry can help: there is no loop to run one on. Close the wrapper so it does not
+            # warn "never awaited"; the store coroutine was never built.
             wrapper.close()
-            coro.close()
             if settle is not None:
                 settle(False)
             return
@@ -2031,31 +2047,63 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if settle is not None:
                 # A no-op once _run_state settled; this covers a cancel before its first step.
                 settle(False)
-            # A task cancelled before its first step never reached the await; close the store
-            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
-            coro.close()
 
         task.add_done_callback(_done)
 
     async def _run_state(
         self,
-        coro: Coroutine[Any, Any, Any],
+        write: Callable[[], Awaitable[Any]],
         key: str,
         on_settled: Callable[[bool], None] | None = None,
+        *,
+        resolves: str | None = None,
+        connection: str = "",
     ) -> None:
+        """Run one alert-instance write under its key's lock. ``resolves`` names the alert type an
+        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not."""
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
         # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
+        # The retries and their waits run INSIDE the lock, so a write emitted later for the same key
+        # cannot land between a failed attempt and the retry that follows it.
+        delays = () if resolves is None else self._INVERSE_RETRY_DELAYS
+        attempts = len(delays) + 1
         landed = False
         try:
             async with hold_keyed_lock(self._state_locks, key):
-                await coro
-            landed = True
-        except Exception:
-            # The alert-instance write is a side observer: a store error must never wedge a delivery
-            # worker or drop the notification. Log metadata only (no event body).
-            log.warning("alert-instance state write failed", exc_info=True)
+                for attempt in range(1, attempts + 1):
+                    try:
+                        await write()
+                    except Exception:
+                        # The alert-instance write is a side observer: a store error must never wedge
+                        # a delivery worker or drop the notification. Log metadata only (no event body),
+                        # and the traceback once, on the last attempt.
+                        log.warning(
+                            "alert-instance state write failed", exc_info=attempt == attempts
+                        )
+                        if attempt < attempts:
+                            await asyncio.sleep(delays[attempt - 1])
+                    else:
+                        landed = True
+                        break
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve gave up after %d attempts: the open %s alert for %r "
+                    "stays open",
+                    attempts,
+                    resolves,
+                    connection,
+                )
+        except asyncio.CancelledError:
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve was cancelled before it landed: the open %s alert for "
+                    "%r stays open",
+                    resolves,
+                    connection,
+                )
+            raise
         finally:
             # A cancel, too, is settled as not landed: the row is most likely still open.
             if on_settled is not None:
@@ -2065,10 +2113,21 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
         calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
         node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
-        still running at the deadline is left to fail as before; this never raises."""
+        still running at the deadline, a resolve's retry among them, is cancelled and logged at
+        ERROR (BACKLOG #3756), so no retry outlives the store; this never raises and does not wait
+        for the cancelled writes to finish."""
         pending = set(self._state_tasks)
-        if pending:
-            await asyncio.wait(pending, timeout=timeout)
+        if not pending:
+            return
+        _, late = await asyncio.wait(pending, timeout=timeout)
+        if late:
+            for task in late:
+                task.cancel()
+            log.error(
+                "%d alert-instance state write(s) still running at the alert-state drain deadline "
+                "were cancelled",
+                len(late),
+            )
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 

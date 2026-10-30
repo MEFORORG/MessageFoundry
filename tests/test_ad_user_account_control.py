@@ -1551,11 +1551,13 @@ async def test_an_estate_that_reads_only_absent_does_not_release_a_hold(
         assert await _open_alerts(store) == {ABORTED, HELD}
 
 
-async def test_a_resolve_the_store_failed_to_write_is_retried_on_the_next_pass(
+async def test_a_resolve_the_store_failed_to_write_once_lands_in_the_same_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The notifier writes alert state fire-and-forget and only logs a failure. So the inverse is
-    raised on every clear pass, not once, and the next pass resolves what the last one could not."""
+    """The notifier retries an inverse's resolve within a bound (BACKLOG #3756), so one failed
+    store write no longer leaves the alert open until the next pass: the retry lands it in the
+    same pass."""
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.0, 0.0, 0.0))
     names = ["u1", "u2", "ok1", "ok2", "ok3"]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
         sink = NotifierAlertSink([], store=store)
@@ -1574,7 +1576,40 @@ async def test_a_resolve_the_store_failed_to_write_is_retried_on_the_next_pass(
 
         monkeypatch.setattr(store, "resolve_alert_instances_for", failing_once)
         assert (await _alerted_pass(service, sink)).hold_clear
+        assert not failures, "the synthetic failure never fired"
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_resolve_the_store_never_wrote_is_retried_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolve whose every attempt fails gives up and leaves the alert open. So the inverse is
+    raised on every clear pass, not once, and the next pass resolves what the last one could not."""
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        real = store.resolve_alert_instances_for
+        failing = True
+        attempts = 0
+
+        async def failing_while_set(
+            *, event_type: str, connection: str, now: float | None = None
+        ) -> int:
+            nonlocal attempts
+            if event_type == "ad_reconcile_held" and failing:
+                attempts += 1
+                raise sqlite3.OperationalError("synthetic: database is locked")
+            return await real(event_type=event_type, connection=connection, now=now)
+
+        monkeypatch.setattr(store, "resolve_alert_instances_for", failing_while_set)
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert attempts == 4  # every attempt failed, and the resolve gave up
         assert await _open_alerts(store) == {HELD}, "the failed resolve went through after all"
+        failing = False
         assert (await _alerted_pass(service, sink)).hold_clear
         assert await _open_alerts(store) == set()
 
