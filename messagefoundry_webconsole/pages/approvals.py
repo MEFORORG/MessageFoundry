@@ -126,8 +126,9 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
     "seal_failed": (
         "FLAGGED: this request failed its integrity check. It was changed outside the engine, or "
         "sealed under a store key this engine does not hold. Its details may not be what was "
-        "requested, and its parameters are withheld. It can never be approved. {verb} it to close "
-        "it, and request the operation again if it is still needed."
+        "requested, and its parameters are withheld. It cannot be approved while this lasts. If a "
+        "store key is missing, restore it first, because a reject cannot be undone. Otherwise, "
+        "{verb} it to close it, and request the operation again if it is still needed."
     ),
 }
 

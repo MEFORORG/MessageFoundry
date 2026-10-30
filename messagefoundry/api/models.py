@@ -565,14 +565,14 @@ class PendingApprovalInfo(BaseModel):
     does. The read can still report a requester account whose integrity seal fails, as any read
     of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
-    standing the listing could not read, the row's seal and the operation's own refusals, such as a
+    standing the listing could not read, a seal that fails after the listing and the operation's own refusals, such as a
     held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
     an ``interrupted`` row.
 
     ``seal_failed`` (BACKLOG #3639; owner ruling 2026-10-26) marks a ``pending`` row that failed
     its integrity seal: it was changed outside the engine, or sealed under a store key this engine
-    does not hold. It is never released, and the reject
-    closes it (BACKLOG #3638). Its ``params`` are ALWAYS ``None``, withheld rather than
+    does not hold. It is refused before every value above and is not released while it fails,
+    and the reject closes it (BACKLOG #3638). Its ``params`` are ALWAYS ``None``, withheld rather than
     unreadable, and its other values are shown as stored, unverified; ``caller_is_requester`` is
     False on it. ``ApprovalGate._seal_failed_entry`` is the source of record."""
 

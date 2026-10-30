@@ -178,11 +178,13 @@ def _unverified_float(value: Any) -> float | None:
     render: not a number, not finite (a JSON reply refuses NaN and infinity), or outside the epoch
     to :data:`_LATEST_SHOWN_TIME`. The row failed its check, so nothing decides on this (BACKLOG
     #3639)."""
+    if value is None:
+        return None
     try:
-        number = None if value is None else float(value)
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    if number is None or not math.isfinite(number) or not 0.0 <= number <= _LATEST_SHOWN_TIME:
+    if not math.isfinite(number) or not 0.0 <= number <= _LATEST_SHOWN_TIME:
         return None
     return number
 

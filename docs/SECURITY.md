@@ -2885,17 +2885,21 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
   `integrity_drift` alert is raised after the commit, because an alert sink cannot join a
   transaction. A crash in that gap leaves the audit rows and no page, and nothing raises it again.
   The alert's subject is `authority-seal-rejected:<approval id>`, apart from `authority-seal`, so
-  a report inside the notifier's cooldown cannot hold it back. One reject writes one such row and
-  raises one such alert.
-- A reject whose write commits nothing (the row moved or changed since the read, a store fault, or
-  a defect in the write) writes the ordinary report instead, throttled per request as the queue
+  a report inside the notifier's cooldown cannot hold it back. A rule matches every such subject
+  with the glob `authority-seal-rejected:*`. Each is its own alert instance, so an escalation tier
+  above one occurrence never fires on it. One reject writes one such row and raises one such alert.
+- A reject whose write moved nothing (the row moved or changed since the read), raised a store
+  fault, or raised a defect writes the ordinary report instead, throttled per request as the queue
   listing and an approve do: an `integrity.authority_seal_failed` row and an `integrity_drift`
-  alert under `authority-seal`.
+  alert under `authority-seal`. A store fault is read as nothing committed, so where a COMMIT
+  landed and only its reply was lost, this report and a 503 stand in for the rejection's alert.
+  The audit rows committed with it, and a second reject answers that it is already rejected.
 - `rotate-key`'s re-seal pass checks a row that fails its approval seal as a tombstone, under the
   key the tombstone names. One that holds gets a tombstone under the active key and is counted
   re-sealed. One that fails, like any other failing row, is left as it is, counted and logged.
 - A seal also fails for a row sealed under a store key this engine does not hold, so a flag is not
-  proof of tampering. The page says so.
+  proof of tampering. The page says so, and says to restore a missing key first: a reject cannot be
+  undone.
 
 At least these limits remain:
 

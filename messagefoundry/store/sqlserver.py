@@ -13041,7 +13041,7 @@ class SqlServerStore:
     async def _write_approval(
         self, cur: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
     ) -> bool:
-        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        """The writer of a sealed ``pending_approvals`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_approval`` states the contract. Call it on ``cur`` inside an open
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer

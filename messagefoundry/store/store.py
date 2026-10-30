@@ -3885,8 +3885,9 @@ def report_role_reseal(resealed: int, refused: int) -> None:
 #
 # One seal per ``pending_approvals`` row, over every other column. It binds what a release acts on:
 # the captured ``params`` (a held reload's config digest among them) and ``requester_user_id``,
-# which the self-approval refusal compares. Each backend writes the table through one helper,
-# ``_write_approval``. A new request is sealed as it is inserted. A status change reads the row,
+# which the self-approval refusal compares. Each backend writes a sealed row through one helper,
+# ``_write_approval``; only the seal-failed reject's tombstone and its re-seal at a key rotation
+# write the table apart from it. A new request is sealed as it is inserted. A status change reads the row,
 # checks its seal, and writes the changed row and its new seal only if the row still carries the
 # seal it read, so a row that fails is never re-sealed. ``ApprovalGate`` checks the seal where it
 # reads a request.
@@ -15310,7 +15311,7 @@ class MessageStore:
         current: ApprovalRow | None = None,
         unless_open: tuple[Any, ...] | None = None,
     ) -> bool:
-        """The one writer of a ``pending_approvals`` row (BACKLOG #2592). Call it inside an open
+        """The writer of a sealed ``pending_approvals`` row (BACKLOG #2592). Call it inside an open
         write. Returns whether a row was written.
 
         With no ``current`` it inserts ``new``, sealed; with ``unless_open`` (the four
