@@ -502,7 +502,7 @@ class _NodeIds:
                 for child in items:
                     if isinstance(child, (dict, list)) and id(child) not in memo:
                         stack.append(child)
-                        if len(order) + len(stack) > _NODE_BUDGET:
+                        if len(order) + len(stack) > _NODE_BUDGET - self._interned:
                             raise _TooManyNodes  # before walking what the budget cannot take
             for container in reversed(order):
                 items = container.values() if isinstance(container, dict) else container

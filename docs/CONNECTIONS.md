@@ -2596,9 +2596,10 @@ What a site needs to know:
   depth below it (vault BACKLOG #3796), the reply is judged as above. Values are compared as JSON
   values, so `1` differs from `true` and `1.0`. Otherwise the update is a permanent
   refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
-  as delivered, as with a reply over the byte bound below. A reply whose repeated occurrences are
-  too large to judge within the bound the ADR states is refused the same way; the rest of a reply's
-  size does not count toward it. The full rule, with what counts as
+  as delivered, as with a reply over the byte bound below. A reply whose repeated occurrences and
+  compared values (the resource type, the judgment, `etag`, `location` and `lastModified`) are
+  too large to judge within the bound the ADR states is refused the same way; only those count
+  toward it. The full rule, with what counts as
   agreement and its costs, is in
   [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
   the 2026-10-17 entry.

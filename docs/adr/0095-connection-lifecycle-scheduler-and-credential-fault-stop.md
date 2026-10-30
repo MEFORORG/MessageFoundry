@@ -501,6 +501,8 @@ reads two ways refuses even where the reply's two readings reach one judgment, f
 `response` repeating `status` as `200 OK` then `201 Created`, beside a second `response` that does
 not repeat it. A reply whose repeated occurrences or compared values need more than the backstop
 allows refuses although its readings may agree; the rest of the reply does not count toward it.
+So a compared value too large for the backstop refuses as `reply-repeats-a-key`, where `main`
+delivered it; a valid FHIR reply carries no such value.
 
 Measured on 2026-10-30 at the 16 MiB read cap, under `tracemalloc` on the same Windows box, for
 `_agreed_reading` alone (the plain read, the keep-first parse and the compare, not FhirPeek's parse
