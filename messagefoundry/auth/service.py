@@ -6822,6 +6822,11 @@ class AuthService:
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
         federated = federated_subject is not None or mech == "oidc"
+        if federated and federated_subject is None:
+            # BACKLOG #2738 item 8, a programming error too. A federated login with no verified pair
+            # would skip the bound-row refusal below, and its session insert would require no pair,
+            # so it could sign in an account bound to another identity. No production caller does.
+            raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
             # other mechanism would let that OIDC session step up by password (ADR 0142 Amendment B).
