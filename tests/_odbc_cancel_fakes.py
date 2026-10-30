@@ -30,6 +30,8 @@ from messagefoundry.store.sqlserver import SqlServerStore
 # so a wedged case fails as a timeout instead of hanging the suite.
 WAIT = 5.0
 USE_AFTER_FREE = "USE-AFTER-FREE"
+# Logged when AioConn.__del__ closes a raw handle the connection still held.
+DEL_CLOSE = "del:raw-close"
 
 
 def always(sql: str) -> bool:
@@ -217,11 +219,17 @@ class AioConn:
     async def close(self) -> None:
         if self._conn is None:
             return
-        # Logged on the loop as the close is submitted, so an arm can start its "not yet" window
-        # at the close rather than at the cancel.
-        self._conn.note("close:submitted")
         await self._execute(self._conn.close)
         self._conn = None
+
+    def __del__(self) -> None:
+        # aioodbc 0.5.0's shape: a connection collected while it still holds its handle closes it
+        # synchronously, on whatever thread runs the collector, outside any gate.
+        raw = getattr(self, "_conn", None)
+        if raw is not None:
+            raw.note(DEL_CLOSE)
+            raw.close()
+            self._conn = None
 
 
 class Pool:
@@ -273,12 +281,3 @@ async def wait_for_entry(log: list[str], entry: str) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"{entry!r} never happened (log={log})")
-
-
-async def assert_never_within(log: list[str], entry: str, within: float) -> None:
-    """``entry`` stays out of ``log`` for ``within`` seconds. Without the gate the close it watches
-    for lands in milliseconds, so a fraction of a second discriminates."""
-    for _ in range(int(within / 0.01)):
-        assert entry not in log, f"{entry!r} happened early (log={log})"
-        await asyncio.sleep(0.01)
-    assert entry not in log, f"{entry!r} happened early (log={log})"

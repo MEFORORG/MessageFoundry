@@ -436,7 +436,8 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 
     The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
     quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
-    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
+    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`). The
+    cancellation exit of an unpooled one-shot connection uses it too (:func:`_abandon_one_shot`).
 
     **The first write is the guarantee, and nothing here awaits.** aioodbc derives
     ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
@@ -2854,15 +2855,45 @@ async def _assert_autocommit(conn: Any) -> None:
     setter goes through the ODBC driver, so it runs off the event loop, through the connection's
     own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
     cancellation during the set cannot let the connection's close free the handle under it
-    (BACKLOG #2394). A stand-in with no ``_execute`` gets a plain thread."""
+    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread."""
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
-    execute = getattr(conn, "_execute", None)
-    if callable(execute):
-        await execute(setattr, raw, "autocommit", True)
+    if _call_gate(conn) is not None:
+        await conn._execute(setattr, raw, "autocommit", True)
     else:
         await asyncio.to_thread(setattr, raw, "autocommit", True)
+
+
+def _abandon_one_shot(conn: Any, cur: Any) -> None:
+    """The cancellation exit of an unpooled one-shot connection (BACKLOG #2394): the pooled
+    quarantine's rule for a connection with no pool.
+
+    The cursor goes to the call gate, then :func:`_detach_connection` drops the connection's handle.
+    The gate closes both once the running call returns, cursor first. Nothing here awaits, so the
+    cancellation propagates at once instead of waiting for a statement that may be an ``ALTER
+    DATABASE`` with no command timeout. Dropping ``_conn`` at once also keeps aioodbc's ``__del__``
+    from closing the handle outside the gate if the collector reaches the connection first."""
+    gate = _call_gate(conn)
+    raw_cur = getattr(cur, "_impl", None)
+    if gate is not None and raw_cur is not None:
+        gate.abandon(raw_cur)
+    _detach_connection(conn)
+
+
+async def _close_one_shot(conn: Any, cur: Any) -> None:
+    """The normal exit of an unpooled one-shot connection: the cursor first, then the connection.
+
+    A cursor left for the collector after its connection closed is freed from wherever the
+    interpreter happens to be, the native-abort shape ``tests/_live_scratch.py`` records. A failure
+    is logged, not raised: a peer's ``ROLLBACK IMMEDIATE`` may already have killed the session."""
+    for handle in (cur, conn):
+        if handle is None:
+            continue
+        try:
+            await handle.close()
+        except Exception:  # noqa: BLE001 - best effort; the caller's own outcome stands
+            log.debug("one-shot connection close failed", exc_info=True)
 
 
 def _options_off(row: Any) -> list[str]:
@@ -4175,6 +4206,8 @@ class SqlServerStore:
                     probe = await aioodbc.connect(
                         dsn=dsn, autocommit=True, timeout=settings.connect_timeout
                     )
+                    pcur: Any = None
+                    abandoned = False
                     try:
                         _install_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         pcur = await probe.cursor()
@@ -4183,8 +4216,14 @@ class SqlServerStore:
                             " WHERE name = DB_NAME()"
                         )
                         prow = await pcur.fetchone()
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            abandoned = True
+                            _abandon_one_shot(probe, pcur)
+                        raise
                     finally:
-                        await probe.close()
+                        if not abandoned:
+                            await _close_one_shot(probe, pcur)
                 except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
                     log.debug("RCSI re-read on %r failed", db, exc_info=True)
                     continue
@@ -4202,15 +4241,16 @@ class SqlServerStore:
             raise RuntimeError(
                 f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
             ) from exc
+        cur: Any = None
+        abandoned = False
         try:
-            # BACKLOG #2394: on a cancellation the `conn.close()` below would otherwise free the
-            # handles under a statement still running on its executor thread; the gate makes it wait
-            # for that call to return. The probe connections of `_rcsi_on_after_a_peer` get the same.
+            # BACKLOG #2394: a cancellation exits through `_abandon_one_shot`, so no handle is freed
+            # under a statement still running on its executor thread. The probe connections of
+            # `_rcsi_on_after_a_peer` exit the same way.
             _install_call_gate(conn)
             await _assert_autocommit(conn)
-            # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
-            # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
-            # guards against on the pooled paths.
+            # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
+            # guards against cannot arise; `_close_one_shot` still closes the cursor first.
             cur = await conn.cursor()
             await cur.execute(
                 "SELECT is_read_committed_snapshot_on, snapshot_isolation_state "
@@ -4273,11 +4313,14 @@ class SqlServerStore:
                         exc,
                         _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
                     )
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                abandoned = True
+                _abandon_one_shot(conn, cur)
+            raise
         finally:
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
-                log.debug("RCSI probe connection close failed", exc_info=True)
+            if not abandoned:
+                await _close_one_shot(conn, cur)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066

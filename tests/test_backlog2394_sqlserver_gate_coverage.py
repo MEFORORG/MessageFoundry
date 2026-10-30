@@ -8,9 +8,10 @@ arms pin the paths that gate did not reach, with the same shared fakes
 freed handle instead of crashing on it.
 
 * ``SqlServerStore._ensure_database_options`` opens its own autocommit connection before the pool
-  exists, and fresh probe connections when its ALTER fails. A cancellation while a statement runs
-  there reaches ``conn.close()`` in a ``finally``; ungated, that close frees the handles under the
-  statement on another thread.
+  exists, and fresh probe connections when its ALTER fails. A cancellation while a statement ran
+  there reached ``conn.close()`` in a ``finally``, which freed the handles under the statement on
+  another thread. It now exits like the pooled quarantine: the cursor goes to the gate, the
+  connection is detached, and the cancellation does not wait for the statement.
 * ``_assert_autocommit`` sets ``autocommit`` on the raw handle, a driver call, off the loop. A
   close beside it frees the handle under the set.
 * ``SqlServerCoordinator._ensure_tables`` held a bare cursor on a gated connection. On a cancel it
@@ -23,6 +24,7 @@ here needs a server.
 from __future__ import annotations
 
 import asyncio
+import gc
 import sys
 import threading
 import types
@@ -39,12 +41,12 @@ from messagefoundry.odbc_call_gate import call_gate
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests._odbc_cancel_fakes import (
+    DEL_CLOSE,
     USE_AFTER_FREE,
     WAIT,
     AioConn,
     Pool,
     RawConn,
-    assert_never_within,
     bare_store,
     cancel_once_started,
     never,
@@ -57,8 +59,6 @@ _STATE_READ = (
 )
 _PROBE_READ = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
 _ALTER_RCSI = "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
-# Measured from the close's submission: without the gate that close lands in milliseconds.
-_EARLY = 0.1
 
 
 def _selects(sql: str) -> bool:
@@ -100,15 +100,20 @@ async def rig() -> AsyncIterator[_Rig]:
 
 
 def _aioodbc_serving(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig, raws: list[RawConn]
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, raws: list[RawConn], *, keep: bool = False
 ) -> list[AioConn]:
     """Stand ``aioodbc`` in: each ``connect`` hands out the next of ``raws``, wrapped as aioodbc
-    wraps it. Returns the connections made, in order."""
+    wraps it. With ``keep`` it returns the connections made. Without, it holds no reference, so the
+    collector can reach them and run their aioodbc-shaped ``__del__``, as it could in a real open."""
     made: list[AioConn] = []
+    count = 0
 
     async def _connect(**kwargs: Any) -> AioConn:
-        conn = AioConn(raws[len(made)], rig.executor)
-        made.append(conn)
+        nonlocal count
+        conn = AioConn(raws[count], rig.executor)
+        count += 1
+        if keep:
+            made.append(conn)
         return conn
 
     module = types.ModuleType("aioodbc")
@@ -117,10 +122,17 @@ def _aioodbc_serving(
     return made
 
 
-async def _release_and_reap(rig: _Rig, task: asyncio.Task[Any]) -> None:
-    rig.release.set()
+async def _cancel_open_mid_call(rig: _Rig) -> None:
+    """Cancel an open while its blocking driver call runs, and require the cancellation to
+    propagate long before that call returns: a cancelled open must not wait on a statement that
+    may be an ``ALTER DATABASE`` with no command timeout. Then run the collector, which may reach
+    the abandoned connection while its statement still runs."""
+    task = await cancel_once_started(
+        rig.started, SqlServerStore._ensure_database_options(_settings())
+    )
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, WAIT)
+        await asyncio.wait_for(task, 1.0)
+    gc.collect()
 
 
 # --- the store's open-time connections -----------------------------------------------------------
@@ -131,36 +143,33 @@ async def test_a_cancelled_state_read_frees_nothing_until_it_returns(
 ) -> None:
     """The RCSI connection. Red before #2394: its close ran on another thread at once."""
     _aioodbc_serving(monkeypatch, rig, [rig.raw(blocks=_selects, rows={_STATE_READ: (1, 1)})])
-    task = await cancel_once_started(
-        rig.started, SqlServerStore._ensure_database_options(_settings())
-    )
+    await _cancel_open_mid_call(rig)
+    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
+    assert not {"cursor.close", "conn.close", DEL_CLOSE} & set(rig.log), rig.log
 
-    await wait_for_entry(rig.log, "close:submitted")
-    await assert_never_within(rig.log, "conn.close", _EARLY)
-    await _release_and_reap(rig, task)
+    rig.release.set()
     await wait_for_entry(rig.log, "conn.close")
 
     assert USE_AFTER_FREE not in rig.log, rig.log
-    assert rig.log.index("execute:end") < rig.log.index("conn.close"), rig.log
+    end = rig.log.index("execute:end")
+    assert end < rig.log.index("cursor.close") < rig.log.index("conn.close"), rig.log
 
 
 async def test_a_cancelled_autocommit_set_frees_nothing_until_it_returns(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """``_assert_autocommit``. Gating the connection is not enough here: the set must run through
-    the gate too, or the gated close does not wait for it."""
+    the gate too, or the detached close does not wait for it."""
     _aioodbc_serving(
         monkeypatch,
         rig,
         [rig.raw(blocks=never, rows={_STATE_READ: (1, 1)}, block_autocommit=True)],
     )
-    task = await cancel_once_started(
-        rig.started, SqlServerStore._ensure_database_options(_settings())
-    )
+    await _cancel_open_mid_call(rig)
+    assert "autocommit:end" not in rig.log, "the arm is vacuous: the set had already returned"
+    assert not {"conn.close", DEL_CLOSE} & set(rig.log), rig.log
 
-    await wait_for_entry(rig.log, "close:submitted")
-    await assert_never_within(rig.log, "conn.close", _EARLY)
-    await _release_and_reap(rig, task)
+    rig.release.set()
     await wait_for_entry(rig.log, "conn.close")
 
     assert USE_AFTER_FREE not in rig.log, rig.log
@@ -174,37 +183,39 @@ async def test_a_cancelled_reread_on_a_probe_frees_nothing_until_it_returns(
     """``_rcsi_on_after_a_peer``'s fresh probe connection, reached when our ALTER fails."""
     main = rig.raw("main", blocks=never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI}))
     probe = rig.raw("probe", blocks=_selects, rows={_PROBE_READ: (1,)})
-    made = _aioodbc_serving(monkeypatch, rig, [main, probe])
-    task = await cancel_once_started(
-        rig.started, SqlServerStore._ensure_database_options(_settings())
-    )
+    _aioodbc_serving(monkeypatch, rig, [main, probe])
+    await _cancel_open_mid_call(rig)
+    assert "probe:execute:start" in rig.log, "the arm is vacuous: the cancel missed the probe"
+    assert "probe:execute:end" not in rig.log, "the arm is vacuous: the read had already returned"
+    early = {"probe:cursor.close", "probe:conn.close", f"probe:{DEL_CLOSE}"}
+    assert not early & set(rig.log), rig.log
 
-    assert len(made) == 2, "the arm is vacuous: the cancel did not land on the probe"
-    await wait_for_entry(rig.log, "probe:close:submitted")
-    await assert_never_within(rig.log, "probe:conn.close", _EARLY)
-    await _release_and_reap(rig, task)
+    rig.release.set()
     await wait_for_entry(rig.log, "probe:conn.close")
     await wait_for_entry(rig.log, "main:conn.close")
 
     assert USE_AFTER_FREE not in rig.log, rig.log
-    assert rig.log.index("probe:execute:end") < rig.log.index("probe:conn.close"), rig.log
+    end = rig.log.index("probe:execute:end")
+    assert end < rig.log.index("probe:cursor.close") < rig.log.index("probe:conn.close"), rig.log
 
 
 async def test_an_ordinary_open_gates_every_connection_it_makes(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """The control. With no cancellation both connections are gated, put into autocommit, read,
-    and closed, so the arms above cannot pass on a path that never ran."""
+    and closed cursor first, so the arms above cannot pass on a path that never ran."""
     rig.release.set()
     main = rig.raw("main", blocks=never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI}))
     probe = rig.raw("probe", blocks=never, rows={_PROBE_READ: (1,)})
-    made = _aioodbc_serving(monkeypatch, rig, [main, probe])
+    made = _aioodbc_serving(monkeypatch, rig, [main, probe], keep=True)
 
     await SqlServerStore._ensure_database_options(_settings())
 
     assert len(made) == 2
     assert all(call_gate(conn) is not None for conn in made)
     assert main.closed and probe.closed and main.autocommit
+    for name in ("main", "probe"):
+        assert rig.log.index(f"{name}:cursor.close") < rig.log.index(f"{name}:conn.close"), rig.log
     assert USE_AFTER_FREE not in rig.log, rig.log
 
 

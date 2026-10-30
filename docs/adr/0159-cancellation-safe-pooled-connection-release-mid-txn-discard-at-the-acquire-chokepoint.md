@@ -433,7 +433,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
   have lost the whole engine process on a cancel at shutdown or demotion.
 
   - `_acquire` now routes every pyodbc call on a pooled connection through a per-connection lock,
-    `_CallGate`, by wrapping aioodbc's `Connection._execute`. Two threads never use one connection
+    `_CallGate` (since BACKLOG #2394, `CallGate` in `messagefoundry/odbc_call_gate.py`), by
+    wrapping aioodbc's `Connection._execute`. Two threads never use one connection
     at once. pyodbc declares DB-API `threadsafety = 1`, under which threads may not share a
     connection at all; aioodbc already hands each connection across executor threads, and the gate
     keeps those hand-offs one call at a time. That wrap is a second private
