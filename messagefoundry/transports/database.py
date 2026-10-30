@@ -2197,31 +2197,40 @@ class _PolledBatch(NamedTuple):
     skip_budget_spent: bool
 
 
-def _require_read_only_poll(statement: str) -> None:
-    """Refuse a DATABASE source ``poll_statement`` that could write (BACKLOG #2178).
+def _read_only_poll_refusal(statement: str) -> str | None:
+    """Why a DATABASE source ``poll_statement`` is refused, or None when it passes (BACKLOG #2178).
 
     The poll runs on the autocommit pool, so a write in it commits at execute, before any row reaches
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, marks every row it matches,
     but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the rows past
     the ceiling are marked and never ingested. The rows a failed handler or a stop leaves behind are
     lost the same way. That is accept-and-drop. Only the per-row ``mark_statement``, run after the
-    handler returns, may mark a row. The test is :func:`_require_read_only`, the one ``db_lookup``
-    uses, applied whatever ``poll_max_rows`` is. Raises :class:`ValueError`, as the source's other
-    setting refusals do, and never echoes statement text. Raised outside the handler, as the
-    ``DatabaseRef`` gate in ``config/wiring.py`` does, so no ``__context__`` rides along."""
-    refusal: str | None = None
+    handler returns, may mark a row.
+
+    The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
+    ``poll_max_rows`` is. It refuses at least a write keyword, ``EXEC`` and ``{CALL}``, a chained
+    second statement, and a locking ``FOR UPDATE`` read (``UPDATE`` is a keyword; on this autocommit
+    connection the lock ends with the statement, so refusing it loses nothing). **It reads the
+    statement's shape only, and it is the only guard here**: a ``SELECT`` that calls a function which
+    writes passes it, and the login cannot be read-only, because ``mark_statement`` writes on the same
+    connection. The operator must keep the poll free of writes.
+
+    ``DatabasePoll`` tests a literal statement when declared, so ``messagefoundry check`` refuses it
+    without a build; ``DatabaseSource`` tests again at construction. The text is the fixed refusal
+    vocabulary, never the statement. It is returned, not raised, so each caller raises its own type
+    with no ``DbLookupError`` chain."""
     try:
         _require_read_only(statement, subject="DATABASE source poll_statement")
     except DbLookupError as exc:
-        refusal = str(exc)
-    if refusal is not None:
-        raise ValueError(
-            f"{refusal}. The poll runs on an autocommit connection, so a write in it, such as "
+        return (
+            f"{exc}. The poll runs on an autocommit connection, so a write in it, such as "
             "UPDATE ... RETURNING or OUTPUT, commits before any row is handed off, and the rows it "
             "marks past poll_max_rows, or behind a failed hand-off or a stop, are never ingested. "
-            "Poll with a SELECT and mark each handled row with mark_statement. A stored-procedure "
-            "poll (EXEC, {CALL ...}) is refused too, because its body cannot be tested"
+            "Poll with a SELECT and mark each handled row with mark_statement. At least a "
+            "stored-procedure poll (EXEC, {CALL ...}), a second statement and a locking read "
+            "(FOR UPDATE, whose lock ends with the statement here) are refused too"
         )
+    return None
 
 
 class DatabaseSource(SourceConnector):
@@ -2246,8 +2255,8 @@ class DatabaseSource(SourceConnector):
     that bounds the leadership-transition duplicate window, the engine can't enforce row claim/mark
     atomicity here: it's on the operator's SQL. The claim is ``mark_statement``, run per row after the
     handler returns, so a row both nodes read in the brief transition window is a duplicate, the same
-    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` cannot claim; see
-    :func:`_require_read_only_poll`.
+    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` must not claim; see
+    :func:`_read_only_poll_refusal`.
     """
 
     polls_shared_resource = True  # a DB table is a shared external resource — leader-gate it
@@ -2264,6 +2273,10 @@ class DatabaseSource(SourceConnector):
         for req in required:
             if not s.get(req):
                 raise ValueError(f"DATABASE source requires a {req!r} setting")
+        # Before the hop is built: a refused poll must not leave a hop-crossing audit line behind.
+        refusal = _read_only_poll_refusal(str(s["poll_statement"]))
+        if refusal is not None:
+            raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
@@ -2287,7 +2300,6 @@ class DatabaseSource(SourceConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._poll_sql = str(s["poll_statement"])
-        _require_read_only_poll(self._poll_sql)
         mark = s.get("mark_statement")
         # mark_statement is optional (a read-only/idempotent feed may omit it); its :name params bind
         # from the polled row's columns, reusing the destination's named-parameter translation.
@@ -2613,8 +2625,8 @@ class DatabaseSource(SourceConnector):
         removing a handled row from ``poll_statement``'s own predicate, which is the shape this connector
         already documents and requires — without a mark the same rows re-emit every poll, ceiling or no
         ceiling, and the rows past a full ceiling are not reached at all, so that case logs a WARNING
-        once per run of full polls rather than the deferral line. "Untouched" holds only because
-        ``poll_statement`` cannot write (:func:`_require_read_only_poll`).
+        once per run of full polls rather than the deferral line. "Untouched" holds only while
+        ``poll_statement`` does not write (:func:`_read_only_poll_refusal` says what is refused).
 
         A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``; the skip
         budget still applies there, bounding this poll's log and event volume the same way."""
@@ -2685,8 +2697,9 @@ class DatabaseSource(SourceConnector):
                 self._unmarked_ceiling_warned = True
                 logger.warning(
                     "DATABASE source filled poll_max_rows (%s) and has no mark_statement, so each "
-                    "poll can select the same first rows again and rows past the ceiling are not "
-                    "reached; add a mark_statement, or raise or disable poll_max_rows. Logged once "
+                    "poll can select the same first rows again and any rows past the ceiling may "
+                    "never be reached; add a mark_statement, or raise or disable poll_max_rows. "
+                    "Logged once "
                     "until a poll returns fewer rows than the ceiling",
                     ceiling,
                 )

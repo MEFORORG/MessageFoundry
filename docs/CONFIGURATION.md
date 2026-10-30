@@ -2742,17 +2742,17 @@ only the **leader** polls a poll source. Under active-passive HA the whole graph
 belt-and-suspenders, and the queue's `FOR UPDATE SKIP LOCKED` + row leases serve intra-node concurrency
 and failover recovery rather than concurrent multi-node draining). The brief overlap during a leadership
 transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
-at-least-once guarantees that cover a crash mid-poll — the file-rename / row-claim atomicity and the
-downstream queue's idempotent handoff make a re-read a tolerated duplicate, never data loss. The
+at-least-once guarantees that cover a crash mid-poll — the file rename, the database source's
+mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
+duplicate, never data loss. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
 For a
 `database` source the row claim is the operator's `mark_statement`, run per row after the handler
-returns, so a row read twice in the transition window is a duplicate. `poll_statement` must be a
-read-only `SELECT` or `WITH`: a poll that writes, such as `UPDATE ... RETURNING`, marks rows it never
-hands off, so it is refused at build, and so is a stored-procedure poll (BACKLOG #2178). The engine
-owns the atomic rename only for file sources.
+returns, so a row read twice in the transition window is a duplicate. `poll_statement` must not
+write; [`CONNECTIONS.md`](CONNECTIONS.md#database-source--databasepoll) says why and what is refused
+(BACKLOG #2178). The engine owns the atomic rename only for file sources.
 
 If the leader stops cleanly it expires its lease so a follower acquires leadership at once; if it
 crashes or is partitioned, the lease ages out and a follower acquires after at most
