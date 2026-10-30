@@ -4,9 +4,9 @@
 
 ``complete_with_response`` stored ``detail`` as the connector handed it, on all three backends, while
 ``record_ack_sent`` ran it through ``safe_text(detail, limit=200)``. Most in-tree connectors build a
-reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, but at least X12's ``TA1*`` detail
-carries the partner's TA1-04 element verbatim, and the store was not the chokepoint ``docs/PHI.md``
-names it as. Both methods now scrub before the writer lock (SQLite) or the pooled connection and its
+reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, but X12's ``TA1*`` detail carried
+the partner's TA1-04 element verbatim, and the store was not the chokepoint ``docs/PHI.md`` names it
+as. The scrub does not know that shape either, so X12 now echoes only a code from TA1-04's closed set. Both methods now scrub before the writer lock (SQLite) or the pooled connection and its
 transaction (Postgres, SQL Server) is taken.
 
 ``resp_headers`` is deliberately NOT scrubbed: a Handler reads the captured values back through
@@ -119,6 +119,52 @@ async def test_in_tree_reply_details_are_unchanged(
     )
     (reply,) = await sqlite_store.correlate_response(mid)
     assert reply.detail == detail
+
+
+async def test_a_ta1_reply_detail_is_stored_without_the_partners_code(
+    sqlite_store: MessageStore,
+) -> None:
+    # X12 used to carry the partner's TA1-04 verbatim as "TA1*<TA1-04>". The store's scrub does not
+    # know that shape: the control below shows "TA1*MRN7731" stored unchanged. So the transport emits
+    # only a code from TA1-04's closed set, and the TA1-shaped reply stores no partner text.
+    from messagefoundry.config.models import ConnectorType, Destination
+    from messagefoundry.transports.x12 import X12Destination
+
+    control_mid, control_item = await _delivered(sqlite_store, dest="OB_2984_CONTROL")
+    await sqlite_store.complete_with_response(
+        control_item.id, body="x", outcome="accepted", detail="TA1*MRN7731", now=101.0
+    )
+    (control,) = await sqlite_store.correlate_response(control_mid)
+    assert control.detail == "TA1*MRN7731"  # the scrub alone is not the control for this shape
+
+    isa = (
+        "ISA*00*" + " " * 10 + "*00*" + " " * 10 + "*ZZ*" + "SENDERID".ljust(15) + "*ZZ*"
+        + "RECEIVERID".ljust(15) + "*240101*1200*^*00501*000000001*0*P*:~"
+    )  # fmt: skip
+    reply = (isa + "TA1*000000001*240101*1200*MRN7731*000~IEA*1*000000001~").encode()
+    sent = (
+        isa
+        + "GS*HS*S*R*20240101*1200*1*X*005010X279A1~ST*270*0001~SE*2*0001~GE*1*1~IEA*1*000000001~"
+    )
+    dest = X12Destination(
+        Destination(
+            name="OB_2984",
+            type=ConnectorType.X12,
+            settings={"host": "127.0.0.1", "port": 9, "capture_response": True},
+        )
+    )
+    captured = dest._check_ta1(reply, payload=sent)
+    assert captured is not None
+    mid, item = await _delivered(sqlite_store)
+    await sqlite_store.complete_with_response(
+        item.id,
+        body=captured.body,
+        outcome=captured.outcome,
+        detail=captured.detail,
+        now=101.0,
+    )
+    (stored,) = await sqlite_store.correlate_response(mid)
+    assert stored.detail == "TA1 with a TA1-04 outside A, E and R"
 
 
 async def test_scrub_runs_before_the_sqlite_writer_lock(

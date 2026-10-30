@@ -624,7 +624,9 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). **A TA1 is acted on only when its
+  accepted-with-warning (delivered, **not** retried, logged). A TA1-04 outside that code set is
+  accepted too, and its captured `detail` is a fixed phrase, never the partner's text (BACKLOG
+  #2984). **A TA1 is acted on only when its
   TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
   all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
   a blank one matches nothing. If the sent payload has no readable ISA there is nothing to

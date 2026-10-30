@@ -1055,9 +1055,12 @@ class DeliveryResponse:
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
     * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest. The
-      store scrubs and bounds it with ``safe_text(detail, limit=200)`` before it is written (BACKLOG
-      #2984), so a longer or PHI-shaped reason reads back redacted or cut, with a ``(+N chars)``
-      note, through ``response_get(dest).detail``.
+      store passes it through ``safe_text(detail, limit=200)`` before it is written (BACKLOG #2984):
+      that redacts the PHI shapes the scrubber knows, such as an HL7 segment fragment, and cuts a
+      longer reason to at most 200 characters, at a whole token, plus a ``(+N chars)`` note. It
+      does not catch every identifier: a bare name or resource id in free text reads back
+      unchanged through ``response_get(dest).detail``, so a connector keeps partner text out of
+      ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
