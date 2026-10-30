@@ -4780,6 +4780,7 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #3402: the key files a graph's connections name are graph data, judged by an awaited
     # preflight at each load the engine runs, with that load's env() values, off the event loop.
     from messagefoundry.config.key_file_access import make_connection_key_file_preflight
+    from messagefoundry.pipeline.refused_body import RefusedBodyPolicy
 
     app = create_managed_app(
         store_settings=settings.store,
@@ -4801,6 +4802,11 @@ def _serve(args: argparse.Namespace) -> int:
         ack_after_default=settings.inbound.ack_after,
         stream_inflight_budget_bytes=settings.inbound.stream_inflight_budget_bytes,
         max_staged_depth=settings.inbound.max_staged_depth,
+        refused_body=RefusedBodyPolicy(
+            allowance_bytes=settings.inbound.refused_body_allowance_bytes,
+            window_seconds=settings.inbound.refused_body_window_seconds,
+            head_bytes=settings.inbound.refused_body_head_bytes,
+        ),
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         per_lane_wake=settings.pipeline.per_lane_wake,

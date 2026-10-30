@@ -1196,13 +1196,18 @@ class UploadStore:
                         _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
                 raise
 
-    async def discard(self, file_id: str) -> None:
+    async def discard(self, file_id: str) -> bool:
         """Remove a stored pair whose ``upload.create`` row could not be written (vault BACKLOG
         #3178), the way a save cancelled after it landed is removed. It holds ``_quota_lock`` while
         it removes, as that save does, so no other save in this process scans the disk partway
         through the removal. The lock is free while the row is being written, so a save in that
         window still counts the pair. A refused removal is logged, never raised, and so is any other
         failure of the removal: only a cancellation of the caller itself propagates.
+
+        It returns whether this removal took the pair away, so the caller writes an
+        ``upload.delete`` row only for a removal that happened (vault BACKLOG #3740 item 2).
+        ``False`` covers a refused or failed removal, a pair something else had already removed,
+        and a removal whose outcome was not read.
 
         **The removal outlives a cancellation, the wait for the lock included.** It runs as its own
         task, held like the other stragglers. A cancelled caller waits up to
@@ -1212,7 +1217,7 @@ class UploadStore:
         removal = asyncio.ensure_future(self._discard_under_lock(file_id))
         self._hold(removal, functools.partial(_log_discard_unfinished, file_id=file_id))
         try:
-            await _wait_to_completion(removal, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
+            return await _wait_to_completion(removal, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -1220,28 +1225,41 @@ class UploadStore:
             # The removal was cancelled, not this caller; _log_discard_unfinished named it.
         except Exception:  # noqa: BLE001, S110 — _log_discard_unfinished logged it by file_id
             pass
+        return False
 
-    async def _discard_under_lock(self, file_id: str) -> None:
+    async def _discard_under_lock(self, file_id: str) -> bool:
         async with self._quota_lock:
+            # _to_thread_to_completion's body, kept here so a cancel still reads the thread's answer.
+            loop = asyncio.get_running_loop()
+            ctx = contextvars.copy_context()
+            removal = loop.run_in_executor(None, ctx.run, self._discard_cancelled_sync, file_id)
             try:
-                await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
+                return await _wait_to_completion(removal)
             except asyncio.CancelledError:
-                # _to_thread_to_completion raises only once the thread has finished the removal,
-                # so it is done; ending normally keeps _log_discard_unfinished from saying it is not.
-                return
+                # With no bound this raises only once the thread has finished the removal, so it
+                # is done; ending normally keeps _log_discard_unfinished from saying it is not, and
+                # the answer still says whether the pair is gone (vault BACKLOG #3740 item 2).
+                return removal.result()
 
-    def _discard_cancelled_sync(self, file_id: str) -> None:
+    def _discard_cancelled_sync(self, file_id: str) -> bool:
         """Remove a pair whose save was cancelled after it landed (BACKLOG #2262; see :meth:`save`).
 
         Body first, then the sidecar, as :meth:`delete` and :meth:`prune_expired` do. The sidecar is
         the listing key, so it stays until the body is gone, and the orphan sweep never sees a body
         with no sidecar. A refused body unlink keeps the whole pair, listed and billed. A refused
         sidecar unlink leaves a listed sidecar with no body, which the retention prune clears. The
-        log names the ``file_id`` only, because the filename can carry PHI."""
+        log names the ``file_id`` only, because the filename can carry PHI. Returns whether this
+        call removed the sidecar, the listing key, after the body: ``False`` when the sidecar was
+        already gone. That keeps a second removal row off a pair an operator's delete had already
+        finished, though not off one whose delete runs alongside this, since a delete does not
+        take ``_quota_lock``."""
         blob_path, meta_path = self._paths(file_id)
         try:
             blob_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
+            try:
+                meta_path.unlink()
+            except FileNotFoundError:
+                return False
         except OSError as exc:
             _log.error(
                 "upload %s was cancelled after its file landed, or its upload.create row failed, "
@@ -1250,6 +1268,8 @@ class UploadStore:
                 file_id,
                 exc,
             )
+            return False
+        return True
 
     async def _reserve_across_shards(
         self, *, uploader_id: str, uploader: str, size: int, reservation: str

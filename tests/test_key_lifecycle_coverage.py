@@ -145,6 +145,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/gcm_invocations.py": frozenset({_DEK}),
     "messagefoundry/pipeline/dr_backup.py": frozenset({_DEK}),
     "messagefoundry/pipeline/secret_rotation.py": frozenset({_DEK}),
+    # Vault BACKLOG #2608: keys the refused-body digest with an HMAC key HKDF-derived from the
+    # audit-chain key, itself derived from the DEK. Key material in the usage-scope guard too.
+    "messagefoundry/pipeline/refused_body.py": frozenset({_DEK}),
     "messagefoundry/uploads.py": frozenset({_DEK}),
     "messagefoundry/__main__.py": frozenset({_DEK, _SELF_SIGNED}),
     # Private keys the engine loads or mints.

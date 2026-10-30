@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -663,6 +663,11 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
         raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
 
 
+#: Ceiling for ``[store].schema_lock_timeout`` (s): the largest whole-second ``sp_getapplock``
+#: ``@LockTimeout``, a T-SQL ``int`` of milliseconds (BACKLOG #1726).
+_SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -996,6 +1001,10 @@ class StoreSettings(_Section):
     # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
     # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
+    # Upper bound (seconds) on a server-DB store open's wait for the schema lock (BACKLOG #1726).
+    # Must be > 0 and at most _SCHEMA_LOCK_TIMEOUT_MAX. Why it exists and what it does not bound:
+    # docs/CONFIGURATION.md.
+    schema_lock_timeout: float = 600.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
     db_schema: str | None = None
@@ -1097,6 +1106,19 @@ class StoreSettings(_Section):
         # this setting exists to remove, so there is deliberately no way to configure it back.
         if value <= 0:
             raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
+        return value
+
+    @field_validator("schema_lock_timeout")
+    @classmethod
+    def _positive_schema_lock_timeout(cls, value: float) -> float:
+        # No "0 disables" value, as with acquire_timeout: on SQL Server an unbounded wait could hang
+        # a store open, and a service stop behind it, forever (BACKLOG #1726). The ceiling is the
+        # largest sp_getapplock @LockTimeout (a T-SQL int of ms), so both backends wait what is set.
+        if not 0 < value <= _SCHEMA_LOCK_TIMEOUT_MAX:
+            raise ValueError(
+                "schema_lock_timeout must be > 0 and at most "
+                f"{_SCHEMA_LOCK_TIMEOUT_MAX:.0f} s (the wait is always bounded)"
+            )
         return value
 
     @field_validator("warm_pool_target")
@@ -2048,6 +2070,15 @@ class TlsSettings(_Section):
         )
 
 
+#: Vault BACKLOG #2608: the refused-body allowance defaults, here so the settings and
+#: pipeline/refused_body.py share one copy. Per inbound, per window: two whole bodies at the 16 MiB
+#: engine frame ceiling; refilled evenly over an hour; a head long enough for the MSH and the first
+#: segments of an HL7 message.
+REFUSED_BODY_ALLOWANCE_BYTES = 32 * 1024 * 1024
+REFUSED_BODY_WINDOW_SECONDS = 3600.0
+REFUSED_BODY_HEAD_BYTES = 8192
+
+
 class InboundSettings(_Section):
     """Inbound-connection defaults that are an operational, per-environment decision rather than
     something authored in the message graph."""
@@ -2103,6 +2134,24 @@ class InboundSettings(_Section):
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
     max_staged_depth: int = 0
+
+    # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body a listener refuses before
+    # ingress (at least decode, NUL, size, declared type, parse, strict validation, streaming detach) is
+    # recorded as an ERROR row, and its length always is (with a keyed digest, never a plain hash;
+    # docs/CONFIGURATION.md says when). The WHOLE body is stored only
+    # while its inbound's rolling byte allowance covers it; past that, the first
+    # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
+    # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
+    # it ships on and has no off value: 0 stores only heads. A poll source's refusals are always whole. The allowance refills evenly over the
+    # window. Held per engine process; an inbound lives on one engine shard. docs/CONFIGURATION.md
+    # carries the catalog rows.
+    refused_body_allowance_bytes: int = Field(default=REFUSED_BODY_ALLOWANCE_BYTES, ge=0)
+    # The window's floor and the head's ceiling keep a typo from switching the bound off in effect:
+    # a near-zero window refills at once, and a head as large as a frame stores every body whole.
+    refused_body_window_seconds: float = Field(
+        default=REFUSED_BODY_WINDOW_SECONDS, ge=1.0, allow_inf_nan=False
+    )
+    refused_body_head_bytes: int = Field(default=REFUSED_BODY_HEAD_BYTES, ge=256, le=1024 * 1024)
 
     @field_validator("max_staged_depth")
     @classmethod
