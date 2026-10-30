@@ -162,3 +162,24 @@ async def test_a_refused_unsafe_name_records_nothing(monkeypatch: pytest.MonkeyP
 
     assert not any(op == "retrieve" for op, _ in client.ops), "the name was refused, not read"
     assert sink.events == []
+
+
+@pytest.mark.parametrize("error_subdir", ["", "."])
+async def test_an_error_subdir_naming_the_poll_directory_records_nothing(
+    monkeypatch: pytest.MonkeyPatch, error_subdir: str
+) -> None:
+    """An ``error_subdir`` that resolves to the poll directory turns the quarantine move into a
+    rename onto itself, which a server reports as success. The file never leaves, so recording it
+    would write one row each time it settles again.
+
+    Mutation: drop the same-path check in ``_move``. Red: events are recorded."""
+    client = _FakeClient(files={_PATH: _HL7})
+    src = _src(monkeypatch, client, max_file_bytes=10, error_subdir=error_subdir)
+    sink = _Sink()
+    src.on_connection_event = sink
+    src._handler = _RecordingHandler()
+    for _ in range(4):
+        await src._poll_once()
+
+    assert sink.events == []
+    assert _PATH in client.files

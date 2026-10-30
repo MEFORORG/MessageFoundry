@@ -3187,6 +3187,16 @@ class RemoteFileSource(SourceConnector):
         """Rename ``path`` into ``dest_dir``; return whether it moved. A failure is logged here, so a
         caller records a quarantine only for a file that left the poll directory (#1621)."""
         dst = posixpath.join(dest_dir, name)
+        if posixpath.normpath(dst) == posixpath.normpath(path):
+            # An error_subdir of "" or "." names the poll directory itself: the rename would be a
+            # no-op that reports success, and the file would be quarantined (and recorded) again
+            # every time it settled. It has not left, so say so.
+            logger.warning(
+                "REMOTEFILE could not move %s: %s is the poll directory itself",
+                safe_name(name),
+                dest_dir,
+            )
+            return False
         try:
             await asyncio.to_thread(self._client.rename, path, dst)
         except _RemoteError as exc:
