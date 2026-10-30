@@ -26,6 +26,7 @@ again when the module runs. Every value is synthetic and generic.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from harness.config.connscale._shape import ConnScaleShape, make_connscale_shape
@@ -46,42 +47,24 @@ from harness.config.connscale._wire import wire_graph
 
 wire_graph(
     make_connscale_shape(
-        count={count!r},
-        base_port={base_port!r},
-        sink_host={sink_host!r},
-        sink_port={sink_port!r},
-        sink_ports={sink_ports!r},
-        transform={transform!r},
-        name_prefix={name_prefix!r},
-    )
+{arguments}    )
 )
 '''
 
 
 def graph_module_text(shape: ConnScaleShape) -> str:
-    """The generated config module for ``shape``. Each value goes through ``repr`` of an ``int`` or
-    a ``str``, so it is a Python literal whatever the string holds; the module re-validates it when
-    it runs."""
+    """The generated config module for ``shape``. Every field of :class:`ConnScaleShape` is written,
+    read from the dataclass rather than listed here, so a field added later cannot be dropped and
+    leave the worker on its default. Each value goes through ``repr`` of an ``int`` or a ``str``, so
+    it is a Python literal whatever the string holds; the module re-validates it when it runs."""
     # Re-validated here so a shape built by hand, around make_connscale_shape, fails at generation
-    # rather than inside the engine's startup.
-    checked = make_connscale_shape(
-        count=shape.count,
-        base_port=shape.base_port,
-        sink_host=shape.sink_host,
-        sink_port=shape.sink_port,
-        sink_ports=shape.sink_ports,
-        transform=shape.transform,
-        name_prefix=shape.name_prefix,
+    # rather than inside the engine's startup. The keyword names are the field names, which a test
+    # pins against make_connscale_shape's signature.
+    checked = make_connscale_shape(**dataclasses.asdict(shape))
+    arguments = "".join(
+        f"        {name}={value!r},\n" for name, value in dataclasses.asdict(checked).items()
     )
-    return _TEMPLATE.format(
-        count=checked.count,
-        base_port=checked.base_port,
-        sink_host=checked.sink_host,
-        sink_port=checked.sink_port,
-        sink_ports=checked.sink_ports,
-        transform=checked.transform,
-        name_prefix=checked.name_prefix,
-    )
+    return _TEMPLATE.format(arguments=arguments)
 
 
 def write_step_config_dir(config_dir: str | Path, shape: ConnScaleShape) -> Path:

@@ -57,19 +57,16 @@ _MAX_COUNT = 5000  # generous headroom over the 1500 ceiling; a typo of 50000 fa
 _NAME_PREFIX_RE = re.compile(r"^[A-Za-z0-9_]*$")
 
 
-def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+def _env_int(name: str) -> int | None:
+    """Parse one integer knob, or ``None`` when it is unset. Parsing only: the bounds live once, in
+    :func:`make_connscale_shape`, so the env route and the generated route cannot disagree."""
     raw = os.environ.get(name)
     if not raw:
-        return default
+        return None
     try:
-        value = int(raw)
+        return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
-    if value > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value}")
-    return value
 
 
 @dataclass(frozen=True)
@@ -169,12 +166,23 @@ def load_connscale_shape() -> ConnScaleShape:
     a ``[sandbox].mode = "subprocess"`` worker's environment is an allowlist that never carries a
     ``MEFOR_`` name, so a worker that ran this would build the default shape (BACKLOG #3132). The
     connscale runner therefore writes the shape into a generated config directory instead."""
-    return make_connscale_shape(
-        count=_env_int("MEFOR_CONNSCALE_COUNT", 50, minimum=_MIN_COUNT, maximum=_MAX_COUNT),
-        base_port=_env_int("MEFOR_CONNSCALE_BASE_PORT", 2600, minimum=1, maximum=_MAX_PORT),
-        sink_host=os.environ.get("MEFOR_CONNSCALE_SINK_HOST", "127.0.0.1") or "127.0.0.1",
-        sink_port=_env_int("MEFOR_CONNSCALE_SINK_PORT", 2700, minimum=1, maximum=_MAX_PORT),
-        sink_ports=_env_int("MEFOR_CONNSCALE_SINK_PORTS", 1, minimum=1, maximum=4096),
-        transform=os.environ.get("MEFOR_CONNSCALE_TRANSFORM", CHEAP).strip().lower() or CHEAP,
-        name_prefix=os.environ.get("MEFOR_CONNSCALE_NAME_PREFIX", "").strip(),
-    )
+    # Only what is set is passed, so each default lives once, in make_connscale_shape's signature.
+    knobs: dict[str, int | str] = {}
+    for key, name in (
+        ("count", "MEFOR_CONNSCALE_COUNT"),
+        ("base_port", "MEFOR_CONNSCALE_BASE_PORT"),
+        ("sink_port", "MEFOR_CONNSCALE_SINK_PORT"),
+        ("sink_ports", "MEFOR_CONNSCALE_SINK_PORTS"),
+    ):
+        value = _env_int(name)
+        if value is not None:
+            knobs[key] = value
+    for key, name in (
+        ("sink_host", "MEFOR_CONNSCALE_SINK_HOST"),
+        ("transform", "MEFOR_CONNSCALE_TRANSFORM"),
+        ("name_prefix", "MEFOR_CONNSCALE_NAME_PREFIX"),
+    ):
+        text = os.environ.get(name, "").strip()
+        if text:
+            knobs[key] = text.lower() if key == "transform" else text
+    return make_connscale_shape(**knobs)  # type: ignore[arg-type]

@@ -586,8 +586,8 @@ def monotonic_pairs(
 
 
 #: Queue-draining workers the connscale graph runs PER CONNECTION, under ``claim_mode = per_lane``.
-#: Read from the graph, not fitted: ``harness/config/connscale/graph.py`` registers one ``outbound()``
-#: and one ``inbound()`` per index inside ``for _i in range(_SHAPE.count)``, and the engine runs a
+#: Read from the graph, not fitted: ``harness/config/connscale/_wire.py`` registers one ``outbound()``
+#: and one ``inbound()`` per index inside ``for i in range(shape.count)``, and the engine runs a
 #: router worker plus a transform worker per inbound and a delivery worker per outbound
 #: (CLAUDE.md section 2, "Concurrency = asyncio"). So three per connection.
 CONNSCALE_WORKERS_PER_CONNECTION = 3
@@ -1264,6 +1264,7 @@ class ConnScaleReport:
                 "claim_mode",
                 "fuse_thread_hops",
                 "batch_handoff_statements",
+                "sandbox_mode",
                 "sweep_mode",
                 "count",
                 "offered_rate",
@@ -1295,6 +1296,7 @@ class ConnScaleReport:
                     _spreadsheet_safe(r.claim_mode),
                     r.fuse_thread_hops,
                     r.batch_handoff_statements,
+                    _spreadsheet_safe(r.sandbox_mode),
                     _spreadsheet_safe(r.sweep_mode),
                     r.count,
                     round(r.offered_aggregate_rate, 2),

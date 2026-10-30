@@ -10,11 +10,16 @@ driver. Synthetic values only.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 from typing import Any
 
 import pytest
 
+from harness.config.connscale._shape import ConnScaleShape, make_connscale_shape
+from harness.load.connscale import probe
 from harness.load.connscale import runner as runner_mod
+from harness.load.connscale.batchbox import iter_batch_cells
 from harness.load.connscale.profile import (
     ConnScaleProfileError,
     get_connscale_profile,
@@ -22,6 +27,7 @@ from harness.load.connscale.profile import (
 )
 from harness.load.connscale.report import ConnScaleRecord, SandboxReading
 from harness.load.connscale.runner import (
+    ConnScaleError,
     _build_record,
     _node_env,
     _sandbox_reading,
@@ -29,6 +35,7 @@ from harness.load.connscale.runner import (
     run_connscale,
     sweep_step_count,
 )
+from harness.load.connscale.stepconfig import graph_module_text
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 
@@ -346,3 +353,60 @@ def test_the_sandbox_reading_is_in_the_artifact() -> None:
     warmup = payload["warmup"]
     assert isinstance(warmup, dict)
     assert warmup["delivered"] == 10
+
+
+# --- review round 1 -------------------------------------------------------------------------------
+
+
+def test_a_non_finite_warm_up_is_refused() -> None:
+    for value in ("nan", "inf"):
+        text = _SANDBOX_AB.replace("warmup_timeout_s = 30.0", f"warmup_timeout_s = {value}")
+        with pytest.raises(ConnScaleProfileError, match="finite"):
+            load_connscale_profile_text(text)
+
+
+def test_the_batch_box_refuses_a_sandbox_or_warm_up_profile() -> None:
+    with pytest.raises(ConnScaleError, match="no sandbox arm"):
+        iter_batch_cells(_profile(), claim_mode="pooled")
+    plain = load_connscale_profile_text('[connscale]\nname = "x"\ncounts = [5]\n')
+    assert iter_batch_cells(plain, claim_mode="pooled")  # the control: an ordinary profile runs
+
+
+def test_the_generator_writes_every_shape_field() -> None:
+    fields = {f.name for f in dataclasses.fields(ConnScaleShape)}
+    # The generated call passes every field by name, so the two must be the same set.
+    assert fields == set(inspect.signature(make_connscale_shape).parameters)
+    text = graph_module_text(make_connscale_shape())
+    for name in fields:
+        assert f"        {name}=" in text
+
+
+def test_an_unreadable_posix_walk_is_no_reading_not_no_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe, "_WINDOWS", False)
+    # No /proc, or no row for the root: no reading, never "1 process".
+    monkeypatch.setattr(probe.FdSampler, "_enumerate_posix", lambda _self: [])
+    assert probe.subtree_size(4242) is None
+    # The control: a snapshot holding the root and two children it started.
+    rows = [(4242, 1, 100.0), (5000, 4242, 101.0), (5001, 4242, 102.0), (6000, 1, 99.0)]
+    monkeypatch.setattr(probe.FdSampler, "_enumerate_posix", lambda _self: rows)
+    assert probe.subtree_size(4242) == 3
+
+
+async def test_a_sandbox_arm_miss_is_not_labelled_pooled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _step(
+        _profile: object, *, sandbox_mode: str, count: int, **_kw: Any
+    ) -> ConnScaleRecord:
+        if sandbox_mode == "subprocess":
+            raise ConnScaleError("engine failed to start (synthetic)")
+        return _record(count, _reading("off", count, started=0))
+
+    monkeypatch.setattr(runner_mod, "_run_one_step", _step)
+    report = await run_connscale(_profile(), engine_api_port_base=9000, sink_port=8000)
+    assert any(n.startswith("SANDBOX ARM MISSING") for n in report.notes), report.notes
+    assert not any("POOLED ARM MISSING" in n for n in report.notes)
+    assert "no subprocess step was recorded" in str(_check(report, "sandbox_workers").observed)
+    assert not report.result_ok

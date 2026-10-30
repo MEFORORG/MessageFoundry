@@ -19,6 +19,7 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -432,8 +433,9 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: {' and '.join(multi_arm)} cannot BOTH be multi-arm in one profile — each A/B "
             f"comparison pairs one axis at a time (fusion + statement-batching are pooled/SQL-Server-"
             f"only and don't compose, ADR 0075: use claim_modes = ['pooled'] with exactly ONE of "
-            f"fuse_modes / batch_modes = [false, true]); got claim_modes={list(profile.claim_modes)}, "
-            f"fuse_modes={list(profile.fuse_modes)}, batch_modes={list(profile.batch_modes)}"
+            f"fuse_modes / batch_modes = [false, true], or a sandbox_modes A/B on its own); got "
+            f"claim_modes={list(profile.claim_modes)}, fuse_modes={list(profile.fuse_modes)}, "
+            f"batch_modes={list(profile.batch_modes)}, sandbox_modes={list(profile.sandbox_modes)}"
         )
     # `empty_claims_base_reading` grades ONLY per_lane lanes (BACKLOG #1211): the herd prediction it
     # reads assumes one router/transform/delivery worker set per lane per stage, which a pooled
@@ -468,6 +470,13 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
 def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
     """The ``sandbox_modes`` rules (BACKLOG #3132), each decided from the profile alone, before any
     engine is spawned."""
+    # nan would pass the "> 0" refusal below and then fail the runner's "> 0" gate, so no warm-up
+    # would run; inf would wait forever on a first message that dead-lettered.
+    if not math.isfinite(profile.warmup_timeout_s):
+        raise ConnScaleProfileError(
+            f"{where}: warmup_timeout_s must be a finite number of seconds, got "
+            f"{profile.warmup_timeout_s}"
+        )
     if SANDBOX_SUBPROCESS not in profile.sandbox_modes:
         return
     # A worker spawns on its inbound's first dispatch. Without a warm-up every spawn lands inside

@@ -351,8 +351,15 @@ async def run_connscale(
                                 reason = _pooled_miss_reason(str(exc))
                                 fuse_tag = "B1" if fuse_mode else "B0"
                                 batch_tag = "B1" if batch_mode else "B0"
+                                # A sandbox A/B varies the sandbox arm, not the claim mode, so
+                                # its miss is not labelled a pooled one (BACKLOG #3132).
+                                arm = (
+                                    "SANDBOX ARM MISSING"
+                                    if profile.ab_axes() == ("sandbox_modes",)
+                                    else "POOLED ARM MISSING"
+                                )
                                 notes.append(
-                                    f"POOLED ARM MISSING [{mode}] N={count} fuse={fuse_tag} "
+                                    f"{arm} [{mode}] N={count} fuse={fuse_tag} "
                                     f"batch={batch_tag} sandbox={sandbox_mode}: {reason}"
                                 )
                                 missing_detail[(mode, count)] = reason
@@ -499,7 +506,12 @@ async def _run_one_step(
     except (ValueError, OSError) as exc:
         shutil.rmtree(config_dir, ignore_errors=True)
         raise ConnScaleError(f"connscale step {tag}: could not write its config: {exc}") from exc
-    node = EngineNode(tag, api_port, env=node_env, config_dir=config_dir, cwd=cwd)
+    try:
+        node = EngineNode(tag, api_port, env=node_env, config_dir=config_dir, cwd=cwd)
+    except BaseException:
+        # The `finally` below is not reached from here, and it is what removes the directory.
+        shutil.rmtree(config_dir, ignore_errors=True)
+        raise
     # Named rather than inlined: the OS probe now runs on its own task and stamps its readings with the
     # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
     # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
@@ -803,10 +815,14 @@ async def _run_one_step(
             await sink.stop()
         with contextlib.suppress(Exception):
             await poller.close()
-        with contextlib.suppress(Exception):
-            await node.stop()
-        # After the stop, so the engine is not reading it. Disposable output this step made.
-        shutil.rmtree(config_dir, ignore_errors=True)
+        try:
+            with contextlib.suppress(Exception):
+                await node.stop()
+        finally:
+            # After the stop, so the engine is not reading it, and in a `finally`, so a
+            # cancellation during the stop does not leave it behind. Disposable output this step
+            # made.
+            shutil.rmtree(config_dir, ignore_errors=True)
 
 
 def _sandbox_reading(sandbox_mode: str, node_env: Mapping[str, str]) -> SandboxReading:
@@ -849,6 +865,10 @@ async def _warm_up(
 
     The warm-up's ACK and delivery latencies go to their own histograms, so the hold's percentiles
     hold no first dispatch. A delivery that arrives after a timed-out wait lands in the hold's.
+
+    NOT EVERY READING IS KEPT CLEAN. The engine's pool-wait figures (wall #2) are cumulative from
+    engine start, so the record's pool-wait peaks include the warm-up's acquires, spawn storm and
+    all. Compare the two arms' wall #2 with that in mind.
     """
     before = None if pid is None else await asyncio.to_thread(subtree_size, pid)
     hold_ack, hold_e2e = metrics.ack, metrics.e2e
@@ -875,7 +895,7 @@ async def _warm_up(
             sent,
             seconds,
         )
-    has_e2e = warm_e2e.count > 0
+    first = warm_e2e.summary() if warm_e2e.count > 0 else None
     return replace(
         sandbox,
         processes_before_warmup=before,
@@ -883,8 +903,8 @@ async def _warm_up(
         warmup_sent=sent,
         warmup_delivered=delivered,
         warmup_seconds=seconds,
-        warmup_first_delivery_p50_ms=warm_e2e.percentile(50.0) / 1e6 if has_e2e else None,
-        warmup_first_delivery_max_ms=warm_e2e.max / 1e6 if has_e2e else None,
+        warmup_first_delivery_p50_ms=None if first is None else first.p50_ms,
+        warmup_first_delivery_max_ms=None if first is None else first.max_ms,
     )
 
 
@@ -2517,6 +2537,10 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     process subtree. Without that, an arm whose engine silently ran Routers and Handlers in-process
     would pass every other check here. A walk that failed is a failure too: an instrument that did
     not read cannot vouch for the arm.
+
+    It grades TODAY'S worker shape, one worker tree per traffic-carrying inbound. ADR 0187 (option
+    1, accepted) replaces that with a bounded shared pool; once the pool is built, a subprocess step
+    starts far fewer processes than inbounds, and this floor must change with it.
     """
     problems: list[str] = []
     for r in records:

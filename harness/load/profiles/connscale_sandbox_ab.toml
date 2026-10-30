@@ -1,6 +1,6 @@
 # Sandbox A/B (ADR 0087, BACKLOG #3132): [sandbox].mode off versus subprocess at 750 and 1500 inbound
-# MLLP connections, against a real engine the harness OWNS per step. It answers ADR 0052 AC-2 for
-# the subprocess sandbox. 1500 is the AC-2 target read as inbound connections; 750 is the inbound
+# MLLP connections, against a real engine the harness OWNS per step. Its readings are evidence for
+# ADR 0052 AC-2 with the subprocess sandbox on. 1500 is the AC-2 target read as inbound connections; 750 is the inbound
 # count if AC-2 counts inbound plus outbound, since a sandbox worker exists per inbound only.
 #
 # This is an OPERATOR sweep (multi-minute, large port budget, SERVER-DB store) -- never CI:
@@ -8,10 +8,14 @@
 #   MEFOR_STORE_BACKEND=postgres MEFOR_STORE_* ... \
 #     python -m harness --connscale connscale_sandbox_ab --report-json out/connscale_sandbox_ab.json
 #
-# Before running it, read BACKLOG #3132's prerequisites. At least these hold today: a POSIX arm
-# waits on the worker CPU budget fix (#3133), a Windows arm waits on the job race fix (#3065), and
-# the row's control run (a small subprocess arm on the env route, which must fail) is a separate
-# step. Each step writes its graph into a generated config directory, so the worker builds the
+# It measures TODAY'S worker shape, one worker tree per traffic-carrying inbound. ADR 0187 (option
+# 1) replaces that with a bounded shared pool; the N=1500 two-arm the owner gates on runs against
+# that pool once it is built, and the `sandbox_workers` floor below changes with it.
+#
+# Before running it, read BACKLOG #3132's prerequisites and the current status of the rows it
+# names there, at least #3133 (the worker's POSIX resource caps) before a POSIX arm and #3065 (the
+# Windows job race) before a Windows arm. The row's control run (a small subprocess arm on the env
+# route, which must fail) is a separate step. Each step writes its graph into a generated config directory, so the worker builds the
 # engine's graph; the warm-up brings every worker up before the hold and records the first-delivery
 # latency beside [sandbox].startup_seconds; the `sandbox_workers` SLO fails a subprocess step that
 # did not start a process per driven inbound. A subprocess arm that cannot reach the top count is a
