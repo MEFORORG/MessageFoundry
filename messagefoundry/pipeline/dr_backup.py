@@ -2576,7 +2576,8 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
+#: sqlite3's own default. Nothing else writes a snapshot these checks open, the backup's own or an
+#: extracted one, so it never waits.
 _SNAPSHOT_BUSY_TIMEOUT = 5.0
 
 
