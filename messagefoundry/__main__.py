@@ -8084,7 +8084,7 @@ _OFFLINE_ALERT_REOPEN_SECONDS = 5.0
 #: How long ``provision-admin`` waits for its whole alert step, the notifier build, the store
 #: reopen, the sends, the open-instance write and the close, before it prints its result without
 #: the step's answer. The build has no bound of its own, so a slow build can run a step past this
-#: that would have answered True; the command then reports the alert as not taken and logs the
+#: that would have answered True; the command then reports no confirmed delivery and logs the
 #: fallback, the safe direction.
 _OFFLINE_ALERT_STEP_SECONDS = 30.0
 
@@ -8116,11 +8116,15 @@ def _offline_alert_notifier(
     )
 
     def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
-        # Resolved on each attempt, not once: the webhook alone needs no secret, so a provider
-        # this shell cannot reach must not cost it.
+        # The provider is resolved only for a build that names a secret reference, which only the
+        # email transport does: a provider this shell cannot reach must not cost the webhook.
         return notifier_from_settings(
             alerts,
-            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
+            secret_provider=(
+                resolve_secret_provider(settings.secrets, posture=posture)
+                if alerts.email_password_secret
+                else None
+            ),
             trust_anchor_policy=settings.tls.policy(),
             posture=posture,
         )
@@ -8196,39 +8200,44 @@ async def _within[T](
     after the awaited call finished but before the awaiting coroutine resumed throws into it, and
     the result, an opened store, is discarded with nothing to close it. Nor is the task cancelled
     at the bound: a driver cancelled mid-open can drop a handle it already holds, and a close
-    cancelled mid-way leaves one half closed. The work runs as its own task, left to finish, so a
-    result is never thrown away. A task still running when its event loop shuts down is cancelled
-    by that shutdown, and its own cancel handling then owns the cleanup."""
+    cancelled mid-way leaves one half closed. The work runs as its own task, left to finish while
+    the loop runs, so a result that lands in that time is never thrown away. It does not outlive
+    the loop: ``provision-admin``'s step loop ends once the step answers, and a task still running
+    then is cancelled by that shutdown, its own cancel handling then owning the cleanup."""
     import asyncio
 
     task = asyncio.ensure_future(awaitable)
-
-    def hold() -> None:
-        _LATE_TASKS.add(task)
-        task.add_done_callback(_LATE_TASKS.discard)
-        task.add_done_callback(on_late)
-
     try:
         await asyncio.wait({task}, timeout=timeout)
     except BaseException:
-        hold()
+        _hold_late(task, on_late)
         raise
     if not task.done():
-        hold()
+        _hold_late(task, on_late)
         raise TimeoutError
     return task.result()
 
 
+def _hold_late[T](task: asyncio.Future[T], on_done: Callable[[asyncio.Future[T]], None]) -> None:
+    """Hold ``task`` in :data:`_LATE_TASKS` until it settles, then hand it to ``on_done``."""
+    _LATE_TASKS.add(task)
+    task.add_done_callback(_LATE_TASKS.discard)
+    task.add_done_callback(on_done)
+
+
 def _close_late_store(opened: asyncio.Future[Store]) -> None:
-    """``on_late`` for the alert's store open: close a store that opened after its bound."""
+    """``on_late`` for the alert's store open: close a store that opened after its bound, and name
+    the class of an open that failed after it, which the caller logged only as a timeout."""
     import asyncio
 
-    if opened.cancelled() or opened.exception() is not None:
+    if opened.cancelled():
         return
-    closing = asyncio.ensure_future(opened.result().close())
-    _LATE_TASKS.add(closing)
-    closing.add_done_callback(_LATE_TASKS.discard)
-    closing.add_done_callback(_log_late_close)
+    if (exc := opened.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store reopen failed after its bound (%s)", type(exc).__name__
+        )
+        return
+    _hold_late(asyncio.ensure_future(opened.result().close()), _log_late_close)
 
 
 def _log_late_close(closing: asyncio.Future[None]) -> None:
@@ -8302,7 +8311,8 @@ async def _raise_offline_administrator_granted(
             try:
                 # Bounded: the answer is read only once this returns, and a close that waits on a
                 # write still running would otherwise hold a True answer past the step's bound. A
-                # close still running at the bound is left to finish, not cancelled half way.
+                # close still running at the bound is not cancelled here; see `_within` for what
+                # the loop's shutdown then does to it.
                 await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
             except Exception as exc:  # noqa: BLE001 - the alert's answer stands
                 log.warning("the alert's store did not close cleanly (%s)", type(exc).__name__)
@@ -8362,7 +8372,8 @@ async def _feed_offline_alert(
     except Exception as exc:  # noqa: BLE001 - as above
         log.warning("the [alerts] notifier failed while closing (%s)", type(exc).__name__)
     await drained  # never raises, and ends by the deadline
-    # Read now: a send the deadline left running may still confirm later, uncounted.
+    # A send the deadline cut off is not counted, even one the relay accepted just before it: the
+    # cancel can land before the drain resumes to tell the observer. The safe direction.
     return confirmed
 
 
@@ -9028,9 +9039,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # True only when recovery codes were issued AND reached the console; false with
                 # --no-totp (none issued) and when the console failed before showing them.
                 "recovery_codes_shown": codes_shown,
-                # Vault BACKLOG #3849 B5: true when at least one [alerts] transport confirmed
-                # delivery of the administrator_granted alert (the relay accepted it, or the
-                # webhook answered 2xx), false when the fallback went to the log.
+                # Vault BACKLOG #3849 B5: true when an [alerts] transport confirmed delivery of the
+                # administrator_granted alert, as `_feed_offline_alert` defines it; false when the
+                # fallback went to the log.
                 "administrator_granted_alerted": alerted,
             },
             compact=True,

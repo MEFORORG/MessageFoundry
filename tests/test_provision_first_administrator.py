@@ -2669,7 +2669,9 @@ async def test_a_store_that_opens_after_its_bound_is_closed_when_it_arrives() ->
 
 async def test_a_close_still_running_at_its_bound_is_left_to_finish() -> None:
     """Review round 1 of repair 3: the alert's store close used ``asyncio.timeout`` too, so a slow
-    close was cancelled half way. It is left to finish now, and the caller is told it timed out."""
+    close was cancelled half way at the bound. It is left to finish while the loop runs, and the
+    caller is told it timed out. This loop outlives the call; the command's step loop does not,
+    and its shutdown cancels a close still running then, as ``_within`` says."""
     from messagefoundry.__main__ import _log_late_close, _within
 
     finish = asyncio.Event()
@@ -2685,6 +2687,34 @@ async def test_a_close_still_running_at_its_bound_is_left_to_finish() -> None:
     for _ in range(10):
         await asyncio.sleep(0)
     assert closed == [True]
+
+
+def test_a_secret_provider_this_shell_cannot_reach_costs_the_email_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 2 of repair 3: the provider was resolved for every build, the webhook alone
+    included, so one this shell cannot reach cost the webhook that needs no secret. It is resolved
+    only for a build that names a secret reference."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config import secretprovider
+    from messagefoundry.config.settings import ServiceSettings
+
+    def unreachable(*_a: object, **_k: object) -> None:
+        raise SecretProviderError("synthetic unreachable provider at vault.example.invalid")
+
+    monkeypatch.setattr(secretprovider, "resolve_secret_provider", unreachable)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_password_secret="alerts/smtp",
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert "vault.example.invalid" not in err and "SecretProviderError" in err
 
 
 def test_a_hop_check_that_raises_costs_the_email_only(

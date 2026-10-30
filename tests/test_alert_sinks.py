@@ -64,20 +64,25 @@ async def test_one_failing_transport_does_not_starve_the_others() -> None:
 async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     """Vault BACKLOG #3849, repair 3: the observer is told of a send that returned, and not of one
     that raised; an observer that raises is logged and the drain goes on to the next transport."""
-    bad, good = _RecordingTransport("bad", fail=True), _RecordingTransport("good")
+    good, bad, last = (
+        _RecordingTransport("good"),
+        _RecordingTransport("bad", fail=True),
+        _RecordingTransport("last"),
+    )
     heard: list[str] = []
 
     def observe(name: str, event: dict[str, Any]) -> None:
         heard.append(name)
         raise RuntimeError("observer fault")
 
-    sink = NotifierAlertSink([bad, good])
+    sink = NotifierAlertSink([good, bad, last])
     sink.set_delivery_observer(observe)
     sink.connection_stopped("OB_X", detail="boom")
     sink.connection_stopped("OB_Y", detail="boom")
     await _drain(sink)
-    assert heard == ["good", "good"]
-    assert len(good.events) == 2
+    # The observer raised after `good`, and `last` still got each event.
+    assert heard == ["good", "last", "good", "last"]
+    assert len(last.events) == 2
 
 
 async def test_realert_throttle_suppresses_repeats() -> None:
