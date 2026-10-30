@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Where a DATABASE connection dials: the one reading of its host and port that both the
-``[egress].allowed_db`` check and the generic dialect's hop guard use (vault BACKLOG #2704).
+"""Where a DATABASE connection dials: the readings of its host and port that the
+``[egress].allowed_db`` check and the generic dialect's hop guard use, built on one split and one
+port rule (vault BACKLOG #2704).
 
 The two dialects send the port by different routes. The SQL Server preset writes the ``port``
 setting into ``SERVER={server},{port}``. The generic dialect writes ``SERVER={server}`` and never
-reads ``port``, so its port reaches the driver as the ``PORT`` keyword in ``odbc_params``, or in
-the ``server`` text itself. An allowlist entry that pins a port means something only while the
-check reads the port the driver is sent, so :func:`database_dial_endpoint` reads it per dialect.
+reads ``port``, so the only port it sends as a port is the ``PORT`` keyword in ``odbc_params``. An
+allowlist entry that pins a port means something only while the check reads the port the driver is
+sent, so :func:`database_dial_endpoint` reads it per dialect.
 
 A leaf module on purpose. :mod:`messagefoundry.transports.egress` and
 :mod:`messagefoundry.transports.database` both read it, and it imports neither, so neither has to
@@ -42,10 +43,15 @@ def port_or_zero(text: str) -> int:
     """``text`` as a port number, or 0 when it is not one: the ONE definition of "is this a port",
     used by every reading in this module.
 
-    The five-digit bound is what a port is, and it also keeps ``int()`` away from CPython's
-    string-to-int digit limit on an absurd operator value, which would turn a log detail into a crash."""
+    A port is 1 to 65535, written in ASCII decimal digits. ``isdigit`` alone also passes a superscript
+    digit, which ``int()`` then refuses with a ValueError. The five-character bound keeps ``int()``
+    away from CPython's string-to-int digit limit on an absurd operator value, which would turn a
+    log detail into a crash."""
     text = text.strip()
-    return int(text) if text.isdigit() and len(text) <= 5 else 0
+    if not (text.isascii() and text.isdecimal() and len(text) <= 5):
+        return 0
+    port = int(text)
+    return port if port <= 65535 else 0
 
 
 def split_generic_server(server: str) -> tuple[str, str]:
@@ -85,8 +91,8 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     are the ones :func:`database_dial_endpoint` reads for ``[egress].allowed_db``, through
     :func:`split_generic_server` and :func:`port_or_zero`. A change to either changes what that
     allowlist admits, so it is reviewed as a change to a control, not to a log line. This function
-    alone picks a winner when the ``server`` text and the keyword disagree; the egress reading
-    refuses that case instead."""
+    alone lets a port in the ``server`` text win; the egress reading takes the port from the
+    keyword only, and refuses a ``server`` port that disagrees with it."""
     host, in_server = split_generic_server(server)
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
@@ -103,7 +109,8 @@ class DialEndpoint(NamedTuple):
     #: entry that names no port, and never one that pins a port.
     port: object | None
     #: Why the port reading itself refuses the hop, or ``None``. Set when the generic dialect is
-    #: given a port twice, in ``server`` and in the ``PORT`` keyword, and the two differ.
+    #: given the ``PORT`` keyword more than once, or a port in ``server`` that ``PORT`` does not
+    #: name.
     conflict: str | None = None
 
 
@@ -118,11 +125,13 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     dialled, defaulting to 1433 as the connection string does.
 
     **The generic dialect** sends ``SERVER={server}`` and never reads the ``port`` setting, so it is
-    ignored here. The port is the one in the ``server`` text, else the ``PORT`` keyword. When both
-    are given and they are not the same port, the reading refuses: which one the driver honours is
-    not measured, and psqlODBC passes ``SERVER`` to libpq as a host and does not parse a ``,port``
-    in it. When neither gives a usable port, the port is ``None``: the driver's default port is not
-    known to the engine.
+    ignored here. The port is the ``PORT`` keyword's, the one value the connection string sends as a
+    port. A port in the ``server`` text is not read as the port: psqlODBC passes ``SERVER`` to libpq
+    as a host and does not parse a ``,port`` in it, so the driver may dial its default port instead.
+    Where ``server`` carries one, ``PORT`` must name the same port, or the reading refuses: which
+    one the driver honours is not measured. ``PORT`` given twice, in any case, is refused too, as
+    the build refuses it. With no usable ``PORT`` the port is ``None``: the driver's default port is
+    not known to the engine.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this change.
     A port suffix is not taken off the host here. libpq reads a comma in a host as a list of hosts,
@@ -133,11 +142,18 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
         return DialEndpoint(host, settings.get("port", SQLSERVER_DEFAULT_PORT))
     params = settings.get("odbc_params")
     # A table that is not a mapping is the build's own refusal; read it as giving no keyword.
-    keyword = odbc_param(params, "port") if isinstance(params, Mapping) else None
+    keywords = [
+        value
+        for key, value in (params.items() if isinstance(params, Mapping) else ())
+        if odbc_keyword_name(str(key)) == "port"
+    ]
+    if len(keywords) > 1:
+        return DialEndpoint(
+            host, None, conflict="odbc_params gives the PORT keyword more than once; give it once"
+        )
+    keyword = port_or_zero(str(keywords[0])) if keywords else None
     in_server = split_generic_server(host)[1]
-    # Each place that gives a port, read as a port; 0 where the text given is not one.
-    given = [port_or_zero(str(text)) for text in (in_server or None, keyword) if text is not None]
-    if len(given) == 2 and (given[0] != given[1] or not given[0]):
+    if in_server and keyword is not None and port_or_zero(in_server) != keyword:
         return DialEndpoint(
             host,
             None,
@@ -147,4 +163,4 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
                 "the driver dials, so give the port once, in the PORT keyword"
             ),
         )
-    return DialEndpoint(host, next((port for port in given if port), None))
+    return DialEndpoint(host, keyword or None)

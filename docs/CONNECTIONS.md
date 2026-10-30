@@ -1725,22 +1725,24 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 ##### The port an `allowed_db` entry binds
 
 An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
-`server` text, in any case. An entry with no port admits that host at any port. An entry with a
-port admits only the port the driver is sent, and the two dialects send it differently (vault
-BACKLOG #2704):
+`server` text, in any case, and a host no entry names is refused. An entry with a port admits only
+the port the connection names, and the two dialects name it differently (vault BACKLOG #2704):
 
 | Dialect | Port the entry is compared with |
 |---|---|
 | `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
-| `generic` | A port in the `server` text, else the `PORT` keyword in `odbc_params`. The `port` setting is ignored, because the generic connection string never carries it. |
+| `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. A port in the `server` text is not read as the port either: psqlODBC passes `SERVER` to libpq as a host, and does not read a `,port` in it. |
 
-On the generic dialect, the egress check **refuses** two cases, at load like every other miss:
+An entry with no port admits its host at any port, with one exception below. On the generic dialect
+the egress check **refuses** these cases, at load like every other miss:
 
-- `server` carries a port and the `PORT` keyword names another, or one of them is not a port.
-  Which one the driver honours is not known, and psqlODBC does not read a `,port` in `SERVER`.
-  Give the port once, in `PORT`.
-- No port can be read, and the matching entry pins one. The driver then dials its own default
-  port, which the engine does not know. Set `PORT` to the port in the entry.
+- `server` carries a port and `PORT` names another, or one of them is not a port. Which one the
+  driver honours is not known. This is refused whatever the entry says. Give the port once, in
+  `PORT`.
+- `PORT` is given more than once, in any case.
+- No port can be read, and the entry for that host pins one. A port in `server` alone counts as no
+  port, and so does a `PORT` value that is not 1 to 65535 in decimal digits. The driver then dials
+  a port the engine does not know. Set `PORT` to the port in the entry.
 
 A port written into `server` does not come off the host. `server = "db,6432"` matches only an
 entry for `db,6432`, never one for `db`: libpq reads a comma in a host as a list of hosts.

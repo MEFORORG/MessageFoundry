@@ -674,31 +674,37 @@ def _database_refusal(
     settings: Mapping[str, Any], allowed: list[str], *, dialect: str | None = None
 ) -> str | None:
     """Why ``[egress].allowed_db`` refuses the hop a DATABASE connection's ``settings`` dial, or
-    ``None`` when it admits it: the ONE rule behind the destination, the source and both lookups
-    (vault BACKLOG #2704).
+    ``None`` when it admits it: the ONE rule behind the outbound connection, the inbound poll and
+    both lookups (vault BACKLOG #2704).
 
     ``dialect`` is the one the caller builds its connection string with, and defaults to the
     ``dialect`` setting. The host and port are read by
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
-    dialect dials. An entry that pins a port admits only that port. A connection whose port the
-    engine cannot read matches an entry that names no port, and never one that pins one."""
+    dialect dials. A host no entry names is refused as unlisted before its port is read. A port
+    the reading cannot settle is refused whatever the entries say. An entry that pins a port admits
+    only that port. A connection whose port the engine cannot read matches an entry that names no
+    port, and never one that pins one."""
     if dialect is None:
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)
-    if endpoint.conflict is not None:
-        return endpoint.conflict
     host, port = endpoint.host, endpoint.port
     pins = _allowed_ports_for(host, allowed)
+    if not pins:
+        return f"server {host!r} is not in the [egress].allowed_db allowlist"
+    if endpoint.conflict is not None:
+        return endpoint.conflict
     # As host_port_allowed matches, except that an unknown port matches only an entry naming none.
     if any(not pin or (port is not None and str(port) == pin.strip()) for pin in pins):
         return None
-    if not pins:
-        return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if port is None:
+        remedy = (
+            "set the PORT keyword in odbc_params to the listed port"
+            if dialect.lower() == "generic"
+            else "set the port setting to the listed port"
+        )
         return (
             f"server {host!r} is listed in [egress].allowed_db only at a pinned port, and "
-            "this connection names no port the engine can read; on the generic dialect set "
-            "the PORT keyword in odbc_params to the listed port"
+            f"this connection names no port the engine can read; {remedy}"
         )
     return (
         f"server {host!r} is not in the [egress].allowed_db allowlist at port {port}, "
