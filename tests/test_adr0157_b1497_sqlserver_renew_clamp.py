@@ -218,17 +218,40 @@ async def test_the_claim_waits_for_a_pooled_connection_at_most_the_clamp() -> No
     the same wedged pool waits the full acquire_timeout."""
     from messagefoundry.store.base import StoreAcquireTimeout
 
-    store = _store(_Conn(), acquire_timeout=1.0)
+    store = _store(_Conn(), acquire_timeout=3.0)
     store._pool = _HangingPool()
     started = time.monotonic()
     with pytest.raises(StoreAcquireTimeout):
-        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=0.1)
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
     clamped = time.monotonic() - started
     started = time.monotonic()
     with pytest.raises(StoreAcquireTimeout):
         await store._fetchone("SELECT 1", ())
     unclamped = time.monotonic() - started
-    assert clamped < 0.6 <= unclamped, (clamped, unclamped)
+    assert clamped < 2.0 <= unclamped, (clamped, unclamped)
+
+
+async def test_a_failed_restore_does_not_fail_a_claim_that_returned() -> None:
+    """The restore is best-effort: the statement has returned, so a renew that committed is not
+    reported as failed because putting command_timeout back raised."""
+
+    class _RefusingRaw(_Raw):
+        @property
+        def timeout(self) -> int:
+            return self._timeout
+
+        @timeout.setter
+        def timeout(self, value: int) -> None:
+            if self.assigned[-2:] == [30, 4]:
+                raise RuntimeError("SQLSetConnectAttr failed")
+            self._timeout = value
+            self.assigned.append(value)
+
+    conn = _Conn()
+    conn._conn = conn.raw = _RefusingRaw()
+    row = await _store(conn)._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+    assert row == {"owner": "A", "leader_epoch": 7}
+    assert conn.raw.assigned == [30, 4]
 
 
 async def test_the_unclamped_read_is_unchanged() -> None:
@@ -349,7 +372,8 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
     settings = load_settings(environ=os.environ).store
     store = await SqlServerStore.open(settings)
     try:
-        assert settings.command_timeout == 0 or settings.command_timeout > 4
+        if 0 < settings.command_timeout <= 4:
+            pytest.skip("command_timeout would end the 4 s statement before the clamp could")
         started = time.monotonic()
         with pytest.raises(Exception, match="(?i)timeout|HYT00"):
             await store._fetchone_clamped(

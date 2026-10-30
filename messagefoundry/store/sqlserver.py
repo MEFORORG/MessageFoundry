@@ -1062,6 +1062,22 @@ def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> in
     return min(whole, command_timeout) if command_timeout > 0 else whole
 
 
+def _restore_statement_timeout(raw: Any, previous: int) -> None:
+    """Put back the statement timeout :meth:`SqlServerStore._statement_timeout` replaced.
+
+    Best-effort: by now the statement has returned, and a renew that committed must not be reported
+    as failed, nor a driver error be replaced, because the restore failed. The next borrow
+    re-applies ``[store].command_timeout`` anyway."""
+    try:
+        raw.timeout = previous
+    except Exception:  # noqa: BLE001 - any driver fault; see the docstring
+        log.warning(
+            "sqlserver: could not restore command_timeout after a clamped statement; the next"
+            " borrow re-applies it",
+            exc_info=True,
+        )
+
+
 def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
     return (resource, timeout_ms)
 
@@ -5216,8 +5232,9 @@ class SqlServerStore:
 
     @asynccontextmanager
     async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
-        """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
-        store borrows from its pool. ``timeout`` is the acquire limit, never ``None``."""
+        """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
+        and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
+        ``None``."""
         t0 = perf_counter()
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
@@ -5435,24 +5452,29 @@ class SqlServerStore:
         try:
             yield
         except Exception:
-            raw.timeout = previous
+            _restore_statement_timeout(raw, previous)
             raise
-        raw.timeout = previous
+        _restore_statement_timeout(raw, previous)
 
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return await self._fetch_rows(sql, params)
 
     async def _fetch_rows(
-        self,
-        sql: str,
-        params: tuple[Any, ...],
-        statement_timeout: int | None = None,
-        borrow_clamp: float | None = None,
+        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> list[dict[str, Any]]:
-        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``statement_timeout`` and
-        ``borrow_clamp`` are ``None`` for every caller but the cluster lease claim/renew, and
-        ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``."""
-        borrow = self._acquire() if borrow_clamp is None else self._acquire_clamped(borrow_clamp)
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
+        ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
+        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets both bounds, so
+        neither can be set without the other."""
+        if timeout_clamp is None:
+            borrow, statement_timeout = self._acquire(), None
+        else:
+            # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
+            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow.
+            borrow = self._acquire_clamped(max(1.0, timeout_clamp))
+            statement_timeout = _clamped_statement_timeout(
+                timeout_clamp, self._settings.command_timeout
+            )
         async with (
             borrow as conn,
             self._statement_timeout(conn, statement_timeout),
@@ -5485,15 +5507,20 @@ class SqlServerStore:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew is its only caller.
 
-        Two bounds, each at most the clamp, so the call runs about twice the clamp at worst, as
-        ``DbCoordinator._call_tick`` does on Postgres. The wait for a pooled connection is the smaller
-        of the clamp and ``[store].acquire_timeout``: a renew that waited out a saturated pool past
-        the fence would otherwise still extend the lease after this node self-fenced. The statement's
+        Two windows, each at most the clamp. The wait for a pooled connection is the smaller of the
+        clamp and ``[store].acquire_timeout``: a renew that waited out a saturated pool past the
+        fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
-        The COMMIT and a ROLLBACK after it are not statements, so the clamp does not bound them;
-        they run under whatever bounds every other store call."""
-        seconds = _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout)
-        rows = await self._fetch_rows(sql, params, seconds, timeout_clamp)
+
+        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
+        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
+        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
+        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
+        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
+        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are not
+        statements, so the clamp does not bound them either; they run under whatever bounds every
+        other store call."""
+        rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:

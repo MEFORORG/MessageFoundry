@@ -563,9 +563,9 @@ async def test_the_fence_baseline_is_stamped_before_the_renew_not_after_it() -> 
 
 
 async def test_the_sqlserver_twin_stamps_the_baseline_from_the_same_instant() -> None:
-    """Lockstep. The SQL Server renew is clamped too, but only its statement, in whole seconds, so
-    the borrow before it can still delay the response; the baseline stamp keeps the margin real
-    whatever that delay is."""
+    """Lockstep. The SQL Server renew is clamped too, but its borrow and its statement each get the
+    clamp, and its COMMIT gets none, so the response can still return late; the baseline stamp keeps
+    the margin real whatever that delay is."""
     mono = _Clock(0.0)
 
     class _Store:

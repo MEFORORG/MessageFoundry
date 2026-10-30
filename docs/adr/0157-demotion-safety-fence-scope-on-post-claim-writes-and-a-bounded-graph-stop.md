@@ -388,9 +388,12 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    seconds, so the clamp is rounded DOWN, never above the value `_renew_fits_the_margin` checked,
 >    and never below 1, and `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp
 >    under 1 s on this backend. A shorter `command_timeout` still wins, as on Postgres. And it binds
->    the claim call only: its borrow waits at most the clamp too, so the call costs about twice the
->    clamp at worst, but the COMMIT after the statement is not bounded by it, and the heartbeat,
->    config-version refresh and stepdown release still run under `command_timeout`.
+>    the claim call only: its borrow waits at most the clamp too, but unlike Postgres the borrow and
+>    the statement do not share one deadline (a whole-second timeout cannot carry what a borrow
+>    leaves of a 1 s clamp), so a renew can land up to about twice the clamp after it is issued,
+>    while the margin check compares the clamp alone. The COMMIT after the statement is not bounded
+>    by it, and the heartbeat, config-version refresh and stepdown release still run under
+>    `command_timeout`.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
 >    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
