@@ -6240,7 +6240,8 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     A credential in the query rides the request line, so the partner's and every proxy's access log
     holds it. ``refuse_url_credentials`` refuses a credential in the userinfo, because that shape
     never authenticated anything; a query credential does authenticate, and some partner APIs take
-    it nowhere else, so it is reported rather than refused.
+    it nowhere else, so it is reported rather than refused, except on the two kinds of hop
+    ``transports.egress.warn_url_query_credentials`` names.
 
     It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
     construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.

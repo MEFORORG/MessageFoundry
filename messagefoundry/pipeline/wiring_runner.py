@@ -2520,7 +2520,7 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    # The executor would warn lookup by lookup, before a later one fails.
+                    # The executor warns before it knows which lookups build.
                     warn_query_credentials=False,
                 )
             if warn:

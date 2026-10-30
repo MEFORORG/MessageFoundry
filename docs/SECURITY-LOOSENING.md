@@ -1765,7 +1765,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A `FhirLookup` that fails to build at a start logs no WARNING, because no read can go through it;
-  its failure is recorded and alerted, and each lookup that did build logs it once. There is also a
+  its failure is recorded and alerted, and each lookup that did build logs it once. An outbound that
+  fails to build logs it first, so the two differ here. An `env()` URL on such a lookup appears
+  nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup

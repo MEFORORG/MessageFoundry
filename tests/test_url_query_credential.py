@@ -697,9 +697,10 @@ async def test_a_start_and_an_operator_start_still_warn_once(
 async def test_a_failed_fhir_lookup_leaves_each_survivor_one_warning_at_start(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The first whole-graph build reaches ``LK_A`` and fails at ``LK_BAD``, then each lookup builds
-    alone, then the survivors build again: ``LK_A`` logged three times and ``LK_Z`` twice. A lookup
-    that did not build logs nothing, since nothing reads through it; its failure is the record."""
+    """The whole-graph build fails at ``LK_BAD``, then each lookup builds alone, then the survivors
+    build again, and the executor warns for every lookup it is given before it builds one: three
+    lines for a survivor and two for ``LK_BAD``. A lookup that did not build now logs nothing, and
+    docs/SECURITY-LOOSENING.md states what that costs."""
     reg = Registry()
     urls = {
         "LK_A": "https://fhir.example.invalid/R4?api_key=PLACEHOLDER",
@@ -889,8 +890,8 @@ async def test_a_plain_engine_start_warns_then_a_reload_warns_once(
     ``auto_start=False`` lane is not built, so that lane logs nothing until a reload's check."""
     cfg = _engine_config(tmp_path)
     eng = await _engine(tmp_path)
-    eng.add_registry(load_config(cfg))
     try:
+        eng.add_registry(load_config(cfg))
         with caplog.at_level(logging.WARNING):
             await eng.start()
         assert _warned(caplog, "outbound 'OB_KEYED'") == 1
