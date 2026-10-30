@@ -1038,9 +1038,10 @@ class ApprovalGate:
     ) -> None:
         """Write the one ``approval.standing_shown`` row for a queue listing that told ``actor``
         these requests are ``requester_not_authorized`` (vault BACKLOG #3747). The listing's answer
-        stands whether or not the row lands, so a lost row is logged and paged, never raised. The
-        page's key is the fixed ``approval:listing``: a lost row belongs to a listing, not to one
-        request, so one outage folds into one open alert however many listings it costs.
+        stands whether or not this row lands, so a lost row is logged and paged, never raised. The
+        log line's context carries the caller and their address, which the row holds outside its
+        detail. The page's key is fixed: a lost row belongs to a listing, not to one request, so
+        one outage folds into one open alert however many listings it costs.
 
         It records this listing's disclosure, not every route to the fact; docs/SECURITY.md says
         what it does not cover."""
@@ -1050,7 +1051,11 @@ class ApprovalGate:
             actor=actor,
             detail=json.dumps({"approval_ids": approval_ids}),
             client=client,  # ADR 0150: the caller's address, matching this row's actor
-            context="the queue was listed",
+            context=(
+                f"the queue was listed by {scrub_log_argument(actor)} "
+                f"from {scrub_log_argument(client or 'an unknown address')}"
+            ),
+            alert_key="approval:listing",
         )
 
     async def _read[T](self, read: Awaitable[T], *, what: str) -> T:

@@ -545,32 +545,65 @@ async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothi
     await _assert_nothing_purged(engine, mid)
 
 
+async def test_a_released_purge_of_an_outbound_another_shard_owns_cancels_nothing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0073 at the release: a non-owning engine shard's quiesced signal is vacuous, so the
+    skip comes from the ownership refusal the executor now shares with the route."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["result"]["cancelled"] == 0
+    assert "owned by engine shard 'other-shard'" in ok.json()["result"]["skipped"]
+    await _assert_nothing_purged(engine, mid)
+
+
 @pytest.mark.parametrize(
     "stored",
     [
-        {"scope": "everything"},
-        {"scope": "ALL"},
-        {"scope": None},
-        {"scope": ["top"]},
-        {},
+        {"name": "OB", "scope": "everything"},
+        {"name": "OB", "scope": "ALL"},
+        {"name": "OB", "scope": None},
+        {"name": "OB", "scope": ["top"]},
+        {"name": "OB"},
+        {"scope": "all"},
+        {"name": None, "scope": "all"},
+        {"name": "", "scope": "all"},
     ],
-    ids=["unknown", "wrong-case", "null", "a-list", "absent"],
+    ids=[
+        "unknown-scope",
+        "wrong-case-scope",
+        "null-scope",
+        "list-scope",
+        "absent-scope",
+        "absent-name",
+        "null-name",
+        "empty-name",
+    ],
 )
-async def test_a_released_purge_with_an_unknown_scope_is_refused_and_fails(
+async def test_a_released_purge_with_an_unusable_stored_target_is_refused_and_fails(
     engine: Engine, tmp_path: Path, stored: dict[str, Any]
 ) -> None:
     """Vault BACKLOG #3798 item 2: anything but "top" used to purge every queued row. The route
-    admits only "top" and "all", so no operator act clears such a row: it raises rather than
-    skips, the release answers 422, and the row's 'failed' is true."""
+    admits only "top" and "all" and always files a name, so no operator act clears such a row: it
+    raises rather than skips, the release answers 422, and the row's 'failed' is true."""
     service = await _service(engine)
     op_id = await _add(service, "op", Role.OPERATOR)
     await _add(service, "approver", Role.ADMINISTRATOR)
     mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
-    held = await _stored_purge_hold(engine, op_id, {"name": "OB", "requester": "op", **stored})
+    held = await _stored_purge_hold(engine, op_id, {"requester": "op", **stored})
     async with _client(engine, service, ON) as c:
         refused = await c.post(f"/approvals/{held}/approve", headers=await _token(c, "approver"))
     assert refused.status_code == 422, refused.text
-    assert "records no valid scope" in refused.json()["detail"]
+    assert "records no valid outbound or scope" in refused.json()["detail"]
     assert await _status_of(engine, held) == "failed"
     await _assert_nothing_purged(engine, mid)
 

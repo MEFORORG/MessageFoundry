@@ -1126,8 +1126,9 @@ def _reload_refusal(identity: Identity) -> str | None:
     return None if _cross_channel_in_scope(identity) else RELOAD_REFUSED_CHANNEL_SCOPED
 
 
-#: The scopes a purge admits. The route's pattern is built from it and the ``_purge`` approval
-#: executor refuses any other, so a release cannot disagree with the request (vault BACKLOG #3798).
+#: The scopes a purge admits. The JSON route's pattern is built from it and the ``_purge`` approval
+#: executor refuses any other, so those two cannot disagree (vault BACKLOG #3798). The console's
+#: routes keep their own literal checks.
 _PURGE_SCOPES = ("top", "all")
 
 
@@ -1164,7 +1165,7 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
     """Why a purge of outbound ``name`` would be refused right now, or ``None``. The route raises
     it, and the proof-free rejoin reads it first, so a repeat is told its hold id only while the
     purge it repeats would still be held (vault BACKLOG #2625). The ``_purge`` approval executor
-    skips on it with this same text (vault BACKLOG #3798), so a release refuses what the route
+    skips on it with this same text (vault BACKLOG #3798), so a release refuses a target the route
     refuses."""
     if rr is None:
         return HTTPException(404, f"no graph is loaded, so no outbound connection: {name}")
@@ -1718,17 +1719,17 @@ def _build_approval_gate(
                 "this purge request records no requester, so its connection_purge row could not "
                 "name who ran it; it was not run",
             )
-        # Vault BACKLOG #3798: any scope the route does not admit is a stored row no request filed.
-        # No operator act clears it, and reading it as "all" would cancel every queued row, so it
-        # raises. 422 is the approve route's "the released operation was refused".
-        scope = p.get("scope")
-        if scope not in _PURGE_SCOPES:
+        # Vault BACKLOG #3798: a scope the route does not admit, or no outbound name, is a stored row
+        # no request filed. No operator act clears it, and reading such a scope as "all" would
+        # cancel every queued row, so it raises. 422 is the approve route's "the released operation
+        # was refused".
+        scope, name = p.get("scope"), p.get("name")
+        if scope not in _PURGE_SCOPES or not isinstance(name, str) or not name:
             raise ApprovalError(
                 422,
-                "this purge request records no valid scope, so what it would cancel is not "
-                "known; it was not run",
+                "this purge request records no valid outbound or scope, so what it would cancel "
+                "is not known; it was not run",
             )
-        name = str(p["name"])
         # A retryable miss, so it skips fail-closed and records cancelled=0/skipped in the approval
         # audit: the operator clears the cause the refusal names, then re-requests.
         refusal = _purge_target_refusal(engine.registry_runner, name)
@@ -6537,9 +6538,8 @@ def create_app(
         cut_off = {a["id"] for a in interrupted}
         rows = [a for a in pending if a["id"] not in cut_off] + interrupted
         # Vault BACKLOG #3747: here and not in a gate, because the console calls this handler
-        # directly, past `require`, and on /ui this row is the only record of the listing. Every
-        # listing writes its own: a held request may have no expiry, so a de-dup key or a throttle
-        # would hide months of views.
+        # directly, past `require`. Every listing writes its own: a held request may have no
+        # expiry, so a de-dup key or a throttle would hide months of views.
         shown = [a["id"] for a in rows if a["release_blocked"] == "requester_not_authorized"]
         if shown:
             await gate.record_standing_shown(

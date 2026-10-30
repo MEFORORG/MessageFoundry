@@ -393,12 +393,9 @@ async def test_a_lost_standing_row_still_answers_200_and_pages(
             assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
     assert sink.events == [("audit_write_failed", "approval:listing", {"action": _SHOWN})]
     assert await engine.store.list_audit(action=_SHOWN) == []
-    # The ids survive in the log line, so the loss can still be read back.
-    assert any(
-        _SHOWN in r.getMessage() and approval_id in r.getMessage()
-        for r in caplog.records
-        if r.levelno == logging.ERROR
-    )
+    # What the row would have said survives in the log line: who, from where, and which requests.
+    [lost] = [r.getMessage() for r in caplog.records if _SHOWN in r.getMessage()]
+    assert approval_id in lost and "checker" in lost and "127.0.0.1" in lost
 
 
 async def test_the_live_purge_registration_requires_an_unscoped_requester(engine: Engine) -> None:

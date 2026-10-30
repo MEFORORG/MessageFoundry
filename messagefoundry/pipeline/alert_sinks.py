@@ -1209,7 +1209,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def audit_write_failed(self, name: str, *, action: str) -> None:
         # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
         # for approval_too_early, so each request is its own instance. A resolution's lost
-        # provenance row uses `approval:<id>:resolve`, its own instance (vault BACKLOG #3438). An
+        # provenance row uses `approval:<id>:resolve`, its own instance (vault BACKLOG #3438), and a
+        # queue listing's lost row uses `approval:listing` (vault BACKLOG #3747). An
         # inline config reload uses `config_reload:inline` (vault BACKLOG #2254). The action name
         # lands in the reason column.
         # The ERROR log line beside it carries the row's detail on some paths and only the exception

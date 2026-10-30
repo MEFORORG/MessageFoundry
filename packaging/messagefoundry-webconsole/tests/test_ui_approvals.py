@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from typing import get_args
 from urllib.parse import quote
@@ -141,9 +142,8 @@ async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: En
 
 async def test_a_listing_that_shows_a_lost_standing_writes_one_row(engine: Engine) -> None:
     """Vault BACKLOG #3747, the console plane: this route calls the JSON handler directly, past its
-    ``require``, and the console's gates write no grant row, so the handler's own row is the only
-    record that this listing told the caller a requester lost their authority. Reached through
-    the real route and the seam, and each listing writes its own."""
+    ``require``, so the row must come from the handler. Reached through the real route and the
+    seam, and each listing writes its own."""
     service, maker_id, _checker = await _two_approvers(engine)
     async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
         await cookie_login(maker, "maker")
@@ -162,6 +162,28 @@ async def test_a_listing_that_shows_a_lost_standing_writes_one_row(engine: Engin
     for row in rows:
         assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
         assert json.loads(str(row["detail"])) == {"approval_ids": [approval_id]}
+
+
+async def test_the_page_still_answers_when_the_store_refuses_every_audit_write(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3747: the console writes no grant row, so the standing row is the only audit
+    write on this page, and its loss must not cost the approver the Reject button."""
+    service, maker_id, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        await service.set_roles(maker_id, [Role.VIEWER.value], actor="test")
+
+        async def _refused(*_args: object, **_kwargs: object) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(engine.store, "record_audit", _refused)
+        r = await checker.get("/ui/approvals")
+    assert r.status_code == 200
+    assert f'action="/ui/approvals/{approval_id}/reject"' in r.text
+    assert await engine.store.list_audit(action="approval.standing_shown") == []
 
 
 def _row(aid: str, **update: object) -> PendingApprovalInfo:

@@ -68,7 +68,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     refusals live in the gate and key on ``identity.user_id`` (BACKLOG #1540). The id takes the JSON
     route's own ``ResourceId`` type, since calling the handler directly skips its path validation
     too. The list passes ``request`` for the caller's address on the ``approval.standing_shown``
-    row its handler writes (vault BACKLOG #3747), the only record of a /ui listing that shows it.
+    row its handler writes (vault BACKLOG #3747).
 
     Approve, reject and resolve are not registered with ``register_ui_action``: that registry
     serves the step-up re-auth continuation, and a continuation that re-POSTed an approve or a

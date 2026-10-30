@@ -2375,10 +2375,14 @@ listing, on `GET /approvals` or on the console's `/ui/approvals`, that marks at 
 with that value writes one `approval.standing_shown` row against the caller. The row carries the
 caller's `client` address (ADR 0150) and those requests' ids in `approval_ids`. A listing that
 shows no such value writes no row. Repeats are not folded together, because a held request may have
-no expiry, so a de-dup key or a throttle would hide months of views. On the console this row is the
-listing's only record, because the console's gates write no grant row. On the JSON route it sits
-beside `auth.permission_granted`. A failed write leaves the listing answering 200, and is logged and
-paged, as below. The value itself still needs no step-up.
+no expiry, so a de-dup key or a throttle would hide months of views. Nothing paces the listing, so
+a client that polls it while such a request is held writes one row per poll. On the console this
+row is the listing's only record, because the console's gates write no grant row. On the JSON route
+it sits beside `auth.permission_granted` while `[diagnostics].audit_all_authz` is on, and it does
+not depend on that switch. A failed write of this row leaves the listing answering 200, and is
+logged and paged, as below. That covers this row alone: the JSON route writes its grant row first,
+so a store that refuses every audit write answers that route 500 before this row is reached, with
+no page. The value itself still needs no step-up.
 
 This row records what that listing disclosed, and only that. It does not record every route to the
 fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
@@ -2558,13 +2562,15 @@ Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
 request moves to `failed`, and `approval.failed` names the error type. A released purge does the
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
-attributed to the requester (vault BACKLOG #3217). A released purge re-reads the route's own
-refusals (vault BACKLOG #3798). If no graph is loaded, or the outbound has left the graph, is
+attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
+makes about its target (vault BACKLOG #3798). If no graph is loaded, or the outbound has left the graph, is
 running, or is owned by another engine shard, the release skips. It cancels nothing, writes no
 `connection_purge` row, and its `approval.approved` row records the route's refusal text as the
 skip. The operator clears the cause and requests the purge again. A held purge whose stored scope
-is neither `top` nor `all` cancels nothing either: no request files one and no operator act clears
-it, so it answers 422, moves to `failed`, and `approval.failed` names the error type.
+is neither `top` nor `all`, or that stores no outbound name, cancels nothing either. No request
+files one and no operator act clears it, so it answers 422, moves to `failed`, and `approval.failed`
+names the error type. The queue does not predict this refusal: `release_blocked` stays `null`, as
+for the operation's other own refusals, and the request is claimed first.
 At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
 exception the claim has. The re-queue or the cancel and its row are then committed, and the gate
 still tries to move the request to `failed`. That row is not forwarded off-box, and no alert says
@@ -2587,7 +2593,8 @@ than to one request.
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
-- the `approval.standing_shown` row a listing writes. The log line carries the row's detail;
+- the `approval.standing_shown` row a listing writes. The log line carries the row's detail, the
+  caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
 - the request or repeat write, including one that reads back as held, as below. The log line names
