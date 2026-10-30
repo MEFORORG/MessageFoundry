@@ -1733,6 +1733,19 @@ def test_a_holder_traceback_drops_its_notes_and_a_syntax_errors_line_number() ->
     assert safe_traceback(ei) == logging.Formatter().formatException(ei)  # a clean one keeps them
 
 
+def test_a_bare_unicode_errors_text_notes_survive_its_traceback() -> None:
+    # Vault BACKLOG #3340 item 7: the note-drop meant for a holder took a bare error's notes too,
+    # which the stdlib renderer printed. A note that is not text can print anything, so it goes.
+    error = _decode_error()
+    error.add_note("while reading feed.csv")
+    error.__notes__.append(_encode_error())  # type: ignore[arg-type]
+    out = safe_traceback((type(error), error, None))
+    _assert_decode_safe(out)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out.endswith("invalid start byte\nwhile reading feed.csv")
+
+
 def _elements_read(scan: Any) -> int:
     """How many elements a scan copied out of containers and attributes: its own record of it."""
     return sum(len(elements or ()) for _arg, elements, _why in scan.nodes.values())
@@ -1860,6 +1873,119 @@ def test_a_chain_map_given_as_the_single_mapping_argument_still_answers_by_key(c
     whole = _record("%s", (held,))  # the stdlib unwraps a lone mapping; "%s" prints it whole
     _chain_filter(chain).filter(whole)
     assert whole.getMessage() == "[_Fallback holding a codec error, not rendered]"
+
+
+# --- the three gaps engine PR 2207 left (vault BACKLOG #3340, items 1 to 3) ----------------------
+
+
+class _DunderSlotError(Exception):
+    """Keeps the error in a slot whose name is a dunder, which Python does not mangle."""
+
+    __slots__ = ("__payload__",)
+
+    def __init__(self, payload: object) -> None:
+        super().__init__("bad frame")
+        self.__payload__ = payload
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.__payload__}"
+
+
+class _InnerAttributeError(Exception):
+    """Prints an attribute of a plain exception it holds, which the plain one never prints."""
+
+    def __init__(self, inner: BaseException) -> None:
+        super().__init__("bad frame")
+        self.inner = inner
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.inner.original}"  # type: ignore[attr-defined]
+
+
+class _InnerArgError(Exception):
+    """The same, with the plain exception in ``.args``."""
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.args[0].original}"
+
+
+class _CauseError(Exception):
+    """Prints its own ``__cause__``, or its ``__context__`` when it has no cause."""
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.__cause__ or self.__context__}"
+
+
+def _holding_inner(kind: type[BaseException]) -> BaseException:
+    inner = RuntimeError("failed")
+    inner.original = _encode_error()  # type: ignore[attr-defined]
+    return kind(inner)
+
+
+def _caused() -> BaseException:
+    error = _CauseError("bad frame")
+    error.__cause__ = _encode_error()
+    return error
+
+
+def _in_context() -> BaseException:
+    try:
+        try:
+            raise _encode_error()
+        except UnicodeEncodeError:
+            raise _CauseError("bad frame") from None  # suppressed in a traceback, still printed
+    except _CauseError as exc:
+        return exc
+    raise AssertionError("nothing was raised")
+
+
+_GAPS = {
+    "dunder-slot": lambda: _DunderSlotError(_encode_error()),
+    "inner-attribute": lambda: _holding_inner(_InnerAttributeError),
+    "inner-in-args": lambda: _holding_inner(_InnerArgError),
+    "cause": _caused,
+    "context": _in_context,
+}
+
+
+@pytest.mark.parametrize("make", list(_GAPS.values()), ids=list(_GAPS))
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_exception_printing_a_unicode_error_by_its_own_code_is_a_note(
+    chain: str, make: Any
+) -> None:
+    error = make()
+    assert "\\xe9" in str(error)  # control: its own __str__ prints the character
+    name = type(error).__name__
+    assert redaction.prints_a_codec_error(error)
+    assert redaction.safe_exc(error) == f"{name}: {_HOLDER}"
+    assert codec_safe_str(error) == _HOLDER
+    out = safe_traceback((type(error), error, error.__traceback__))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out.endswith(f"{name}: {_HOLDER}")
+    note = f"[{name} holding a codec error, not rendered]"
+    record = _record("got %s and %r", (error, [error]))
+    _chain_filter(chain).filter(record)
+    assert record.getMessage() == f"got {note} and [{note}]"
+
+
+def test_a_plain_exception_holding_an_error_by_attribute_keeps_its_message_on_its_own() -> None:
+    # Its own __str__ prints .args alone, so it is read deeply only beneath one that may print more.
+    inner = RuntimeError("failed")
+    inner.original = _encode_error()  # type: ignore[attr-defined]
+    assert redaction.safe_exc(inner) == "RuntimeError: failed"
+    record = _record("got %s", ([inner],))
+    args = record.args
+    prepare_log_record(record)
+    assert record.args is args
+
+
+def test_a_builtin_exception_raised_from_a_unicode_error_keeps_its_own_message() -> None:
+    # A builtin __str__, an OSError's or a KeyError's included, never prints the chain.
+    for error in (OSError(2, "cannot open"), KeyError("k"), ValueError("bad")):
+        error.__cause__ = _encode_error()
+        assert not redaction.prints_a_codec_error(error)
+        assert redaction.codec_safe_str(error) == str(error)
 
 
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(

@@ -65,6 +65,7 @@ Pure stdlib, so it can be used from any engine package.
 
 from __future__ import annotations
 
+import builtins
 import encodings
 import encodings.aliases
 import hashlib
@@ -2603,10 +2604,10 @@ def safe_traceback(ei: ExcInfo) -> str:
     A different exception that HOLDS a Unicode error, as ``RuntimeError(exc)``, has the same
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
     a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
-    exception's ``__notes__`` after its line, so those are replaced or dropped on such a node. One
-    whose message
-    was built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
-    third path, closed where the wrap is written."""
+    exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
+    ``UnicodeError`` keeps the notes that are plain text. One whose message was built as text,
+    ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the third path, closed
+    where the wrap is written."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -2626,8 +2627,13 @@ def safe_traceback(ei: ExcInfo) -> str:
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None
-            if getattr(node, "__notes__", None) is not None:
-                node.__notes__ = None  # printed after the line, each by its own str() or repr()
+            notes = getattr(node, "__notes__", None)
+            if notes is not None:  # printed after the line, each by its own str() or repr()
+                # A Unicode error's own keep each note that is exact text, as add_note writes it,
+                # which the stdlib printed (vault BACKLOG #3340, item 7). Any other note may be
+                # an error itself, and a holder's go whole, as its message did.
+                keep = isinstance(exc, UnicodeError) and type(notes) is list
+                node.__notes__ = [n for n in notes if type(n) is str] if keep else None
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2737,30 +2743,67 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
     return _NOT_FOUND
 
 
-#: ``id(class)`` -> (a weak reference to the class, its :func:`_readers` answer). Keyed by id
+#: :func:`_reader_record`'s answer for one class.
+type _ReaderRecord = tuple[tuple[Any, ...] | None, tuple[Any, ...] | None, bool]
+
+#: ``id(class)`` -> (a weak reference to the class, its :func:`_reader_record`). Keyed by id
 #: because hashing a class runs its metaclass. The reference's callback drops the entry when the
-#: class dies, which is before its id can be reused, so a reloaded config module's classes are
-#: not kept alive here.
-_READERS: dict[int, tuple[Any, tuple[Any, ...] | None]] = {}
+#: class dies, which is before its id can be reused.
+#:
+#: THE WEAK REFERENCE DOES NOT KEEP EVERY CLASS FROM BEING PINNED (vault BACKLOG #3340, item 6).
+#: The cached descriptors of a class's own ``__dict__`` and of its own slots each hold the class
+#: strongly, so a class that defines either stays alive here, its id taken, until the cache clears
+#: at :data:`_READERS_MAX` entries. A dataclass defines its own ``__dict__``, so a reloaded config
+#: module's dataclasses are among them, as is an exception with a slot of its own. That is bounded,
+#: at 1,024 classes. A class whose answer holds only inherited descriptors, as a plain exception's
+#: does, is not pinned, and its entry goes when it dies.
+_READERS: dict[int, tuple[Any, _ReaderRecord]] = {}
 _READERS_MAX = 1024
 _EXC_STR: Any = BaseException.__dict__["__str__"]
 _EXC_REPR: Any = BaseException.__dict__["__repr__"]
+#: ``BaseException``'s own chain links. A ``__str__`` or ``__repr__`` written in Python may print
+#: either (vault BACKLOG #3340, item 3). The builtin descriptors read the instance's own links,
+#: whatever a subclass defines under those names, and run none of its code.
+_CHAIN_LINKS: tuple[Any, ...] = (
+    BaseException.__dict__["__cause__"],
+    BaseException.__dict__["__context__"],
+)
+#: The ``id`` of each ``__str__`` and ``__repr__`` a builtin exception class defines. Each is C
+#: code that prints at most the exception's own slots and ``.args``: never its chain, and never
+#: an attribute of another object it holds. Ids, so testing a caller's method against them runs
+#: none of the caller's code; each one lives as long as the interpreter, so its id is never reused.
+_BUILTIN_EXC_RENDERS = frozenset(
+    id(method)
+    for kind in vars(builtins).values()
+    if isinstance(kind, type) and issubclass(kind, BaseException)
+    for name in ("__str__", "__repr__")
+    if (method := vars(kind).get(name)) is not None
+)
 
 
 def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
     """The descriptors that read what a render of a ``kind`` instance may print, or None when
     ``kind`` is not read by attribute. The first is the instance ``__dict__``'s, or None; the rest
-    are slots. A dataclass's slots are its fields, since ``slots=True`` keeps each field in one; a
-    ``UserDict`` view's is the mapping it prints.
+    are slots, and for an exception whose own code renders it, its chain links. A dataclass's
+    slots are its fields, since ``slots=True`` keeps each field in one; a ``UserDict`` view's is
+    the mapping it prints.
 
     An exception is read by attribute only when a class of its own defines ``__str__`` or
     ``__repr__``. The builtin ones print ``.args`` alone, so an ``AttributeError``'s ``.obj`` or a
     ``RuntimeError`` that merely stores an error cannot print it, and each keeps its own message.
     One that does define either is read through every slot its classes define, the builtin ones
-    included (an ``OSError``'s ``strerror`` and ``filename``, a ``SyntaxError``'s ``msg``).
+    and dunder-named ones included (an ``OSError``'s ``strerror`` and ``filename``, a
+    ``SyntaxError``'s ``msg``). When that method is not a builtin exception's own, its
+    ``__cause__`` and ``__context__`` are read too (vault BACKLOG #3340, items 1 and 3).
 
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
     class changed after an instance of it was first logged keeps its first answer."""
+    return _reader_record(kind)[0]
+
+
+def _reader_record(kind: type[Any]) -> _ReaderRecord:
+    """:func:`_readers`' answer for ``kind``, then the readers to use beneath an object whose own
+    code renders it, then whether ``kind`` is such an object. Kept per class."""
     key = id(kind)
     cached = _READERS.get(key)
     if cached is not None and cached[0]() is kind:
@@ -2776,7 +2819,7 @@ def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
     return found
 
 
-def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
+def _find_readers(kind: type[Any]) -> _ReaderRecord:
     # Identity tests along the real MRO, so no caller code answers for the class.
     mro = _TYPE_MRO.__get__(kind)
     names: tuple[str, ...] | None = None
@@ -2792,18 +2835,35 @@ def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
                 names = ()
         if base is BaseException:
             is_exception = True
-    if is_exception and (
-        _class_attribute(kind, "__str__") is not _EXC_STR
-        or _class_attribute(kind, "__repr__") is not _EXC_REPR
-    ):
-        names = (names or ()) + tuple(
+    plain = _resolve_readers(kind, names, ())
+    if not is_exception:
+        return plain, plain, False
+    slots = (
+        *(names or ()),
+        *(
             name
             for owner in mro
+            if owner is not BaseException  # its one slot, __suppress_context__, is a bool
             for name, value in _TYPE_DICT.__get__(owner).items()
-            if type(value) is MemberDescriptorType
-            and type(name) is str
-            and not name.startswith("__")
-        )
+            if type(value) is MemberDescriptorType and type(name) is str
+        ),
+    )
+    # Beneath an object whose own code renders it, that code may print any attribute of this
+    # exception, its chain included, whatever its own __str__ prints (vault BACKLOG #3340, item 2).
+    everything = _resolve_readers(kind, slots, _CHAIN_LINKS)
+    renders = (_class_attribute(kind, "__str__"), _class_attribute(kind, "__repr__"))
+    if renders[0] is _EXC_STR and renders[1] is _EXC_REPR:  # prints .args alone
+        return plain, everything, False
+    if all(id(method) in _BUILTIN_EXC_RENDERS for method in renders):  # its own slots at most
+        return _resolve_readers(kind, slots, ()), everything, False
+    return everything, everything, True  # code of its own, which may print anything it reaches
+
+
+def _resolve_readers(
+    kind: type[Any], names: tuple[str, ...] | None, extra: tuple[Any, ...]
+) -> tuple[Any, ...] | None:
+    """The instance ``__dict__``'s descriptor or None, then each of ``names`` that is a slot of
+    ``kind``, then ``extra``; or None when ``names`` is None."""
     if names is None:
         return None
     own_dict = _class_attribute(kind, "__dict__")
@@ -2813,10 +2873,11 @@ def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
         if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
         else None
     ]
-    for name in names:
+    for name in dict.fromkeys(names):  # each name is a str, so hashing it runs no caller code
         slot = _class_attribute(kind, name)
         if type(slot) is MemberDescriptorType:
             found.append(slot)
+    found.extend(extra)
     return tuple(found)
 
 
@@ -2964,7 +3025,9 @@ def prints_a_codec_error(exc: BaseException) -> bool:
     """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
     BACKLOG #3295). It looks in at least: its ``.args``; its fields, when it is a dataclass; and,
     when a class of its own defines ``__str__`` or ``__repr__``, the attributes in its instance
-    ``__dict__`` and its slots, which that method may print.
+    ``__dict__`` and its slots, which that method may print. When that method is not a builtin
+    exception's, also its ``__cause__`` and ``__context__``, and every attribute of an exception
+    it reaches (vault BACKLOG #3340).
 
     IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
     that is not read by attribute, text already built from the error, or anything past the
@@ -3013,6 +3076,11 @@ class _Scan:
     keys for that reason. ``charged_root`` skips the first walk, so everything beneath the root is
     read with the limit.
 
+    Beneath an exception whose own code renders it (:func:`_reader_record`), the second walk
+    reads every exception the deep way, its chain and every attribute included, since that code
+    may print any of them (vault BACKLOG #3340). An object met both ways is read the deep way, so
+    a plain exception shared with such a holder can print as a note where it is met plainly too.
+
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
     So an error past the budget prints raw, as it did before any object was read by attribute. A
     note in its place would rewrite a large object that holds none, which is the one thing the
@@ -3027,7 +3095,7 @@ class _Scan:
         seeds: list[int] = []
         # Objects to read by attribute, in the order met. Popped from the end, so the first
         # element of a list, which the first walk meets last, is read first.
-        charged: list[Any] = [root] if charged_root else []
+        charged: list[tuple[Any, bool]] = [(root, False)] if charged_root else []
         pending: list[Any] = [] if charged_root else [root]
         while pending:
             arg = pending.pop()
@@ -3041,7 +3109,7 @@ class _Scan:
                 continue
             if not issubclass(kind, _ARG_WALKED):
                 if _readers(kind) is not None:
-                    charged.append(arg)
+                    charged.append((arg, False))
                 continue
             try:
                 children = _children(arg, kind)
@@ -3052,16 +3120,21 @@ class _Scan:
             nodes[key] = (arg, children, "")
             pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
             if _readers(kind) is not None:
-                charged.append(arg)
+                charged.append((arg, False))
         budget = _ATTRIBUTE_BUDGET
-        read: set[int] = set()  # read by attribute, or first met by the second walk
+        # id -> whether it was read beneath an object whose own code renders it, which reads
+        # more (:func:`_reader_record`). One read the other way first is read again that way.
+        read: dict[int, bool] = {}
         while charged and budget > 0:
-            arg = charged.pop()
+            arg, deep = charged.pop()
             kind = type(arg)
             key = id(arg)
-            if kind in _ARG_SCALARS or key in read:
+            if kind in _ARG_SCALARS:
                 continue
-            read.add(key)
+            before = read.get(key)
+            if before is not None and before >= deep:  # read already, at least as deep
+                continue
+            read[key] = deep
             if issubclass(kind, UnicodeError):
                 if key not in nodes:
                     nodes[key] = (arg, [], "")
@@ -3070,13 +3143,19 @@ class _Scan:
             known = nodes.get(key)
             if known is not None and known[1] is None:
                 continue  # the first walk could not read it, and it already counts as an error
-            slots = _readers(kind)
+            shallow, beneath, opens = _reader_record(kind)
+            slots = beneath if deep else shallow
             if known is None and slots is None and not issubclass(kind, _ARG_WALKED):
                 budget -= 1  # an object that is not read at all: nothing beneath it to follow
                 continue
+            # Everything an object's own code renders from, at any depth, is read the deep way:
+            # that code may print any attribute of what it reaches (vault BACKLOG #3340, item 2).
+            inner = deep or opens
             try:
                 if known is not None:
-                    children, found = known[1] or [], []
+                    children = known[1] or []
+                    # Its elements were followed when it was met; again only to read them deeper.
+                    found = children[:budget] if inner else []
                 elif issubclass(kind, _ARG_WALKED):
                     children = found = _children(arg, kind, budget)
                 else:
@@ -3085,6 +3164,9 @@ class _Scan:
                 if slots is not None and budget > 0:
                     held = _attribute_values(arg, slots, budget)
                     budget -= len(held)
+                    if before is not None and held:  # read once already: add only what is new
+                        have = {id(child) for child in children}
+                        held = [value for value in held if id(value) not in have]
                     children, found = children + held, found + held
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)
@@ -3101,7 +3183,8 @@ class _Scan:
                 elif id(child) not in nodes:  # counted where it is read, whatever budget is left
                     nodes[id(child)] = (child, [], "")
                     seeds.append(id(child))
-            charged.extend(reversed(follow))  # popped in the order read: .args before attributes
+            # Popped in the order read: .args before attributes.
+            charged.extend((child, inner) for child in reversed(follow))
         self.nodes = nodes
         self.holds: set[int] = set()
         if not seeds:

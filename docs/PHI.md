@@ -1687,8 +1687,16 @@ An exception that holds one prints as its class and a fixed note too, never its 
 That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, and an `OSError` whose
 `strerror` or `filename` is the error. It also covers an exception that keeps the error on an
 attribute, when its class defines `__str__` or `__repr__`; such a class loses its own message
-even if it never prints the error. A builtin exception prints only its arguments, so one that
-merely stores an error keeps its message. The rule applies in a traceback, as a log argument, in
+even if it never prints the error. When that method is the class's own code rather than a builtin
+exception's, the walk also reads the exception's `__cause__` and `__context__`, and every
+attribute of an exception it holds (vault BACKLOG #3340). So such a class raised from a codec
+error, or while one was being handled, loses its message the same way. An exception whose
+`__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
+stores an error on an attribute keeps its message. Some builtin exceptions define their own, at
+least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
+fixed note even where its own `__str__` would not print it. A builtin's `__str__` never prints
+the chain, so a builtin exception raised from a codec error keeps its message. The rule applies
+in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
 `codec_safe_str()` returns the note alone, with no class.
 
@@ -1710,7 +1718,9 @@ budget before a smaller one is read.
   what it returns.
 - **Objects the filter does not read.** At least a `MappingProxyType`, a `slice`, and an object of
   your own class that is not a dataclass or an exception. An error held in one still prints raw,
-  and so does a dataclass or a list that holds such an object.
+  and so does a dataclass or a list that holds such an object. A dataclass or a `SimpleNamespace`
+  whose own `__str__` or `__repr__` prints an attribute of a plain exception it holds can print
+  an error too: only an exception's own code makes the walk read what it holds that deeply.
 - **An argument that renders differently the second time.** The three later filters render the
   message again, so an object whose `__repr__` changes or raises on a later call can still raise
   from the log call, or print what the first step did not see.
