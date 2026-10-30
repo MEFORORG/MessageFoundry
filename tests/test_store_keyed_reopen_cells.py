@@ -7,11 +7,16 @@ The contract is ``tests/_keyed_reopen_contract.py``. The server legs run it from
 leg, where its negative control is cheap enough to cover every cell: a contract that cannot go red
 proves nothing on any backend, and all three backends share its whole body.
 
-**Why the controls are few.** One run with every pass removed reaches every cell's at-rest check, and
-one control per cell would buy little beyond that for its store opens. It proves less for the read
-half: a read can refuse on a sibling column it opens first. Measured once per cell when this file was
-written: with any one pass removed, the at-rest check named that cell alone on 16 of SQLite's 18
-cells, the read path reported it too, and the keyed open refused on the other two, the warmed cells.
+**Why the controls are few.** One run with every unwarmed pass removed reaches each of those cells'
+at-rest checks, and one control per cell would buy little beyond that for its store opens. It proves
+less for the read half: a read can refuse on a sibling column it opens first. The warmed cells never
+reach the at-rest check, because with their pass removed the keyed open raises first. Measured once
+per cell when this file was written: with any one pass removed, the at-rest check named that cell
+alone on 16 of SQLite's 18 cells, the read path reported it too, and the keyed open refused on the
+other two.
+
+**A removed pass is refused as an unmarked value, so it says nothing about a pass that ran and got it
+wrong.** The two damaged-seal controls cover that: one reaches the equality check and one the AAD.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ import pytest
 
 from messagefoundry.store import MessageStore
 from messagefoundry.store import store as store_module
-from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
+from messagefoundry.store.crypto import AesGcmCipher, CipherError, generate_key, make_cipher
 from tests._keyed_reopen_contract import (
     CONTROL_CELL,
     READERS,
@@ -34,6 +39,7 @@ from tests._keyed_reopen_contract import (
     assert_names_the_control_cell_alone,
     cells_in_scope,
     keyed_reopen_report,
+    plain,
     remove_seal_passes,
 )
 from tests.test_store_cipher_sweep_parity import _BACKENDS
@@ -77,11 +83,11 @@ async def test_every_written_cell_is_sealed_and_reads_back(tmp_path: Path) -> No
     assert await _report(tmp_path / "msg.db") == KeyedReopenReport()
 
 
-async def test_removing_every_pass_reds_every_cell(
+async def test_removing_every_unwarmed_pass_reds_every_unwarmed_cell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The negative control over the whole scope. The read half may name a cell for a sibling's
-    refusal, as the module docstring says, so only the at-rest half proves that cell's own check."""
+    """The negative control over every cell but the warmed two. The read half may name a cell for a
+    sibling's refusal, as the module docstring says, so only the at-rest half proves its own check."""
     cells = [cell for cell in cells_in_scope("store.py") if cell not in WARMED_AT_OPEN]
     remove_seal_passes(monkeypatch, MessageStore, cells)
     report = await _report(tmp_path / "msg.db")
@@ -94,6 +100,44 @@ async def test_removing_one_pass_names_that_cell_alone(
 ) -> None:
     remove_seal_passes(monkeypatch, MessageStore, {CONTROL_CELL})
     assert_names_the_control_cell_alone(await _report(tmp_path / "msg.db"))
+
+
+def _damage_the_control_cells_seal(
+    monkeypatch: pytest.MonkeyPatch, *, suffix: str = "", wrong_aad: bytes | None = None
+) -> None:
+    """Seal :data:`CONTROL_CELL`'s value with ``suffix`` added, or under ``wrong_aad``, and every
+    other value as usual. Picked out by its text, because ``encrypt`` is not told the cell."""
+    real = AesGcmCipher.encrypt
+
+    def encrypt(self: AesGcmCipher, plaintext: str, *, aad: bytes | None = None) -> str:
+        if plaintext == plain(CONTROL_CELL):
+            return real(self, plaintext + suffix, aad=wrong_aad or aad)
+        return real(self, plaintext, aad=aad)
+
+    monkeypatch.setattr(AesGcmCipher, "encrypt", encrypt)
+
+
+async def test_a_seal_that_damages_a_value_reds_that_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cell is sealed, the read succeeds, and only the equality check can see the difference."""
+    _damage_the_control_cells_seal(monkeypatch, suffix="-DAMAGED")
+    report = await _report(tmp_path / "msg.db")
+    assert report.unsealed == []
+    assert list(report.unreadable) == [CONTROL_CELL]
+    assert report.unreadable[CONTROL_CELL].startswith("read back")
+
+
+async def test_a_seal_under_the_wrong_tag_reds_that_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cell is sealed and marked, and only the read path's own tag refuses it. This is the check
+    the v1 default format could not make, which binds no tag."""
+    _damage_the_control_cells_seal(monkeypatch, wrong_aad=b"not this cell's tag")
+    report = await _report(tmp_path / "msg.db")
+    assert report.unsealed == []
+    assert list(report.unreadable) == [CONTROL_CELL]
+    assert "CipherError" in report.unreadable[CONTROL_CELL]
 
 
 @pytest.mark.parametrize("cell", WARMED_AT_OPEN, ids=lambda cell: f"{cell[0]}.{cell[1]}")

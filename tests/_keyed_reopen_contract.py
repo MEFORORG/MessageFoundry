@@ -9,10 +9,11 @@ every written cell through that cell's real writer, a keyed handle re-opens the 
 must then be sealed at rest and read back through its real read path.
 
 **The scope is the parity guard's own instrument, not a list here.** The cells come from
-``_written_cells``, per backend, so a new cipher-covered cell cannot quietly fall outside this. Its
-absence from :func:`write_every_cell` stops the keyless half on every leg, and its absence from
-:data:`READERS` reds the plain leg with no database. ``shared_body`` is in scope on SQLite alone for
-the same reason it is there: only that backend writes a row into it.
+``_written_cells``, per backend, so this covers at least every cell that instrument can see: one
+sealed through a tag builder it does not know is outside both. A new cell it does see stops the
+keyless half on every leg until :func:`write_every_cell` writes it, and reds the plain leg with no
+database until :data:`READERS` reads it. ``shared_body`` is in scope on SQLite alone for the same
+reason it is there: only that backend writes a row into it.
 
 **The cipher is the cell-bound writer, ``write_v2=True``, and that is what makes the read-back mean
 anything.** ``make_cipher`` defaults to the v1 format, which binds no AAD, so a v1 read-back would
@@ -77,8 +78,8 @@ _QUEUED, _DEAD, _REPLIED = "OB_QUEUED", "OB_DEAD", "OB_REPLIED"
 #: one fails a keyed open itself, and a sealed one fails a keyless open.
 WARMED_AT_OPEN: tuple[Cell, ...] = (("state", "value"), ("reference", "value"))
 
-#: The cell a server leg's negative control removes. It shares no read path with another cell, so the
-#: report names it alone. A message cell would not do: every read of a message opens ``messages.raw``.
+#: The cell a server leg's negative control removes. Its read opens no other cipher cell, so the report
+#: names it alone. Not every cell's does: a response read opens all three of its columns.
 CONTROL_CELL: Cell = ("connection_event", "reason")
 
 
@@ -236,7 +237,8 @@ async def write_every_cell(store: Any) -> Written:
 
 async def _message_field(store: Any, message_id: str, name: str) -> Any:
     row = await store.get_message(message_id)
-    assert row is not None, message_id
+    if row is None:
+        raise LookupError(f"no message {message_id}")
     return row[name]
 
 
@@ -270,7 +272,11 @@ async def _event_detail(store: Any, message_id: str) -> Any:
 
 
 async def _last_error(store: Any, message_id: str) -> Any:
-    return (await store.outbox_for(message_id))[0]["last_error"]
+    """Through both of its read paths, which decrypt it separately: a delivery row, and the
+    dead-letter list's join."""
+    delivery = (await store.outbox_for(message_id))[0]["last_error"]
+    dead = (await store.list_dead(allowed_channels=None))[0]["last_error"]
+    return delivery if delivery == dead else (delivery, dead)
 
 
 async def _connection_reason(store: Any) -> Any:
@@ -284,7 +290,8 @@ async def _alert_reason(store: Any) -> Any:
 
 async def _preset_criteria(store: Any) -> Any:
     row = await store.get_search_preset(preset_id=_PRESET, owner_user_id=_PRESET_OWNER)
-    assert row is not None
+    if row is None:
+        raise LookupError(f"no preset {_PRESET}")
     return row["criteria"]
 
 
@@ -329,9 +336,7 @@ async def _unsealed(store: Any, fetch: Fetch, cells: Sequence[Cell]) -> list[Cel
     unsealed = []
     for cell in cells:
         values = await _at_rest(store, fetch, cell)
-        if not values or not all(
-            value.startswith(_V4_PREFIX) and plain(cell) not in value for value in values
-        ):
+        if not values or not all(value.startswith(_V4_PREFIX) for value in values):
             unsealed.append(cell)
     return unsealed
 
