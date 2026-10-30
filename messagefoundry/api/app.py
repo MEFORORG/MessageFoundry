@@ -472,6 +472,7 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
+from messagefoundry.privilege_probes import probe_vault
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
     RemoteDebugPosture,
@@ -536,6 +537,7 @@ from messagefoundry.uploads import (
     browse_messages,
     split_uploaded,
 )
+from messagefoundry.vault_preflight import run_vault_privilege_preflight
 
 __all__ = ["create_app", "create_managed_app"]
 
@@ -11413,7 +11415,9 @@ def create_managed_app(
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it.
+    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
+    Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
     (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
@@ -11682,6 +11686,32 @@ def create_managed_app(
                 await notifier.aclose()
             await store.close()
             raise
+        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): probe each Vault token the engine uses, with the
+        # probe check-privileges runs and through the provider's own client, at the same seam and
+        # under the same teardown discipline as the store preflight above. Under
+        # [security].enforcement=enforce the root policy or any grant on an administrative path
+        # refuses unless [security].allow_over_granted_vault_token accepts it (audited); every other
+        # finding warns and audits. Needs the resolved service settings to name the consumers, so it
+        # runs on the serve path, which always passes them; an embedding that passes none has no
+        # Vault consumer this lifespan could name.
+        if static_credential_settings is not None:
+            _security = security_settings or SecuritySettings()
+            try:
+                await run_vault_privilege_preflight(
+                    static_credential_settings,
+                    store,
+                    enforcing=(security_enforcement or _security.enforcement)
+                    is SecurityEnforcement.ENFORCE,
+                    over_grant_accepted=_security.allow_over_granted_vault_token,
+                    probe=partial(
+                        probe_vault, settings=static_credential_settings, posture=_hop_posture
+                    ),
+                )
+            except BaseException:
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
         # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
         # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
         # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop

@@ -192,6 +192,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `max_session_hours` | `12` (a value above `12` is named. `0` or less ends every session at once, which is stricter) |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
+| Vault token | `allow_over_granted_vault_token` | `false` (ADR 0216: accept a Vault token holding the root policy or an administrative grant under `enforce`, audited) |
 | Interpreter | `allow_remote_debugging` | `false` (vault BACKLOG #2700: accept the interpreter's remote debugging on under `enforce`, which otherwise refuses the start; reported) |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
@@ -1846,6 +1847,27 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   declares, and it has nothing to lift on an unobservable probe, which only warns.
 - **How to turn it off:** remove it, after the grant matches [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md)
   §1.1 or §1.2. `messagefoundry check-privileges` shows the grant and what `serve` would do with it.
+
+### `allow_over_granted_vault_token = true` — start on a Vault token holding the gravest grants
+
+> **A switch.** `[security].allow_over_granted_vault_token`, default `false`.
+> [ADR 0216](../docs/adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md), ASVS 13.2.2.
+- **What you lose:** the refusal under `enforce` that a Vault token the engine uses earns when the
+  startup probe finds it holding the root policy, any grant on an administrative path (a policy
+  write, including one of its own policies, an identity group, a mount, an auth method or
+  `auth/token/create`), or a Transit key's `config`, `rotate`, `export` or `backup`. Such a token can
+  widen its own reach, or take the store key out of Vault. Any code path that reaches the token
+  inherits that.
+- **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
+- **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
+  `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in
+  `GET /security/posture`.
+- **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
+  token shared by two hops or an extra capability on a path the engine calls, and a probe that could
+  not read the token, only warn, so there is nothing for it to lift there.
+- **How to turn it off:** remove it, after the token's policy matches the grant
+  [`SECURITY.md`](SECURITY.md) prescribes for that hop. `messagefoundry check-privileges` shows the
+  grant and what `serve` would do with it.
 
 ### `schema_management` — the engine's runtime login runs its own schema DDL
 

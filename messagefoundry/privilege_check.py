@@ -67,6 +67,7 @@ __all__ = [
     "EXIT_SETTINGS",
     "EXIT_UNOBSERVABLE",
     "VAULT_ADMIN_PATHS",
+    "VAULT_OVER_GRANT_OPT_OUT",
     "HopPrivilege",
     "HopState",
     "VaultConsumer",
@@ -82,6 +83,9 @@ __all__ = [
     "vault_consumers",
     "vault_admin_paths",
     "vault_hop",
+    "vault_hops",
+    "vault_preflight_outcome",
+    "vault_refusal_reason",
 ]
 
 #: Every probe that ran found nothing beyond the documented grant. Hops with no probe do not count.
@@ -115,13 +119,18 @@ _LOUD_LABEL: dict[HopState, str] = {
 
 @dataclass(frozen=True, slots=True)
 class HopPrivilege:
-    """One backend hop: who the engine presents, what that identity should hold, and what was seen."""
+    """One backend hop: who the engine presents, what that identity should hold, and what was seen.
+
+    ``refusing`` holds the over-grant reasons in the class that refuses a start under ``enforce``
+    (ADR 0216). Only a Vault hop fills it; it is empty for every other hop, and for a Vault hop
+    whose over-grants are all in the warning class."""
 
     hop: str
     state: HopState
     identity: str
     minimal: str
     detail: str
+    refusing: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -380,7 +389,15 @@ def vault_hop(
     serving two hops holds the union of both grants, so each hop holds more than its own least
     grant. A capability the engine needs and the token lacks is reported but is not an over-grant:
     the engine's own call would fail. Unobservable: any part of the reading could not be made, and
-    no over-grant was seen. Over-grant wins, as it does in the exit code."""
+    no over-grant was seen. Over-grant wins, as it does in the exit code.
+
+    **Two classes (ADR 0216, owner ruling 2026-10-04).** The root policy and any grant on an
+    administrative path -- :data:`VAULT_ADMIN_PATHS`, a write of the token's own policies, and a
+    Transit key's ``config``, ``rotate``, ``export`` and ``backup`` -- are the REFUSING class, kept
+    in :attr:`HopPrivilege.refusing`. Everything else is the WARNING class, at least: a token shared
+    by two hops, an extra capability on a path the engine calls, and a policy name the probe cannot
+    tell from root by reading it, which means it cannot judge rather than that it saw root."""
+    grave: list[str] = []
     over: list[str] = []
     notes: list[str] = []
     # Judged on the printed form too: a name that only LOOKS like root once its invisible
@@ -389,7 +406,7 @@ def vault_hop(
     # apart from root on a terminal at all, so it is reported rather than guessed at.
     for p in reading.policies:
         if p == "root" or printable(p) == "root":
-            over.append("the token carries the root policy")
+            grave.append("the token carries the root policy")
         elif not (p.isascii() and p.isprintable()):
             over.append(
                 f"the policy name {_quoted(p)} is not plain printable ASCII, so it cannot be told "
@@ -408,7 +425,7 @@ def vault_hop(
     for path in reading.admin_paths:
         extra = set(reading.capabilities.get(path, ())) - {"deny"}
         if extra:
-            over.append(f"{path} grants {_caps(extra)}; the engine never calls it")
+            grave.append(f"{path} grants {_caps(extra)}; the engine never calls it")
     for other_hop, other in (shared or {}).items():
         for path in other.required:
             extra = set(other.capabilities.get(path, ())) - {"deny"}
@@ -432,13 +449,18 @@ def vault_hop(
     checked = [p for p in reading.required if p in reading.capabilities]
     if checked:
         seen.append("; ".join(f"{p}: {_caps(reading.capabilities[p])}" for p in checked))
-    if over:
+    if grave or over:
         state = HopState.OVER_GRANTED
     elif reading.problems:
         state = HopState.UNOBSERVABLE
     else:
         state = HopState.CLEAN
-    parts = [*(f"over-granted: {o}" for o in over), *seen, *notes]
+    parts = [
+        *(f"over-granted, refusing class: {g}" for g in grave),
+        *(f"over-granted: {o}" for o in over),
+        *seen,
+        *notes,
+    ]
     parts += [f"could not observe: {p}" for p in reading.problems]
     if state is HopState.CLEAN:
         parts.append(
@@ -449,10 +471,12 @@ def vault_hop(
     # policy name inside an administrative PATH as well as in the policy list, and the JSON output
     # carries the value itself (json.dumps escapes it there).
     detail = ". ".join(parts)
-    return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, detail)
+    return HopPrivilege(
+        consumer.hop, state, consumer.identity, consumer.minimal, detail, refusing=tuple(grave)
+    )
 
 
-def _vault_hops(
+def vault_hops(
     consumers: list[VaultConsumer], readings: list[VaultTokenReading]
 ) -> list[HopPrivilege]:
     """Judge every Vault hop, each against the union of grants of every hop that holds its token.
@@ -468,6 +492,40 @@ def _vault_hops(
         }
         hops.append(vault_hop(consumer, reading, shared=shared))
     return hops
+
+
+#: The audited opt-out that lets an enforcing instance start on a Vault token holding a grant in
+#: the refusing class (ADR 0216).
+VAULT_OVER_GRANT_OPT_OUT = "[security].allow_over_granted_vault_token"
+
+
+def vault_preflight_outcome(
+    hop: HopPrivilege, *, enforcing: bool, over_grant_accepted: bool
+) -> PreflightOutcome:
+    """What ``serve`` does with one judged Vault hop (ADR 0216). Stated once, so the startup
+    preflight and ``check-privileges`` cannot disagree.
+
+    A hop with no finding is CLEAN. Under ``enforcement = warn`` every finding warns. Under
+    ``enforce`` a grant in the refusing class refuses unless ``over_grant_accepted``
+    (``[security].allow_over_granted_vault_token``) accepts it; the warning class and an
+    unobservable probe warn. The outcomes are the store preflight's own
+    :class:`~messagefoundry.store.privilege.PreflightOutcome`."""
+    if hop.state not in (HopState.OVER_GRANTED, HopState.UNOBSERVABLE):
+        return PreflightOutcome.CLEAN
+    if not enforcing or not hop.refusing:
+        return PreflightOutcome.WARN
+    return PreflightOutcome.ACCEPTED if over_grant_accepted else PreflightOutcome.REFUSE
+
+
+def vault_refusal_reason(hops: Iterable[str]) -> str:
+    """Why :attr:`PreflightOutcome.REFUSE` applies to the named Vault hops, in the words the
+    refusal and ``check-privileges`` both print."""
+    return (
+        f"a Vault token on {', '.join(hops)} holds the root policy or a grant on an administrative "
+        "path, under [security].enforcement = 'enforce'. Reduce the token's policy to the grant "
+        f"docs/SECURITY.md prescribes, or set {VAULT_OVER_GRANT_OPT_OUT} = true to accept it "
+        "(audited)"
+    )
 
 
 # --- LDAP: the AD bind account ------------------------------------------------------------------
@@ -657,7 +715,7 @@ def settings_hops(
     network calls)."""
     consumers = vault_consumers(settings)
     vault = (
-        _vault_hops(consumers, [vault_probe(c) for c in consumers])
+        vault_hops(consumers, [vault_probe(c) for c in consumers])
         if consumers
         else [_not_configured("vault", "no Vault consumer is configured")]
     )
@@ -682,23 +740,58 @@ def serve_verdict(
     settings: ServiceSettings,
     hops: Iterable[HopPrivilege] = (),
 ) -> str:
-    """What ``serve`` would do at startup with this store observation under these settings (ADR 0199).
+    """What ``serve`` would do at startup with these observations under these settings (ADR 0199,
+    ADR 0216).
 
-    The decision is the preflight's own :func:`~messagefoundry.store.privilege.preflight_outcome`, so
-    the read-out and the serve gate cannot disagree. The exit code does NOT follow it: an over-grant
-    exits 3 whether or not serve would start, because the grant is still wider than the runbook's.
+    The decisions are the preflights' own -- :func:`~messagefoundry.store.privilege.preflight_outcome`
+    for the store and :func:`vault_preflight_outcome` for each Vault hop -- so the read-out and the
+    serve gates cannot disagree. The exit code does NOT follow them: an over-grant exits 3 whether or
+    not serve would start, because the grant is still wider than the runbook's.
 
-    Only the store finding gates a start. When another hop in ``hops`` is over-granted, the verdict
-    says so, so nobody reads a Vault or LDAP over-grant as one ``serve`` would refuse. Whether an
-    observed Vault over-grant should refuse start under ``enforce``, as the store's does under
-    ADR 0199, is left to its own change."""
-    ungated = [h.hop for h in hops if h.hop != "store" and h.state is HopState.OVER_GRANTED]
-    note = (
-        f" (the over-grant on {', '.join(ungated)} is reported only; it does not gate a start)"
-        if ungated
-        else ""
-    )
-    return _store_verdict(report, settings) + note
+    The store finding and a Vault grant in the refusing class gate a start. A Vault finding that
+    only warns, an accepted Vault over-grant, and an LDAP over-grant are named after the verdict, so
+    nobody reads one as a refusal."""
+    hops = list(hops)
+    security = settings.security
+    enforcing = security.enforcement is SecurityEnforcement.ENFORCE
+    vault: dict[PreflightOutcome, list[str]] = {}
+    for h in hops:
+        if h.hop.startswith("vault"):
+            outcome = vault_preflight_outcome(
+                h,
+                enforcing=enforcing,
+                over_grant_accepted=security.allow_over_granted_vault_token,
+            )
+            vault.setdefault(outcome, []).append(h.hop)
+    store = _store_verdict(report, settings)
+    refused = vault.get(PreflightOutcome.REFUSE, [])
+    if refused:
+        reason = vault_refusal_reason(refused)
+        verdict = (
+            f"{store}; and {reason}"
+            if store.startswith("would REFUSE")
+            else f"would REFUSE to start: {reason}"
+        )
+    else:
+        verdict = store
+    notes: list[str] = []
+    if accepted := vault.get(PreflightOutcome.ACCEPTED):
+        notes.append(
+            f"the over-grant on {', '.join(accepted)} is accepted by {VAULT_OVER_GRANT_OPT_OUT} "
+            "(audited)"
+        )
+    if warned := vault.get(PreflightOutcome.WARN):
+        notes.append(f"{', '.join(warned)} warns only; it does not refuse a start")
+    ungated = [
+        h.hop
+        for h in hops
+        if h.hop != "store" and not h.hop.startswith("vault") and h.state is HopState.OVER_GRANTED
+    ]
+    if ungated:
+        notes.append(
+            f"the over-grant on {', '.join(ungated)} is reported only; it does not gate a start"
+        )
+    return verdict + "".join(f" ({n})" for n in notes)
 
 
 def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> str:
