@@ -36,7 +36,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     build_destination,
 )
-from messagefoundry.transports.file import FileDestination
+from messagefoundry.transports.file import FileDestination, _Replaced
 from messagefoundry.transports.remotefile import _RemoteError
 from tests._refusal_log_capture import record_texts
 from tests.test_remotefile_transport import _dest, _FakeClient
@@ -229,9 +229,32 @@ def test_without_names_keeps_text_that_names_no_file() -> None:
 
 
 def test_without_names_swaps_each_name_once_in_one_pass() -> None:
-    # A shorter name must not be matched again inside the label a longer one became.
+    # A shorter name must not be matched again inside the label a longer one became, and an echo
+    # in another case takes the label of the name as rendered.
     names = ["/in/1.hl7", "/in/1-1.hl7", "/in/11.hl7"]
     exc = _RemoteError("550 /in/1-1.hl7 and /in/1.HL7", permanent=True)
     assert str(exc.without_names(names)) == (
-        f"550 /in/{safe_name('1-1.hl7')} and /in/{safe_name('1.HL7')}"
+        f"550 /in/{safe_name('1-1.hl7')} and /in/{safe_name('1.hl7')}"
     )
+
+
+@pytest.mark.parametrize(
+    ("raised", "kept"),
+    [
+        (OSError(f"share refused out/{MRN}_SYNTHETIC-1.hl7"), "file write failed: OSError"),
+        (_Replaced("not the file that was read"), "_Replaced: not the file that was read"),
+    ],
+    ids=["message-only", "own-fixed-message"],
+)
+async def test_an_error_with_no_errno_keeps_only_what_names_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: OSError, kept: str
+) -> None:
+    # A message-only OSError can quote a bumped name, so only its type is kept; this module's own
+    # refusals carry fixed words, so their message is kept.
+    def refuse(src: object, dst: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(DeliveryError) as caught:
+        await _file_destination(tmp_path / "out").send(BODY)
+    assert kept in str(caught.value) and MRN not in _traceback(caught.value)

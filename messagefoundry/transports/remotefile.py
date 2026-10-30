@@ -302,15 +302,21 @@ class _RemoteError(Exception):
         it refused, and on an upload that path ends in a name rendered from message fields, in its
         temp form or as a bumped candidate; a case-insensitive server may echo it in its stored
         case. A temp name holds the name it is for, so replacing the name covers it. One pass,
-        longest name first, so a label already put in is never matched again.
+        longest name first, so a label already put in is never matched again. Each echo takes the
+        label of the name as rendered, whatever its case, so it matches the label the upload's own
+        log lines carry.
 
         It is a denylist over the server's free text: a reply that cuts a name short or encodes it
-        some other way keeps that form."""
+        some other way keeps that form. A very short name is also replaced where it appears as
+        other text, such as a reply code."""
         text = str(self)
         bases = sorted({posixpath.basename(n) for n in names} - {""}, key=len, reverse=True)
         if bases:
+            labels = {base.casefold(): safe_name(base) for base in bases}
             pattern = re.compile("|".join(map(re.escape, bases)), re.IGNORECASE)
-            text = pattern.sub(lambda m: safe_name(m.group(0)), text)
+            text = pattern.sub(
+                lambda m: labels.get(m.group(0).casefold()) or safe_name(m.group(0)), text
+            )
         return _RemoteError(
             text,
             permanent=self.permanent,

@@ -584,9 +584,15 @@ class FileDestination(DestinationConnector):
         except OSError as exc:
             # An OS error quotes the path it failed on, and its last part is this name, rendered
             # from message fields, or a bumped name-1.ext of it. The error text reaches last_error,
-            # the connection event and the alert, so it keeps the type, errno and OS text only, and
-            # an OSError with no errno keeps its type alone (BACKLOG #2814).
-            reason = _describe_os_error(exc) if exc.errno is not None else type(exc).__name__
+            # the connection event and the alert, so it keeps the type, errno and OS text only
+            # (BACKLOG #2814). An OSError with no errno keeps its type alone, unless it is one of
+            # this module's own, whose fixed message never names a file.
+            fixed_message = isinstance(exc, (_Unconfined, _Replaced))
+            reason = (
+                _describe_os_error(exc)
+                if exc.errno is not None or fixed_message
+                else type(exc).__name__
+            )
         else:
             return
         # Raised outside the handler, so the OS error, which quotes the path, is on neither
