@@ -264,19 +264,22 @@ def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool |
     return True if prior is None else fingerprint_changed(prior.fingerprint, fingerprint)
 
 
-async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> None:
+async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> bool:
     """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before it changes
-    anything, so a crash or a failed step leaves the record standing (BACKLOG #3737).
+    anything, so a crash or a failed step leaves the record standing (BACKLOG #3737). Returns
+    whether it did.
 
     Skipped when the stored stamp already names ``key_id``: that run changes no key, so there is
     nothing for :func:`reconcile_rotation_meta` to withhold. A stamp under a scheme this release does
     not know cannot say so, and opens the record."""
     fingerprint = dek_fingerprint(key_id)
     prior = (await meta_store.get_secret_rotation_meta()).get(_DEK_CLASS_ID)
-    if dek_changed(prior, fingerprint) is not False:
-        await meta_store.upsert_secret_rotation_meta(
-            ROTATION_RECORD_ID, fingerprint=fingerprint, tracked_since=day, last_rotated=day
-        )
+    if dek_changed(prior, fingerprint) is False:
+        return False
+    await meta_store.upsert_secret_rotation_meta(
+        ROTATION_RECORD_ID, fingerprint=fingerprint, tracked_since=day, last_rotated=day
+    )
+    return True
 
 
 async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -> None:
@@ -302,8 +305,13 @@ def _rotation_incomplete(record: SecretRotationMetaRow | None, fingerprint: str)
     was changed by hand, so it stamps as any such change does."""
     if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED:
         return False
+    # A key id has one length, so one of any other length is a damaged record, not another key.
     head, _, key_id = record.fingerprint.partition(":")
-    if head != KEY_ID_SCHEME or not key_id or key_id.strip(_LOWER_HEX):
+    if (
+        head != KEY_ID_SCHEME
+        or len(record.fingerprint) != len(fingerprint)
+        or key_id.strip(_LOWER_HEX)
+    ):
         log.warning(
             "secret rotation: the rotation record could not be read, so the store key's rotation "
             "date was not stamped. Run `messagefoundry rotate-key` to completion."
@@ -559,7 +567,8 @@ async def reconcile_rotation_meta(
             log.warning(
                 "secret rotation: rotate-key has not completed for the store key in use, so its "
                 "rotation date was not stamped and its age is still read from the prior date. Run "
-                "`messagefoundry rotate-key` until it exits 0, or set the key back."
+                "`messagefoundry rotate-key` until it exits 0. Do not simply put the prior key "
+                "back: values may already be under this one. docs/PHI.md says how to back out."
             )
         elif changed_fp:
             last_rotated = today  # rotation auto-detected, so reset the clock
@@ -597,7 +606,11 @@ async def reconcile_rotation_meta(
         if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
             held.update(extra_values)
         # An env() key is free text, and a cell written over this row would hide the record.
-        held.pop(ROTATION_RECORD_ID, None)
+        if held.pop(ROTATION_RECORD_ID, None) is not None:
+            log.warning(
+                "secret rotation: a credential's env() key is the reserved name of the rotation "
+                "record, so that credential is not tracked. Rename the key."
+            )
         for class_id, value in held.items():
             label = labels.get(class_id, class_id)
             max_age = settings.secret_max_age_days

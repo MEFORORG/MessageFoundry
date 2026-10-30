@@ -43,7 +43,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
 from messagefoundry.controlchars import strip_control_chars
@@ -613,9 +613,9 @@ class ResealResult:
     rotation stamp while it is non-zero (BACKLOG #3181). It includes a value no configured key opens,
     which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
     text is not counted here when its sidecar is readable: no key reads that body and no re-run
-    changes it (``unsealable``, ``body_lost``), and neither is a file that is not a regular file
-    (``not_regular``). At least a file too large for an upload and a sidecar that is not text are
-    still skips.
+    changes it (``unsealable``, ``body_lost``), and neither is a FIFO, a directory or a device
+    (``not_regular``). At least a file too large for an upload, a symlink and a sidecar that is not
+    text are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -642,11 +642,9 @@ class ResealResult:
     #: any other, so retiring the prior key loses nothing. The upload stays listed with a body that
     #: cannot be read until an operator deletes it or the retention prune removes it at expiry.
     body_lost: int = 0
-    #: How many UPLOADS have a body or sidecar that is a symlink, a FIFO or anything else but a
-    #: regular file (BACKLOG #3737). The engine never writes one, this pass neither opens nor follows
-    #: it, and it is not a skip, or one planted link would fail every rotation. An operator removes it
-    #: by hand. If a link points at a file that belongs here, that file was not rotated, so the file
-    #: goes back and ``rotate-key`` runs again before the prior key is retired.
+    #: How many UPLOADS have a body or sidecar that is a FIFO, a directory or a device (BACKLOG
+    #: #3737). It holds no value, so it is not a skip, and an operator removes it by hand. A symlink
+    #: is not counted here: its target may be under the prior key, so it is a skip.
     not_regular: int = 0
 
 
@@ -659,7 +657,7 @@ class _Half(Enum):
     SEALED_PLAINTEXT = auto()  # the same, and it was plaintext
     LOST = auto()  # a body that is missing or is not text
     UNSEALABLE = auto()  # a plaintext sidecar over a lost body
-    NOT_REGULAR = auto()  # a symlink, FIFO or the like, left as it was and not followed
+    NOT_REGULAR = auto()  # a FIFO, directory or device, or a plaintext sidecar over one; left as is
     SKIPPED = auto()  # it may still be under the prior key
 
 
@@ -2101,8 +2099,8 @@ class UploadStore:
         that comes back under a key retired since then is unreadable, so the command's note tells
         the operator to keep the prior key while one may.
 
-        **Nothing but a regular file is opened or followed (BACKLOG #3737),** and no file larger than
-        an upload can be is read whole. See :meth:`_reseal_half`.
+        **Only a regular file is opened (BACKLOG #3737),** no link is followed, and no file larger
+        than an upload can be is read whole. See :meth:`_reseal_half`.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -2180,18 +2178,23 @@ class UploadStore:
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
         that was. Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
 
-        Nothing is opened until ``lstat`` shows a regular file (BACKLOG #3737). A FIFO would block
-        the open for good, and following a symlink would re-seal or read a file this store does not
-        own. The engine writes neither, and no key reads either from here, so each is reported and
-        left alone rather than failing every run."""
+        ``lstat`` decides what is opened (BACKLOG #3737). A FIFO would block the open for good. It,
+        a directory and a device hold no value, so each is reported and left alone, and it is not
+        a skip, like a missing body. A symlink is not followed, because that would re-seal or read a
+        file this store does not own. It is a skip, because its target may be a real upload still
+        under the prior key. This guards an offline command against what is on disk when it looks,
+        not against a writer racing it."""
         try:
             info = path.lstat()
-            if not S_ISREG(info.st_mode):
+            if S_ISLNK(info.st_mode):
                 _log.warning(
-                    "uploaded file %s (%s): not a regular file; left as it is and not followed",
+                    "uploaded file %s (%s): skipped, it is a symlink and was not followed",
                     fid,
                     kind,
                 )
+                return _Half.SKIPPED
+            if not S_ISREG(info.st_mode):
+                _log.warning("uploaded file %s (%s): not a file; left as it is", fid, kind)
                 return _Half.NOT_REGULAR
             # Read the MARKER first, not the file. The idempotency test is a prefix compare, and a
             # sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip it made a
@@ -2208,7 +2211,8 @@ class UploadStore:
                 # takes, so a planted one would abort the pass. A skip and not a loss: it may be a
                 # real body from before a lowered max_upload_bytes, still under the prior key.
                 _log.warning(
-                    "uploaded file %s (%s): skipped, larger than an upload can be (%d bytes)",
+                    "uploaded file %s (%s): skipped, %d bytes is larger than an upload can be. If "
+                    "it is a real upload, raise [store].max_upload_bytes for this run",
                     fid,
                     kind,
                     info.st_size,
@@ -2240,7 +2244,7 @@ class UploadStore:
             # is listed already, so it is still re-sealed: left behind, it would drop out of reach of
             # prune_expired once that key goes.
             if body is _Half.NOT_REGULAR:
-                return _Half.CURRENT  # the pair is reported by its body; nothing is written
+                return _Half.NOT_REGULAR  # left as it is, for the same reason as its body
             # The body is missing or is not text: the one test the prune and the quota use too.
             # Asked of a CURRENT body, because that pass trusts a body whose first bytes are the
             # active marker without reading the rest. Every other body was read whole just now.
@@ -2936,7 +2940,10 @@ def _unopened_cause(cipher: AesGcmCipher, stored: str) -> str:
     head = stored[:_MARKER_READ_LIMIT]
     key_id = cipher.named_key_id(head)
     if key_id is None:
-        return "its marker names no key id this engine writes, so it is old, damaged or planted"
+        return (
+            "its marker names no key id this cipher reads, so it is old, damaged, planted or "
+            "sealed by another cipher"
+        )
     if cipher.holds_key_for(head):
         return f"key {key_id} is configured and did not open it, so it is damaged or was moved"
     return f"key {key_id} is not configured; supply it, unless the value is damaged"

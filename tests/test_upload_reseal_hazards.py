@@ -3,9 +3,10 @@
 """BACKLOG #3737: what the upload reseal does with a file the engine did not write.
 
 The pass opened whatever sat at a body or sidecar path. A FIFO blocked it for good, a symlink out of
-the root failed the path guard on every run, and a huge file was read whole, where a ``MemoryError``
-aborts the pass. Its skip log kept only the cause's class, which is the same for a missing key and a
-damaged file. Each test fails on the code before #3737."""
+the root failed the path guard with its whole pair unsealed, and a huge file was read whole, where a
+``MemoryError`` aborts the pass. Its skip log kept only the cause's class, which is the same for a
+missing key and a damaged file. At least the tests of those behaviours fail on the code before
+#3737; the two pins say so in their own docstrings."""
 
 from __future__ import annotations
 
@@ -123,10 +124,12 @@ def test_a_skip_on_the_other_half_outranks_a_non_regular_file(
     assert (result.skipped, result.not_regular) == (1, 0)
 
 
-def test_a_symlink_out_of_the_root_is_neither_followed_nor_a_skip(
+def test_a_symlink_is_a_skip_is_not_followed_and_leaves_its_sidecar_resealed(
     tmp_path: Path, keys: tuple[str, str]
 ) -> None:
-    """On the old code it failed the path guard, so every run exited 1. The target stays as it was."""
+    """Its target may be a real upload under the prior key, so the run must not read as whole. On
+    the old code the path guard refused the id, so the sidecar beside the link stayed under the
+    prior key too. Only the target stays as it was."""
     key_a, key_b = keys
     root = tmp_path / "uploads"
     fid = _save(root, _aes(key_a))
@@ -136,24 +139,26 @@ def test_a_symlink_out_of_the_root_is_neither_followed_nor_a_skip(
     before = outside.read_bytes()
     blob.unlink()
     _symlink(blob, outside)
-    result = _reseal(root, _aes(key_b, key_a))
-    assert (result.skipped, result.not_regular, result.resealed) == (0, 1, 1)
+    rotated = _aes(key_b, key_a)
+    result = _reseal(root, rotated)
+    assert (result.skipped, result.not_regular, result.resealed) == (1, 0, 1)
     assert outside.read_bytes() == before
     assert blob.is_symlink()
+    stored = (root / f"{fid}.meta").read_text(encoding="utf-8")
+    assert stored.startswith(rotated.active_marker_prefix)
 
 
 def test_a_dangling_symlink_is_not_taken_for_a_lost_body(
     tmp_path: Path, keys: tuple[str, str]
 ) -> None:
-    """``stat`` follows it to nothing and would call the body missing, and the note for a missing
-    body promises the prune."""
+    """``stat`` follows it to nothing and would call the body missing, which is not a skip."""
     key_a, key_b = keys
     fid = _save(tmp_path, _aes(key_a))
     blob = tmp_path / f"{fid}.blob"
     blob.unlink()
     _symlink(blob, tmp_path / "nowhere")
     result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert (result.not_regular, result.body_lost) == (1, 0)
+    assert (result.skipped, result.body_lost) == (1, 0)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
@@ -258,7 +263,7 @@ def test_the_skip_log_carries_no_text_from_a_malformed_marker(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert _reseal(tmp_path, _aes(key_b, key_a)).skipped == 1
     assert planted not in caplog.text
-    assert "its marker names no key id this engine writes" in caplog.text
+    assert "its marker names no key id this cipher reads" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -289,5 +294,5 @@ def test_the_command_reports_a_non_regular_file_and_completes(
     assert main(["rotate-key", "--db", str(db)]) == 0
     out = capsys.readouterr().out
     assert "OK:" in out and "PARTIAL:" not in out
-    assert "note: 1 uploaded file(s) have a body or sidecar that is a symlink" in out
-    assert "that file was not rotated" in out
+    assert "note: 1 uploaded file(s) have a body or sidecar that is a FIFO" in out
+    assert "Remove it by hand" in out

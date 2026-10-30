@@ -6,8 +6,9 @@
 ``rotate-key`` had finished, so a run's withheld stamp held only until then. The rotation record
 closes that: a ``secret_rotation_meta`` row the command opens first and closes last, which the
 reconcile honours. And a run that skipped an upload used to roll the audit chain anyway, which cannot
-be undone and took away the back-out to the prior key. Each test here fails on the code before
-#3737: the stamp is written, or the back-out refuses.
+be undone and took away the back-out to the prior key. At least the tests of those two behaviours
+fail on the code before #3737: the stamp is written, or the back-out refuses. The out-of-band tests
+pin what must not change.
 
 The skipped upload is sealed under a key nobody supplies, a cause an operator can fix by removing
 it, and it fails the run the way any skip does."""
@@ -211,6 +212,7 @@ def test_a_partial_run_leaves_the_prior_key_usable_for_a_back_out(
     assert "PARTIAL:" in captured.out
     assert "the audit chain was not rolled" in captured.out
     assert "To back out, make the prior key active" in captured.out
+    assert "Do NOT remove" not in captured.err  # no roll was attempted, so none failed
 
     for path in planted:
         path.unlink()
@@ -249,13 +251,48 @@ def test_a_run_with_the_same_key_opens_no_record(
     assert ROTATION_RECORD_ID not in asyncio.run(_rows(db, key_a))
 
 
+def test_a_same_key_run_that_skips_offers_no_back_out(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """It changed no key, so there is no prior key to go back to."""
+    db, uploads, key_a, _key_b = rig
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_a, "", uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    out = capsys.readouterr().out
+    assert "the audit chain was not rolled" in out
+    assert "To back out" not in out
+
+
 def test_a_key_changed_with_no_rotate_key_still_stamps(tmp_path: Path) -> None:
-    """Out of band, with no record at all, and with a closed one: as it did before the record."""
+    """Out of band, with no record at all: as it did before the record."""
     db, key_a, key_b = tmp_path / "oob.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
     rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
     assert rows[_DEK].last_rotated != _OLD_DATE
+
+
+def test_a_key_changed_by_hand_over_a_closed_record_still_stamps(tmp_path: Path) -> None:
+    """A closed record is a blank, not an unreadable one. Read as unreadable, it would withhold every
+    hand change after the first completed rotation, for good."""
+    db, key_a, key_b = tmp_path / "closed.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def open_then_close() -> None:
+        store = await _open(db, key_a)
+        try:
+            await open_rotation_record(store, _key_id(key_b), "2026-10-30")
+            await close_rotation_record(store, "2026-10-30")
+        finally:
+            await store.close()
+
+    asyncio.run(open_then_close())
+    rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert rows[ROTATION_RECORD_ID].fingerprint == ""
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
 
 
 def test_a_record_naming_another_key_does_not_hold_this_one(tmp_path: Path) -> None:
@@ -289,6 +326,7 @@ def test_a_record_naming_another_key_does_not_hold_this_one(tmp_path: Path) -> N
         "sha256-16:NOTHEX",
         "sha3-16:" + "a" * 16,
         "a" * 16,  # untagged: a read of it as a key id would call it another key, and stamp
+        "sha256-16:ab",  # the same, truncated
     ],
 )
 def test_an_unreadable_record_fails_toward_not_stamping(
