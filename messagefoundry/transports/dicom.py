@@ -146,8 +146,9 @@ logger = logging.getLogger(__name__)
 
 #: Per-object size cap default: it bounds what is persisted, and — charged against the raw received Data
 #: Set before decode (see DicomScpSource._raw_over_cap) — what one received object costs in memory.
-#: max_pdu_size bounds a fragment, NOT the object: pynetdicom accumulates every fragment of an incoming
-#: object with no ceiling of its own. Overridable via DICOM(max_object_bytes=...).
+#: max_pdu_size is the fragment size the SCP offers, NOT a bound on the object, and it is not enforced on
+#: receipt: pynetdicom accumulates every fragment of an incoming object with no ceiling of its own.
+#: Overridable via DICOM(max_object_bytes=...).
 #:
 #: **The SCP never honours more than** :data:`_ENGINE_INGRESS_CEILING_BYTES`, whatever is configured
 #: here (BACKLOG #1910). This default still reaches the outbound SCU unchanged.
@@ -241,9 +242,10 @@ _PROTOCOL_VERSION = 0x0001
 #: pynetdicom's decoder runs twice on a request that passes, and it logs for each UID it dislikes.
 _MAX_ASSOCIATE_RQ_BYTES = 256 * 1024
 
-#: The DUL states (PS3.8 section 9.2) in which an admitted connection is not read; see
-#: ``_AdmittedSocket.ready``: awaiting the request, awaiting the local answer to it, and closing.
-_STATES_THAT_DO_NOT_READ = frozenset({"Sta2", "Sta3", "Sta13"})
+#: The DUL states (PS3.8 section 9.2) in which ``_AdmittedSocket.ready`` does not read: awaiting the
+#: request and awaiting the local answer to it, and closing.
+_STATES_BEFORE_THE_ANSWER = frozenset({"Sta2", "Sta3"})
+_STATE_CLOSING = "Sta13"
 
 #: The most refusal lines one SCP writes per window over every address together. The per-address
 #: bound alone would still let many addresses earn a line each.
@@ -280,8 +282,8 @@ def _address_host(client_address: Any) -> str:
 def _require_association_seams(handler: type[Any], association_socket: type[Any]) -> None:
     """Refuse a pynetdicom without the private names :func:`_admitting_server_class` builds on.
 
-    A patch release of the pinned line can still arrive unread. With these gone the SCP would start
-    and then fail every connection, with nothing above stderr to say why, so it does not start."""
+    An install that got round the pin could bring another release. With these gone the SCP would
+    start and then fail every connection, with nothing above stderr to say why, so it does not."""
     present = (
         callable(getattr(handler, "_create_association", None))
         and isinstance(vars(association_socket).get("ready"), property)
@@ -327,12 +329,11 @@ def _admitting_server_class() -> type[Any]:
     moved ahead of the first read (vault BACKLOG #2583). Built on first use, because pynetdicom is the
     optional ``[dicom]`` extra and is never imported at module top.
 
-    **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before raising the
-    pynetdicom cap in the ``[dicom]`` extra.** ``pyproject.toml`` holds that cap at the release line
-    this was read against, so a later line is stopped at install time. A patch release of the same
-    line can still arrive unread. The comment above the extra there gives the bound and the steps to
-    raise it. :func:`_require_socketserver_routing` refuses a pynetdicom that left this routing, and
-    ``tests/test_dicom_scp_admission.py`` pins the rest.
+    **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before moving the
+    pynetdicom pin in the ``[dicom]`` extra.** ``pyproject.toml`` pins the release this was read
+    against, so any other is stopped at install time. The comment above the extra there gives the
+    steps to move it. :func:`_require_socketserver_routing` refuses a pynetdicom that left this
+    routing, and ``tests/test_dicom_scp_admission.py`` pins the rest.
 
     * ``AssociationServer.get_request`` accepts a connection and, on a TLS listener, runs the TLS
       handshake in the same call. That call is on the accept loop, and the accepted socket has no
@@ -552,8 +553,10 @@ def _admitting_server_class() -> type[Any]:
             The DUL reads a PDU's header and then its body, so each of those has the deadline. It
             takes a short read as a closed connection, and that ends the connection the normal way.
             A raise would too, but pynetdicom logs each one at ERROR with a traceback, and a peer
-            could repeat that as often as it could connect, so the refusal goes through the
-            throttled line instead. It is a deadline per read and not per object: a peer that keeps
+            could repeat that as often as it could connect. So the refusal goes through the
+            throttled line instead. A short header read is silent in the DUL. A short body read
+            still earns one ERROR line of pynetdicom's, unthrottled, with no traceback and no bytes
+            of the PDU in it. It is a deadline per read and not per object: a peer that keeps
             finishing PDUs is for ``max_object_bytes`` and pynetdicom's own timers."""
             seconds = cast(float, self.ae.network_timeout)
             expired = _RefusedPeer(f"no complete PDU within {seconds:g}s")
@@ -627,6 +630,12 @@ def _admitting_server_class() -> type[Any]:
             so a peer repeating such a request could go round the slots. These are the same three
             steps, so a request that passes here is one the association will be given.
 
+            A presentation context with no transfer syntax gets past all three and then kills the
+            ``Association`` thread, because negotiation reads each context's first transfer syntax
+            without looking. So that is refused here too. Nothing here shows that negotiation cannot
+            fail some other way, and ``_AdmittedSocket.ready`` is what ends a DUL left by one that
+            does.
+
             A wrong protocol version still gets the A-ASSOCIATE-RJ the DUL answers it with, so
             that peer can be told why. The rest could not be told anything it would read."""
             pdu = A_ASSOCIATE_RQ()
@@ -640,10 +649,18 @@ def _admitting_server_class() -> type[Any]:
                 # Rejected-permanent, from the ACSE, protocol version not supported: AE-6's answer.
                 primitive.result, primitive.result_source, primitive.diagnostic = 0x01, 0x02, 0x02
                 try:
+                    # The read restored a blocking socket. This thread holds a slot, and shutdown()
+                    # joins it, so its one send gets the same short bound as a slice of a read.
+                    sock.settimeout(_STOP_POLL_SECONDS)
                     sock.sendall(A_ASSOCIATE_RJ(primitive).encode())
                 except OSError as exc:
                     logger.debug("DICOM association rejection not sent: %s", safe_exc(exc))
                 raise _RefusedPeer("its association request has the wrong protocol")
+            if any(
+                not context.transfer_syntax
+                for context in primitive.presentation_context_definition_list
+            ):
+                raise _RefusedPeer("a context in its association request has no transfer syntax")
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -700,18 +717,31 @@ def _admitting_server_class() -> type[Any]:
 
         @property
         def ready(self) -> bool:
-            """Whether the DUL should read. Not in Sta2, Sta3 or Sta13, whatever has arrived.
+            """Whether the DUL should read. Not before the request is answered, whatever has
+            arrived, and not in Sta13.
 
             The DUL reads before it takes its next event, so a byte behind the request would have
             it reading while the request itself waits, unanswered, on its queue. The association
             then counts for a whole deadline before ``maximum_associations`` is checked, with its
             slot already given back, so such peers would go round every cap. Sta13 is the same
-            read after a rejection, which only delays closing the connection."""
+            read after a rejection, which only delays closing the connection.
+
+            Holding off relies on the ``Association`` thread to answer, and only that thread reads
+            the idle timer, so this is also where a DUL finds it has nobody left. If that thread
+            has died, in any state, or was killed with no answer queued, no answer is coming and
+            nothing else would ever end the DUL: ``kill()`` itself waits for Sta1. So this closes
+            the connection, which puts the DUL's own closed-connection event on its queue. A
+            rejection queues its answer before it kills, and that answer still has to go out."""
             if self.replay:
                 return True
-            if self.assoc.dul.state_machine.current_state in _STATES_THAT_DO_NOT_READ:
+            assoc = self.assoc
+            state = assoc.dul.state_machine.current_state
+            unanswered = state in _STATES_BEFORE_THE_ANSWER
+            killed_unanswered = unanswered and assoc._kill and assoc.dul.to_provider_queue.empty()
+            if killed_unanswered or not assoc.is_alive():
+                self.close()
                 return False
-            return super().ready
+            return not unanswered and state != _STATE_CLOSING and super().ready
 
         def recv(self, nr_bytes: int) -> bytearray:
             if self.replay:

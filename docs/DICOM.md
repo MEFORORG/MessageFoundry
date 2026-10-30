@@ -85,14 +85,17 @@ starts when the SCP starts to read, after any TLS handshake and any
 `max_associations_per_second` wait. An SCU sends its request as soon as it connects, so a working
 sender does not meet this. The first PDU has to be a well-formed association request of at most 256 KiB.
 PS3.8 sets no limit on that PDU, so a larger request is legal in the format, but a modality would
-not need one. Anything else is closed at once. A wrong protocol version gets the association
-rejection the standard gives it, and the rest get no rejection.
+not need one. Anything else is closed at once: a first PDU that is not an association request, a
+request over that size, one that does not decode, and one with a presentation context that names no
+transfer syntax. A wrong protocol version gets the association rejection the standard gives it. The
+others get no rejection and no A-ABORT.
 
 **After that, each PDU has a deadline too.** The SCP reads a PDU's header and then its body, and
 each read has `timeout_seconds`, however slowly the bytes arrive. A peer that stops part way through
-a PDU is ended there. This is a deadline per read, not per object, so a sender sending PDUs of the
-shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second. Raising `max_pdu_size` raises
-that floor. A peer that keeps finishing PDUs is not ended by this. A send to a peer that stops
+a PDU is ended there. This is a deadline per read, not per object, so at the default 30 seconds a
+sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second.
+Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer that keeps finishing
+PDUs is not ended by this. A send to a peer that stops
 reading has a `timeout_seconds` bound too. `timeout_seconds` has to be above zero; the connection
 is refused when it is built otherwise.
 
@@ -112,7 +115,7 @@ served. At least these limits apply:
   `max_associations`. The idle timer, the header read and the body read each have `timeout_seconds`,
   so one peer could hold that slot for about three times `timeout_seconds`, 90 seconds at the default.
   Only an association the SCP accepted can do this. Over `max_associations` the request is rejected
-  at once, whatever follows it.
+  once it is decoded, whatever follows it.
 - The SCP does not refuse a PDU longer than the `max_pdu_size` it offered. pynetdicom reads the
   length the peer announces, into memory, for as long as the deadline allows, on an association the
   SCP accepted.
@@ -192,7 +195,7 @@ two-tier split:
 - **`hl7_map`** — pure helpers a code-first Handler composes to build HL7 v2 (header → ORM/ORU fields; each SR
   measurement → an `OBX`), HL7-escaped and CR/LF-guarded.
 
-Backed by the optional **`[dicom]` extra** (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure-Python, **no
+Backed by the optional **`[dicom]` extra** (`pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, **no
 numpy**), lazily imported so a SQLite-only install and a console peek-import stay driverless.
 
 ---

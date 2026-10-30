@@ -155,7 +155,8 @@ transport = "mllp"
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
   spelling. The one cap with no "off", the HTTP listener's `max_header_bytes`, refuses `0` in either
   spelling. Not every numeric setting has the negative refusal yet: at least DICOM `max_pdu_size`,
-  `max_associations` and `timeout_seconds` do not.
+  `max_associations`, and `timeout_seconds` on the outbound SCU, do not. The inbound SCP refuses a
+  `timeout_seconds` of zero or less when the connection is built.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so
@@ -2826,7 +2827,7 @@ Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
-`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
+`pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
 extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
@@ -2841,8 +2842,8 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `max_associations` | `10` | cap on concurrent inbound associations. Connections with no association yet have their own fixed caps ([DICOM.md](DICOM.md) section 3) |
 | `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **the wait itself drops, refuses and answers nothing differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Choose a rate that keeps few peers waiting.** A waiting peer has no association yet, so it holds one of the fixed slots [DICOM.md](DICOM.md) section 3 states, and raising `max_associations` does not change that: a connection over those slots is closed. Keep the wait inside your senders' ACSE timeouts too, or a paced modality aborts. |
 | `association_burst` | = the rate | tokens the bucket holds, i.e. how large a burst of associations passes unpaced before the sustained rate applies. Only meaningful with `max_associations_per_second` set. Floor of 1 so an SCP can always make progress. |
-| `max_pdu_size` | `16384` | cap one PDU's bytes (`0` = unbounded); DoS guard |
-| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
+| `max_pdu_size` | `16384` | the largest PDU this SCP offers to take. It is **offered to the peer and not enforced on receipt**: [DICOM.md](DICOM.md) section 3 says what a longer one gets. `0` offers no limit, so one PDU can carry a whole object under one read deadline |
+| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout, and a **fixed deadline on each PDU header and body read**, not an idle timer, so a low value cuts a slow sender off. Must be above zero |
 | `tls` | `false` | wrap the association in **DICOM-over-TLS** (required for a non-loopback bind — see below) |
 | `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). The key must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
@@ -4072,7 +4073,7 @@ reading this page already applies to a file the scan never opened.
 | SOAP destination | as REST — indirect via the lane budget | as REST | as REST |
 | FHIR destination + `fhir_lookup` | as REST; `fhir_lookup` additionally runs off the event loop on the thread executor | as REST; a lookup that cannot run raises into the Handler | transient → retry; a `fhir_lookup` failure fails the message, never silently degrades |
 | DICOMweb STOW-RS destination | as REST — indirect via the lane budget | as REST | as REST |
-| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
+| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
@@ -4287,7 +4288,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
 **Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
-optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure‑Python, no numpy), `[fhir]`
+optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure‑Python, no numpy), `[fhir]`
 (`fhir.resources` + `fhir-core` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
 lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
 chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the

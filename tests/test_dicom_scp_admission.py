@@ -835,13 +835,13 @@ def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
 
 
 def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_against() -> None:
-    """The ``[dicom]`` extra must admit only the pynetdicom 3.0 line, from 3.0.4 up.
+    """The ``[dicom]`` extra must admit only pynetdicom 3.0.4, the release that was measured.
 
-    ``_admitting_server_class`` was read against pynetdicom 3.0.4. The routing guard above refuses a
-    release that left the hooks, but only when the listener starts. The cap in ``pyproject.toml``
-    stops a 3.1 or later at install time (vault BACKLOG #2713). RED when someone widens that cap or
-    lowers the floor. A 3.0.x patch above 3.0.4 is still admitted. Only the routing guard stands in
-    front of one, and it checks the routing alone. Before you change the versions below, re-read
+    ``_admitting_server_class`` was read against pynetdicom 3.0.4. The guards in ``transports/dicom.py``
+    refuse a release that left the hooks, but only when the listener starts, and they check names.
+    The read and send bounds rest on behaviour measured at 3.0.4, so the exact pin in
+    ``pyproject.toml`` stops any other release at install time (vault BACKLOG #2713, #2712). RED when
+    someone widens that pin. Before you change the versions below, re-read
     ``_admitting_server_class`` against the new release; the comment above the extra in
     ``pyproject.toml`` has the steps.
     """
@@ -868,9 +868,9 @@ def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_aga
     assert spec.contains(version("pynetdicom"), prereleases=True), (
         f"these tests ran on pynetdicom {version('pynetdicom')}, which [dicom] ({spec}) refuses"
     )
-    # 3.0.3 is the release below the one read. 3.1.0.dev0 is a real development release on PyPI, so
-    # pre-releases are checked too.
-    for unread in ("3.0.3", "3.1.0.dev0", "3.1.0", "4.0.0"):
+    # 3.0.3 is the release below the one read. 3.0.5 is the next patch, which nothing has measured.
+    # 3.1.0.dev0 is a real development release on PyPI, so pre-releases are checked too.
+    for unread in ("3.0.3", "3.0.5", "3.1.0.dev0", "3.1.0", "4.0.0"):
         assert not spec.contains(unread, prereleases=True), (
             f"[dicom] ({spec}) admits pynetdicom {unread}, which the admitting server was never "
             "read against"
