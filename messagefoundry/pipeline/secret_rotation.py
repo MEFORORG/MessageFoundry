@@ -82,6 +82,7 @@ __all__ = [
     "SecretStamp",
     "StoreKeyRotationOverdueError",
     "close_rotation_record",
+    "dek_changed",
     "dek_fingerprint",
     "enforce_secret_expiry",
     "enforce_store_key_expiry",
@@ -246,11 +247,21 @@ def dek_fingerprint(key_id: str) -> str:
 #: The ``secret_rotation_meta`` row that is the rotation record (BACKLOG #3737): which store key
 #: ``rotate-key`` started on and has not finished. It tracks no secret and holds none. Its
 #: ``fingerprint`` is that key's :func:`dek_fingerprint`, or :data:`_ROTATION_RECORD_CLOSED` once a
-#: run completes, and its dates are when that last happened. A ``:`` keeps it apart from the
-#: environment-variable names and ``env()`` keys the other rows use. The row is unsealed, so the
-#: rotation pass leaves it alone and it reads the same under any key.
+#: run completes, and its dates are when that last happened. A ``:`` keeps it apart from every
+#: environment-variable name. An ``env()`` key is free text, so the reconcile drops one with this
+#: exact name rather than write a cell over the record. The row is unsealed, so the rotation pass
+#: leaves it alone and it reads the same under any key.
 ROTATION_RECORD_ID = "rotate-key:incomplete"
 _ROTATION_RECORD_CLOSED = ""
+
+
+def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool | None:
+    """Whether the DEK ``fingerprint`` differs from the stored stamp ``prior``, by
+    :func:`fingerprint_changed`, which also says what ``None`` means. A store with no stamp yet
+    counts as changed. ASVS 11.2.4 (BACKLOG #1167): the compare is ``hmac.compare_digest``, never
+    ``!=``, and :func:`_fingerprint_bytes` keeps it total. Pinned by the monkeypatched-comparator
+    call-count test in tests\\test_secret_rotation_watcher.py."""
+    return True if prior is None else fingerprint_changed(prior.fingerprint, fingerprint)
 
 
 async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> None:
@@ -262,7 +273,7 @@ async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str,
     not know cannot say so, and opens the record."""
     fingerprint = dek_fingerprint(key_id)
     prior = (await meta_store.get_secret_rotation_meta()).get(_DEK_CLASS_ID)
-    if prior is None or fingerprint_changed(prior.fingerprint, fingerprint) is not False:
+    if dek_changed(prior, fingerprint) is not False:
         await meta_store.upsert_secret_rotation_meta(
             ROTATION_RECORD_ID, fingerprint=fingerprint, tracked_since=day, last_rotated=day
         )
@@ -271,8 +282,9 @@ async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str,
 async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -> None:
     """Close the rotation record, once a whole ``rotate-key`` run is done and stamped (BACKLOG
     #3737). The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
-    no rotation in progress. Writes nothing where no run ever opened one."""
-    if ROTATION_RECORD_ID in await meta_store.get_secret_rotation_meta():
+    no rotation in progress. Writes nothing where none is open."""
+    record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
+    if record is not None and record.fingerprint != _ROTATION_RECORD_CLOSED:
         await meta_store.upsert_secret_rotation_meta(
             ROTATION_RECORD_ID,
             fingerprint=_ROTATION_RECORD_CLOSED,
@@ -290,8 +302,8 @@ def _rotation_incomplete(record: SecretRotationMetaRow | None, fingerprint: str)
     was changed by hand, so it stamps as any such change does."""
     if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED:
         return False
-    head, sep, key_id = record.fingerprint.partition(":")
-    if head != KEY_ID_SCHEME or not sep or not key_id or key_id.strip(_LOWER_HEX):
+    head, _, key_id = record.fingerprint.partition(":")
+    if head != KEY_ID_SCHEME or not key_id or key_id.strip(_LOWER_HEX):
         log.warning(
             "secret rotation: the rotation record could not be read, so the store key's rotation "
             "date was not stamped. Run `messagefoundry rotate-key` to completion."
@@ -531,64 +543,48 @@ async def reconcile_rotation_meta(
 
     # The DEK row stored under a scheme this release does not compile in (BACKLOG #3421).
     refused = 0
-    withheld = False  # a changed DEK the rotation record kept from being stamped (BACKLOG #3737)
     if dek_key_id:
         # The DEK's fingerprint IS its one-way key-id (SHA-256 of the key) — no value is handled here.
         fingerprint = dek_fingerprint(dek_key_id)
         prior = stored.get(_DEK_CLASS_ID)
-        # ASVS 11.2.4 (BACKLOG #1167): `fingerprint_changed` compares with `hmac.compare_digest`,
-        # never `!=`. `_fingerprint_bytes` is what keeps the comparison total; read its docstring
-        # before changing either side. Pinned by the monkeypatched-comparator call-count test in
-        # tests\test_secret_rotation_watcher.py.
-        changed_fp = True if prior is None else fingerprint_changed(prior.fingerprint, fingerprint)
-        if changed_fp is not False and _rotation_incomplete(
+        changed_fp = dek_changed(prior, fingerprint)
+        tracked_since, last_rotated = (today, today) if prior is None else _kept_dates(prior)
+        withheld = changed_fp is not False and _rotation_incomplete(
             stored.get(ROTATION_RECORD_ID), fingerprint
-        ):
+        )
+        if withheld:
             # BACKLOG #3737. Nothing is written, so the run that completes still sees a change and
             # stamps it. With no row at all, this start tracks an unpersisted age floor (today),
             # which is what a first start gives any key.
-            withheld = True
-            kept = (today, today) if prior is None else _kept_dates(prior)
-            await _record(
-                _DEK_CLASS_ID,
-                _DEK_LABEL,
-                fingerprint if prior is None else prior.fingerprint,
-                settings.store_key_max_age_days,
-                *kept,
-                write=False,
+            log.warning(
+                "secret rotation: rotate-key has not completed for the store key in use, so its "
+                "rotation date was not stamped and its age is still read from the prior date. Run "
+                "`messagefoundry rotate-key` until it exits 0, or set the key back."
             )
-        elif prior is None:
-            await _record(
-                _DEK_CLASS_ID,
-                _DEK_LABEL,
-                fingerprint,
-                settings.store_key_max_age_days,
-                today,
-                today,
-                write=True,
-            )
-        else:
-            tracked_since, last_rotated = _kept_dates(prior)
-            if changed_fp:
-                last_rotated = today  # rotation auto-detected, so reset the clock
-            elif changed_fp is None:
-                # BACKLOG #3421: refused. Its dates are kept and it is re-stamped under today's
-                # scheme, so the next rotation is detected.
-                refused += 1
-            # Written when changed or refused, and when equal but stored before tags: that row is
-            # re-stamped in its tagged form, dates kept, so no untagged row outlives this release
-            # for a later scheme to misread (BACKLOG #3421). The tag is public, so a prefix test is
-            # not a secret-dependent compare.
-            await _record(
-                _DEK_CLASS_ID,
-                _DEK_LABEL,
-                fingerprint,
-                settings.store_key_max_age_days,
-                tracked_since,
-                last_rotated,
-                write=changed_fp is not False
-                or not prior.fingerprint.startswith(f"{KEY_ID_SCHEME}:"),
-            )
+        elif changed_fp:
+            last_rotated = today  # rotation auto-detected, so reset the clock
+        elif changed_fp is None:
+            # BACKLOG #3421: refused. Its dates are kept and it is re-stamped under today's
+            # scheme, so the next rotation is detected.
+            refused += 1
+        # Written when new, changed or refused, and when equal but stored before tags: that row is
+        # re-stamped in its tagged form, dates kept, so no untagged row outlives this release
+        # for a later scheme to misread (BACKLOG #3421). The tag is public, so a prefix test is
+        # not a secret-dependent compare.
+        await _record(
+            _DEK_CLASS_ID,
+            _DEK_LABEL,
+            prior.fingerprint if withheld and prior is not None else fingerprint,
+            settings.store_key_max_age_days,
+            tracked_since,
+            last_rotated,
+            write=not withheld
+            and (
+                prior is None
+                or changed_fp is not False
+                or not prior.fingerprint.startswith(f"{KEY_ID_SCHEME}:")
+            ),
+        )
 
     cipher = meta_store.secret_rotation_cipher()
     labels = dict(_ENV_SECRET_CLASSES)
@@ -651,12 +647,6 @@ async def reconcile_rotation_meta(
     # One line per kind for the lot, carrying the COUNT only: the ids come from the secret-bearing
     # mapping (for a Connection credential the id is the env() key), and CodeQL's clear-text-logging
     # rule flags a log line built from them.
-    if withheld:
-        log.warning(
-            "secret rotation: rotate-key has not completed for the store key in use, so its "
-            "rotation date was not stamped and its age is still read from the prior date. Run "
-            "`messagefoundry rotate-key` until it exits 0, or set the key back."
-        )
     if refused:
         log.warning(
             "secret rotation: %d stored fingerprint(s) name a scheme this release does not know, "

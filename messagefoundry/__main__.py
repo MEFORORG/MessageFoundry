@@ -10412,13 +10412,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str] | None]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
             close_rotation_record,
+            dek_changed,
             dek_fingerprint,
-            fingerprint_changed,
             open_rotation_record,
         )
         from messagefoundry.store.store import SecretRotationMetaStore
@@ -10455,7 +10455,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # both data passes, so a refusal leaves the data rotation above intact and resumable.
             # Never after a skip: the roll cannot be undone, and it would take away the back-out to
             # the prior key that a run which stopped short still has (BACKLOG #3737).
-            rolled = None if uploads.skipped else await store.roll_audit_key_epoch()
+            rolled = (False, "") if uploads.skipped else await store.roll_audit_key_epoch()
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
@@ -10464,7 +10464,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if isinstance(store, SecretRotationMetaStore) and rolled is not None and rolled[0]:
+            if isinstance(store, SecretRotationMetaStore) and rolled[0]:
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -10474,11 +10474,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
                     # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
                     fingerprint = dek_fingerprint(key_id)
-                    changed = (
-                        True
-                        if prior is None
-                        else fingerprint_changed(prior.fingerprint, fingerprint)
-                    )
+                    changed = dek_changed(prior, fingerprint)
                     if changed is None and prior is not None:
                         # BACKLOG #3421: refused. Nothing says whether this run changed the key, so
                         # it is re-stamped with its dates kept, as the watcher does: never a reset.
@@ -10517,7 +10513,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, rolled = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -10546,9 +10542,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     )
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
-    # uploaded file may still be under that key (BACKLOG #3181). A skip leaves `rolled` as None.
-    complete = rolled is not None and rolled[0]
-    print(f"OK: {done}" if complete else f"PARTIAL: {done}")
+    # uploaded file may still be under that key (BACKLOG #3181), which leaves the chain unrolled.
+    print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
         # Sealing makes them readable, and it would seal a planted file just the same, so say how
@@ -10605,7 +10600,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "a run completes.",
             file=sys.stderr,
         )
-    if rolled is None:
         # BACKLOG #3737: the roll is the one step that cannot be undone, so a run that skipped a file
         # leaves it for the run that completes.
         print(
@@ -10615,7 +10609,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "rolled and the prior key can never be active again."
         )
         return 1
-    rolled_ok, rolled_msg = rolled
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
         # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).

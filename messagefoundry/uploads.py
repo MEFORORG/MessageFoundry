@@ -657,7 +657,6 @@ class _Half(Enum):
     CURRENT = auto()  # already under the active key; nothing was written
     RESEALED = auto()  # rewritten under the active key
     SEALED_PLAINTEXT = auto()  # the same, and it was plaintext
-    LEFT = auto()  # a plaintext sidecar left as it was, over a body that is not a regular file
     LOST = auto()  # a body that is missing or is not text
     UNSEALABLE = auto()  # a plaintext sidecar over a lost body
     NOT_REGULAR = auto()  # a symlink, FIFO or the like, left as it was and not followed
@@ -666,6 +665,8 @@ class _Half(Enum):
 
 #: The halves this pass rewrote, each one value in :attr:`ResealResult.resealed`.
 _WRITTEN = frozenset({_Half.RESEALED, _Half.SEALED_PLAINTEXT})
+#: More characters than any ``mfenc:`` marker has before its ciphertext.
+_MARKER_READ_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -2129,7 +2130,7 @@ class UploadStore:
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
             body = self._reseal_half(cipher, fid, blob_path, "body")
-            meta = self._reseal_half(cipher, fid, meta_path, "meta", body=body, blob=blob_path)
+            meta = self._reseal_half(cipher, fid, meta_path, "meta", over=(body, blob_path))
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
             # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
@@ -2173,12 +2174,11 @@ class UploadStore:
         path: Path,
         kind: Literal["body", "meta"],
         *,
-        body: _Half | None = None,
-        blob: Path | None = None,
+        over: tuple[_Half, Path] | None = None,
     ) -> _Half:
-        """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes the
-        ``body`` half's result and the ``blob`` path, because a plaintext sidecar is sealed only
-        over a body that was. Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
+        """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
+        the body half's result and its path, because a plaintext sidecar is sealed only over a body
+        that was. Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
 
         Nothing is opened until ``lstat`` shows a regular file (BACKLOG #3737). A FIFO would block
         the open for good, and following a symlink would re-seal or read a file this store does not
@@ -2232,18 +2232,21 @@ class UploadStore:
             )
             return _Half.SKIPPED
         plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
-        if plaintext and blob is not None:
+        if plaintext and over is not None:
+            body, blob = over
             # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is. A keyed
             # store refuses it, so the upload is unlisted; sealing it would list an upload whose body
             # is unusable, and would seal a planted lone sidecar too. A sidecar under a retired key
             # is listed already, so it is still re-sealed: left behind, it would drop out of reach of
             # prune_expired once that key goes.
             if body is _Half.NOT_REGULAR:
-                return _Half.LEFT  # the pair is reported by its body; the prune cannot reach it
+                return _Half.CURRENT  # the pair is reported by its body; nothing is written
             # The body is missing or is not text: the one test the prune and the quota use too.
-            # Asked even when the body pass succeeded, because that pass trusts a body whose first
-            # bytes are the active marker without reading the rest.
-            if body is _Half.LOST or self._lost_body_size(blob) is not None:
+            # Asked of a CURRENT body, because that pass trusts a body whose first bytes are the
+            # active marker without reading the rest. Every other body was read whole just now.
+            if body is _Half.LOST or (
+                body is _Half.CURRENT and self._lost_body_size(blob) is not None
+            ):
                 # No key reads either half and no re-run changes that, so it is not a skip. It
                 # stays refused, and the prune removes it at expiry.
                 _log.warning(
@@ -2927,11 +2930,14 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
 def _unopened_cause(cipher: AesGcmCipher, stored: str) -> str:
     """Why no key opened ``stored``, for the log, telling a key to supply from a damaged file
     (BACKLOG #3737). It reads only the marker, and :meth:`AesGcmCipher.named_key_id` passes on
-    nothing but a well-formed id, so no text cut from a damaged or planted file reaches the log."""
-    key_id = cipher.named_key_id(stored)
+    nothing but a well-formed id, so no text cut from a damaged or planted file reaches the log.
+    Only the head of ``stored`` is passed, because parsing a marker copies what follows it, and that
+    can be a whole upload."""
+    head = stored[:_MARKER_READ_LIMIT]
+    key_id = cipher.named_key_id(head)
     if key_id is None:
-        return "its marker names no key, so it is damaged or was not sealed by this engine"
-    if cipher.holds_key_for(stored):
+        return "its marker names no key id this engine writes, so it is old, damaged or planted"
+    if cipher.holds_key_for(head):
         return f"key {key_id} is configured and did not open it, so it is damaged or was moved"
     return f"key {key_id} is not configured; supply it, unless the value is damaged"
 

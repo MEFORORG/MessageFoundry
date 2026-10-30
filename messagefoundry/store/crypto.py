@@ -1486,13 +1486,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         Lets a caller tell a cell whose AEAD tag fails under a key it holds (the cell does not
         belong where it is) from one sealed under a key that is not configured. False for an
         unmarked or malformed value. Reads only the marker, never the ciphertext."""
-        if not stored.startswith(MARKER_PREFIX):
-            return False
-        try:
-            key_id, _salt, _blob = self._parse(stored)
-        except CipherError:
-            return False
-        return key_id in self._keyring
+        return self.named_key_id(stored) in self._keyring
 
     def named_key_id(self, stored: str) -> str | None:
         """The key id the marker of ``stored`` names, or ``None`` when it is unmarked, malformed, or

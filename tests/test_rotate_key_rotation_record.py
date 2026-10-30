@@ -34,6 +34,7 @@ from messagefoundry.pipeline.secret_rotation import (
 from messagefoundry.store.crypto import CipherError, cipher_info, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore, SecretRotationMetaRow
 from messagefoundry.uploads import UploadStore
+from tests.test_cli import _rotate_env
 
 _DEK = "MEFOR_STORE_ENCRYPTION_KEY"
 _OLD_DATE = "2025-01-01"
@@ -83,9 +84,7 @@ def _plant_unopenable_upload(uploads: Path) -> list[Path]:
 
 
 def _env(monkeypatch: pytest.MonkeyPatch, active: str, retired: str, uploads: Path) -> None:
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", active)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", retired)
-    monkeypatch.setenv("MEFOR_STORE_UPLOADS_DIR", str(uploads))
+    _rotate_env(monkeypatch, active=active, retired=retired, uploads=uploads)
 
 
 async def _rows(db: Path, key: str, *retired: str) -> dict[str, SecretRotationMetaRow]:

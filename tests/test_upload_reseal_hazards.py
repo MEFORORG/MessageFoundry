@@ -18,8 +18,8 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import ResealResult, UploadStore
+from tests.test_cli import _rotate_env, _seed_store_and_upload
 
 _BODY = b"MSH|^~\\&|A|B|C|D|202601010000||ADT^A01|1|P|2.5\rPID|1||1\r"
 _MAX = 1 << 20
@@ -258,7 +258,7 @@ def test_the_skip_log_carries_no_text_from_a_malformed_marker(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert _reseal(tmp_path, _aes(key_b, key_a)).skipped == 1
     assert planted not in caplog.text
-    assert "its marker names no key" in caplog.text
+    assert "its marker names no key id this engine writes" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -281,24 +281,11 @@ def test_the_command_reports_a_non_regular_file_and_completes(
     monkeypatch.chdir(tmp_path)
     db, uploads = tmp_path / "rot.db", tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
-
-    async def seed() -> str:
-        store = await MessageStore.open(db, cipher=make_cipher(key_a))
-        try:
-            meta = await UploadStore(uploads, store.cipher(), max_bytes=_MAX).save(
-                data=_BODY, filename="a.hl7", uploader="op", uploader_id="u"
-            )
-            return meta.file_id
-        finally:
-            await store.close()
-
-    fid = asyncio.run(seed())
+    fid = _seed_store_and_upload(db, uploads, key_a)
     blob = uploads / f"{fid}.blob"
     blob.unlink()
     blob.mkdir()
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)
-    monkeypatch.setenv("MEFOR_STORE_UPLOADS_DIR", str(uploads))
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0
     out = capsys.readouterr().out
     assert "OK:" in out and "PARTIAL:" not in out
