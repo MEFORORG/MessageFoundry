@@ -430,6 +430,84 @@ def test_the_walk_cannot_clear_a_path_it_cannot_read() -> None:
     assert _walk(r"C:\certs\ca.pem", nt) is None
 
 
+def test_the_walk_cannot_clear_a_drive_whose_subst_target_it_cannot_read() -> None:
+    """A failed ``QueryDosDeviceW`` other than "no such device" is not read as a real volume: a
+    subst drive the walk could not read would hide the links behind it."""
+
+    def unreadable(_drive: str) -> str | None:
+        raise OSError("the drive S: could not be read (winerror 122)")
+
+    verdict = database._windows_path_verdict(
+        r"S:\ca.pem",
+        probe=lambda _p: (FILE, None),
+        drive_type=lambda _r: _FIXED,
+        drive_target=unreadable,
+        cwd=r"C:\work",
+    )
+    assert verdict is None
+
+
+def test_each_file_keyword_is_walked_once_per_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #2705: the refusal and the checks that read the files share one judgement. A second
+    walk could disagree with the first, and an empty answer then skipped the key-wrap, certificate
+    and CA checks while the connection string kept the path. Here the second walk of each value
+    would say off-host: the build reads the files the first walk cleared, and the walk runs once
+    per spelling. Red with ``driver_file_spellings`` walking again inside the checks."""
+    walked: list[str] = []
+
+    def once(path: str) -> bool | None:
+        walked.append(path)
+        return walked.count(path) > 1  # a second look at the same path flips to off-host
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "_path_verdict", once)
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    params = {"sslca": r"C:\certs\ca.pem", "sslkey": r"C:\certs\k.pem", "sslpassword": "pw"}
+    _build(odbc_params=params)
+    assert sorted(walked) == [r"C:\certs\ca.pem", r"C:\certs\k.pem"]
+    assert sorted(set(read)) == [r"C:\certs\ca.pem", r"C:\certs\k.pem"]  # both checks ran
+
+
+def test_a_direct_check_refuses_a_set_value_its_own_walk_does_not_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check called without the build's verdicts walks the path itself, and refuses a set value
+    that walk does not clear, rather than reading nothing and passing."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
+    with pytest.raises(ValueError, match="not a plain local path"):
+        database._refuse_encrypted_driver_ca({"sslca": r"Z:\certs\ca.pem"}, connection=_CONNECTION)
+
+
+@pytest.mark.parametrize("mode", ["disable", "DISABLED"])
+def test_a_ca_off_the_host_is_left_unread_when_tls_is_off(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """With TLS off the driver reads no CA, so an ``sslca`` or ``sslcapath`` on a mapped drive is
+    not refused: it is left to the driver unread, the outcome the CA check's unreached-share
+    leniency gives. A client key is still refused, and with TLS on the CA is refused. Red with the
+    remote refusal applied whatever the mode."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a CA left to the driver must not be read")
+
+    monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
+    monkeypatch.setattr(database, "read_if_regular", never)
+    ca = r"Z:\certs\ca.pem"
+    assert f"sslca={{{ca}}}" in _build(odbc_params={"SSLmode": mode, "sslca": ca})
+    assert "sslcapath={Z:\\certs}" in _build(
+        odbc_params={"SSLmode": mode, "sslcapath": r"Z:\certs"}
+    )
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"SSLmode": "verify-full", "sslca": ca})
+
+
 def _symlink_or_skip(target: str, link: Path, *, directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=directory)

@@ -1747,7 +1747,9 @@ prefix, is refused, because it can name another host. On Windows, so is a path t
 another host: a mapped network drive, or a link, a chain of links or a `subst` drive that ends
 at a share. So is a path the check cannot read through. The check reads links without following
 them and asks a drive's type rather than opening it. A missing folder, or a drive letter with no
-volume on this host, is left to the driver. The driver still gets the value as you wrote it.
+volume on this host, is left to the driver. With TLS off, as under `SSLmode=disable`, the
+driver reads no CA, so an `SSLCA` or `SSLCAPATH` that leads to another host is left to it unread
+rather than refused. The driver still gets the value as you wrote it.
 
 At least these are not caught, so keep those files on a local disk:
 

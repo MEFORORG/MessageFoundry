@@ -582,9 +582,10 @@ def _windows_drive_type(root: str) -> int:
 
 
 def _windows_drive_target(drive: str) -> str | None:
-    """The folder a ``subst`` drive stands for, or ``None`` for a real volume, as
-    ``anchor_path.windows_host_readers`` reads it: ``QueryDosDeviceW`` answers ``\\??\\C:\\...``
-    for a substituted drive."""
+    """The folder a ``subst`` drive stands for, or ``None`` for a real volume or no device at all,
+    as ``anchor_path.windows_host_readers`` reads it: ``QueryDosDeviceW`` answers ``\\??\\C:\\...``
+    for a substituted drive. Any other failure of the query raises ``OSError``, so the walk does
+    not clear the path: a subst drive it could not read would hide the links behind it."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive target is read only on Windows")
     import ctypes
@@ -594,8 +595,15 @@ def _windows_drive_target(drive: str) -> str | None:
     kernel32.QueryDosDeviceW.restype = ctypes.c_uint
     buf = ctypes.create_unicode_buffer(1024)
     if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-        return None
+        error = ctypes.get_last_error()
+        if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
+            return None
+        raise OSError(f"the drive {drive} could not be read (winerror {error})")
     return buf.value[4:] if buf.value.startswith("\\??\\") else None
+
+
+#: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
+_ERROR_FILE_NOT_FOUND = 2
 
 
 def _windows_path_verdict(
@@ -651,6 +659,9 @@ def _windows_path_verdict(
         return True
     except _PathEnds:
         return False
+    except OSError as exc:  # a reader the walk does not guard, such as drive_target
+        logger.debug("DATABASE file keyword path not cleared: %s", exc)
+        return None
     if cause is not None:
         logger.debug("DATABASE file keyword path not cleared: %s", cause)
         return None
@@ -683,9 +694,20 @@ def _path_verdict(text: str) -> bool | None:
         return None
 
 
-def _file_keyword_verdicts(value: object) -> dict[str, bool | None]:
-    """Each spelling a driver may be given, as sent and trimmed, with its :func:`_path_verdict`.
-    A spelling the spelling check refuses is ``True`` and is not walked."""
+#: A file keyword's verdicts: each spelling a driver may be given, as sent and trimmed, with its
+#: :func:`_path_verdict`. Computed ONCE per judgement (:func:`file_keyword_verdicts`) and passed
+#: to every reader of it, so the refusal and the checks that read the file cannot disagree.
+FileVerdicts = Mapping[str, bool | None]
+
+#: The file keywords that name CA material, which no driver reads with TLS off.
+_ODBC_CA_KEYS = frozenset({"sslca", "sslcapath"})
+
+
+def file_keyword_verdicts(value: object) -> FileVerdicts:
+    """:data:`FileVerdicts` for ``value``, empty for a falsy one. A spelling the spelling check
+    refuses is ``True`` and is not walked."""
+    if not value:
+        return {}
     raw = str(value)
     return {
         p: True if _is_remote_spelling(p) else _path_verdict(p)
@@ -694,33 +716,44 @@ def _file_keyword_verdicts(value: object) -> dict[str, bool | None]:
     }
 
 
-def _names_another_host(value: object) -> bool:
+def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> bool:
     """Whether a file keyword's ``value`` must be refused: any spelling leads off this host, or the
     trimmed spelling, which the build treats as the path, cannot be cleared. A padded spelling that
     cannot be cleared is not refused, since Windows reads ``" C:\\x"`` as a stream name under the
     working directory, but it is not read either (:func:`driver_file_spellings`). A falsy value
-    names no path."""
+    names no path. ``verdicts`` are this value's, when the caller already has them."""
     if not value:
         return False
-    verdicts = _file_keyword_verdicts(value)
+    if verdicts is None:
+        verdicts = file_keyword_verdicts(value)
     trimmed = str(value).strip()
     return True in verdicts.values() or (bool(trimmed) and verdicts.get(trimmed) is None)
 
 
-def driver_file_spellings(value: object) -> tuple[str, ...]:
+def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
     """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
-    since a driver may trim it. Empty for a value that can name another host, which the build
-    refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
-    #3090), and without a spelling the walk could not clear. Any value, a ``Path`` too, is read as
-    its ``str()``: the text the build sends and the remote screen reads, so the engine checks the
-    file the driver is told to load."""
-    if not value or _names_another_host(value):
+    since a driver may trim it. Empty for a value that can name another host, so no check opens a
+    remote path (vault BACKLOG #3090), and without a spelling the walk could not clear. Any value,
+    a ``Path`` too, is read as its ``str()``: the text the build sends and the remote screen reads,
+    so the engine checks the file the driver is told to load.
+
+    ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
+    whenever there is one. Empty is then an answer that judgement already acted on, by refusing
+    the value or by leaving CA material with TLS off to the driver. Without them the path is walked
+    again here, and a caller must treat an empty answer for a set value as its own refusal."""
+    if not value:
         return ()
-    return tuple(p for p, leaves in _file_keyword_verdicts(value).items() if leaves is False)
+    if verdicts is None:
+        verdicts = file_keyword_verdicts(value)
+    if names_another_host(value, verdicts):
+        return ()
+    return tuple(p for p, leaves in verdicts.items() if leaves is False)
 
 
-def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
-    """Refuse a file keyword whose path is not a plain local one.
+def _refuse_remote_path(
+    value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
+) -> None:
+    """Refuse a file keyword whose path is not a plain local one, judged from its ``verdicts``.
 
     A path that starts with two separators, or with the device prefix, can name another host, and
     the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. So
@@ -728,14 +761,47 @@ def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> 
     or a chain of them, to a share (:func:`_windows_path_verdict`, BACKLOG #2705). The value sent to
     the driver is unchanged; only the judgement resolves it. What the check does not catch is listed
     once, in ``docs/CONNECTIONS.md`` under Generic ODBC."""
-    if _names_another_host(value):
+    if names_another_host(value, verdicts):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
-            "local path on this host: not a share, a network drive, a link to one, or a path it cannot read"
+            "local path on this host: not a share, a network drive, a link to one, or a path it "
+            "cannot read"
         )
 
 
-def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_remote_paths(
+    named: Mapping[str, Any], *, connection: str | None
+) -> dict[str, FileVerdicts]:
+    """Judge every file keyword in ``named`` once, refuse each that is not a plain local path, and
+    return the verdicts for the checks that read the files.
+
+    With TLS off (:func:`generic_odbc_tls_off`) the driver reads no CA, so a CA keyword that leads
+    off the host is not refused: it is left to the driver unread, the outcome the CA check's
+    unreached-share leniency gives (:class:`_UnreachedShare`), and its verdicts make that check
+    read nothing. A client certificate or key is still refused."""
+    tls_off = generic_odbc_tls_off({"dialect": "generic", "odbc_params": named})
+    verdicts: dict[str, FileVerdicts] = {}
+    for name in sorted(_ODBC_PATH_KEYS & named.keys()):
+        verdicts[name] = file_keyword_verdicts(named[name])
+        if tls_off and name in _ODBC_CA_KEYS:
+            if names_another_host(named[name], verdicts[name]):
+                logger.debug(
+                    "%sDATABASE odbc_params %s: not a local path, left to the driver unread, "
+                    "which reads no CA with TLS off",
+                    hop_name_prefix(connection),
+                    name,
+                )
+            continue
+        _refuse_remote_path(named[name], verdicts[name], name=name, connection=connection)
+    return verdicts
+
+
+def _refuse_weak_driver_key(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Check a driver client key's passphrase wrap before the connection string reaches the driver
     (BACKLOG #1352, #1171).
 
@@ -755,10 +821,17 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     a padded value is checked as a driver may trim it, and a pipe named here is never read: it is
     refused, as anything that is not a regular file is, on its stat, or on its descriptor if it
     was swapped in after that stat (:func:`~messagefoundry.auth.trust_anchors.read_if_regular`)."""
-    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
+    _refuse_weak_driver_wrap(
+        named, "sslkey", "key file", connection, leave_irregular=False, verdicts=verdicts
+    )
 
 
-def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_weak_driver_cert(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Check the key wrap of a driver's client certificate file before the driver loads it (vault
     BACKLOG #3090, step 5).
 
@@ -774,7 +847,9 @@ def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None
     connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
     what it does not cover."""
     if not str(named.get("sslkey") or "").strip():
-        _refuse_weak_driver_wrap(named, "sslcert", "certificate file", connection)
+        _refuse_weak_driver_wrap(
+            named, "sslcert", "certificate file", connection, verdicts=verdicts
+        )
 
 
 def _refuse_weak_driver_wrap(
@@ -784,6 +859,7 @@ def _refuse_weak_driver_wrap(
     connection: str | None,
     *,
     leave_irregular: bool = True,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
 ) -> None:
     """Refuse a weak or unlockable key wrap in the ``keyword`` file, with ``sslpassword`` as its
     passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
@@ -798,6 +874,7 @@ def _refuse_weak_driver_wrap(
         "its wrap",
         error=KeyWrapRefused,
         leave_irregular=leave_irregular,
+        verdicts=verdicts,
     ):
         refuse_weak_key_wrap(
             data,
@@ -820,7 +897,12 @@ _WINDOWS_INVALID_NAME = 123
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
 
 
-def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_encrypted_driver_ca(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Refuse an ``sslca`` CA file with an encryption header before the driver loads it (BACKLOG
     #3090).
 
@@ -848,6 +930,7 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
         "CA file",
         "it for an encryption header or a private key",
         leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
+        verdicts=verdicts,
     ):
         if has_encryption_header_bytes(data):
             raise ValueError(
@@ -872,13 +955,25 @@ def _driver_file_spellings(
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
     leave_unreachable: bool = False,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
 ) -> Iterator[tuple[str, bytes]]:
     """``(setting, bytes)`` for each spelling of the ``keyword`` file
     (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
     Nothing when the keyword is unset, and nothing more once a spelling is left to the driver as
-    an unreached share: another spelling of it would wait out the same network timeout."""
+    an unreached share: another spelling of it would wait out the same network timeout.
+
+    ``verdicts`` are the build's (:func:`_refuse_remote_paths`), so the spellings read here are the
+    ones that judgement cleared, never a second walk that could disagree with it. Without them the
+    path is walked here, and a set value that walk does not clear is refused."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
-    for path in driver_file_spellings(named.get(keyword)):
+    value = named.get(keyword)
+    given = None if verdicts is None else verdicts.get(keyword, {})
+    if given is None and value and names_another_host(value):
+        raise error(
+            f"{setting}: the {what} is not a plain local path on this host, so it was not read "
+            f"to check {checked_for}"
+        )
+    for path in driver_file_spellings(value, given):
         try:
             data = _read_driver_file(
                 path,
@@ -1093,13 +1188,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
-        if name in _ODBC_PATH_KEYS:  # after the text check: a value refused there is not resolved
-            _refuse_remote_path(value, name=name, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
-    _refuse_weak_driver_key(named, connection=connection)
-    _refuse_weak_driver_cert(named, connection=connection)
-    _refuse_encrypted_driver_ca(named, connection=connection)
+    # Each file keyword is judged once, here, and every check below reads that judgement.
+    verdicts = _refuse_remote_paths(named, connection=connection)
+    _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
+    _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
+    _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
     _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
 
