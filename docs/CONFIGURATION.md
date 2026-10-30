@@ -1293,9 +1293,10 @@ It differs from `subprocess` in at least these ways:
   lookup runs on this way, a later lookup on the same connection from that inbound waits for it,
   until a quarter of its own call's cap (at most 2 seconds) is left. It is refused if it is still
   waiting then, which leaves that quarter for the Handler to handle the refusal. This rule holds
-  within one inbound and one session. A reload replaces the session, so a lookup still running in
-  the old one is not waited for, and two inbounds can each run a lookup on one connection. It does
-  not bound the database either: a `db_lookup` its runner gave up on can still be running there.
+  per inbound, within one sandbox session: the engine starts an inbound's session afresh at a
+  reload or a stop, and a lookup still running from before then is not waited for. Two inbounds can
+  each run a lookup on one connection. It does not bound the database either: a `db_lookup` its
+  runner gave up on can still be running there.
 - **It needs a config directory.** A graph built in code with none cannot start a worker. Under
   `subprocess` such a graph quietly runs in-process; under `isolated` the runner refuses to be built
   instead, because in-process its lookups would not go through the broker.

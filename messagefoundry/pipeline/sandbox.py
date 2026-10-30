@@ -1281,9 +1281,10 @@ class SandboxSession:
     def _busy_refusal(lookup: codec.LookupRequest) -> str:
         fn = _LOOKUP_FN[lookup.kind]
         return (
-            f"{fn}({_shown_name(lookup.connection)!r}) refused: an earlier lookup on this "
-            "connection is still running after the wall cap cut it off, and this inbound's "
-            "sandbox session serves one at a time per connection (ADR 0147)"
+            # Short, scope first: a dead-letter keeps about the first 200 characters of this.
+            f"{fn}({_shown_name(lookup.connection)!r}) refused: this inbound's sandbox session "
+            "runs one lookup per connection, and one the wall cap cut off is still running "
+            "(ADR 0147)"
         )
 
     def _lookup_refusal(self, phase: str, lookup: codec.LookupRequest) -> str | None:
