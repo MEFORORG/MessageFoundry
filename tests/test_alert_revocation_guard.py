@@ -566,6 +566,8 @@ async def test_the_alerts_test_send_reports_the_whole_remedy(tmp_path: Path) -> 
     detail = (await _test_send(tmp_path)).json()["detail"]
     assert "[tls].crl_file" in detail
     assert "[alerts].email_tls_revocation_attested" in detail
+    assert "[alerts].email_username" in detail
+    assert RELAY in detail  # the operator's own setting, which the refusal names
 
 
 _LONG_TEXT = " ".join(f"word-{i:05d}" for i in range(2000))
@@ -598,7 +600,7 @@ async def test_a_test_send_failure_that_is_not_the_builds_refusal_keeps_the_gene
     )
     detail = reply.json()["detail"]
     assert detail.startswith(f"{error.__name__}: word-00000"), detail  # the arm under test ran
-    assert "word-00300" not in detail, detail
+    assert "word-00100" not in detail, detail  # present under the lifted cut, below
 
 
 async def test_a_hop_refusal_from_the_secret_read_keeps_the_general_cut(
@@ -608,7 +610,7 @@ async def test_a_hop_refusal_from_the_secret_read_keeps_the_general_cut(
     monkeypatch.setattr(app_module, "resolve_connector_secret", _raises(InsecureHopRefused))
     detail = (await _test_send(tmp_path)).json()["detail"]
     assert detail.startswith("InsecureHopRefused: word-00000"), detail
-    assert "word-00300" not in detail, detail
+    assert "word-00100" not in detail, detail  # present under the lifted cut, below
 
 
 async def test_the_lifted_cut_on_the_builds_refusal_is_a_bound_not_none(
@@ -617,7 +619,7 @@ async def test_the_lifted_cut_on_the_builds_refusal_is_a_bound_not_none(
     monkeypatch.setattr(alert_sinks, "_refuse_alert_smtp_revocation", _raises(InsecureHopRefused))
     detail = (await _test_send(tmp_path)).json()["detail"]
     assert "word-00100" in detail  # well past the general 200-character cut
-    assert "word-01999" not in detail
+    assert "word-00200" not in detail
 
 
 async def test_a_create_app_embedding_hands_the_test_send_its_own_posture(

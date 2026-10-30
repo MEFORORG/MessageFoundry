@@ -381,9 +381,10 @@ class ConnScaleRecord:
 
     @property
     def step_label(self) -> str:
-        """The step's name in a console note or an SLO observation. It names the sandbox arm, so
-        the two arms of a sandbox A/B read as two steps. The other A/B axes are not in it."""
-        return f"{self.sweep_mode}@N={self.count} sandbox={self.sandbox_mode}"
+        """The step's name in a console note or an SLO observation. It names the lane and the
+        sandbox arm, so the two arms of those A/Bs read as two steps. The fuse and batch axes are
+        not in it."""
+        return f"{lane_label(self.sweep_mode, self.claim_mode)}@N={self.count} sandbox={self.sandbox_mode}"
 
     def to_json_dict(self) -> dict[str, object]:
         return {

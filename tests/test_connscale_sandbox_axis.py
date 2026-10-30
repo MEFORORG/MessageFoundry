@@ -20,6 +20,7 @@ from harness.config.connscale._shape import ConnScaleShape, make_connscale_shape
 from harness.load.connscale import probe
 from harness.load.connscale import runner as runner_mod
 from harness.load.connscale.batchbox import iter_batch_cells
+from harness.load.connscale.intake_audit import VERDICT_INVARIANT_SUSPECT, not_run
 from harness.load.connscale.profile import (
     ConnScaleProfileError,
     get_connscale_profile,
@@ -306,9 +307,13 @@ async def _sweep(
     return report
 
 
-def _check(report: Any, name: str) -> Any:
-    (check,) = [c for c in report.slos if c.name == name]
+def _only(checks: Any, name: str) -> Any:
+    (check,) = [c for c in checks if c.name == name]
     return check
+
+
+def _check(report: Any, name: str) -> Any:
+    return _only(report.slos, name)
 
 
 async def test_a_subprocess_arm_with_a_worker_per_inbound_passes(
@@ -371,6 +376,12 @@ async def test_the_console_tells_the_two_arms_of_an_ab_apart(
     assert len(notes) == 4
     assert len(set(notes)) == 4, notes
     assert len({r.step_label for r in report.records}) == 4
+    suspect = dataclasses.replace(not_run("synthetic"), verdict=VERDICT_INVARIANT_SUSPECT)
+    audited = [dataclasses.replace(r, intake_audit=suspect) for r in report.records]
+    console = dataclasses.replace(report, records=audited).render_console()
+    assert "fixed_aggregate/pooled@N=10 sandbox=subprocess --" in console
+    checks = runner_mod._evaluate_slos(dataclasses.replace(_profile(), intake_audit=True), audited)
+    assert "fixed_aggregate/pooled@N=10 sandbox=subprocess" in str(_only(checks, "intake_audit"))
 
 
 def test_the_sandbox_reading_is_in_the_artifact() -> None:

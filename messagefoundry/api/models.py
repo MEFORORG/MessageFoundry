@@ -1877,7 +1877,7 @@ class AlertTestEmailResult(BaseModel):
     """Result of ``POST /alerts/test-email`` (BACKLOG #118) — a live SMTP send of a synthetic, PHI-free
     event through the **real** alert-email transport (the same path a genuine alert takes). Carries NO
     email addresses: only whether email is configured, the send outcome, how long the attempt took, the
-    recipient count, and a ``safe_exc``-scrubbed failure detail."""
+    recipient count, and a ``safe_exc``-scrubbed failure detail, which can name the relay host."""
 
     configured: bool
     success: bool

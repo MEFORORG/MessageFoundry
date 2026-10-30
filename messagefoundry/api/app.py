@@ -6270,7 +6270,7 @@ def create_app(
         Admin-gated (``service:configure``): it fires a live outbound SMTP dial, so it is service/settings
         administration, not the diagnostic ack/resolve tier. The result carries **no** email addresses —
         only a configured/success flag, the duration, the recipient count, and a ``safe_exc``-scrubbed
-        failure detail. One metadata-only ``alert_test_email`` audit row is written (best-effort; skipped
+        failure detail, which can name the relay host. One metadata-only ``alert_test_email`` audit row is written (best-effort; skipped
         when no engine is bound). Never touches the message pipeline / staged queue."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
