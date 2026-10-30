@@ -376,8 +376,9 @@ _ALERT_SMTP_WAYS_ACROSS = (
 def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
     """The posture both ``[alerts]`` revocation guards judge on: the one passed, else the ambient
     one, else enforcing. **An unknown posture counts as enforcing**, by ADR 0173 section 12, as on
-    the Vault hops and the AI broker; it cannot relax a hop. This differs from the LDAPS bind and
-    the OIDC legs, where :meth:`RevocationHopGuard.enforce_construction` no-ops with no posture."""
+    the Vault hops and the AI broker, though those two do not read the stamped posture first; it
+    cannot relax a hop. This differs from at least the LDAPS bind, the OIDC legs and the FTPS hops,
+    where :meth:`RevocationHopGuard.enforce_construction` no-ops with no posture."""
     if posture is not None:
         return posture
     ambient = current_hop_posture()
@@ -406,7 +407,12 @@ def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) ->
 
 
 def _refuse_webhook_revocation(
-    url: str, *, posture: HopPosture | None, attested: bool, attested_reason: str | None
+    url: str,
+    *,
+    allowed_hosts: tuple[str, ...],
+    posture: HopPosture | None,
+    attested: bool,
+    attested_reason: str | None,
 ) -> None:
     """Apply the ADR 0173 revocation-hop guard to the https alert webhook (BACKLOG #2193 slice (d)).
 
@@ -420,8 +426,16 @@ def _refuse_webhook_revocation(
     API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, and
     where none is stamped it counts as enforcing (:func:`_alert_hop_posture`), not as the no-op the
     LDAPS bind keeps. A cleartext ``http`` URL takes no revocation guard: there is no certificate,
-    and the cleartext refusal owns that hop."""
-    if urllib.parse.urlsplit(url).scheme.lower() != "https":
+    and the cleartext refusal owns that hop.
+
+    A host outside ``allowed_hosts`` is left to :meth:`WebhookTransport._post`, which refuses it at
+    every POST, for the reason :func:`_refuse_alert_smtp_revocation` gives for its relay: judging
+    its revocation first would send the operator to attest a hop the egress policy forbids."""
+    split = urllib.parse.urlsplit(url)
+    if split.scheme.lower() != "https":
+        return
+    # The same host test _post applies, so the two cannot disagree on which host is listed.
+    if allowed_hosts and (split.hostname or "").lower() not in (h.lower() for h in allowed_hosts):
         return
     RevocationHopGuard.capture(
         # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
@@ -586,6 +600,7 @@ class WebhookTransport:
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
             url,
+            allowed_hosts=allowed_hosts,
             posture=posture,
             attested=revocation_attested,
             attested_reason=revocation_attested_reason,

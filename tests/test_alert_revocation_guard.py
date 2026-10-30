@@ -298,7 +298,7 @@ def test_an_attested_webhook_crosses_and_is_recorded() -> None:
     assert REASON in log.audit and _WEBHOOK_CELL in log.audit, log.state()
 
 
-@pytest.mark.parametrize("reason", [None, "   ", "covered\nFORGED LINE"])
+@pytest.mark.parametrize("reason", [None, "   ", "covered\nFORGED LINE", "lone \ud800 surrogate"])
 def test_a_direct_build_cannot_attest_without_a_recordable_reason(reason: str | None) -> None:
     """The settings load refuses these; a transport built directly is refused at its guard too,
     as the AI broker is, so no crossing is recorded with no reason or a forged line."""
@@ -310,6 +310,19 @@ def test_a_direct_build_cannot_attest_without_a_recordable_reason(reason: str | 
     with pytest.raises(ValueError, match="email_tls_revocation_attested") as exc:
         _email(ENFORCING, revocation_attested=True, revocation_attested_reason=reason)
     assert not isinstance(exc.value, InsecureHopRefused)
+    with pytest.raises(ValueError, match="email_tls_revocation_attested") as exc:
+        _notifier(ENFORCING, revocation_attested=True, revocation_attested_reason=reason)
+    assert not isinstance(exc.value, InsecureHopRefused)
+
+
+def test_a_webhook_host_outside_the_allowlist_is_left_to_the_post_refusal() -> None:
+    """As for the SMTP relay: the allowlist refuses the host at every POST, so the guard does not
+    send the operator to attest a hop the egress policy forbids. A listed host is still judged."""
+    transport = WebhookTransport(WEBHOOK, allowed_hosts=("other.example.test",), posture=ENFORCING)
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+        transport._post({"type": "t", "connection": "c"})
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        WebhookTransport(WEBHOOK, allowed_hosts=("HOOKS.example.test",), posture=ENFORCING)
 
 
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
@@ -535,6 +548,50 @@ async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
         assert body["success"] is False
         assert "revocation" in (body["detail"] or ""), body
         assert "synthetic-not-a-secret" not in reply.text
+    finally:
+        await engine.stop()
+
+
+async def test_a_create_app_embedding_hands_the_test_send_its_own_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """create_app alone, with [ai] and a warn [security], stashes the posture it derives, so the
+    test send of an unattested off-box login warns and sends rather than taking the guard's
+    enforcing default for no posture. The send itself is faked; nothing is dialled."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings, SecurityEnforcement
+    from messagefoundry.pipeline import Engine
+
+    sent: list[str] = []
+    monkeypatch.setattr(alert_sinks, "send_plain_email", lambda **kw: sent.append(kw["host"]))
+    engine = await Engine.create(
+        tmp_path / "alerts.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        alerts = AlertsSettings(
+            email_smtp_host=RELAY,
+            email_from="alerts@example.test",
+            email_to=["ops@example.test"],
+            email_username="alerts-relay",
+            email_password="synthetic-not-a-secret",
+        )
+        app = create_app(
+            engine,
+            allow_no_auth=True,
+            alerts_settings=alerts,
+            ai_settings=AiSettings(),
+            security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+        )
+        assert app.state.alert_hop_posture == NOT_ENFORCING
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            reply = await client.post("/alerts/test-email")
+        assert reply.status_code == 200
+        assert reply.json()["success"] is True, reply.json()
+        assert sent == [RELAY]
     finally:
         await engine.stop()
 
