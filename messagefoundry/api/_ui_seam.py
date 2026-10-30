@@ -725,8 +725,9 @@ from typing import Any
 #: BACKLOG #3690: ``AuthService.finish_webauthn_registration`` gained the ``factor_refused``
 #: keyword, which ``POST /ui/account/webauthn/verify`` passes when it skipped its ceremony-budget
 #: draw, so the finish refuses on the route's read rather than a later one. A newer console on an
-#: older engine would raise TypeError at the passkey finish; an older console on this engine would
-#: leave the race open. The digest moved from ``9cd9fe02e6e90c18`` (derived with ``--digest``).
+#: older engine would raise TypeError at the passkey finish; a released console on this engine
+#: charges every finish and never passes the keyword, so it just keeps charging a refused session.
+#: The digest moved from ``9cd9fe02e6e90c18`` (derived with ``--digest``).
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

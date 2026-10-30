@@ -166,8 +166,15 @@ async def test_a_finish_the_route_left_uncharged_never_completes(
     async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
         c.cookies.set("mf_session", token)
         raced = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
-    assert raced.status_code == 400 and raced.json()["ok"] is False, raced.text
-    assert "already has a second factor" in raced.json()["error"]
+        assert raced.status_code == 400 and raced.json()["ok"] is False, raced.text
+        assert "already has a second factor" in raced.json()["error"]
+        again = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+        assert again.status_code == 400 and "ceremony expired" in again.json()["error"]
+    paths = [
+        json.loads(r["detail"])["path"]
+        for r in await service.store.list_audit(action="auth.mfa_denied")
+    ]
+    assert paths == ["finish_webauthn_registration"]
     assert calls == []
     assert await service.store.list_webauthn_credentials(identity.user_id) == []
     assert await service.mfa_satisfied(token) is False

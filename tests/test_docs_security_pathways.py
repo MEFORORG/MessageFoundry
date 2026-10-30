@@ -735,7 +735,8 @@ def test_the_retired_directory_password_sign_in_is_not_described_as_live() -> No
     # pinned in tests/test_mfa_access_gate.py; this only ties the signal-table AD row to it. The body
     # is ``_unverified_session_owes_factor`` since BACKLOG #2076: ``mfa_satisfied`` hashes the token
     # and delegates to ``_mfa_satisfied_hash`` (BACKLOG #296), which asks that helper about an
-    # unstamped session, and the session cap asks the same helper, so all three share one rule.
+    # unstamped session through ``_session_satisfaction`` (BACKLOG #3690 item 7), and the session
+    # cap asks the same helper, so all three share one rule.
     satisfied = ast.parse(
         textwrap.dedent(inspect.getsource(AuthService._unverified_session_owes_factor))
     )
