@@ -39,7 +39,7 @@ The policy is two independent axes, then **clamped** by the instance's **product
   |---|---|
   | `off` | No AI assistance at all. |
   | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. What the prompt holds is the IDE's own behaviour; the engine enforces nothing about it. |
-  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one prompt, labelled `code_only`, to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. Never reaches `phi` scope. |
+  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one prompt, labelled `code_only`, to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. An off-box endpoint is refused under `enforce` unless `[ai].endpoint_revocation_attested` is set with its reason, because the engine checks no revocation of the endpoint's certificate ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). Never reaches `phi` scope. |
   | `managed_claude` | Engine-brokered managed provider. **Future** — not serviceable by this IDE version. |
   | `managed_claude_baa` | Engine-brokered managed provider under a **BAA** + zero-data-retention connection — the only mode that can reach `phi` scope. **Future.** |
 

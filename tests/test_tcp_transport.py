@@ -246,6 +246,37 @@ def test_codec_allows_a_space_trailer() -> None:
     assert tcp_mod._codec_from_settings({"start": 2, "end": 3, "trailer": 0x20}) == codec
 
 
+def test_codec_refuses_a_trailer_equal_to_the_start_byte() -> None:
+    # BACKLOG #3742. Built, this codec decoded three framed messages as [AAA, \x02BBB, \x02CCC] and
+    # left a frame open. The refusal names the setting, directly, through the settings and at build.
+    same = {"start": 0x02, "end": 0x03, "trailer": 0x02}
+    refusal = "frame trailer must not equal the start byte 0x02"
+    with pytest.raises(ValueError, match=refusal):
+        FrameCodec(**same)
+    with pytest.raises(ValueError, match=f"TCP framing misconfigured: {refusal}"):
+        tcp_mod._codec_from_settings(dict(same))
+    with pytest.raises(ValueError, match=refusal):
+        _source(framing=None, **same)
+    with pytest.raises(ValueError, match=refusal):
+        _dest(9, framing=None, **same)
+
+
+@pytest.mark.parametrize("trailer", [0x03, 0x04, 0x0D])
+def test_a_distinct_trailer_decodes_three_frames_as_three_payloads(trailer: int) -> None:
+    # The control for the refusal above: the same start and end with a trailer that differs from
+    # the start byte builds at every layer, and three framed messages in one read decode to three
+    # payloads with no frame left open. 0x03 is the end byte: a trailer equal to end stays allowed.
+    settings = {"start": 0x02, "end": 0x03, "trailer": trailer}
+    codec = FrameCodec(**settings)
+    assert tcp_mod._codec_from_settings(dict(settings)) == codec
+    assert _source(framing=None, **settings).codec == codec
+    assert _dest(9, framing=None, **settings).codec == codec
+    decoder = codec.decoder()
+    stream = codec.frame("AAA") + codec.frame("BBB") + codec.frame("CCC")
+    assert list(decoder.feed(stream)) == [b"AAA", b"BBB", b"CCC"]
+    assert not decoder.in_frame
+
+
 @pytest.mark.parametrize("trailer", [None, 0x20])
 def test_a_neutralised_reply_decodes_as_one_frame(trailer: int | None) -> None:
     # The property behind the 0x20 refusal, for a codec that may be built: a reply holding both
