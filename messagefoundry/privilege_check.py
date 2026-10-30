@@ -519,7 +519,12 @@ def vault_preflight_outcome(
     ``enforce`` a grant in the refusing class refuses unless ``over_grant_accepted``
     (``[security].allow_over_granted_vault_token``) accepts it; the warning class and an
     unobservable probe warn. The outcomes are the store preflight's own
-    :class:`~messagefoundry.store.privilege.PreflightOutcome`."""
+    :class:`~messagefoundry.store.privilege.PreflightOutcome`.
+
+    This judges the grants seen. The startup preflight also refuses, under ``enforce``, a hop whose
+    probe failed for a reason other than a network failure, a timeout or a 403
+    (:func:`~messagefoundry.privilege_probes.excused_failure`), because that token was never
+    judged; ``check-privileges`` reports such a hop as one it could not read."""
     if hop.state not in (HopState.OVER_GRANTED, HopState.UNOBSERVABLE):
         return PreflightOutcome.CLEAN
     if not enforcing or not hop.refusing:

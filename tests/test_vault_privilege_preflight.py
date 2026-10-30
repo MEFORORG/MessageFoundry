@@ -59,6 +59,7 @@ from tests.test_vault_ldap_privilege_probes import (
     _KEK,
     _TOKEN,
     _VAULT_ADDR,
+    Forbidden,
     _FakeVault,
     _least_caps,
     _reading,
@@ -334,23 +335,177 @@ async def test_no_vault_consumer_probes_nothing_and_writes_no_row() -> None:
     assert store.audits == []
 
 
-@pytest.mark.parametrize("enforcing", [True, False])
-async def test_a_probe_that_raises_is_unobservable_and_never_aborts_the_start(
-    enforcing: bool,
-) -> None:
-    """A raise from the probe (a token re-read that fails, an unrouted consumer kind) must not
-    escape: under warn nothing may refuse, and under enforce an unobservable probe only warns."""
-    store = _AuditStore()
-
+def _raising(exc: BaseException) -> Any:
     def probe(consumer: VaultConsumer) -> VaultTokenReading:
-        raise ValueError(f"synthetic failure quoting {_TOKEN}")
+        raise exc
 
-    [hop] = await run_vault_privilege_preflight(
-        _VAULT_SETTINGS, store, enforcing=enforcing, over_grant_accepted=False, probe=probe
-    )
-    assert hop.state is HopState.UNOBSERVABLE
-    assert "the probe raised ValueError" in hop.detail
+    return probe
+
+
+#: A probe failure the 2026-10-04 ruling lets only warn: a network failure, a timeout, a 403.
+_EXCUSED = [
+    pytest.param(ConnectionError(f"https://vault.invalid/ token={_TOKEN}"), id="network"),
+    pytest.param(TimeoutError(f"timed out, token={_TOKEN}"), id="timeout"),
+    pytest.param(Forbidden(f"permission denied, token={_TOKEN}"), id="403"),
+]
+
+#: Programming defects, such as an hvac rename or a signature drift leaves behind.
+_DEFECTS = [
+    pytest.param(TypeError(f"lookup_self() got an unexpected keyword, {_TOKEN}"), id="TypeError"),
+    pytest.param(AttributeError(f"no attribute 'lookup_self', {_TOKEN}"), id="AttributeError"),
+]
+
+
+@pytest.mark.parametrize("error", _DEFECTS)
+async def test_a_probe_that_raises_a_code_defect_refuses_start_under_enforce(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Lander's hold on PR 2650: a catch-all read any raise as unobservable, which only warns,
+    so a TypeError after an hvac signature drift let an enforcing instance start on a token nobody
+    judged. RED at dc852601f1: the preflight returned and nothing refused."""
+    store = _AuditStore()
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(VaultPrivilegeError, match="not a network failure") as refused,
+    ):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS, store, enforcing=True, over_grant_accepted=False, probe=_raising(error)
+        )
+    name = type(error).__name__
+    assert "vault.store" in str(refused.value)
+    assert f"the probe raised {name}" in caplog.text
+    [(_, detail)] = store.audits
+    assert detail["refused"] is True and detail["unexcused"] == [name]
+    assert _TOKEN not in str(refused.value) and _TOKEN not in caplog.text
     assert _TOKEN not in json.dumps(store.audits)
+
+
+async def test_the_opt_out_does_not_accept_a_probe_that_raised_a_code_defect() -> None:
+    """The opt-out accepts a grant that was seen; a token the probe never read is not one."""
+    with pytest.raises(VaultPrivilegeError, match="does not accept this"):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            _AuditStore(),
+            enforcing=True,
+            over_grant_accepted=True,
+            probe=_raising(TypeError("synthetic")),
+        )
+
+
+@pytest.mark.parametrize("error", _DEFECTS)
+async def test_a_code_defect_inside_the_real_probe_refuses_start_under_enforce(
+    error: Exception,
+) -> None:
+    """The same defect where an hvac drift would really land: inside ``read_vault_token``, whose
+    own catch records it as a problem and never raises. RED at dc852601f1: it read as unobservable
+    and only warned."""
+    store = _AuditStore()
+    with pytest.raises(VaultPrivilegeError, match="vault.store"):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            store,
+            enforcing=True,
+            over_grant_accepted=False,
+            probe=_probe(_FakeVault(caps=_least_caps(), lookup_error=error)),
+        )
+    [(_, detail)] = store.audits
+    assert detail["state"] == "unobservable" and detail["refused"] is True
+    assert detail["unexcused"] == [type(error).__name__]
+
+
+async def test_an_answer_missing_a_path_refuses_start_under_enforce() -> None:
+    """A capabilities answer that names no capabilities for a path left that path unjudged, and is
+    not a network, timeout or 403 failure, so it refuses as a code defect does."""
+    vault = _FakeVault(caps=_least_caps())
+    vault.unanswered.add(f"transit/keys/{_KEK}/config")
+    store = _AuditStore()
+    with pytest.raises(VaultPrivilegeError, match="not a network failure"):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            store,
+            enforcing=True,
+            over_grant_accepted=False,
+            probe=_probe(vault),
+        )
+    assert store.audits[0][1]["unexcused"] == ["an answer naming no capabilities for a path"]
+
+
+@pytest.mark.parametrize("error", _EXCUSED)
+async def test_a_network_timeout_or_403_failure_only_warns_under_enforce(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the two tests above: the failures the ruling excuses still only warn, both
+    raised from the probe and caught inside it."""
+    for probe in (_raising(error), _probe(_FakeVault(caps=_least_caps(), lookup_error=error))):
+        store = _AuditStore()
+        with caplog.at_level(logging.WARNING):
+            [hop] = await run_vault_privilege_preflight(
+                _VAULT_SETTINGS, store, enforcing=True, over_grant_accepted=False, probe=probe
+            )
+        assert hop.state is HopState.UNOBSERVABLE
+        [(_, detail)] = store.audits
+        assert detail["refused"] is False and detail["unexcused"] == []
+    assert "REFUSING" not in caplog.text
+    assert _TOKEN not in caplog.text
+
+
+def test_the_real_library_classes_are_excused() -> None:
+    """The fakes above stand in for these: requests' timeouts and connection errors are OSErrors,
+    and hvac's 403 is ``Forbidden``. A change to either library that moves them fails here."""
+    hvac_exceptions = pytest.importorskip("hvac.exceptions")
+    requests = pytest.importorskip("requests")
+    from messagefoundry.privilege_probes import excused_failure
+
+    for error in (
+        requests.ConnectionError("synthetic"),
+        requests.ConnectTimeout("synthetic"),
+        requests.ReadTimeout("synthetic"),
+        hvac_exceptions.Forbidden("synthetic"),
+    ):
+        assert excused_failure(error), type(error).__name__
+    for error in (
+        hvac_exceptions.InternalServerError("synthetic"),
+        TypeError("synthetic"),
+        AttributeError("synthetic"),
+    ):
+        assert not excused_failure(error), type(error).__name__
+
+
+@pytest.mark.parametrize("enforcing", [True, False])
+async def test_a_probe_that_raises_never_escapes_the_preflight(enforcing: bool) -> None:
+    """A raise from the probe (a token re-read that fails, an unrouted consumer kind) never escapes
+    as itself: under warn nothing may refuse, and under enforce it refuses through the preflight's
+    own error, after its audit row."""
+    store = _AuditStore()
+    probe = _raising(ValueError(f"synthetic failure quoting {_TOKEN}"))
+    if enforcing:
+        with pytest.raises(VaultPrivilegeError):
+            await run_vault_privilege_preflight(
+                _VAULT_SETTINGS, store, enforcing=True, over_grant_accepted=False, probe=probe
+            )
+    else:
+        [hop] = await run_vault_privilege_preflight(
+            _VAULT_SETTINGS, store, enforcing=False, over_grant_accepted=False, probe=probe
+        )
+        assert hop.state is HopState.UNOBSERVABLE
+        assert "the probe raised ValueError" in hop.detail
+    assert _TOKEN not in json.dumps(store.audits)
+    assert store.audits[0][1]["refused"] is enforcing
+
+
+async def test_a_code_defect_under_warn_warns_naming_its_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _AuditStore()
+    with caplog.at_level(logging.WARNING):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            store,
+            enforcing=False,
+            over_grant_accepted=False,
+            probe=_raising(TypeError("synthetic")),
+        )
+    assert "the probe raised TypeError" in caplog.text and "REFUSING" not in caplog.text
     assert store.audits[0][1]["refused"] is False
 
 
