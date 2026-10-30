@@ -912,31 +912,38 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("event", "script_rc", "step_rc", "warns"),
+    ("event", "script_rcs", "step_rc", "warns"),
     [
-        ("pull_request", 1, 1, False),  # a LOW margin still blocks before enqueue
-        ("merge_group", 1, 0, True),  # ... and is a warning in the queue
-        ("merge_group", 2, 2, False),  # a gate that could not measure still fails, queue or not
-        ("merge_group", 0, 0, False),
-        ("push", 1, 1, False),
+        ("pull_request", "0", 0, False),
+        ("pull_request", "1 0", 0, True),  # under 1.30x, at or over 1.20x: a warning
+        ("pull_request", "1 1", 1, False),  # under 1.20x blocks before enqueue
+        ("pull_request", "1 2", 2, False),  # the second call could not measure: never a pass
+        ("pull_request", "2", 2, False),  # the first could not, so there is no second opinion
+        ("merge_group", "1", 0, True),  # a warning in the queue, with no second floor
+        ("merge_group", "2", 2, False),  # a gate that could not measure still fails, queue or not
+        ("merge_group", "0", 0, False),
+        ("push", "1", 1, False),  # 1.30x still blocks, and nothing asks about 1.20x
+        ("push", "2", 2, False),
     ],
 )
-def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_group(
-    bash: Path, tmp_path: Path, event: str, script_rc: int, step_rc: int, warns: bool
+def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
+    bash: Path, tmp_path: Path, event: str, script_rcs: str, step_rc: int, warns: bool
 ) -> None:
-    """The owner ruling of 2026-10-29 (quoted beside the step in ci.yml), pinned until #3515's
-    re-measure reverts it. Runs the step's REAL run body under the runner's own `bash -eo
-    pipefail`, with `python` stubbed to the script's exit code, so the pin is on behaviour rather
-    than on a spelling.
+    """The owner ruling of 2026-10-29 and the 1.20x floor decided under the delegation of 2026-10-30
+    (both beside the step in ci.yml), pinned until #3515's re-measure reverts them. Runs the step's
+    REAL run body under the runner's own `bash -eo pipefail`, with `python` stubbed to one exit code
+    per call, so the pin is on behaviour rather than on a spelling.
 
-    Falsified by widening the branch to `"$rc" -ne 0`, and separately by deleting the `::warning`
-    line: RED both times. Restored.
+    Falsified by widening the merge_group branch to `"$rc" -ne 0`, by deleting the `::warning` line,
+    by widening the pull_request branch to every event, by passing a second-call exit 2, and by
+    dropping `--min-margin 1.20`: RED each time. Restored.
     """
     check = _margin_check("test")
     assert "continue-on-error" not in check, "continue-on-error would also pass exit 2 in the queue"
     assert (check.get("env") or {}).get("EVENT_NAME") == "${{ github.event_name }}"
     summary = tmp_path / "summary.md"
     summary.write_text("", encoding="utf-8")
+    calls = tmp_path / "calls.txt"
     env = probe_env(
         bash,
         dict(
@@ -946,9 +953,16 @@ def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_grou
             STEP_CAP="46",
             TESTS_OUTCOME="success",
             GITHUB_STEP_SUMMARY=summary.as_posix(),
+            STUB_CALLS=calls.as_posix(),
         ),
     )
-    stub = f"python() {{ return {script_rc}; }}\n"
+    # One line per call, so the argv each call received can be asserted. The exit codes are consumed
+    # from a shell variable, which survives between calls because `||` does not open a subshell.
+    stub = (
+        f"stub_rcs='{script_rcs}'\n"
+        """python() { printf '%s\\n' "$*" >> "$STUB_CALLS"; """
+        """this=${stub_rcs%% *}; stub_rcs=${stub_rcs#* }; return "$this"; }\n"""
+    )
     done = subprocess.run(
         [str(bash), "-eo", "pipefail", "-c", stub + str(check["run"])],
         capture_output=True,
@@ -957,10 +971,19 @@ def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_grou
         env=env,
         check=False,
     )
-    print(f"[step-margin] {event} rc {script_rc}: step {done.returncode}; {done.stdout.strip()!r}")
+    print(
+        f"[step-margin] {event} rcs {script_rcs}: step {done.returncode}; {done.stdout.strip()!r}"
+    )
     assert done.returncode == step_rc, done.stdout + done.stderr
     assert ("::warning" in done.stdout) is warns, done.stdout
     assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
+    argv = calls.read_text(encoding="utf-8").splitlines()
+    # push and merge_group never make a second call
+    assert len(argv) == len(script_rcs.split()), argv
+    assert "--min-margin" not in argv[0], argv[0]
+    assert all("--step Tests (pytest) --leg ubuntu-latest" in line for line in argv), argv
+    if len(argv) == 2:
+        assert argv[1].endswith("--min-margin 1.20"), argv[1]
 
 
 def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:

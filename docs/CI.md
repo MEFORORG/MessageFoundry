@@ -400,15 +400,16 @@ Two limits, stated so nobody reads more into a green than it carries:
   `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
 - **A step's wall-clock cap is now checked against the step, and a low margin reds the leg** --
-  except the engine `test` leg in `merge_group`, where a low margin is a warning until BACKLOG #3515
-  re-measures the cap (owner ruling 2026-10-29; the margin step in `ci.yml` says what that gives
-  up). The same ruling moved the recurring timing tests listed in `tests/timing_quarantine.txt` off
-  the engine legs into the advisory `timing-quarantine` job (BACKLOG #4773). Each
+  except the engine `test` leg until BACKLOG #3515 re-measures the cap. In `merge_group` a low margin
+  is a warning (owner ruling 2026-10-29). On `pull_request` it is a warning from 1.30x down to 1.20x
+  and reds below 1.20x (decided under the owner's delegation of 2026-10-30). The margin step in
+  `ci.yml` says what each gives up. The ruling of 2026-10-29 also moved the recurring timing tests
+  listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job (BACKLOG #4773). Each
   gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),
-  keys on that step's **own** `outcome`, and reds below 1.30x. It prints the elapsed, the
-  percent-of-cap and its own red/green control pair into the job summary. A **skipped** step (a
+  keys on that step's **own** `outcome`, and reds below 1.30x unless the exception above applies. It
+  prints the elapsed, the percent-of-cap and its own red/green control pair into the job summary. A **skipped** step (a
   docs-only PR) reports `NO OBSERVATION` in words rather than a healthy-looking ratio. Recorded
   per-leg maxima — with their pool, their date, and whether they are right-censored — live in
   `scripts/ci/step_margin_baseline.toml`; a capped step with no row there fails the check closed.
