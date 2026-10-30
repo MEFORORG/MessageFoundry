@@ -472,8 +472,9 @@ it fails closed with this code. The two
 `json` parses are not bounded here; they ran before vault BACKLOG #3796 too, and the 16 MiB read
 cap bounds them.
 
-**CORRECTED 2026-10-30 (vault BACKLOG #3796).** The paragraph before this said the three-or-more
-occurrence rule held *"at any depth"* and compared each occurrence's *"value"*. It held in every
+**CORRECTED 2026-10-30 (vault BACKLOG #3796).** Until this date, the paragraph that now opens
+*"The same refusal applies to an occurrence of a repeated key that reads a third way"* said the
+three-or-more occurrence rule held *"at any depth"* and compared each occurrence's *"value"*. It held in every
 object, but it compared an occurrence only by its keep-first reading, with Python equality. So a
 middle object that read `404` only keeping the last key was delivered, as were `1` against `true`,
 `1` against `1.0` and `0.0` against `-0.0` at every level, the top-level object included, and in
