@@ -102,7 +102,7 @@ from messagefoundry.connection_names import (
     is_connection_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
-from messagefoundry.credential import CERT_NAME_PREFIXES
+from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
@@ -3141,6 +3141,14 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         return
 
     if mode in _INTAKE_KEY_MODES:
+        if settings["intake_client_subjects"]:
+            # The same rule as under "none": the listener reads the table only under mtls_subject.
+            raise WiringError(
+                f"Http sets intake_client_subjects but intake_auth={mode!r}, which never reads a "
+                "client certificate — set intake_auth='mtls_subject', or remove the setting; a "
+                "control that is configured but never consulted reads as protection that does not "
+                "exist"
+            )
         if settings["intake_api_key"] is None:
             raise WiringError(
                 f"Http intake_auth={mode!r} needs intake_api_key — supply it via env() "
@@ -3166,14 +3174,15 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             "authenticates no one in particular"
         )
     unqualified = [
-        s for names in subjects.values() for s in names if not str(s).startswith(CERT_NAME_PREFIXES)
+        s for names in subjects.values() for s in names if not QUALIFIED_CERT_NAME.fullmatch(str(s))
     ]
     if unqualified:
         raise WiringError(
-            f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "
-            "'CN:' / 'SAN:<type>:' prefix. A certificate's names are matched as 'CN:<value>' and "
-            "'SAN:DNS:<value>' so a spoofed commonName cannot collide with a pinned SAN; a bare name "
-            "matches nothing and would 403 every request from the partner it names"
+            f"Http intake_client_subjects entries must be qualified — {unqualified} are not "
+            "'CN:<value>' / 'SAN:<type>:<value>', each part non-empty. A certificate's names are "
+            "matched as 'CN:<value>' and 'SAN:DNS:<value>' so a spoofed commonName cannot collide "
+            "with a pinned SAN; any other name matches nothing and would 403 every request from the "
+            "partner it names"
         )
 
 
@@ -3195,7 +3204,9 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
     if value is None:
         return None
     setting = "Http intake_client_subjects"
-    if _is_nested_envref(value):
+    # An EnvRef only: a raw marker never reaches here whole, because the connections.toml loader
+    # decodes a top-level one, and a table merely keyed "env" is an issuer key to refuse below.
+    if isinstance(value, EnvRef):
         raise WiringError(
             f"{setting} may not be an env() reference - it is a table of issuer DN to subject "
             "names, written in code or connections.toml, and an environment value is a string"

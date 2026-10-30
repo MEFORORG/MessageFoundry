@@ -667,7 +667,9 @@ def _subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]]:
     fails at construction rather than denying every peer with nothing in the log."""
     if not subjects:
         return {}
-    if not isinstance(subjects, Mapping):
+    if not isinstance(subjects, Mapping) or any(
+        not isinstance(names, list | tuple) for names in subjects.values()
+    ):
         raise ValueError(
             "HTTP source intake_client_subjects must be a table keyed by the issuing CA's DN, each "
             "naming a list of subjects, not a flat list (vault BACKLOG #2287)"
@@ -820,18 +822,6 @@ class HttpSource(SourceConnector):
         self._intake_subjects: dict[str, dict[str, str]] = _subjects_by_issuer(
             s.get("intake_client_subjects")
         )
-        #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
-        #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
-        #: then no certificate names an issuer, so every one is denied.
-        self._issuer_index: IssuerIndex | None = (
-            _client_issuer_index(
-                self._log_name,
-                loaded_client_ca[0] if loaded_client_ca else None,
-                self._intake_subjects,
-            )
-            if self.intake_auth == "mtls_subject"
-            else None
-        )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
         # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
@@ -863,6 +853,19 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
+        #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
+        #: then no certificate names an issuer, so every one is denied. Built after every check
+        #: in this constructor that can refuse it, because it may warn (BACKLOG #2749's rule).
+        self._issuer_index: IssuerIndex | None = (
+            _client_issuer_index(
+                self._log_name,
+                loaded_client_ca[0] if loaded_client_ca else None,
+                self._intake_subjects,
+            )
+            if self.intake_auth == "mtls_subject"
+            else None
+        )
         if self.max_body_bytes is None:
             # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
             # #2749, as FileSource does for its caps). Logged after every check in this constructor,
@@ -1066,13 +1069,17 @@ class HttpSource(SourceConnector):
             return ""
         try:
             leaf_der = ssl_object.getpeercert(binary_form=True)
-        except (ValueError, ssl.SSLError):
+            return index.issuer_of(leaf_der) if leaf_der else ""
+        except Exception:
+            # Deliberately broad, as the API shim's twin is: anything that stops the issuer being
+            # established must DENY (a charged, audited 403), never escape into the generic
+            # per-connection handler, which neither charges the attempt nor audits it.
             logger.warning(
-                "HTTP source %s: could not read a client certificate to find its issuer; denying",
+                "HTTP source %s: could not establish a client certificate's issuer; denying",
                 self._log_name,
+                exc_info=True,
             )
             return ""
-        return index.issuer_of(leaf_der) if leaf_der else ""
 
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""

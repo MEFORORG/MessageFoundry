@@ -1368,15 +1368,20 @@ one `Http()` listener would have let any of them speak for any listed partner.
 - **The issuer is found by signature, from the bytes the context loaded.** `pki.IssuerIndex`, the
   index the API uses, is built once from the exact `cadata` text the listener's `SSLContext` loaded as
   its client trust store. The context builder hands that text back through a callback, so the listener
-  never reads `tls_ca_file` a second time, where a swapped file could differ. A loaded CA is the
-  issuer only when its subject equals the leaf's issuer name exactly and its key verifies the leaf.
+  never reads `tls_ca_file` a second time, where a swapped file could differ. What makes a loaded CA
+  the issuer is stated once, on `IssuerIndex` in [pki.py](../../messagefoundry/pki.py).
   The listener reads the leaf from `getpeercert(binary_form=True)`. It never reads
   `getpeercert()["issuer"]`, which OpenSSL matches to a CA loosely, and never `get_verified_chain()`,
   which is empty on a resumed session. The match itself is `client_cert_principal_under_issuer`, the
   API's matcher.
 - **Only a loaded CA counts.** A leaf signed by an intermediate the client sends is refused, even when a
   key names that intermediate's DN, because any loaded CA could mint an intermediate with another CA's
-  name. An operator whose partners use an intermediate loads it into `tls_ca_file` and keys by its DN.
+  name. An operator whose partners use an intermediate loads it into `tls_ca_file`, beside the root
+  that signed it, and keys by the intermediate's DN.
+- **A key rollover under one DN denies both CAs, as on the API.** Two loaded CAs with one subject and
+  different keys name no issuer, so a partner CA re-keyed under its old name is refused until one of
+  the two leaves `tls_ca_file`. The start warning names the key. This keeps the API's rule rather than
+  invent a second one; ADR 0083 Amendment 1 records why the key is a name.
 - **The listener warns at start about a key that cannot match,** as the API does: one naming no loaded
   CA, or naming two loaded CAs with one subject and different keys. Either would otherwise deny every
   certificate under it with nothing in the log.

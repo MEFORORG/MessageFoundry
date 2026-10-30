@@ -27,7 +27,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.wiring import Http, WiringError
+from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.transports.http_listener import HttpSource
 from tests.test_api_tls import _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
 
@@ -75,28 +75,35 @@ async def _started(source: HttpSource) -> HttpSource:
     return source
 
 
-async def _status(source: HttpSource, bundle: Path) -> int:
+async def _status(source: HttpSource, bundle: Path, *, send: bool) -> int:
     """The HTTP status the listener answers a client presenting ``bundle``.
 
-    A refusal is answered at accept, before any request byte is read, so the client reads first and
-    writes its request only when nothing has arrived. Writing first can race the listener's close
-    into a reset that loses the status."""
+    A refusal is answered at accept, before any request byte is read, so a case expecting one sends
+    nothing (``send=False``) and only reads: writing into a socket the listener is closing can reset
+    it and lose the status. If such a client were admitted instead, the listener would wait for a
+    request and the read would time out, failing the case. ``send=True`` posts a body first."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # the LISTENER side is the verifier under test
     ctx.load_cert_chain(bundle)
     reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport, ssl=ctx)
     try:
-        try:
-            data = await asyncio.wait_for(reader.read(-1), 0.5)
-        except TimeoutError:
+        if send:
             writer.write(b"POST /ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(-1), 5.0)
+        data = await asyncio.wait_for(reader.read(-1), 10.0)
     finally:
         writer.close()
     assert data.startswith(b"HTTP/1.1 "), data[:40]
     return int(data.split(b" ", 2)[1])
+
+
+async def _refused(source: HttpSource, bundle: Path) -> int:
+    return await _status(source, bundle, send=False)
+
+
+async def _admitted(source: HttpSource, bundle: Path) -> int:
+    return await _status(source, bundle, send=True)
 
 
 async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subject_is_not(
@@ -114,9 +121,9 @@ async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subjec
     )
     try:
         # Control: the same subject from the CA it is listed under is admitted.
-        assert await _status(source, _bundle(tmp_path, named)) == 202
+        assert await _admitted(source, _bundle(tmp_path, named)) == 202
         # Both chains verify at the TLS layer; only the issuer differs.
-        assert await _status(source, _bundle(tmp_path, other)) == 403
+        assert await _refused(source, _bundle(tmp_path, other)) == 403
     finally:
         await source.stop()
 
@@ -130,8 +137,8 @@ async def test_a_ca_with_a_lookalike_name_is_refused(tmp_path: Path) -> None:
     source = await _started(_source(tmp_path, [named[0], lookalike[0]], {"CN=Acme CA": [SUBJECT]}))
     try:
         forged = _bundle(tmp_path, lookalike, leaf_issuer=named[0].subject)
-        assert await _status(source, forged) == 403
-        assert await _status(source, _bundle(tmp_path, named)) == 202  # control
+        assert await _refused(source, forged) == 403
+        assert await _admitted(source, _bundle(tmp_path, named)) == 202  # control
     finally:
         await source.stop()
 
@@ -150,13 +157,13 @@ async def test_a_leaf_signed_by_an_intermediate_the_client_sends_is_refused(
     sent = _bundle(tmp_path / "sent", intermediate, sent=(intermediate[0],))
     source = await _started(_source(tmp_path / "root-only", [root[0]], subjects))
     try:
-        assert await _status(source, sent) == 403
+        assert await _refused(source, sent) == 403
     finally:
         await source.stop()
     # Control: with the intermediate loaded too, the same certificate is admitted under it.
     source = await _started(_source(tmp_path / "both", [root[0], intermediate[0]], subjects))
     try:
-        assert await _status(source, sent) == 202
+        assert await _admitted(source, sent) == 202
     finally:
         await source.stop()
 
@@ -220,11 +227,28 @@ def test_the_flat_list_is_refused_naming_the_table_to_write() -> None:
         pytest.param({"CN=Acme CA": [""]}, "item 0 must be a non-empty subject name", id="blank"),
         pytest.param({"CN=Acme CA": [5]}, "item 0 must be a non-empty subject name", id="not-str"),
         pytest.param({"CN=Acme CA": ["partner.example"]}, "must be qualified", id="unqualified"),
+        pytest.param(
+            {"CN=Acme CA": ["SAN:partner.example"]}, "must be qualified", id="san-no-type"
+        ),
+        pytest.param({"CN=Acme CA": ["CN:"]}, "must be qualified", id="empty-cn"),
     ],
 )
 def test_the_factory_refuses_what_cannot_match(subjects: Any, message: str) -> None:
     with pytest.raises(WiringError, match=message):
         _http(subjects)
+
+
+def test_a_subject_table_is_refused_where_no_certificate_is_read() -> None:
+    """The table is consulted only under ``mtls_subject``, so a key mode that sets it is refused, as
+    ``intake_auth="none"`` already was: a control configured but never consulted."""
+    for mode in ("api_key", "bearer"):
+        with pytest.raises(WiringError, match=f"intake_auth='{mode}', which never reads"):
+            Http(
+                port=8443,
+                intake_auth=mode,
+                intake_api_key=env("acme_intake_key"),
+                intake_client_subjects={"CN=Acme CA": [SUBJECT]},
+            )
 
 
 def test_a_valid_table_is_carried_onto_the_spec() -> None:

@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
     "CERT_NAME_PREFIXES",
+    "QUALIFIED_CERT_NAME",
     "VERIFIED_ISSUER_KEY",
     "constant_time_equal",
     "constant_time_match",
@@ -127,6 +129,11 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
 #: The qualified name spaces :func:`cert_name_candidates` yields. A configured name outside them can
 #: never match, so the loaders that take one refuse it.
 CERT_NAME_PREFIXES = ("CN:", "SAN:")
+
+#: A configured name :func:`cert_name_candidates` can actually yield: ``CN:<value>`` or
+#: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
+#: Shared by ``[api].tls_client_cert_identities`` and ``Http``'s ``intake_client_subjects`` (#2287).
+QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
 
 
 def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:

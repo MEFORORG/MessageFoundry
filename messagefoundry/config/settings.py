@@ -101,6 +101,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
+from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
@@ -1352,9 +1353,6 @@ class StoreSettings(_Section):
 #: those is a separate question, recorded in ADR 0154.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-#: A cert-map name ``credential.cert_name_candidates`` can actually yield: ``CN:<value>`` or
-#: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
-_QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
 #: A users-row id as ``AuthService`` mints it (``uuid4().hex``). The cert map targets this, never a
 #: username, because a rename can hand a username to another row (#2238).
 _USER_ID = re.compile(r"[0-9a-f]{32}")
@@ -2016,7 +2014,7 @@ class ApiSettings(_Section):
             if not names:
                 raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")
             for name, target in names.items():
-                if not _QUALIFIED_CERT_NAME.fullmatch(name):
+                if not QUALIFIED_CERT_NAME.fullmatch(name):
                     raise ValueError(
                         f"{field} name {name!r} under {issuer!r} is not qualified: write "
                         '"CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal")'
