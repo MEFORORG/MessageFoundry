@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from collections.abc import Collection, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
@@ -789,10 +790,9 @@ class DryRunResult:
     # **PHI. Every consumer that prints, logs or serves this must pass it through
     # `messagefoundry.redaction.safe_error` first** (BACKLOG #1668). It is built unredacted on purpose:
     # a consumer that holds a `--show-phi` opt-in has to still have the raw text to honor it, so
-    # scrubbing here would close the leak by deleting the feature. At least these producers feed it
-    # below (`exc.reason`, `parse error:`, the joined strict-validation errors, the strict-validation
-    # timeout, `router/handler error:`) and
-    # at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
+    # scrubbing here would close the leak by deleting the feature. Producers below include
+    # `exc.reason`, `parse error:`, the joined strict-validation errors, the strict-validation timeout
+    # and `router/handler error:`, and at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
     # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
     # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
@@ -909,47 +909,40 @@ def _dry_run_raw(
     )
 
 
-def _validate_within_timeout(text: str, ic: InboundConnection) -> ValidationResult | None:
-    """Strict-validate ``text`` as the listener does, under the same timeout; ``None`` on expiry.
+def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
+    """Strict-validate ``text`` under the listener's timeout; the refusal text, or ``None`` if valid.
 
-    The listener bounds the call with ``asyncio.wait_for`` over ``asyncio.to_thread``. This function
-    is synchronous, so it bounds the same call by joining a thread with the timeout
-    :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves. With the
-    backstop disabled it validates inline, as the listener validates un-timed.
+    The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread``; this
+    function is synchronous, so it waits on a thread for the timeout
+    :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves, and on expiry
+    returns the listener's text word for word (the parity test compares the two). With the backstop
+    disabled it validates inline, as the listener validates un-timed.
 
-    The thread is a **daemon** and is not pooled. Like the listener's worker, an expired one cannot be
-    killed and runs on until the size and segment caps let it finish. A daemon thread is not joined
-    at interpreter exit, so such a body cannot hold ``messagefoundry check`` open as it exits; a
-    ``concurrent.futures`` pool would, because its workers are joined at exit.
-
-    The caller blocks for up to the timeout. At least these callers run off any event loop: the
-    ``dryrun`` and ``check`` CLIs, ``verify``'s self smoke and the traced dry-run. A caller on a loop
-    thread would stall that loop for up to the timeout, where the inline validate this replaced
-    stalled it for as long as hl7apy ran.
-
-    An error the validate raises reaches the caller, as it did when the call was inline. It is held
-    rather than left to escape the thread, where the default hook would print its traceback."""
+    The thread is a **daemon** and not pooled. An expired one cannot be killed and runs on until the
+    size and segment caps let it finish, as on the listener; a daemon is not joined at interpreter
+    exit, so it cannot hold ``messagefoundry check`` open, where a ``concurrent.futures`` pool's
+    worker would be. The caller blocks for up to the timeout, so a caller on an event loop thread
+    would stall that loop; at least the ``dryrun`` and ``check`` CLIs, ``verify``'s self smoke and the
+    traced dry-run run off any loop."""
     timeout = strict_validate_timeout(ic)
     version = ic.validation.hl7_version
     if timeout is None:
-        return validate(text, expected_version=version)
-    results: list[ValidationResult] = []
-    errors: list[BaseException] = []
+        result = validate(text, expected_version=version)
+    else:
+        future: Future[ValidationResult] = Future()
 
-    def _run() -> None:
+        def _run() -> None:
+            try:
+                future.set_result(validate(text, expected_version=version))
+            except BaseException as exc:  # re-raised by future.result, as the inline call raised
+                future.set_exception(exc)
+
+        threading.Thread(target=_run, name="dryrun-strict-validate", daemon=True).start()
         try:
-            results.append(validate(text, expected_version=version))
-        except BaseException as exc:  # handed to the caller below, not swallowed
-            errors.append(exc)
-
-    worker = threading.Thread(target=_run, name="dryrun-strict-validate", daemon=True)
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        return None
-    if errors:
-        raise errors[0]
-    return results[0]
+            result = future.result(timeout)
+        except TimeoutError:
+            return f"strict-validation timed out after {timeout}s"
+    return None if result.ok else "; ".join(result.errors)[:200]
 
 
 @runs_author_code
@@ -973,7 +966,7 @@ def dry_run(
     since there is nothing left to decode.
 
     Strict validation runs under the connection's **timeout**, as on the listener, and an expiry is an
-    ``ERROR`` result carrying the listener's text (:func:`_validate_within_timeout`). **One live guard
+    ``ERROR`` result carrying the listener's text (:func:`_strict_validation_error`). **One live guard
     is deliberately not mirrored: document detach** (``async`` and side-effecting, so there is no
     honest pure mirror; rationale in :mod:`messagefoundry.pipeline.ingress_guards`).
 
@@ -1022,32 +1015,18 @@ def dry_run(
 
     mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
 
-    # The listener's rule, including its header-only downgrade for a streaming inbound's body at or
-    # over its threshold: timing a whole-body validate the engine never runs could refuse what it takes.
-    if strict_validation_due(ic, text):
-        result = _validate_within_timeout(text, ic)
-        if result is None:
-            # The listener's refusal text for the #89 backstop, word for word; the parity test in
-            # tests/test_ingress_guard_parity.py compares it with the live ERROR row.
-            return DryRunResult(
-                inbound=ic.name,
-                disposition=MessageStatus.ERROR,
-                raw=text,
-                message_type=mt,
-                control_id=cid,
-                summary=summ,
-                error=f"strict-validation timed out after {strict_validate_timeout(ic)}s",
-            )
-        if not result.ok:
-            return DryRunResult(
-                inbound=ic.name,
-                disposition=MessageStatus.ERROR,
-                raw=text,
-                message_type=mt,
-                control_id=cid,
-                summary=summ,
-                error="; ".join(result.errors)[:200],
-            )
+    # strict_validation_due keeps the listener's header-only downgrade for a streaming body over its
+    # threshold, so the preview never times a whole-body validate the engine does not run.
+    if strict_validation_due(ic, text) and (refused := _strict_validation_error(text, ic)):
+        return DryRunResult(
+            inbound=ic.name,
+            disposition=MessageStatus.ERROR,
+            raw=text,
+            message_type=mt,
+            control_id=cid,
+            summary=summ,
+            error=refused,
+        )
 
     try:
         outcome = route_message(
