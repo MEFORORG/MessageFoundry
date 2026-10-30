@@ -140,6 +140,18 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
         level="PL-2",
         auto_bound_days=30,
     ),
+    # PL-1 the File source's `.processed` archive: a clear-text copy of every inbound payload. The
+    # fourth auto-bound window, at the body window and keyed on ARCHIVE time (the File source sets the
+    # copy's mtime when it archives it), by owner ruling A2 of 2026-10-08 (BACKLOG #1188). It is safe
+    # to bound where transform state is not: nothing reads an archived copy back, so age since archive
+    # cannot delete data the engine still uses. `.error` is not covered (#3335).
+    RetentionWindow(
+        setting="[retention].processed_archive_days",
+        field="processed_archive_days",
+        reads_from="[retention]",
+        level="PL-1",
+        auto_bound_days=30,
+    ),
     # --- classified and WARNED, never auto-bounded (see auto_bound_days above) ---------------------
     RetentionWindow(
         setting="[retention].state_max_age_days",
@@ -231,12 +243,13 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
 #: most of the entries leaves a non-empty tuple, and a startup gate would then check two windows while
 #: reporting success.
 #:
-#: TEN since BACKLOG #1966 added the forwarder spool. It was NINE, and that number was corrected by its own drift test rather than by counting. It was first
+#: ELEVEN since BACKLOG #1188 added the `.processed` archive window (owner ruling A2 of 2026-10-08).
+#: TEN after BACKLOG #1966 added the forwarder spool. It was NINE before that, and that number was corrected by its own drift test rather than by counting. It was first
 #: written as 7 — the count I derived by hand from the classification. The two-way equality against
 #: docs/PHI.md §2 immediately reported `[backup].retention_keep` and
 #: `[retention].connection_event_retention_hours` as documented-but-absent. That is precisely the
 #: failure this floor exists to catch, caught in the constant it protects, before either had ever run.
-MIN_PHI_RETENTION_WINDOWS: Final[int] = 10
+MIN_PHI_RETENTION_WINDOWS: Final[int] = 11
 
 
 def auto_bounded_windows() -> tuple[RetentionWindow, ...]:
@@ -375,7 +388,7 @@ def evaluate_retention_gate(
     prod = "production " if production else ""
 
     # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
-    # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+    # UNSET (a fourth, the `.processed` archive, by owner ruling A2 of 2026-10-08), on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
     # `enforce` posture an unset window took the refusal below instead of a default.
     #
     # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset

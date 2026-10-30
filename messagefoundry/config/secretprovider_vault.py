@@ -29,6 +29,7 @@ is contained as a typed ``Any`` local here (never a repo-wide ignore).
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,7 @@ from messagefoundry.config.tls_policy import (
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
+from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -52,8 +54,12 @@ _EXTRA = "vault"
 _VAULT_KV_CONNECTOR = "Vault KV secret provider"
 
 # Vault connection config comes from the environment (never the config file): the address/token are
-# host-specific/secret. They fall back to hvac's own VAULT_ADDR/VAULT_TOKEN conventions when the MEFOR_*
-# overrides are unset, so a standard Vault-agent environment works unchanged.
+# host-specific/secret. The token may come from the secrets directory instead (ADR 0214).
+#
+# BACKLOG #2851: both are REQUIRED and always handed to hvac. Given None, hvac reads VAULT_ADDR,
+# VAULT_TOKEN and then ~/.vault-token, which in an operator's shell are the operator's own Vault and
+# token. So an unset or empty variable refuses, with the fixed text below, rather than fall back.
+# The twin of store/keyprovider_vault.py's.
 _ENV_ADDR = "MEFOR_SECRETS_VAULT_ADDR"
 _ENV_TOKEN = "MEFOR_SECRETS_VAULT_TOKEN"  # nosec B105 — the env-var NAME, not a token value
 #: KV v2 mount point the connector secrets live under (Vault's conventional default is ``secret``).
@@ -65,6 +71,35 @@ _ENV_KV_MOUNT = "MEFOR_SECRETS_VAULT_KV_MOUNT"
 #: (:func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` records why ``[tls]`` does
 #: not reach this hop yet.)
 _ENV_CA_FILE = "MEFOR_SECRETS_VAULT_CA_FILE"
+
+#: The refusals for an unset address or token: fixed text naming the variable, never a value. One
+#: text each, for the provider and ``check-privileges`` alike (BACKLOG #2851).
+_ADDR_UNSET = (
+    f"{_ENV_ADDR} is not set or is empty, so the connector-secret Vault is not known. The engine "
+    f"sends its token only to the address named there, never to VAULT_ADDR. Set it in the "
+    f"service's environment, and run check-privileges with that environment"
+)
+_TOKEN_UNSET = (
+    f"{_ENV_TOKEN} is not set or is empty, in the secrets directory or the environment, so the "
+    f"connector-secret token is not known. The engine reads only the token named there, never "
+    f"VAULT_TOKEN or ~/.vault-token. Supply it to the service in one of those two places, and "
+    f"run check-privileges with the service's environment"
+)
+#: The Windows twin, as in ``store/keyprovider_vault.py``: on Windows the token goes in the
+#: secrets directory only, never in the service's environment (owner ruling 2026-10-01).
+_TOKEN_UNSET_WINDOWS = (
+    f"{_ENV_TOKEN} is not set or is empty, so the connector-secret token is not known. On "
+    f"Windows, supply it only as the file named {_ENV_TOKEN} in the secrets directory "
+    f"MEFOR_SECRETS_DIRECTORY names, never in the service's environment. The engine never reads "
+    f"VAULT_TOKEN or ~/.vault-token in its place. Run check-privileges with "
+    f"MEFOR_SECRETS_DIRECTORY set as the service has it"
+)
+
+
+def _token_unset(platform: str | None = None) -> str:
+    """The unset-token refusal for ``platform``, this process's when ``None``. Fixed text."""
+    return _TOKEN_UNSET_WINDOWS if (platform or sys.platform) == "win32" else _TOKEN_UNSET
+
 
 #: Default field read from a KV secret when a reference omits ``#<field>``.
 _DEFAULT_FIELD = "value"
@@ -106,16 +141,17 @@ def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
 
 
 def _build_client(
-    addr: str | None,
-    token: str | None,
+    addr: str,
+    token: str,
     *,
     revocation_attested: bool,
     posture: HopPosture | None = None,
     revocation_reason: str | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake KV backend without a live
-    Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
-    environment conventions.
+    Vault. ``addr`` and ``token`` are REQUIRED and always passed to hvac (BACKLOG #2851): take them
+    from :func:`secrets_vault_address` and :func:`secrets_vault_token`. An empty one is refused here
+    too, with the same text, because hvac reads ``VAULT_ADDR`` for an empty address.
 
     ``revocation_attested`` is ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). It is
     REQUIRED, so no caller builds this client without saying whether the hop is attested. Pass the
@@ -124,6 +160,11 @@ def _build_client(
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
     enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
     reason, for the one line an attested crossing logs."""
+    # The backstop for a caller that did not read through those two functions.
+    if not addr:
+        raise SecretProviderError(_ADDR_UNSET)
+    if not token:
+        raise SecretProviderError(_token_unset())
     hvac = _import_hvac()
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
     # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
@@ -193,6 +234,20 @@ def _split_ref(ref: str) -> tuple[str, str]:
     return path, field
 
 
+def _token_setting() -> str | None:
+    """``MEFOR_SECRETS_VAULT_TOKEN`` through the one accessor: its file in the secrets directory,
+    else the environment (vault BACKLOG #2595). A directory that cannot be used raises
+    :class:`SecretProviderError`, so the subsystem fails closed as it does for any other bad Vault
+    setting."""
+    # The refusal is raised outside the handler and carries only the message, so nothing the
+    # directory read held rides along on its chain (BACKLOG #2307 states the rule).
+    try:
+        return secret_setting(_ENV_TOKEN)
+    except SecretsDirectoryError as exc:
+        refusal = str(exc)
+    raise SecretProviderError(refusal)
+
+
 class VaultSecretProvider:
     """``vault`` — read a connector credential from Vault KV v2 (ADR 0019 §5)."""
 
@@ -206,8 +261,10 @@ class VaultSecretProvider:
     def resolve(self, ref: str) -> str:
         path, field = _split_ref(ref)
         mount = _kv_mount()
-        addr = os.environ.get(_ENV_ADDR)
-        token = os.environ.get(_ENV_TOKEN)
+        # BACKLOG #2851: an unset address or token refuses here, rather than let hvac fall back.
+        # Read on every resolve, so a token file replaced in the secrets directory is what the
+        # next read uses.
+        addr, token = secrets_vault_hop()
         # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
         # ValueError, and the `except Exception` below would relabel it "could not read secret ...
         # from Vault KV" — turning a configuration refusal into what reads as a connectivity failure,
@@ -261,36 +318,54 @@ def build_provider(
 
 
 def secrets_vault_token() -> str:
-    """The connector-secret token named in ``MEFOR_SECRETS_VAULT_TOKEN``, for ``check-privileges``.
+    """The connector-secret token named in ``MEFOR_SECRETS_VAULT_TOKEN``: its file in the secrets
+    directory, else the environment, for ``check-privileges``. The provider reads it with the
+    address, through :func:`secrets_vault_hop`, with the same refusal.
 
-    **It refuses when that variable is unset, where the provider does not.** Given no token, hvac
-    reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
-    own token, and the check would judge it, or read a secret with it, as the engine's. Raises
-    :class:`SecretProviderError`, which the probe reports as not observed."""
-    token = os.environ.get(_ENV_TOKEN)
+    **It refuses when that setting is unset or empty** (BACKLOG #2851). Given no token, hvac reads
+    ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's own
+    token, which the engine would read secrets with, and the check would judge, as the engine's.
+    Raises :class:`SecretProviderError`, which the probe reports as not observed."""
+    token = _token_setting()
     if not token:
-        raise SecretProviderError(
-            f"{_ENV_TOKEN} is not set, so the connector-secret token is not known. The check reads "
-            f"only the token named there, never VAULT_TOKEN or ~/.vault-token; run it with the "
-            f"service's environment"
-        )
+        raise SecretProviderError(_token_unset())
     return token
+
+
+def secrets_vault_hop() -> tuple[str, str]:
+    """The connector-secret Vault's address and token, for :meth:`VaultSecretProvider.resolve`.
+    Each is read as :func:`secrets_vault_address` and :func:`secrets_vault_token` read it, but both
+    are read before either refuses, so one refusal names every unset variable, or the secrets
+    directory's own refusal beside an unset address (BACKLOG #2851)."""
+    refusals: list[str] = []
+    addr: str | None = None
+    token: str | None = None
+    try:
+        addr = secrets_vault_address()
+    except SecretProviderError as exc:
+        refusals.append(str(exc))
+    try:
+        token = secrets_vault_token()
+    except SecretProviderError as exc:
+        refusals.append(str(exc))
+    # Raised outside the handlers, so nothing a read held rides along on the chain (BACKLOG #2307).
+    # Either is None exactly when its read refused.
+    if addr is None or token is None:
+        raise SecretProviderError(". ".join(refusals))
+    return addr, token
 
 
 def secrets_vault_address() -> str:
     """The connector-secret Vault named in ``MEFOR_SECRETS_VAULT_ADDR``, for ``check-privileges``.
+    The provider reads it with the token, through :func:`secrets_vault_hop`, with the same refusal.
 
-    **It refuses when that variable is unset, where the provider does not.** Given no address, hvac
-    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then receive
-    the engine's token. Raises :class:`SecretProviderError`, which the probe reports as not
-    observed. The provider keeps its documented fallback (docs/CONFIGURATION.md)."""
+    **It refuses when that variable is unset or empty** (BACKLOG #2851). Given no address, hvac
+    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then
+    receive the engine's token. Raises :class:`SecretProviderError`, which the probe reports as not
+    observed."""
     addr = os.environ.get(_ENV_ADDR)
     if not addr:
-        raise SecretProviderError(
-            f"{_ENV_ADDR} is not set, so the connector-secret Vault is not known. The check sends "
-            f"the token only to the address named there, never VAULT_ADDR; run it with the "
-            f"service's environment"
-        )
+        raise SecretProviderError(_ADDR_UNSET)
     return addr
 
 

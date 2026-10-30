@@ -573,6 +573,10 @@ markers = [
     # so `-m tooling` and `-m 'not tooling'` partition the suite from ONE reviewed list. ci.yml runs
     # the engine legs with `not tooling` and this tier as its own path-gated job.
     "tooling: repo-harness tests (worktree gate, coordination, ledger, CI workflows) -- subject is the development harness, not the engine.",
+    # Applied by tests/conftest.py from tests/timing_quarantine.txt, the same way (BACKLOG #4773; the
+    # ruling is quoted in that file). The engine legs deselect it; ci.yml's `timing-quarantine` job,
+    # which gates no merge, runs it.
+    "timing_quarantine: timing-dependent tests held off the engine legs until their row fixes the timing dependence (#4773).",
 ]
 
 [tool.ruff]

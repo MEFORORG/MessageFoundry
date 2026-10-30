@@ -103,7 +103,15 @@ async def _sso_service(
 ) -> AuthService:
     """Windows SSO and federated sign-in both on. ``bind`` binds ``jdoe`` before any sign-in."""
     ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "asmith": _principal("asmith"), "ghost": None})
-    return await _service(store, rsa_key, ldap=ldap, bind=bind, kerberos_enabled=True, **over)
+    return await _service(
+        store,
+        rsa_key,
+        ldap=ldap,
+        bind=bind,
+        kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
+        **over,
+    )
 
 
 async def _windows_sso(service: AuthService, monkeypatch: pytest.MonkeyPatch, name: str) -> str:
@@ -220,7 +228,9 @@ async def test_the_refusal_reaches_a_renamed_bound_row_before_anything_is_writte
     try:
         renamed = _principal("jdoe2", object_id=PRINCIPAL.directory_object_id)
         ldap = _FakeLdap(by_username={"jdoe2": renamed})
-        service = await _service(store, rsa_key, ldap=ldap, kerberos_enabled=True)
+        service = await _service(
+            store, rsa_key, ldap=ldap, kerberos_enabled=True, kerberos_realm="EXAMPLE.COM"
+        )
         _as(monkeypatch, "jdoe2")
 
         refused = await service.authenticate_kerberos(b"spnego-token")

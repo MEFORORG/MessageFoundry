@@ -16,6 +16,7 @@ import math
 import pickle
 import struct
 from collections.abc import Iterator
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -25,6 +26,7 @@ from messagefoundry.config.code_sets import CodeSet, UnmappedKind, UnmappedPolic
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     Send,
@@ -952,7 +954,7 @@ def _code_sets(
 def _boot_round_trip(code_sets: object) -> Any:
     return decode_boot(
         encode_boot(
-            config_dir="cfg",
+            snapshot=ConfigSnapshot(directory=Path("cfg"), files={}),
             forbidden=("socket",),
             mem_mb=512,
             code_sets=code_sets,

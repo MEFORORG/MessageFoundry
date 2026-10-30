@@ -877,7 +877,7 @@ class _RecordingLedger:
     ) -> bool:
         return True
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         self.metas_at_release.append(len(list(self.root.glob("*.meta"))))
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
@@ -1011,7 +1011,9 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
     """BACKLOG #2262 under the cancellation production delivers. The request deadline reaches the
     route through anyio task groups (``BaseHTTPMiddleware``), which cancel again at every await. A
     plain ``to_thread`` cleanup cancelled before a worker picked it up never ran; measured in review
-    at 25 runs of 200. The cleanup now waits through repeat cancellations, as the write does."""
+    at 25 runs of 200. The cleanup is now a job nothing cancels. Since vault BACKLOG #3740 item 4
+    the save stops waiting for it at the repeat cancellation rather than spin, so the removal can
+    end just after the save does, and this waits for it."""
     import functools
 
     import anyio
@@ -1029,6 +1031,7 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
+    await _removals_settled(store)
     assert list((tmp_path / "uploads").iterdir()) == []
 
 
@@ -1042,10 +1045,12 @@ async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file
     releasing, finish = asyncio.Event(), asyncio.Event()
 
     class _SlowReleaseLedger(_RecordingLedger):
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             releasing.set()
             await finish.wait()
-            await super().release_upload_quota(reservation_id)
+            await super().release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     ledger = _SlowReleaseLedger(root)
     store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
@@ -1107,10 +1112,12 @@ class _GatedLedger:
             await self._pause()
         return applied
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         if self.hold == "release":
             await self._pause()
-        await self.store.release_upload_quota(reservation_id)
+        await self.store.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=reservation_id
+        )
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         await self.store.touch_upload_quota(reservation_id)
@@ -1167,6 +1174,7 @@ async def test_an_anyio_scope_cancel_at_either_ledger_call_pays_the_slot_back(
             tg.cancel_scope.cancel()
         finally:
             ledger.gate.set()
+    await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert not root.exists() or list(root.iterdir()) == []
 
@@ -1196,6 +1204,7 @@ async def test_a_deadline_mid_write_still_pays_the_reservation_back(
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
+    await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert list(root.iterdir()) == []
 
@@ -1245,6 +1254,17 @@ async def _drain_stragglers(store: UploadStore) -> None:
             return
         await asyncio.wait(set(store._stragglers), timeout=10)
     raise AssertionError("ledger calls were still running")
+
+
+async def _removals_settled(store: UploadStore) -> None:
+    """Wait for a cancelled save's removal. Under an anyio scope the save stops waiting for it at
+    the repeat cancellation (vault BACKLOG #3740 item 4), so it can end just after the save does.
+    An entry also leaves the map at its bound, still running; the bound here is the module's 5 s,
+    far past a healthy unlink."""
+    if pending := set(store._pending_removals):
+        await asyncio.wait(pending, timeout=10)
+    await asyncio.sleep(0)  # the removal's done callback runs one loop pass after it ends
+    assert not store._pending_removals, "a cancelled save's removal was still being waited for"
 
 
 async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(

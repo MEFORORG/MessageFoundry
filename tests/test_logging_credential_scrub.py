@@ -582,9 +582,9 @@ _REGISTRY_SENTINEL = "wt-Sekr3t_Val-71"
 #: NOT scrub, each with the reason it is out.
 #:
 #: ALL SIX ARE THE USERNAME CLASS, and the class is out on grounds the engine already recorded at the
-#: layer that owns it, not on taste here. ``messagefoundry/redaction.py`` states its own residual
-#: outright -- the residual is an adversarially-crafted SINGLE-TOKEN identifier -- and a username is a
-#: single-token identifier. ``docs/PHI.md`` says the same from the other end: the forwarded log stream
+#: layer that owns it, not on taste here. ``messagefoundry/redaction.py`` states its own residuals
+#: outright -- its module docstring lists a SINGLE-TOKEN identifier first among them -- and a username
+#: is a single-token identifier. ``docs/PHI.md`` says the same from the other end: the forwarded log stream
 #: still carries usernames, and that is its stated reason for gating the off-box hop. Scrubbing
 #: usernames here would contradict a documented position two layers deep, and it would reach the wrong
 #: shape anyway: a username leaks as ``Login failed for user 'svc'``, as ``UID=svc;``, as ``CN=svc,OU=``

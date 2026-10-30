@@ -28,6 +28,10 @@ transform = "cheap"
 reload_probe = true
 store_backend = "postgres"
 corpus_count_per_trigger = 20
+# The engine's default claim mode is `pooled` (ADR 0066), so the operator sweep measures it, and pins
+# it so the claim mode is never a second variable between arms of one run (BACKLOG #3132). The
+# harness default stays `per_lane` because connscale-smoke's per_lane-only checks rely on it.
+claim_modes = ["pooled"]
 
 [connscale.slo]
 # Correctness gate only: no message loss at any N, and the backlog drains. The wall metrics are

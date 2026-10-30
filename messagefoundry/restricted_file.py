@@ -133,6 +133,11 @@ _REACH_MASK = (
     | 0x80000000  # GENERIC_READ
 )
 
+#: The same, for a DIRECTORY that holds key or secret files: also FILE_DELETE_CHILD, which lets its
+#: holder delete any file in the directory whatever that file's own access list says. Deleting a
+#: secret file can send its setting back to a less protected source (vault BACKLOG #2595).
+_DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
+
 #: Groups and logon classes that many accounts hold, beyond the ones the trust-anchor check already
 #: names (``auth.trust_anchors._is_broad_sid``: Everyone, Authenticated Users, Users, Guests, the
 #: INTERACTIVE, NETWORK, BATCH and SERVICE logon classes, Domain Users and Domain Guests). **At
@@ -178,7 +183,7 @@ def _is_broad_group(sid: str) -> bool:
     return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
 
 
-def _windows_access_problem(security: _WinPathSecurity) -> str | None:
+def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
     """Why a broad group can read or change the file this access list belongs to, or ``None``.
 
     A list that could not be read is a problem too, and so is an entry of a kind this check cannot
@@ -191,14 +196,14 @@ def _windows_access_problem(security: _WinPathSecurity) -> str | None:
         return "it has no access list at all, so every account on the host can read or change it"
     if security.aces is None:
         return "its access list could not be read in full"
-    for ace_type, mask, sid in security.aces:
+    for ace_type, ace_mask, sid in security.aces:
         if ace_type not in _GRANTING_ACE_TYPES:
             continue  # a deny or audit entry grants nothing
         if ace_type != ACCESS_ALLOWED_ACE_TYPE:
             # A conditional or object allow entry. The reader records neither its rights nor its
             # account, so who it lets in is unknown.
             return "its access list holds a conditional entry this check cannot interpret"
-        if mask & _REACH_MASK and _is_broad_group(sid):
+        if ace_mask & mask and _is_broad_group(sid):
             return f"{describe_sid(sid)} can read or change it"
     return None
 
@@ -213,8 +218,12 @@ def _posix_access_problem(mode: int) -> str | None:
     return None
 
 
-def broad_access_problem(path: Path) -> str | None:
+def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
+
+    With ``directory``, ``path`` is a directory that holds such files, and on Windows a broad
+    group's right to delete a file inside it (FILE_DELETE_CHILD) is a problem too. On POSIX the
+    group and other write bits, which the check already refuses, are that right.
 
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
     over. The groups are at least Everyone, Authenticated Users and the local Users group; the
@@ -234,7 +243,10 @@ def broad_access_problem(path: Path) -> str | None:
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        return _windows_access_problem(_win32_config_source_probes().read_path(path))
+        return _windows_access_problem(
+            _win32_config_source_probes().read_path(path),
+            _DIRECTORY_REACH_MASK if directory else _REACH_MASK,
+        )
     return _posix_access_problem(status.st_mode)
 
 

@@ -86,7 +86,11 @@ from messagefoundry.transports.base import (
     float_setting,
     register_destination,
 )
-from messagefoundry.transports.email import checked_envelope, refuse_unverified_smtp_credential
+from messagefoundry.transports.email import (
+    checked_envelope,
+    partial_refusal_under,
+    refuse_unverified_smtp_credential,
+)
 
 __all__ = ["DirectDestination"]
 
@@ -424,10 +428,12 @@ class DirectDestination(DestinationConnector):
             # as "this connector has no escape" would be a FALSE ABSENCE claim.
             # MEFOR_ALLOW_INSECURE_TLS still governs this hop: weakened_tls_escape_permitted_here() is
             # that same env var plus the production-PHI clamp. Any absence claim about the raw call is
-            # scoped to THIS FILE and never repo-wide — `insecure_tls_allowed()` remains live at call
-            # sites in auth/ldap.py, pipeline/alert_sinks.py, transports/{ai_broker,database,mllp}.py
-            # and config/settings.py (docs/DEPLOYMENT.md enumerates the ones the clamp does not yet
-            # cover — see #329). Verified by grep at the time of writing, not assumed.
+            # scoped to THIS FILE and never repo-wide. `insecure_tls_allowed()` is still called in
+            # config/settings.py, by `hop_insecure_escape_downgrades`, the clamp every other cell
+            # reads it through. CORRECTED 2026-10-27 (vault BACKLOG #3533 item 11): this named live
+            # calls in auth/ldap.py, pipeline/alert_sinks.py and transports/{ai_broker,database,mllp}.py
+            # too. A grep of messagefoundry/ for the bare call found none of them that day; the LDAPS
+            # one went with engine PR 2310, which left that hop no escape at all.
             if not weakened_tls_escape_permitted_here():
                 raise ValueError(
                     "Direct destination use_tls=false submits over cleartext SMTP; refused unless "
@@ -795,6 +801,7 @@ class DirectDestination(DestinationConnector):
                 code="smime-build",
                 permanent=True,
             )
+        partial: NegativeAckError | None = None
         try:
             with self._connect() as smtp:
                 if self.username is not None:
@@ -809,7 +816,9 @@ class DirectDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="DIRECT outbound",
                     )
-                self._envelope.send(smtp, msg)
+                # A partial RCPT refusal raises NegativeAckError, which no arm below catches, so it
+                # reaches the delivery worker as the permanent refusal it is (vault BACKLOG #2924).
+                self._envelope.send(smtp, msg, cell=f"Direct {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --
@@ -823,13 +832,19 @@ class DirectDestination(DestinationConnector):
             # operator needs and it contains no message content.
             raise DeliveryError(f"Direct {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
-            raise DeliveryError(
-                f"Direct {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
-            ) from exc
+            # A QUIT refused after a partial refusal must not turn it into a retry. The refusal is
+            # raised below, outside this handler, so its own chain stays empty.
+            partial = partial_refusal_under(exc)
+            if partial is None:
+                raise DeliveryError(
+                    f"Direct {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
+                ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(
                 f"Direct {self.host}:{self.port} unreachable: {type(exc).__name__}"
             ) from exc
+        if partial is not None:
+            raise partial
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)

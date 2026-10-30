@@ -112,21 +112,25 @@ from messagefoundry.transports.rest import (
     auth_challenge_refused,
     capture_response_headers,
     cleartext_acceptance_from_settings,
+    dynamic_header_rule,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_held_dynamic_headers,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
     revocation_attestation_from_settings,
+    url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -807,7 +811,7 @@ class FhirDestination(DestinationConnector):
                 "FHIR destination requires a 'url' setting (the FHIR service base URL)"
             )
         _reject_config_control_chars(url, "url")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "FHIR destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
@@ -944,9 +948,12 @@ class FhirDestination(DestinationConnector):
             scheme,
             self._headers,
             self.base_url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(
+                ConnectorType.FHIR,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
@@ -986,9 +993,7 @@ class FhirDestination(DestinationConnector):
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
                 self.base_url,
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                credentials=(),
                 connection=config.name,
             )
 
@@ -1029,6 +1034,10 @@ class FhirDestination(DestinationConnector):
                 _redact_url(self.base_url),
             )
             self._opener = _insecure_opener(*proxy_handlers)
+        # Vault BACKLOG #3533 item 6: a Handler's per-message headers meet the rule this hop's
+        # static headers meet, at send.
+        self._connection_name = config.name
+        self._header_rule = dynamic_header_rule(scheme, self.base_url, verify_tls=verify)
         # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
         # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
         from messagefoundry.transports.http_auth import digest_handler_from_settings
@@ -1181,11 +1190,25 @@ class FhirDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | ReplyBodyDropped | None:
+        # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the connection's
+        # fault and stops the lane with the row kept. Judged after any per-message refusal below,
+        # it would dead-letter the row instead (Lander finding 6 on engine PR 2576).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_delivery_url(self.base_url, connector="FHIR")
         request = self._resolve_request(payload)
         # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
         # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
         # which are semantically required and must win. Pure; None → {} → byte-identical.
-        extra_headers = {**outbound_headers_from_metadata(metadata), **request.headers}
+        dynamic_headers = outbound_headers_from_metadata(metadata)
+        if self._header_rule is not None:
+            # Only the Handler's headers: request.headers are the connector's own interaction headers.
+            refuse_held_dynamic_headers(
+                dynamic_headers,
+                rule=self._header_rule,
+                connector="FHIR destination",
+                connection=self._connection_name,
+            )
+        extra_headers = {**dynamic_headers, **request.headers}
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this). The
         # transaction wrap and its reply parse ride the same thread: both scale with the body.
         body, status, headers, entry_outcome = await asyncio.to_thread(
@@ -1679,7 +1702,7 @@ class FhirLookupExecutor:
             # #1241: the SECOND url construction site in this module. The destination screens its
             # own; screening one and not its sibling reproduces the asymmetry the item reports.
             _reject_config_control_chars(url, "url", f"lookup {cname!r}")
-            scheme = urllib.parse.urlsplit(url).scheme.lower()
+            scheme = url_scheme(url, f"FhirLookup {cname!r} 'url'")
             if scheme not in ("http", "https"):
                 raise ValueError(
                     f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
@@ -1730,9 +1753,13 @@ class FhirLookupExecutor:
                 scheme,
                 check_headers,
                 url,
-                attested=attested,
-                cleartext_accepted=lk_accepted,
-                cleartext_reason=lk_reason,
+                credentials=http_credentials_sent(
+                    ConnectorType.FHIR,
+                    s,
+                    lookup=True,
+                    cleartext=True,
+                    proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, url),
+                ),
                 connection=label,
             )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a

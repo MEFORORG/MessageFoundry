@@ -30,6 +30,7 @@ from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._ast_sites import call_sites, callee_name, parse_source
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._vault_hop_env import STORE, supply_vault_hop
 
 #: ``strict_requests`` imports ``requests`` and ``urllib3`` at module scope.
 _needs_the_vault_extra = pytest.mark.skipif(
@@ -140,15 +141,16 @@ def _is_fixed_text(call: ast.Call, constants: frozenset[str]) -> bool:
 
 
 def test_every_marked_refusal_is_built_from_fixed_text() -> None:
-    """The marker means the text names no address, proxy URL, token or reply. This holds each
-    site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
+    """The marker means the text names nothing the ``VaultHopRefused`` docstring says it never
+    names. This holds each site to a shape built only from the connector label, literals, module
+    constants and the listed helpers. It does not read a listed helper's own text."""
     tree = parse_source(_HOME.read_text(encoding="utf-8"))
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)
-    # 14 marked refusals when this floor was last set (BACKLOG #3458). A scan that sees few of
-    # them, or none, leaves the rest unchecked. Lower the floor only if refusals were really merged
-    # or removed, and raise it when one is added.
-    assert len(sites) >= 14, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
+    # 18 marked refusals when this floor was last set (vault BACKLOG #3454). A scan that sees few
+    # of them, or none, leaves the rest unchecked. Lower the floor only if refusals were really
+    # merged or removed, and raise it when one is added.
+    assert len(sites) >= 18, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
     loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
     # The constants the sites use today are found, so the lookup is not passing on an empty set.
@@ -229,21 +231,27 @@ def test_a_proxy_url_the_stdlib_parser_rejects_is_refused_with_fixed_text() -> N
     build as a bare ``ValueError``, which a command such as ``rotate-key`` prints.
 
     The proxy below reads as ``https://`` to ``urllib3``, so the credential check passes it. Its
-    user name holds U+2100, which NFKC normalization turns into text with a ``/``."""
+    user name holds U+2100, which NFKC normalization turns into text with a ``/``.
+
+    Since vault BACKLOG #3454 the build refuses that URL before this check, with fixed text of its
+    own, because requests could not send it either. The scheme reader is still pinned below."""
     import urllib.parse
 
     import requests
 
     from messagefoundry.transports.strict_requests import (
+        _UNSENDABLE_PROXY_URL,
         VaultHopRefused,
+        _proxy_scheme,
         _refuse_an_insecure_vault_hop,
-        _unverifiable_proxy_leg,
     )
 
     proxy = "https://us℀er:synthetic-pw@proxy.synthetic.test:3128"
     # The premise: the standard parser does reject this URL, and its error does quote the password.
     with pytest.raises(ValueError, match="synthetic-pw"):
         urllib.parse.urlsplit(proxy)
+    # The #3247 half: the scheme reader reads it with urllib3, without raising.
+    assert _proxy_scheme(proxy) == "https"
 
     session = requests.Session()
     session.trust_env = False  # only the proxy passed below applies
@@ -255,8 +263,9 @@ def test_a_proxy_url_the_stdlib_parser_rejects_is_refused_with_fixed_text() -> N
             request_proxies={"http": proxy},
         )
     assert type(caught.value) is VaultHopRefused
-    # The whole text is the helper's fixed one, so no part of the proxy URL can be in it.
-    assert str(caught.value) == _unverifiable_proxy_leg("Vault test hop")
+    # The whole text is fixed, so no part of the proxy URL can be in it.
+    assert str(caught.value) == f"Vault test hop: {_UNSENDABLE_PROXY_URL}"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     for fragment in ("synthetic-pw", "proxy.synthetic.test", "3128"):
         assert fragment not in str(caught.value)
 
@@ -279,6 +288,7 @@ class _Client:
 def _active_key_failure(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> str:
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    supply_vault_hop(monkeypatch, STORE)  # required since BACKLOG #2851
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token, **_: _Client(exc))
     with pytest.raises(KeyProviderError) as caught:
         keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()

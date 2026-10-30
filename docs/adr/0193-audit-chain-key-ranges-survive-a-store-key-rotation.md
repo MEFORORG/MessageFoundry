@@ -4,7 +4,10 @@
   ruling: see *Amendment 2026-10-01* at the end. Decision items 2 and 8, the field names in item
   3's closing record, and the first sentence of *Negative / risks* are superseded there. The text
   below is kept as it was decided. **Amended 2026-10-20** (BACKLOG #3420): see *Amendment
-  2026-10-20*, which adds a scheme to each range record and supersedes nothing.
+  2026-10-20*, which adds a scheme to each range record and supersedes nothing. **Amended
+  2026-10-27** (BACKLOG #2720): see *Amendment 2026-10-27*, which records what a Transit key
+  rotation does to the chain. It supersedes only the clause, stated twice, that put Transit's key
+  versioning outside this ADR; that the engine sees one Transit range still stands.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -409,3 +412,83 @@ The AC-13 to AC-15 cases run on all three backends, as the 2026-10-01 cases do.
   either would still strand the range rows written before it.
 - **It does not name the scheme in the anchor.** An anchor stays `COUNT:HEAD`. Its hex width follows
   the in-heap scheme, and a Transit head stays opaque.
+
+---
+
+## Amendment 2026-10-27 -- a Transit key rotation keeps the chain
+
+- **Status:** Accepted -- records behaviour already built by engine PR 2167 (merged 2026-10-08,
+  BACKLOG #2337). This amendment changes no code (BACKLOG #2720).
+- **Supersedes:** one clause, stated twice: *"Transit's own key versioning is outside this ADR"*,
+  at the end of *Negative / risks*, and its restatement in the 2026-10-01 amendment's *What this
+  amendment does not do*. Under `vault_transit` the engine still sees one range, `vault-transit`; what is no longer
+  outside this ADR is what a Transit key rotation does to that range.
+
+### Why
+
+Under `cipher_provider = "vault_transit"` each row MAC is Transit's `generate_hmac`, and the string
+Transit returns names the key version that made it: `vault:v<N>:...`. Before PR 2167 the check of a
+stored row called `generate_hmac` again with no version, so Transit used its latest. After a
+rotation every older row's recompute named the new version, differed from the stored string, and
+`audit-verify` reported the chain broken at row 1 with nothing tampered. Zero deployments (CLAUDE.md
+section 0): this is what the first deployment's first routine rotation would have done.
+
+### What PR 2167 built
+
+1. **An append names its version.** It calls `generate_hmac` unpinned, so Transit uses its latest
+   version, and the string it stores carries that version.
+2. **A check recomputes pinned to the stored version.** `_version_pinned_mac` in `store/store.py`
+   reads `<N>` from the stored string and calls `TransitCipher.audit_hmac(data, key_version=N)`.
+   The chain walk (`_audit_row_mac`), the genesis-row check at open, and the one-row MAC check
+   behind the Transit attestation all go through it. The recompute is compared with the stored
+   string in constant time (`hmac.compare_digest`).
+3. **A refused version is a break at that row; an outage is not.** A pinned call that Transit
+   answers with HTTP 400 for that version alone raises `AuditKeyVersionRefusedError`
+   (`TransitCipher._refuses_only_version`). The walk records a break at that row, naming the
+   version, and goes on. Any other failure, an unreachable Vault among them, is a `CipherError`:
+   the walk could not run, and no tamper alert fires.
+
+### Why regenerating pinned stands in for Transit's verify call
+
+#2720 asked for Transit's verify call on the stored string in place of regenerate-and-compare. The
+pinned recompute gives the two properties that call would:
+
+- **No break on rotation.** Each row is recomputed under the version that sealed it, so a rotation
+  changes only what new rows name.
+- **Forgery resistance.** The recompute runs inside Transit under that version's key, which never
+  enters the engine's heap. A writer with database access and no Transit access cannot produce a
+  string that matches altered content. Planting a version Transit does not hold is refused, and so
+  reads as a break.
+
+The engine does the comparison instead of Transit, and does it in constant time.
+
+### The edge: a version Transit will no longer compute with
+
+A row whose version Transit refuses reads as a chain break, by design: the walk fails closed rather
+than pass a row it cannot check. A planted version is one case. The other is a real older version
+Transit will no longer compute an HMAC with. PR 2167's review recorded that raising the Transit
+key's `min_encryption_version` does this, so every row sealed under a lower version would then read
+as a break, and so would the attestation, with no re-attest hint. That limit is specific to
+regenerating. Vault's Transit API documentation, read on 2026-10-27, says a pinned HMAC generate
+needs a version at or above the key's `min_encryption_version`, and that `min_decryption_version`
+is the floor for verifying an HMAC. No Vault or OpenBao server was run to confirm it. PR 2167
+named Transit's verify call as the fix for this limit; it is not built. Until it is, do not raise
+the audit key's `min_encryption_version` above the oldest version a stored row names: every older
+row would then read as a break in `audit-verify`, and in the startup walk where it is on.
+
+`_refuses_only_version` infers a refused version from Transit's reply; it does not read the key's
+version range. So a node whose copy of the key lags a rotation can refuse a real, newer version, and
+that row reads as a break too.
+
+### Evidence
+
+All against an in-process fake Transit client with key versions, never a real server, in
+`tests/test_transit_bound_attestation.py`:
+
+- `test_rotating_the_transit_key_keeps_the_attestation` -- the chain and the attestation verify
+  after the fake key moves from version 1 to version 2, and the recompute was pinned to version 1.
+- `test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk` and
+  `test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_as_a_break` -- a planted
+  version is a break at its row.
+- `test_a_transit_outage_on_the_startup_walk_still_could_not_run` and
+  `test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version` -- an outage is not a break.

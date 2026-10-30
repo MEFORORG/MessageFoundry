@@ -30,7 +30,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry import pki
-from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE
+from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, PRIVATE_KEY_SCOPE
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.transports import database
 from messagefoundry.transports.database import _build_odbc_dsn
@@ -154,6 +154,37 @@ def test_a_plain_sslca_file_still_builds(tmp_path: Path) -> None:
     """The control: the same certificate without the headers goes to the driver unchanged."""
     ca = _write(tmp_path, _certificate())
     assert f"SSLCA={{{ca}}}" in _build(SSLCA=ca)
+
+
+#: BACKLOG #3745: a key block with no encryption header, PKCS#8 encrypted and plain.
+_KEY_SHAPES = [
+    pytest.param("ENCRYPTED PRIVATE" + " KEY", id="PKCS#8 encrypted"),
+    pytest.param("PRIVATE" + " KEY", id="plain"),
+]
+
+
+def _with_key(label: str) -> str:
+    return _certificate() + f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n"
+
+
+@pytest.mark.parametrize("label", _KEY_SHAPES)
+def test_a_sqlserver_pin_with_a_private_key_is_refused_at_load(tmp_path: Path, label: str) -> None:
+    """Red with the private-key check removed from ``load_pinned_server_certificate``:
+    ``cryptography`` parses the one certificate and skips the key block."""
+    pin = _write(tmp_path, _with_key(label))
+    with pytest.raises(ValidationError, match=r"\[store\]\.ssl_root_cert") as refused:
+        _sqlserver(pin)
+    assert PRIVATE_KEY_SCOPE in str(refused.value)
+    assert "AAAA" not in str(refused.value)
+
+
+@pytest.mark.parametrize("label", _KEY_SHAPES)
+def test_an_sslca_file_with_a_private_key_is_refused(tmp_path: Path, label: str) -> None:
+    """Red with the private-key check removed from ``_refuse_encrypted_driver_ca``."""
+    ca = _write(tmp_path, _with_key(label))
+    with pytest.raises(ValueError, match=re.escape(f"the CA file {PRIVATE_KEY_SCOPE}")) as refused:
+        _build(sslca=ca)
+    assert _CONNECTION in str(refused.value) and "AAAA" not in str(refused.value)
 
 
 def test_a_missing_sslca_file_is_left_to_the_driver(tmp_path: Path) -> None:

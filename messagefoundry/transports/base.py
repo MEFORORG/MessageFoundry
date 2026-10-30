@@ -24,15 +24,18 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import errno
 import math
 import numbers
 import operator
+import os
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Protocol
+from pathlib import Path
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -57,6 +60,14 @@ __all__ = [
     "ReplyOutcome",
     "SyncReplyResolver",
     "ProcessedFileLedger",
+    "ProcessedArchive",
+    "ArchiveGuard",
+    "archive_dir_key",
+    "build_archive_guard",
+    "guarded_destination_dirs",
+    "guard_dir_settings",
+    "guarded_setting_keys",
+    "guarded_source_dirs",
     "FILE_KEY_SCHEME",
     "FILE_KEY_SCHEMES",
     "FileKeyError",
@@ -624,6 +635,187 @@ class InboundReply:
 #: CI-enforced freedom from ``store/`` and ``pipeline/`` imports (AC-17) while still returning bytes
 #: that came out of the store.
 SyncReplyResolver = Callable[[str], Awaitable[InboundReply]]
+
+
+@runtime_checkable
+class ProcessedArchive(Protocol):
+    """A running inbound that archives what it read into a directory the retention pass may age out:
+    the local File source's ``.processed`` (owner ruling A2 of 2026-10-08, BACKLOG #1188).
+
+    The retention runner reads these from the live graph each pass and never imports a transport. It
+    hands every archive, as ``protected``, an :class:`ArchiveGuard` over each watch and ``.error``
+    directory any inbound in the deployment names (:func:`guarded_source_dirs`) and each outbound
+    target directory (:func:`guarded_destination_dirs`), bound or not, so one whose archive directory
+    is, or holds, any of those deletes nothing: a misconfigured ``processed_subdir`` must never let an
+    age sweep reach undelivered drops, files awaiting a partner's pickup, or the ``.error`` copies,
+    whose deletion nobody has ruled on (#3335). ``archiving`` says whether this source writes the
+    archive at all; one that does not is protected but never swept."""
+
+    directory: Path
+    processed_dir: Path
+    error_dir: Path
+
+    @property
+    def archiving(self) -> bool: ...
+
+    async def prune_processed_archive(
+        self,
+        older_than: float,
+        *,
+        protected: ArchiveGuard,
+        deadline_hit: Callable[[], bool],
+    ) -> int | None:
+        """Delete archived files whose archive time is before ``older_than`` (epoch seconds), and
+        return how many went, or None when this archive refused or could not open its directory,
+        which leaves a directory it shares to a sibling. A file it cannot remove is skipped and
+        tried again next pass. Only an ``OSError`` may escape, and the caller contains it."""
+        ...
+
+
+@dataclass(frozen=True)
+class ArchiveGuard:
+    """What an archive sweep must not reach (BACKLOG #1188).
+
+    ``keys`` holds each guarded directory's :func:`archive_dir_key`, for the check before the archive
+    directory is opened. ``ids`` holds the ``(st_dev, st_ino)`` of each guarded directory and of every
+    readable directory above one, for the check once it is open: an archive directory that is, or
+    holds, a guarded one under another name (a UNC path and the local path of one share, a bind
+    mount, a DFS link, a lexical ``x/..``) is recognised by what was actually opened.
+
+    ``unresolved`` holds each guarded directory that exists, or may, but whose identity could not be
+    read, an unreachable share or a refused ``stat`` say. Without that identity an alias of it would
+    pass the check once the archive is open, so each archive reads them again under its own
+    identity (an alternate credential may reach a share the engine's own account cannot), and an
+    archive that still cannot read one deletes nothing: the guard fails closed, as the sweep does
+    for an opened archive directory whose identity it cannot read."""
+
+    keys: frozenset[str] = frozenset()
+    ids: frozenset[tuple[int, int]] = frozenset()
+    unresolved: frozenset[Path] = frozenset()
+    #: The :func:`archive_dir_key` of each engine-owned tree (the backup destination, the log
+    #: directory, say): an archive directory INSIDE one is refused too, not only one that is or holds
+    #: it. Compared by resolved path only.
+    trees: frozenset[str] = frozenset()
+
+
+def archive_dir_key(path: Path) -> str:
+    """The form in which an archive sweep compares directories (BACKLOG #1188): links resolved, and
+    case folded on EVERY platform. A case-sensitive volume holding two directories that differ only in
+    case then reads them as one, which can only make the sweep refuse more, never reach further.
+    Blocking (``realpath``), and it can raise ``OSError`` on an unreachable share."""
+    return os.path.normcase(os.path.realpath(path)).casefold()
+
+
+#: What an absent directory raises: one not created yet (a ``.error`` before the first quarantine, an
+#: outbound directory before the first write) has nothing an archive could alias. Windows is read by
+#: its own codes, an allowlist, because it maps an unreachable network path (``ERROR_BAD_NETPATH``,
+#: ``ERROR_BAD_NET_NAME``) to ``ENOENT`` too, and those must fail closed.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
+_ABSENT_WINERRORS = frozenset({2, 3})  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+
+
+def _is_absent(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _ABSENT_WINERRORS
+    return exc.errno in _ABSENT_ERRNOS
+
+
+def build_archive_guard(dirs: Iterable[Path]) -> ArchiveGuard:
+    """The :class:`ArchiveGuard` over ``dirs``. Blocking (``realpath``, ``stat``).
+
+    A directory that cannot be resolved is compared by its absolute path. Its identity, and that of
+    each directory above it, is recorded for the check once the archive is open. A directory that
+    does not exist yet stands in by its nearest existing ancestor. A directory whose identity cannot
+    be read for any other reason goes into :attr:`ArchiveGuard.unresolved`, and so does one none of
+    whose path can be read, and so does one whose stat reports inode 0: Windows answers a refused
+    directory from its parent's listing with inode 0 rather than raising, and some file systems
+    report 0 for every directory. An ancestor above a readable directory that cannot itself be read
+    (a traverse-only parent) is passed over, and an ancestor's inode 0 is not recorded, since it
+    would match every directory so reported. Each directory is stat'ed once per call."""
+    keys: set[str] = set()
+    ids: set[tuple[int, int]] = set()
+    unresolved: set[Path] = set()
+    seen: set[Path] = set()
+    for path in dict.fromkeys(dirs):
+        try:
+            here = Path(os.path.realpath(path))
+        except (OSError, ValueError):
+            here = Path(os.path.abspath(path))
+        keys.add(os.path.normcase(str(here)).casefold())
+        found = False
+        for candidate in (here, *here.parents):
+            if candidate in seen:
+                found = True
+                break  # it, with its identity, and everything above it were recorded already
+            try:
+                st = os.stat(candidate)
+            except (OSError, ValueError) as exc:
+                if found:
+                    continue  # a traverse-only ancestor; the guarded directory itself was read
+                if isinstance(exc, OSError) and _is_absent(exc):
+                    continue  # not created yet; the nearest existing ancestor stands in for it
+                break  # the guarded directory exists, or may, and cannot be read
+            if not st.st_ino and not found:
+                break  # no identity for the guarded directory (or its stand-in): unresolved
+            found = True
+            if st.st_ino:
+                # Only a directory with an identity is memoised: one of inode 0 reached first as an
+                # ancestor must still be unresolved when it is itself a guarded directory.
+                seen.add(candidate)
+                ids.add((st.st_dev, st.st_ino))
+        if not found:
+            unresolved.add(Path(path))
+    return ArchiveGuard(frozenset(keys), frozenset(ids), frozenset(unresolved))
+
+
+def guarded_setting_keys(kind: ConnectorType, *, outbound: bool = False) -> tuple[str, ...] | None:
+    """The settings the connector registered for ``kind`` reads its guarded directories from
+    (:func:`guarded_source_dirs`, :func:`guarded_destination_dirs`): ``()`` when it declares no
+    directories, and None when it declares directories but not the settings they come from."""
+    builder = (_DESTINATIONS if outbound else _SOURCES).get(kind)
+    if not callable(getattr(builder, "guarded_dirs", None)):
+        return ()
+    keys = getattr(builder, "guarded_setting_keys", None)
+    return None if keys is None else tuple(keys)
+
+
+def guard_dir_settings(
+    kind: ConnectorType, settings: Mapping[str, Any], *, outbound: bool = False
+) -> dict[str, Any] | None:
+    """Only the settings a connection of ``kind`` reads its guarded directories from, copied out of
+    ``settings`` before ``env()`` resolution (:func:`guarded_setting_keys`): empty when it declares no
+    directories, and None when it declares directories but not their settings, which the guard
+    treats as unresolvable (fail closed) rather than handing ``guarded_dirs`` every setting. Nothing
+    else is carried, so a credential setting never travels with the guard, and another setting's
+    ``env()`` value, a not-deployed connection's secret say, is neither read nor able to switch the
+    sweep off (BACKLOG #1188)."""
+    keys = guarded_setting_keys(kind, outbound=outbound)
+    if keys is None:
+        return None
+    return {k: settings[k] for k in keys if k in settings}
+
+
+def guarded_source_dirs(config: Source) -> tuple[Path, ...]:
+    """The directories an inbound built from ``config`` reads drops from or quarantines into, which no
+    archive sweep may reach (BACKLOG #1188). Empty for a connector that declares none. A connector
+    declares them with a ``guarded_dirs(config)`` callable on what it registered, and the settings
+    that callable reads in ``guarded_setting_keys``, so the pipeline asks without naming a connector
+    type."""
+    declare = getattr(_SOURCES.get(config.type), "guarded_dirs", None)
+    if not callable(declare):
+        return ()
+    return tuple(declare(config))
+
+
+def guarded_destination_dirs(config: Destination) -> tuple[Path, ...]:
+    """The directories an outbound built from ``config`` writes into, which no archive sweep may reach
+    (BACKLOG #1188): a written file can be awaiting a partner's pickup. Empty for a connector that
+    declares none. Declared like :func:`guarded_source_dirs`."""
+    declare = getattr(_DESTINATIONS.get(config.type), "guarded_dirs", None)
+    if not callable(declare):
+        return ()
+    return tuple(declare(config))
 
 
 class ProcessedFileLedger(Protocol):

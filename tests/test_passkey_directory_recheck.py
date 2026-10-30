@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -42,7 +43,7 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.crypto import generate_key, make_cipher  # noqa: E402
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import (  # noqa: E402
     MessageStore,
     SignCountAnswer,
@@ -333,6 +334,7 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
     p.directory.answer = DirectoryAnswer.DISABLED
 
@@ -351,6 +353,7 @@ async def _lock_second_step(store: MessageStore, user_id: str) -> None:
         lockout_seconds=900.0,
         max_lockout_seconds=86_400.0,
         totp_usable=_opened_totp_state,
+        passkey_escalates=None,
     )
 
 
@@ -1059,3 +1062,103 @@ async def test_an_account_deleted_after_the_holder_re_read_is_a_lost_session(key
         assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
     finally:
         await store.close()
+
+
+async def _assert_with_the_set_read_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None = None,
+) -> tuple[MessageStore, str, Elevation]:
+    """A local passkey assertion whose sign-count write answers ``moved``, after which the passkey
+    set read raises ``read_fault`` and, when given, the audit write raises ``audit_fault``. Returns
+    the store (open, faults undone), the token and the answer; the caller closes the store. A raise
+    closes it here."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        return await _finish_with_the_set_read_failing(store, monkeypatch, read_fault, audit_fault)
+    except BaseException:
+        await store.close()
+        raise
+
+
+async def _finish_with_the_set_read_failing(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None,
+) -> tuple[MessageStore, str, Elevation]:
+    service, token, response, _user_id = await _local_assertion(store)
+    real_update = store.update_webauthn_sign_count
+
+    def _raising(exc: Exception) -> Any:
+        async def _fault(*_args: Any, **_kwargs: Any) -> Any:
+            raise exc
+
+        return _fault
+
+    async def _moved(*args: Any, **kwargs: Any) -> SignCountAnswer:
+        answer = await real_update(*args, **kwargs)
+        assert answer == "moved"
+        monkeypatch.setattr(store, "list_webauthn_credentials", _raising(read_fault))
+        if audit_fault is not None:
+            monkeypatch.setattr(store, "record_audit", _raising(audit_fault))
+        return answer
+
+    monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
+    try:
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+    finally:
+        monkeypatch.undo()
+    return store, token, refused
+
+
+@pytest.mark.parametrize(
+    "audit_fault",
+    [
+        None,
+        sqlite3.OperationalError("synthetic: the audit write was refused"),
+        RuntimeError("synthetic: a keyless audit append"),
+        ValueError("synthetic: no active connection"),
+        CipherError("synthetic: Transit could not compute the chain MAC"),
+    ],
+    ids=["audit-written", "audit-operational", "audit-runtime", "audit-closed", "audit-cipher"],
+)
+async def test_a_store_fault_in_the_passkey_re_read_refuses_with_an_audit_row(
+    audit_fault: Exception | None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3775. After the sign-count write, a store fault in ``_passkey_held`` must not end
+    the attempt with no audit row. RED when: the fault raises past ``finish_webauthn_assertion``,
+    the factor is marked, no ``auth.webauthn_failed`` row names ``store_error`` when the audit
+    write lands, or a refused audit write (any class ``audit_write_errors`` names) turns the
+    refusal into a raise. The fault is logged either way."""
+    store, token, refused = await _assert_with_the_set_read_failing(
+        monkeypatch, sqlite3.OperationalError("synthetic: the set read was refused"), audit_fault
+    )
+    try:
+        assert refused.ok is False and refused.session_lost is False
+        assert "the passkey re-read raised" in caplog.text
+        failures = await _audited_assertion_failures(store)
+        assert ({"reason": "store_error"} in failures) is (audit_fault is None)
+        assert await store.list_audit(action="auth.webauthn_verified") == []
+        assert await _clone_answers(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.revoked_at is None
+        assert session.mfa_verified_at is None  # the factor was not marked
+    finally:
+        await store.close()
+
+
+async def test_a_defect_in_the_passkey_re_read_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3775. ``sqlite3.ProgrammingError`` is a ``DatabaseError`` but a defect (a bad
+    statement or bind, ``AUDIT_WRITE_DEFECTS``), so it is not passed over as a store refusal. RED
+    when: it is answered as a ``store_error`` refusal instead of raising."""
+    with pytest.raises(sqlite3.ProgrammingError, match="synthetic"):
+        await _assert_with_the_set_read_failing(
+            monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
+        )

@@ -5,7 +5,7 @@
 A process started with no ``env=`` gets a copy of its parent's whole environment. The engine's own
 environment holds its secrets by design: the store key, the store password and every ``env()``
 connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what its child gets,
-through one of the four builders here, and ``tests/test_child_process_environment.py`` fails a
+through one of the builders here, and ``tests/test_child_process_environment.py`` fails a
 process start whose environment does not come from one of them.
 
 * :func:`system_tool_environment` is the platform's start-up names, for a fixed
@@ -17,14 +17,20 @@ process start whose environment does not come from one of them.
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
   and the extra names its caller adds. A variable nobody listed does not cross.
-* :func:`hook_environment` is **everything except the engine's own namespace**, for a command an
-  operator configured (the DR hook). Such a command may need ordinary variables the engine cannot
-  list in advance, such as a cloud profile or a proxy. It has no use for the engine's settings, so
-  the whole ``MEFOR_*`` prefix is dropped. Dropping a prefix does not go stale the way a list of
-  secret names would. A few names outside the prefix are dropped too
-  (:data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
-  the hook**: a ``[secrets].provider = "env"`` reference may name any variable, a library may read
-  one this module does not know, and neither can be listed here.
+* :func:`hook_environment` is an **allowlist** too, for a shell command an operator configured (the
+  DR hook): the platform's start-up names, on Windows the few
+  machine-layout names a shell script expects (:data:`_WINDOWS_SHELL_NAMES`), and the names the
+  operator listed in ``[dr].pass_environment``. A variable nobody listed does not cross, so no
+  secret is in the hook's own environment by default, whatever name it is kept under. Settings
+  load refuses the engine's own names in that setting.
+* :func:`non_engine_environment` is **everything except the engine's own namespace**: the whole
+  ``MEFOR_*`` prefix, and the few names outside it in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+  It is a deny-list, so **a secret kept under any other name still crosses**: a
+  ``[secrets].provider = "env"`` reference may name any variable, and a library may read one this
+  module does not know. Only for a fixed tool the engine's own code names, run on a build or CI
+  runner rather than by the service, that reads settings the engine cannot list in advance: the
+  dependency auditor's ``pip`` and ``pip-audit``, which read their index, proxy and certificate
+  settings from the environment. ``tests/test_child_process_environment.py`` fails another caller.
 * :func:`engine_environment` is the **whole** environment, for a Python child started through the
   bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
   builds connections and so needs the secrets, and other such children, the tray's relaunch among
@@ -53,6 +59,7 @@ __all__ = [
     "engine_environment",
     "hook_environment",
     "inherited_interpreter_flags",
+    "non_engine_environment",
     "outside_engine_namespace",
     "python_child_argv",
     "python_module_argv",
@@ -60,8 +67,9 @@ __all__ = [
     "worker_environment",
 ]
 
-#: The engine's own settings and secrets are named with this prefix. The libraries it uses read
-#: other names as well; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
+#: The engine's own settings and secrets are named with this prefix. Secrets under other names are
+#: kept from children too; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the ones known here,
+#: and its comment says why each is there.
 ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
 #: The interpreter options every Python child is started with. Each child starts a script,
@@ -179,11 +187,31 @@ _POSIX_NAMES: Final = frozenset(
     }
 )
 
-#: Secrets the engine may rely on that are not named ``MEFOR_*``, because a library it uses reads
-#: them when the engine's own setting is unset. At least these two: hvac falls back to
-#: ``VAULT_TOKEN`` when ``MEFOR_STORE_VAULT_TOKEN`` or ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, and
-#: asyncpg falls back to ``PGPASSWORD`` when ``[store].password`` is unset. A list of names, so it
-#: can be incomplete; the module docstring says what that leaves.
+#: What a Windows shell script expects beyond :data:`_WINDOWS_NAMES`, for the DR hook only: where
+#: programs and shared data are installed. Machine layout, never a secret. Measured on Windows 11
+#: with the start-up names alone, ``cmd`` leaves ``%ProgramFiles%`` unexpanded. ``PSModulePath``
+#: is left out on purpose: PowerShell builds it when it is unset, as measured, and the engine's
+#: own value may name another PowerShell edition's modules.
+_WINDOWS_SHELL_NAMES: Final = frozenset(
+    {
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+    }
+)
+
+#: Secrets outside the ``MEFOR_*`` prefix that are kept from every child process and refused in
+#: ``pass_environment``. At least these two. asyncpg falls back to ``PGPASSWORD`` when
+#: ``[store].password`` is unset. ``VAULT_TOKEN`` is no longer read by the engine, whose Vault
+#: clients refuse an unset ``MEFOR_*_VAULT_TOKEN`` rather than let hvac fall back (BACKLOG
+#: #2851); it stays because an operator's own Vault token, inherited from the shell that started
+#: the engine, is still a secret a Router, a Handler or a hook has no business holding. A list of
+#: names, so it can be incomplete; the module docstring says what that leaves.
 ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
 
 
@@ -203,8 +231,8 @@ def _allowed_for_a_worker(name: str, extra_names: Collection[str]) -> bool:
 
 
 def outside_engine_namespace(name: str) -> bool:
-    """Whether ``name`` is neither one of the engine's own ``MEFOR_*`` variables nor a secret a
-    library reads on its behalf. Upper-cased on every platform: Windows reads ``mefor_x`` and
+    """Whether ``name`` is neither one of the engine's own ``MEFOR_*`` variables nor one of the
+    secrets in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`. Upper-cased on every platform: Windows reads ``mefor_x`` and
     ``MEFOR_X`` as one variable, and on POSIX refusing the lower-case spelling costs nothing."""
     upper = name.upper()
     return (
@@ -318,6 +346,15 @@ def _source(environ: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if environ is None else environ
 
 
+def _extra_keys(extra_names: Collection[str]) -> frozenset[str]:
+    """``extra_names`` as :func:`_key` compares them."""
+    if isinstance(extra_names, str):
+        # A bare string is a collection of its characters, so no name would cross and nothing
+        # would say why.
+        raise TypeError("extra_names takes a collection of names, not one string")
+    return frozenset(_key(name) for name in extra_names)
+
+
 def worker_environment(
     environ: Mapping[str, str] | None = None,
     *,
@@ -341,11 +378,7 @@ def worker_environment(
     writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
     ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
-    if isinstance(extra_names, str):
-        # A bare string is a collection of its characters, so no name would cross and nothing
-        # would say why.
-        raise TypeError("extra_names takes a collection of names, not one string")
-    extras = frozenset(_key(name) for name in extra_names)
+    extras = _extra_keys(extra_names)
     env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
@@ -400,11 +433,31 @@ def system_tool_environment(
     return {**{n: v for n, v in _source(environ).items() if _key(n) in allowed}, **pins}
 
 
-def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a command an operator configured: everything outside the engine's own
-    ``MEFOR_*`` namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
+def hook_environment(
+    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
+) -> dict[str, str]:
+    """The DR hooks' allowlist over ``environ`` (default :data:`os.environ`), as the module
+    docstring describes; ``extra_names`` is ``[dr].pass_environment``.
 
-    ``PYTHONPATH`` crosses as this process has it."""
+    No interpreter variable crosses unless listed: the hook is a shell command, not this
+    interpreter's child. ``LD_LIBRARY_PATH`` does, with the other POSIX start-up names, so a hook
+    that starts an interpreter needing it still starts. An extra in the engine's own namespace
+    raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
+    the first."""
+    extras = _extra_keys(extra_names)
+    for key in extras:
+        if not outside_engine_namespace(key):
+            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
+    names = _platform_names() | extras
+    if sys.platform == "win32":
+        names |= _WINDOWS_SHELL_NAMES
+    return {n: v for n, v in _source(environ).items() if _key(n) in names}
+
+
+def non_engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Everything in ``environ`` (default :data:`os.environ`) outside the engine's own ``MEFOR_*``
+    namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`: the deny-list the module docstring
+    says is only for the dependency auditor. ``PYTHONPATH`` crosses as ``environ`` has it."""
     return {n: v for n, v in _source(environ).items() if outside_engine_namespace(n)}
 
 

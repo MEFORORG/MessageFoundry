@@ -144,13 +144,16 @@ tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py
 tests/test_dependabot_cap_ignores.py
 tests/test_docs_runbooks.py
+tests/test_appcontainer_spike_judge.py
 tests/test_dpapi_spike_judge.py
 tests/test_failure_signal.py
 tests/test_feature_map_claims.py
+tests/test_find_emptied_worktrees.py
 tests/test_freethread_smoke_liveness.py
 tests/test_gate_installed_parity.py
 tests/test_gate_liveness.py
 tests/test_gate_rule_scan_agreement.py
+tests/test_held_pr_turns.py
 tests/test_ide_licence_packaging.py
 tests/test_incomplete_run_banner.py
 tests/test_ingress_probe_summary.py
@@ -169,6 +172,7 @@ tests/test_new_dependency_check.py
 tests/test_new_glyph_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py
+tests/test_owed_ledger_acts.py
 tests/test_pr_state.py
 tests/test_precompact_reprime_hook.py
 tests/test_private_paths_stay_ignored.py
@@ -188,6 +192,7 @@ tests/test_role_cards.py
 tests/test_scan_forbidden_loaded_set.py
 tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
+tests/test_seat_worktree_lock.py
 tests/test_security_composite_parity.py
 tests/test_security_posture.py
 tests/test_security_txt_expiry_reminder.py

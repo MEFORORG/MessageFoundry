@@ -26,7 +26,10 @@ always audited.
 
 WHAT IT DOES, in order, exiting with the first non-zero status:
 
-1. ``pip install --dry-run --ignore-installed --require-hashes -r <lock>`` on the lock AS COMMITTED.
+1. ``pip install --dry-run --ignore-installed --require-hashes --only-binary :all: -r <lock>`` on
+   the lock AS COMMITTED. Wheels only, whatever the caller's pip configuration says: a dry-run
+   still builds an sdist to read its metadata, and that runs the package's build code in an audit.
+   So a pin with no wheel for the host fails here (vault BACKLOG #4083 finding 4).
    This keeps what the old ``pip-audit -r <lock>`` did as a side effect: its pip path dry-run
    installed the lock into a fresh venv, so a pin with a wrong hash or no installable artifact on the
    runner reddened the gate. For ``ci/locks/ci-quality.lock`` that was the only such check in a
@@ -36,6 +39,15 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
    committed, never installed), and prints each pin it un-gated.
 3. ``pip-audit -r <copy> --desc --disable-pip --strict`` plus any extra arguments (``--ignore-vuln
    <ID>`` for a triaged advisory, which therefore goes AFTER the lock).
+
+``--skip-private <name>``, given BEFORE the lock and repeatable, leaves that one pin out of the copy,
+and prints it as not audited (vault BACKLOG #3786 finding 1). It is for a package no advisory
+database can look up, such as an adopter's private one: ``--strict`` fails such a pin, and
+``--ignore-vuln`` cannot clear that, since it names an advisory, not a package. Every other pin is
+still looked up under ``--strict``, and step 1 still checks the named one's hashes, so it must be
+downloadable from the index pip is configured with. Past refusing the engine and the MessageFoundry
+packages this release knows to be published, nothing checks that the named package is in fact
+private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
@@ -53,8 +65,11 @@ never writes and which would resolve against the temporary copy's directory, or 
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place. It does not judge whether a non-empty lock is complete; released-line-audit
-carries its own floor for that.
+would stay in place; and a ``--skip-private`` that names the engine or another published
+MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
+as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
+as an unknown option). It does not judge
+whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
 before it (a line ending in a backslash continues, unless it is a comment), indented or not. A
@@ -76,13 +91,14 @@ import argparse
 import codecs
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import engine_environment, hook_environment, python_module_argv
+from messagefoundry.childenv import engine_environment, non_engine_environment, python_module_argv
 
 
 def is_requirement_line(line: str) -> bool:
@@ -180,13 +196,74 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
     return "".join(out), stripped, requirements
 
 
+#: A distribution name at the start of a requirement (PEP 508).
+_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def canonical_name(name: str) -> str:
+    """``name`` as PEP 503 compares it: runs of ``-``, ``_`` and ``.`` folded to ``-``, lower case."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tuple[str, str]]]:
+    """``text`` without each requirement whose canonical name is in ``names``, the lines it
+    continues onto included; and each dropped requirement as ``(canonical name, first line)``.
+    Where a requirement starts and how far it goes on is read as :func:`_kinds` reads it."""
+    out: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    dropping = continued = False
+    lines = text.splitlines(keepends=True)
+    for line, kind in zip(lines, _kinds(lines), strict=True):
+        body = _body(line)
+        if not continued:
+            head = body.lstrip()
+            match = _NAME.match(head) if kind == "requirement" else None
+            name = canonical_name(match[0]) if match else ""
+            dropping = bool(name) and name in names
+            if dropping:
+                dropped.append((name, head.removesuffix("\\").rstrip()))
+        if not dropping:
+            out.append(line)
+        continued = body.endswith("\\") and not body.lstrip().startswith("#")
+    return "".join(out), dropped
+
+
+#: Distribution names this repo's release workflow publishes to PyPI, beside the engine's own.
+#: The repository's one record of them: its install-instruction provenance test reads it, and keeps
+#: the dated PyPI probe that classified each name.
+PUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset(
+    {"messagefoundry-harness", "messagefoundry-toolkit", "messagefoundry-webconsole"}
+)
+
+#: The engine is the pin the adopter's tripwire exists to audit, so it is never skipped as private.
+#: Nor is a MessageFoundry package this release knows to be published (``PUBLISHED_DISTRIBUTIONS``):
+#: an advisory database can look each one up, so skipping it would only hide an advisory against it
+#: (BACKLOG #3786). A name published after this release is not in the set.
+#: Folded as the requested names are, so a spelling added to the record still matches.
+_NEVER_PRIVATE = frozenset(canonical_name(n) for n in {"messagefoundry", *PUBLISHED_DISTRIBUTIONS})
+
+
+def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str]) -> str | None:
+    """Why a ``--skip-private`` request is refused, or ``None``."""
+    if "--skip-private" in pip_audit_args:
+        # After the lock, argparse hands it to pip-audit, which fails with a usage error that
+        # names neither the flag's position nor this module.
+        return "--skip-private goes before the lock, not after it"
+    named = sorted(_NEVER_PRIVATE.intersection(private))
+    return (
+        f"--skip-private may not name the engine or a published MessageFoundry package: {named}"
+        if named
+        else None
+    )
+
+
 def _run(cmd: list[str]) -> int:
-    # hook_environment: everything outside the engine's MEFOR_* namespace and its named secrets, so
-    # pip and pip-audit keep the index, proxy and certificate settings they read from the
-    # environment, and an engine secret set on the same runner does not reach them. Built over
+    # non_engine_environment: everything outside the engine's MEFOR_* namespace and its named
+    # secrets, so pip and pip-audit keep the index, proxy and certificate settings they read from
+    # the environment, and an engine secret set on the same runner does not reach them. Built over
     # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
     # working directory back on the children's sys.path, which -P keeps off it.
-    env = hook_environment(engine_environment())
+    env = non_engine_environment(engine_environment())
     # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
     # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
     # interpreter and its child flags, some fixed and some repeated from this process's own flags
@@ -200,6 +277,14 @@ def _run(cmd: list[str]) -> int:
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument(
+        "--skip-private",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="leave this pin out of the audit, for a package no advisory database can look up; "
+        "repeatable, and given before the lock",
+    )
     parser.add_argument("lock", type=Path, help="the hashed lock to audit")
     parser.add_argument(
         "pip_audit_args",
@@ -227,15 +312,40 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
             file=sys.stderr,
         )
         return 2
+    private = {canonical_name(name) for name in args.skip_private}
+    refusal = _skip_private_refusal(private, args.pip_audit_args)
+    if refusal:
+        print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
+        return 2
+    text, skipped = drop_requirements(text, private)
+    unmatched = private - {name for name, _ in skipped}
+    if unmatched:
+        print(
+            f"::error::{args.lock}: --skip-private names a package the lock does not pin: "
+            f"{sorted(unmatched)}",
+            file=sys.stderr,
+        )
+        return 2
+    if len(skipped) == requirements:
+        print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
+        return 2
+    # A skipped pin is neither counted nor listed as audited.
+    stripped = [
+        e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
+    ]
     print(
-        f"{args.lock}: {requirements} pinned requirements, {len(stripped)} un-gated from a marker "
-        "the host would have evaluated:"
+        f"{args.lock}: {requirements - len(skipped)} pinned requirements audited, {len(stripped)} "
+        "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
         print(f"  {entry}")
+    for _, entry in skipped:
+        print(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
-    status = run([*pip_check, "--require-hashes", "--quiet", "-r", str(args.lock)])
+    status = run(
+        [*pip_check, "--require-hashes", "--only-binary", ":all:", "--quiet", "-r", str(args.lock)]
+    )
     if status:
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:

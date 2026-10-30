@@ -90,6 +90,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # again. Either change arrives as an ENGINE or harness diff, which does not trip the
         # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
         "test_anon_doc_claims.py",
+        # Reads messagefoundry/config/settings.py off disk and parses the comment above
+        # AuthSettings.require_mfa (vault BACKLOG #3474). It fails when that comment gives the old
+        # exposure rule again, which arrives as an ENGINE diff the tooling path gate does not see.
+        # Its other arms read docs/SECURITY-LOOSENING.md and docs/CONFIGURATION.md, and they are
+        # not the reason it stays.
+        "test_exposure_rule_doc_drift.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
@@ -178,6 +184,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # subject.
         "test_packaged_tree_denylist.py",
         "test_release_pipeline.py",
+        # Reads messagefoundry/** (redaction.py and logging_setup.py among them), docs/** and the
+        # other trees off disk, and fails when a comment or docstring names the exception-message
+        # convention as THE control for a redaction residual again (BACKLOG #3464). That arrives as
+        # an ENGINE diff, which does not trip the tooling path gate.
+        "test_redaction_convention_claim.py",
         # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing
         # them. What it guards is the erased-body predicate going missing from a replay statement,
         # which arrives as an ENGINE diff and does not trip the tooling path gate (BACKLOG #1560).
@@ -273,8 +284,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # classifier does not follow (BACKLOG #1799). A regression arrives as a
         # messagefoundry/store/sqlserver.py diff, which the tooling path gate does not see.
         "test_adr0075_rt_count_gate.py",
-        #   install_instruction_provenance -> globs messagefoundry/**/*.py
-        "test_install_instruction_provenance.py",
+        # install_instruction_provenance left this list when it began importing the engine's
+        # published-distribution record (BACKLOG #3786), which classifies it as an engine test.
         #   sds_rule_ids_are_stable -> :397 rglobs messagefoundry/**/*.py. Milder than the four above
         #     (it catches a dangling SDS-N.N citation in an engine docstring, not a correctness bug),
         #     and it is listed here anyway: the value of this list is that it is exhaustive for its
@@ -283,6 +294,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sds_rule_ids_are_stable.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
+        # Guards tests/timing_quarantine.txt, which takes ENGINE tests off the engine legs (BACKLOG
+        # #4773). An edit to that list alone does not trip the tooling job's path gate, so listed as
+        # tooling this guard would not run on the change that breaks the list.
+        "test_timing_quarantine.py",
         # Reads every module under messagefoundry/ and harness/ and lists each call that hands a
         # posture toward a Vault hop (vault BACKLOG #2983). What breaks it is a new caller in the
         # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
@@ -585,7 +600,10 @@ def test_marker_is_registered() -> None:
     ("needle", "why"),
     [
         (
-            "-m 'not tooling'",
+            # The whole engine expression since the timing quarantine (BACKLOG #4773) joined it.
+            # The bare `-m 'not tooling'` now appears only in comments, so it would match nothing
+            # that runs. Back to the bare form when the quarantine is retired.
+            "-m 'not tooling and not timing_quarantine'",
             "the engine legs must DESELECT the harness tier -- without it the partition buys nothing",
         ),
         (

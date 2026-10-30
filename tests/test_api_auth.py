@@ -35,6 +35,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
 from tests._role_pairing import bypass_view_raw_pairing_rule
 from tests._session_race import rotate_after_first_call
 
@@ -633,17 +634,18 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
 
 
-async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
+async def test_a_logout_raced_by_a_rotation_ends_the_session_under_its_new_token(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3029. ``POST /auth/logout`` reads the session in its auth dependency, then the
+    """BACKLOG #3715. ``POST /auth/logout`` reads the session in its auth dependency, then the
     service revokes it by hash. A step-up on the same session that re-keys it between the two
-    leaves that hash naming no session. The ``auth.logout`` row used to read the same either way.
+    leaves that hash naming no session, and the session used to live on under its new token while
+    the row said ``nothing_to_revoke`` (BACKLOG #3029).
 
     The rotation runs right after the dependency's read of the presented hash, so it always lands
-    and the session lives on under its new token. The row's ``outcome`` must then say nothing was
-    revoked. Ending it under the rotated token is not this route's to do; that is BACKLOG #3028.
-    The branch where the revoke lands is test_session_supersession.py's logout test.
+    after the request arrived. The route passes its arrival time, so the service follows that
+    rotation's link and ends the session under the new token. The row names the caller, the
+    session that ended and, in ``presented``, the hash the caller sent.
     """
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
@@ -660,19 +662,61 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     assert rotations, "the injection never fired, so this measured nothing"
     rotated = rotations[0]
     assert rotated is not None, "the rotation failed closed, so the race was not driven"
-    assert await service.identity_for_token(rotated, activity=False) is not None
-    # BACKLOG #3339: a sign-out that ended nothing still names the caller and the address.
-    assert await _logout_rows(store) == [("u", _DEFAULT_PEER[0], "nothing_to_revoke")], (
-        "the auth.logout row claimed a revoke that missed, or lost its actor or address"
+    assert await service.identity_for_token(rotated, activity=False) is None, (
+        "the sign-out left the session live under the token the rotation handed out"
     )
-
-
-async def _logout_rows(store: Any) -> list[tuple[object, object, object]]:
-    """Each ``auth.logout`` row as its actor, client address and ``detail.outcome``."""
-    return [
-        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
-        for row in await store.list_audit(action="auth.logout")
+    # BACKLOG #3339: the row names the caller and the address.
+    assert await logout_rows(store) == [("u", _DEFAULT_PEER[0], "revoked")]
+    assert await logout_details(store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(rotated)[:12],
+            "presented": hash_token(token)[:12],
+        }
     ]
+
+
+async def test_logout_passes_a_proven_at_read_before_its_gate(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3715. ``POST /auth/logout`` passes a ``proven_at`` read during the request and
+    before its gate reads the session; ``AuthService.logout`` says why. The clock ticks on every
+    read, so "before" is a strict order. ``proven_at=None`` fails here."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+
+    start = time.time()
+    ticks = iter(range(1, 10**9))
+    monkeypatch.setattr(time, "time", lambda: start + next(ticks) * 0.001)
+    gate_reads: list[float] = []
+    real_get_session = engine.store.get_session
+
+    async def _timed_get_session(*args: Any, **kwargs: Any) -> Any:
+        gate_reads.append(time.time())
+        return await real_get_session(*args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "get_session", _timed_get_session)
+    proven: list[float | None] = []
+    real_logout = service.logout
+
+    async def _spy_logout(token: str | None, **kwargs: Any) -> Any:
+        proven.append(kwargs["proven_at"])
+        return await real_logout(token, **kwargs)
+
+    monkeypatch.setattr(service, "logout", _spy_logout)
+    async with _client(engine, service) as c:
+        sent = time.time()
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+    assert gate_reads, "the gate never read the session, so this measured nothing"
+    assert len(proven) == 1
+    assert proven[0] is not None, (
+        "the route passed no proven_at, so it took the credential-free bound"
+    )
+    assert sent < proven[0] < gate_reads[0], (
+        "proven_at is not a wall-clock read taken during this request, before the gate"
+    )
 
 
 async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine: Engine) -> None:
@@ -680,15 +724,15 @@ async def test_a_logout_audit_row_names_the_caller_and_the_client_address(engine
     ``client_ip``, and the ``auth.logout`` row records both. The peer is pinned, so the ``client``
     assertion compares a value this test named (BACKLOG #1644). The sign-in comes from another
     address, so the row cannot pass by recording the address the session was minted from. The
-    route's control, a token that names no session, is the rotation race test above: its dependency
-    refuses any other dead token."""
+    route's dependency refuses a dead token, so the route has no control that names no session;
+    ``tests/test_session_supersession.py`` drives that branch in the service."""
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service, peer=("192.0.2.10", 40000)) as c:
         token = (await _login(c, "u")).json()["token"]
     async with _client(engine, service, peer=("192.0.2.44", 40001)) as c:
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
-    assert await _logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
+    assert await logout_rows(engine.store) == [("u", "192.0.2.44", "revoked")]
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
@@ -1473,7 +1517,8 @@ async def test_audit_export_stop_reaches_the_server_as_an_abort(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The stop leaves the app as a raise. This pins the raise, NOT what the client receives: the
-    client still gets a short file that looks complete (BACKLOG #3381; see ``ExportStopped``)."""
+    client sees a failed transfer, which ``tests/test_export_stop_wire.py`` measures over a real
+    server (BACKLOG #3907; see ``ExportStopped``)."""
     with pytest.raises(ExportStopped):
         await _export_with_mid_stream_act(
             engine, monkeypatch, Role.AUDITOR, _revoke, raise_app_exceptions=True
@@ -2272,6 +2317,33 @@ async def test_list_and_revoke_own_session(engine: Engine) -> None:
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # revoked
         assert (await c.get("/auth/me", headers=h2)).status_code == 200  # current still valid
         assert len((await c.get("/me/sessions", headers=h2)).json()["sessions"]) == 1
+
+
+async def test_revoking_an_own_session_a_rotation_re_keyed_answers_404_and_writes_a_miss_row(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749 item 7. A session's id is its token hash, so an elevation on that session
+    makes an id the caller read earlier name nothing. ``DELETE /me/sessions/{id}`` then answers
+    404, as for an unknown id, revokes nothing and writes the ``auth.session_revoke_missed`` row
+    (vault BACKLOG #3260, limb 2). The positive branch is test_list_and_revoke_own_session."""
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t1 = (await _login(c, "u")).json()["token"]
+        t2 = (await _login(c, "u")).json()["token"]
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
+        stale = hash_token(t1)
+        rotated = await service._rotate_session_token(t1)  # an elevation in t1's own tab
+        assert rotated is not None
+        missed = await c.delete(f"/me/sessions/{stale}", headers=_auth(t2))
+        assert missed.status_code == 404
+        still = await c.get("/auth/me", headers=_auth(rotated))
+        assert still.status_code == 200, "a revoke landed on the re-keyed session"
+    rows = await engine.store.list_audit(action="auth.session_revoke_missed")
+    assert [(row["actor"], json.loads(str(row["detail"]))) for row in rows] == [
+        ("u", {"session": stale[:12]})
+    ]
 
 
 async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:
@@ -3438,6 +3510,67 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
         user = await engine.store.get_user(ida_id)
         assert user is not None and user.must_change_password is False
         assert await engine.store.list_audit(action="auth.temp_password_expired") == []
+
+
+async def test_post_logout_past_the_deadline_is_refused_at_the_gate_with_one_row(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749. ``POST /auth/logout`` passes its gate first, and the gate ends a session whose
+    temporary credential lapsed (BACKLOG #2298), so the route never runs: a 401, one
+    ``auth.temp_password_expired`` row with ``"at": "session"``, and no ``auth.logout`` row. The
+    sign-out's own lapse check (the test below) is not reached, so it adds no second row."""
+    service = await _service(engine, _expiring_service_settings())
+    mo_id = await create_local_user_chosen(
+        service,
+        username="mo",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, mo_id, time.time() + 30)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "mo")).json()["token"]
+        await _move_deadline_to(engine, mo_id, time.time() - 1)
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 401
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"at": "session"' in rows[0]["detail"]
+    assert await logout_rows(engine.store) == []
+
+
+async def test_a_logout_whose_credential_lapsed_after_its_gate_records_lapsed(
+    engine: Engine,
+) -> None:
+    """RED when: a sign-out reports ``revoked`` for a session whose temporary credential lapsed, or
+    writes no ``auth.temp_password_expired`` row for it (BACKLOG #3749).
+
+    Called on the service directly, as ``POST /auth/logout`` does once its gate proved the session
+    live, with the deadline passing in between. The sign-out applies the gate's own lapse test, so
+    it records ``lapsed`` and writes the gate's row, once, with ``"at": "logout"``."""
+    service = await _service(engine, _expiring_service_settings())
+    ned_id = await create_local_user_chosen(
+        service,
+        username="ned",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, ned_id, time.time() + 30)
+    outcome = await service.login("ned", PW)
+    assert outcome.ok and outcome.token is not None
+    assert await service.identity_for_token(outcome.token) is not None
+    await _move_deadline_to(engine, ned_id, time.time() - 1)
+    ended = await service.logout(
+        outcome.token, actor="ned", client="192.0.2.7", proven_at=time.time()
+    )
+    assert ended == "lapsed"
+    assert await logout_rows(engine.store) == [("ned", "192.0.2.7", "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == [
+        ("ned", "192.0.2.7", {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "logout"})
+    ]
 
 
 def test_the_must_change_refusal_states_a_passed_deadline_as_passed() -> None:

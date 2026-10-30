@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from messagefoundry.api import create_app
 from messagefoundry.api import security as api_security
 from messagefoundry.api.app import _get_engine
+from messagefoundry.api.auth_routes import _arrival
 from messagefoundry.api.auth_routes import _service as _service_guard
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
@@ -371,7 +372,8 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
     dependencies read and found unable to refuse. A new kind fails here until someone reads it."""
     # refuse_undeclared_route runs ahead of every route's own dependencies, but it refuses only a
     # route with no gate, and every route this loop reads has one (vault BACKLOG #2604).
-    cannot_refuse = {no_store_reply, refuse_undeclared_route}
+    # `_arrival` (POST /auth/logout, BACKLOG #3715) only reads the clock and never raises.
+    cannot_refuse = {no_store_reply, refuse_undeclared_route, _arrival}
     app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
     marked: set[object] = set()
     skipped: set[object] = set()
@@ -880,7 +882,7 @@ async def test_a_session_revoked_while_the_body_arrives_is_refused_by_the_gate(
     request = _request(app, bearer)
     await found.step(request)
     await service.logout(
-        bearer["Authorization"].removeprefix("Bearer "), actor="admin", client=None
+        bearer["Authorization"].removeprefix("Bearer "), actor="admin", client=None, proven_at=None
     )
     for gate in gates:
         with pytest.raises(HTTPException) as refused:

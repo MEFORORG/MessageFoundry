@@ -136,6 +136,11 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "kerberos_enabled requires ad_enabled",
     ),
+    "kerberos_without_realm": (
+        _auth(kerberos_enabled=True),
+        {},
+        "kerberos_enabled requires kerberos_realm",
+    ),
     "recheck_without_ad": (
         {"ad_session_recheck_seconds": 60, "ad_bind_password": _BIND_PASSWORD, **_CARRIER},
         {},
@@ -233,11 +238,6 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
     ),
     # ServiceSettings cross-section checks
     "oidc_without_public_origin": (_auth(), {"api": {}}, "requires an external origin"),
-    "plain_ldap_under_enforce": (
-        _auth(ad_server="ldap://dc.corp.example", ad_allow_insecure_ldap=True),
-        {"security": {"enforcement": "enforce"}},
-        "is inert under [security].enforcement = enforce",
-    ),
     "allow_list_broad_proxy": (
         _auth(),
         {

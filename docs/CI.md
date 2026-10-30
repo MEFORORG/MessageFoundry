@@ -399,7 +399,11 @@ Two limits, stated so nobody reads more into a green than it carries:
   branch protection. It is now a **pre-commit hook** scoped to `.github/workflows/**`, plus a step in
   `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
-- **A step's wall-clock cap is now checked against the step, and a low margin reds the leg.** Each
+- **A step's wall-clock cap is now checked against the step, and a low margin reds the leg** --
+  except the engine `test` leg in `merge_group`, where a low margin is a warning until BACKLOG #3515
+  re-measures the cap (owner ruling 2026-10-29; the margin step in `ci.yml` says what that gives
+  up). The same ruling moved the recurring timing tests listed in `tests/timing_quarantine.txt` off
+  the engine legs into the advisory `timing-quarantine` job (BACKLOG #4773). Each
   gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),

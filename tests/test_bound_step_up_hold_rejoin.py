@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
 
+from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_CONFIG_RELOAD,
@@ -205,6 +207,124 @@ async def test_a_repeated_purge_rejoins_its_hold_without_a_new_proof(
         doomed = await c.post("/connections/OB/purge", headers=_auth(token))
         assert doomed.status_code == 409, doomed.text
         assert await _repeat_rows(engine) == 2
+
+
+async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: the purge's params carry the display name, so a requester renamed
+    since filing used to file a second hold for the same purge. The repeat is keyed on the
+    immutable id, by the proof-free rejoin and by the guard alike, and the approver still sees the
+    name the hold was filed under."""
+    await _quiesced_outbound(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", ["operator"])
+    await _add(service, "admin", ["administrator"])
+    action = STEP_UP_ACTION_CONNECTION_PURGE
+    async with _client(engine, service) as c:
+        admin = await _login(c, "admin")
+        token = await _reauth(c, await _login(c, "op"), action)
+        first = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert first.status_code == 202, first.text
+        held = str(first.json()["approval_id"])
+
+        # The directory renames op; the same session now resolves to the new name.
+        op = await engine.store.get_user_by_username("op")
+        assert op is not None
+        assert await engine.store.set_user_username(op.id, "op2", expected_username="op")
+        me = await c.get("/auth/me", headers=_auth(token))
+        assert me.status_code == 200 and me.json()["username"] == "op2", me.text
+
+        # The proof-free rejoin finds op2's hold. Unfixed, this was a step-up 403.
+        again = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert again.status_code == 202, again.text
+        assert again.json()["approval_id"] == held
+        assert await _pending_ids(c, admin) == [held]
+
+        # A new holder of the freed name is someone else, so their purge is their own hold.
+        await _add(service, "op", ["operator"])
+        theirs_token = await _login(c, "op")
+        theirs = await c.post("/connections/OB/purge", headers=_auth(theirs_token))
+        assert _refused_for(theirs, action), theirs.text
+        theirs_token = await _reauth(c, theirs_token, action)
+        theirs = await c.post("/connections/OB/purge", headers=_auth(theirs_token))
+        assert theirs.status_code == 202, theirs.text
+        new_op_hold = str(theirs.json()["approval_id"])
+        assert new_op_hold != held
+
+        # The same purge at another scope is a different request, rename or not.
+        top = await c.post("/connections/OB/purge?scope=top", headers=_auth(token))
+        assert _refused_for(top, action), top.text
+        assert await _pending_ids(c, admin) == sorted([held, new_op_hold])
+
+        # Past the route's proof-free rejoin (here a lapsed window; also the console, which
+        # demands a proof every time), the core still joins op2's hold. Unfixed, the guard
+        # filed a second one.
+        monkeypatch.setattr(app_module, "step_up_window_live", _never)
+        token = await _reauth(c, token, action)
+        guarded = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert guarded.status_code == 202, guarded.text
+        assert guarded.json()["approval_id"] == held
+        assert await _pending_ids(c, admin) == sorted([held, new_op_hold])
+
+        # What the approver sees still names the requester as filed.
+        listed = (await c.get("/approvals", headers=_auth(admin))).json()["approvals"]
+        row = next(a for a in listed if a["id"] == held)
+        assert row["requester"] == "op"
+        assert row["params"] == {"name": "OB", "scope": "all", "requester": "op"}
+        repeats = await engine.store.list_audit(action="approval.request_repeated")
+        assert sorted(str(r["actor"]) for r in repeats) == ["op2", "op2"]
+
+        # Once that hold is settled, a repeat files a new one under the current name, never
+        # the old one, which by now names someone else.
+        rejected = await c.post(f"/approvals/{held}/reject", headers=_auth(admin))
+        assert rejected.status_code == 200, rejected.text
+        token = await _reauth(c, token, action)
+        fresh = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert fresh.status_code == 202, fresh.text
+        fresh_id = str(fresh.json()["approval_id"])
+        assert fresh_id not in (held, new_op_hold)
+        stored = await engine.store.get_pending_approval(fresh_id)
+        assert stored is not None
+        assert json.loads(str(stored["params"]))["requester"] == "op2"
+
+
+async def test_an_exact_purge_repeat_past_the_proof_never_joins_a_hold_settled_since(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: the core's rejoin takes only a renamed requester's repeat. An exact
+    repeat that has spent its proof keeps the guard's serialized step, which never joins a request
+    settled since. A rejoin reads first and answers after, so a reject in between would point a
+    proof-spent repeat at the rejected hold. The stale read here stands in for that window."""
+    await _quiesced_outbound(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", ["operator"])
+    await _add(service, "admin", ["administrator"])
+    action = STEP_UP_ACTION_CONNECTION_PURGE
+    async with _client(engine, service) as c:
+        admin = await _login(c, "admin")
+        token = await _reauth(c, await _login(c, "op"), action)
+        first = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert first.status_code == 202, first.text
+        held = str(first.json()["approval_id"])
+
+        store = engine.store
+        before = await store.list_pending_approvals(now=0.0)
+        assert [str(r["id"]) for r in before] == [held]
+        rejected = await c.post(f"/approvals/{held}/reject", headers=_auth(admin))
+        assert rejected.status_code == 200, rejected.text
+
+        async def _read_before_the_reject(*_args: object, **_kwargs: object) -> object:
+            return before
+
+        monkeypatch.setattr(store, "list_pending_approvals", _read_before_the_reject)
+        monkeypatch.setattr(app_module, "step_up_window_live", _never)
+        token = await _reauth(c, token, action)
+        again = await c.post("/connections/OB/purge", headers=_auth(token))
+        assert again.status_code == 202, again.text
+        # Before the fix: the rejected hold's id, and nothing held for this proof-spent request.
+        assert again.json()["approval_id"] != held
+        assert await store.list_audit(action="approval.request_repeated") == []
 
 
 async def test_a_repeated_reload_rejoins_its_hold_without_a_new_proof(engine: Engine) -> None:

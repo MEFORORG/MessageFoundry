@@ -666,7 +666,7 @@ def test_a_fail_open_pass_is_recorded_by_the_configured_log_handlers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """ADR 0200 Amendment A calls the WARNING the record of a fail-open pass. The gate runs before
-    ``configure_logging``, so logged there it reached bare stderr only. ``serve`` now writes it
+    ``configure_logging``, so logged there it reached stderr only. ``serve`` now writes it
     twice, as it does the #1989 static-credential lines: to stderr where the gate runs, and again
     through the handlers ``configure_logging`` installs. Standard output is such a handler here,
     and the app log file and the off-box forwarder hang off the same root logger."""

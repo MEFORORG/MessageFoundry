@@ -579,8 +579,17 @@ SITES: dict[str, Site] = {
         OPERATOR,
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
-    "messagefoundry/config/fingerprint.py::_require_listable": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
+    "messagefoundry/config/snapshot.py::ConfigSnapshot.covers_environment_file": Site(
+        1, OPERATOR, _CONFIG_FIXED
+    ),
+    "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
+    "messagefoundry/config/snapshot.py::read_config_snapshot": Site(
+        2,
+        REVIEWED,
+        "A fixed folder name under the operator's config directory, and the names its own listing "
+        "of that folder returned; read, never written.",
+    ),
     "messagefoundry/config/tls_policy.py::staged_crl": Site(
         1, INTERNAL, "A fixed name in a private temp directory this function made."
     ),
@@ -594,8 +603,20 @@ SITES: dict[str, Site] = {
         "access list of for the trust check; no file is opened through them here.",
     ),
     "messagefoundry/config/wiring.py::install_trust_paths": Site(2, INTERNAL, _PKG_LITERAL),
-    "messagefoundry/config/wiring.py::load_config": Site(1, OPERATOR, _CODESETS),
-    "messagefoundry/config/wiring.py::validate_config": Site(1, OPERATOR, _CODESETS),
+    "messagefoundry/config/wiring.py::load_snapshot": Site(
+        2,
+        REVIEWED,
+        "The snapshot's directory joined to the fixed codesets name, which only names the folder in "
+        "a refusal, and to each module name the snapshot holds, which ConfigSnapshot checks is a "
+        "plain name on this platform (vault BACKLOG #2596). Compiled under, never opened.",
+    ),
+    "messagefoundry/config/wiring.py::validate_config": Site(
+        3,
+        REVIEWED,
+        "The operator's config directory joined to the fixed codesets name, to a module name its "
+        "snapshot holds (checked a plain name, compiled under and never opened), and to an "
+        "unreadable file's relative path, which only names it in a diagnostic.",
+    ),
     "messagefoundry/corepoint_import.py::_replace_modules": Site(
         1, INTERNAL, "A pid temp name beside a target the importer already built."
     ),
@@ -604,6 +625,14 @@ SITES: dict[str, Site] = {
         GUARDED,
         "The module stem from an export's inbound name is folded through the guard (BACKLOG #1130).",
         "messagefoundry/corepoint_import.py::_sanitize",
+    ),
+    "messagefoundry/engine_secrets.py::SecretsDirectory._read_file": Site(
+        1,
+        GUARDED,
+        "A name from the secrets directory's own listing that the open accepted: one of the fixed "
+        "setting names, or the value prefix then ASCII letters, digits and underscores. No separator "
+        "can reach the join (vault BACKLOG #2595).",
+        "messagefoundry/engine_secrets.py::open_secrets_directory",
     ),
     "messagefoundry/generators/_core.py::write_corpus": Site(
         2,
@@ -740,6 +769,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/transports/file.py::FileSource.__init__": Site(
         2, OPERATOR, "The operator's processed and error subdirectory settings."
+    ),
+    "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
+        1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."
+    ),
+    "messagefoundry/transports/file.py::_prune_entries": Site(
+        1,
+        REVIEWED,
+        "A bare name from listing the archive directory the sweep opened through no link, joined "
+        "into that held directory; the Windows delete then opens it as itself, refusing a link.",
     ),
     "messagefoundry/transports/file.py::_archive": Site(
         1,
@@ -922,11 +960,15 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        27,
+        38,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
-        "root and its site-packages and dist-info folders, project root, data directory, NSSM "
-        "directory, temp), plus registry keys named after the service's own images.",
+        "root and its site-packages, dist-info, wheelhouse and buildtemp folders, the engine "
+        "wheel's folder, "
+        "the base interpreter's folder and the one above it, "
+        "project root, data directory, NSSM directory, temp), the leaf name of the engine wheel "
+        "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
+        "named after the service's own images.",
     ),
     "scripts/service/measure-store-access.ps1": Site(
         21,

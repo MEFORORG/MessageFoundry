@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 
+from messagefoundry.author_output import runs_author_code
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.run_context import RunContext, run_contexts
@@ -339,7 +340,7 @@ def _accepted(
         if pred is None:
             kept.append(hname)
             continue
-        if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+        if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
             # ADR 0087 parity: the predicate is user code and must run under the SAME isolation as the
             # Router/Handler it sits beside. Evaluating it here in the parent would let a predicate
             # reach the imports and resources the sandbox exists to deny.
@@ -430,7 +431,7 @@ def route_only(
     # its "not even an allocation" promise rather than paying for a seam it never crosses.
     origin: tuple[str | bytes, str] | None = None
     raw_result: list[str] | str | None
-    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+    if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
         if derived:
             origin = (raw, ic.content_type.value)
         raw_result = cast(
@@ -524,7 +525,7 @@ def transform_one(
     if payload is None:
         payload = _payload(raw, content_type)
     raw_result: HandlerResult
-    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+    if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
         raw_result = cast(
             "HandlerResult",
             run_sandboxed(
@@ -894,6 +895,7 @@ def _dry_run_raw(
     )
 
 
+@runs_author_code
 def dry_run(
     registry: Registry,
     raw: str | bytes,
@@ -936,6 +938,9 @@ def dry_run(
 
     The live ``db_lookup``/``fhir_lookup`` bridges are not part of that gap. They have no runner here,
     so a Handler that reaches either and does not catch the error returns ``ERROR``.
+
+    Under a CLI command whose stdout carries its result, a ``print()`` the Router or a Handler runs
+    goes to stderr: :func:`~messagefoundry.author_output.runs_author_code` (vault BACKLOG #3474).
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:

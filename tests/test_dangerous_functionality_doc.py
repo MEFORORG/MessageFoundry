@@ -75,7 +75,9 @@ from messagefoundry.redaction import json_loads_or_refusal
 from tests.test_threat_model_doc_drift import (
     _ALLOWED_SUBPROCESS_SITES,
     _TOOLKIT_PREFIX,
+    _code_only,
     _scanned_py_files,
+    _subprocess_sites,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -667,19 +669,29 @@ def _bound_phrase(seconds: float) -> str:
 
 
 _OPENSSL_NAME_RE = re.compile(r"`(OPENSSL_[A-Z_]+)`")
+_CIPHER_PARAGRAPH_LEAD = "**The host cipher read gives PowerShell script text.**"
+_OPENSSL_ITEM_LEAD = "The two `openssl` starts in `verify/cipher_policy.py`"
 
 
 def _cipher_probe_drift(
     text: str, live_seconds: float, openssl_names: tuple[str, ...]
 ) -> list[str]:
-    """Section 4 must state the host cipher probes' timeout as the code sets it, and name exactly
-    the variables the ``openssl`` probe passes on top of its allowlist (vault BACKLOG #3804 items
-    3 and 5). Before this, both were doc-side text that nothing read."""
+    """Section 4 must state the host cipher probes' timeout as the code sets it, in the probe
+    paragraph, and name exactly the variables the ``openssl`` probes pass on top of their allowlist,
+    in those starts' environment-list item (vault BACKLOG #3804 items 3 and 5). Each is read from its
+    own place, so a match elsewhere in the section cannot stand in for it (#4083 finding 7)."""
+    section = _section(text, 4)
+    paragraph = section.partition(_CIPHER_PARAGRAPH_LEAD)[2].partition("\n\n")[0]
+    items = [item for item in _env_list_items(text) if item.startswith(_OPENSSL_ITEM_LEAD)]
+    if not paragraph or len(items) != 1:
+        return [
+            f"section 4 has no {_CIPHER_PARAGRAPH_LEAD!r} paragraph or not one "
+            f"{_OPENSSL_ITEM_LEAD!r} item"
+        ]
     # Whitespace is collapsed, so a re-wrap of the paragraph does not read as drift.
-    section = " ".join(_section(text, 4).split())
     rendered = f"{_bound_phrase(live_seconds)} (`_PROBE_TIMEOUT_S`)"
-    problems = [] if rendered in section else [f"section 4 does not state {rendered!r}"]
-    named = set(_OPENSSL_NAME_RE.findall(section))
+    problems = [] if rendered in " ".join(paragraph.split()) else [f"no {rendered!r} there"]
+    named = set(_OPENSSL_NAME_RE.findall(items[0]))
     if named != set(openssl_names):
         problems.append(
             f"section 4 names {sorted(named)} for the openssl probe, the code passes "
@@ -747,6 +759,19 @@ def test_cipher_probe_text_drift_is_reported() -> None:
     assert _cipher_probe_drift(text, seconds + 1, names)
     assert _cipher_probe_drift(text, seconds, (*names, "OPENSSL_NEW"))
     assert _cipher_probe_drift(text, seconds, names[1:])
+    # Each is read only where it belongs (#4083 finding 7): the same text moved elsewhere in
+    # section 4 is reported, where a section-wide match read it as present.
+    stated = f"{_bound_phrase(seconds)} (`_PROBE_TIMEOUT_S`)"
+    moved, count = _loose(stated).subn("limited", text)
+    assert count == 1
+    tray = "**The tray opens files"
+    moved = _replace_once(moved, tray, f"Probes are {stated}.\n\n{tray}")
+    assert _cipher_probe_drift(moved, seconds, names)
+    last = names[-1]
+    stray, count = _loose(f"and `{last}`").subn("", text)
+    assert count == 1
+    stray = _replace_once(stray, "- The sandbox worker,", f"- The sandbox worker (`{last}`),")
+    assert _cipher_probe_drift(stray, seconds, names)
 
     source = _package_sources()["verify/cipher_policy.py"]
     assert not _cipher_probe_code_problems(source)
@@ -800,9 +825,8 @@ def _env_list_drift(text: str, sources: Mapping[str, str]) -> list[str]:
         return ["section 4's environment list has no items"]
     problems: list[str] = []
     for item in items:
-        ticked = _TICKED_RE.findall(item)
-        modules = [tok for tok in ticked if tok.endswith(".py")]
-        builders = {tok for tok in ticked if tok in _BUILDERS}
+        modules = _TICKED_PY_RE.findall(item)
+        builders = {tok for tok in _TICKED_RE.findall(item) if tok in _BUILDERS}
         head = " ".join(item.split())[:60]
         if not modules or not builders:
             problems.append(f"the item {head!r} names no module or no builder")
@@ -827,7 +851,9 @@ def test_environment_list_drift_is_reported() -> None:
     assert _env_list_drift(_replace_once(text, "(`hook_environment`)", "(none)"), sources)
     changed = dict(sources)
     changed["pipeline/dr.py"] = _replace_once(
-        changed["pipeline/dr.py"], "env=hook_environment()", "env=engine_environment()"
+        changed["pipeline/dr.py"],
+        "env=hook_environment(extra_names=pass_environment)",
+        "env=engine_environment()",
     )
     assert _env_list_drift(text, changed)
 
@@ -1978,6 +2004,36 @@ def _harness_drift(text: str, sources: Mapping[str, str]) -> list[str]:
 
 def test_the_harness_section_matches_the_code() -> None:
     _assert_no_drift(11, _harness_drift(_doc_text(), _harness_sources()))
+
+
+def _harness_start_gap(text: str, sources: Mapping[str, str]) -> set[str]:
+    """Harness modules on one side only: the threat-model test's spawn forms, run over the
+    harness, against section 11's process-start rows."""
+    live = _subprocess_sites({rel: _code_only(source) for rel, source in sources.items()})
+    assert live, "no harness process start found by the threat-model forms: the scan is dead"
+    return live ^ set(_start_rows_in(_harness_region(text, _HARNESS_STARTS_LEAD)))
+
+
+def test_the_harness_starts_agree_with_the_threat_model_detector() -> None:
+    """Section 11's process starts are held to this page's own detector above. The threat-model
+    test keeps its own spawn forms and its own register, ``_ALLOWED_SUBPROCESS_SITES``, which
+    covers the engine and the toolkit only. Two registers of one class, read by two detectors,
+    drift apart unless something compares them (vault BACKLOG #3474, item 10), as
+    :func:`test_the_two_process_start_inventories_agree` does for section 4. The harness is not
+    added to that register: it is the 15.1.5 section's, matched there by basename."""
+    gap = _harness_start_gap(_doc_text(), _harness_sources())
+    assert not gap, f"the two harness process-start inventories disagree on {sorted(gap)}"
+
+
+def test_the_harness_start_comparison_fires() -> None:
+    """A start section 11 does not list, and a row the code does not back, each show as a gap."""
+    text, sources = _doc_text(), _harness_sources()
+    planted = {**sources, "load/planted.py": "import os\nos.startfile(path)\n"}
+    assert _harness_start_gap(text, planted) == {"load/planted.py"}
+    anchor = "| `__main__.py` | `git rev-parse HEAD` |"
+    assert text.count(anchor) == 1, "re-anchor the planted row on a row section 11 still has"
+    widened = text.replace(anchor, "| `load/ghost.py` | x | x | argument list |\n" + anchor)
+    assert _harness_start_gap(widened, sources) == {"load/ghost.py"}
 
 
 _SWAP_CONTROLS: list[tuple[str, tuple[str, ...]]] = [

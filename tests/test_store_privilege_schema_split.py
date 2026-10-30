@@ -1250,7 +1250,7 @@ def _keyed_postgres_store(conn: _GenesisPgConn, chain: list[list[dict[str, Any]]
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[Any]:
         yield conn
 
-    async def _no_lock(conn: Any, classid: int, key: str) -> None:
+    async def _no_lock(conn: Any, classid: int, key: str, *, timeout: float | None = None) -> None:
         return None
 
     async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
@@ -1398,7 +1398,7 @@ async def test_sqlserver_starts_a_fresh_chain_with_insert_alone(
     async def _commit(_conn: Any) -> None:
         return None
 
-    async def _applock(_cur: Any, _resource: str) -> None:
+    async def _applock(_cur: Any, _resource: str, *, timeout_ms: int | None = None) -> None:
         return None
 
     async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:

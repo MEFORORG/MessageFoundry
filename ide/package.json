@@ -721,7 +721,7 @@
         "messagefoundry.serviceConfig": {
           "type": "string",
           "default": "messagefoundry.toml",
-          "description": "Service-settings TOML the engine loads (relative to the workspace). The Alert Wizard reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent."
+          "description": "Service-settings TOML the engine loads (relative to the workspace). The Alert Wizard reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent. Connection edits are also checked against this file; the extension README says when."
         },
         "messagefoundry.engineUrl": {
           "type": "string",
@@ -766,9 +766,17 @@
                     "url": {
                       "type": "string",
                       "description": "This instance's Engine API URL, e.g. https://prod-shard-1:8765."
+                    },
+                    "caFile": {
+                      "type": "string",
+                      "markdownDescription": "Optional full path to a PEM to trust for this instance. Defaults to its environment's `caFile`, including one that is refused, which then refuses every request to an `https://` instance too unless another entry pins its `host:port` with a usable `caFile`."
                     }
                   }
                 }
+              },
+              "caFile": {
+                "type": "string",
+                "markdownDescription": "Optional full path (a drive-letter or UNC path on Windows, an absolute path elsewhere) to a PEM certificate to trust for this engine: its issuing CA, or its own self-signed certificate. Requests to this engine then verify against this file instead of the default roots. On an `https://` entry, a value this extension refuses (at least: not a string, not a full path) never falls back to the default roots. Unless another entry pins the same `host:port` with a usable `caFile`, every request to it is refused. Correct the `caFile`, or remove every refused `caFile` for that `host:port`, to end that. On an `http://` entry a `caFile` is refused and pins nothing, so requests are still sent. Verification is never turned off. The file is re-read when a request fails verification, so a renewed certificate written to the same path is followed."
               }
             }
           }

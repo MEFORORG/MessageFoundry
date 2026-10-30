@@ -1289,12 +1289,14 @@ def test_a_service_config_that_cannot_be_read_exits_2(
 
 # --- the source guard ----------------------------------------------------------------------------------
 
-#: Product callers that may pass ``keyless_chain_refusal=None`` without computing it, and why. Each is
-#: read-only against the audit log, or is not a path a service opens its store through.
+#: Product callers that may pass ``keyless_chain_refusal=None`` without computing it, and why. Each
+#: starts no keyless chain: it is read-only against the audit log, appends nothing itself, or is not
+#: a path a service opens its store through.
 _MAY_PASS_NONE = {
     # read-only: db_status() for the support bundle
     ("messagefoundry/support/bundle.py", "_db_info"),
-    # read-only: open and close, or list_messages, for the deployment verifier
+    # read-only: open and close, or list_messages, for the deployment verifier. One exception,
+    # which appends nothing itself: smoke.connect_opens_read_only names it (BACKLOG #1708).
     ("messagefoundry/verify/smoke.py", "check_store_connectivity._open_close"),
     ("messagefoundry/verify/smoke.py", "newest_message_id._newest"),
     ("messagefoundry/verify/smoke.py", "check_smoke_disposition._poll"),
@@ -1334,6 +1336,10 @@ _CLI_OPENERS = {
     # the read-only "an Administrator exists" probe before the prompt: at the refusing default it
     # would refuse an existing empty store even under the opt-out the CLI gate already accepted
     "_provision_admin.administrator_exists",
+    # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
+    # alert's open instance lands in the store, on the write's verdict and posture. It passes no
+    # create; this guard reads only the verdict, so nothing here pins that
+    "_provision_admin.reopen",
     # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
     "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",

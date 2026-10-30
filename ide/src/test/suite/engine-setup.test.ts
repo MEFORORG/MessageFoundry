@@ -89,9 +89,11 @@ suite("engine setup page — the test-only dev engine is separated and context-h
       "must state that a store-less launch confirms creating a NEW database",
     );
     // ADR 0183 Wave 5: the engine creates no account, so Start provisions one before it serves.
+    // Vault BACKLOG #3849 B3: in the Start dialog's words, a LOCAL administrator.
     assert.ok(
-      /no enabled administrator/i.test(body) && /provision one before the engine starts/i.test(body),
-      "must state that Start provisions an administrator before the engine starts",
+      /no enabled local administrator/i.test(body) &&
+        /provision one before the engine starts/i.test(body),
+      "must state that Start provisions a local administrator before the engine starts",
     );
     // Has-store half: a launch where a store exists shows no modal — it just starts that engine.
     assert.ok(

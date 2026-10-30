@@ -268,7 +268,10 @@ def raw_body_without_summary(perms: Iterable[Permission]) -> bool:
     a time; the routes keep their own gates as a second line. No built-in role has this shape.
 
     **Judged per role, and it stays that way (a maintainer decision of 2026-10-12, not an owner
-    ruling; vault BACKLOG #2727).** Each caller passes one role's set, never a user's merged set.
+    ruling; vault BACKLOG #2727).** The minting and decoding callers pass one role's set, never a
+    user's merged set. ``Identity.build`` also passes the merged set it built, as a tripwire that
+    whole roles cannot trip (vault BACKLOG #3474), so a rule added here must hold for a union of
+    roles that each pass it.
     So a ``view_raw`` role meant to pair with another role's ``view_summary`` is refused, even for
     a user who would hold both roles. docs/SECURITY.md, "Custom roles", gives the reasons and the
     premise they rest on, and ``tests/test_custom_roles.py`` pins the answer.

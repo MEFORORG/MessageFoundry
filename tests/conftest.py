@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from tests import _process_guard as process_guard
+from tests import _timing_quarantine as timing_quarantine
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._qt_cycles import collect_qobjects_in_cycles
@@ -910,6 +911,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:
             item.add_marker(pytest.mark.tooling)
+    # BACKLOG #4773: the timing quarantine, from tests/timing_quarantine.txt, which states its rules.
+    timing_quarantine.mark_quarantined(items, _TESTS_DIR)
 
 
 @pytest.fixture(autouse=True)

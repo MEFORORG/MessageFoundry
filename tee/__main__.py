@@ -48,8 +48,16 @@ from pathlib import Path
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
-from tee.anon.leak import CoverageTally
-from tee.anon.rules import AnonError, RuleError, kept_defaults, load_rules, retargeted_defaults
+from tee.anon.leak import RETARGET_ADVICE, CoverageTally, LeakReport, has_retarget_residue
+from tee.anon.rules import (
+    RETARGET_ACKNOWLEDGED,
+    AnonError,
+    RuleError,
+    kept_defaults,
+    load_rules,
+    retargeted_defaults,
+)
+from tee.anon.surrogates import site_prefixes_loaded
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -660,9 +668,22 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    # The store is read AFTER both checks above. Read before them, a run with no captured bodies
-    # returned here and never read the overlay, so a bad one stayed hidden until a run that had
-    # bodies (BACKLOG #3003).
+    # Printed whatever the cause, and before the store is read, so every run that passes the salt
+    # and overlay checks says it, one with no captured bodies too. With no prefix the site-code
+    # scrub matches nothing, and the leak-check's live-tables field does not name the prefix. A
+    # warning, not a refusal: a token-less public build loads none (BACKLOG #3516).
+    if not site_prefixes_loaded():
+        print(
+            "warning: no site prefix loaded, so no site code is scrubbed. The token source "
+            "(MEFOR_FORBIDDEN_TOKENS, or else scripts/security/scan-tokens.local.txt in the "
+            "checkout that holds the tee) is unset, missing or unreadable, or has no two-digit "
+            "entry under [site_prefix]",
+            file=sys.stderr,
+        )
+
+    # The store is read AFTER the salt and overlay checks above. Read before them, a run with no
+    # captured bodies returned here and never read the overlay, so a bad one stayed hidden until
+    # a run that had bodies (BACKLOG #3003).
     store = await RelayStore.open(args.db)
     try:
         rows = await store.captures(
@@ -688,8 +709,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             + ", which turns off the default scrub of each: those fields are not rewritten",
             file=sys.stderr,
         )
-    # Printed for the same reason. A different kind can leave part of a field in the dataset
-    # while the leak-check counts the field as scrubbed (BACKLOG #3000).
+    # Printed for the same reason. load_rules refused every retarget the overlay did not list under
+    # [hl7].retarget_acknowledged, so each one here was listed. A different kind can still leave
+    # part of a field in the dataset, and the leak-check scans what is left only for a dashed SSN
+    # or a punctuated phone (BACKLOG #3000, #3493).
     retargeted = retargeted_defaults(rules)
     if retargeted:
         print(
@@ -698,14 +721,24 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 f"{default.path} ({default.kind.value} to {now.kind.value})"
                 for default, now in retargeted
             )
-            + ", which replaces the default scrub of each: a different kind can leave part of "
-            "the field as captured",
+            + f", which replaces the default scrub of each, as [hl7].{RETARGET_ACKNOWLEDGED} "
+            "allows: a different kind can leave part of the field as captured",
             file=sys.stderr,
         )
 
     lines: list[str] = []
     coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
+    # Reports with a shape a retarget left (BACKLOG #3493). A keep is the wrong advice for one:
+    # it would leave the whole field. The row's own refusal text is never printed, so the run
+    # line below is the only place to say so.
+    residue_reports = 0
+
+    def _tally(report: LeakReport) -> None:
+        nonlocal residue_reports
+        coverage.add(report)
+        residue_reports += has_retarget_residue(report)
+
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
@@ -714,7 +747,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 salt=salt,
                 rules=rules,
                 require_full_coverage=args.require_full_coverage,
-                on_report=coverage.add,
+                on_report=_tally,
             )
         except AnonError:
             # Counted apart from the rest: anonymize refused the message before the leak-check
@@ -755,12 +788,23 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             if coverage.refused
             else ""
         )
+        steps = [
+            "Extend the rule map or add a keep in an anon.toml overlay, or repair each line no "
+            "rule can reach (a malformed segment id, or a header line with no separator after "
+            "its encoding characters), then retry."
+        ]
+        if residue_reports:
+            # A keep is the wrong advice here: it would leave the whole field.
+            steps = [
+                f"{residue_reports} of them carried a PHI shape that a retarget of a default field "
+                f"left past its first component. {RETARGET_ADVICE} A keep would leave the whole "
+                "field.",
+                *(["For the others:", *steps] if residue_reports < failed else ["Then retry."]),
+            ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
             "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
-            f"closed). {before_check}Extend the rule map or add a keep in an anon.toml overlay, "
-            "or repair each line no rule can reach (a malformed segment id, or a header line "
-            "with no separator after its encoding characters), then retry.",
+            f"closed). {before_check}{' '.join(steps)}",
             file=sys.stderr,
         )
         return 1

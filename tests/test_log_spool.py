@@ -34,6 +34,7 @@ from messagefoundry.logging_setup import (
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
+    forwarder_status,
     is_permanent_connect_error,
 )
 
@@ -468,6 +469,7 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
     assert installed is False
     assert "ERROR" in out and "failed permanently" in out
     assert "not reachable yet" not in out
+    _assert_reads_not_installed_permanently()
     # The spool was released, so a later configure in this process can take it.
     again = LogSpool(spool_dir, max_bytes=1_000)
     again.open()
@@ -495,6 +497,15 @@ def test_a_name_that_does_not_resolve_fails_permanently_under_the_real_create_so
     out = capsys.readouterr().out
     assert installed is False
     assert "ERROR" in out and "failed permanently" in out
+    _assert_reads_not_installed_permanently()
+
+
+def _assert_reads_not_installed_permanently() -> None:
+    """What the health surface reads after a permanent start failure: configured, not installed,
+    and the fixed word ``permanent`` (vault BACKLOG #4083 finding 11)."""
+    status = forwarder_status()
+    assert (status.configured, status.installed, status.start_failure) == (True, False, "permanent")
+    assert status.state == "not_installed"
 
 
 def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
@@ -1021,7 +1032,7 @@ def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
         fwd.close()  # idempotent: no second report
     reports = [r.getMessage() for r in caplog.records if "drain deadline" in r.getMessage()]
     assert len(reports) == 1
-    assert "moved 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
+    assert "moved at least 3 record(s)" in reports[0] and str(spool_dir) in reports[0]
     assert "late" not in caplog.text  # a count and a directory, never a record
     assert len(_segments(spool_dir)) == 1  # and they are on disk for the next start
 

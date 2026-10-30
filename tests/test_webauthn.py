@@ -675,9 +675,9 @@ async def test_an_account_deleted_mid_enrolment_is_not_reported_as_a_label_clash
         )
         original = store.add_webauthn_credential
 
-        async def delete_first(cred: WebAuthnCredential) -> None:
+        async def delete_first(cred: WebAuthnCredential, **kwargs: Any) -> bool:
             await store.delete_user(identity.user_id)
-            await original(cred)
+            return await original(cred, **kwargs)
 
         monkeypatch.setattr(store, "add_webauthn_credential", delete_first)
         with pytest.raises(ValueError, match="no such user") as raised:
@@ -727,9 +727,9 @@ async def test_a_shared_authenticator_racing_an_enrolment_is_not_a_label_clash(
         )
         original = store.add_webauthn_credential
 
-        async def raced(cred: WebAuthnCredential) -> None:
+        async def raced(cred: WebAuthnCredential, **kwargs: Any) -> bool:
             await original(dataclasses.replace(cred, user_id=racer, label="the other tab"))
-            await original(cred)
+            return await original(cred, **kwargs)
 
         monkeypatch.setattr(store, "add_webauthn_credential", raced)
         with pytest.raises(ValueError, match="this passkey is already enrolled") as raised:
@@ -931,6 +931,7 @@ async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_rem
             *,
             require_way_past: bool = False,
             totp_usable: Any = None,
+            passkey_counts: Any = None,
         ) -> bool:
             await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
             return await real_delete(

@@ -51,7 +51,8 @@ def test_connection_string_neutralizes_password_injection() -> None:
     )
     dsn = connection_string(s)
     assert "PWD={p}}a;Encrypt=no}" in dsn  # brace-quoted, internal } doubled — no breakout
-    # The real security flags are emitted last (ODBC last-wins), so the injected one can't win.
+    # The real security flags are emitted last. The quoting above is what keeps the injected one out:
+    # which repeated keyword the driver keeps is not measured (messagefoundry/odbc_dsn.py).
     assert dsn.rstrip(";").endswith("TrustServerCertificate=no")
     assert "Encrypt=yes" in dsn
 
@@ -80,7 +81,7 @@ def test_multi_subnet_failover_default_off() -> None:
 def test_multi_subnet_failover_emitted_when_enabled() -> None:
     dsn = connection_string(_sqlserver_settings(multi_subnet_failover=True))
     assert "MultiSubnetFailover=Yes" in dsn
-    # It must sit BEFORE the TLS tail so ODBC last-wins keeps the secure Encrypt/Trust flags final.
+    # It sits in the head, BEFORE the TLS tail, so the Encrypt/Trust flags stay the final keywords.
     assert dsn.index("MultiSubnetFailover=Yes") < dsn.index("Encrypt=yes")
     assert dsn.rstrip(";").endswith("TrustServerCertificate=no")
 

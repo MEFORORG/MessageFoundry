@@ -774,6 +774,7 @@ def _sso_service(engine: Engine) -> AuthService:
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",
@@ -942,6 +943,7 @@ async def test_sso_rate_limits_token_leg_only(
         AuthSettings(
             ad_enabled=True,
             kerberos_enabled=True,
+            kerberos_realm="EXAMPLE.COM",
             ad_server="ldaps://x",
             ad_user_search_base="DC=x",
             ad_bind_dn="CN=svc,DC=x",
@@ -979,6 +981,7 @@ async def test_kerberos_preflight_requires_capable_provider(
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",

@@ -316,7 +316,7 @@ def test_a_budget_one_above_the_cap_does_not_warn() -> None:
 
 def test_serve_logs_the_dead_breaker_warning_once_logging_is_configured() -> None:
     """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
-    or it would reach bare stderr only. Read from the source, as the unread-variable replay test in
+    or it would reach stderr only. Read from the source, as the unread-variable replay test in
     tests/test_settings_env_keys.py does, because running ``serve`` that far starts an engine."""
     import inspect
 

@@ -291,6 +291,7 @@ from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
     MISCONFIGURED_ABORT,
+    OUTAGE_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
@@ -311,12 +312,15 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     TrustAnchorError,
     anchor_refusal,
+    explicit_cause,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
     smtp_hop_anchor_spec,
+    trust_anchor_cause,
 )
+from messagefoundry.auth.webauthn import configured_rp_id
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -378,6 +382,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.static_credentials import SETTINGS_PREFIX, static_credential_hops
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     fips_attestation,
     kex_groups_report,
     phi_read_hop_disposition,
@@ -423,7 +428,8 @@ from messagefoundry.pipeline import (
 )
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
-    configured_alert_transport_names,
+    NotifierAlertSink,
+    alerts_without_email,
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import (
@@ -445,9 +451,17 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
+from messagefoundry.pipeline.engine import (
+    CONFIG_WRITE_ACTIONS,
+    ConfigRefusedBeforeApprovalCheck,
+    ConfigWriteAuditFailed,
+)
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
-from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+from messagefoundry.pipeline.refused_body import RefusedBodyPolicy, head_only_resubmit_refusal
+from messagefoundry.pipeline.security_notify import (
+    SecurityEventNotifier,
+    security_notifier_from_settings,
+)
 from messagefoundry.pipeline.security_signals import (
     SecuritySignalThresholds,
     install_security_signals,
@@ -458,8 +472,13 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
+from messagefoundry.privilege_probes import probe_vault
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
+from messagefoundry.remotedebug import (
+    RemoteDebugPosture,
+    install_remote_debug_guard,
+    remote_debug_posture,
+)
 from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
@@ -507,6 +526,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
+    UploadError,
     UploadNotFoundError,
     UploadPathError,
     UploadQuotaError,
@@ -517,6 +537,7 @@ from messagefoundry.uploads import (
     browse_messages,
     split_uploaded,
 )
+from messagefoundry.vault_preflight import run_vault_privilege_preflight
 
 __all__ = ["create_app", "create_managed_app"]
 
@@ -555,8 +576,8 @@ _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/upload
 #:
 #: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
 #: the whole ``/connections`` dashboard family — most of which returns no classified column. The
-#: middleware reads the template off ``request.scope["route"]``, which the router populates during
-#: ``call_next``. An exact set is safe here only because
+#: middleware reads the template off ``request.scope["route"]``, which the router populates before
+#: the response starts. An exact set is safe here only because
 #: ``tests/test_no_store_phi_coverage.py`` selects routes by what their response model CARRIES rather
 #: than by what permission gates it: a new classified route that nobody adds here reds that guard.
 #:
@@ -596,9 +617,10 @@ _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
 
-    The router writes the matched route into the request scope while ``call_next`` runs, so this is
-    readable in a middleware only AFTER the downstream call returns. ``None`` covers a 404 (nothing
-    matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
+    The router writes the matched route into the request scope before the endpoint runs, so a
+    middleware can read it from ``http.response.start`` on, never before it calls downstream.
+    ``None`` covers a 404 (nothing matched) and a mount, neither of which is in
+    :data:`_NO_STORE_ROUTE_PATHS`.
     """
     return getattr(request.scope.get("route"), "path", None)
 
@@ -949,6 +971,12 @@ async def _alert_control_action(
             )
 
 
+def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:
+    """The file and owner fields of a row the system writes for an upload it removed: the prune's,
+    and the removal's after a failed creation row. Shared so the two rows cannot drift apart."""
+    return {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
+
+
 async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     """Write the ``upload.prune`` row for one pruned upload. The retention runner and the
     save-time sweep both call this, so their rows cannot drift apart.
@@ -958,13 +986,7 @@ async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     uploader, and carries no ``client``. The owner is DATA in ``detail``. Both the display name and
     the IMMUTABLE ``uploader_id`` are recorded: the file is gone, and a username is reassignable
     (BACKLOG #1225), so a row read later could otherwise name a different person than it meant."""
-    await store.record_audit(
-        "upload.prune",
-        actor="system",
-        detail=json.dumps(
-            {"file_id": meta.file_id, "uploader": meta.uploader, "uploader_id": meta.uploader_id}
-        ),
-    )
+    await store.record_audit("upload.prune", actor="system", detail=json.dumps(_upload_owner(meta)))
 
 
 async def _record_upload_create(
@@ -976,10 +998,13 @@ async def _record_upload_create(
     short. A row that still fails, by an error or the shutdown drain's cancellation, removes the
     pair, so a failed row does not leave a stored file with no row saying who created it. At
     least two cases still can: a removal the filesystem refuses, which is logged and keeps the
-    pair, and a process that dies between the save and the row. The other way round is possible
-    too: a row that committed and then raised, such as a cancellation while the store releases
-    its connection, removes a file its row names. The file name is not in the row (vault BACKLOG
-    #2619)."""
+    pair, and a process that dies between the save and the row.
+
+    A failed call cannot tell a row that never landed from one that committed and then raised,
+    such as by a cancellation while the store releases its connection. So the removal writes an
+    ``upload.delete`` row of its own (:func:`_discard_and_record`, vault BACKLOG #3740 item 2), so
+    a file a committed row names is not left removed with no row saying so, unless that row fails
+    too, which is logged at ERROR. The file name is in neither row (vault BACKLOG #2619)."""
     try:
         await store.record_audit(
             "upload.create",
@@ -990,8 +1015,52 @@ async def _record_upload_create(
             client=client,
         )
     except BaseException:
-        await us.discard(meta.file_id)
+        await _discard_and_record(store, us, meta)
         raise
+
+
+#: Why :func:`_discard_and_record` removed a file, in its ``upload.delete`` row.
+_UPLOAD_CREATE_ROW_FAILED: Final = "upload.create row failed"
+
+
+async def _discard_and_record(store: Store, us: UploadStore, meta: UploadedFileMeta) -> None:
+    """Remove a stored file whose ``upload.create`` call failed, and write its ``upload.delete``
+    row (vault BACKLOG #3740 item 2). No operator asked for the removal, so, like
+    :func:`_record_upload_prune`'s row, the row is the system's, with no ``client``, and its owner
+    and :data:`_UPLOAD_CREATE_ROW_FAILED` are data in ``detail``. A removal the filesystem
+    refused, or whose answer was not read, writes no row, since the row says the file is gone.
+
+    It runs in the failed call's handler, often during the shutdown drain's cancellation. So the
+    removal and its row run as one task through :func:`_write_through_cancel`, as a delete's do:
+    the cancel waits for both only as long as that allows, and the task goes on past it and
+    writes the row once the removal lands. A row that fails, or a task that ends before the
+    removal answered, is logged at ERROR with its ``file_id``, and the line says which.
+    ``defects=()``, because a raise here would replace the failure being handled."""
+    detail = json.dumps(
+        {**_upload_owner(meta), "size": meta.size, "reason": _UPLOAD_CREATE_ROW_FAILED}
+    )
+    removed = False
+
+    def lost() -> str:
+        shown = _lost_row("upload.delete", "system", detail)
+        if removed:
+            return shown
+        return f"{shown}; the removal had not answered, so the file may still be stored"
+
+    async def remove_then_row() -> None:
+        nonlocal removed
+        removed = await us.discard(meta.file_id)
+        if removed:
+            await store.record_audit("upload.delete", actor="system", detail=detail)
+
+    await write_audit_soft(
+        lambda: _write_through_cancel(remove_then_row(), lost),
+        log=_log,
+        message="upload %s: its upload.create row failed, and the upload.delete row for its "
+        "removal was not written. Lost row: %s",
+        args=lambda: (scrub_log_argument(meta.file_id), lost()),
+        defects=(),
+    )
 
 
 def _dead_letter_replay_audit(
@@ -1054,12 +1123,16 @@ def _reload_refusal(identity: Identity) -> str | None:
 
 
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
-    """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
-    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445).
+    """What a held purge captures. The route's guard and both its rejoins read it. A repeat is
+    recognised when the two are identical (vault BACKLOG #2625 with #2445), or differ only in
+    ``requester``, by the rejoins.
 
     ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
     to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
-    only these params."""
+    only these params. The route's proof-free rejoin passes ``requester_name="any"`` and the
+    core's passes ``"renamed"``, so a renamed requester's repeat joins the hold they already have
+    (BACKLOG #3740 item 9). The default, ``"same"``, would not. The replay and reload holds do not
+    pass it, so a rename still gives those a second hold."""
     return {"name": name, "scope": scope, "requester": requester}
 
 
@@ -1160,6 +1233,16 @@ _INNER_SHARE: Final = 0.8
 #: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
 #: for it and moves on, leaving it to finish or fail on its own.
 _CUT_GRACE_SECONDS: Final = 0.1
+#: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
+#: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
+#: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
+#: budget, and cancel a reload, DR change or ``upload.create`` row that would have finished in it.
+_OUTLIVING_WAIT_SHARE: Final = 0.25
+#: The label the upload route runs its ``upload.create`` row under as an outliving operation. The
+#: upload straggler drain settles these operations only: at least their arms start a removal, and
+#: a path that runs ``_record_upload_create`` under another label drops out of that wait (vault
+#: BACKLOG #3740 item 6).
+_UPLOAD_CREATE_OPERATION: Final = "upload.create audit"
 
 #: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
 #: this keeps one alive until it ends.
@@ -1313,8 +1396,16 @@ def _app_drain_steps(
        released reload's outcome write follows the reload.
     2. Upload stragglers (vault BACKLOG #3180), with an upload store only: the quota-ledger calls a
        cancelled save left running, the releases they start, and the save-time sweeps that write
-       ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
-       ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
+       ``upload.prune`` rows. After the long-operations drain, because a pair removed when its
+       ``upload.create`` row failed there (vault BACKLOG #3178) is removed by that operation's
+       cancellation arm. The arm can still be running when the long-operations drain stops
+       waiting, as when the cancelled row's own unwind outlasts that drain's grace, so this step
+       first waits, within its own wait, for the ``upload.create`` operations still running,
+       and no other (vault BACKLOG #3740 item 6). A removal those start is then held as a
+       straggler before the drain looks. One whose operation is still running when that wait
+       ends can start after the drain returned.
+       Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
+       counted it as still rolling back.
     3. Every approval write the gate still has running (BACKLOG #2087), at least the outcome writes
        and the request writes (vault BACKLOG #3193), which would otherwise meet a closed store.
     4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
@@ -1331,12 +1422,14 @@ def _app_drain_steps(
     outliving: OutlivingOperations = app.state.outliving_operations
 
     async def _outliving(bound: float) -> None:
-        # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
-        # rollback arm record 'interrupted' before the store closes. With the managed lifespan's
-        # full set of steps that grace is below the DR hook reap, and the NSSM window leaves the
-        # budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py) states what that costs.
-        wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
-        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
+        # _OUTLIVING_WAIT_SHARE of it waiting, the rest grace: the grace after is what lets a
+        # cancelled operation's rollback arm record 'interrupted' before the store closes. With
+        # the managed lifespan's full set of steps that grace is below the DR hook reap, and the
+        # NSSM window leaves the budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py)
+        # states what that costs.
+        share = bound * _INNER_SHARE
+        wait = min(OUTLIVING_DRAIN_SECONDS, share * _OUTLIVING_WAIT_SHARE)
+        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, share - wait))
 
     steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
     uploads: UploadStore | None = getattr(app.state, "upload_store", None)
@@ -1345,12 +1438,17 @@ def _app_drain_steps(
         # slots that go stale: a discard removal it cancels leaves a stored file with no
         # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
         # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
-        # its bound, so it cancels what it owns before the cut.
+        # its bound, so it cancels what it owns before the cut. It settles the upload.create rows
+        # first, as item 2 above says; a DR change or reload still rolling back gets only the
+        # long-operations drain's grace.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
                 0.5,
-                lambda b: uploads.drain_stragglers_within(b * _INNER_SHARE),
+                lambda b: uploads.drain_stragglers_within(
+                    b * _INNER_SHARE,
+                    settle=partial(outliving.settle, label=_UPLOAD_CREATE_OPERATION),
+                ),
             )
         )
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
@@ -1388,6 +1486,100 @@ def _app_drain_steps(
                 lambda _b: app.state.summary_auditor.flush(store),
             )
         )
+    return steps
+
+
+def _managed_teardown_steps(
+    app: FastAPI,
+    engine: Engine,
+    store: Store,
+    auth: AuthService | None,
+    *,
+    background: Sequence[asyncio.Future[None]],
+    upload_retention_runner: UploadRetentionRunner | None,
+    security_notifier: SecurityEventNotifier | None,
+    remove_security_signals: Callable[[], None] | None,
+    notifier: NotifierAlertSink | None,
+) -> list[_TeardownStep]:
+    """The managed lifespan's shutdown steps, in order, each optional one left out when its part
+    was never built. A function of its own so a test can pin the order and count the bounded
+    steps against the real list (vault BACKLOG #3740 items 15 and 16)."""
+    steps: list[_TeardownStep] = []
+    if upload_retention_runner is not None:
+        # Handed part of its bound, so the runner's own wait ends, names any unaudited file and
+        # cancels the sweep before the teardown cuts it. With the managed set of steps that bound
+        # is below the runner's own default wait, which then never runs in full here.
+        steps.append(
+            _TeardownStep(
+                "the upload retention runner's stop",
+                0.5,
+                lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
+            )
+        )
+    # return_exceptions absorbs both our cancellation AND any exception a task that died earlier
+    # stored (review M-33).
+    steps.append(
+        _TeardownStep(
+            "the store-reading tasks",
+            0.1,
+            lambda _b: asyncio.gather(*background, return_exceptions=True),
+            # Never cut, as before: a task left running here would meet the store that
+            # engine.stop() closes.
+            bounded=False,
+        )
+    )
+    steps += _app_drain_steps(app, store, auth, owns_auth=True)
+    # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit row.
+    # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
+    # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
+    # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
+    # wait ends before the step is cut; the wait never cancels a write. A small floor, since the
+    # gate closes at once and most shutdowns have no write running. The embedded lifespan
+    # (create_app(engine=...)) has no such step, so its caller's engine.stop() runs the 5 s wait,
+    # outside the reserve that lifespan's budget assumes.
+    steps.append(
+        _TeardownStep(
+            "the config-write drain",
+            0.25,
+            lambda b: engine.drain_config_writes(b * _INNER_SHARE),
+        )
+    )
+    if security_notifier is not None:
+        # It drains queued user emails, and records a notice it could not send in the audit log,
+        # so it closes while the store is open, after the lock notices that hand it mail (BACKLOG
+        # #3191).
+        steps.append(
+            _TeardownStep(
+                "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
+            )
+        )
+    if remove_security_signals is not None:
+        steps.append(
+            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
+        )
+    steps.append(
+        _TeardownStep(
+            "engine.stop()",
+            _ENGINE_STOP_RESERVE_SECONDS,
+            lambda _b: engine.stop(),
+            bounded=False,
+        )
+    )
+    # B11: the harness-only instrumented executor (None in production and other tests). The engine
+    # is stopped, so no more to_thread work: a non-blocking shutdown is clean.
+    shim_executor = getattr(app.state, "connscale_executor", None)
+    if shim_executor is not None:
+        steps.append(
+            _TeardownStep(
+                "the instrumented executor's shutdown",
+                0.05,
+                _sync(partial(shim_executor.shutdown, wait=False)),
+            )
+        )
+    if notifier is not None:
+        # Last, after the engine quiesces, so a final connection_stopped or queue_buildup alert
+        # still drains.
+        steps.append(_TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose()))
     return steps
 
 
@@ -1827,7 +2019,8 @@ def _posture_loosenings(
             revocation_attested_hops=revocation_hops,
             path_form_fhir_hops=path_form_hops,
             api=api_settings,
-            # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
+            # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
+            # gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
             # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
             # live section. An app built without it (an embedding, or a test) is read at the
@@ -2035,10 +2228,9 @@ _ROW_UNWIND_MARGIN_SECONDS: Final = 0.1
 _UNLANDED_ROW_WRITES: set[asyncio.Future[Any]] = set()
 
 
-async def _write_through_cancel(
-    write: Coroutine[Any, Any, object], lost: Callable[[], str]
-) -> None:
-    """Await an audit row's ``write`` so that a cancel cannot cut it short (BACKLOG #3157 item 4).
+async def _write_through_cancel[T](write: Coroutine[Any, Any, T], lost: Callable[[], str]) -> T:
+    """Await an audit row's ``write`` so that a cancel cannot cut it short (BACKLOG #3157 item 4),
+    and return what it returns.
 
     At least :meth:`OutlivingOperations.drain` cancels a reload still running at shutdown, and the
     cancel can land while the reload's own outcome row is being written. Cancelling that write
@@ -2057,9 +2249,8 @@ async def _write_through_cancel(
     from messagefoundry.uploads import _wait_to_completion
 
     task = asyncio.ensure_future(write)
-    write_cancelled = False
     try:
-        await _wait_to_completion(task, cancel_bound=_row_cancel_wait)
+        return await _wait_to_completion(task, cancel_bound=_row_cancel_wait)
     except asyncio.CancelledError:
         current = asyncio.current_task()
         if not (task.cancelled() and (current is None or current.cancelling() == 0)):
@@ -2071,11 +2262,9 @@ async def _write_through_cancel(
         # Nobody cancelled the caller: the write itself was cancelled, as by a store that closed
         # under it. That is a failed write for the caller's fail-soft handler to log, not a
         # cancellation to pass on.
-        write_cancelled = True
-    if write_cancelled:
-        # Raised after the handler, so the caught cancellation rides neither __cause__ nor
-        # __context__.
-        raise RuntimeError("the audit row's write was cancelled")
+    # Reached only when the write itself was cancelled. Raised after the handler, so the caught
+    # cancellation rides neither __cause__ nor __context__.
+    raise RuntimeError("the audit row's write was cancelled")
 
 
 def _row_cancel_wait() -> float:
@@ -2285,6 +2474,23 @@ async def _answer_refused_reload(
     raise HTTPException(status, answer) from exc
 
 
+def _refused_by_trust_anchor(exc: WiringError) -> bool:
+    """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
+    cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
+    the shape the settings preflight and ``refused_connection_anchor`` raise.
+
+    A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
+    factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
+    config to fix: ``invalid_config``, as the reload has always audited it (vault BACKLOG
+    #3498). A cycle ends the walk."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while isinstance(cur, WiringError) and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return isinstance(cur, TrustAnchorError)
+
+
 async def _audit_refused_reload(
     engine: Engine,
     exc: Exception,
@@ -2311,7 +2517,9 @@ async def _audit_refused_reload(
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
-    request whose digest cannot be taken is refused the same way, with no hold filed. A directory
+    request whose digest cannot be taken is refused the same way, with no hold filed. A release
+    refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
+    and adds ``approved_fingerprint`` and ``approval_digest_check`` ``not_reached``. A directory
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
     engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
     ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
@@ -2343,6 +2551,14 @@ async def _audit_refused_reload(
     (BACKLOG #3157)."""
     warn = _log.warning if reported is None else _log.debug
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run, **(extra or {})}
+    if isinstance(exc, ConfigRefusedBeforeApprovalCheck):
+        # A release refused before its digest check, such as by the trust check of a source whose
+        # permissions were loosened: the row names the approval and says the check was not
+        # reached, so it is not read as a refusal of the approved bytes (vault BACKLOG #2596). A
+        # digest and a marker only. Before the chain, which still sets the reason: it is a
+        # WiringError, and its kept cause tells trust_anchor and store_unavailable apart.
+        detail["approved_fingerprint"] = exc.approved
+        detail["approval_digest_check"] = "not_reached"
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
@@ -2393,7 +2609,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc, WiringError) and isinstance(exc.__cause__, AnchorStoreUnavailable):
+    elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
         # warn, as every refusal here: a convergence reload's retry logs at DEBUG (vault #3109).
@@ -2405,7 +2621,7 @@ async def _audit_refused_reload(
         status = 503
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     elif isinstance(exc, WiringError):
-        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
@@ -2720,9 +2936,7 @@ async def _compare_start_config(
     digest, as main's did. The caller stops the process vouching for that digest only when both
     digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
     that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least two cases: an edit that lands and is reverted between them, and
-    a module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
-    source the digests hash.
+    reads miss at least an edit that lands and is reverted between them.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
     start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it
@@ -3545,22 +3759,6 @@ async def _audit_alert_rules_withheld(
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
-
-    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
-    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
-    would then be hidden as one."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
-
-
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -3610,7 +3808,7 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
-        if _caused_by_trust_anchor(exc):
+        if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
@@ -3795,6 +3993,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
+    # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
+    # imports, so a script injected while they load still runs. Installing at import would put a
+    # permanent audit hook in every process that imports the package, which this does not.
+    # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
+    # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
+    install_remote_debug_guard()
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -3836,10 +4041,11 @@ def create_app(
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
     # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
-    # DR activate, DR release and config reload outlive a caller the request deadline cancels, and
-    # the managed lifespan drains what is still running before engine.stop() (vault BACKLOG #2751,
-    # #2752, #2753). One per app; the handlers below close over it, so /ui gets it too, and so does
-    # the approval gate's released reload.
+    # DR activate, DR release, config reload, an upload's upload.create row and an upload delete
+    # outlive a caller the request deadline cancels (vault BACKLOG #2751, #2752, #2753, #3178).
+    # Both lifespans drain what is still running; _app_drain_steps says when. One per app; the
+    # handlers below close over it, so /ui gets it too, and so does the approval gate's released
+    # reload.
     outliving = OutlivingOperations()
     app.state.outliving_operations = outliving
     if engine is not None:
@@ -4064,44 +4270,68 @@ def create_app(
     # One-shot XFP-omission tripwire state (L5b, ADR 0068 §8): fires at most once per process.
     xfp_tripwire_fired = False
 
-    @app.middleware("http")
-    async def _security_headers(request: Request, call_next: Any) -> Any:
+    # _security_headers and _limit_request_body are PURE ASGI, never ``@app.middleware("http")``
+    # (BACKLOG #3907): that decorator's BaseHTTPMiddleware ends a response cleanly before an inner
+    # raise leaves it, which turns a stopped export into a complete-looking short file. See
+    # ExportStopped. They are closure factories rather than classes because they share create_app
+    # locals, the tripwire's nonlocal flag among them.
+
+    def _security_headers(inner: ASGIApp) -> ASGIApp:
+        async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
+            nonlocal xfp_tripwire_fired
+            if scope["type"] != "http":
+                await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            if (
+                tls_terminated_upstream
+                and not xfp_tripwire_fired
+                and request.url.scheme == "http"
+                and (request.url.path == "/ui" or request.url.path.startswith("/ui/"))
+            ):
+                # A /ui request arrived with a cleartext scheme while a TLS-terminating proxy is
+                # DECLARED — either the proxy is not sending X-Forwarded-Proto, or its peer address
+                # is not matched by [api].trusted_proxies (including the ::1-vs-127.0.0.1
+                # mismatch). Cookie Secure/HSTS are forced by exposure_protected regardless, but
+                # the source-IP chain (audit, rate limits, new-IP step-up) is degraded until this
+                # is fixed.
+                xfp_tripwire_fired = True
+                _log.warning(
+                    "a /ui request arrived scheme=http while [api].tls_terminated_upstream is set "
+                    "— the proxy is not sending X-Forwarded-Proto, or its peer IP is not matched "
+                    "by [api].trusted_proxies (check ::1 vs 127.0.0.1). See "
+                    "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
+                )
+
+            async def send_with_headers(message: Message) -> None:
+                # The response start is where the router has run, so the matched route the
+                # no-store arm reads is in the scope by now.
+                if message["type"] == "http.response.start":
+                    _apply_security_headers(request, MutableHeaders(scope=message))
+                await send(message)
+
+            await inner(scope, receive, send_with_headers)
+
+        return middleware
+
+    def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
         # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped operator client
         # is the browser web console at /ui, so these bind today, and they cost nothing on a JSON
         # API. HSTS is emitted over https OR when the operator declared the
         # browser-facing scheme https (exposure_protected — L5b, ADR 0068 §8: the per-request
         # scheme is unreliable behind a proxy that omits X-Forwarded-Proto).
-        nonlocal xfp_tripwire_fired
-        if (
-            tls_terminated_upstream
-            and not xfp_tripwire_fired
-            and request.url.scheme == "http"
-            and (request.url.path == "/ui" or request.url.path.startswith("/ui/"))
-        ):
-            # A /ui request arrived with a cleartext scheme while a TLS-terminating proxy is
-            # DECLARED — either the proxy is not sending X-Forwarded-Proto, or its peer address
-            # is not matched by [api].trusted_proxies (including the ::1-vs-127.0.0.1 mismatch).
-            # Cookie Secure/HSTS are forced by exposure_protected regardless, but the source-IP
-            # chain (audit, rate limits, new-IP step-up) is degraded until this is fixed.
-            xfp_tripwire_fired = True
-            _log.warning(
-                "a /ui request arrived scheme=http while [api].tls_terminated_upstream is set — "
-                "the proxy is not sending X-Forwarded-Proto, or its peer IP is not matched by "
-                "[api].trusted_proxies (check ::1 vs 127.0.0.1). See "
-                "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
-            )
-        response = await call_next(request)
+        #
         # The header names/values and the HSTS condition come from api/header_floor.py so this
         # middleware and the outermost floor that backstops it cannot drift apart. This one still
         # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
         for name, value in BASELINE_SECURITY_HEADERS:
-            response.headers.setdefault(name, value)
+            headers.setdefault(name, value)
         # hsts_notable, NOT hsts_applies: this middleware is the INNERMOST writer, so it wins the
         # setdefault race against the floor. Leaving the bare scheme test here would put HSTS on
         # every routed response of the minted-certificate default and the floor could never take it
         # off again -- the guard has to hold at both emitters or it holds at neither.
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
-            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
+            headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
@@ -4117,18 +4347,27 @@ def create_app(
             # no-store still applies to any /ui path so a browser/proxy never caches HTML.
             ui_csp = getattr(request.app.state, "ui_csp", None)
             if ui_csp is not None:
-                response.headers["Content-Security-Policy"] = ui_csp
-            response.headers["Cache-Control"] = "no-store"
+                headers["Content-Security-Policy"] = ui_csp
+            headers["Cache-Control"] = "no-store"
         # Prefix test first: it is a C-level startswith over a 5-tuple and short-circuits the whole
         # PHI-read surface before the scope lookup is reached.
         elif path.startswith(_NO_STORE_PREFIXES) or (
             _matched_route_path(request) in _NO_STORE_ROUTE_PATHS
         ):
-            response.headers["Cache-Control"] = "no-store"
-        return response
+            headers["Cache-Control"] = "no-store"
 
-    @app.middleware("http")
-    async def _limit_request_body(request: Request, call_next: Any) -> Any:
+    def _limit_request_body(inner: ASGIApp) -> ASGIApp:
+        async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
+            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
+            if refusal is None:
+                await inner(scope, receive, send)
+            else:
+                await refusal(scope, receive, send)
+
+        return middleware
+
+    def _body_refusal(request: Request) -> JSONResponse | None:
+        """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
         # generous cap rejects oversized/abusive bodies early (API-INPUT).
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
@@ -4166,7 +4405,7 @@ def create_app(
                     {"detail": "chunked request bodies are not accepted; send a Content-Length"},
                     status_code=411,
                 )
-            return await call_next(request)
+            return None
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4182,7 +4421,13 @@ def create_app(
         if too_big:
             _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
             return JSONResponse({"detail": "request body too large"}, status_code=413)
-        return await call_next(request)
+        return None
+
+    # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body
+    # OUTSIDE _security_headers, as the two decorators did: its 400/411/413 refusals do not pass
+    # through _security_headers, and the outermost floor (registered below) is what covers them.
+    app.add_middleware(_security_headers)
+    app.add_middleware(_limit_request_body)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -4398,10 +4643,12 @@ def create_app(
         store_privilege = getattr(request.app.state, "store_privilege", None)
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
-        # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process. An app built without `serve` takes it here, once, and that first
-        # reading reads files, so the call is kept off the event loop.
+        # create_app installed the remote-debugging hook (vault BACKLOG #3673), so a reading that
+        # says it is missing points at another audit hook in the process.
+        #
+        # The start-up reading is the one `serve` took as it started, kept for the life of the
+        # process. An app built without `serve` takes it here, once, and that first reading reads
+        # files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
         # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
@@ -5051,10 +5298,12 @@ def create_app(
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
                 refused = _ANCHOR_REFUSED_DETAIL
-            except WiringError as exc:
+            except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
-                # audit row. The full refusal goes to the operator log; the answer names only the
+                # audit row. BACKLOG #2193: a hop guard the connector's own constructor runs, such
+                # as the FTPS poll's revocation guard, raises InsecureHopRefused, a ValueError and
+                # not a WiringError, and is the same refusal. The full refusal goes to the operator log; the answer names only the
                 # listener, because other start gates' text can name paths and sibling bindings.
                 _log.warning(
                     "operator %s of inbound connection %r refused: %s",
@@ -5350,13 +5599,16 @@ def create_app(
         operation: str,
         params: dict[str, Any],
         identity: Identity,
+        *,
+        requester_name: Literal["same", "any", "renamed"] = "same",
     ) -> str | None:
-        """The caller's open hold for this exact request, answered with no proof, or ``None``.
+        """The caller's open hold for this request, answered with no proof, or ``None``.
 
         For the two ``proof_in_route`` routes (vault BACKLOG #2625). A rejoin holds and runs nothing,
         so it spends no proof, even one the request brought. It does need a live session window,
         as the org opt-out asks of every request, so a session whose window has lapsed goes to the
-        proof instead. ``None`` sends the route on to its spend and its guard."""
+        proof instead. ``None`` sends the route on to its spend and its guard.
+        ``requester_name`` is :meth:`ApprovalGate.rejoin`'s."""
         if gate is None or not await step_up_window_live(request):
             return None
         return await gate.rejoin(
@@ -5365,6 +5617,7 @@ def create_app(
             requester=identity.username,
             requester_user_id=identity.user_id,
             client=client_ip(request),
+            requester_name=requester_name,
         )
 
     @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
@@ -5398,6 +5651,7 @@ def create_app(
                 "connection_purge",
                 _purge_hold_params(name, scope, identity.username),
                 identity,
+                requester_name="any",
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -5439,9 +5693,22 @@ def create_app(
         if (
             gate is not None
         ):  # dual-control: hold for a second approver when [approvals] gates purge
-            pending = await gate.guard(
+            params = _purge_hold_params(name, scope, identity.username)
+            # BACKLOG #3740 item 9: the guard matches the params text, which carries the display
+            # name, so a renamed requester's repeat is joined here first, on the immutable id.
+            # Only a renamed one: an exact repeat goes to the guard, whose serialized step never
+            # joins a request settled since. Nothing is filed here, so a hold settled before this
+            # read gets a new one from the guard, under the current name.
+            pending = await gate.rejoin(
                 "connection_purge",
-                _purge_hold_params(name, scope, identity.username),
+                params,
+                requester=identity.username,
+                requester_user_id=identity.user_id,
+                client=client_ip(request),
+                requester_name="renamed",
+            ) or await gate.guard(
+                "connection_purge",
+                params,
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
@@ -6785,9 +7052,9 @@ def create_app(
         caller is re-resolved before each row. Once its standing fails, or its channel scope differs
         from the one it started with, wider or narrower, the stream records
         ``messages_export.stopped`` and raises :class:`ExportStopped` (BACKLOG #1154, #3381), which
-        does not reach the client as a failed download; see that class. Each streamed body is re-checked
-        against that row's per-channel scope, which is therefore the starting one (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
+        reaches the client as a failed download (BACKLOG #3907); see that class. Each streamed body
+        is re-checked against that row's per-channel scope, which is therefore the starting one
+        (load-bearing for the attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited
         (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
@@ -7642,6 +7909,9 @@ def create_app(
         be proved after retention has blanked both bodies (vault BACKLOG #2615,
         :func:`_edit_resend_provenance`).
 
+        A refused body whose row stored only its head is refused 409 in both modes, since its body is
+        cut (vault BACKLOG #2608, :func:`head_only_resubmit_refusal`).
+
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
         store write gives the proof back."""
@@ -7649,6 +7919,15 @@ def create_app(
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
         )
+
+    def _refuse_head_only(message_id: str, row: Mapping[str, Any]) -> None:
+        """409 when ``row`` is a refused body stored only as its head; :func:`head_only_resubmit_refusal`
+        says why (vault BACKLOG #2608). It reads the metadata the scoped read already decrypted. Each
+        mode calls it last before its store write, after the ingress guards, so every refusal the
+        route made before this check keeps its order and its audit row."""
+        refusal = head_only_resubmit_refusal(message_id, row.get("metadata"))
+        if refusal is not None:
+            raise HTTPException(409, refusal)
 
     async def _edit_resend_core(
         message_id: str,
@@ -7710,6 +7989,7 @@ def create_app(
                     channel_id=row["channel_id"],
                     detail={"message_id": message_id, "mode": "direct", "to": body.to},
                 )
+                _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
                 direct_provenance = await _edit_resend_provenance(engine, row, admitted)
@@ -7786,6 +8066,7 @@ def create_app(
                 channel_id=row["channel_id"],
                 detail={"message_id": message_id, "mode": "reroute"},
             )
+            _refuse_head_only(message_id, row)
             client = client_ip(request)
             reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
@@ -8062,11 +8343,19 @@ def create_app(
             raise HTTPException(409, str(exc)) from None
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
+        #
+        # Kept by design (vault BACKLOG #3740 item 3, the owner's delegated ruling of 2026-10-29):
+        # a deadline here answers 503 for an upload that was stored, so a client that retries
+        # stores the same content a second time. Each copy keeps its own upload.create row, is
+        # owned by its uploader and counts against that uploader's quota, so a duplicate is
+        # attributed and bounded. Discarding the file on a deadline instead would cancel its row
+        # partway, and a removal that is refused or cut short would then leave a stored file with
+        # no row, which is the gap #3178 closed.
         await outliving.run(
             _record_upload_create(
                 engine.store, us, meta, actor=identity.username, client=client_ip(request)
             ),
-            "upload.create audit",
+            _UPLOAD_CREATE_OPERATION,
         )
 
         # ASVS 5.2.4: an age-based retention sweep triggered by the save (off-loop, best-effort). A prune
@@ -8446,20 +8735,41 @@ def create_app(
         except _UploadSidecarRefused:
             refused = True
         client = client_ip(request)
+        actor = identity.username
 
         async def _delete_and_record() -> UploadedFileMeta:
-            removed = await us.delete(file_id, sidecar_refused=refused)
-            await engine.store.record_audit(
-                "upload.delete",
-                actor=identity.username,
-                detail=json.dumps({"file_id": removed.file_id, "size": removed.size}),
-                client=client,
-            )
-            return removed
+            detail: str | None = None
+
+            async def _unlink_then_row() -> UploadedFileMeta | UploadError:
+                nonlocal detail
+                try:
+                    removed = await us.delete(file_id, sidecar_refused=refused)
+                except (UploadPathError, UploadNotFoundError, UploadUnreadableError) as exc:
+                    # Each is raised before any unlink, so no row is owed, and a cancel landing
+                    # meanwhile must not log one as lost. Returned, so the route still answers it.
+                    return exc
+                detail = json.dumps({"file_id": removed.file_id, "size": removed.size})
+                await engine.store.record_audit(
+                    "upload.delete", actor=actor, detail=detail, client=client
+                )
+                return removed
+
+            def _lost() -> str:
+                if detail is not None:
+                    return _lost_row("upload.delete", actor, detail)
+                shown = _lost_row("upload.delete", actor, json.dumps({"file_id": file_id}))
+                return f"{shown}; the delete had not returned, so the file may still be stored"
+
+            # Vault BACKLOG #3740 item 1: the shutdown drain's cancel waits a bounded time for the
+            # unlink and its row, and a row that does not land is logged at ERROR by file_id.
+            outcome = await _write_through_cancel(_unlink_then_row(), _lost)
+            if isinstance(outcome, UploadError):
+                raise outcome
+            return outcome
 
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
-        # row. The shutdown drain can still cancel it, as it can any outliving operation.
+        # row.
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
@@ -9152,6 +9462,7 @@ def create_app(
                 path=db.path,
                 size_bytes=db.size_bytes,
                 disk_free_bytes=db.disk_free_bytes,
+                disk_free_status=db.disk_free_status.value,
                 journal_mode=db.journal_mode,
                 messages=db.messages,
                 events=db.events,
@@ -10026,8 +10337,9 @@ def create_app(
             # this project's own wheel, which is what takes it out of dependency-confusion territory.
             # The previous wording here said to "point at the path install" while the string beneath it
             # already named the distribution; the comment is corrected rather than the string (BACKLOG
-            # #1193). tests/test_install_instruction_provenance.py holds that classification and fails
-            # if this drifts back to an extra that does not exist or a name nobody has claimed.
+            # #1193). messagefoundry/security/audit_all_platforms.py holds that classification
+            # (PUBLISHED_DISTRIBUTIONS), and tests/test_install_instruction_provenance.py fails if
+            # this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
                 "distribution: `pip install messagefoundry-webconsole`, or set "
@@ -10486,6 +10798,16 @@ _MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 #: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
 #: cooldown still pages.
 _PAGING_ALERT_SOURCE = "directory-reconciler-paging"
+#: The source label of a lasting directory outage's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3709), apart from the others for the same reasons.
+_OUTAGE_ALERT_SOURCE = "directory-reconciler-outage"
+#: What the lasting outage tells the operator. Short, for the store's 200-character reason, and
+#: about probes rather than the network: a group search past the engine's own bound reads the same,
+#: and a disable still revokes that account on a pass that reaches its user search.
+_OUTAGE_ALERT_TEXT: Final[str] = (
+    "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
+    "nothing. Check the directory, the path to it, and any group-search paging alert."
+)
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -10505,8 +10827,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_session_revoked`` alert, except a quiet one whose row was written, which the service
     leaves off the returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says
     which are quiet). A whole-directory outage aborts too, but it is audited as
-    ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the directory is not,
-    and the pass is fail-open.
+    ``auth.ad_reconcile_skipped``: the accounts are fine, the directory is not, and the pass is
+    fail-open. One such pass pages nothing. A run of ``[auth].ad_reconcile_outage_passes`` of them
+    pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
+    source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
+    resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -10533,7 +10858,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
     label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
     such a base read as "not found" for every account, so it tripped the breaker on an estate
-    large enough; read as an outage, it would page nobody.
+    large enough; read as an outage, it would page only once the outage lasted (BACKLOG #3709).
 
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, after
     the revocations and on an outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
@@ -10558,9 +10883,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
     also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
+    under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
-    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
+    ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
     sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
@@ -10571,6 +10898,15 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        if plan.outage_page:
+            # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
+            # raises here cannot cost one.
+            sink.ad_reconcile_aborted(
+                _OUTAGE_ALERT_SOURCE,
+                reason=OUTAGE_ABORT,
+                probed=plan.asked,
+                detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
+            )
         return
     if plan.aborted is not None and not plan.judged_nothing:
         # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
@@ -10628,6 +10964,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+    if plan.outage_clear:
+        sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -10682,6 +11020,7 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
+    "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 
@@ -10912,54 +11251,6 @@ def _chain_registry_preflights(
     return chained
 
 
-def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
-    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
-    (BACKLOG #3470). A refused CA must never suppress an alert.
-
-    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
-      transport it lacks, and the other transports would go with it.
-    * A rule or tier that named only email now names every transport left. An empty list means
-      suppress, and the operator never asked for that. ``None`` would not do for a tier: it keeps
-      its rule's transports, which may be an empty list. An explicit empty list stays one.
-    * With no transport left there is no notifier, and the engine's logging sink logs each
-      alert. Only a rule that names a transport is kept then. The notifier refuses it, and the
-      lifespan logs that refusal. The rest route only the notifier, and kept they would log
-      advice to configure the email that is configured.
-    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
-      not built. A secret store that is down cannot abort the start before the CA refusal."""
-    left = sorted(configured_alert_transport_names(alerts) - {"email"})
-
-    def _no_email(transports: list[str] | None) -> list[str] | None:
-        if transports is None:
-            return None
-        kept = [t for t in transports if t != "email"]
-        if transports and not kept:
-            return list(left)
-        return kept
-
-    rules = [
-        rule.model_copy(
-            update={
-                "transports": _no_email(rule.transports),
-                "escalate": [
-                    tier.model_copy(update={"transports": _no_email(tier.transports)})
-                    for tier in rule.escalate
-                ],
-            }
-        )
-        for rule in alerts.rules
-    ]
-    if not left:
-        rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
-    return alerts.model_copy(
-        update={
-            "email_to": [],
-            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
-            "rules": rules,
-        }
-    )
-
-
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -10979,6 +11270,7 @@ def create_managed_app(
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
     max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
+    refused_body: RefusedBodyPolicy | None = None,  # vault BACKLOG #2608: [inbound].refused_body_*
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -11075,7 +11367,9 @@ def create_managed_app(
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it.
+    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
+    Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
     (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
@@ -11110,10 +11404,13 @@ def create_managed_app(
         # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
         # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
-        # UNCLAMPED without an explicit posture, and the plain ldap:// bind refusal reads it too
-        # (vault BACKLOG #2354); threading this makes both apply on first deployment. The LDAPS
-        # ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only for an embedding that passes no [ai] (serve always passes it); since
-        # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
+        # UNCLAMPED without an explicit posture, and the LDAPS revocation guard reads it (BACKLOG
+        # #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain ldap://
+        # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
+        # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
+        # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
+        # fails closed (vault BACKLOG #2354), but the two revocation guards are the unstamped
+        # no-op, as for any hop built outside a posture. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
@@ -11158,7 +11455,7 @@ def create_managed_app(
         notifier_alerts = alerts_settings
         if smtp_anchor_refusal is not None and alerts_settings is not None:
             # Keep the webhook: drop only the email transport, which would load the refused CA.
-            notifier_alerts = _alerts_without_email(alerts_settings)
+            notifier_alerts = alerts_without_email(alerts_settings)
             _log.warning(
                 "alert email is off: the CA it reads was refused. The start check below refuses "
                 "the start. Until then a rule that sent only by email uses the other transports, "
@@ -11285,8 +11582,8 @@ def create_managed_app(
                 await store.close()
                 raise
         # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
-        # api-mTLS client CA), and the settings CAs a hop dials with (vault BACKLOG #3188;
-        # trust_anchors module item 10), BEFORE any listener binds — a group/world-writable anchor refuses (at
+        # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
+        # trust_anchors module item 10) and the SQL Server store pin (item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at
         # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
         # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
         # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
@@ -11317,25 +11614,40 @@ def create_managed_app(
         # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
         # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
         # server principal), so the default single-node path is a log line and nothing else.
+        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
+        # probe check-privileges runs and a client from the provider's own constructor, in the same
+        # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+        # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
+        # it (audited), and so does a probe failure that is not a network failure, a timeout or a
+        # 403, which the opt-out does not lift; every other finding warns and audits
+        # (vault_preflight_outcome). It names the consumers from the
+        # resolved service settings, which serve always passes; an embedding that passes none has
+        # no Vault consumer this lifespan could name.
+        _security = security_settings or SecuritySettings()
+        # The dial falls back to [security].enforcement when no explicit one was passed, so an
+        # embedder that sets only security_settings gets its own dial.
+        _enforcing = (security_enforcement or _security.enforcement) is SecurityEnforcement.ENFORCE
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    # The dial falls back to [security].enforcement when no explicit one was
-                    # passed, so an embedder that sets only security_settings gets its own dial.
-                    enforcing=(
-                        security_enforcement
-                        or (security_settings or SecuritySettings()).enforcement
-                    )
-                    is SecurityEnforcement.ENFORCE,
-                    over_grant_accepted=(
-                        security_settings or SecuritySettings()
-                    ).allow_over_granted_store_principal,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
+            if static_credential_settings is not None:
+                await run_vault_privilege_preflight(
+                    static_credential_settings,
+                    store,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_vault_token,
+                    probe=partial(
+                        probe_vault, settings=static_credential_settings, posture=_hop_posture
+                    ),
+                )
         except BaseException:
             if notifier is not None:
                 await notifier.aclose()
@@ -11387,6 +11699,7 @@ def create_managed_app(
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
             max_staged_depth=max_staged_depth,
+            refused_body=refused_body,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
@@ -11434,6 +11747,23 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
+            # directories they name (key files, CA files, spool dirs), which the `.processed`
+            # archive sweep must never reach.
+            owned_settings=(
+                auth_settings,
+                ai_settings,
+                security_settings,
+                alerts_settings,
+                secrets_settings,
+                tls_settings,
+                cluster_settings,
+                approvals_settings,
+                integrity_settings,
+                service_settings,
+                static_credential_settings,
+                egress_settings,
+            ),
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
             # every real reload. Each listener's own build then enforces again and loads the bytes
@@ -11671,9 +12001,10 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the AD bind, which is built out of the
-                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
-                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
+                    # Thread the derived instance posture to the hops this service builds out of the
+                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
+                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
+                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.
@@ -11686,6 +12017,9 @@ def create_managed_app(
                     admin_grant_alert=administrator_granted_alert(
                         notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
                     ),
+                    # BACKLOG #3937: the relying party a passkey must be under to count as a way
+                    # past the sign-in lock at the factor-drop gates; None counts none.
+                    way_past_rp_id=configured_rp_id(public_origin),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
@@ -11938,88 +12272,17 @@ def create_managed_app(
             for task in background:
                 task.cancel()
 
-            steps: list[_TeardownStep] = []
-            if upload_retention_runner is not None:
-                # Handed part of its bound, so the runner's own wait ends, names any unaudited
-                # file and cancels the sweep before the teardown cuts it. With the managed set of
-                # steps that bound is below the runner's own default wait, which then never runs
-                # in full here.
-                steps.append(
-                    _TeardownStep(
-                        "the upload retention runner's stop",
-                        0.5,
-                        lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
-                    )
-                )
-            # return_exceptions absorbs both our cancellation AND any exception a task that died
-            # earlier stored (review M-33).
-            steps.append(
-                _TeardownStep(
-                    "the store-reading tasks",
-                    0.1,
-                    lambda _b: asyncio.gather(*background, return_exceptions=True),
-                    # Never cut, as before: a task left running here would meet the store that
-                    # engine.stop() closes.
-                    bounded=False,
-                )
+            steps = _managed_teardown_steps(
+                app,
+                engine,
+                store,
+                auth,
+                background=background,
+                upload_retention_runner=upload_retention_runner,
+                security_notifier=security_notifier,
+                remove_security_signals=remove_security_signals,
+                notifier=notifier,
             )
-            steps += _app_drain_steps(app, store, auth, owns_auth=True)
-            # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
-            # row. Drained here, under the budget, rather than by the 5 s wait engine.stop() runs
-            # when no drain ran first. Draining closes the engine's gate, and engine.stop() then
-            # gives a write still running only a 1 s late wait, inside its reserve. Handed
-            # _INNER_SHARE of its bound, so its wait ends before the step is cut; the wait never
-            # cancels a write. A small floor, since the gate closes at once and most shutdowns
-            # have no write running. The embedded lifespan (create_app(engine=...)) has no such
-            # step, so its caller's engine.stop() runs the 5 s wait, outside the reserve that
-            # lifespan's budget assumes.
-            steps.append(
-                _TeardownStep(
-                    "the config-write drain",
-                    0.25,
-                    lambda b: engine.drain_config_writes(b * _INNER_SHARE),
-                )
-            )
-            if security_notifier is not None:
-                # It drains queued user emails, and records a notice it could not send in the audit
-                # log, so it closes while the store is open, after the lock notices that hand it
-                # mail (BACKLOG #3191).
-                steps.append(
-                    _TeardownStep(
-                        "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
-                    )
-                )
-            if remove_security_signals is not None:
-                steps.append(
-                    _TeardownStep(
-                        "the security-signal removal", 0.05, _sync(remove_security_signals)
-                    )
-                )
-            steps.append(
-                _TeardownStep(
-                    "engine.stop()",
-                    _ENGINE_STOP_RESERVE_SECONDS,
-                    lambda _b: engine.stop(),
-                    bounded=False,
-                )
-            )
-            # B11: the harness-only instrumented executor (None in production and other tests). The
-            # engine is stopped, so no more to_thread work: a non-blocking shutdown is clean.
-            shim_executor = getattr(app.state, "connscale_executor", None)
-            if shim_executor is not None:
-                steps.append(
-                    _TeardownStep(
-                        "the instrumented executor's shutdown",
-                        0.05,
-                        _sync(partial(shim_executor.shutdown, wait=False)),
-                    )
-                )
-            if notifier is not None:
-                # Last, after the engine quiesces, so a final connection_stopped or queue_buildup
-                # alert still drains.
-                steps.append(
-                    _TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose())
-                )
             await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS)
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does

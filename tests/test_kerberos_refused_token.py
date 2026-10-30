@@ -99,7 +99,7 @@ def test_kerberos_principal_refuses_a_crafted_token_by_type_only(
     real_wrapper: None, token: bytes, error: str
 ) -> None:
     with pytest.raises(KerberosTokenRefused) as caught:
-        kerberos_principal(token, AuthSettings())
+        kerberos_principal(token, AuthSettings(kerberos_realm="EXAMPLE.COM"))
     assert caught.value.error_type == error
     assert _LEAK not in str(caught.value)
     # Not merely suppressed: a structured logger or crash reporter reads both attributes directly.
@@ -111,7 +111,7 @@ def _refusal_log_line(token: bytes, caplog: pytest.LogCaptureFixture) -> str:
         caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"),
         pytest.raises(KerberosTokenRefused),
     ):
-        kerberos_principal(token, AuthSettings())
+        kerberos_principal(token, AuthSettings(kerberos_realm="EXAMPLE.COM"))
     [record] = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
     assert record.levelname == "WARNING"
     return record.getMessage()
@@ -194,6 +194,7 @@ async def _service(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AuthServi
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",
@@ -337,7 +338,7 @@ def test_a_failed_principal_read_logs_its_status_and_keeps_no_chain(
         caplog.at_level(logging.WARNING, logger="messagefoundry.auth.ldap"),
         pytest.raises(LdapError) as caught,
     ):
-        kerberos_principal(b"token", AuthSettings())
+        kerberos_principal(b"token", AuthSettings(kerberos_realm="EXAMPLE.COM"))
     assert str(caught.value) == "Kerberos principal read failed: _SspiError winerror=-2146893048"
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
