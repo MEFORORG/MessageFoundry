@@ -761,7 +761,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/store.py::MessageStore._ensure_schema": Site(
         2, OPERATOR, _SQLITE_SIDECARS
     ),
-    "messagefoundry/store/store.py::forget_store_salt": Site(
+    "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(

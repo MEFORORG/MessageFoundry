@@ -10440,10 +10440,10 @@ class PostgresStore:
 
         Every account's epoch is raised first, in id order, so the account row locks are taken
         before any session row's, the order ``create_session`` takes them in, and two of these
-        take them in one order. The borrow is :meth:`_after_commit_txn`'s, for the reason it
-        gives."""
+        take them in one order. The borrow is the ordinary bounded one: this is a standalone act,
+        not the tail of a write its caller already committed."""
         now = time.time() if now is None else now
-        async with self._after_commit_txn() as conn:
+        async with self._timed_acquire() as conn, conn.transaction():
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
                 await self._bump_session_epoch(conn, str(row["id"]))
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)

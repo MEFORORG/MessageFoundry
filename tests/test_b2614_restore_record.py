@@ -76,7 +76,7 @@ async def test_the_first_start_after_a_marker_records_the_restore(tmp_path: Path
     store = await MessageStore.open(db, cipher=make_cipher(key))
     token = await _seed(store)
     await store.close()
-    write_restore_marker(
+    ended = write_restore_marker(
         db,
         archive_sha256="ab" * 32,
         archive_created_at=1_000_000.0,
@@ -86,23 +86,27 @@ async def test_the_first_start_after_a_marker_records_the_restore(tmp_path: Path
 
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
-        assert not await _revoked(store, token)  # control: the marker alone ends nothing
+        # The restore itself ends the sessions in the file, which needs no key...
+        assert ended == 1 and await _revoked(store, token)
+        # ...and the start ends any made since, such as one from a command run on the file first.
+        late = await _seed(store, "u3")
+        assert not await _revoked(store, late)  # control
         sink = _Sink()
         await _record_a_restore(store, sink)
-        assert await _revoked(store, token)
+        assert await _revoked(store, late)
         rows = await store.list_audit(action=STORE_RESTORED_ACTION, limit=5)
         assert len(rows) == 1
         detail = json.loads(rows[0]["detail"])
         assert detail["archive_sha256"] == "ab" * 32
         assert detail["archive_age_seconds"] == 3 * 86400
         assert detail["last_audit_at"] == 999_000.0
-        assert detail["sessions_revoked"] == 1
+        assert detail["sessions_revoked"] == 2
         assert rows[0]["actor"] == "system"
         assert [(n, a) for n, _d, a in sink.raised] == [
             (STORE_RESTORED_SUBJECT, "1970-01-12T13:30:00Z")
         ]
-        assert "3.0 days" in sink.raised[0][1] and "1 session(s)" in sink.raised[0][1]
-        assert "re-apply every disable, delete, role change and reset" in sink.raised[0][1]
+        assert "3.0 days old" in sink.raised[0][1] and "2 session(s)" in sink.raised[0][1]
+        assert "Re-apply every disable, delete, role change and reset" in sink.raised[0][1]
 
         # Once only: the marker is gone, so a second start writes and raises nothing.
         fresh = await _seed(store, "u2")
@@ -191,10 +195,10 @@ async def test_the_restore_writes_the_marker_with_the_archive_hash(tmp_path: Pat
 
     restored = await MessageStore.open(dest, cipher=make_cipher(key))
     try:
-        assert not await _revoked(restored, token)  # the archive's session came back live...
+        assert await _revoked(restored, token)  # the restore ended the archive's session
         record = await restored.consume_restore_record()
         assert record is not None and record.archive_sha256 == expected
-        assert await _revoked(restored, token)  # ...until the first start ended it
+        assert record.sessions_revoked == 1  # counted by the restore, carried to the record
     finally:
         await restored.close()
 
@@ -234,3 +238,13 @@ def test_the_server_backends_hold_no_marker(backend: str) -> None:
     assert len(returns) == 1
     value: Any = returns[0].value
     assert isinstance(value, ast.Constant) and value.value is None
+
+
+def test_the_schema_carries_the_marker_table_verbatim() -> None:
+    """The restore writes ``_RESTORE_MARKER_DDL`` into an archive's store and the open runs
+    ``_SCHEMA``; the two must create the same table, or the open's schema check refuses a restored
+    store."""
+    from messagefoundry.store.store import _RESTORE_MARKER_DDL, _SCHEMA
+
+    assert "CREATE TABLE IF NOT EXISTS restore_marker" in _RESTORE_MARKER_DDL
+    assert _RESTORE_MARKER_DDL.strip() in _SCHEMA

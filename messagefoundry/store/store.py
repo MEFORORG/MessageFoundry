@@ -1859,11 +1859,6 @@ _COUNT_USER_SESSIONS_SQL: Final = (
 )
 #: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
 _EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
-#: Every account's sweep at once, for ``revoke_all_sessions`` (BACKLOG #2614). It takes
-#: ``_EXCEPT_TOKEN_HASH_SQL`` for the kept session, as the per-account sweep does.
-_REVOKE_ALL_SESSIONS_SQL: Final = (
-    "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL"
-)
 
 
 @dataclass(frozen=True)
@@ -6244,20 +6239,32 @@ def _write_closed_store[T](
     return result
 
 
+def finite_or_none(value: object) -> float | None:
+    """``value`` as a finite float, or ``None`` for anything else (BACKLOG #2614). For a time read
+    from an archive, which a plaintext archive on a keyless box does not authenticate: a text,
+    infinite or NaN value is "not known", never a traceback."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def newest_audit_time(path: Path) -> float | None:
     """The ``ts`` of the newest audit row in a CLOSED SQLite store file, or ``None`` when it has no
-    audit table or no row (BACKLOG #2614). Read-only. The restore prints it, because every account
-    change made after it on the source is missing from the restored store."""
+    audit table or no numeric row (BACKLOG #2614). Read-only. The restore prints it, because every
+    account change made after it on the source is missing from the restored store."""
     conn = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         if not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'"
         ).fetchone():
             return None
-        row = conn.execute("SELECT MAX(ts) FROM audit_log").fetchone()
+        row = conn.execute(
+            "SELECT MAX(ts) FROM audit_log WHERE typeof(ts) IN ('real', 'integer')"
+        ).fetchone()
     finally:
         conn.close()
-    return None if row is None or row[0] is None else float(row[0])
+    return None if row is None else finite_or_none(row[0])
 
 
 def write_restore_marker(
@@ -6267,31 +6274,48 @@ def write_restore_marker(
     archive_created_at: float | None,
     last_audit_at: float | None,
     restored_at: float,
-) -> None:
-    """Mark a CLOSED SQLite store file as placed by ``restore`` and not yet recorded (BACKLOG #2614).
+) -> int:
+    """Mark a CLOSED SQLite store file as placed by ``restore`` and not yet recorded (BACKLOG #2614),
+    and end every session it holds. Returns how many sessions it ended.
 
     The marker is a row in the store itself, not a file beside it, because the store is what an
     operator moves: a store copied or renamed after the restore keeps its marker, and the first
     engine start on it, wherever it lands, still records the restore and ends every session. One
     row only; a second restore of the same file replaces it.
 
+    The sessions are ended here too, in the same transaction as the marker, because a revoke
+    needs no key: so no path that honours a session without consuming the marker, such as an
+    older build started on the file, gets the archive's sessions back. The first start still
+    raises every account's session epoch, which needs the key, and adds this count to its own.
+
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
     naming this archive, raises ``sqlite3.OperationalError``."""
 
-    def mark(conn: sqlite3.Connection) -> None:
+    def mark(conn: sqlite3.Connection) -> int:
+        # Two autocommit statements, not one transaction: the file is the restore's staged copy,
+        # and a failure between them discards it whole, so no half-written file is ever placed.
         conn.executescript(_RESTORE_MARKER_DDL)
+        revoked = 0
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone():
+            revoked = conn.execute(
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL",
+                (restored_at,),
+            ).rowcount
         conn.execute(
             "INSERT OR REPLACE INTO restore_marker (id, archive_sha256, archive_created_at,"
-            " last_audit_at, restored_at) VALUES (1, ?, ?, ?, ?)",
-            (archive_sha256, archive_created_at, last_audit_at, restored_at),
+            " last_audit_at, restored_at, sessions_revoked) VALUES (1, ?, ?, ?, ?, ?)",
+            (archive_sha256, archive_created_at, last_audit_at, restored_at, revoked),
         )
+        return revoked
 
     def marked(proof: sqlite3.Connection) -> bool:
         row = proof.execute("SELECT archive_sha256 FROM restore_marker WHERE id = 1").fetchone()
         return row is not None and row[0] == archive_sha256
 
-    _write_closed_store(
+    return _write_closed_store(
         path,
         mark,
         marked,
@@ -7772,21 +7796,22 @@ _LAST_RECEIVED_SQL: Final[str] = (
 
 #: A restore the engine has not yet recorded (BACKLOG #2614). ``messagefoundry restore`` writes the
 #: one row into the store it places (:func:`write_restore_marker`), and the first engine start
-#: after it consumes the row (:meth:`MessageStore.consume_restore_record`). Kept apart from the
-#: script below because the restore writes it into an archive's store, which an earlier build may
-#: have written without this table. Non-secret: a hash and three times.
+#: after it consumes the row (:meth:`MessageStore.consume_restore_record`). Its own constant because
+#: the restore writes it into an archive's store, which an earlier build may have written without
+#: this table. The schema script repeats it verbatim, so that script stays one literal; a test in
+#: ``tests/test_b2614_restore_record.py`` pins the two equal. Non-secret: a hash, times, a count.
 _RESTORE_MARKER_DDL: Final = """
 CREATE TABLE IF NOT EXISTS restore_marker (
     id                 INTEGER PRIMARY KEY CHECK (id = 1),
     archive_sha256     TEXT NOT NULL,     -- the .mfbak file the restore read, hex
     archive_created_at REAL,              -- the archive manifest's created_utc; NULL when absent
     last_audit_at      REAL,              -- the newest audit row the archive held; NULL for none
-    restored_at        REAL NOT NULL
+    restored_at        REAL NOT NULL,
+    sessions_revoked   INTEGER NOT NULL DEFAULT 0  -- sessions the restore itself ended in the file
 );
 """
 
-_SCHEMA = (
-    """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
     channel_id   TEXT NOT NULL,
@@ -8428,9 +8453,18 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     tracked_since TEXT NOT NULL,      -- ISO YYYY-MM-DD first observed (tracked-since age floor)
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
+
+-- BACKLOG #2614: the restore marker. The same text as _RESTORE_MARKER_DDL, which a test pins;
+-- spelled here too, so this script stays one literal the BEGIN guard can read.
+CREATE TABLE IF NOT EXISTS restore_marker (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    archive_sha256     TEXT NOT NULL,     -- the .mfbak file the restore read, hex
+    archive_created_at REAL,              -- the archive manifest's created_utc; NULL when absent
+    last_audit_at      REAL,              -- the newest audit row the archive held; NULL for none
+    restored_at        REAL NOT NULL,
+    sessions_revoked   INTEGER NOT NULL DEFAULT 0  -- sessions the restore itself ended in the file
+);
 """
-    + _RESTORE_MARKER_DDL
-)
 
 # The latest event of each listed message, for the tracking view (list_messages, search_messages).
 # BACKLOG #1726: MAX(id) reads ix_events_message as a covering scan and fetches one row by primary key,
@@ -17763,13 +17797,16 @@ class MessageStore:
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
         for row in await cur.fetchall():
             await self._bump_session_epoch(str(row[0]))
-        if except_token_hash is None:
-            cur = await self._db.execute(_REVOKE_ALL_SESSIONS_SQL, (now,))
-            return int(cur.rowcount)
+        # Spelled at the call, not built from a constant, so the BEGIN guard in
+        # `tests/test_writer_txn_is_the_only_begin.py` can read it.
         cur = await self._db.execute(
-            _REVOKE_ALL_SESSIONS_SQL + _EXCEPT_TOKEN_HASH_SQL, (now, except_token_hash)
+            "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL"
+            " AND (? IS NULL OR token_hash != ?)",
+            (now, except_token_hash, except_token_hash),
         )
         revoked = int(cur.rowcount)
+        if except_token_hash is None:
+            return revoked
         kept = await self._db.execute(
             "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
         )
@@ -17785,12 +17822,18 @@ class MessageStore:
         :meth:`AuthStore.consume_restore_record`.
 
         One transaction, so a start that dies part-way leaves the marker for the next start: the
-        sessions are not ended without the row that says why, and the row is never written twice."""
+        sessions are not ended without the row that says why, and the row is never written twice.
+
+        Its first statement is a write, which takes SQLite's write lock even when it matches no
+        row, so the marker is read under that lock. Two processes starting together on one
+        restored file then queue on the lock, and the second finds the marker gone, rather than
+        both reading it and one failing its upgrade from a stale snapshot."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
+            await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
             cur = await self._db.execute(
-                "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at"
-                " FROM restore_marker WHERE id = 1"
+                "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at,"
+                " sessions_revoked FROM restore_marker WHERE id = 1"
             )
             row = await cur.fetchone()
             if row is None:
@@ -17798,10 +17841,11 @@ class MessageStore:
                 return None
             record = RestoreRecord(
                 archive_sha256=str(row[0]),
-                archive_created_at=None if row[1] is None else float(row[1]),
-                last_audit_at=None if row[2] is None else float(row[2]),
-                restored_at=float(row[3]),
-                sessions_revoked=await self._revoke_all_sessions_in_txn(None, now),
+                archive_created_at=finite_or_none(row[1]),
+                last_audit_at=finite_or_none(row[2]),
+                restored_at=finite_or_none(row[3]) or now,
+                sessions_revoked=int(row[4] or 0)
+                + await self._revoke_all_sessions_in_txn(None, now),
             )
             audit = AuditAppend(
                 action=STORE_RESTORED_ACTION,

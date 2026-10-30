@@ -101,7 +101,7 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     out = capsys.readouterr().out
     assert "newest audit row in it 20" in out
     assert "must be re-applied by hand" in out
-    assert "The first engine start on this store ends every session" in out
+    assert "The restore ended every session the archive held" in out
 
     json_dest = tmp_path / "json" / "msg.db"
     argv = ["restore", archive, "--to", str(json_dest), "--service-config", toml, "--json"]
@@ -149,3 +149,13 @@ async def test_the_primitive_checks_no_age_unless_asked(tmp_path: Path) -> None:
     assert info.value.kind == "age" and not dest.exists()
     result = await run_restore(archive, dest_store_path=dest, store_settings=settings)
     assert result.archive_created_at == 1.0
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "soon"])
+def test_a_max_age_that_would_refuse_everything_is_rejected_at_parse(
+    bad: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(["restore", "a.mfbak", "--to", str(tmp_path / "x.db"), "--max-age-days", bad])
+    assert info.value.code == 2
+    assert "--max-age-days" in capsys.readouterr().err

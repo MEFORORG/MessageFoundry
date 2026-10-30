@@ -233,6 +233,20 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
 _RESTORE_MAX_AGE_DAYS = 7.0
 
 
+def _positive_days(text: str) -> float:
+    """``--max-age-days``: a finite number of days above zero. Zero, a negative or NaN would refuse
+    every archive, which reads as a fault in the archive rather than in the flag."""
+    import math
+
+    try:
+        days = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a number of days: {text!r}") from exc
+    if not math.isfinite(days) or days <= 0:
+        raise argparse.ArgumentTypeError(f"must be a number of days above zero, not {text!r}")
+    return days
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -1313,7 +1327,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # old archive is refused unless the operator says it is meant.
     restore.add_argument(
         "--max-age-days",
-        type=float,
+        type=_positive_days,
         default=_RESTORE_MAX_AGE_DAYS,
         help=f"refuse an archive taken more than this many days ago (default "
         f"{_RESTORE_MAX_AGE_DAYS:g}), or one that does not say when it was taken",
@@ -11029,15 +11043,22 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     that already landed."""
     import getpass
 
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import KeylessAuditChainRefused, StoreNotFoundError, open_store
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_call_errors,
+    )
 
     settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
     if isinstance(settings, int):
         return settings
 
-    async def run() -> int:
+    async def run() -> tuple[int, str | None]:
         store = await _open_store_or_refuse_the_key(
             open_store(
                 settings.store,
@@ -11047,17 +11068,24 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         try:
             _refuse_an_unauditable_write(store)
             revoked = await store.revoke_all_sessions()
-            await store.record_audit(
-                "auth.session_revoked",
-                actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"scope": "all", "count": revoked}),
-            )
-            return revoked
+            # The revoke has committed. A failed audit append (a running engine holding the
+            # write lock past the busy timeout, say) must not read as "nothing happened".
+            try:
+                await store.record_audit(
+                    "auth.session_revoked",
+                    actor=f"cli:{getpass.getuser()}",
+                    detail=json.dumps({"scope": "all", "count": revoked}),
+                )
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
+            except store_call_errors() as exc:
+                return revoked, safe_exc(exc)
+            return revoked, None
         finally:
             await store.close()
 
     try:
-        revoked = run_guarded(run())
+        revoked, unaudited = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -11068,6 +11096,12 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if unaudited is not None:
+        return _emit_error(
+            f"revoked {revoked} session(s), but the audit row could not be written: {unaudited}. "
+            "The sessions are ended; record the act by hand",
+            as_json=args.json,
+        )
     if args.json:
         print(json.dumps({"ok": True, "revoked": revoked}))
     else:
@@ -11107,12 +11141,13 @@ def _restore(args: argparse.Namespace) -> int:
         )
     except BackupError as exc:
         # BACKLOG #2614: the primitive states the age; the override is this command's to name.
-        hint = (
-            " Choose a newer archive, or pass --allow-old-archive (or a larger --max-age-days) to "
-            "restore this one."
-            if exc.kind == "age"
-            else ""
-        )
+        hint = ""
+        if exc.kind == "age":
+            # An undated archive passes no limit, so only the flag restores it.
+            larger = "" if "does not say when" in str(exc) else " (or a larger --max-age-days)"
+            hint = (
+                f" Choose a newer archive, or pass --allow-old-archive{larger} to restore this one."
+            )
         return _emit_error(f"restore failed ({exc.kind}): {exc}{hint}", as_json=args.json)
 
     from messagefoundry.pipeline.alerts import utc_or_unknown

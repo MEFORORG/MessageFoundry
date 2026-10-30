@@ -2883,10 +2883,14 @@ _DECRYPT_REFUSAL = (
 
 
 #: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
-RESTORED_ACCOUNTS_NOTICE = (
+REAPPLY_NOTICE = (
     "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
-    "delete, role change and reset made after its newest audit row must be re-applied by hand. "
-    "The first engine start on this store ends every session."
+    "delete, role change and reset made after its newest audit row must be re-applied by hand."
+)
+#: The CLI summary's whole notice: what to re-apply, and what the restore already did.
+RESTORED_ACCOUNTS_NOTICE = (
+    f"{REAPPLY_NOTICE} The restore ended every session the archive held, and the first engine "
+    "start on this store records the restore."
 )
 
 
@@ -2915,8 +2919,8 @@ def _refuse_an_old_archive(
         )
     raise BackupError(
         "age",
-        f"{taken}. Its newest audit row is {newest}. {RESTORED_ACCOUNTS_NOTICE} Nothing was "
-        "written.",
+        f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
+        f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
     )
 
 

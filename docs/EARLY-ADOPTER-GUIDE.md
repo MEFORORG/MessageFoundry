@@ -684,11 +684,12 @@ decrypts it, and writes the store. It **refuses to overwrite** an existing store
 with `messagefoundry restore-verify <archive>`.
 
 **A restore brings back the archive's accounts as they were (BACKLOG #2614)**: users, password
-hashes, roles, second factors and sessions. So the restore writes a marker into the store it places,
-and the first `serve` on that store, wherever it has been moved, revokes every session, writes one
-`store_restored` audit row naming the archive's SHA-256, its age and the time of its newest audit
-row, and raises a `store_restored` alert. Every user signs in again. Other commands that open the
-store, such as `provision-admin`, leave the marker for that start. The engine does not re-apply
+hashes, roles, second factors and sessions. So the restore ends every session in the store it
+places and writes a marker into it. The first `serve` on that store, wherever it has been moved,
+revokes every session again, writes one `store_restored` audit row naming the archive's SHA-256,
+its age and the time of its newest audit row, and raises a `store_restored` alert. Every user signs
+in again. Other commands that open the store, such as `provision-admin`, leave the marker for that
+start. The engine does not re-apply
 changes made after the archive was taken.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive

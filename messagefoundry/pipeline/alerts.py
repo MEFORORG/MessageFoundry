@@ -212,8 +212,14 @@ STORE_RESTORED_SUBJECT = "store:restored"
 
 
 def utc_or_unknown(ts: float | None) -> str:
-    """``ts`` as ISO 8601 UTC to the second, or ``unknown`` for ``None``."""
-    return "unknown" if ts is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    """``ts`` as ISO 8601 UTC to the second, or ``unknown`` for ``None`` or a value the platform
+    cannot render (an archive's time is not always authenticated, BACKLOG #2614)."""
+    if ts is None:
+        return "unknown"
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return "unknown"
 
 
 def store_restored_detail(
@@ -226,17 +232,18 @@ def store_restored_detail(
     """The one-line description of a ``store_restored`` alert both sinks show (BACKLOG #2614).
     A time in UTC, an age in days and a count: nothing read from a row's content.
 
-    The alert instance's reason column keeps only about the first 200 characters, so the newest
-    audit time leads: it is the line after which every account change must be applied again."""
+    The alert instance's reason column keeps only about the first 200 characters, and the store's
+    redaction turns the time in it into ``[redacted]``. So the age and the count lead, and the
+    line names the ``store_restored`` audit row, which carries the time whole."""
     age = (
-        "unknown"
+        "of unknown age"
         if archive_created_at is None
-        else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days"
+        else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
     )
     return (
-        f"restored store's newest audit row {utc_or_unknown(last_audit_at)}: re-apply every disable, "
-        f"delete, role change and reset made after it. Archive age {age}. {revoked} session(s) "
-        "revoked."
+        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
+        "Re-apply every disable, delete, role change and reset made after its newest audit row "
+        f"({utc_or_unknown(last_audit_at)}; also in the store_restored audit row)."
     )
 
 

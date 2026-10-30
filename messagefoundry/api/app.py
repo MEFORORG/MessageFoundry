@@ -3110,14 +3110,13 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
     record = await store.consume_restore_record()
     if record is None:
         return
-    detail = store_restored_detail(
-        archive_created_at=record.archive_created_at,
-        last_audit_at=record.last_audit_at,
-        restored_at=record.restored_at,
-        revoked=record.sessions_revoked,
-    )
-    _log.warning("started on a restored store: %s", detail)
     try:
+        detail = store_restored_detail(
+            archive_created_at=record.archive_created_at,
+            last_audit_at=record.last_audit_at,
+            restored_at=record.restored_at,
+            revoked=record.sessions_revoked,
+        )
         sink.store_restored(
             STORE_RESTORED_SUBJECT,
             detail=detail,

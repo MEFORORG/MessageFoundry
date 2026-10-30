@@ -11575,13 +11575,14 @@ class AuthService:
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
         :meth:`revoke_other_sessions` does."""
-        kept = True
         try:
             revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:
             await self._session_seal_failed(keep_token_hash)
             revoked = await self._store.revoke_all_sessions()
-            kept = False
+        # Read back rather than inferred: a revoke of the caller's own session that landed before
+        # the sweep leaves nothing kept, and the reply and the audit row must say so.
+        kept = await self._load_session(keep_token_hash) is not None
         await self._audit(
             "auth.session_revoked",
             actor=actor,
