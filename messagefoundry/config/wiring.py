@@ -4664,6 +4664,14 @@ class SetState:
             raise WiringError("SetState namespace must be a non-empty string")
         if not isinstance(self.key, str) or not self.key:
             raise WiringError("SetState key must be a non-empty string")
+        # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
+        # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
+        # entries. Refused on every backend so a feed behaves the same wherever it runs. The message
+        # names the field only: the value may be PHI.
+        if self.namespace.endswith(" "):
+            raise WiringError("SetState namespace must not end with a space")
+        if self.key.endswith(" "):
+            raise WiringError("SetState key must not end with a space")
         try:
             import json
 

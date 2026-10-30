@@ -1861,6 +1861,109 @@ async def test_transform_state_persists_and_reloads_on_reopen(store) -> None:
         await s2.close()
 
 
+async def test_state_merge_collapses_case_variants_under_a_ci_default(store) -> None:
+    """BACKLOG #1588, the control: the defect is real on this server. This is the experiment the
+    row asked for, and the positive control for the next test.
+
+    On a ``_CI_`` database it runs the shipped ``_SQL_STATE_MERGE`` against a scratch table whose key
+    columns take the database default, and shows the two spellings collapse into one row that keeps
+    the stored spelling. The scratch table sits in the user database, not ``#temp``, because tempdb
+    carries the server collation. It skips only off ``_CI_``, where there is no collapse to show."""
+    from messagefoundry.store.sqlserver import _SQL_STATE_MERGE, _state_merge_params
+
+    db = await store._fetchall(
+        "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS c"
+    )
+    collation = str(db[0]["c"])
+    if "_CI_" not in collation.upper():
+        pytest.skip(f"collation {collation} is not _CI_, so there is no collapse to show here")
+
+    probe = f"state_collation_probe_{uuid4().hex[:12]}"
+    merge = _SQL_STATE_MERGE.replace("MERGE state ", f"MERGE {probe} ", 1)
+    assert merge != _SQL_STATE_MERGE, "the MERGE no longer targets `state`; re-point the probe"
+    await store._execute(
+        f"CREATE TABLE {probe} ("
+        " namespace NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+        " [key] NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+        " value NVARCHAR(MAX) NOT NULL, set_at FLOAT NOT NULL, message_id NVARCHAR(64) NULL,"
+        f" CONSTRAINT pk_{probe} PRIMARY KEY (namespace, [key]))"
+    )
+    try:
+        for key in ("MRN-abc", "mrn-ABC"):
+            await store._execute(merge, _state_merge_params("ns", key, "v", 1.0, "m"))
+        collapsed = await store._fetchall(f"SELECT [key] FROM {probe}")
+    finally:
+        await store._execute(f"DROP TABLE IF EXISTS {probe}")
+    assert [r["key"] for r in collapsed] == ["MRN-abc"], (
+        f"collation {collation} is case-insensitive, so the two spellings must merge into the"
+        " stored one; if they did not, this control no longer shows the defect"
+    )
+
+
+async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
+    """BACKLOG #1588: ``state.namespace`` and ``state.[key]`` are BIN2, so two spellings the cache
+    holds apart stay two rows, and a keyed reopen decrypts each under the AAD it was sealed with.
+    Passes on every collation. Encryption is on because the keyed symptom of a merged row is a
+    CipherError when ``_load_state_cache`` rebuilds the AAD from the stored spelling. Accent and
+    composed-versus-decomposed spellings ride along: BIN2 compares code points, as the cache does.
+
+    Trailing spaces are not covered: SQL Server pads ``=`` under BIN2 too, so 'k' and 'k ' still
+    collide. That limit stays open."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    first = [("ns", "MRN-abc", {"v": 1}), ("NS", "k", {"v": 2}), ("ns", "caf\u00e9", {"v": 3})]
+    second = [("ns", "mrn-ABC", {"v": 4}), ("ns", "k", {"v": 5}), ("ns", "cafe\u0301", {"v": 6})]
+    expected = {(ns, k): v for ns, k, v in first + second}
+
+    async def _handoff(s: Any, state_ops: list[tuple[str, str, Any]], now: float) -> None:
+        mid, rid = await _ss_seed_routed(s, channel_id="IB", raw=RAW, now=now)
+        assert await s.transform_handoff(
+            routed_id=rid,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB", "b")],
+            state_ops=state_ops,
+            now=now,
+        )
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    try:
+        keyed = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        try:
+            await _handoff(keyed, first, 100.0)
+            await _handoff(keyed, second, 200.0)
+            rows = await keyed._fetchall("SELECT namespace, [key] FROM state")
+            assert {(r["namespace"], r["key"]) for r in rows} == set(expected)
+            assert dict(keyed.state_view()) == expected
+            cols = await keyed._fetchall(
+                "SELECT name, collation_name FROM sys.columns"
+                " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
+            )
+            assert {r["name"]: r["collation_name"] for r in cols} == {
+                "namespace": "Latin1_General_100_BIN2",
+                "key": "Latin1_General_100_BIN2",
+            }
+        finally:
+            await keyed.close()
+
+        reopened = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        try:
+            assert dict(reopened.state_view()) == expected  # every row decrypts under its own AAD
+        finally:
+            await reopened.close()
+    finally:
+        # Purge the sealed rows so the next keyless fixture open does not fail closed inside
+        # _load_state_cache. Through the fixture's already-open pool, not a keyed open: a keyed open
+        # warms the same cache, so it would raise on exactly the rows a failing run leaves.
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in ("message_events", "state", "response", "queue", "messages"):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
+
+
 async def test_concurrent_route_handoff_exactly_one_wins(store) -> None:
     mid, ing = await _ingress_and_claim(store, "IB", RAW)
     results = await asyncio.gather(
