@@ -3233,6 +3233,7 @@ def _serve(args: argparse.Namespace) -> int:
         cert_monitor=settings.cert_monitor,
         backup=settings.backup,
         secrets=settings.secrets,
+        ai=settings.ai,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -7966,7 +7967,10 @@ def _offline_security_notifier(
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
-    (vault BACKLOG #2983). ``None`` counts as enforcing there.
+    (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
+    (BACKLOG #2193) reads ``posture`` too, and where it is ``None`` it reads the instance's own,
+    derived from ``settings``. That guard would count no posture as enforcing, so on a ``warn``
+    instance the derived posture is what lets it warn rather than refuse.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -7995,6 +7999,7 @@ def _offline_security_notifier(
     ``email_username`` and the password and send unauthenticated.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 
     alerts = settings.alerts
@@ -8011,6 +8016,17 @@ def _offline_security_notifier(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
+            # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
+            # every build failure here is: the notice is dropped and the recovery goes on. A
+            # caller with no posture (admin reset-totp) gets the instance's own, derived from
+            # these settings, so a warn instance warns rather than taking the guard's enforcing
+            # default for no posture. The Vault read above keeps the caller's posture, where None
+            # counts as enforcing.
+            posture=(
+                posture
+                if posture is not None
+                else hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
         print(
@@ -8109,13 +8125,34 @@ def _offline_alert_notifier(
     construction the relay. A failure with nothing left to drop yields ``None``, and the caller's
     alert reaches the log instead: the grant it reports has already been written, and a recovery
     command must not die on its page.
+
+    ``posture`` keys the transports' revocation guards (BACKLOG #2193). Where it is ``None`` the
+    guards get the instance's own, derived from ``settings``, as :func:`_offline_security_notifier`
+    gives its guard, so a ``warn`` instance warns rather than taking the guards' enforcing default
+    for no posture. The Vault read for the SMTP password keeps the caller's posture, where ``None``
+    counts as enforcing, as there. ``provision-admin`` always passes one, so the split is reached
+    only by a caller with none.
+
+    A revocation guard's refusal, bare or as the cause of a ``SecretProviderError`` from the Vault
+    hop, is printed in its own words, once: it names the hop, its host and the setting that clears
+    it, and reads no secret, as ``_build_provision_auth_service`` shows one. Every other failure is
+    named by its class only.
     """
-    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.controlchars import scrub_control_chars
     from messagefoundry.pipeline.alert_sinks import (
         alerts_without_email,
         alerts_without_webhook,
         configured_alert_transport_names,
         notifier_from_settings,
+    )
+
+    guard_posture = (
+        posture
+        if posture is not None
+        else hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     )
 
     def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
@@ -8129,8 +8166,24 @@ def _offline_alert_notifier(
                 else None
             ),
             trust_anchor_policy=settings.tls.policy(),
-            posture=posture,
+            posture=guard_posture,
         )
+
+    # The class only, as `_build_provision_auth_service` names a secret failure: the text of a
+    # provider's error can carry its address or a reference. A revocation guard's refusal is the
+    # one exception, printed once in its own words.
+    failures: list[str] = []
+    shown: set[str] = set()
+
+    def failed(exc: Exception) -> None:
+        failures.append(type(exc).__name__)
+        # The Vault provider raises its revocation refusal as the cause of its own type (#2317).
+        hop = exc.__cause__ if isinstance(exc, SecretProviderError) else exc
+        if isinstance(hop, InsecureHopRefused):
+            refusal = scrub_control_chars(_sentence(hop))
+            if refusal not in shown:
+                shown.add(refusal)
+                print(f"WARNING: {refusal}", file=sys.stderr)
 
     alerts = settings.alerts
     names = configured_alert_transport_names(alerts)
@@ -8152,13 +8205,10 @@ def _offline_alert_notifier(
             hop_accepted = False
         if not hop_accepted:
             alerts, emails = alerts_without_email(alerts), False
-    # The class only, here and below, as `_build_provision_auth_service` names a secret failure:
-    # the text of a provider's error can carry its address or a reference.
-    failures: list[str] = []
     try:
         return build(alerts)
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
-        failures.append(type(exc).__name__)
+        failed(exc)
     if emails and len(names) > 1:
         print(
             f"WARNING: the [alerts] notifier could not be built ({failures[0]}); this command "
@@ -8172,7 +8222,7 @@ def _offline_alert_notifier(
             try:
                 built = build(alone)
             except Exception as retry:  # noqa: BLE001 - as above
-                failures.append(type(retry).__name__)
+                failed(retry)
                 continue
             print(
                 f"WARNING: the [alerts] notifier was built without the {dropped} transport, so "
@@ -8281,7 +8331,8 @@ async def _raise_offline_administrator_granted(
     CALLER then writes the logging sink's line,
     so the line is written once whether or not this step answers at all. It never raises. Its own
     failure lines name the exception's class only, because a provider's or driver's text can carry
-    an address. The notifier's lines are not this step's: a failed send or open-instance write is
+    an address; a revocation guard's refusal, which names its hop's host and reads no secret, is
+    the one text :func:`_offline_alert_notifier` prints (BACKLOG #2193). The notifier's lines are not this step's: a failed send or open-instance write is
     logged inside :class:`NotifierAlertSink` as ``serve`` logs it, through the command's redacting
     handler."""
     import asyncio
@@ -11802,6 +11853,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        AiSettings,
         AlertsSettings,
         ApiSettings,
         ApprovalsSettings,
@@ -11818,7 +11870,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets]/[ai] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -11844,6 +11896,9 @@ def _security(args: argparse.Namespace) -> int:
     _backup = BackupSettings()
     # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
     _secrets = SecretsSettings()
+    # BACKLOG #2193 slice (e): [ai].endpoint_revocation_attested is a loosening too. Same read and
+    # marker.
+    _ai = AiSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -11859,6 +11914,7 @@ def _security(args: argparse.Namespace) -> int:
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
             _secrets = _full.secrets
+            _ai = _full.ai
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -11892,6 +11948,7 @@ def _security(args: argparse.Namespace) -> int:
                 cert_monitor=_cert_monitor,
                 backup=_backup,
                 secrets=_secrets,
+                ai=_ai,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

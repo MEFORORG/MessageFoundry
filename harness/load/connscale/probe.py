@@ -633,6 +633,31 @@ class FdSampler:
         return pages * int(page_size)
 
 
+#: Walks :func:`subtree_size` tries before it reports no reading. A Windows walk is one bounded
+#: enumeration, and the first one after a spawn storm is the one most likely to time out.
+_SUBTREE_WALK_ATTEMPTS = 3
+
+
+def subtree_size(pid: int) -> int | None:
+    """How many processes are in ``pid``'s subtree right now, root included, from a fresh walk.
+
+    ``None`` when no walk read the root. A root-only fallback would read as "no children", which is
+    the very reading a sandbox arm that ran in-process gives (BACKLOG #3132), so this does NOT use
+    :meth:`FdSampler._resolve_pids`: on POSIX that turns an unreadable ``/proc`` or a missing root
+    row into a root-only list and does not flag it. Here a snapshot with no validatable root row is
+    a failed walk on both platforms. Up to :data:`_SUBTREE_WALK_ATTEMPTS` walks. Synchronous, like
+    every walk here; call it off the event loop."""
+    sampler = FdSampler(pid)
+    for _ in range(_SUBTREE_WALK_ATTEMPTS):
+        if _WINDOWS:
+            walked = sampler._descendants_windows()  # noqa: SLF001 -- this module's own sampler
+        else:
+            walked = _validated_descendants(sampler._enumerate_posix(), pid)  # noqa: SLF001
+        if walked is not None:
+            return 1 + len(set(walked) - {pid})
+    return None
+
+
 def _validated_descendants(rows: list[ProcRow], root: int) -> list[int] | None:
     """BFS the ppid→children map built from ``rows``, returning every descendant PID that PASSES the
     provenance check (root excluded, so the caller prepends it once). ``None`` means the ROOT's own
