@@ -539,9 +539,10 @@ the audit chain and the wipe do not apply. And the start-time age check does not
 
 **Section 7 recording, for this key.** On a store whose audit chain is keyed, `rotate-key` appends an
 `audit.key_epoch` row, MAC'd under the new key's audit sub-key. That records the move to a new active
-key. On a keyless audit chain it writes no such row. In both cases `rotate-key` and the start-time
-reconcile stamp the new key's id and date in the secret-rotation metadata, which records the change
-without auditing it. A key leaving the retired list is never recorded, because the engine sees only
+key. On a keyless audit chain it writes no such row. In both cases a `rotate-key` run that completes,
+or a start-time reconcile, stamps the new key's id and date in the secret-rotation metadata, which
+records the change without auditing it. Neither stamps a key an unfinished `rotate-key` run holds
+(BACKLOG #3737, [PHI.md](PHI.md)). A key leaving the retired list is never recorded, because the engine sees only
 the setting.
 
 **Found by this read, outside the mapping.** The rotation-fingerprint MAC key hung off the active

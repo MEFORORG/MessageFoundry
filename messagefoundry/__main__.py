@@ -10327,11 +10327,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
     either data pass, the audit range rolls after both, and the stamp and the record's close come
     last, on a run with no skip and a good roll. Every run that reaches the roll takes it, one that
     skipped an upload included (owner ruling 2026-10-30), so an engine started on the new key alone
-    keeps a chain that verifies. That costs the way back: a key opens one audit range, so after any
-    run reaches the roll you cannot go back to the prior key. Recovery is forward. Fix the cause and
-    re-run, where the roll is a verified no-op and the stamp and the close follow, or rotate to a new
-    key. A run that stops short leaves the record open, so no ``serve`` start stamps its key, unless
-    one already did before this run: that start's stamp stands and no record opens.
+    keeps a chain that verifies. That costs the way back to the prior key, which docs/PHI.md states.
+    A re-run finds the roll a verified no-op, and the stamp and the close follow. A run that stops
+    short leaves the record open, so no ``serve`` start stamps its key, unless one already did before
+    this run: that start's stamp stands and no record opens.
     """
     from pathlib import Path
 
@@ -10458,8 +10457,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # both data passes, so a refusal leaves their work in place for a re-run to go on from.
             # A skip rolls too (owner ruling 2026-10-30, BACKLOG #3737): new rows land under the key
             # the engine will run with, so a start on that key alone keeps a chain that verifies.
-            # It is one-way, because a key opens one range: no run can go back to the prior key. A
-            # re-run finds the range already under this key, and the roll is a verified no-op.
+            # It is one-way; docs/PHI.md says what that costs. A re-run finds the range already
+            # under this key, and the roll is a verified no-op.
             rolled = await store.roll_audit_key_epoch()
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
@@ -10620,11 +10619,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
     if uploads.skipped:
         # BACKLOG #3737, owner ruling 2026-10-30: a skipped run reaches the audit step like any other,
-        # so an operator who reads PARTIAL as "go back" must be told there is no way back.
+        # so an operator who reads PARTIAL as "go back" must be told. Conditional, because this run
+        # cannot see whether the key changed: a same-key run or a keyless chain rolled nothing.
         print(
-            "note: this run did not complete, and it reached the audit step. A key opens one audit "
-            "range, so you cannot go back to the prior key. Keep that key in "
-            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, then fix the cause and re-run, or rotate to a new "
+            "note: this run did not complete. Fix the cause and re-run. If this store is moving to "
+            "a new key and its audit chain is keyed, the chain has rolled to that key, and a key "
+            "opens one audit range, so you cannot go back to the prior key: keep it in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, and if the cause cannot be fixed, rotate to a new "
             "key."
         )
     return 0 if complete else 1
