@@ -345,16 +345,15 @@ class ServerSchemaMismatchError(RuntimeError):
         )
         if schema is not None:
             where = f"schema {schema!r} of {where}"
-        # The remedy leads, ahead of the differences, as the SQLite refusal's does: a path that cuts
-        # an uncaught error's text keeps the part an operator acts on. It is split by kind of
-        # difference, so a table that only lacks a column is not told to give up its rows.
+        # The differences lead and the remedy follows. Every path that prints this cuts it short:
+        # provision-schema at 500 characters and safe_exc at 200. The remedy is the same every time,
+        # so it is what a cut may lose. It is split by kind of difference, so a table that only
+        # lacks a column is not told to give up its rows.
         super().__init__(
-            f"the {backend} store's tables in {where} are not what this build creates, so the open"
-            " refused and marked nothing current. Where a name below is taken by another object, or"
-            " an index has another shape or cannot serve, rename or drop that object. Where a table"
-            " lacks a column, add the column as this build's DDL declares it. Or build the store in"
-            " an empty database or schema. Then restart: the next open runs the batch again."
-            " Differences: " + "; ".join(self.differences) + "."
+            f"{backend} schema differs: " + "; ".join(self.differences) + f". In {where}; the"
+            " open refused and marked nothing current. Rename or drop an object that takes a name,"
+            " or an index of another shape or that cannot serve; add a missing column as this build"
+            " declares it; or use an empty database or schema. Then restart."
         )
 
     def __reduce__(self) -> tuple[type[ServerSchemaMismatchError], tuple[object, ...]]:

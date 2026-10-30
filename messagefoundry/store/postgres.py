@@ -1228,7 +1228,10 @@ _SCHEMA.append(
 # function. Same contract, same caveat.
 # 7 (BACKLOG #1726): the same function builds ix_messages_received. Same contract. This bump is the
 # only thing that moves the hash for it, since _SCHEMA is unchanged.
-_MIGRATION_REV = 7
+# 8 (BACKLOG #1720): the same function's catalog reads are scoped to current_schema(), and the open
+# now checks the live schema before it writes the marker. _SCHEMA is unchanged, so this bump is the
+# only thing that sends a store marked by an earlier build through both once.
+_MIGRATION_REV = 8
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -1273,7 +1276,9 @@ _LIVE_COLUMNS_SQL = (
     " AND NOT a.attisdropped AND c.relkind IN ('r', 'p')"
 )
 # indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC. pg_get_indexdef with a column
-# number prints that key column alone: its name, or the expression.
+# number prints that key column alone: its name, or the expression. The two arrays are zipped with
+# ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
+# only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
 _LIVE_INDEXES_SQL = (
     "SELECT q.name AS idx, c.relkind::text AS kind, t.relname::text AS tbl,"
     " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
@@ -1281,7 +1286,8 @@ _LIVE_INDEXES_SQL = (
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
     "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
     "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
-    " FROM pg_catalog.unnest($1::text[], $2::text[]) AS q(name, tbl)"
+    " FROM ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))"
+    " AS q(name, tbl)"
     " LEFT JOIN pg_catalog.pg_class c ON c.relname = q.name AND c.relnamespace ="
     "   (SELECT w.relnamespace FROM pg_catalog.pg_class w"
     "    WHERE w.oid = pg_catalog.to_regclass(q.tbl))"

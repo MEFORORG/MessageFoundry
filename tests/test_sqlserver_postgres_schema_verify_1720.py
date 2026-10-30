@@ -268,36 +268,82 @@ def test_an_index_that_exists_but_cannot_serve_says_why() -> None:
     ]
 
 
-def test_the_refusal_leads_with_the_remedy_and_is_an_engine_refusal() -> None:
+def test_the_refusal_leads_with_the_differences_and_is_an_engine_refusal() -> None:
     exc = ServerSchemaMismatchError("postgres", "mf", ["table 'queue' is missing column 'seq'"])
     assert isinstance(exc, RuntimeError)
     assert type(exc).__module__.startswith("messagefoundry.")  # printed whole by the CLI
     text = str(exc)
-    assert text.index("rename or drop that object") < text.index("Differences:")
-    assert text.endswith("table 'queue' is missing column 'seq'.")
+    assert text.startswith("postgres schema differs: table 'queue' is missing column 'seq'. In ")
+    assert text.index("missing column 'seq'") < text.index("Rename or drop")
     assert exc.differences == ("table 'queue' is missing column 'seq'",)
     copied = pickle.loads(pickle.dumps(exc))
     assert (str(copied), copied.differences, copied.database) == (text, exc.differences, "mf")
+
+
+def test_the_first_difference_survives_the_shortest_cut() -> None:
+    """``safe_exc`` keeps 200 characters of a message and ``provision-schema`` 500, so the remedy,
+    which is the same every time, goes last, and so does the place, whose length is the operator's.
+    A long difference the compare writes for one of this build's indexes fits the shortest cut."""
+    from messagefoundry.redaction import safe_exc
+
+    first = (
+        f"index {_FIFO!r} was never built: the name is taken by a partitioned table"
+        " (expected on queue(stage, channel_id, status, seq))"
+    )
+    exc = ServerSchemaMismatchError(
+        "sqlserver", "mf_test", [first, "table 'x' is missing column 'y'"]
+    )
+    cut = safe_exc(exc, limit=200)
+    assert first in cut
+    assert first in str(exc)[:200]
+    # Control: the earlier layout, remedy first, loses the difference at the same cut.
+    remedy_first = "x" * 446 + " Differences: " + first
+    assert first not in safe_exc(RuntimeError(remedy_first), limit=200)
 
 
 def test_the_refusal_names_where_it_looked_and_scopes_its_remedy() -> None:
     """The Postgres schema is named, an unset database setting never prints as ``None``, and a table
     that only lacks a column is told to gain it, never to be renamed or dropped."""
     exc = ServerSchemaMismatchError("postgres", "mf", ["x"], "tenant_b")
-    assert "store's tables in schema 'tenant_b' of database 'mf' are not" in str(exc)
+    assert ". In schema 'tenant_b' of database 'mf'; the open refused" in str(exc)
     copied = pickle.loads(pickle.dumps(exc))
     assert (str(copied), copied.schema) == (str(exc), "tenant_b")
     unset = ServerSchemaMismatchError("sqlserver", None, ["x"])
     assert "None" not in str(unset)
-    assert "store's tables in the connection's default database are not" in str(unset)
+    assert ". In the connection's default database; the open refused" in str(unset)
     text = str(ServerSchemaMismatchError("postgres", "mf", ["x"]))
-    assert "store's tables in database 'mf' are not" in text
-    remedy = text[: text.index("Differences:")]
-    assert "Where a table lacks a column, add the column as this build's DDL declares it." in remedy
+    assert ". In database 'mf'; the open refused" in text
+    remedy = text[text.index("Rename or drop") :]
+    assert "add a missing column as this build declares it" in remedy
     # The rename-or-drop remedy is scoped to a taken name or an index, never to a whole table.
-    rename = remedy[: remedy.index("rename or drop that object")]
-    assert rename.endswith("an index has another shape or cannot serve, ")
-    assert "Rename or drop each object" not in remedy
+    rename = remedy[: remedy.index(";")]
+    assert rename == (
+        "Rename or drop an object that takes a name, or an index of another shape or that cannot"
+        " serve"
+    )
+
+
+#: A schema-qualified ``unnest`` call with two or more arguments. PostgreSQL rewrites a multi-argument
+#: ``unnest`` in FROM into ROWS FROM only when the name is unqualified, so the qualified form raises
+#: UndefinedFunction. The fakes match the SQL as a string and cannot see that.
+_QUALIFIED_MULTI_UNNEST = re.compile(r"pg_catalog\.unnest\s*\([^()]*,", re.IGNORECASE)
+
+
+def test_no_live_schema_read_calls_a_qualified_multi_argument_unnest() -> None:
+    """Only the live ``postgres-store`` leg proves the query runs; this pins the one shape known to
+    fail, in every SQL constant the Postgres store and the shared check define."""
+    from messagefoundry.store import postgres, server_schema_verify
+
+    assert _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[], $2::text[]) AS q")
+    assert not _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[]) AS t(name)")
+    for module in (postgres, server_schema_verify):
+        texts = [v for v in vars(module).values() if isinstance(v, str)]
+        assert len(texts) > 5, f"{module.__name__}: no SQL constants read"
+        offenders = [t for t in texts if _QUALIFIED_MULTI_UNNEST.search(t)]
+        assert offenders == [], f"{module.__name__}: {offenders}"
+    assert "ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))" in (
+        postgres._LIVE_INDEXES_SQL
+    )
 
 
 # --- PostgreSQL _ensure_schema, through a fake connection ------------------------------------------

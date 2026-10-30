@@ -2759,13 +2759,24 @@ _SCHEMA: list[str] = [
 ]
 
 
+# The revision of the live-schema check _ensure_schema runs after the batch and before the marker
+# (BACKLOG #1720). That check is Python, so the content hash cannot see it, and a store marked before
+# it existed would take the fast path past it forever. Bump this when the check changes what it
+# refuses. It is NOT for migrations: those still live in _SCHEMA, which moves the hash on its own.
+# 1 (BACKLOG #1720): the check is added.
+_SCHEMA_CHECK_REV = 1
+
+
 def _schema_hash() -> str:
-    """Content hash of the shipped DDL batch. The ``schema_meta`` marker stores it; a match at open
-    means this exact batch already ran, so the batch (and its exclusive applock) is skipped. Any
-    edit to ``_SCHEMA`` — new table, new index, a B10-style guarded migration — changes the hash and
-    forces one full (idempotent) run, so there is no version constant to forget to bump. On-open
-    migrations MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code."""
-    return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
+    """Content hash of the shipped DDL batch, plus the live-schema check's revision. The
+    ``schema_meta`` marker stores it; a match at open means this exact batch already ran and passed
+    that check, so the batch (and its exclusive applock) is skipped. Any edit to ``_SCHEMA`` — new
+    table, new index, a B10-style guarded migration — changes the hash and forces one full
+    (idempotent) run, so a migration has no version constant to forget to bump. On-open migrations
+    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the check,
+    which cannot live there, has ``_SCHEMA_CHECK_REV``."""
+    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={_SCHEMA_CHECK_REV}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _declared_schema() -> SchemaShape:
