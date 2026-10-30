@@ -609,7 +609,7 @@ not): those four refuse on every one, while MLLP, raw TCP and X12 build on the n
 same run. So `enforcement = warn` is not a way to stand up a cleartext HTTP destination —
 `cleartext_accepted` is the only one, and it is audited at every construction.
 
-**Two outbound channels do not — and they are the two that reach furthest.** Confirming that MLLP and
+**Two outbound channels do not, or not always — and they are the two that reach furthest.** Confirming that MLLP and
 REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
@@ -691,7 +691,7 @@ there is for MLLP:
   table); an anonymous hop is governed below.
 
 **Two more channels can carry PHI in cleartext even though they are not "no-TLS" by protocol** — the
-engine will not refuse either one for you:
+engine will not always refuse them for you:
 
 - **`dialect='generic'` DATABASE** (source *or* destination) — TLS is the ODBC driver's own keyword in
   `odbc_params`, which MessageFoundry cannot introspect. With no TLS mode, or with one set to a no-TLS

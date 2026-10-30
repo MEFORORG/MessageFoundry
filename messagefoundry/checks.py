@@ -2985,7 +2985,7 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     in the same DSN.
 
     **This is the INVENTORY, and the refusal is elsewhere** (BACKLOG #1178). A generic hop whose
-    ``odbc_params`` say TLS is not required is now gated at connector construction through the shared
+    ``odbc_params`` say TLS is not required, or set no TLS mode, is gated at construction through the shared
     cleartext-hop authority (``transports.database.generic_cleartext_hop_guard``), so on an enforcing
     instance it fails the REQUIRED ``build-check`` — which stamps the derived posture and constructs
     every connector — rather than being reported here and crossed anyway.

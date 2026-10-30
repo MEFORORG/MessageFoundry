@@ -1776,16 +1776,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
-> verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
+> TLS mode, or a mode pinned to no TLS. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
 > `dialect='generic'`. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 > (2026-07-12 amendment).
 - **What you lose:** on `dialect='generic'` MessageFoundry cannot introspect an arbitrary ODBC driver's
   TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
   the driver's own keyword. With no mode set — or with one pinned to a no-TLS value — the rows, and
   the credential in the DSN, may cross in plaintext.
-- **Why it is a delegation rather than a refusal:** the engine cannot enumerate an arbitrary driver's
-  keywords, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
-  was wrong, until #333, was that its only control was a log line.
+- **Why a set mode stays a delegation:** the engine cannot tell whether an arbitrary driver's value
+  verifies anything, and a guess-based refusal would break legitimate drivers. The delegation is
+  correct; what was wrong, until #333, was that its only control was a log line.
 - **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
@@ -1798,10 +1798,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
   for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
-  is delegated however it is spelled, so a typo clears the check. `encrypt` is unproven on psqlODBC and
-  on MySQL drivers: no test shows either reads it, so `Encrypt=yes` there clears the check and may
-  change nothing on the wire.
-- **It is never silent:** a WARN at each construction naming the connection and the offending keyword;
+  is delegated however it is spelled, so a typo clears the check, and on some drivers it would select
+  no TLS. `encrypt` is unproven on psqlODBC and on MySQL drivers.
+  [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
+- **It is never silent:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
 - **What it cannot do:** the WARN and these reports refuse nothing. The refusal is

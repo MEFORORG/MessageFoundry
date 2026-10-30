@@ -507,7 +507,7 @@ _TLS_KEYWORDS_WITH_NO_MODE = sorted(
     for keyword in _ODBC_PARAM_ALLOWLIST - _ODBC_TLS_MODE_KEYWORDS
     if _is_tls_keyword(keyword)
 )
-_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but neither sslmode nor encrypt has a value"
+_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but sslmode has no value"
 
 
 def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
@@ -521,8 +521,8 @@ def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> 
 
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str) -> None:
-    """BACKLOG #2483. libpq defaults to ``sslmode=prefer``, so a key or certificate path with no
-    mode beside it could still fall back to plaintext. A real mode beside it is the control."""
+    """BACKLOG #2483. A key or certificate path with no mode beside it leaves the driver at its own
+    default, which need not require TLS. A real mode beside it is the control."""
     for spelling in (keyword, keyword.upper()):
         assert generic_odbc_tls_unenforced({spelling: "fixture"}) == _NO_MODE_REASON
     assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "require"}) is None
@@ -570,6 +570,7 @@ def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
 ) -> None:
     logged = _generic_dsn_logs({"sslcert": "client.pem"}, caplog)
     assert "TLS verification is NOT enforced" in logged and _NO_MODE_REASON in logged
+    assert "SSLmode=verify-full" in logged
 
 
 @pytest.mark.parametrize(

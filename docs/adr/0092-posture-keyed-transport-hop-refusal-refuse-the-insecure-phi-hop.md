@@ -130,8 +130,9 @@ authority rather than delegate.
 **Amended 2026-10-30 (BACKLOG #2483).** The keyword test above no longer decides the level, and the
 hop has been gated as well as logged since BACKLOG #1178. Only `sslmode` or `encrypt` with a value
 outside the no-TLS deny-list counts as the operator owning TLS. A lone key or certificate keyword,
-or a blank mode, now reads as no mode, because libpq defaults to `sslmode=prefer`. This only adds
-refusals, so the No-loosen rule (§5) holds. `encrypt` is unproven on psqlODBC and on MySQL drivers.
+or a blank mode, now reads as no mode, because a driver's own default need not require TLS. This only
+adds refusals, so the No-loosen rule (§5) holds. `encrypt` stays on that list unproven;
+[CONNECTIONS.md](../CONNECTIONS.md#generic-odbc-postgresql--mysql) records the limits.
 
 ## Amendment (2026-07-13) — the DEFERRED residuals closed (BACKLOG #200)
 

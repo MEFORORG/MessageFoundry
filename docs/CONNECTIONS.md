@@ -1840,10 +1840,19 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
 > dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **Those two
 > are the only keywords that can set a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`,
-> `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode:
-> libpq defaults to `sslmode=prefer`, which can fall back to plaintext. Name the mode as well as the
-> files. `Encrypt` is **unproven** on psqlODBC and on MySQL drivers: no test shows either reads it,
-> so on those drivers use `SSLmode` or `SSLMODE`, and do not take `Encrypt=yes` as a tested control.
+> `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode and
+> leaves the driver at its own default. Name the mode as well as the files. libpq's default is
+> `sslmode=prefer`, which can fall back to plaintext. psqlODBC's own source sets `disable`, so no TLS
+> would be attempted at all. `Encrypt` is **unproven** on psqlODBC and on MySQL drivers: no test
+> shows either reads it, so on those drivers use `SSLmode` or `SSLMODE`.
+>
+> **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
+> `Encrypt=yes` would clear this check with no TLS attempted. It also reads `SSLmode` by a
+> case-sensitive first letter and sends anything it does not recognize to `disable`, so
+> `SSLmode=REQUIRE` or `SSLmode=VERIFY_IDENTITY` would clear this check and select no TLS. The
+> engine cannot see this, because a value outside the deny-list stays delegated. These psqlODBC
+> facts come from its source at commit `0395bf4cc33a`, and were not measured against a driver.
+>
 > A passphrase keyword
 > such as `sslpassword` is not a TLS keyword here: it sets no TLS mode, and its value is never read or
 > reported (BACKLOG #1352). It is also reported

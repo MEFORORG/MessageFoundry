@@ -19,7 +19,7 @@ path TLS is the operator's responsibility (configured through the driver's own k
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
 Construction logs the delegation as a fail-safe (a WARNING when no TLS mode is set — see
 :func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
-required goes through the shared cleartext-hop authority like every other cleartext transport, so an
+required, or set no mode, goes through the shared cleartext-hop authority like every other cleartext transport, so an
 enforcing instance refuses it off-loopback rather than crossing in the clear (BACKLOG #1178 — see
 :func:`generic_cleartext_hop_guard`). The live aioodbc round-trip is exercised by the CI SQL Server service-container job
 (``tests/test_database_connector_integration.py``); the connector logic is also unit-tested with a
@@ -331,12 +331,12 @@ _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 # The ONLY keywords whose value can set a generic hop's TLS mode, in the form
 # :func:`_odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
 # as the operator owning TLS. A key, certificate or CA file, or a cipher list, sets no mode: on its
-# own it leaves libpq at its default, `sslmode=prefer`, which falls back to plaintext without a word.
+# own it leaves the driver at its own default, and the defaults docs/CONNECTIONS.md records do not
+# require TLS.
 #
 # `encrypt` IS UNPROVEN. It is here for a driver that reads it, and no test shows that psqlODBC or a
 # MySQL driver does. On a driver that ignores it, `Encrypt=yes` would clear this gate and leave the
 # driver at its own default, so treat that spelling as the operator's claim, not a tested control.
-# The drivers' own `sslmode` spellings are the ones this path documents.
 _ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
 
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
@@ -459,7 +459,7 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     if _sets_tls_mode(params):
         return None
     if any(_is_tls_keyword(str(k)) for k in params):
-        return "a TLS keyword is set in odbc_params, but neither sslmode nor encrypt has a value"
+        return "a TLS keyword is set in odbc_params, but sslmode has no value"
     return "no TLS keyword is set in odbc_params"
 
 

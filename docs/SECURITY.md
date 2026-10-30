@@ -1205,7 +1205,7 @@ named it as still open, waiting on engine PR 1877.
   pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
   verifying certificate, or the command is changed to pass its posture.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
-  one. `generic_odbc_no_tls_params` records that residual.
+  one. The comment above `_ODBC_NO_TLS_VALUES` records that residual.
 
 Backups and the support bundle write to a path. If that path is a network share, the operating
 system makes the connection, and the engine opens no socket of its own for it.

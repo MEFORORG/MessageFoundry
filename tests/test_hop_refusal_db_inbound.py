@@ -586,15 +586,16 @@ def test_generic_disabling_tls_value_refused_when_enforcing() -> None:
         DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "disable"}))
 
 
+_GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _generic_source)]
+
+
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
-@pytest.mark.parametrize(
-    ("connector", "config"),
-    [(DatabaseDestination, _generic_dest), (DatabaseSource, _generic_source)],
-)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_generic_lone_tls_keyword_refused_when_enforcing(
     keyword: str, connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
-    # BACKLOG #2483: a key or certificate path sets no mode, and libpq defaults to sslmode=prefer.
+    # BACKLOG #2483: a key or certificate path sets no mode, and a driver's own default need not
+    # require TLS.
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
@@ -602,23 +603,29 @@ def test_generic_lone_tls_keyword_refused_when_enforcing(
         connector(config(odbc_params={keyword: "fixture"}))
 
 
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 @pytest.mark.parametrize("mode", ["require", "verify-full"])
-def test_generic_certificate_beside_an_enforcing_mode_is_not_gated(mode: str) -> None:
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
+    keyword: str, mode: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
     # The control for the test above: the same keyword crosses once a mode is set beside it.
-    params = {"sslcert": "fixture", "sslmode": mode}
     with active_hop_posture(PROD_PHI):
-        assert DatabaseDestination(_generic_dest(odbc_params=params))
-        assert DatabaseSource(_generic_source(odbc_params=params))
+        built = connector(config(odbc_params={keyword: "fixture", "sslmode": mode}))
+    assert built._cleartext_guard is None  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("params", [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}])
-def test_generic_blank_mode_refused_when_enforcing(params: dict[str, str]) -> None:
-    # The DSN would go out as sslmode={}, which is no evidence of a mode.
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_blank_mode_refused_when_enforcing(
+    params: dict[str, str], connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    # The DSN would carry the keyword with nothing in it, which is no evidence of a mode.
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
     ):
-        DatabaseDestination(_generic_dest(odbc_params=params))
+        connector(config(odbc_params=params))
 
 
 def test_generic_inbound_poll_refused_when_enforcing() -> None:
