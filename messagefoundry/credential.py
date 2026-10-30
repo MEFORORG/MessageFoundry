@@ -159,9 +159,10 @@ def client_cert_principal(
     present in the map. An empty/absent cert, an empty map, or a subject with no listed name all
     return ``None`` — an unmapped or spoofed-CN cert resolves to nothing.
 
-    **Issuer-blind by design**, so the operator API does not call it directly: it goes through
+    **Issuer-blind by design**, so no production caller calls it directly: the operator API and the
+    inbound HTTP listener's ``intake_client_subjects`` both go through
     :func:`client_cert_principal_under_issuer`, which picks the flat map for the cert's own issuer
-    first (BACKLOG #2237). The inbound listener's ``intake_client_subjects`` still calls this one."""
+    first (BACKLOG #2237, #2287)."""
     if not peercert or not cert_map:
         return None
     for candidate in cert_name_candidates(peercert):
@@ -181,12 +182,14 @@ def client_cert_principal(
 # OpenSSL builds the chain by a loose name compare (case-folded, whitespace collapsed), so a second
 # trusted CA named "CN=ACME   CA" can sign a leaf whose issuer field reads "CN=Acme CA" and it still
 # verifies. The api shim instead finds the loaded CA whose key ACTUALLY signed the leaf and records
-# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). This leaf
-# only reads that string, so it stays stdlib-only.
+# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). The inbound
+# HTTP listener does the same for intake_client_subjects (BACKLOG #2287, transports/http_listener.py).
+# This leaf only reads that string, so it stays stdlib-only.
 
-#: The key the api shim adds to a copy of the ``getpeercert()`` dict, holding the canonical RFC 4514
-#: subject of the loaded CA certificate whose key directly signed the leaf, or ``""`` when none qualifies. ``ssl`` never
-#: produces this key, and the shim overwrites it on every connection, so a peer cannot supply it.
+#: The key the api shim and the inbound HTTP listener add to a copy of the ``getpeercert()`` dict,
+#: holding the canonical RFC 4514 subject of the loaded CA certificate whose key directly signed the
+#: leaf, or ``""`` when none qualifies. ``ssl`` never produces this key, and each overwrites it on
+#: every connection, so a peer cannot supply it.
 VERIFIED_ISSUER_KEY = "mf_verified_issuer"
 
 

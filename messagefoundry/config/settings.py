@@ -306,6 +306,29 @@ def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
     return value
 
 
+def refuse_a_non_canonical_issuer(issuer: str, setting: str) -> None:
+    """Refuse an issuing-CA DN key that could never equal a loaded CA's subject (#2237, #2287).
+
+    Shared by ``[api].tls_client_cert_identities`` and the ``Http`` factory's
+    ``intake_client_subjects``, so both surfaces hold an issuer key to one round trip and one wording.
+    Raises ``ValueError``; the factory re-raises it as its own error type."""
+    # Lazy: pki pulls in cryptography, which a config with no issuer-keyed map never needs.
+    from messagefoundry.pki import canonical_dn
+
+    canonical = canonical_dn(issuer)
+    if canonical is None:
+        raise ValueError(
+            f"{setting} issuer {issuer!r} is not an RFC 4514 distinguished name "
+            "(attr=value,...); name the issuing CA's DN"
+        )
+    if canonical != issuer:
+        # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
+        raise ValueError(
+            f"{setting} issuer {issuer!r} is not in the canonical form the engine compares, "
+            f"so it would never match; write it as the key '{canonical}'"
+        )
+
+
 def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     """Refuse a CRL path that names no file, at load, naming ``setting`` (BACKLOG #1997).
 
@@ -1987,23 +2010,9 @@ class ApiSettings(_Section):
     @classmethod
     def _cert_identities_can_match(cls, v: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
         """Refuse an entry that would silently match nothing (#2237)."""
-        # Lazy: pki pulls in cryptography, which a config with no cert map never needs.
-        from messagefoundry.pki import canonical_dn
-
         field = "[api].tls_client_cert_identities"
         for issuer, names in v.items():
-            canonical = canonical_dn(issuer)
-            if canonical is None:
-                raise ValueError(
-                    f"{field} issuer {issuer!r} is not an RFC 4514 distinguished name "
-                    "(attr=value,...); name the issuing CA's DN"
-                )
-            if canonical != issuer:
-                # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
-                raise ValueError(
-                    f"{field} issuer {issuer!r} is not in the canonical form the engine compares, "
-                    f"so it would never match; write it as the key '{canonical}'"
-                )
+            refuse_a_non_canonical_issuer(issuer, field)
             if not names:
                 raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")
             for name, target in names.items():

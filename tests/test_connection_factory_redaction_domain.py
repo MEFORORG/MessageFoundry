@@ -171,10 +171,12 @@ def _takes_a_spec(fn: Any) -> bool:
 #: has a value that fits and the settings that must come with it, so the factory builds and the
 #: container is still populated for the surface walk. Keyed by factory, so another factory's setting
 #: of the same name keeps the generic probe. vault BACKLOG #2804: FHIR's Bundle entry lists take
-#: FHIR verbs and type names, and apply only to a transaction or batch connection.
-GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[list[str], dict[str, Any]]] = {
+#: FHIR verbs and type names, and apply only to a transaction or batch connection. vault BACKLOG
+#: #2287: Http's intake_client_subjects is keyed by an issuing CA's DN, which ``X-Probe-Auth`` is not.
+GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {
     ("FHIR", "allowed_entry_methods"): (["POST"], {"interaction": "transaction"}),
     ("FHIR", "allowed_entry_types"): (["Patient"], {"interaction": "transaction"}),
+    ("Http", "intake_client_subjects"): ({"CN=Probe CA": ["CN:x-probe"]}, {}),
 }
 
 

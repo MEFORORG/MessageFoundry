@@ -596,9 +596,11 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     included. Both spellings are refused: an :class:`EnvRef` from code-first, and the raw marker dict
     ``connections.toml`` leaves behind (see :func:`_is_nested_envref`).
 
-    Each factory calls this FIRST, ahead of its own validators, because at least one of them --
-    ``Http``'s ``intake_client_subjects`` prefix check -- quotes the offending items in its message and
-    would print the default this refusal withholds. Offenders are named by setting and index only.
+    Each factory calls this FIRST, ahead of its own validators, because a validator may quote the
+    offending items in its message and would print the default this refusal withholds. ``Http``'s
+    ``intake_client_subjects`` prefix check does, and since that setting became a table of lists
+    (BACKLOG #2287) ``_intake_subjects_by_issuer`` calls this once per issuer's list, before it.
+    Offenders are named by setting and index only.
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
@@ -2779,8 +2781,8 @@ def Http(
     intake_api_key_next: EnvRef
     | None = None,  # rotation: accepted alongside intake_api_key, so a partner key rotates without an outage
     intake_api_key_header: str = "x-api-key",  # header carrying the api_key credential (a header NAME, not a secret)
-    intake_client_subjects: Sequence[str]
-    | None = None,  # mtls_subject allow-list, QUALIFIED: "CN:<v>" / "SAN:DNS:<v>"
+    intake_client_subjects: Mapping[str, Sequence[str]]
+    | None = None,  # mtls_subject allow-list: issuing CA's DN -> QUALIFIED "CN:<v>" / "SAN:DNS:<v>"
     intake_auth_health: Literal[
         "require", "allow"
     ] = "require",  # whether GET/HEAD probes need the credential too
@@ -2852,6 +2854,13 @@ def Http(
     against ``intake_client_subjects``. Set ``intake_api_key_next`` to rotate a partner key without an
     outage: both are accepted while the partner cuts over.
 
+    ``intake_client_subjects`` is keyed by the DN of the CA that issues each partner's certificate,
+    as ``rfc4514_string()`` renders that CA's subject, and each key names that CA's subjects:
+    ``{"CN=Acme CA,O=Acme": ["CN:partner.example"]}``. A subject counts only when the loaded CA under
+    its key signed the leaf, so another CA in ``tls_ca_file`` issuing the same subject is refused
+    ``403`` (vault BACKLOG #2287). Only a CA loaded from ``tls_ca_file`` counts as an issuer: a leaf
+    signed by an intermediate the client sends is refused, so load that intermediate and name it.
+
     **TLS is confidentiality; intake auth is authentication.** Enabling one is never an argument for
     relaxing the other. In particular a bare ``tls`` + ``tls_ca_file`` means "any certificate this CA ever
     signed", with no subject binding at all — which is why ``mtls_subject`` additionally requires
@@ -2887,7 +2896,7 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
-    _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
+    subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -2909,7 +2918,7 @@ def Http(
         "intake_api_key": intake_api_key,
         "intake_api_key_next": intake_api_key_next,
         "intake_api_key_header": intake_api_key_header,
-        "intake_client_subjects": list(intake_client_subjects) if intake_client_subjects else None,
+        "intake_client_subjects": subjects,
         "intake_auth_health": intake_auth_health,
         "intake_auth_rate_limit": intake_auth_rate_limit,
         "intake_auth_rate_limit_global": intake_auth_rate_limit_global,
@@ -3156,7 +3165,9 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             "alone means 'any certificate this CA ever signed', which binds no subject and "
             "authenticates no one in particular"
         )
-    unqualified = [s for s in subjects if not str(s).startswith(CERT_NAME_PREFIXES)]
+    unqualified = [
+        s for names in subjects.values() for s in names if not str(s).startswith(CERT_NAME_PREFIXES)
+    ]
     if unqualified:
         raise WiringError(
             f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "
@@ -3164,6 +3175,76 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             "'SAN:DNS:<value>' so a spoofed commonName cannot collide with a pinned SAN; a bare name "
             "matches nothing and would 403 every request from the partner it names"
         )
+
+
+def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
+    """``Http``'s ``intake_client_subjects`` checked for shape, or ``None`` when unset (#2287).
+
+    The setting is a table: the DN of each issuing CA, as ``cryptography``'s ``rfc4514_string()``
+    renders that CA's subject, mapped to a list of qualified subject names. This mirrors
+    ``[api].tls_client_cert_identities``, and an issuer key is held to the same canonical-form
+    round trip, so a key that could never equal a loaded CA's subject is refused here.
+
+    Every check is made here because neither the ``connections.toml`` type check nor
+    :func:`_reject_envref_in_lists` reaches it. The type check stops one level in, at its depth cap,
+    so it never looks inside a subject list. The list refusal scans only list-valued settings, and
+    this one is a table. So this function refuses ``env()`` at each level itself: as the whole
+    table, as an issuer's list and as a list item. A whole-table ``env()`` would resolve to a string.
+    No refusal repeats a reference's ``default``. The flat list this setting used to be is refused
+    with the shape to write, and there is no compatibility shim, because nothing is deployed."""
+    if value is None:
+        return None
+    setting = "Http intake_client_subjects"
+    if _is_nested_envref(value):
+        raise WiringError(
+            f"{setting} may not be an env() reference - it is a table of issuer DN to subject "
+            "names, written in code or connections.toml, and an environment value is a string"
+        )
+    if not isinstance(value, Mapping):
+        raise WiringError(
+            f"{setting} must be a table keyed by the DN of the CA that issues each partner's "
+            "certificate, each naming that CA's subjects, e.g. "
+            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is no longer "
+            "read, because it let any CA in tls_ca_file issue a listed subject (BACKLOG #2287)"
+        )
+    if not value:
+        return None
+    from messagefoundry.config.settings import refuse_a_non_canonical_issuer
+
+    checked: dict[str, list[str]] = {}
+    for position, (issuer, names) in enumerate(value.items()):
+        if not isinstance(issuer, str):
+            label = _envref_label(issuer) if _is_nested_envref(issuer) else type(issuer).__name__
+            raise WiringError(
+                f"{setting} issuer key {position} must be the issuing CA's DN as a string, not "
+                f"{label}"
+            )
+        try:
+            refuse_a_non_canonical_issuer(issuer, setting)
+        except ValueError as exc:
+            raise WiringError(str(exc)) from exc
+        if _is_nested_envref(names):
+            raise WiringError(
+                f"{setting} issuer {issuer!r} may not name its subjects with an env() reference - "
+                "a nested setting is not env-resolved; write the subjects as a static list"
+            )
+        if not isinstance(names, list | tuple):
+            raise WiringError(
+                f"{setting} issuer {issuer!r} must name a list of subjects, e.g. "
+                "['CN:partner.example'], not a single value"
+            )
+        # The item scan first, so no message below can quote an item that is a reference.
+        _reject_envref_in_lists("Http", **{f"intake_client_subjects {issuer!r}": names})
+        if not names:
+            raise WiringError(f"{setting} issuer {issuer!r} names no subjects")
+        for index, name in enumerate(names):
+            if not isinstance(name, str) or not name:
+                raise WiringError(
+                    f"{setting} issuer {issuer!r} item {index} must be a non-empty subject name, "
+                    'such as "CN:partner.example"'
+                )
+        checked[issuer] = list(names)
+    return checked
 
 
 def File(
