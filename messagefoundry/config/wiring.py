@@ -3822,15 +3822,16 @@ def DICOM(
     ``max_associations_per_second`` bounds how fast this SCP ACCEPTS new associations;
     ``association_burst`` is how large a burst passes before the sustained rate applies (default: one
     second's worth). Over budget the SCP **waits before reading the association request**, so the peer
-    is back-pressured by TCP and then served in full — nothing is dropped, refused or answered
-    differently, and a rejected association charges nothing. **The unit is an association, not a
+    is back-pressured by TCP and then served in full — the wait itself drops, refuses and answers
+    nothing differently, and a rejected association charges nothing. **The unit is an association, not a
     message**, and that is a property of DIMSE rather than a shortcut: ``pynetdicom`` owns the read
     loop, so by the time a C-STORE reaches this engine the object has already been read and decoded,
     and pacing there would delay a message the count-and-log invariant has already obliged us to
     account for. So an established association is NOT bounded in the objects it may push — those are
     bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
     guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
-    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace.
+    it with a rate that keeps few peers waiting: a waiting peer holds one of the SCP's slots for
+    connections with no association yet, and a connection over those fixed caps is closed.
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the

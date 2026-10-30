@@ -233,8 +233,10 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # startup guard stands in front of one, and it checks the routing alone.
 # That subclass's request handler also reads the association request ahead of pynetdicom (vault BACKLOG
 # #2712). So it relies on private names too: RequestHandler._create_association, the order of the steps
-# in RequestHandler.handle, Association.dul.socket, and DULServiceProvider._read_pdu_data reading through
-# AssociationSocket.ready and recv. A test in tests/test_dicom_scp_pre_association.py pins them.
+# in RequestHandler.handle, Association.dul.socket, DULServiceProvider._is_transport_event testing
+# AssociationSocket.ready, and DULServiceProvider._read_pdu_data reading through AssociationSocket.recv.
+# _require_association_seams refuses to start without the names, and a test in
+# tests/test_dicom_scp_pre_association.py pins the rest at the locked version.
 # The harness DIMSE driver (harness/drivers/dimse.py) also overrides a private hook, AE._create_socket, to
 # cap what it reads from the engine; its read-cap test in tests/test_harness_dimse.py fails if the hook moves.
 # TO RAISE IT: re-read _admitting_server_class against the new release's pynetdicom/transport.py and

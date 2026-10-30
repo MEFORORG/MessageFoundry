@@ -280,7 +280,7 @@ async def test_a_full_listener_serves_a_real_sender_once_the_deadline_expires(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The residual docs/DICOM.md states: at the cap, a sender waits for the deadline, not for the
-    # stalled peers to go away.
+    # stalled peers to leave. These peers do not reconnect; one that did could take the slot again.
     monkeypatch.setattr(dicom_module, "_MAX_PENDING_CONNECTIONS", 2)
     held: list[socket.socket] = []
     async with _running_scp({"timeout_seconds": 1.5}) as scp:
@@ -294,7 +294,7 @@ async def test_a_full_listener_serves_a_real_sender_once_the_deadline_expires(
             assert refused == (False, None), "CONTROL: the cap was full"
             assert any("already in progress" in m for m in _warnings(caplog)), _warnings(caplog)
 
-            await _until(lambda: _pending_count(scp) == 0)  # the stalled peers are STILL connected
+            await _until(lambda: _pending_count(scp) == 0)  # the SCP closed them; they never left
             result = await asyncio.to_thread(_scu_cstore, port, make_sr_part10())
             assert result == (True, 0x0000)
         finally:
@@ -319,7 +319,9 @@ async def test_a_request_sent_in_pieces_inside_the_deadline_gets_its_association
                 await asyncio.sleep(0.1)
             assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
             await asyncio.to_thread(lambda: sock.recv(4096))  # the rest of the A-ASSOCIATE-AC
-            sock.sendall(_RELEASE_RQ)
+            sock.sendall(_RELEASE_RQ[:3])  # a later PDU in pieces is served too
+            await asyncio.sleep(0.1)
+            sock.sendall(_RELEASE_RQ[3:])
             assert await asyncio.to_thread(sock.recv, 1) == _RELEASE_RP
         finally:
             sock.close()
@@ -379,15 +381,15 @@ def _wrong_protocol(request: bytes) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("build", "reason"),
+    ("build", "reason", "answer"),
     [
-        (lambda _request: b"\x01\x00\x00\x00\x00\x00", "does not decode"),
-        (_wrong_protocol, "wrong protocol"),
+        (lambda _request: b"\x01\x00\x00\x00\x00\x00", "does not decode", b""),
+        (_wrong_protocol, "wrong protocol", dicom_module._RJ_PDU_PROTOCOL_VERSION),
     ],
     ids=["no-body", "wrong-protocol"],
 )
 async def test_a_request_the_dul_would_not_pass_on_starts_no_association(
-    build: Callable[[bytes], bytes], reason: str, caplog: pytest.LogCaptureFixture
+    build: Callable[[bytes], bytes], reason: str, answer: bytes, caplog: pytest.LogCaptureFixture
 ) -> None:
     # pynetdicom's DUL answers each of these and gives the association nothing, so a started
     # Association waited out timeout_seconds with its socket already closed, counted against
@@ -397,10 +399,108 @@ async def test_a_request_the_dul_would_not_pass_on_starts_no_association(
         sock = _stall(scp.sockport, opening)
         try:
             with caplog.at_level(logging.WARNING, logger=_LOG):
+                sock.settimeout(3.0)
+                assert await asyncio.to_thread(sock.recv, 64) == answer
                 assert await asyncio.to_thread(_closed_within, sock, 3.0)
             assert any(reason in m for m in _warnings(caplog)), _warnings(caplog)
             await _until(lambda: scp._server._pending == {})
             assert scp._server.active_associations == [], "the request started an association"
+        finally:
+            sock.close()
+
+
+def _p_data_header() -> bytes:
+    """The head of a P-DATA-TF that announces 4096 bytes."""
+    return b"\x04\x00\x00\x00\x10\x00"
+
+
+@_BOTH_TRANSPORTS
+@pytest.mark.parametrize(
+    "stray",
+    [b"\x07", _p_data_header(), _p_data_header() + b"\x00" * 10],
+    ids=["one-byte", "header", "header-and-body"],
+)
+async def test_a_stall_mid_pdu_on_an_established_association_is_ended(
+    stray: bytes, tls: bool, tmp_path: Path
+) -> None:
+    # Measured on the first build of this row, which read only the first PDU: still open 10 s later
+    # at timeout_seconds 2, holding a max_associations slot until the peer closed. The DUL was
+    # blocked in recv, so its timers could not run, and kill() would not return.
+    request = await asyncio.to_thread(_a_real_association_request)
+    extra = _tls_settings(tmp_path) if tls else {}
+    settings = {"max_associations": 2, "timeout_seconds": 1.0, **extra}
+    async with _running_scp(settings) as scp:
+        await asyncio.to_thread(lambda: None)  # so the loop's worker is up before the baseline
+        baseline = len(_threads_outside_the_test())
+        sock = await asyncio.to_thread(_open, scp.sockport, tls=tls)
+        try:
+            sock.sendall(request)
+            assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+            await asyncio.to_thread(lambda: sock.recv(4096))
+            sock.sendall(stray)
+            assert await asyncio.to_thread(_closed_within, sock, 5.0), (
+                "the stalled peer was not ended"
+            )
+            await _until(lambda: len(_threads_outside_the_test()) <= baseline)
+            assert scp._server.active_associations == []
+        finally:
+            sock.close()
+
+
+async def test_a_dribble_mid_pdu_on_an_established_association_is_ended_on_time() -> None:
+    # A deadline, not an idle timer: every gap here is far shorter than timeout_seconds.
+    request = await asyncio.to_thread(_a_real_association_request)
+    async with _running_scp({"timeout_seconds": 1.0}) as scp:
+        sock = await asyncio.to_thread(_open, scp.sockport)
+        sock.sendall(request)
+        assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+        await asyncio.to_thread(lambda: sock.recv(4096))
+        sock.settimeout(0.1)
+        pending = _p_data_header() + b"\x00" * 4096
+        took = await asyncio.to_thread(_send_slowly, sock, pending, give_up=6.0)
+        assert took is not None, "a peer dribbling a PDU was never ended"
+        assert took < 4.0, f"ended after {took:.2f}s against a 1.0s deadline"
+
+
+async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing() -> None:
+    # Found by review of this row's first build. Each peer sends a whole request, so it spends no
+    # slot, plus one stray byte. Over max_associations it is rejected, then the DUL blocked reading
+    # the byte and kill() never returned: six peers at max_associations=1 held 12 threads for as
+    # long as they stayed connected, and a real sender was turned away.
+    request = await asyncio.to_thread(_a_real_association_request)
+    settings: dict[str, object] = {"max_associations": 1, "timeout_seconds": 1.0}
+    held: list[socket.socket] = []
+    async with _running_scp(settings) as scp:
+        await asyncio.to_thread(lambda: None)  # so the loop's worker is up before the baseline
+        baseline = len(_threads_outside_the_test())
+        try:
+            for _ in range(6):
+                held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
+            await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=8.0)
+            assert scp._server.active_associations == []
+            assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
+                True,
+                0x0000,
+            )
+        finally:
+            for sock in held:
+                sock.close()
+
+
+async def test_stop_ends_a_reader_stalled_mid_pdu() -> None:
+    # The DUL thread is not a daemon, so one left blocked would keep the process from exiting.
+    request = await asyncio.to_thread(_a_real_association_request)
+    settings: dict[str, object] = {"timeout_seconds": 30.0}
+    baseline = 0
+    async with _running_scp(settings) as scp:
+        await asyncio.to_thread(lambda: None)
+        baseline = len(_threads_outside_the_test())
+        sock = await asyncio.to_thread(_open, scp.sockport)
+        try:
+            sock.sendall(request + _p_data_header())
+            await _until(lambda: len(scp._server.active_associations) == 1)
+            await scp.stop()
+            await _until(lambda: len(_threads_outside_the_test()) < baseline)
         finally:
             sock.close()
 
@@ -460,31 +560,21 @@ async def test_stop_does_not_wait_out_a_peer_with_no_association(tls: bool, tmp_
             silent.close()
 
 
-async def test_a_stall_mid_pdu_on_an_established_association_is_not_bounded_yet() -> None:
-    """PINS A GAP, so that it is on the record and cannot close unnoticed. Measured at pynetdicom
-    3.0.4: the peer finishes its association, starts a PDU and stops. It was still open 10 s later
-    at ``timeout_seconds`` 2, and it holds a ``max_associations`` slot until it closes.
+def test_a_pynetdicom_without_the_association_seams_is_refused() -> None:
+    # Without them the SCP would start and then fail every connection. So it does not start.
+    from pynetdicom.transport import AssociationSocket, RequestHandler
 
-    The first-request read covers the path up to the association only. After it, reading is the
-    DUL thread's blocking ``recv``, for the reason ``_admitting_server_class`` gives. Vault BACKLOG
-    #2712 limb 1 closes the connections before an association, so this is not that limb's to fix,
-    and docs/DICOM.md states the residual. When this test fails because the peer WAS ended, the gap
-    has closed: replace this test with one that asserts so, and correct docs/DICOM.md.
-    """
-    request = await asyncio.to_thread(_a_real_association_request)
-    settings: dict[str, object] = {"max_associations": 2, "timeout_seconds": 1.0}
-    async with _running_scp(settings) as scp:
-        sock = await asyncio.to_thread(_open, scp.sockport)
-        try:
-            sock.sendall(request)
-            assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
-            await asyncio.to_thread(lambda: sock.recv(4096))
-            sock.sendall(b"\x04\x00\x00\x00\x10\x00" + b"\x00" * 10)  # P-DATA-TF, 4096 announced
-            assert not await asyncio.to_thread(_closed_within, sock, 2.0)
-            assert len(scp._server.active_associations) == 1
-        finally:
-            sock.close()
-        await _until(lambda: scp._server.active_associations == [])
+    dicom_module._require_association_seams(RequestHandler, AssociationSocket)  # CONTROL: 3.0.4
+
+    class NoFactory:
+        pass
+
+    class SocketReadsElsewhere(NoFactory):
+        pass
+
+    for handler, sock in ((NoFactory, AssociationSocket), (RequestHandler, SocketReadsElsewhere)):
+        with pytest.raises(RuntimeError, match="does not have the association hooks"):
+            dicom_module._require_association_seams(handler, sock)
 
 
 def test_the_pynetdicom_seams_the_first_request_read_relies_on_are_still_there() -> None:
@@ -513,6 +603,10 @@ def test_the_pynetdicom_seams_the_first_request_read_relies_on_are_still_there()
     assert callable(vars(AssociationSocket)["recv"])
     reader = inspect.getsource(DULServiceProvider._read_pdu_data)
     assert "recv(6)" in reader and "recv(pdu_length)" in reader
+    assert "self.socket.ready" in inspect.getsource(DULServiceProvider._is_transport_event)
+    # A raise from recv is what ends a stalled reader, so the DUL must still catch it as a closed
+    # connection, on both reads.
+    assert reader.count("except (OSError, TimeoutError)") == 2 and '"Evt17"' in reader
     # _check_association_request repeats these steps, so that the two cannot disagree on a request.
     assert "pdu.decode(b)" in inspect.getsource(DULServiceProvider._decode_pdu)
     indication = inspect.getsource(AE_6)
@@ -527,4 +621,5 @@ def test_the_doc_states_the_bounds_of_the_first_request_read() -> None:
     doc = (Path(__file__).resolve().parents[1] / "docs" / "DICOM.md").read_text(encoding="utf-8")
     assert f"at most {dicom_module._MAX_PENDING_CONNECTIONS} connections" in doc
     assert f"at most {dicom_module._MAX_ASSOCIATE_RQ_BYTES // 1024} KiB" in doc
-    assert "`timeout_seconds`" in doc
+    assert "A peer has `timeout_seconds` to deliver its whole association request." in doc
+    assert "each read has `timeout_seconds`" in doc

@@ -76,32 +76,39 @@ MLLP listener uses, and it is not a setting.
 One SCP holds at most 256 connections with no association yet, and at most 32 from one peer address.
 A connection counts from accept until its association starts.
 So that is also at most 256 TLS handshakes at once, and at most 32 from one peer.
-A connection over either number is closed. Those are the MLLP listener's two connection caps, and
-they are not settings.
+A connection over either number is closed. The numbers are the MLLP listener's two connection caps.
+Here they are constants, not settings.
 
 **A peer has `timeout_seconds` to deliver its whole association request.** That is a deadline, not
 an idle timer, so a peer that sends a byte at a time is ended on time, as a silent one is. The clock
 starts when the SCP starts to read, after any TLS handshake and any
 `max_associations_per_second` wait. An SCU sends its request as soon as it connects, so a working
-sender does not meet this. The first PDU has to be a well-formed association request of at most 512 KiB.
-PS3.8 sets no limit on that PDU, and the most a request can name is far smaller. Anything else is
-closed at once, with no association rejection.
+sender does not meet this. The first PDU has to be a well-formed association request of at most 256 KiB.
+PS3.8 sets no limit on that PDU, so a larger request is legal in the format, but a modality would
+not need one. Anything else is closed at once. A wrong protocol version gets the association
+rejection the standard gives it, and the rest get no rejection.
+
+**After that, each PDU has a deadline too.** The SCP reads a PDU's header and then its body, and
+each read has `timeout_seconds`, however slowly the bytes arrive. A peer that stops part way through
+a PDU is ended there, on an association it was given and on one it was refused. This is a deadline
+per read, not per object, so at the shipped 16 KiB `max_pdu_size` a sender has to keep up about
+0.5 KiB per second. Raising `max_pdu_size` raises that floor. A peer that keeps finishing PDUs is not
+ended by this.
 
 **A peer that stalls before its request is complete does not use up `max_associations`.** It never
-gets an association, so with `max_associations=2` and stalled peers still connected, a real sender
-is served. These are the limits of that:
+gets an association, so with `max_associations=2` and three stalled peers held, a real sender is
+served. These are the limits of that:
 
 - A stalled peer holds one of the slots above until the deadline. Up to 32 stalled connections from
   one address, or 256 in all, would refuse a sender that shares the address, or any sender, until
-  those deadlines run out. The sender succeeds once they do, while the stalled peers are still
-  connected. A sender behind one NAT address shares that address with every other sender there.
+  those deadlines run out. A peer that reconnects as soon as it is closed can take the slot again,
+  so a sender then gets in only by reaching a free slot first. A sender behind one NAT address
+  shares that address with every other sender there.
 - A connection waiting on `max_associations_per_second` has no association yet, so it holds a slot
   too. A rate low enough to keep many senders waiting can fill the slots, and a connection over them
   is closed.
-- **These bounds stop once the association is established.** A peer that finishes its association
-  and then stalls part way through a PDU is not ended by `timeout_seconds`, and it holds a
-  `max_associations` slot until it closes the connection. pynetdicom's reader is blocked in that
-  read, so its own timers cannot run. Measured at pynetdicom 3.0.4 on cleartext.
+- A peer that sends a whole request and then stalls has an association for up to `timeout_seconds`,
+  so it counts against `max_associations` for that long.
 
 **A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
 no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a
