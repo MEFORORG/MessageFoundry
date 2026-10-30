@@ -79,6 +79,7 @@ from tests._live_scratch import (
     sqlserver_admin,
     throwaway_password,
 )
+from tests._server_schema_rows import pg_live_rows
 
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
 _POSTGRES_ON = bool(os.getenv("MEFOR_TEST_POSTGRES"))
@@ -633,7 +634,9 @@ class _ProvisioningPgConn:
         return {"present": False} if "to_regclass" in sql else None
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
-        return []  # information_schema: nothing present yet, so every gated ADD fires
+        # information_schema: nothing present yet, so every gated ADD fires. The BACKLOG #1720
+        # live-schema reads after the batch see what it declares.
+        return pg_live_rows(sql, args)
 
     async def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
         self.writes.append(" ".join(sql.split()))

@@ -29,6 +29,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _SCHEMA_LOCK, SqlServerStore, _schema_hash
+from tests._server_schema_rows import mssql_live_rows
 
 
 class _FakeCursor:
@@ -63,7 +64,9 @@ class _FakeCursor:
     applock_rc: int = 0
 
     async def fetchall(self) -> list[object]:
-        return []
+        # The BACKLOG #1720 live-schema reads see what the batch declares; nothing else is there.
+        params = self._executed[-1][1] if self._executed else None
+        return list(mssql_live_rows(self._last_sql, params))  # type: ignore[arg-type]
 
     async def close(self) -> None:
         pass

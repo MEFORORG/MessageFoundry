@@ -169,11 +169,13 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
+from messagefoundry.store.schema_verify import IndexShape, SchemaShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.server_schema_verify import declared_schema, refuse_short_schema
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -2766,6 +2768,50 @@ def _schema_hash() -> str:
     return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
 
 
+def _declared_schema() -> SchemaShape:
+    """What the live-schema check expects: every object the batch declares (BACKLOG #1720)."""
+    return declared_schema(tuple(_SCHEMA))
+
+
+def _object_kind_label(type_desc: object) -> str | None:
+    """``sys.objects.type_desc`` as the compare words it: ``table`` for a user table, the type in
+    lower-case words otherwise, ``None`` where nothing holds the name."""
+    if type_desc is None:
+        return None
+    return "table" if type_desc == "USER_TABLE" else str(type_desc).lower().replace("_", " ")
+
+
+def _live_columns_sql(count: int) -> str:
+    """The live columns of ``count`` tables, named as bound parameters (BACKLOG #1720).
+
+    ``OBJECT_ID`` resolves each name the way the batch's unqualified DDL did, in the login's default
+    schema and then ``dbo``. The object's type is read too, so a name held by something other than a
+    user table is named as such. The placeholder list is built from a count, never from a name."""
+    values = ", ".join(["(?)"] * count)
+    return (
+        "SELECT v.name, o.type_desc, c.name"
+        f" FROM (VALUES {values}) AS v(name)"
+        " LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(v.name)"
+        " LEFT JOIN sys.columns AS c ON c.object_id = o.object_id AND o.type = 'U'"
+    )
+
+
+def _live_indexes_sql(count: int) -> str:
+    """The key columns of ``count`` (table, index) pairs, bound as parameters (BACKLOG #1720). An
+    index name is unique only within its table here, so each is looked up on the table the batch
+    declared it on, as its ``INDEXPROPERTY`` guard did. ``key_ordinal`` is 0 for an INCLUDE column."""
+    values = ", ".join(["(?, ?)"] * count)
+    return (
+        "SELECT v.idx, i.index_id, i.is_unique, i.has_filter, ic.key_ordinal, c.name,"
+        " ic.is_descending_key"
+        f" FROM (VALUES {values}) AS v(tbl, idx)"
+        " LEFT JOIN sys.indexes AS i ON i.object_id = OBJECT_ID(v.tbl) AND i.name = v.idx"
+        " LEFT JOIN sys.index_columns AS ic ON ic.object_id = i.object_id"
+        " AND ic.index_id = i.index_id AND ic.key_ordinal > 0"
+        " LEFT JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
+    )
+
+
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
@@ -4720,6 +4766,11 @@ class SqlServerStore:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
                         for statement in _SCHEMA:
                             await cur.execute(statement)
+                        # BACKLOG #1720: before the marker, on this cursor and under its lifted
+                        # query timeout. Every guarded CREATE above skips a name that is already
+                        # taken, so only a read of the live catalog can say the batch built what
+                        # the marker is about to record. A refusal rolls the batch back below.
+                        await self._verify_live_schema(cur)
                         await cur.execute("DELETE FROM schema_meta WHERE id=1")
                         await cur.execute(
                             "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
@@ -4753,6 +4804,44 @@ class SqlServerStore:
                 if lock_bounded:
                     await self._reset_schema_lock_timeout(conn)
                 raise
+
+    async def _verify_live_schema(self, cur: Any) -> None:
+        """Refuse the open when the live schema lacks a table, column or index the batch declares
+        (BACKLOG #1720). Runs on the batch's own cursor, before the marker.
+
+        Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
+        are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
+        what is not. Reads only."""
+        expected = _declared_schema()
+        tables = sorted(expected.columns)
+        await cur.execute(_live_columns_sql(len(tables)), tables)
+        column_rows = [
+            (table, _object_kind_label(kind), column)
+            for table, kind, column in await cur.fetchall()
+        ]
+        names = sorted(expected.named_indexes)
+        pairs = [v for name in names for v in (expected.named_indexes[name].table, name)]
+        await cur.execute(_live_indexes_sql(len(names)), pairs)
+        found: dict[str, tuple[bool, bool, dict[int, str]]] = {}
+        for name, index_id, unique, has_filter, ordinal, column, desc in await cur.fetchall():
+            if index_id is None:
+                continue  # no index of that name on its table
+            entry = found.setdefault(name, (bool(unique), bool(has_filter), {}))
+            if ordinal is not None:
+                entry[2][int(ordinal)] = str(column).lower() + (" DESC" if desc else "")
+        indexes = {
+            name: IndexShape(
+                expected.named_indexes[name].table,
+                tuple(keys[k] for k in sorted(keys)),
+                unique,
+                partial,
+            )
+            for name, (unique, partial, keys) in found.items()
+        }
+        # Index names are per table here, so no other kind of object can hold one: nothing taken.
+        refuse_short_schema(
+            self.backend.value, self._settings.database, expected, column_rows, indexes, {}
+        )
 
     async def _reset_schema_lock_timeout(self, conn: Any) -> None:
         """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
