@@ -1017,7 +1017,7 @@ def _entry_with(entry: str) -> bytes:
     "reply",
     [
         # The middle response reads 200 keeping the first key and 404 keeping the last. Both
-        # readings of the whole reply take an outer 200, so before #3796 it was delivered.
+        # readings of the whole reply take an outer 200, so before vault BACKLOG #3796 it was delivered.
         _entry_with(
             '{"response": {"status": "200 OK"}, '
             '"response": {"status": "200 OK", "status": "404 Not Found"}, '
@@ -1068,7 +1068,7 @@ def _entry_with(entry: str) -> bytes:
 async def test_a_repeated_key_that_differs_as_a_json_node_is_dead_lettered(
     reply: bytes, capture: bool
 ) -> None:
-    # Each of these was delivered before #3796, so each fails on the unfixed code.
+    # Each of these was delivered before vault BACKLOG #3796, so each fails on the unfixed code.
     dest = _dest(interaction="update", capture_response=capture)
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:
@@ -1210,6 +1210,109 @@ def test_ints_whose_own_hashes_collide_are_interned_by_keys_that_do_not() -> Non
     assert len({hash(key) for key in ids._table}) == len(colliding)
     # Control: the type and the value are still the id, so 1 and true stay apart.
     assert ids.node(1) != ids.node(True) and ids.node(1) == ids.node(1)
+
+
+_KEY_HASHES = """
+import json, sys
+from messagefoundry.transports.fhir import _KeepFirstKey
+hook = _KeepFirstKey()
+json.loads('{"a": [1, [2.5, "x"]], "b": {"c": 1, "d": [true]}, "b": {"c": 1, "d": [true]}}',
+           object_pairs_hook=hook)
+print(json.dumps([[getattr(k[0], "__name__", "?"), hash(k[1])] for k in hook.ids._table]))
+"""
+
+
+def test_every_interning_key_but_true_false_and_null_hashes_by_the_process_seed() -> None:
+    # A reply's lists and objects get ids from the ids below them, which are small ints the reply
+    # orders. A key whose hash is a fixed function of them (a tuple of ints, as at b7b82b02) could
+    # be built offline to collide, and each lookup would then scan every earlier key: quadratic.
+    # A test cannot plant such a collision cheaply (it is a 64-bit search), so this pins the
+    # precondition: each key's hash moves with PYTHONHASHSEED, which an attacker does not know.
+    import os
+    import subprocess
+    import sys
+
+    def hashes(seed: str) -> list[list[Any]]:
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        out = subprocess.run(
+            [sys.executable, "-c", _KEY_HASHES],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+        return list(json.loads(out))
+
+    one, two = hashes("1"), hashes("2")
+    kinds = [kind for kind, _ in one]
+    assert kinds == [kind for kind, _ in two]
+    assert {"list", "dict", "int", "float", "str", "bool"} <= set(kinds)  # every kind was reached
+    for (kind, first), (_, second) in zip(one, two, strict=True):
+        if kind == "bool":
+            continue  # true and false are two keys at most
+        assert first != second, kind
+
+
+def _with_many_values(count: int) -> bytes:
+    """A reply with one repeated key and ``count`` more integers beside it."""
+    return _reply_with(
+        '{"status": "200 OK"}', meta='{"t": 1, "t": 1, "w": [' + ", ".join(["0"] * count) + "]}"
+    )
+
+
+async def test_a_reply_past_the_node_budget_is_dead_lettered() -> None:
+    # At the 16 MiB read cap a reply took about 1.5 GiB and most of a minute to judge here, so the
+    # id work is bounded and fails closed past it (ADR 0095 B.1).
+    import messagefoundry.transports.fhir as fhir_module
+
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    # Control: the same shape, well inside the budget, is delivered.
+    dest._opener = _FakeOpener(body=_with_many_values(1000))  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+
+
+async def test_the_node_budget_also_bounds_the_compare_of_the_two_readings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The plain reading's compared values are interned after the keep-first parse, so the budget
+    # must hold there too: set it just past what the keep-first parse took.
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _reply_with('{"status": "200 OK", "etag": [[0, 1, 2, 3]], "etag": [[0, 1, 2, 3]]}')
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None  # control: the readings agree
+    hook = fhir_module._KeepFirstKey()
+    _, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=hook)
+    assert hint is None
+    monkeypatch.setattr(fhir_module, "_NODE_BUDGET", hook.ids._interned + 3)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key" and ei.value.__context__ is None
+
+
+async def test_running_out_of_memory_judging_a_reply_is_dead_lettered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A MemoryError is not a DeliveryError: escaping send() it would read as an internal error.
+    import messagefoundry.transports.fhir as fhir_module
+
+    class _NoMemory(fhir_module._KeepFirstKey):
+        def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            raise MemoryError
+
+    monkeypatch.setattr(fhir_module, "_KeepFirstKey", _NoMemory)
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK", "status": "200 OK"}'))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    assert ei.value.__context__ is None
 
 
 @pytest.mark.parametrize(
