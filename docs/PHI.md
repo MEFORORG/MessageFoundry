@@ -623,8 +623,19 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
-   step did not complete (BACKLOG #3181). The next `serve` start stamps a changed key all the same,
-   so a stamp does not prove that a rotation completed.
+   step did not complete (BACKLOG #3181). **A `serve` start does not stamp that key either (BACKLOG
+   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before it changes
+   anything and closes it only when a run completes, so a killed or failed run leaves it open. While
+   it names the key in use, or cannot be read, `serve` logs a WARNING and reads the key's age from
+   the prior date, and under `[security].enforcement = enforce` that date can refuse the start
+   ([`[secret_rotation]`](CONFIGURATION.md)). A key changed with no `rotate-key` still stamps at the
+   next start, so a stamp proves a changed key, not that a `rotate-key` ran. **A run that skipped an
+   upload does not roll the audit chain**, because that roll cannot be undone: a key keys one audit
+   range, so the prior key can never be active again after it. Until a run completes you can
+   back out: make the prior key active, keep the new key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`,
+   and re-run `rotate-key`. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
+   UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
+   key will ever open it. Restore that upload, or remove its two files from the uploads directory.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it
