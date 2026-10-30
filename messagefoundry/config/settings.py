@@ -10452,9 +10452,8 @@ def security_loosenings(
                 f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
-                "and any credential cross in the clear, except an HTTP-family credential other than "
-                "a forward-proxy login, which is still refused over cleartext http off this machine "
-                "or with verification off",
+                "and any credential cross in the clear, except an HTTP-family credential, which is "
+                "still refused over cleartext http off this machine or with verification off",
             )
         )
     if revocation_attested_hops:

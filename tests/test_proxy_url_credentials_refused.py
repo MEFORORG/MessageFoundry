@@ -648,7 +648,7 @@ def _refused_at_build(build: Callable[[], object]) -> None:
     with pytest.raises(InsecureHopRefused) as raised:
         build()
     text = str(raised.value)
-    assert "proxy_url holds a user and a password" in text
+    assert "holds a user and a password" in text
     assert "connection 'OB_REST'" in text or "connection 'OB'" in text
     _assert_names_no_credential(raised.value)
 
@@ -724,7 +724,7 @@ def test_the_other_http_connectors_refuse_it_too(factory: Callable[[], Connectio
 
 
 def test_a_fhir_lookup_refuses_it_too() -> None:
-    with pytest.raises(InsecureHopRefused, match="proxy_url holds a user and a password"):
+    with pytest.raises(InsecureHopRefused, match="holds a user and a password"):
         FhirLookupExecutor(
             {"epic": {"url": _HTTPS_TARGET, "proxy_url": _CREDENTIALED}},
             egress=permitting({"proxy_url": _CREDENTIALED}),
@@ -747,6 +747,46 @@ def test_a_credential_inherited_from_egress_proxy_url_fails_the_build() -> None:
         egress,
     )
     assert isinstance(build_destination(own, egress=egress), RestDestination)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        pytest.param("http://127.0.0.1/@proxy-marker.invalid:9", id="at-after-a-slash"),
+        pytest.param("http://127.0.0.1?@proxy-marker.invalid:9", id="at-after-a-question-mark"),
+        pytest.param("http://127.0.0.1#@proxy-marker.invalid:9", id="at-after-a-hash"),
+        pytest.param(f"http:/{_CRED}@{_PROXY_HOST}", id="one-slash-urllib-cannot-read"),
+    ],
+)
+@pytest.mark.parametrize(
+    "login",
+    [pytest.param({}, id="no-login"), pytest.param({"proxy_user": "a", "proxy_password": "b"})],
+)
+def test_a_proxy_url_the_checks_would_misread_fails_the_build(
+    proxy_url: str, login: dict[str, str]
+) -> None:
+    """urlsplit reads the first three as loopback and urllib would dial the host after the ``@``,
+    so the ``proxy_user`` guard's loopback admission and ``[egress].allowed_proxy`` would both judge
+    a host the request never reaches. Called directly, because this is the seam that refuses."""
+    with pytest.raises(InsecureHopRefused, match="would not dial") as raised:
+        rest.proxy_config_from_settings(
+            {"proxy_url": proxy_url, **login}, dest_scheme="https", connection="OB"
+        )
+    _assert_names_no_credential(raised.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "http://proxy.example.test:3128",
+        "http://proxy.example.test:3128/",
+        "https://PROXY.example.test",
+        "http://[2001:db8::1]:3128",
+        "http://127.0.0.1:3128",
+    ],
+)
+def test_control_a_proxy_url_both_readers_agree_on_builds(proxy_url: str) -> None:
+    assert not rest._proxy_url_misleads_the_checks(proxy_url)
 
 
 @pytest.mark.parametrize(

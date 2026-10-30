@@ -617,8 +617,8 @@ def refuse_url_credentials(
     reads it as no port and ``http.client`` as the default. Not every shape is caught: an ``@`` with
     no port is ordinary path text, and the comment on the third check names another.
 
-    ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
-    credentials, and #1207 masks them for display.
+    ``proxy_url`` is deliberately NOT screened here: :func:`proxy_config_from_settings` has its own
+    refusal, which reads the URL as urllib does, and #1207 masks a credential for display.
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
@@ -1037,10 +1037,18 @@ _PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
 #: The refusal of a credential written in a connection's ``proxy_url`` (vault BACKLOG #3007). Fixed
 #: text, naming no part of the URL, because the part it is about is a password.
 _PROXY_URL_CREDENTIAL_REFUSED = (
-    "web-proxy URL credentials: proxy_url holds a user and a password; refused, with no escape. "
-    "No declaration lifts a credential written in a proxy URL. Take it out of the URL. To log in "
-    "to the proxy, set proxy_user and proxy_password: a proxy off this machine then also takes "
-    "cleartext_accepted with a cleartext_reason"
+    "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
+    "[egress], holds a user and a password; refused, with no escape. No declaration lifts a "
+    "credential written in a proxy URL. Take it out of the URL. To log in to the proxy, set "
+    "proxy_user and proxy_password: a proxy off this machine then also takes cleartext_accepted "
+    "with a cleartext_reason"
+)
+#: The refusal of a ``proxy_url`` the engine's checks and urllib would read differently. Fixed text,
+#: for the same reason.
+_PROXY_URL_UNREADABLE_REFUSED = (
+    "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
+    "[egress], holds an @ that urllib cannot read, or it names a host urllib would not dial. "
+    "Correct the URL; a password in it belongs in proxy_password"
 )
 
 
@@ -2315,8 +2323,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     parser the handler runs. ``urlsplit`` would be the wrong reader: with an unencoded ``/``, ``?`` or
     ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
     sends the password. A user with no password sends nothing. Never raises: a URL the transport
-    cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
-    caller passes a value, and anything that is not a string answers ``False``."""
+    cannot parse sends nothing either. Not an ``env()`` reference: the caller passes a value, and
+    anything that is not a string answers ``False``."""
     if not isinstance(proxy_url, str):
         return False
     proxy = proxy_url.strip()
@@ -2330,6 +2338,24 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     except ValueError:
         return False
     return bool(user and password)
+
+
+def _proxy_url_misleads_the_checks(proxy_url: str) -> bool:
+    """Whether the checks that read an ``http(s)`` ``proxy_url`` with ``urlsplit`` would judge
+    another host than the one ``_parse_proxy`` hands the proxy handler to dial.
+
+    An ``@`` after a ``/``, a ``?`` or a ``#`` ends the authority for ``urlsplit`` and not for
+    ``_parse_proxy``. So ``http://127.0.0.1/@proxy.example`` reads as loopback to the
+    ``proxy_user`` guard, and as ``127.0.0.1`` to ``[egress].allowed_proxy``, while urllib would
+    dial ``proxy.example``. A URL ``_parse_proxy`` cannot read and that holds an ``@`` counts too,
+    as it does at send."""
+    try:
+        # Private, but it is what ProxyHandler.proxy_open calls; a test pins the pairing.
+        _, _, _, hostport = urllib.request._parse_proxy(proxy_url)  # type: ignore[attr-defined]
+        authority = urllib.parse.urlsplit(proxy_url).netloc
+    except ValueError:
+        return "@" in proxy_url
+    return authority.rpartition("@")[2].lower() != str(hostport).lower()
 
 
 def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
@@ -2371,7 +2397,8 @@ def proxy_config_from_settings(
     A user and a password in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`, in
     every posture and under every declaration, including one inherited from
     ``[egress].proxy_url`` (vault BACKLOG #3007). At send they would meet a refusal that retries,
-    so a known fault is reported here rather than on each message."""
+    so a known fault is reported here rather than on each message. So does a URL
+    :func:`_proxy_url_misleads_the_checks` reads, with or without a credential."""
     raw = s.get("proxy_url")
     if not raw:
         return None
@@ -2401,6 +2428,8 @@ def proxy_config_from_settings(
         )
     if proxy_url_sends_userinfo(proxy_url):
         raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_CREDENTIAL_REFUSED}")
+    if _proxy_url_misleads_the_checks(proxy_url):
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_UNREADABLE_REFUSED}")
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,

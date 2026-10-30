@@ -1590,7 +1590,7 @@ legs only, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
 a leg it lets through and what it does not check.
 
-**A credential written in a proxy URL has no way across, and `proxy_user` has one declared way
+**No declaration lifts a credential written in a proxy URL, and `proxy_user` has one declared way
 (owner rulings of 2026-10-05 and 2026-10-30, vault BACKLOG #3007).** R1 of the vault's
 `ASVS-OWNER-RULINGS-2026-10-05.md` refuses a proxy credential over cleartext unless the connection
 declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault's
@@ -1602,14 +1602,19 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   `cleartext_reason`. A build on that declaration writes the cleartext acceptance audit record.
   `[security].enforcement = warn` does not lift the refusal: the HTTP family's no-loosen floor
   turns that WARN back into a refusal.
-- **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses.
+- **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses. A connection
+  cannot hold it and `cleartext_accepted` together, so an attested connection has no route to a
+  `proxy_user` login on a proxy off this machine.
 - **No declaration lifts a credential written in a URL or the environment.** A user and password
   in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build. That
   holds at every `[security].enforcement` setting and for a proxy on this machine, and
   `static_credential_accepted` does not lift it. A credential in `HTTP_PROXY`, `HTTPS_PROXY` or the
   system proxy settings meets the send-time rule above.
-- **The alert webhook, the OIDC legs and the AI broker have no setting for this.** They refuse an
-  environment proxy credential outright.
+- **The alert webhook, the OIDC legs and the AI broker have no setting for this.** The send-time
+  rule above is all that judges an environment proxy credential on them.
+
+A `proxy_url` also fails its build when urllib would dial another host than the one it names to
+the engine's checks, or when it holds an `@` that urllib cannot read.
 
 A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
@@ -3334,7 +3339,7 @@ verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
 Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
 over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
-#3230). A forward-proxy login is the exception, as
+#3230). It does not admit a forward-proxy login either; `cleartext_accepted` does, as
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
 says.
 
