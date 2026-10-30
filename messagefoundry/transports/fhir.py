@@ -417,7 +417,7 @@ class _NodeIds:
     one value. An object's id ignores key order.
 
     Ids are interned bottom-up, each container once, by walking with a stack rather than by
-    recursion, so a value is judged in time linear in its size at any depth ``json`` itself parses
+    recursion, so a value is judged in expected time linear in its size, at any depth ``json`` parses
     (vault BACKLOG #3796 records a compare, reverted in engine PR 2356, that recursed and was
     exponential).
 
@@ -439,9 +439,13 @@ class _NodeIds:
 
     def _leaf(self, value: object) -> int:
         # The type tag keeps bool, int, float, str and null apart; float.hex keeps -0.0 apart from
-        # 0.0 and gives every NaN one spelling.
+        # 0.0 and gives every NaN one spelling. An int is keyed by its text, whose hash is
+        # randomized, because an int's own hash is not: a reply could fill the table with ints
+        # that collide and make each lookup scan them all.
         if type(value) is float:
             return self._intern((float, value.hex()))
+        if type(value) is int:
+            return self._intern((int, str(value)))
         return self._intern((type(value), value))
 
     def record(self, obj: dict[str, Any], kept: frozenset[tuple[str, int]], two_ways: bool) -> None:
@@ -509,21 +513,20 @@ class _KeepFirstKey:
         # which lowers the depth this parse takes (measured 2026-10-30, vault BACKLOG #3796).
         node = self.ids.node
         first: dict[str, Any] = {}
-        nodes: list[tuple[int, bool]] = []
-        two_ways = False
+        node_ids: list[int] = []
+        flags: list[bool] = []
         for key, value in pairs:
             first.setdefault(key, value)
-            seen = node(value)
-            nodes.append(seen)
-            two_ways = two_ways or seen[1]
+            node_id, value_two_ways = node(value)
+            node_ids.append(node_id)
+            flags.append(value_two_ways)
+        two_ways = True in flags
         if len(first) == len(pairs):
-            self.ids.record(
-                first, frozenset(zip(first, [n for n, _ in nodes], strict=True)), two_ways
-            )
+            self.ids.record(first, frozenset(zip(first, node_ids, strict=True)), two_ways)
             return first
         occurrences: dict[str, list[tuple[int, bool]]] = {}
-        for (key, _), seen in zip(pairs, nodes, strict=True):
-            occurrences.setdefault(key, []).append(seen)
+        for (key, _), node_id, value_two_ways in zip(pairs, node_ids, flags, strict=True):
+            occurrences.setdefault(key, []).append((node_id, value_two_ways))
         kept: list[tuple[str, int]] = []
         for key, each in occurrences.items():
             kept.append((key, each[0][0]))

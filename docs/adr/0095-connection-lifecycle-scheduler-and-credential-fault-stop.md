@@ -448,11 +448,14 @@ on. A key seen only twice, with `1` then `true` in a value nothing reads, still 
 and is delivered, as above. An object's key order is not part of it. Every `NaN` token is one
 value, unlike under Python's float comparison: a key repeated with `NaN` each time, or a `NaN`
 beside a repeat, reads one way and is judged as any other. `NaN` against a number or against
-`Infinity` is a disagreement. A number is the double `json` parses it to, so `1.0` and `1.00`, or
-two numerals that round to one double, are one value. Each value gets one id, interned bottom-up:
-in the keep-first parse for that reading, and in one walk afterwards for the values compared from
-the plain reading. So the work is linear in the reply's size and nothing recurses past the depth
-`json` itself parses (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
+`Infinity` is a disagreement. A number is the value `json` parses it to: a numeral with a fraction
+or an exponent is a double, so `1.0` and `1.00`, or two such numerals that round to one double,
+are one value; an integer numeral is an exact integer, so `-0` is the integer `0` and one value
+with `0`. Each value gets one id, interned bottom-up: in the keep-first parse for that reading, and
+in one walk afterwards for the values compared from the plain reading. An integer is interned by
+its text, whose hash Python randomizes, so a reply cannot choose integers whose hashes collide. So
+the expected work is linear in the reply's size, and nothing recurses past the depth `json` itself
+parses (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
 
 **CORRECTED 2026-10-30 (vault BACKLOG #3796).** The paragraph before this said the three-or-more
 occurrence rule held *"at any depth"* and compared each occurrence's *"value"*. It held in every

@@ -1196,6 +1196,22 @@ async def test_one_against_true_at_the_bottom_of_a_deep_occurrence_is_dead_lette
     assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
 
 
+def test_ints_whose_own_hashes_collide_are_interned_by_keys_that_do_not() -> None:
+    # Python's int hash is n mod (2**61 - 1), so these 64 ints share one hash. Interned by the int
+    # itself, each lookup would scan every earlier one, and a reply full of them would take
+    # quadratic time; the operation count above cannot see that.
+    import messagefoundry.transports.fhir as fhir_module
+
+    colliding = [5 + k * (2**61 - 1) for k in range(64)]
+    assert len({hash(n) for n in colliding}) == 1
+    ids = fhir_module._NodeIds()
+    for n in colliding:
+        ids.node(n)
+    assert len({hash(key) for key in ids._table}) == len(colliding)
+    # Control: the type and the value are still the id, so 1 and true stay apart.
+    assert ids.node(1) != ids.node(True) and ids.node(1) == ids.node(1)
+
+
 @pytest.mark.parametrize(
     ("reply", "hint"),
     [
