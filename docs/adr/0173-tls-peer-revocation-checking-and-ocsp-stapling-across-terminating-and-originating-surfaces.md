@@ -749,6 +749,7 @@ OpenSSL 3.5.7: a CRL past `nextUpdate` refuses the handshake with "CRL has expir
 flag, and the same handshake is accepted with it. So that arm stays refused unless attested, as it
 was before #2188.
 The MLLP destination's guard reads a context built the same way. That hop is not changed here.
+*(Note 2026-10-30: it is changed since, with the DICOM C-STORE SCU, by §13.)*
 
 `opener` is now a required keyword, so a new caller cannot omit it and bring back the false
 refusal.
@@ -1447,3 +1448,38 @@ words to older text, the older words are kept.
 
 **What this amendment does not do.** It adds no check on the wire, builds no CRL lever, and does
 not grade any hop §7.1 did not already name.
+
+## 13. Amendment 2026-10-30 -- a CRL does not admit an MLLP or DICOM SCU hop with `tls_allow_expired` (vault BACKLOG #2978)
+
+**The ruling.** Owner ruling 2026-10-05: an MLLP destination with `tls_allow_expired` stays refused
+unless attested, the same as the HTTP family, "one rule everywhere". **The owner's words name MLLP.**
+Reaching the DICOM C-STORE SCU with it is the batch 191 Manager's reading of "one rule everywhere";
+the owner may reverse that reading. The FTPS upload and poll already followed the rule.
+
+**The defect it closes.** §4.3 records that `relax_verify_expiry` sets `X509_V_FLAG_NO_CHECK_TIME`,
+which OpenSSL applies to a CRL's validity window too, so a CRL past `nextUpdate` is accepted at the
+handshake. The MLLP destination and the DICOM SCU handed the guard that relaxed context, so a
+`[tls].crl_file` that reached either would have admitted an off-box hop under an enforcing posture,
+on first deployment, with no attestation.
+
+**What changed.**
+
+- Both hops now hand `RevocationHopGuard` no context when theirs skips validity-period checks, so a
+  CRL cannot admit them and only `tls_revocation_attested` with its reason crosses. The refusal names
+  `EXPIRY_RELAXED_WAYS_ACROSS`, the FTPS remedy moved to `config/tls_policy.py` and shared, so it does
+  not offer the CRL the hop already has.
+- **Where the flag is read:** at the two call sites, off the context the hop dials with
+  (`skips_validity_period`), as `context_checks_revocation` reads the CRL flag. The guard and
+  `context_checks_revocation` are unchanged. REST, SOAP, FHIR and FTPS read the setting at their call
+  sites; on these hops the setting and the flag are set together.
+- The attested crossing still logs its audit line, which §4.3 names as the only record of the
+  attestation on this shape: with no CRL credit, the attestation is what crosses the hop.
+- Without `tls_allow_expired` both hops are unchanged: a CRL that reaches the context admits them.
+
+Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
+refused with a CRL on the relaxed context, admitted and audited on the attestation, and admitted by
+the same CRL without the relaxation, for each hop.
+
+**Left open.** The REST, SOAP and FHIR refusals on this shape still name the default remedy, which
+offers `[tls].crl_file`; they hand the guard no opener, so that lever cannot cross them. This
+amendment does not change those three call sites.
