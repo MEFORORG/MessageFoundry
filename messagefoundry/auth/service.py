@@ -595,6 +595,29 @@ def _bounded_address_text(address: str) -> str:
     return f"{prefix}...sha256:{digest}"
 
 
+#: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`
+#: (BACKLOG #3965), each mapped to the audit action of the row it writes, which the backstop's page
+#: names.
+StepUpReturnAuditReason = Literal["state_mismatch", "non_navigation_fetch"]
+_STEP_UP_RETURN_AUDIT_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
+    {"state_mismatch": "auth.reauth", "non_navigation_fetch": "auth.login_failed"}
+)
+#: The one key of the step-up return audit budget's all-sources backstop, which has no per-key gate.
+_STEP_UP_RETURN_AUDIT_BACKSTOP_KEY: Final = "<all>"
+
+
+def _step_up_return_audit_key(user_id: str | None, client: str | None) -> str:
+    """The source a step-up return's audit row is charged to (BACKLOG #3965): the account the flow
+    names, or the callback's client address for a flow that names none. The prefixes keep the two
+    kinds apart, so no address can take an account's key. An unknown address shares one key, as
+    there is nothing else to tell such callers apart by."""
+    if user_id:
+        return f"user:{user_id}"
+    if client:
+        return f"client:{_bounded_address_text(_host_key(client))}"
+    return "client:<unknown>"
+
+
 #: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
@@ -3153,6 +3176,7 @@ class AuthService:
         integrity_alert: Callable[[str], None] | None = None,
         admin_loss_alert: Callable[[str, str], None] | None = None,
         admin_grant_alert: Callable[[str, str], None] | None = None,
+        step_up_return_audit_alert: Callable[[str], None] | None = None,
         way_past_rp_id: str | None = None,
     ) -> None:
         self._store = store
@@ -3315,20 +3339,44 @@ class AuthService:
         # match among them) and a non-navigation fetch. The flow cookie is SameSite=Lax, so a
         # foreign page can repeat those while a flow lives. _reauth_limiter bounds them per user
         # and has no global term, on purpose (one user's ceremonies must never refuse another's),
-        # so K users could write about K x login_rate_limit_per_ip rows a window. This adds the
-        # global ceiling on the login knobs, as _repeated_credential_limiter has one. It gates the
+        # so K users could write about K x login_rate_limit_per_ip rows a window. It gates the
         # ROW, never the return: an over-budget branch answers as before and is logged instead,
         # so a flood across many users cannot refuse anyone's step-up. It never draws on
         # _login_limiter or _reauth_limiter.
+        # The budget is PER SOURCE (_step_up_return_audit_key): the account the flow names, or the
+        # callback's client address for a flow that names none, so one source spending its budget
+        # costs no other source a row. A global term on this limiter would let one caller who
+        # drives many accounts' flows silence every other account's rows, so it has none.
         self._step_up_return_audit_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
+                glob=0,
+                window_seconds=settings.login_rate_limit_window_seconds,
+            )
+            if settings.login_rate_limit_enabled
+            else None
+        )
+        # The safety ceiling across every source, so a spread of sources still cannot grow
+        # audit_log unbounded. Hitting it pages (_page_step_up_return_audit_backstop). Past it an
+        # ACCOUNT still writes one row a window (_step_up_return_audit_first_row), so the ceiling
+        # never silences a named user outright; a source with no account gets no such row, because
+        # client addresses are the caller's to multiply and accounts are not.
+        self._step_up_return_audit_backstop: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=0,
                 glob=settings.login_rate_limit_global,
                 window_seconds=settings.login_rate_limit_window_seconds,
             )
             if settings.login_rate_limit_enabled
             else None
         )
+        self._step_up_return_audit_first_row = SlidingWindowRateLimiter(
+            per_key=1, glob=0, window_seconds=settings.login_rate_limit_window_seconds
+        )
+        # Called with the audit action of the row the backstop stopped; injected by the API
+        # lifespan, as integrity_alert is. None logs only. Paged at most once a window.
+        self._step_up_return_audit_alert = step_up_return_audit_alert
+        self._step_up_return_audit_paged_at: float | None = None
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -3567,16 +3615,63 @@ class AuthService:
             return True
         return self._reauth_limiter.allow(actor)
 
-    def allow_step_up_return_audit(self, user_id: str) -> bool:
+    def allow_step_up_return_audit(
+        self, user_id: str | None, *, client: str | None, reason: StepUpReturnAuditReason
+    ) -> bool:
         """Whether a refusal on an IdP step-up's return that consumed nothing may write its audit
         row (BACKLOG #3965): a ``state_mismatch``, on the completion or the abandon leg, or the
-        console's ``non_navigation_fetch``. Keyed on the user the staged flow names, with a global
-        ceiling across users. It gates the row only, never the return, and draws neither the
-        sign-in window nor the ceremony budget. True = write; always True when the limiter is
-        disabled."""
-        if self._step_up_return_audit_limiter is None:
+        console's ``non_navigation_fetch``, which ``reason`` names.
+
+        Keyed per source by :func:`_step_up_return_audit_key`: the user the staged flow names, or,
+        for a flow that names none, the callback's ``client`` address. One source spending its
+        budget costs no other source a row. A backstop across every source sits behind it; past
+        that, an account still writes one row a window and a source with no account writes none,
+        and the first refusal past it in a window pages (:meth:`_page_step_up_return_audit_backstop`).
+        It gates the row only, never the return, and draws neither the sign-in window nor the
+        ceremony budget. True = write; always True when the limiter is disabled."""
+        limiter = self._step_up_return_audit_limiter
+        if limiter is None:
             return True
-        return self._step_up_return_audit_limiter.allow(user_id)
+        key = _step_up_return_audit_key(user_id, client)
+        if not limiter.would_allow(key):
+            return False
+        if not self._step_up_return_audit_backstop_admits(key, named=bool(user_id), reason=reason):
+            return False
+        # No await since would_allow, so the hit it found room for is still free.
+        return limiter.allow(key)
+
+    def _step_up_return_audit_backstop_admits(
+        self, key: str, *, named: bool, reason: StepUpReturnAuditReason
+    ) -> bool:
+        """Whether the all-sources backstop of :meth:`allow_step_up_return_audit` admits a row for
+        ``key``, charging it when it does. Past it only a ``named`` account's one row a window is
+        admitted, and the backstop pages."""
+        backstop = self._step_up_return_audit_backstop
+        if backstop is None or backstop.allow(_STEP_UP_RETURN_AUDIT_BACKSTOP_KEY):
+            return True
+        self._page_step_up_return_audit_backstop(reason)
+        return named and self._step_up_return_audit_first_row.allow(key)
+
+    def _page_step_up_return_audit_backstop(self, reason: StepUpReturnAuditReason) -> None:
+        """Raise the backstop's page, at most once a window: the injected alert, naming the audit
+        action of the row it stopped, and a WARNING line. Never raises."""
+        now = time.monotonic()
+        paged = self._step_up_return_audit_paged_at
+        if paged is not None and now - paged < self._settings.login_rate_limit_window_seconds:
+            return
+        self._step_up_return_audit_paged_at = now
+        action = _STEP_UP_RETURN_AUDIT_ACTIONS[reason]
+        _log.warning(
+            "the federated step-up return audit backstop is spent across all callers; past it "
+            "only one %s row per account per window is written",
+            action,
+        )
+        if self._step_up_return_audit_alert is None:
+            return
+        try:
+            self._step_up_return_audit_alert(action)
+        except Exception:  # noqa: BLE001 -- a page failure must not change what a return answers
+            _log.warning("the step-up return audit backstop page could not be raised")
 
     def allow_phi_read(self, actor: str) -> bool:
         """Per-actor anti-automation gate for the PHI-read endpoints (WP-8, ASVS 2.4.1). True =
@@ -6407,8 +6502,10 @@ class AuthService:
         if not consumed:
             # Repeatable while the flow lives, so its row draws the step-up return's audit budget
             # (BACKLOG #3965). A sign-in flow names no user; the callback never sends one here, and
-            # one that arrives anyway still draws the budget, under a key no user id can take.
-            audit = self.allow_step_up_return_audit(flow.step_up_user_id or "<oidc>")
+            # one that arrives anyway still draws the budget, keyed by the callback's address.
+            audit = self.allow_step_up_return_audit(
+                flow.step_up_user_id, client=client, reason="state_mismatch"
+            )
             if not audit:
                 _log.warning(
                     "federated step-up return refused (state_mismatch) for %s; its audit budget "

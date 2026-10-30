@@ -497,12 +497,28 @@ async def test_a_return_naming_no_live_step_up_flow_still_draws_the_sign_in_wind
 
 
 def _drain_step_up_return_audit_budget(service: AuthService) -> None:
-    """Spend the step-up return audit budget's GLOBAL ceiling across many users, as K accounts'
-    forged returns would."""
-    for i in range(_settings().login_rate_limit_global):
-        if not service.allow_step_up_return_audit(f"another-user-{i}"):
-            break
-    assert not service.allow_step_up_return_audit("one-more-user"), "fixture: not spent"
+    """Spend the step-up return audit budget's all-callers BACKSTOP across many users, as K
+    accounts' forged returns would. Past it each of those users has also spent its first row."""
+    per_user = _settings().login_rate_limit_per_ip
+    for i in range(_settings().login_rate_limit_global // per_user + 1):
+        for _ in range(per_user):
+            service.allow_step_up_return_audit(
+                f"another-user-{i}", client="198.51.100.200", reason="state_mismatch"
+            )
+    assert not service.allow_step_up_return_audit(
+        "another-user-0", client="198.51.100.200", reason="state_mismatch"
+    ), "fixture: not spent"
+
+
+def _drain_own_step_up_return_audit_budget(service: AuthService, user_id: str) -> None:
+    """Spend ``user_id``'s own step-up return audit budget, leaving the backstop far from spent."""
+    for _ in range(_settings().login_rate_limit_per_ip):
+        assert service.allow_step_up_return_audit(
+            user_id, client="198.51.100.201", reason="state_mismatch"
+        ), "fixture: refused before the user's budget was spent"
+    assert not service.allow_step_up_return_audit(
+        user_id, client="198.51.100.201", reason="state_mismatch"
+    ), "fixture: not spent"
 
 
 async def _fetch_return(c: httpx.AsyncClient, location: str) -> httpx.Response:
@@ -518,15 +534,19 @@ async def _fetch_return(c: httpx.AsyncClient, location: str) -> httpx.Response:
     )
 
 
-@pytest.mark.parametrize("spent", [False, True])
+@pytest.mark.parametrize("spent", ["none", "own", "others"])
 async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_budget(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, spent: bool
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, spent: str
 ) -> None:
-    """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row has no global
-    ceiling. Within the budget the row is written. With the ceiling spent by other users it is
-    not, and the refusal is otherwise the same: a 303 that consumes nothing and keeps the cookie."""
+    """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row is not bounded
+    per user, or other users spending the all-callers backstop stop this user's row. Within the
+    user's budget the row is written. With the user's own budget spent it is not. With the
+    backstop spent by other users the user's first row is still written, and the backstop pages.
+    The refusal is otherwise the same: a 303 that consumes nothing and keeps the cookie."""
     caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole")
     service = await _service(engine, _FakeLdap())
+    pages: list[str] = []
+    service._step_up_return_audit_alert = pages.append
     async with _client(engine, service) as c:
         identity = await service.identity_for_token(
             await _federated_sign_in(service, c, monkeypatch), activity=False
@@ -535,22 +555,28 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         start = await _start_step_up(c)
         assert start.status_code == 303
         flow_id = _flow_id(c)
-        if spent:
+        if spent == "own":
+            _drain_own_step_up_return_audit_budget(service, identity.user_id)
+        elif spent == "others":
             _drain_step_up_return_audit_budget(service)
+            pages.clear()  # the drain itself paged; only the return's own call counts below
+            service._step_up_return_audit_paged_at = None
         rows_before = await service.store.count_audit(limit=None, action="auth.login_failed")
 
         r = await _fetch_return(c, start.headers["location"])
 
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
         rows = await service.store.count_audit(limit=None, action="auth.login_failed")
-        assert rows - rows_before == (0 if spent else 1)
+        assert rows - rows_before == (0 if spent == "own" else 1)
         # Past the budget the refusal still leaves a trace: the line, in place of the row.
         logged = "refused (non_navigation_fetch)" in caplog.text
-        assert logged is spent, caplog.text
+        assert logged is (spent == "own"), caplog.text
+        # The backstop pages, naming the action of the row it would have stopped.
+        assert pages == (["auth.login_failed"] if spent == "others" else []), pages
         # The row was charged under the staged user, the key the service's state_mismatch draws.
         limiter = service._step_up_return_audit_limiter
         assert limiter is not None
-        assert (identity.user_id in limiter._hits) is not spent
+        assert f"user:{identity.user_id}" in limiter._hits
         assert service.oidc_step_up_flow(flow_id) is not None and _flow_id(c) == flow_id
 
 

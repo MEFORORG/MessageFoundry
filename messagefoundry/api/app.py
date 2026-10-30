@@ -438,6 +438,7 @@ from messagefoundry.pipeline.alerts import (
     administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
+    step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
@@ -12061,6 +12062,11 @@ def create_managed_app(
                     # administrator_granted here, as a directory sign-in does in its route.
                     admin_grant_alert=administrator_granted_alert(
                         notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                    ),
+                    # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
+                    # audit_write_failed here when it stops a row, at most once a window.
+                    step_up_return_audit_alert=step_up_return_audit_alert(
+                        notifier or LoggingAlertSink()
                     ),
                     # BACKLOG #3937: the relying party a passkey must be under to count as a way
                     # past the sign-in lock at the factor-drop gates; None counts none.
