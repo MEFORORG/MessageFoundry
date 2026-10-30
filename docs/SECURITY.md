@@ -2868,9 +2868,11 @@ store fails it, and is never released or resolved. The failure writes an
 `integrity.authority_seal_failed` audit row and raises `integrity_drift`. Nothing expires such a
 request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
 
-- `GET /approvals` and the Approvals page list a failing `pending` request after the sound ones,
+- `GET /approvals` and the Approvals page list a failing `pending` request after the sound
+  `pending` ones,
   with `release_blocked` set to `seal_failed`. Its `params` are always withheld, never decoded or
-  sent. Its other values are shown as stored and are unverified; a time no page can render is
+  sent. Its `approver` and `decided_at` are withheld, and its status reads `pending`. Its other
+  values are shown as stored and are unverified; a time no page can render is
   shown as the epoch, or as no expiry. The page offers Reject and no Approve. RBAC is unchanged:
   the queue and the reject still need `approvals:approve`.
 - The reject is a narrow store write on SQLite, SQL Server and PostgreSQL. It reads the row in the
@@ -2888,7 +2890,7 @@ request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
   a report inside the notifier's cooldown cannot hold it back. A rule matches every such subject
   with the glob `authority-seal-rejected:*`. Each is its own alert instance, so an escalation tier
   above one occurrence never fires on it. One reject writes one such row and raises one such alert.
-- A reject whose write moved nothing (the row moved or changed since the read), raised a store
+- A reject whose write moved nothing (its status or seal changed since the read), raised a store
   fault, or raised a defect writes the ordinary report instead, throttled per request as the queue
   listing and an approve do: an `integrity.authority_seal_failed` row and an `integrity_drift`
   alert under `authority-seal`. A store fault is read as nothing committed, so where a COMMIT
@@ -2909,7 +2911,15 @@ At least these limits remain:
 - the queue reads only requests unexpired by their own stored `expires_at`, an unverified value.
   A failing row whose stored expiry has passed is not listed, and the queue does not report it.
   A reject by its id still closes it;
-- a failing `interrupted` release is still left out of its list, and its resolve answers 409.
+- a failing `interrupted` release is still left out of its list, and its resolve answers 409;
+- the write compares only the status and the seal. Another column changed between the reject's read
+  and its write, with the seal left alone, is tombstoned as it then stands, and `prior` holds what
+  the read found;
+- on SQLite, a column holding invalid UTF-8 fails the store's read itself, before any seal check, so
+  the queue answers 503 for every request, and so does that request's reject, until the row is
+  repaired by hand;
+- the listing reads the newest 100 open requests by their stored request time, an unverified value,
+  so a failing row past them is neither listed nor reported, and planted rows can push others out.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves

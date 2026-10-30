@@ -1443,7 +1443,8 @@ def authority_seal_alert(
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call raises
     ``integrity_drift`` under ``subject`` with the given reason.
 
-    The reason names a row kind and a short id prefix, never a row value, so it carries no PHI.
+    The reason names a row kind and an id (a short prefix, or an approval request's full id), never
+    another row value, so it carries no PHI.
     Never raises: an alert failure must not change what a sign-in or a request resolves to."""
 
     def _raise(reason: str) -> None:

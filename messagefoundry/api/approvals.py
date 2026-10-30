@@ -1074,8 +1074,9 @@ class ApprovalGate:
         """A queue entry for a ``pending`` request that fails its seal (BACKLOG #3639).
 
         ``params`` is ``None`` ALWAYS: the stored params are the value a writer outside the store
-        is most likely to have changed, and they are never decoded or sent to a page. The other
-        values are shown as stored, unverified, so the operator can tell which request it is; the
+        is most likely to have changed, and they are never decoded or sent to a page.
+        ``approver`` and ``decided_at`` are ``None`` and ``status`` is ``pending``, whatever is
+        stored. The other values are shown as stored, unverified, so the operator can tell which request it is; the
         flag says they cannot be trusted. ``caller_is_requester`` is False, because the stored
         requester id is unverified too; it only steers which button a page labels, and the reject
         it offers is open to any approver anyway. Nothing here is acted on."""
@@ -2399,9 +2400,10 @@ class ApprovalGate:
 
         The expiry is not tested, because ``expires_at`` is one of the unverified values. The
         store moves only a row it reads ``pending`` and failing that still carries the seal this
-        read found, so the row it tombstones is the row read here. The tombstone overwrites the
-        row's ``approver``, ``decided_at`` and seal, so the ``integrity.authority_seal_failed``
-        row keeps them as read, under ``prior``, for whoever investigates; the params are left in
+        read found. It compares only the status and the seal, so another column changed after this
+        read, with the seal left alone, is tombstoned as it then stands. The tombstone overwrites
+        the row's ``approver``, ``decided_at`` and seal, so the ``integrity.authority_seal_failed``
+        row keeps them as this read found them, under ``prior``, for whoever investigates; the params are left in
         the row as found and are never copied. ``approval.rejected`` holds the id and
         ``seal_failed`` only. The answer names the stored operation and requester, unverified,
         for the caller's page.
