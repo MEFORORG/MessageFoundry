@@ -430,10 +430,35 @@ resource type, whether there is an entry response, and the entry's `etag`, `loca
 and two statuses that both classify as transient are retried. When the readings differ in any of
 those, in either capture mode, or the keep-first read cannot parse a body the plain read takes,
 the delivery is a permanent refusal, code `reply-repeats-a-key`, not sent again and not recorded
-as delivered, as a reply the engine needs and cannot read is above. The same refusal applies when
-a key occurs three or more times in one object, at any depth, and some occurrence equals neither
-its first nor its last value, because the two readings alone would never see it (so
-`200 OK`, `404 Not Found`, `200 OK` dead-letters, as does such a repeat inside `meta`).
+as delivered, as a reply the engine needs and cannot read is above.
+
+The same refusal applies to an occurrence of a repeated key that reads a third way, in any object
+of the reply, because the two readings alone would never see it. Every occurrence is compared as a
+JSON node, so an occurrence reads a third way in two cases. In the first, the key occurs three or
+more times and some occurrence is a node equal to neither its first nor its last occurrence (so
+`200 OK`, `404 Not Found`, `200 OK` dead-letters, as does such a repeat inside `meta`). In the
+second, an occurrence holds, at any depth below it, an object that repeats a key whose first and
+last occurrences differ, so that the occurrence itself reads two ways. That covers a middle
+`response` that reads `200` keeping the first key and `404` keeping the last (vault BACKLOG #3796).
+
+Both the occurrence compare and the compare of the two readings judge JSON values, not Python
+values. A value's type is part of it, so `1` differs from `true` and from `1.0`, and `0.0` differs
+from `-0.0`, both at any depth inside an occurrence and in the values the two readings are compared
+on. A key seen only twice, with `1` then `true` in a value nothing reads, still reads one judgment
+and is delivered, as above. An object's key order is not part of it. Every `NaN` token is one
+value, unlike under Python's float comparison: a key repeated with `NaN` each time, or a `NaN`
+beside a repeat, reads one way and is judged as any other. `NaN` against a number or against
+`Infinity` is a disagreement. Each value is compared once, by an id built bottom-up in the
+keep-first parse, so the work is linear in the reply's size and nothing recurses past the depth
+`json` itself parses (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
+
+**CORRECTED 2026-10-30 (vault BACKLOG #3796).** The paragraph before this said the three-or-more
+occurrence rule held *"at any depth"* and compared each occurrence's *"value"*. It held in every
+object, but it compared an occurrence only by its keep-first reading, with Python equality. So a
+middle object that read `404` only keeping the last key was delivered, as were `1` against `true`,
+`1` against `1.0` and `0.0` against `-0.0` below the top level and in the compared `etag`,
+`location` and `lastModified`. And a `NaN` beside a repeat refused, since a `NaN` is unequal to
+itself there.
 
 It fails closed only on disagreement because a reply that reads one way under both rules carries
 no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
@@ -446,8 +471,12 @@ text. The owner has not ruled on it and may overturn it.**
 
 Costs, at least these. A reply nested in the narrow band between the hook's depth limit and plain
 `json`'s is refused with this code although it may repeat no key, and its text then says it does.
-An ETag that differs with capture off refuses, though nothing reads it in that mode.
+That band was 25 to 26 levels of about 14,300 on the Windows box that measured it on 2026-10-30,
+against 13 before vault BACKLOG #3796, and it depends on the platform's stack. An ETag that differs with capture off refuses, though nothing
+reads it in that mode. An occurrence that reads two ways refuses even where the reply's two
+readings reach one judgment, for example a first `response` repeating `status` as `200 OK` then
+`201 Created`, beside a second `response` that does not repeat it.
 
 It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
-`read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the section headed vault BACKLOG
-#2812.
+`read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the sections headed vault BACKLOG
+#2812 and vault BACKLOG #3796.
