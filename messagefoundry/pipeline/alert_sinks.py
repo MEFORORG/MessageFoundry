@@ -372,6 +372,17 @@ _ALERT_SMTP_WAYS_ACROSS = (
 )
 
 
+def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
+    """The posture both ``[alerts]`` revocation guards judge on: the one passed, else the ambient
+    one, else enforcing. **An unknown posture counts as enforcing**, by ADR 0173 section 12, as on
+    the Vault hops and the AI broker; it cannot relax a hop. This differs from the LDAPS bind and
+    the OIDC legs, where :meth:`RevocationHopGuard.enforce_construction` no-ops with no posture."""
+    if posture is not None:
+        return posture
+    ambient = current_hop_posture()
+    return ambient if ambient is not None else HopPosture.fail_closed(enforcing=None)
+
+
 def _refuse_webhook_revocation(
     url: str, *, posture: HopPosture | None, attested: bool, attested_reason: str | None
 ) -> None:
@@ -384,14 +395,12 @@ def _refuse_webhook_revocation(
     ``context=None``: the hop dials through :data:`_NO_REDIRECT_OPENER`, built at import, and no
     CRL reaches it, so the owner ruling of 2026-10-27 gave it an attestation pair on the pattern of
     ADR 0173 section 12, and no CRL lever. ``posture`` is PASSED, because the sink is built in the
-    API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, as
-    :meth:`RevocationHopGuard.capture` does for every hop; where none is stamped the guard is the
-    shipped no-op, as on the LDAPS bind. A cleartext ``http`` URL takes no revocation guard: there
-    is no certificate, and the cleartext refusal owns that hop."""
+    API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, and
+    where none is stamped it counts as enforcing (:func:`_alert_hop_posture`), not as the no-op the
+    LDAPS bind keeps. A cleartext ``http`` URL takes no revocation guard: there is no certificate,
+    and the cleartext refusal owns that hop."""
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         return
-    if posture is None and current_hop_posture() is None:
-        return  # the unstamped no-op, before hop_url_host can refuse anything (as the SMTP guard)
     RevocationHopGuard.capture(
         # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
         # refused before this runs (refuse_url_credentials).
@@ -403,7 +412,7 @@ def _refuse_webhook_revocation(
         ),
         attested=attested,
         context=None,
-        posture=posture,
+        posture=_alert_hop_posture(posture),
         ways_across=_WEBHOOK_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink, not a connection
@@ -464,13 +473,11 @@ def _refuse_alert_smtp_revocation(
     never reads the setting. A CRL that cannot be loaded refuses here, and so at the build.
 
     ``posture`` is PASSED, because both callers are built outside every ``active_hop_posture``
-    scope. ``None`` reads the ambient posture; where none is stamped the guard is the shipped no-op
-    and no context is built, so a build with no posture is unchanged."""
+    scope. ``None`` reads the ambient posture, and where none is stamped it counts as enforcing
+    (:func:`_alert_hop_posture`), as for the webhook."""
     if username is None or not use_tls or not tls_verify:
         return
     if allowed_hosts and host.lower() not in (h.lower() for h in allowed_hosts):
-        return
-    if posture is None and current_hop_posture() is None:
         return
     RevocationHopGuard.capture(
         host=host,
@@ -486,7 +493,7 @@ def _refuse_alert_smtp_revocation(
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
         ),
-        posture=posture,
+        posture=_alert_hop_posture(posture),
         ways_across=_ALERT_SMTP_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink and the security notifier, not a connection
@@ -2146,7 +2153,8 @@ def notifier_from_settings(
     ``posture`` keys the webhook's cleartext refusal (#329) and both transports' revocation guards
     (BACKLOG #2193): an off-box https webhook, and an SMTP login to an off-box relay, are refused on
     an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
-    ``[tls].crl_file`` reaches the hop."""
+    ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
+    enforcing (ADR 0173 section 12)."""
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

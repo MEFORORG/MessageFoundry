@@ -820,8 +820,8 @@ def security_notifier_from_settings(
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
     ``email_password``, byte-identical to before. ``audit`` is where a dropped or failed notice is
     recorded (BACKLOG #2383); ``None`` records nothing. ``posture`` keys the SMTP login's
-    revocation guard (BACKLOG #2193), as on the alerts sink; ``None`` with none stamped is the
-    guard's no-op."""
+    revocation guard (BACKLOG #2193), as on the alerts sink; ``None`` with none stamped counts as
+    enforcing there (ADR 0173 section 12)."""
     if not (alerts.email_smtp_host and alerts.email_from):
         return None
     # The sender is MAIL FROM on every notice, and send_plain_email refuses one that fails the address

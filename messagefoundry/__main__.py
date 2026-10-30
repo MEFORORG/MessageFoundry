@@ -7963,7 +7963,8 @@ def _offline_security_notifier(
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
     (BACKLOG #2193) reads ``posture`` too, and where it is ``None`` it reads the instance's own,
-    derived from ``settings``, because that guard treats no posture as a no-op.
+    derived from ``settings``. That guard would count no posture as enforcing, so on a ``warn``
+    instance the derived posture is what lets it warn rather than refuse.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -8039,8 +8040,9 @@ def _offline_security_notifier(
             # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
             # every build failure here is: the notice is dropped and the recovery goes on. A
             # caller with no posture (admin reset-totp) gets the instance's own, derived from
-            # these settings, so the guard is never the unstamped no-op here. The Vault read
-            # above keeps the caller's posture, where None counts as enforcing.
+            # these settings, so a warn instance warns rather than taking the guard's enforcing
+            # default for no posture. The Vault read above keeps the caller's posture, where None
+            # counts as enforcing.
             posture=(
                 posture
                 if posture is not None

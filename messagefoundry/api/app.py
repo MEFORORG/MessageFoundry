@@ -11460,8 +11460,9 @@ def create_managed_app(
         # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
         # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
         # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
-        # fails closed (vault BACKLOG #2354), but the two revocation guards are the unstamped
-        # no-op, as for any hop built outside a posture. Reuses
+        # fails closed (vault BACKLOG #2354), and so do the [alerts] SMTP login and webhook
+        # revocation guards, which count no posture as enforcing (ADR 0173 section 12); the LDAPS
+        # bind's guard is the unstamped no-op, as for any RevocationHopGuard hop. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(

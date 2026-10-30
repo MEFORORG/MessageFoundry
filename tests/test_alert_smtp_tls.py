@@ -40,9 +40,14 @@ from messagefoundry.config.settings import (
     StoreSettings,
     security_loosenings,
 )
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import EmailTransport
 from messagefoundry.pipeline.security_notify import SecurityEventNotifier
 from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_NO_ALERTS_TOML
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _RecordingSMTP:
@@ -583,6 +588,7 @@ def test_a_credential_over_starttls_still_logs_in(smtp: type[_RecordingSMTP]) ->
         recipients=["ops@x"],
         username="svc",
         password="pw",
+        posture=_NOT_ENFORCING,
     )
     asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
     assert smtp.captured["tls"] is True
@@ -626,6 +632,7 @@ def test_cram_md5_is_never_selected_even_when_the_server_offers_it(
         recipients=["ops@x"],
         username="svc",
         password="pw",
+        posture=_NOT_ENFORCING,
     )
     asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
     assert smtp.captured["auth_mechanism"] == "PLAIN"

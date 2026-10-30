@@ -443,6 +443,10 @@ _POSTURES_BUILT = sorted(
         # The AI broker's revocation guard, for a broker built with no posture: HopPosture's
         # fail_closed(enforcing=None), which is enforcing. It cannot relax (BACKLOG #2193 (e)).
         ("transports/ai_broker.py", "_refuse_an_unrevoked_ai_hop"),
+        # The [alerts] SMTP login and webhook revocation guards, for a build with no posture
+        # passed or stamped: fail_closed(enforcing=None), which is enforcing. It cannot relax
+        # (BACKLOG #2193, ADR 0173 section 12).
+        ("pipeline/alert_sinks.py", "_alert_hop_posture"),
         # The synthetic load rigs, which declare a warn posture for their own rig stores. Only
         # the `open_store` one reaches a link of this chain; `_NOT_HANDED_DOWN` argues it.
         ("harness/load/connscale/runner.py", "_reset_server_store"),
@@ -480,6 +484,9 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
+        # The offline security notifier's SMTP login guard, for a caller with no posture
+        # (BACKLOG #2193).
+        ("__main__.py", "_offline_security_notifier", "settings.security.enforcement"),
         ("__main__.py", "_provision_admin", "settings.security.enforcement"),
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
         ("__main__.py", "_start_logging", "settings.security.enforcement"),

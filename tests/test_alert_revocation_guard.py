@@ -54,8 +54,10 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     TrustAnchorPolicy,
+    active_hop_posture,
     build_smtp_tls_context,
     context_checks_revocation,
+    current_hop_posture,
 )
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.pipeline.alert_sinks import (
@@ -229,24 +231,22 @@ def test_an_smtp_login_warns_but_builds_when_not_enforcing() -> None:
     assert log.has("revocation") and log.has(_SMTP_CELL), log.state()
 
 
-def test_an_smtp_login_built_with_no_posture_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No posture, none stamped: the guard is the shipped no-op and builds no context. The warn arm
-    is the control that this capture sees the guard's lines."""
-    built: list[str] = []
-    original = build_smtp_tls_context  # the function alert_sinks binds
-
-    def _count(**kwargs: Any) -> Any:
-        built.append(kwargs["host"])
-        return original(**kwargs)
-
-    monkeypatch.setattr(alert_sinks, "build_smtp_tls_context", _count)
-    with _guard_log() as log:
+def test_an_smtp_login_built_with_no_posture_is_refused() -> None:
+    """No posture passed and none stamped counts as enforcing (ADR 0173 section 12), as on the AI
+    broker. It was the unstamped no-op until the batch 453 wave 3 alignment."""
+    assert current_hop_posture() is None
+    with pytest.raises(InsecureHopRefused, match="revocation") as exc:
         _email(None)
+    assert _SMTP_CELL in str(exc.value)
+    with pytest.raises(InsecureHopRefused, match="revocation"):
         _notifier(None)
-        assert built == []
-        _email(NOT_ENFORCING)
-    assert built == [RELAY]
-    assert sum(_SMTP_CELL in m for m in log.messages) == 1, log.state()
+
+
+def test_an_smtp_login_with_no_posture_passed_reads_the_stamped_one() -> None:
+    """The enforcing default is only for no posture at all: a stamped warn posture still warns."""
+    with _guard_log() as log, active_hop_posture(NOT_ENFORCING):
+        _email(None)
+    assert log.has("revocation") and log.has(_SMTP_CELL), log.state()
 
 
 def test_the_alerts_settings_pair_reaches_both_smtp_builds() -> None:
@@ -313,10 +313,15 @@ def test_an_https_webhook_warns_but_builds_when_not_enforcing() -> None:
     assert log.has("revocation") and log.has(_WEBHOOK_CELL), log.state()
 
 
-def test_an_https_webhook_built_with_no_posture_is_unchanged() -> None:
-    with _guard_log() as log:
+def test_an_https_webhook_built_with_no_posture_is_refused() -> None:
+    """No posture passed and none stamped counts as enforcing (ADR 0173 section 12), as on the AI
+    broker. It was the unstamped no-op until the batch 453 wave 3 alignment."""
+    assert current_hop_posture() is None
+    with pytest.raises(InsecureHopRefused, match="revocation") as exc:
         WebhookTransport(WEBHOOK)
-        WebhookTransport(WEBHOOK, posture=NOT_ENFORCING)
+    assert _WEBHOOK_CELL in str(exc.value)
+    with _guard_log() as log, active_hop_posture(NOT_ENFORCING):
+        WebhookTransport(WEBHOOK)
     assert sum(_WEBHOOK_CELL in m for m in log.messages) == 1, log.state()
 
 
@@ -452,9 +457,9 @@ def _engine_builds(name: str) -> list[tuple[str, ast.Call]]:
 @pytest.mark.parametrize("name", sorted(_POSTURE_BUILDS))
 def test_every_engine_build_passes_a_posture(name: str) -> None:
     """A CENSUS PIN on the posture, as for the LDAPS bind. The census entry proves the guard is
-    called; it cannot see a caller that stops passing ``posture``, which would leave the guard the
-    unstamped no-op with every behaviour test above still green. A name that is always ``None``
-    still passes this."""
+    called; it cannot see a caller that stops passing ``posture``, which would leave the guard on
+    its enforcing default for no posture, so a warn instance would refuse rather than warn. A name
+    that is always ``None`` still passes this."""
     builds = _engine_builds(name)
     assert {rel for rel, _ in builds} >= _POSTURE_BUILDS[name], builds
     missing = []
@@ -514,10 +519,10 @@ def test_an_offline_notifier_with_no_posture_reads_the_instance_posture(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``admin reset-totp`` passes no posture. The offline notifier then derives the instance's
-    own, so the guard refuses (and the notice is dropped with a WARNING) rather than being the
-    unstamped no-op."""
+    own: an enforcing instance refuses (and the notice is dropped with a WARNING), and a warn
+    instance builds with a WARNING, where the guard's own default for no posture would refuse."""
     from messagefoundry.__main__ import _offline_security_notifier
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import SecurityEnforcement, ServiceSettings
 
     alerts = AlertsSettings(
         email_smtp_host=RELAY,
@@ -527,6 +532,8 @@ def test_an_offline_notifier_with_no_posture_reads_the_instance_posture(
     )
     assert _offline_security_notifier(ServiceSettings(alerts=alerts)) is None
     assert "revocation" in capsys.readouterr().err
+    warn = SecuritySettings(enforcement=SecurityEnforcement.WARN)
+    assert _offline_security_notifier(ServiceSettings(alerts=alerts, security=warn)) is not None
     attested = alerts.model_copy(
         update={
             "email_tls_revocation_attested": True,

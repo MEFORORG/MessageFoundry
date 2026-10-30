@@ -1473,8 +1473,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
   instance's own posture. A build that holds no posture, such as an embedding that passes no
-  `[ai]`, does not refuse: it is the unstamped no-op the LDAPS bind and the OIDC legs share. This
-  differs from the Vault pairs above, where no posture counts as enforcing.
+  `[ai]`, counts as enforcing, as on the Vault pairs above and the AI endpoint below. This
+  differs from the LDAPS bind and the OIDC legs, which do not refuse with no posture.
 - **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
   carries its path token. **Setting the flag adds no check on the wire.**

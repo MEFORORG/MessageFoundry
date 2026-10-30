@@ -51,6 +51,7 @@ from messagefoundry.auth.oidc.flow import _MAX_TOKEN_RESPONSE_BYTES as _OIDC_TOK
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
@@ -92,6 +93,11 @@ _AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for thes
 
 
 # --- the fakes ----------------------------------------------------------------------------------
+
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _UnboundedResp:
@@ -533,7 +539,7 @@ def test_alert_webhook_drain_is_bounded(
     """The drain stops one byte past the bound. Before #3040 the over-cap reply then raised, and
     the notifier reported an alert the host had taken with a 2xx as failed. Owner ruling
     2026-10-12 (#3040 item 1): it counts as delivered, with a WARNING that carries no reply byte."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
@@ -561,7 +567,7 @@ def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
     closed without one. urllib never hands the webhook such a reader, since it raises every
     non-2xx as HTTPError first. So it is the 2xx, and not the size alone, that makes the alert
     delivered."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     resp = _UnboundedResp()
     resp.status = status  # type: ignore[assignment]
     import messagefoundry.pipeline.alert_sinks as sinks
@@ -870,7 +876,7 @@ def test_an_alert_already_accepted_is_not_reported_as_a_failed_send(
 ) -> None:
     """The webhook POST is accepted before the drain runs, so raising here would tell an operator
     the alert failed when the host took it."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(

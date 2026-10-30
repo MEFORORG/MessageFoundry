@@ -1013,8 +1013,10 @@ bind-guard ladder above:
   - **The https webhook.** The POST carries the webhook's path token. Its one lever is
     `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
     opener built at import, so no CRL reaches it, as on the Vault hops.
-  - **A build with no instance posture is not refused**, as for the LDAPS bind and the OIDC legs:
-    `serve` always hands the posture down, and an embedding that passes no `[ai]` hands none.
+  - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the
+    AI-broker endpoint, and unlike the LDAPS bind and the OIDC legs, which do not refuse there.
+    `serve` always hands the posture down; an embedding that passes no `[ai]` hands none, and its
+    off-box hops above are then refused unless attested.
 
   **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
   off-box `[ai].endpoint` is refused under `enforce` unless
