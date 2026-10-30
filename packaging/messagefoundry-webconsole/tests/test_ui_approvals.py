@@ -582,8 +582,8 @@ def test_a_release_that_did_no_work_says_so() -> None:
         )
         return str(pages.approval_approved(outcome))
 
-    skipped = _page({"cancelled": 0, "skipped": "outbound running"})
-    assert "The operation skipped its work: outbound running." in skipped
+    skipped = _page({"cancelled": 0, "skipped": "no such outbound connection: OB"})
+    assert "The operation skipped its work: no such outbound connection: OB." in skipped
     degraded = _page({"inbound": 1, "outbound": 1, "degraded": True, "failures": ["audit"]})
     assert "at least one follow-on step failed: audit." in degraded
     # BACKLOG #3015: a released reload says a changed anchor takes a restart, as the inline does.

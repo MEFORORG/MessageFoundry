@@ -2542,8 +2542,13 @@ Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
 request moves to `failed`, and `approval.failed` names the error type. A released purge does the
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
-attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
-is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
+attributed to the requester (vault BACKLOG #3217). A released purge re-reads the route's own
+refusals (vault BACKLOG #3798). If no graph is loaded, or the outbound has left the graph, is
+running, or is owned by another engine shard, the release skips. It cancels nothing, writes no
+`connection_purge` row, and its `approval.approved` row records the route's refusal text as the
+skip. The operator clears the cause and requests the purge again. A held purge whose stored scope
+is neither `top` nor `all` cancels nothing either: no request files one and no operator act clears
+it, so it answers 422, moves to `failed`, and `approval.failed` names the error type.
 At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
 exception the claim has. The re-queue or the cancel and its row are then committed, and the gate
 still tries to move the request to `failed`. That row is not forwarded off-box, and no alert says
