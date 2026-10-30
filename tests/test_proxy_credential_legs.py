@@ -62,6 +62,7 @@ from messagefoundry.transports.bounded_read import (
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
     ProxyCredentialsRefusedError,
+    _proxies_of,
     build_strict_opener,
 )
 from messagefoundry.transports.rest import RestDestination
@@ -423,6 +424,64 @@ def test_control_a_host_on_no_bypass_list_still_reaches_the_proxy_with_its_heade
     assert len(proxy.cleartext) == 1
     assert proxy.cleartext[0].startswith(b"POST http://partner.example.test/x ")
     assert f"Proxy-Authorization: {_HEADER}\r\n".encode() in proxy.cleartext[0]
+
+
+_STATIC_PROXY_HEADER = {"Proxy-Authorization": _HEADER}
+
+
+def test_a_rest_send_with_a_static_proxy_header_to_a_loopback_host_is_refused() -> None:
+    """A connection's static ``headers`` with no ``proxy_user``: no guard admitted the header and
+    no bypass rule leaves it off. A loopback host is never proxied, so it would reach the
+    destination, and the destination is not dialled (vault BACKLOG #3417). Measured 2026-10-30:
+    with ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the send
+    delivered the header to this socket and this test failed. Control: with no header the same
+    send is delivered."""
+    with _WireProxy() as destination:
+        url = f"http://{destination.address}/x"
+        _send_refused(_rest(url, headers=_STATIC_PROXY_HEADER), "#3417")
+        assert destination.connections == 0
+        asyncio.run(_rest(url).send('{"a": 1}'))
+    assert len(destination.cleartext) == 1
+
+
+def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_entry_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``proxy_url = "default"`` reads the environment when the connection is built; the shared
+    opener read it at import. ``HTTP_PROXY`` gives that connection no proxy for ``https``, so the
+    send goes direct, and the static header is refused before the dial (vault BACKLOG #3417).
+    Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a
+    no-op, the dial was reached with the header on the request and this test failed. Control: with
+    no header the same send reaches the dial."""
+    monkeypatch.setenv("HTTP_PROXY", f"http://{_MARKER}")
+    dest = _rest(_HTTPS_TARGET, proxy_url="default", headers=_STATIC_PROXY_HEADER)
+    assert set(_proxies_of(_proxy_handler(dest))) == {"http"}
+    _send_refused(dest, "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, proxy_url="default").send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
+    assert dialled.value.proxy_header is None
+
+
+@pytest.mark.parametrize(
+    "proxy_url", ["default", f"http://{_MARKER}"], ids=["default-proxy", "configured-proxy"]
+)
+def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch, proxy_url: str
+) -> None:
+    """A static header, so #3442 has no credential of the connection's own to leave off, and
+    ``NO_PROXY`` names the destination, so urllib sends the request direct. Each connection has a
+    proxy for ``https``, because with none the shared opener goes direct whatever ``NO_PROXY``
+    says. The header is refused before the dial (vault BACKLOG #3417). Measured 2026-10-30: with
+    ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the dial was
+    reached with the header on the request and this test failed. Control: with no ``NO_PROXY`` the
+    request goes to the proxy, and the header is refused on that leg."""
+    monkeypatch.setenv("HTTPS_PROXY", f"http://{_MARKER}")
+    monkeypatch.setenv("NO_PROXY", "partner.example.test")
+    dest = _rest(_HTTPS_TARGET, proxy_url=proxy_url, headers=_STATIC_PROXY_HEADER)
+    _send_refused(dest, "#3417")
+    monkeypatch.delenv("NO_PROXY")  # urllib reads its list on every request
+    _send_refused(dest, "#3416")
 
 
 # --- #3443: a static Proxy-Authorization beside the connection's own proxy credential -----------
