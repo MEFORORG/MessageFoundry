@@ -16,6 +16,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -339,6 +340,110 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
             break
         await asyncio.sleep(0.02)
     assert withdrawn in caplog.text, caplog.text
+
+
+async def test_abandoned_removals_run_on_their_own_capped_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 4, the Lander's hold on PR 2645: each removal abandoned at the
+    bound kept a default-executor worker, with no cap, so hung unlinks could fill the pool every
+    ``asyncio.to_thread`` in the engine shares. Removals now run on their own small pool, so a
+    hung one past its cap queues there. Red before: three hung removals ran at once on the
+    default executor."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
+    pool = ThreadPoolExecutor(max_workers=1)
+    # raising=False, so the unfixed module, which has no such pool, fails on the count below.
+    monkeypatch.setattr(uploads_mod, "_removal_executor", lambda: pool, raising=False)
+    store = _uploads(tmp_path, None)
+    metas = [
+        await store.save(data=b"x\n", filename=f"{n}.txt", uploader="op", uploader_id="u-op")
+        for n in range(3)
+    ]
+    unhang, count = threading.Event(), threading.Lock()
+    running, peak, finished = 0, 0, 0
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        nonlocal running, peak, finished
+        with count:
+            running += 1
+            peak = max(peak, running)
+        try:
+            unhang.wait(30)  # bounded, so a red run cannot hang the suite
+            return real_discard(file_id)
+        finally:
+            with count:
+                running -= 1
+                finished += 1
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    try:
+        for meta in metas:
+            await store._remove_cancelled_pair(meta.file_id)
+        await asyncio.sleep(0.1)  # time for a queued removal to start, were nothing capping it
+        assert peak == 1, f"{peak} hung removals ran at once"
+        assert await asyncio.wait_for(asyncio.to_thread(int), 5) == 0  # the default pool is free
+    finally:
+        unhang.set()
+    for _ in range(250):
+        if finished == 3:
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.to_thread(pool.shutdown, True)
+    assert await store.list_files() == []
+
+
+async def test_a_repeated_cancel_does_not_spin_a_cancelled_save_on_its_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 4, the Lander's hold on PR 2645: the removal's wait absorbed every
+    cancellation in a loop, under ``_quota_lock``, so an anyio scope, which cancels again on every
+    loop pass, spun the cancelled save for the whole bound while every other upload queued. The
+    cancelled save now stops waiting at the next cancellation, and the next save waits for the
+    removal, without spinning, before it scans. Red before: A ran out the whole bound."""
+    import anyio
+
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 2.0)
+    store = _uploads(tmp_path, None)
+    landed, finish = _hold_after_the_sidecar_lands(monkeypatch)
+    unhang = threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        unhang.wait(30)  # bounded, so a red run cannot hang the suite
+        return real_discard(file_id)
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    loop = asyncio.get_running_loop()
+    ended: list[float] = []
+
+    async def _a() -> None:
+        try:
+            await store.save(
+                data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op"
+            )
+        finally:
+            ended.append(loop.time())
+
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_a)
+            try:
+                assert await asyncio.to_thread(landed.wait, 10), "A's sidecar never landed"
+                cancelled_at = loop.time()
+                tg.cancel_scope.cancel()
+            finally:
+                finish.set()
+        assert ended[0] - cancelled_at < 1.0, "A waited out the bound under repeated cancels"
+        b = asyncio.create_task(
+            store.save(data=b"second\n", filename="b.txt", uploader="op", uploader_id="u-op")
+        )
+        await asyncio.sleep(0.1)
+        assert not b.done(), "B went on while A's pair was still being removed"
+    finally:
+        unhang.set()
+    assert isinstance(await asyncio.wait_for(b, 10), UploadedFileMeta)
+    assert [m.filename for m in await store.list_files()] == ["b.txt"]
 
 
 async def test_the_drain_reads_its_default_waits_when_it_runs(

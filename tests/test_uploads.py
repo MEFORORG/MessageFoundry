@@ -1011,7 +1011,9 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
     """BACKLOG #2262 under the cancellation production delivers. The request deadline reaches the
     route through anyio task groups (``BaseHTTPMiddleware``), which cancel again at every await. A
     plain ``to_thread`` cleanup cancelled before a worker picked it up never ran; measured in review
-    at 25 runs of 200. The cleanup now waits through repeat cancellations, as the write does."""
+    at 25 runs of 200. The cleanup is now a job nothing cancels. Since vault BACKLOG #3740 item 4
+    the save stops waiting for it at the repeat cancellation rather than spin, so the removal can
+    end just after the save does, and this waits for it."""
     import functools
 
     import anyio
@@ -1029,6 +1031,10 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
+    for _ in range(250):
+        if not list((tmp_path / "uploads").iterdir()):
+            break
+        await asyncio.sleep(0.02)
     assert list((tmp_path / "uploads").iterdir()) == []
 
 
