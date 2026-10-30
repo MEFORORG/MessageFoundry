@@ -360,6 +360,57 @@ async def test_the_long_operations_drain_splits_its_share_by_its_named_wait_shar
     assert (wait, grace) == pytest.approx((share / 2, share / 2))
 
 
+async def test_a_stuck_non_upload_operation_does_not_hold_the_upload_straggler_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upload drain settles only the ``upload.create`` rows, the one long operation whose arm
+    starts an upload removal. A DR change or reload still rolling back at shutdown is not waited
+    for there: its wait would come out of the slack the later audit-writing steps get. Red before:
+    the settle waited on every long operation, so the step ran on for its whole wait share,
+    about 1.3 s here, although its only straggler had finished at 0.2 s."""
+    from messagefoundry.api.app import _app_drain_steps
+    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    monkeypatch.setattr(app_module, "OUTLIVING_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "CANCEL_GRACE_SECONDS", 0.1)
+    uploads = UploadStore(tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096)
+    outliving = OutlivingOperations()
+    release = asyncio.Event()
+
+    async def _stuck_rollback() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # a DR hook reap that outlasts the drain's grace
+            raise
+
+    caller = asyncio.ensure_future(outliving.run(_stuck_rollback(), "DR activate"))
+    finished: list[float] = []
+    began = time.monotonic()
+
+    async def _ledger_call() -> None:
+        await asyncio.sleep(0.2)
+        finished.append(time.monotonic() - began)
+
+    straggler = asyncio.ensure_future(_ledger_call())
+    uploads._hold(straggler)
+    await asyncio.sleep(0)
+    try:
+        app: Any = SimpleNamespace(
+            state=SimpleNamespace(outliving_operations=outliving, upload_store=uploads)
+        )
+        await _run_teardown(_app_drain_steps(app, None, None, owns_auth=False), 2.6)
+        elapsed = time.monotonic() - began
+        assert finished, "the straggler was cancelled before its 0.2 s"
+        assert outliving.inflight == ["DR activate"], "the control: the DR arm is still running"
+        assert elapsed < 0.9, f"the upload drain waited on the DR arm: {elapsed:.2f}s"
+    finally:
+        release.set()
+        await asyncio.gather(caller, straggler, return_exceptions=True)
+
+
 async def test_a_removal_a_cancelled_create_row_starts_late_is_drained_before_the_teardown_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -399,7 +450,7 @@ async def test_a_removal_a_cancelled_create_row_starts_late_is_drained_before_th
         actor="op",
         client=None,
     )
-    caller = asyncio.ensure_future(outliving.run(row, "upload.create row"))
+    caller = asyncio.ensure_future(outliving.run(row, app_module._UPLOAD_CREATE_OPERATION))
     try:
         await asyncio.wait_for(writing.wait(), _WAIT_S)
         assert await uploads.list_files(), "the control: the pair is stored"

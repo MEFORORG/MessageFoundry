@@ -1236,6 +1236,10 @@ _CUT_GRACE_SECONDS: Final = 0.1
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
 #: budget, and cancel a reload, DR change or ``upload.create`` row that would have finished in it.
 _OUTLIVING_WAIT_SHARE: Final = 0.25
+#: The label the upload route runs its ``upload.create`` row under as an outliving operation. The
+#: upload straggler drain settles these operations only, since only their arms start a removal
+#: (vault BACKLOG #3740 item 6).
+_UPLOAD_CREATE_OPERATION: Final = "upload.create audit"
 
 #: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
 #: this keeps one alive until it ends.
@@ -1393,8 +1397,8 @@ def _app_drain_steps(
        ``upload.create`` row failed there (vault BACKLOG #3178) is removed by that operation's
        cancellation arm. The arm can still be running when the long-operations drain stops
        waiting, as when the cancelled row's own unwind outlasts that drain's grace, so this step
-       first waits, within its own wait, for the operations still running (vault BACKLOG #3740
-       item 6). A removal those start is then held as a straggler before the drain looks. One
+       first waits, within its own wait, for the ``upload.create`` operations still running,
+       and no other (vault BACKLOG #3740 item 6). A removal those start is then held as a straggler before the drain looks. One
        whose operation is still running when that wait ends can start after the drain returned.
        Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
        counted it as still rolling back.
@@ -1430,14 +1434,16 @@ def _app_drain_steps(
         # slots that go stale: a discard removal it cancels leaves a stored file with no
         # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
         # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
-        # its bound, so it cancels what it owns before the cut. It settles the long operations
-        # first, as item 2 above says.
+        # its bound, so it cancels what it owns before the cut. It settles the upload.create rows
+        # first, as item 2 above says, and no other long operation: a DR change or reload still
+        # rolling back would only spend the slack the later audit-writing steps get.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
                 0.5,
                 lambda b: uploads.drain_stragglers_within(
-                    b * _INNER_SHARE, settle=outliving.settle
+                    b * _INNER_SHARE,
+                    settle=partial(outliving.settle, label=_UPLOAD_CREATE_OPERATION),
                 ),
             )
         )
@@ -8344,7 +8350,7 @@ def create_app(
             _record_upload_create(
                 engine.store, us, meta, actor=identity.username, client=client_ip(request)
             ),
-            "upload.create audit",
+            _UPLOAD_CREATE_OPERATION,
         )
 
         # ASVS 5.2.4: an age-based retention sweep triggered by the save (off-loop, best-effort). A prune
