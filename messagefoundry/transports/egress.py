@@ -675,7 +675,7 @@ def _database_refusal(
     settings: Mapping[str, Any], allowed: list[str], *, dialect: str | None = None
 ) -> str | None:
     """Why ``[egress].allowed_db`` refuses the hop a DATABASE connection's ``settings`` name, or
-    ``None`` when it admits it: the ONE rule behind the outbound connection, the inbound poll and
+    ``None`` when it admits it: the rule the outbound connection, the inbound poll and
     both lookups (vault BACKLOG #2704).
 
     ``dialect`` is the one the caller builds its connection string with, and defaults to the
@@ -706,8 +706,8 @@ def _database_refusal(
             "this connection names no port the engine can read"
         )
     return (
-        f"server {host!r} is not in the [egress].allowed_db allowlist at port {port}, "
-        "the port this connection names"
+        f"server {host!r} at port {port}, the port this connection names, is not in the "
+        "[egress].allowed_db allowlist"
     )
 
 

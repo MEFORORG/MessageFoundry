@@ -57,6 +57,21 @@ def port_or_zero(text: str) -> int:
     return port if port <= 65535 else 0
 
 
+def _preset_port(value: object) -> int | None:
+    """The port the SQL Server preset's connection string sends for a ``port`` setting, or ``None``.
+
+    ``_build_dsn`` writes ``int(port)``, so this reads it with the same ``int()``: a float, a sign or
+    a non-ASCII digit that ``int()`` accepts is the port sent. A value ``int()`` refuses fails that
+    build too, and a number outside 1 to 65535 is not a port."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        port = int(value)
+    except (ValueError, OverflowError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
 def split_generic_server(server: str) -> tuple[str, str]:
     """Split a generic-dialect ``server`` into its host and the text after a port separator, which
     is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
@@ -124,8 +139,8 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     Server preset, whatever ``settings`` say.
 
     **The SQL Server preset** sends ``SERVER={server},{port}``, so the ``port`` setting is the port
-    sent, defaulting to 1433 as the connection string does, and read as a number as the connection
-    string's ``int()`` reads it.
+    sent, defaulting to 1433 as the connection string does, and read with the same ``int()`` the
+    connection string uses (:func:`_preset_port`).
 
     **The generic dialect** sends ``SERVER={server}`` and never reads the ``port`` setting, so it is
     ignored here. The port is the ``PORT`` keyword's, the one value the connection string sends as a
@@ -140,9 +155,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     change, so an entry is matched on its host as written."""
     host = str(settings.get("server", ""))
     if dialect.lower() != "generic":
-        return DialEndpoint(
-            host, port_or_zero(str(settings.get("port", SQLSERVER_DEFAULT_PORT))) or None
-        )
+        return DialEndpoint(host, _preset_port(settings.get("port", SQLSERVER_DEFAULT_PORT)))
     params = settings.get("odbc_params")
     # A table that is not a mapping is the build's own refusal; read it as giving no keyword.
     keywords = [
@@ -160,8 +173,8 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
             host,
             None,
             conflict=(
-                f"server {host!r} holds a comma, read as a port suffix or a host list: name one "
-                "host and put the port in the PORT keyword"
+                "name one host in server and put the port in the PORT keyword: "
+                f"server {host!r} holds a comma, read as a port suffix or a host list"
             ),
         )
     if split_generic_server(host)[1]:

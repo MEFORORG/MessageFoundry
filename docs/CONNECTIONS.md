@@ -1740,16 +1740,17 @@ driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `
 to its own default port, and the check cannot see that. Check that your driver reads the keyword.
 
 An entry with no port admits its host at any port. On the generic dialect the egress check
-**refuses** these cases for a listed host, at load like every other miss:
+**refuses** at least these cases for a listed host, at load like every other miss:
 
 - `server` holds a comma anywhere: `db,6432`, `[db],6432`, `db,` or `db,replica`, whatever the
   entry says. psqlODBC passes `SERVER` to libpq as a host, and libpq reads a comma there as a list
   of hosts. Name one host in `server` and put the port in `PORT`.
-- `server` carries a port as `host:port` or `[v6]:port`. No entry can name such a `server`, because
-  an entry splits at its first colon.
 - `PORT` is given more than once, in any case.
 - No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
+
+A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
+so no entry can name it, and it is refused as unlisted.
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
 port compared.

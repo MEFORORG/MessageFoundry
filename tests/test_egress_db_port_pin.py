@@ -237,6 +237,14 @@ def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: 
     check({"server": HOST, "database": "d", "port": " 5432"}, PINNED)
 
 
+@pytest.mark.parametrize("port", [5432.0, "+5432", "05432"])
+def test_sqlserver_preset_port_is_read_with_the_int_the_connection_string_uses(
+    check: Check, port: object
+) -> None:
+    # The preset's connection string sends int(port); a value int() reads as 5432 sends 5432.
+    check({"server": HOST, "database": "d", "port": port}, PINNED)
+
+
 def test_unlisted_host_is_refused_as_unlisted_before_its_port_is_read(check: Check) -> None:
     with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
         check(_generic(server="evil.test.invalid,1", odbc_params={"PORT": "2"}), HOST_ONLY)
