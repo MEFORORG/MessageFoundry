@@ -15141,13 +15141,13 @@ class SqlServerStore:
                     await self._bump_session_epoch(cur, str(user_id))
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
-                    revoked = len(await cur.fetchall())
                 else:
                     await cur.execute(
                         _MSSQL_REVOKE_ALL_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, except_token_hash),
                     )
-                    revoked = len(await cur.fetchall())
+                revoked = len(await cur.fetchall())
+                if except_token_hash is not None:
                     await cur.execute(
                         "SELECT s.user_id, u.session_epoch FROM sessions s"
                         " JOIN users u ON u.id = s.user_id WHERE s.token_hash=?",

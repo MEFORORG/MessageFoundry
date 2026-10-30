@@ -11563,24 +11563,22 @@ class AuthService:
         return revoked
 
     async def revoke_every_session(
-        self, *, actor: str, keep_token_hash: str | None = None, client: str | None = None
+        self, *, actor: str, keep_token_hash: str, client: str | None = None
     ) -> tuple[int, bool]:
         """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
         compromise where walking the accounts one by one would leave the rest live meanwhile.
         ``keep_token_hash`` keeps the caller's own session, so the administrator who ran it is not
-        signed out mid-response; ``None`` keeps nothing. Returns the count and whether a session
-        was kept. Audited even when the count is zero, because the act itself is the record an
-        investigator looks for.
+        signed out mid-response. Returns the count and whether that session was kept. Audited
+        even when the count is zero, because the act itself is the record an investigator looks
+        for. The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
         :meth:`revoke_other_sessions` does."""
-        kept = keep_token_hash is not None
+        kept = True
         try:
             revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:
-            if keep_token_hash is None:
-                raise
             await self._session_seal_failed(keep_token_hash)
             revoked = await self._store.revoke_all_sessions()
             kept = False

@@ -61,7 +61,7 @@ from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.last_resort import run_guarded
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
@@ -324,7 +324,7 @@ class RestoreResult:
     #: BACKLOG #2614: the SHA-256 of the archive bytes this restore read, the archive's own
     #: ``created_utc`` as epoch seconds, and the newest audit row it held; each time ``None`` when
     #: the archive did not say. The restore writes them into the store's restore marker.
-    archive_sha256: str = ""
+    archive_sha256: str
     archive_created_at: float | None = None
     last_audit_at: float | None = None
 
@@ -2900,8 +2900,9 @@ def _refuse_an_old_archive(
     """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
     say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
     archive, so the older it is the more an operator must re-apply, and the refusal names the
-    time after which that is so. The CLI's ``--allow-old-archive`` skips this check."""
-    newest = _utc_iso(last_audit_at) if last_audit_at is not None else "unknown"
+    time after which that is so. The caller words how to override it; the CLI's
+    ``--allow-old-archive`` skips this check."""
+    newest = utc_or_unknown(last_audit_at)
     if archive_created_at is None:
         taken = "the archive does not say when it was taken"
     else:
@@ -2915,7 +2916,7 @@ def _refuse_an_old_archive(
     raise BackupError(
         "age",
         f"{taken}. Its newest audit row is {newest}. {RESTORED_ACCOUNTS_NOTICE} Nothing was "
-        "written. Choose a newer archive, or pass --allow-old-archive to restore this one.",
+        "written.",
     )
 
 
@@ -2992,7 +2993,7 @@ def _restore_blocking(
     dest_store_path: Path,
     config_dest: Path | None,
     keys: list[bytes],
-    max_age_seconds: float | None = None,
+    max_age_seconds: float | None,
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
     :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,

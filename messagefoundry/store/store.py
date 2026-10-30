@@ -6180,6 +6180,46 @@ def forget_store_salt(path: Path) -> bool:
     switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
     refuses while another connection holds the file. After the delete, the main file is re-read with
     no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+
+    def drop(conn: sqlite3.Connection) -> bool:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        ).fetchone()
+        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+
+    def gone(proof: sqlite3.Connection) -> bool:
+        return not (
+            proof.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+            ).fetchone()[0]
+            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+        )
+
+    return _write_closed_store(
+        path,
+        drop,
+        gone,
+        what="its store salt cannot be dropped",
+        proof_failed="still holds a store salt after it was dropped",
+    )
+
+
+def _write_closed_store[T](
+    path: Path,
+    write: Callable[[sqlite3.Connection], T],
+    prove: Callable[[sqlite3.Connection], bool],
+    *,
+    what: str,
+    proof_failed: str,
+) -> T:
+    """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
+    :func:`forget_store_salt` and :func:`write_restore_marker`.
+
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
+    and which SQLite refuses while another connection holds the file; ``write`` then runs in
+    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
+    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
+    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
@@ -6187,29 +6227,21 @@ def forget_store_salt(path: Path) -> bool:
         if mode != "delete":
             raise sqlite3.OperationalError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
-                "connection holds it, so its store salt cannot be dropped"
+                f"connection holds it, so {what}"
             )
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-        ).fetchone()
-        removed = exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        result = write(conn)
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
         raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
-        left = (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
-        )
+        proven = prove(proof)
     finally:
         proof.close()
-    if left:
-        raise sqlite3.OperationalError(f"{path} still holds a store salt after it was dropped")
-    return removed
+    if not proven:
+        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+    return result
 
 
 def newest_audit_time(path: Path) -> float | None:
@@ -6243,35 +6275,29 @@ def write_restore_marker(
     engine start on it, wherever it lands, still records the restore and ends every session. One
     row only; a second restore of the same file replaces it.
 
-    Call it after :func:`forget_store_salt`, which leaves the file out of WAL mode, so the write
-    lands in the main file. It is proven there the same way: a non-empty ``-wal`` beside it, or a
-    re-read that finds no row, raises ``sqlite3.OperationalError``."""
-    wal = path.with_name(path.name + "-wal")
-    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
-    try:
-        mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
-        if mode != "delete":
-            raise sqlite3.OperationalError(
-                f"could not take {path} out of WAL mode (it is still {mode!r}), so its restore "
-                "marker cannot be written"
-            )
+    It is proven in the main file as :func:`forget_store_salt`'s drop is, through
+    :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
+    naming this archive, raises ``sqlite3.OperationalError``."""
+
+    def mark(conn: sqlite3.Connection) -> None:
         conn.executescript(_RESTORE_MARKER_DDL)
         conn.execute(
             "INSERT OR REPLACE INTO restore_marker (id, archive_sha256, archive_created_at,"
             " last_audit_at, restored_at) VALUES (1, ?, ?, ?, ?)",
             (archive_sha256, archive_created_at, last_audit_at, restored_at),
         )
-    finally:
-        conn.close()
-    if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
-    proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
-    try:
-        written = proof.execute("SELECT archive_sha256 FROM restore_marker WHERE id = 1").fetchone()
-    finally:
-        proof.close()
-    if written is None or written[0] != archive_sha256:
-        raise sqlite3.OperationalError(f"{path} holds no restore marker after it was written")
+
+    def marked(proof: sqlite3.Connection) -> bool:
+        row = proof.execute("SELECT archive_sha256 FROM restore_marker WHERE id = 1").fetchone()
+        return row is not None and row[0] == archive_sha256
+
+    _write_closed_store(
+        path,
+        mark,
+        marked,
+        what="its restore marker cannot be written",
+        proof_failed="holds no restore marker after it was written",
+    )
 
 
 def _secure_file(path: Path) -> None:

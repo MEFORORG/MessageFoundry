@@ -11106,7 +11106,14 @@ def _restore(args: argparse.Namespace) -> int:
             )
         )
     except BackupError as exc:
-        return _emit_error(f"restore failed ({exc.kind}): {exc}", as_json=args.json)
+        # BACKLOG #2614: the primitive states the age; the override is this command's to name.
+        hint = (
+            " Choose a newer archive, or pass --allow-old-archive (or a larger --max-age-days) to "
+            "restore this one."
+            if exc.kind == "age"
+            else ""
+        )
+        return _emit_error(f"restore failed ({exc.kind}): {exc}{hint}", as_json=args.json)
 
     from messagefoundry.pipeline.alerts import utc_or_unknown
     from messagefoundry.pipeline.dr_backup import RESTORED_ACCOUNTS_NOTICE
