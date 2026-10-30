@@ -73,6 +73,7 @@ __all__ = [
     "DOC_REF_MARKER",
     "BinaryCarriageError",
     "DocRefError",
+    "EscapedDocumentError",
     "encode",
     "decode",
     "is_marked",
@@ -112,6 +113,14 @@ class DocRefError(ValueError):
     ``mfdoc:v1:ref:`` marker, or a malformed body (a content address that is not a 64-hex SHA-256).
     Subclasses ``ValueError`` so a mis-formed handle propagates to the error/dead-letter path rather
     than dereferencing garbage."""
+
+
+class EscapedDocumentError(ValueError):
+    """An OBX-5 ED Base64 document's ``OBX-5.5`` holds the message's HL7 escape character, so it
+    cannot be detached verbatim (vault BACKLOG #2809). The read decodes an escape such as ``\\X0D\\``
+    to the character it names, so the stored value would not be the sender's bytes, and a decoded CR
+    would make every later re-attach raise. Base64 needs no escape, so the ingress detach refuses the
+    message instead. The text names the OBX occurrence only, never a byte of the value."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
@@ -323,6 +332,26 @@ def parse_doc_ref(value: str) -> tuple[str, str]:
 # put_attachment + the OBX-5.5 replace are orchestrated by the ingress path (pipeline/), which owns the
 # store. The value returned per document IS the exact OBX-5.5 base64 string: the base64 alphabet carries
 # no HL7 delimiter, so the message's own escaping is a no-op on it and Message.field yields it verbatim.
+# A value that holds the escape character anyway is refused rather than yielded (vault BACKLOG #2809).
+
+
+def _obx_5_5_holds_escape(message: Message, occurrence: int) -> bool:
+    """Whether the RAW (still escaped) ``OBX-5.5`` text of that OBX holds the message's escape
+    character. ``Message.field`` decodes escapes on a component read, so the raw field is scanned by
+    position instead, on the first repetition as that read takes it, without copying the value."""
+    _field_sep, comp_sep, rep_sep, esc, _sub_sep = message._encoding_chars()
+    raw = message.field("OBX-5", occurrence=occurrence) or ""
+    rep_end = raw.find(rep_sep)
+    if rep_end == -1:
+        rep_end = len(raw)
+    start = 0
+    for _ in range(4):  # past the separators ahead of component 5
+        start = raw.find(comp_sep, start, rep_end)
+        if start == -1:
+            return False
+        start += 1
+    end = raw.find(comp_sep, start, rep_end)
+    return raw.find(esc, start, rep_end if end == -1 else end) != -1
 
 
 def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tuple[int, str, str]]:
@@ -333,7 +362,10 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     ``"Base64"``, ``OBX-5.5`` non-empty and not already a tombstone **or** a live ``mfdoc:v1:ref:``
     handle — a re-scan of an already-detached skeleton yields nothing, so a re-run is a no-op). The
     ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
-    Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``."""
+    Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``.
+
+    Raises :class:`EscapedDocumentError` for a qualifying document whose raw ``OBX-5.5`` holds the
+    escape character: the value this would yield is decoded, not verbatim (vault BACKLOG #2809)."""
     count = message.count_segments("OBX")
     for occ in range(1, count + 1):
         if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
@@ -345,6 +377,12 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
             continue  # empty / already-stripped / already-detached — idempotent
         if len(data_b64) < min_b64_len:
             continue
+        if _obx_5_5_holds_escape(message, occ):
+            raise EscapedDocumentError(
+                f"OBX occurrence {occ}: the Base64 document in OBX-5.5 holds an HL7 escape "
+                "sequence, which base64 never needs; refusing to detach a value that is not the "
+                "sender's verbatim bytes"
+            )
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
         yield occ, data_b64, ed_type
 

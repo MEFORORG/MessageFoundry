@@ -131,6 +131,7 @@ from messagefoundry.parsing import (
 from messagefoundry.parsing.binary import (
     DOC_REF_MARKER,
     DocRefError,
+    EscapedDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
@@ -7895,7 +7896,12 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
+            except (
+                _StreamBudgetExceeded,
+                StreamingAttachmentsUnsupported,
+                DocRefError,
+                EscapedDocumentError,
+            ) as exc:
                 await self._record_refused(
                     ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
                 )
@@ -8251,11 +8257,18 @@ class RegistryRunner:
                 _StreamBudgetExceeded,
                 StreamingAttachmentsUnsupported,
                 DocRefError,
+                EscapedDocumentError,
             ) as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
+                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
+                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
+                if isinstance(exc, EscapedDocumentError):
+                    nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                else:
+                    nak_code, nak_text = "AE", "streaming detach failed"
                 ack = (
-                    build_ack(peek, code="AE", text="streaming detach failed", ack_mode=ack_mode)
+                    build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8263,7 +8276,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code=nak_code,
                         ack_phase="ingest",
                         ack_body=None,
                         detail=detach_err,
@@ -8749,7 +8762,9 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption)."""
+        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, a
+        ``ValueError`` from the parse or the splice, is a permanent :class:`NegativeAckError` instead,
+        since no retry could clear it (vault BACKLOG #2809)."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8769,6 +8784,16 @@ class RegistryRunner:
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
+        except ValueError as exc:
+            # Below the DocRefError arm on purpose, since DocRefError is a ValueError. Every other
+            # ValueError here is the MESSAGE's: the payload does not parse, or a stored value cannot be
+            # set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The reader raises none, since a
+            # store fault arrives as _StoreReadFault. The same payload fails the same way on every
+            # attempt, so a retry could never succeed and the internal-error arm could stop the lane:
+            # refuse it permanently, which dead-letters this row alone. Raised after the handler ends,
+            # so a parse error that quotes the payload is on neither chain (see IngressGuardError).
+            refused = f"document re-attach failed: {safe_exc(exc)}"
+        raise NegativeAckError(refused, code="reattach", permanent=True)
 
     async def _pace_outbound(self, name: str) -> None:
         """Apply this outbound lane's egress send pacing (BACKLOG #82): wait until at least
@@ -8885,8 +8910,10 @@ class RegistryRunner:
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
                 # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # not a refusal, so it stays what shadow made it before, a completed delivery. A
-                # store read fault is not a hydration failure: it re-pends, as live (vault #2756).
+                # not a refusal, so it stays what shadow made it before, a completed delivery, unless
+                # the payload itself caused it: that one is a permanent refusal and dead-letters, as
+                # live (vault #2809). A store read fault is not a hydration failure: it re-pends, as
+                # live (vault #2756).
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))

@@ -32,7 +32,13 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
+from messagefoundry.config.models import (
+    BatchConfig,
+    ConnectorType,
+    ContentType,
+    InternalErrorPolicy,
+    RetryPolicy,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -50,9 +56,9 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 DEST = "OB_EPIC"
 DEST2 = "OB_EPIC_2"
@@ -303,6 +309,50 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     assert item2 is not None
     await runner._process_delivery_item(DEST, item2)
     assert _obx5_5(col.deliveries[0]) == b64  # retry delivered the identical verbatim frame
+
+
+async def _store_doc_with_a_cr(store: MessageStore) -> str:
+    """A stored document holding a real CR, as a detach that decoded ``\\X0D\\`` would have left it
+    before vault BACKLOG #2809. ``Message.set`` refuses it at every re-attach."""
+    b64 = _big_b64(600)
+    return await _store_doc(store, b64[:100] + "\r" + b64[100:])
+
+
+async def test_hydrate_a_reattach_the_payload_breaks_is_a_permanent_refusal(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #2809 step 2: the same payload fails the same way on every attempt, so it must not
+    # be the retryable DeliveryError, nor escape as a bare ValueError to the internal-error arm.
+    ref = await _store_doc_with_a_cr(store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    with pytest.raises(NegativeAckError) as ei:
+        await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    assert ei.value.permanent is True
+    assert ei.value.code == "reattach"
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+async def test_a_reattach_the_payload_breaks_dead_letters_the_row(store: MessageStore) -> None:
+    ref = await _store_doc_with_a_cr(store)
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    # Under STOP the internal-error arm would halt the whole lane on this one message, which is how
+    # the pre-fix code handled it. A permanent refusal never reaches that arm.
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is not _ItemOutcome.STOPPED
+    assert retry_until is None  # not re-pended for a retry that could never succeed
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 1
 
 
 # --- batch path -----------------------------------------------------------------------------------
