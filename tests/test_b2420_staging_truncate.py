@@ -372,6 +372,108 @@ async def test_a_backup_that_will_not_fit_opens_no_staging_directory(tmp_path, m
     assert opened == []
 
 
+def _share_owner_for(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server-owner stand-in: everything made under ``data`` reports the share's owner, not the
+    process's, as on an SMB or NFS share whose server sets the owner."""
+    real_owner = dr_backup._owner_of
+
+    def owner(path: Path) -> object | None:
+        p = Path(path).absolute()
+        if p != data and p.is_relative_to(data):
+            return "share-owner"
+        return real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", owner)
+
+
+def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    opened: list[Path] = []
+    real_open = dr_backup._open_staging
+
+    def recording_open(root: Path, prefix: str, *, secure: bool):
+        opened.append(root)
+        return real_open(root, prefix, secure=secure)
+
+    monkeypatch.setattr(dr_backup, "_open_staging", recording_open)
+    return opened
+
+
+async def test_a_killed_runs_leftover_on_a_server_owner_share_is_freed_before_space_refuses(
+    tmp_path, monkeypatch
+) -> None:
+    """On a share whose server sets the owner, the early sweep, keyed on the process's owner, misses
+    a killed run's large leftover. Before this, the free-space check then refused with `space`, and
+    every later backup did too until someone deleted it by hand. The check now sweeps by the owner a
+    probe directory there gets, and the run proceeds."""
+    import shutil
+
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    dead = _abandoned(data, "mefor-backup-")
+    _share_owner_for(data, monkeypatch)
+
+    class _Usage:
+        def __init__(self, free: int) -> None:
+            self.free = free
+
+    # The leftover is what fills the volume: while it exists there is no room.
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage(1 if dead.exists() else 1 << 40))
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert not dead.exists()
+    assert not any(p.name.startswith("mefor-owner-probe-") for p in data.iterdir())
+
+
+async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
+    tmp_path, monkeypatch
+) -> None:
+    """The control: with the same stand-in, a volume that is short even once the leftover is swept
+    still refuses with `space`, opens no run directory, and leaves no probe behind."""
+    import shutil
+
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    dead = _abandoned(data, "mefor-backup-")
+    _share_owner_for(data, monkeypatch)
+
+    class _Usage:
+        free = 1
+
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage())
+    opened = _recording_open(monkeypatch)
+    try:
+        with pytest.raises(dr_backup.BackupError) as caught:
+            await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert opened == []
+    assert not dead.exists()  # swept by the probed owner before the refusal
+    assert not any(
+        p.name.startswith(("mefor-owner-probe-", "mefor-backup-")) for p in data.iterdir()
+    )
+
+
+async def test_a_leaked_owner_probe_is_swept_by_the_next_run(tmp_path, monkeypatch) -> None:
+    """A probe whose removal failed is an empty directory with no lock. The next sweep of its root
+    removes it, and leaves a probe-named directory that holds anything."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    leaked = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-", dir=data))
+    kept = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-", dir=data))
+    (kept / "keep.txt").write_bytes(b"synthetic")
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None
+    assert not leaked.exists()
+    assert (kept / "keep.txt").read_bytes() == b"synthetic"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="GetFinalPathNameByHandleW is Windows-only")
 def test_a_volume_without_final_paths_empties_nothing_and_says_so(
     tmp_path, monkeypatch, caplog

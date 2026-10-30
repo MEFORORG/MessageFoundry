@@ -538,8 +538,9 @@ class BackupRunner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
         # owner a new directory of this process gets, so a volume a killed run filled is freed before
-        # this run needs room for its own directory, and a run whose open fails still sweeps. Off the
-        # loop, like the rest.
+        # this run needs room for its own directory, and a run whose open fails still sweeps. Where
+        # the staging root gives a directory another owner, the space check below sweeps by that one
+        # too before it refuses. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
         early_owner = await asyncio.to_thread(_process_owner)
         if early_owner is not None:
@@ -551,9 +552,8 @@ class BackupRunner:
         await asyncio.to_thread(_sweep_os_temp, early_owner)
         # After those sweeps, which free what dead runs left, and before this run's directory is
         # opened or anything is written: a run that cannot fit fails here with kind `space`, naming
-        # the volume, not half-way through a multi-GB write. The sweep by this run's own directory's
-        # owner below, which runs only where that owner differs, has not run yet, so on such a share
-        # what a killed run left still counts as used here.
+        # the volume, not half-way through a multi-GB write.
+        swept_by: list[object] = [] if early_owner is None else [early_owner]
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
             staging_root,
@@ -561,6 +561,23 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
+        if shortfall is not None:
+            # On a share whose server sets the owner, or where the early read failed, the early sweep
+            # missed what this account's killed run left, and it would refuse every later run until
+            # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
+            # removed before this returns, sweep by it, and check once more. No run directory is open
+            # yet, so a refusal still leaves no lock or marker.
+            probed = await asyncio.to_thread(_probe_owner, staging_root)
+            if probed is not None and probed not in swept_by:
+                swept_by.append(probed)
+                if await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None):
+                    shortfall = await asyncio.to_thread(
+                        self._space_shortfall,
+                        staging_root,
+                        dest_dir,
+                        config_only=config_only,
+                        config_dir=config_dir,
+                    )
         if shortfall is not None:
             raise BackupError(
                 "space", f"not enough free space to stage this backup: it {shortfall}"
@@ -598,8 +615,8 @@ class BackupRunner:
         # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
         staging_leftover: str | None = None
         try:
-            # Swept again by this run's own directory's owner only where that differs, such as a
-            # share whose server sets the owner, or where the early read failed.
+            # Swept again by this run's own directory's owner only where no sweep above went by it,
+            # such as a share whose server sets the owner, or where the early read failed.
             own_owner = await asyncio.to_thread(_owner_of, work.path)
             if own_owner is None:
                 log.warning(
@@ -607,7 +624,7 @@ class BackupRunner:
                     work.path,
                     staging_root,
                 )
-            elif own_owner != early_owner:
+            elif own_owner not in swept_by:
                 await asyncio.to_thread(_sweep_owned, staging_root, own_owner, own=work.path)
             snap_path: Path | None = None
             if not config_only:
@@ -1763,8 +1780,9 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
 
 #: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
-#: ``ERROR_INVALID_FUNCTION`` and ``ERROR_NOT_SUPPORTED``.
-_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50})
+#: ``ERROR_INVALID_FUNCTION``, ``ERROR_NOT_SUPPORTED`` and ``ERROR_INVALID_PARAMETER``, the set
+#: ``transports/file.py`` treats as "this volume does not do that".
+_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50, 87})
 
 
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
@@ -2064,6 +2082,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
+#: The bare directory :func:`_probe_owner` makes to learn the owner a new directory gets. Never a
+#: staging directory; a leaked one is empty, and the sweep removes it by ``rmdir`` alone.
+_OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
 _SERVER_DB_STAGING_DIR = ".mefor-staging"
@@ -2435,8 +2456,21 @@ def _process_owner() -> object | None:
     from what a directory there gets, and the backup then sweeps by its own directory's owner too."""
     if sys.platform != "win32":
         return os.geteuid()
+    return _probe_owner(None)
+
+
+def _probe_owner(root: Path | None) -> object | None:
+    """The owner a directory this process makes under ``root`` gets, as :func:`_owner_of` reports
+    it, learned by making a bare ``mefor-owner-probe-*`` directory there and removing it. ``None``
+    for the OS temp dir; ``None`` returned when the probe cannot be made or its owner read, and
+    nothing is created when ``root`` does not exist.
+
+    The probe holds no file, no lock and no marker, so it is never a staging directory. One whose
+    removal fails is left empty, and the next sweep of that root removes it (:func:`_sweep_owned`).
+    A sibling shard's sweep can remove a probe before its owner is read here; that answers ``None``,
+    and the caller only skips a sweep."""
     try:
-        probe = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-"))
+        probe = Path(tempfile.mkdtemp(prefix=_OWNER_PROBE_PREFIX, dir=root))
     except OSError:
         return None
     try:
@@ -2507,7 +2541,8 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         log.warning("DR staging: could not list staging root %s: %s", root, safe_exc(exc))
         return 0
     for entry in entries:
-        if not entry.name.startswith(_SWEPT_PREFIXES):
+        probe = entry.name.startswith(_OWNER_PROBE_PREFIX)
+        if not probe and not entry.name.startswith(_SWEPT_PREFIXES):
             continue
         try:
             if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
@@ -2517,6 +2552,13 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         path = Path(entry.path)
         if path == own:
             continue  # this run's own directory, held live
+        if probe:
+            # A probe `_probe_owner` failed to remove. `rmdir` alone, which refuses a directory that
+            # holds anything and never follows a link, so nothing but an empty directory goes.
+            if _owner_of(path) == owner:
+                with contextlib.suppress(OSError):
+                    os.rmdir(path)
+            continue
         # No lock file is no proof either way. Checked before the owner, which on Windows costs a
         # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
         if not os.path.lexists(path / _LOCK_NAME):
@@ -2529,7 +2571,11 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             )
             continue
         try:
-            fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW)
+            # `_O_NONBLOCK` as the re-mark has it: a FIFO planted at the lock must not hold the sweep.
+            fd = os.open(
+                path / _LOCK_NAME,
+                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
+            )
         except FileNotFoundError:
             continue  # no lock file: no proof either way
         except OSError as exc:
