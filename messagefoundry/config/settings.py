@@ -672,9 +672,8 @@ def _check_revocation_attestation_pair(
 
     The rules :func:`_check_vault_revocation_attestation` gives, for any section's pair: the three
     flag-plus-reason rules, and no control character or lone surrogate in the reason, which is
-    printed in the loosening report. Every settings-scoped pair goes through it: the Vault pairs,
-    the ``[alerts]`` SMTP login and webhook pairs, and ``[ai].endpoint_revocation_attested``
-    (BACKLOG #2193)."""
+    printed in the loosening report. At least the Vault pairs, the ``[alerts]`` SMTP login and
+    webhook pairs, and ``[ai].endpoint_revocation_attested`` go through it (BACKLOG #2193)."""
     _check_flag_with_reason(
         flag,
         reason,

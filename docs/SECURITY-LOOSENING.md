@@ -1519,10 +1519,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `enforce`. A short-lived endpoint certificate is the main honest basis; put its lifetime in the
   reason. A gateway on this machine that checks the upstream's revocation itself needs no
   attestation at all: a loopback endpoint is not refused.
-- **What it cannot do:** it never lifts the broker's other refusals: an `http` endpoint, an
-  endpoint missing from `[ai].allowed_endpoints`, or credentials in the URL. The process-wide
-  `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
-  posture (BACKLOG #299). On a `warn` instance it turns the warning into a silent crossing.
+- **What it cannot do:** it lifts only the revocation refusal. The broker's other refusals stand,
+  at least an `http` endpoint, an endpoint missing from `[ai].allowed_endpoints`, and credentials
+  in the URL. The process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under
+  an enforcing or unknown posture (BACKLOG #299). On a `warn` instance it turns the warning into a
+  silent crossing.
 - **How it is reported:** at least four ways. `security_loosenings()` names it as
   `ai.endpoint_revocation_attested`, with the reason, so `messagefoundry security show` and
   `GET /security/posture` list it. The serve-time loosening WARNING prints that entry, reason
