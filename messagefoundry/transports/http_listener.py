@@ -852,14 +852,17 @@ class HttpSource(SourceConnector):
     def _client_task_done(self, task: asyncio.Task[None], writer: asyncio.StreamWriter) -> None:
         """Drop a finished TLS client task, and close its socket if the task was cancelled or
         failed: asyncio does that for a coroutine accept callback, and `_on_tls_accept` is not one.
-        A task cancelled before its first step never ran its own ``finally``."""
+        A task cancelled before its first step never ran its own ``finally``, so its writer is
+        dropped from ``_clients`` here too."""
         self._client_tasks.discard(task)
         if task.cancelled():
+            self._clients.discard(writer)
             writer.close()
             return
         exc = task.exception()
         if exc is not None:
             logger.error("HTTP client connection task failed: %s", safe_exc(exc))
+            self._clients.discard(writer)
             writer.close()
 
     async def _start_tls(
@@ -1180,6 +1183,9 @@ class HttpSource(SourceConnector):
         # True from the start of a TLS handshake this listener runs until it succeeds; see
         # `MLLPSource._on_client` for why `wait_closed()` is skipped then (BACKLOG #1606).
         handshaking = False
+        # False while a socket this listener upgrades is still plain TCP. Nothing is written to it
+        # then: a TLS client cannot read a plaintext answer (BACKLOG #2479).
+        answerable = not self._upgrade_tls
         try:
             # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
             # for every socket listener (transports/admission.py). Refused before a request byte,
@@ -1189,10 +1195,9 @@ class HttpSource(SourceConnector):
                 if refusal.kind is None:
                     return  # the listener is stopping: close unread, with no answer
                 await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
-                # A socket still awaiting its upgrade gets no answer: a TLS client cannot read a
-                # plaintext one, and a handshake run only to refuse would be the work the
-                # pre-handshake refusal exists to save.
-                if not self._upgrade_tls:
+                # A socket still awaiting its upgrade gets no answer (see `answerable`), and a
+                # handshake run only to refuse would be the work the pre-handshake refusal saves.
+                if answerable:
                     status, body = (
                         (403, '{"error":"forbidden"}')
                         if refusal.kind == "peer_not_allowlisted"
@@ -1209,6 +1214,7 @@ class HttpSource(SourceConnector):
                 if not await self._start_tls(reader, writer, peer_host):
                     return  # never a session: no `established`, so no `closed` either
                 handshaking = False
+                answerable = True
                 if self._admission.stopping:
                     return  # the handshake finished after stop() began: refuse it unread
             # mTLS intake auth needs no request bytes at all, so it refuses here, before any read.
@@ -1243,7 +1249,7 @@ class HttpSource(SourceConnector):
             failed = True
             logger.error("HTTP connection failed unexpectedly: %s", safe_exc(exc))
             await self._emit_event("framing_error", peer_host=peer_host, reason=safe_exc(exc))
-            if not handshaking:  # mid-handshake there is no session to answer in
+            if answerable:
                 await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
             if epoch is not None:

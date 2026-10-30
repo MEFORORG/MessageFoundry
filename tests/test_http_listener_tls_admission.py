@@ -24,7 +24,7 @@ import pytest
 
 from messagefoundry.transports import http_listener as http_module
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
-from tests.test_tls_handshake_failures import _client_hello, _pinned_client
+from tests.test_tls_handshake_failures import _client_hello, _pinned_client, _plaintext_peer
 from tests.test_tls_handshake_failures import _http_tls_source as _tls_source
 
 
@@ -240,6 +240,28 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
         assert "established" not in events.kinds()
     finally:
         source._admission.stopping = False
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_path: Path) -> None:
+    """``loop.start_tls`` builds its TLS object from the listener's own context, so a context an
+    earlier loop-run start() hooked would count each failure a second time. start() unhooks it on
+    the listener-run path, and ``_start_tls`` alone counts, with the peer."""
+    source, _cert_path = _tls_source(tmp_path)
+    assert source._ssl is not None
+    source._tls_failures.watch(source._ssl)  # as a loop-run start() left it
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_Intake())
+    try:
+        assert source._ssl.sslobject_class is ssl.SSLObject
+        await _plaintext_peer(source.sockport)
+        await _until(lambda: source.tls_handshake_failures >= 1, "the failure was not counted")
+        await asyncio.sleep(0.1)  # room for a second count, which must not come
+        assert source.tls_handshake_failures == 1
+        (_kind, peer, _reason) = events.seen[0]
+        assert peer == "127.0.0.1"
+    finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
