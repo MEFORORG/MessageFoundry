@@ -1378,9 +1378,10 @@ one `Http()` listener would have let any of them speak for any listed partner.
   which is empty on a resumed session. The match itself is `client_cert_principal_under_issuer`, the
   API's matcher.
 - **Only a loaded CA counts.** A leaf signed by an intermediate the client sends is refused, even when a
-  key names that intermediate's DN, because any loaded CA could mint an intermediate with another CA's
-  name. An operator whose partners use an intermediate loads it into `tls_ca_file`, beside the root
-  that signed it, and keys by the intermediate's DN.
+  key names that intermediate's DN, unless that intermediate is itself loaded in `tls_ca_file`. Any
+  loaded CA could mint an intermediate with another CA's name, so only the copy the operator loaded is
+  trusted as an issuer. An operator whose partners use an intermediate loads it into `tls_ca_file`,
+  beside the root that signed it, and keys by the intermediate's DN.
 - **A key rollover under one DN denies both CAs, as on the API.** Two loaded CAs with one subject and
   different keys name no issuer, so a partner CA re-keyed under its old name is refused until one of
   the two leaves `tls_ca_file`. The start warning names the key. This keeps the API's rule rather than

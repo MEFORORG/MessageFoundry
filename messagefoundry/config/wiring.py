@@ -2857,9 +2857,10 @@ def Http(
     ``intake_client_subjects`` is keyed by the DN of the CA that issues each partner's certificate,
     as ``rfc4514_string()`` renders that CA's subject, and each key names that CA's subjects:
     ``{"CN=Acme CA,O=Acme": ["CN:partner.example"]}``. A subject counts only when the loaded CA under
-    its key signed the leaf, so another CA in ``tls_ca_file`` issuing the same subject is refused
-    ``403`` (vault BACKLOG #2287). Only a CA loaded from ``tls_ca_file`` counts as an issuer: a leaf
-    signed by an intermediate the client sends is refused, so load that intermediate and name it.
+    its key signed the leaf, so a listed subject from a CA it is not listed under is refused ``403``
+    (vault BACKLOG #2287). Only a CA loaded from ``tls_ca_file`` counts as an issuer: a leaf signed by
+    an intermediate the client sends is refused unless that intermediate is itself loaded there, so
+    load it beside its root and name it.
 
     **TLS is confidentiality; intake auth is authentication.** Enabling one is never an argument for
     relaxing the other. In particular a bare ``tls`` + ``tls_ca_file`` means "any certificate this CA ever
@@ -3206,8 +3207,10 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
     if value is None:
         return None
     setting = "Http intake_client_subjects"
-    # An EnvRef only: a raw marker never reaches here whole, because the connections.toml loader
-    # decodes a top-level one, and a table merely keyed "env" is an issuer key to refuse below.
+    # An EnvRef only. In connections.toml, parse_env_setting has already turned any top-level table
+    # whose keys fit {env, default, cast} into an EnvRef (refused here) or refused it itself, so no
+    # raw marker arrives from a file. A code-first dict keyed "env" is not decoded; it reaches the
+    # issuer-key check below and is refused there as a key that is not a DN.
     if isinstance(value, EnvRef):
         raise WiringError(
             f"{setting} may not be an env() reference - it is a table of issuer DN to subject "

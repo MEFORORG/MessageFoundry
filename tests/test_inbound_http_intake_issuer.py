@@ -28,7 +28,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError, env
-from messagefoundry.transports.http_listener import HttpSource
+from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
 from tests.test_api_tls import _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
 
 SUBJECT = "CN:partner.example"
@@ -179,6 +179,128 @@ def test_an_issuer_key_naming_no_loaded_ca_is_warned_about(
     warned = [r.getMessage() for r in caplog.records]
     assert any("'CN=Missing CA'" in m and "names no CA" in m for m in warned), warned
     assert not any("'CN=Acme CA'" in m for m in warned), warned
+
+
+class _Ledger:
+    """Stands in for the runner's rate limiter and audit sink, recording what each one is given."""
+
+    def __init__(self) -> None:
+        self.charges: list[str] = []
+        self.audits: list[str] = []
+
+    def check(self, peer: str) -> bool:
+        return True
+
+    def charge_failure(self, peer: str) -> None:
+        self.charges.append(peer)
+
+    def note_success(self, peer: str) -> None:
+        pass
+
+    async def audit(self, action: str, _peer: str | None, _detail: str | None) -> None:
+        self.audits.append(action)
+
+
+async def test_an_issuer_that_cannot_be_established_is_a_charged_audited_403(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Whatever stops the issuer being found must deny through the intake-auth path: a 403 that is
+    charged to the failed-attempt budget and audited, not an unexpected-error answer that is
+    neither."""
+    named = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    source = _source(tmp_path, [named[0]], {"CN=Acme CA": [SUBJECT]})
+    ledger = _Ledger()
+    source.intake_rate_limiter = ledger
+    source.on_intake_audit = ledger.audit
+    index = source._issuer_index
+    assert index is not None
+
+    def broken(_leaf_der: bytes) -> str:
+        raise RuntimeError("an error the lookup does not anticipate")
+
+    await _started(source)
+    try:
+        # Control first: the same certificate is admitted while the lookup works.
+        assert await _admitted(source, _bundle(tmp_path, named)) == 202
+        index.issuer_of = broken  # type: ignore[method-assign,assignment]
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+            assert await _refused(source, _bundle(tmp_path, named)) == 403
+    finally:
+        await source.stop()
+    assert len(ledger.charges) == 1, ledger.charges
+    assert ledger.audits == ["intake.auth_subject_denied"]
+    assert any("could not establish" in r.getMessage() for r in caplog.records)
+
+
+async def test_two_loaded_cas_with_one_name_and_different_keys_admit_neither(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partner CA re-keyed under its old DN: the key names a name, so the two cannot be told apart,
+    and neither CA's certificates are admitted (as on the API). The start warning names the key."""
+    first = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    second = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    for name in ("both", "one"):
+        (tmp_path / name).mkdir()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        source = _source(tmp_path / "both", [first[0], second[0]], {"CN=Acme CA": [SUBJECT]})
+    assert any("'CN=Acme CA'" in r.getMessage() for r in caplog.records)
+    await _started(source)
+    try:
+        assert await _refused(source, _bundle(tmp_path, first)) == 403
+    finally:
+        await source.stop()
+    # Control: with only one of the two loaded, the same certificate is admitted.
+    source = await _started(_source(tmp_path / "one", [first[0]], {"CN=Acme CA": [SUBJECT]}))
+    try:
+        assert await _admitted(source, _bundle(tmp_path, first)) == 202
+    finally:
+        await source.stop()
+
+
+def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses is what this
+    warns about, and a trust store the listener's context loads cannot be made to hold one here, so
+    the builder is handed the text directly."""
+    good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    junk = b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n"
+    cadata = (_pem(good[0]) + junk).decode("ascii")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        index = _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
+    assert index is not None and index.unreadable == 1
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("1 certificate(s) in tls_ca_file could not be parsed" in m for m in warned), warned
+    # Control: the same store without the junk block warns about nothing.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        _client_issuer_index("IB_PARTNER", _pem(good[0]).decode("ascii"), {"CN=Acme CA": [SUBJECT]})
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "subjects",
+    [
+        pytest.param([SUBJECT], id="flat-list"),
+        pytest.param({"CN=Acme CA": SUBJECT}, id="issuer-names-a-string"),
+    ],
+)
+def test_a_directly_built_source_refuses_a_table_that_is_not_one(subjects: Any) -> None:
+    """A ``Source`` built without the ``Http()`` factory still fails at construction on the retired
+    flat list, or on an issuer naming a string, which would otherwise be read character by
+    character and deny the partner with nothing in the log."""
+    with pytest.raises(ValueError, match="must be a table keyed by the issuing CA's DN"):
+        HttpSource(
+            Source(
+                type=ConnectorType.HTTP,
+                settings={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "intake_auth": "mtls_subject",
+                    "intake_client_subjects": subjects,
+                },
+            )
+        )
 
 
 def test_only_mtls_subject_builds_an_issuer_index(tmp_path: Path) -> None:
