@@ -1665,7 +1665,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
-| `port` | `1433` | server port |
+| `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
 | `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on the **SQL Server preset only**, where it reaches ODBC Driver 18 as pyodbc's `timeout=` (the driver ignores a DSN keyword for it). `generic` gets no login timeout from the engine and uses its driver's default |
@@ -1716,8 +1716,9 @@ outbound(
 `dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
-`odbc_driver`. The parameterized-`:name` binding, error classification, pooling and `[egress].allowed_db`
-gate are identical to the SQL Server preset.
+`odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
+the SQL Server preset. The `[egress].allowed_db` gate checks the same host, but reads the port
+differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1727,6 +1728,48 @@ gate are identical to the SQL Server preset.
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
 The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+
+##### The port an `allowed_db` entry binds
+
+An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
+`server` text, in any case, and a host no entry names is refused. An entry with a port admits only
+the port the connection string sends, compared as a number (`db:05432` names port 5432). The two
+dialects send it differently (vault BACKLOG #2704):
+
+| Dialect | Port the entry is compared with |
+|---|---|
+| `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
+| `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
+
+**The check compares the port the connection string sends, not the port the driver opens.** A
+driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
+to its own default port, and the check cannot see that. Check that your driver reads the keyword.
+
+An entry with no port admits its host at any port. On the generic dialect the egress check
+**refuses** at least these cases for a listed host, at load like every other miss:
+
+- `server` holds a comma anywhere: `db,6432`, `[db],6432`, `db,` or `db,replica`, whatever the
+  entry says. psqlODBC passes `SERVER` to libpq as a host, and libpq reads a comma there as a list
+  of hosts. Name one host in `server` and put the port in `PORT`.
+- `PORT` is given more than once, in any case, or with a leading zero (`05432`), which a driver
+  could read as octal. A pin in an entry may keep a leading zero: the engine alone reads it.
+- No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
+  from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
+- The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
+  The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
+  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
+  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
+  host-only entry still admits any driver.
+
+The check reads the driver **name** as written, an odbcinst alias or a library path included, and
+cannot see which library that name loads. A name that misdescribes its driver, such as a path
+holding `mysql` to a library that ignores `PORT`, is outside what the check can catch.
+
+A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
+so no entry can name it, and it is refused as unlisted.
+
+`db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
+port compared.
 
 ##### Accepted `odbc_params` keywords
 

@@ -25,6 +25,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.proxy_address import ProxyAddress, parse_proxy_url
 from messagefoundry.transports.rest import (
@@ -97,18 +98,10 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
                 "[egress].allowed_remote is empty — list the REMOTEFILE host to permit it"
             )
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
-        host = str(source.settings.get("server", ""))
-        port = source.settings.get("port", 1433)
-        if not host_port_allowed(host, port, egress.allowed_db):  # same host[:port] matching
-            log.warning(
-                "connect denied: inbound %r DATABASE server %r not in [egress].allowed_db",
-                name,
-                host,
-            )
-            raise WiringError(
-                f"inbound {name!r}: DATABASE server {host!r} is not in the "
-                "[egress].allowed_db allowlist"
-            )
+        refusal = _database_refusal(source.settings, egress.allowed_db)
+        if refusal is not None:
+            log.warning("connect denied: inbound %r DATABASE %s", name, refusal)
+            raise WiringError(f"inbound {name!r}: DATABASE {refusal}")
     elif source.type is ConnectorType.REMOTEFILE and egress.allowed_remote:
         host = str(source.settings.get("host", ""))
         port = source.settings.get("port")
@@ -143,15 +136,12 @@ def check_lookup_allowed(
             "[egress].allowed_db is empty — list the server to permit it"
         )
     if egress.allowed_db:
-        host = str(settings.get("server", ""))
-        port = settings.get("port", 1433)
-        if not host_port_allowed(host, port, egress.allowed_db):  # same host[:port] matching
-            log.warning(
-                "connect denied: %s %r server %r not in [egress].allowed_db", label, name, host
-            )
-            raise WiringError(
-                f"{label} {name!r}: server {host!r} is not in the [egress].allowed_db allowlist"
-            )
+        # Both callers build the SQL Server preset whatever `settings` say (neither DatabaseLookup
+        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting.
+        refusal = _database_refusal(settings, egress.allowed_db, dialect="sqlserver")
+        if refusal is not None:
+            log.warning("connect denied: %s %r %s", label, name, refusal)
+            raise WiringError(f"{label} {name!r}: {refusal}")
 
 
 # Every settings key naming a SECOND egress host that the HTTP family POSTs **credentials** to — a
@@ -537,18 +527,10 @@ def check_egress_allowed(
             f"outbound {dest.name!r}", dest.settings, egress.allowed_http
         )
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:
-        host = str(dest.settings.get("server", ""))
-        port = dest.settings.get("port", 1433)
-        if not host_port_allowed(host, port, egress.allowed_db):  # same host[:port] matching
-            log.warning(
-                "egress denied: outbound %r DATABASE server %r not in [egress].allowed_db",
-                dest.name,
-                host,
-            )
-            raise WiringError(
-                f"outbound {dest.name!r}: DATABASE server {host!r} is not in the "
-                "[egress].allowed_db allowlist"
-            )
+        refusal = _database_refusal(dest.settings, egress.allowed_db)
+        if refusal is not None:
+            log.warning("egress denied: outbound %r DATABASE %s", dest.name, refusal)
+            raise WiringError(f"outbound {dest.name!r}: DATABASE {refusal}")
     elif dest.type is ConnectorType.REMOTEFILE and egress.allowed_remote:
         host = str(dest.settings.get("host", ""))
         port = dest.settings.get("port")
@@ -702,14 +684,62 @@ def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str 
 
 
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
+    return any(
+        not allow_port or str(port) == allow_port.strip()
+        for allow_port in _allowed_ports_for(host, allowed)
+    )
+
+
+def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
+    """The port text of each ``host`` / ``host:port`` entry whose host is ``host``, in any case:
+    ``""`` for an entry that names no port. The parse :func:`host_port_allowed` and the DATABASE
+    check share; at least ``transports.ai_broker.endpoint_host_allowed`` keeps its own copy."""
     host = host.lower()
-    for entry in allowed:
-        allow_host, _, allow_port = entry.partition(":")
-        if allow_host.strip().lower() == host and (
-            not allow_port or str(port) == allow_port.strip()
-        ):
-            return True
-    return False
+    return [
+        allow_port
+        for allow_host, _, allow_port in (entry.partition(":") for entry in allowed)
+        if allow_host.strip().lower() == host
+    ]
+
+
+def _database_refusal(
+    settings: Mapping[str, Any], allowed: list[str], *, dialect: str | None = None
+) -> str | None:
+    """Why ``[egress].allowed_db`` refuses the hop a DATABASE connection's ``settings`` name, or
+    ``None`` when it admits it. The outbound connection, the inbound poll and both lookups share
+    this rule (vault BACKLOG #2704).
+
+    ``dialect`` is the one the caller builds its connection string with, and defaults to the
+    ``dialect`` setting. The host and port are read by
+    :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
+    dialect's connection string sends. A host no entry names is refused as unlisted, before its
+    port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
+    the entries for that host say. An entry that pins a port admits only that port, compared as a
+    number on both sides. A connection whose port the engine cannot read matches an entry that
+    names no port, and never one that pins one."""
+    if dialect is None:
+        dialect = str(settings.get("dialect", "sqlserver"))
+    endpoint = database_dial_endpoint(settings, dialect=dialect)
+    host, port = endpoint.host, endpoint.port
+    pins = _allowed_ports_for(host, allowed)
+    if not pins:
+        return f"server {host!r} is not in the [egress].allowed_db allowlist"
+    if endpoint.conflict is not None:
+        return endpoint.conflict
+    # As host_port_allowed matches, except that an unknown port matches only an entry naming none,
+    # and a pin is read as a number, as the connection's port is: `db:05432` names port 5432.
+    if any(not pin or (port is not None and port_or_zero(pin) == port) for pin in pins):
+        return None
+    if port is None:
+        # The remedy first: a stored failure keeps about its first 200 characters.
+        return (
+            f"server {host!r}: {endpoint.remedy}. [egress].allowed_db pins a port, and this "
+            "connection names no port the engine can read"
+        )
+    return (
+        f"server {host!r} at port {port}, the port this connection names, is not in the "
+        "[egress].allowed_db allowlist"
+    )
 
 
 def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
