@@ -111,6 +111,7 @@ from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
     REFUSAL_LOG_WINDOW_SECONDS,
     RefusalLog,
+    notify_refusal,
 )
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -639,8 +640,10 @@ class DicomScpSource(SourceConnector):
         self._refusal_log = RefusalLog(
             window_seconds=_REFUSAL_LOG_WINDOW_SECONDS, max_per_window=_REFUSAL_LOG_MAX_PER_WINDOW
         )
+        #: The inbound's name, for the refusal observers (vault BACKLOG #2613).
+        self._refusal_name = config.name or ""
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
-        self._ssl = _server_ssl_context(s, name=config.name or "")
+        self._ssl = _server_ssl_context(s, name=self._refusal_name)
         # Failed inbound TLS handshakes and their throttled WARNING (vault BACKLOG #3784). Before,
         # a failed one left no record above DEBUG. A log line rather than a connection event: this
         # SCP emits none, and #3784 adds no event kind. Driven on the loop only; the connection
@@ -876,7 +879,10 @@ class DicomScpSource(SourceConnector):
         peer never holds a connection, so it has no episode to end. The window throttle is
         :class:`~messagefoundry.transports.admission.RefusalLog`, which the socket listeners use for
         their allowlist refusals too (vault BACKLOG #2606).
+
+        Every refusal, logged or not, also reaches :func:`notify_refusal` (vault BACKLOG #2613).
         """
+        notify_refusal(self._refusal_name)
         total = self._refusal_log.note(peer_ip)
         if total is None:
             return

@@ -289,7 +289,11 @@ async def test_the_frame_deadline_also_closes_a_peer_trickling_outside_any_frame
 
 def test_a_late_stop_does_not_wipe_a_restarted_listeners_counts() -> None:
     gate = ListenerAdmission(
-        transport="TCP", max_connections=None, max_connections_per_host=2, source_ip_allowlist=None
+        transport="TCP",
+        name="IB_TEST",
+        max_connections=None,
+        max_connections_per_host=2,
+        source_ip_allowlist=None,
     )
     gate.stopping = False  # restarted
     gate.admit("192.0.2.7")
@@ -612,7 +616,11 @@ class _PeerWriter:
 
 def test_admission_refuses_while_stopping_and_releases_what_it_admits() -> None:
     gate = ListenerAdmission(
-        transport="TCP", max_connections=2, max_connections_per_host=1, source_ip_allowlist=None
+        transport="TCP",
+        name="IB_TEST",
+        max_connections=2,
+        max_connections_per_host=1,
+        source_ip_allowlist=None,
     )
     w: Any = _PeerWriter()
     assert gate.check(w, "192.0.2.7") is None
@@ -634,7 +642,11 @@ def test_a_release_from_before_a_restart_leaves_the_restarted_count_alone() -> N
     host = "192.0.2.7"
     w: Any = _PeerWriter()
     gate = ListenerAdmission(
-        transport="TCP", max_connections=10, max_connections_per_host=2, source_ip_allowlist=None
+        transport="TCP",
+        name="IB_TEST",
+        max_connections=10,
+        max_connections_per_host=2,
+        source_ip_allowlist=None,
     )
     straggler = gate.admit(host)
     gate.stopping = True  # stop() begins; the straggler's task outlives it
@@ -666,7 +678,11 @@ def test_a_release_still_counts_when_a_late_stop_skipped_the_reset() -> None:
     release must give that slot back, or the host would stay one short of its cap for good."""
     host = "192.0.2.7"
     gate = ListenerAdmission(
-        transport="TCP", max_connections=None, max_connections_per_host=2, source_ip_allowlist=None
+        transport="TCP",
+        name="IB_TEST",
+        max_connections=None,
+        max_connections_per_host=2,
+        source_ip_allowlist=None,
     )
     earlier = gate.admit(host)
     gate.stopping = True
