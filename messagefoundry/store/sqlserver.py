@@ -197,6 +197,7 @@ from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -7915,14 +7916,18 @@ class SqlServerStore:
                 work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
                 origin_id = work_row["message_id"]
 
-                async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                async def _consume_dead(
+                    label: str, error: str, event_detail: str, *, erased: bool = False
+                ) -> bool:
                     # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
-                    # and CONSUME it (status flipped), never re-loop.
+                    # and CONSUME it (status flipped), never re-loop. `erased` blanks the token too,
+                    # so `_REPLAYABLE_BODY` refuses it from then on.
+                    blank = ", payload=''" if erased else ""
                     await self._exec_terminal(
                         cur,
                         label,
                         (response_row_id,),
-                        "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                        f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
                         + output
                         + " WHERE id=?"
                         + guard,
@@ -7963,11 +7968,21 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
+                # Retention erased the reply (BACKLOG #1560; the SQLite twin says how a token reaches
+                # here). `#eligible` is materialized once, so a replay can commit between that read
+                # and the artifact's erasure. It must never become a child message.
+                if art is None or art[0] is None:
+                    return await _consume_dead(
+                        "ingress_handoff(erased)",
+                        REINGRESS_ARTIFACT_ERASED,
+                        "re-ingress reply erased",
+                        erased=True,
+                    )
                 body = (
                     self._cipher.decrypt(
                         art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
                     )
-                    if (art and art[0])
+                    if art[0]
                     else ""
                 ) or ""
                 # (4) Correlation lineage from the origin's metadata (parse once).
@@ -8942,6 +8957,14 @@ class SqlServerStore:
                     " WHERE stage=? AND status IN (?, ?) AND payload <> ''"
                     " AND message_id IN (SELECT id FROM #eligible)",
                     (Stage.OUTBOUND.value, OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value),
+                )
+                # A dead RESPONSE work-row's reference goes with the artifact erased below, so
+                # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                await cur.execute(
+                    "UPDATE queue SET payload=''"
+                    " WHERE stage=? AND status=? AND payload <> ''"
+                    " AND message_id IN (SELECT id FROM #eligible)",
+                    (Stage.RESPONSE.value, OutboxStatus.DEAD.value),
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
                 # message holds — but ONLY once the message has NO queue row that could still be

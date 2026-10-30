@@ -867,8 +867,10 @@ per tier which of those its code provides, and an operator carries the rest
   + `require_phi_read` (the second since vault BACKLOG #1187), audited `outbound.read` — not by
   `GET /messages/{id}/raw`.
 - **Retention / destruction.** `messages.raw` is blanked in place by `purge_message_bodies`;
-  `queue.payload` is blanked for done/cancelled outbound rows in the same transaction, and for dead rows
-  at **every** stage by `purge_dead_letters`; `response.body` is set to `NULL` in place by the same pass;
+  `queue.payload` is blanked for done/cancelled outbound rows in the same transaction, for a dead
+  `response` work-row, whose payload is a reference to the reply this pass erases (vault BACKLOG
+  #1560), and for dead rows at **every** stage by `purge_dead_letters`; `response.body` is set to
+  `NULL` in place by the same pass;
   `shared_body.body` is refcount-decremented and GC'd at 0 when its **last** referrer is purged;
   streaming attachments are decref'd + GC'd at 0 (plus a startup `sweep_orphan_attachments`).
   The legacy SQL Server `outbox.payload` no longer exists to be purged — its rows were folded into

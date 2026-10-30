@@ -937,7 +937,10 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #: three facts make that an exact discriminator rather than a heuristic:
 #:
 #: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
-#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
+#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins), and that includes a dead
+#:    ``Stage.RESPONSE`` work-row, whose payload is a reference and not a body: the purge that erases
+#:    the ``response`` artifact blanks the reference with it. A SQL join could not decide that row,
+#:    because the artifact's destination and sequence exist only inside the sealed reference;
 #: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
 #:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
 #: 3. a store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the
@@ -949,7 +952,15 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
 #: frame and the finalizer would record it as a successful send. :meth:`QueueStore.list_replay_targets`
 #: reads with it too, so the console draws no replay button for such a row (BACKLOG #1743).
+#:
+#: The predicate reads the row, so it cannot see an artifact erased after the row was re-pended. That
+#: race is closed in ``ingress_handoff`` on each backend, which dead-letters a token whose artifact
+#: is gone (:data:`REINGRESS_ARTIFACT_ERASED`).
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
+#: #1560). The server backends import it for their own ``ingress_handoff``.
+REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
@@ -12572,11 +12583,13 @@ class MessageStore:
                 return False
             origin_id = wr["message_id"]
 
-            async def _consume_dead(error: str, event_detail: str) -> bool:
+            async def _consume_dead(error: str, event_detail: str, *, erased: bool = False) -> bool:
                 # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction and
                 # CONSUME it (return True) — never re-loop forever on a row that can't be used.
+                # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                blank = ", payload=''" if erased else ""
                 await self._db.execute(
-                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                    f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
@@ -12603,23 +12616,26 @@ class MessageStore:
                     "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
                 )
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
-            #    only if retention purged it — but an outstanding work-row makes the message
-            #    purge-ineligible (Q8), so this is defensive: treat as empty, still consume.
+            #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
+            #    message purge-ineligible, but a DEAD one does not, and a replay can race the purge.
+            #    An erased reply must never become a child message, so dead-letter the token.
             cur = await self._db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
                 (origin_msg_id, dest, seq),
             )
             art = await cur.fetchone()
+            if art is None or art["body"] is None:
+                return await _consume_dead(
+                    REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
+                )
             body = (
                 self._dec(
                     art["body"],
                     aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                 )
-                if (art and art["body"] is not None)
-                else ""
+                or ""
             )
-            body = body or ""
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -17781,6 +17797,11 @@ class MessageStore:
         replay re-queues a row's *own* payload, never ``messages.raw``, nulling the message body here
         can't break a later dead-row replay.
 
+        The one exception is a dead ``Stage.RESPONSE`` work-row (BACKLOG #1560). Its payload is a
+        reference to a ``response`` artifact this purge erases, so it is not the row's own body. The
+        reference is blanked here with the artifact, and the row keeps its ``dead`` status and
+        ``last_error`` for :meth:`purge_dead_letters`.
+
         ``metadata`` (#150 SetMeta / operator-attached values, PHI per PHI.md §2) rides this same
         window (ASVS 14.2.7): it is blanked in the SAME statement as the body, so it can never outlive
         it. The guard is therefore ``raw <> '' OR metadata IS NOT NULL`` — a message purged by a
@@ -17856,6 +17877,15 @@ class MessageStore:
                     *cutoff_params,
                     *inflight,
                 ),
+            )
+            # A dead RESPONSE work-row's payload is a reference to a `response` artifact, not a body, and
+            # the artifact is erased below. Blank the reference with it, so `_REPLAYABLE_BODY` refuses
+            # the row and no replay can re-ingress an erased reply (BACKLOG #1560). Exact, because the
+            # reference names an artifact of this same message and this purge erases all of them.
+            await self._db.execute(
+                "UPDATE queue SET payload='' WHERE stage=? AND status=? AND payload <> '' "
+                f"AND message_id IN ({eligible})",
+                (Stage.RESPONSE.value, OutboxStatus.DEAD.value, *cutoff_params, *inflight),
             )
             # #149 Phase 3a: release the streaming attachment each eligible message holds — but ONLY
             # once the message has NO queue row that could still be delivered/replayed (the negated

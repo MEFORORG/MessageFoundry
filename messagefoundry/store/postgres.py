@@ -202,6 +202,7 @@ from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -5388,16 +5389,20 @@ class PostgresStore:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
 
-                    async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                    async def _consume_dead(
+                        label: str, error: str, event_detail: str, *, erased: bool = False
+                    ) -> bool:
                         # An unrecoverable token: dead-letter it + ERROR the origin in THIS
                         # transaction and CONSUME it (return True ⇒ the conn.transaction() commits)
                         # — never re-loop (NOT the _Noop rollback, which would leave the token live).
+                        # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                        blank = ", payload=''" if erased else ""
                         await self._exec_terminal(
                             conn,
                             label,
                             (response_row_id,),
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
-                            " updated_at=$4 WHERE id=$5" + guard,
+                            f" updated_at=$4{blank} WHERE id=$5" + guard,
                             OutboxStatus.DEAD.value,
                             self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
                             now,
@@ -5429,15 +5434,22 @@ class PostgresStore:
                         dest,
                         seq,
                     )
+                    # Retention erased the reply (BACKLOG #1560; the SQLite twin says how a token
+                    # reaches here). It must never become a child message.
+                    if art is None or art["body"] is None:
+                        return await _consume_dead(
+                            "ingress_handoff(erased)",
+                            REINGRESS_ARTIFACT_ERASED,
+                            "re-ingress reply erased",
+                            erased=True,
+                        )
                     body = (
                         self._dec(
                             art["body"],
                             aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                         )
-                        if (art and art["body"] is not None)
-                        else ""
+                        or ""
                     )
-                    body = body or ""
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
@@ -10532,6 +10544,16 @@ class PostgresStore:
                     *lead,
                     Stage.OUTBOUND.value,
                     [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value],
+                )
+                # A dead RESPONSE work-row's reference goes with the artifact erased below, so
+                # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                await conn.execute(
+                    f"UPDATE queue SET payload=''"
+                    f" WHERE stage=${nxt} AND status=${nxt + 1} AND payload <> ''"
+                    f" AND message_id IN ({eligible})",
+                    *lead,
+                    Stage.RESPONSE.value,
+                    OutboxStatus.DEAD.value,
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
                 # message holds — but ONLY once it has NO queue row that could still be delivered/replayed
