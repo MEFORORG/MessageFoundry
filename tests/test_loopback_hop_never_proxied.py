@@ -33,7 +33,13 @@ import pytest
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    active_hop_posture,
+    hop_url_host,
+    is_loopback_hop_host,
+)
 from messagefoundry.config.wiring import Rest
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.transports import build_destination, rest
@@ -62,7 +68,8 @@ _LOOPBACK_URLS = (
     "https://[::1]/x",
 )
 
-#: Hosts the guard does not accept. Three of them only look like loopback.
+#: Hosts the guard does not accept. Three of them only look like loopback. The last four spell a
+#: loopback host in a form the predicate does not normalise (vault BACKLOG #2706).
 _OFF_BOX_URLS = (
     "http://partner.invalid/x",
     "https://partner.invalid/x",
@@ -71,6 +78,10 @@ _OFF_BOX_URLS = (
     "http://127.partner.invalid/x",
     "http://10.0.0.5/x",
     "http://[2001:db8::1]:18080/x",
+    "http://localhost./x",
+    "http://LOCALHOST./x",
+    "http://127.0.0.1./x",
+    "http://%6cocalhost/x",
 )
 
 
@@ -404,3 +415,60 @@ def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target()
         "OB", settings, None, targets=["http://127.0.0.1:18080/x", "https://partner.invalid/x"]
     )
     assert hop is not None and hop.name == "proxy:OB"
+
+
+# --- the limit stated on is_loopback_hop_host: only case is normalised ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "on_box"),
+    [
+        ("localhost.", False),
+        ("LOCALHOST.", False),
+        ("127.0.0.1.", False),
+        ("%6cocalhost", False),
+        ("localhost", True),  # CONTROL: the plain spellings
+        ("LOCALHOST", True),
+        ("127.0.0.1", True),
+    ],
+)
+def test_the_three_predicates_agree_on_each_spelling(host: str, on_box: bool) -> None:
+    """Read as written, because ``urlsplit`` would lowercase the host. The guard and the opener
+    are held to the same answer for the URLs in ``_OFF_BOX_URLS`` (vault BACKLOG #2706)."""
+    assert is_loopback_hop_host(host) is on_box
+    assert is_never_proxied_host(host) is on_box
+    assert rest._is_loopback_target(host) is on_box
+
+
+def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
+    """The proxy takes ``localhost.``, so the pre-emptive header goes with the request, to the
+    proxy and not to the destination (vault BACKLOG #2706). CONTROL: ``localhost`` goes direct,
+    with no proxy and no credential. The proxy is on the box, so the guard admits the credential
+    in every posture."""
+    settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
+    config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
+    assert config is not None
+    resolved = config.for_host("https://localhost./x")
+    assert resolved is not None
+    assert resolved.auth_headers()["Proxy-Authorization"].startswith("Basic ")
+    assert config.for_host("https://localhost/x") is None
+
+
+def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out() -> None:
+    """``_proxy_bypasses`` strips the dot and the predicate does not, so the two disagree on
+    ``localhost.``. The match takes the proxy off the hop, and the cleartext guard, which reads
+    the predicate, still refuses it (vault BACKLOG #2706). CONTROL: with no entry there is no
+    match."""
+    assert rest.proxy_bypasses_host("localhost.", ["localhost"])
+    assert not rest.proxy_bypasses_host("localhost.", None)
+    with active_hop_posture(HopPosture(enforcing=True)), pytest.raises(InsecureHopRefused):
+        _rest("http://localhost./x", proxy_url=_PROXY, proxy_no_proxy="localhost")
+
+
+def test_the_host_a_plain_rstrip_would_empty_stays_off_box() -> None:
+    """Why the limit is not closed by stripping the dot. ``http://./x`` names the host ``.``, which
+    is remote today; stripped, it would be the empty host, which the predicate reads as loopback."""
+    host = hop_url_host("http://./x", cell="test")
+    assert host == "."
+    assert not is_loopback_hop_host(host)
+    assert is_loopback_hop_host(host.rstrip("."))

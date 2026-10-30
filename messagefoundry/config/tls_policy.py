@@ -2109,7 +2109,17 @@ def is_loopback_hop_host(host: str) -> bool:
     ``127.0.0.1``), plus the ``localhost`` name and an empty host. It **never resolves DNS**: any other
     name cannot be *proven* loopback, so it is treated as remote (fail-closed) — a name that happens to
     resolve to a loopback address is still refused, because resolution is attacker-influenceable and
-    would let a hostname smuggle an off-box hop past the on-box carve-out."""
+    would let a hostname smuggle an off-box hop past the on-box carve-out.
+
+    **A limit (vault BACKLOG #2706): only case is normalised.** ``localhost.``, ``127.0.0.1.`` and
+    ``%6cocalhost`` each read as remote here, though a resolver may take the first two as this box.
+    So the cleartext guards refuse them, and a proxy takes them with the connection's proxy
+    credential, as for any remote hop. The limit errs one way: it lets no hop the engine judged
+    on-box leave the host. ``transports.rest._proxy_bypasses`` strips a trailing dot and this does
+    not, so a ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as
+    remote here. The two disagree only toward "remote": that match takes the proxy off the hop and
+    opens no on-box carve-out. A plain ``rstrip(".")`` is not the fix, because the host of
+    ``http://./x`` is ``.``, and stripping it leaves the empty host, which reads as loopback."""
     h = host.lower()
     if h in _LOOPBACK_HOP_HOST_NAMES:
         return True
