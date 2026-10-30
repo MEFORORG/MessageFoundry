@@ -8033,6 +8033,9 @@ def _offline_security_notifier(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
+            # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
+            # every build failure here is: the notice is dropped and the recovery goes on.
+            posture=posture,
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
         print(

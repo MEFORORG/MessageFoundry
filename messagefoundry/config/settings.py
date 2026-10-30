@@ -648,16 +648,39 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
     ``models.require_hop_reason`` holds a connection's reason to. A lone surrogate cannot be
     encoded as UTF-8, so the route could not serialize its answer; an environment value with a
     byte that is not UTF-8 decodes to one."""
-    flag_name = f"[{section}].vault_revocation_attested"
-    reason_name = f"[{section}].vault_revocation_attested_reason"
+    _check_hop_revocation_attestation(
+        flag,
+        reason,
+        flag_name=f"[{section}].vault_revocation_attested",
+        reason_name=f"[{section}].vault_revocation_attested_reason",
+        flag_means="attest revocation checking for this Vault hop",
+        why="say what covers revocation of the Vault server certificate (for example, that the "
+        "certificate is short-lived, with its lifetime), so the record says what was relied on",
+    )
+
+
+def _check_hop_revocation_attestation(
+    flag: bool,
+    reason: str | None,
+    *,
+    flag_name: str,
+    reason_name: str,
+    flag_means: str,
+    why: str,
+) -> None:
+    """Load-validate one settings-held revocation attestation pair (ADR 0173 section 12).
+
+    The rules :func:`_check_vault_revocation_attestation` gives, for any section's pair: the three
+    flag-plus-reason rules, and no control character or lone surrogate in the reason, which is
+    printed in the loosening report. The ``[alerts]`` SMTP login and webhook pairs (BACKLOG #2193)
+    use it too."""
     _check_flag_with_reason(
         flag,
         reason,
         flag_name=flag_name,
         reason_name=reason_name,
-        flag_means="attest revocation checking for this Vault hop",
-        why="say what covers revocation of the Vault server certificate (for example, that the "
-        "certificate is short-lived, with its lifetime), so the record says what was relied on",
+        flag_means=flag_means,
+        why=why,
     )
     if reason is not None and (has_control_char(reason) or has_lone_surrogate(reason)):
         raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
@@ -4780,6 +4803,27 @@ def vault_revocation_attestations(
     ]
 
 
+def alert_revocation_attestations(alerts: AlertsSettings) -> list[tuple[str, str, str | None]]:
+    """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers and
+    its reason (BACKLOG #2193). The ``[alerts]`` sibling of :func:`vault_revocation_attestations`,
+    read by :func:`security_loosenings`."""
+    pairs = (
+        (
+            "alerts.email_tls_revocation_attested",
+            "the [alerts] SMTP relay, for a login (email_username) over verified STARTTLS",
+            alerts.email_tls_revocation_attested,
+            alerts.email_tls_revocation_attested_reason,
+        ),
+        (
+            "alerts.webhook_tls_revocation_attested",
+            "the [alerts] webhook host, over verified https",
+            alerts.webhook_tls_revocation_attested,
+            alerts.webhook_tls_revocation_attested_reason,
+        ),
+    )
+    return [(switch, hop, reason) for switch, hop, flag, reason in pairs if flag]
+
+
 def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> HopPosture:
     """The instance's :class:`~messagefoundry.config.tls_policy.HopPosture` for the #200 hop-refusal gate.
 
@@ -5733,6 +5777,14 @@ class AlertsSettings(_Section):
     # any host (the URL is operator-configured, not request-derived). When set, the webhook_url host
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
     webhook_allowed_hosts: list[str] = []
+    # BACKLOG #2193 (ADR 0173 section 12 pattern, owner ruling 2026-10-27): attests that revocation of
+    # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
+    # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
+    # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
+    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
+    webhook_tls_revocation_attested: bool = False
+    webhook_tls_revocation_attested_reason: str | None = None
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
@@ -5751,6 +5803,13 @@ class AlertsSettings(_Section):
     # PEM bundle of trust anchors for that hop. None (the default) = the [tls] internal-CA policy if one
     # is configured, else the OS trust store. A path, not a secret — same status as [tls].internal_ca_file.
     email_tls_ca_file: str | None = None
+    # BACKLOG #2193 (owner ruling 2026-10-27): with email_username set, the SMTP login crosses a
+    # STARTTLS hop the engine verifies and checks no CRL or OCSP on. An off-box relay on an enforcing
+    # instance is then refused at build unless [tls].crl_file reaches the hop's context or this is
+    # true, with its mandatory reason. A hop with no login takes no guard (declined in ADR 0173).
+    # A loosening, named in security_loosenings(). It never lifts the cleartext or verify-off refusals.
+    email_tls_revocation_attested: bool = False
+    email_tls_revocation_attested_reason: str | None = None
     email_username: str | None = None
     email_password: str | None = None  # secret — supply via MEFOR_ALERTS_EMAIL_PASSWORD
     # Connector SecretProvider reference (ADR 0019 §5, BACKLOG #196). When set AND [secrets].provider is
@@ -5856,6 +5915,29 @@ class AlertsSettings(_Section):
             "[alerts].email_tls_ca_file if it needs one; or remove email_username and the password "
             "to send unauthenticated"
         )
+
+    @model_validator(mode="after")
+    def _revocation_attestation_pairs(self) -> AlertsSettings:
+        """Each flag and its reason travel together (BACKLOG #2193); the rules are on the helper."""
+        _check_hop_revocation_attestation(
+            self.email_tls_revocation_attested,
+            self.email_tls_revocation_attested_reason,
+            flag_name="[alerts].email_tls_revocation_attested",
+            reason_name="[alerts].email_tls_revocation_attested_reason",
+            flag_means="attest revocation checking for the alerts SMTP relay",
+            why="say what covers revocation of the relay's certificate (for example, that it is "
+            "short-lived, with its lifetime), so the record says what was relied on",
+        )
+        _check_hop_revocation_attestation(
+            self.webhook_tls_revocation_attested,
+            self.webhook_tls_revocation_attested_reason,
+            flag_name="[alerts].webhook_tls_revocation_attested",
+            reason_name="[alerts].webhook_tls_revocation_attested_reason",
+            flag_means="attest revocation checking for the alert webhook host",
+            why="say what covers revocation of the webhook host's certificate (for example, that "
+            "it is short-lived, with its lifetime), so the record says what was relied on",
+        )
+        return self
 
     @model_validator(mode="after")
     def _check_email_templates(self) -> AlertsSettings:
@@ -9700,7 +9782,8 @@ def security_loosenings(
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
     ``[store].vault_revocation_attested`` and ``[secrets].vault_revocation_attested`` (vault BACKLOG
-    #2983),
+    #2983), ``[alerts].email_tls_revocation_attested`` and
+    ``[alerts].webhook_tls_revocation_attested`` (BACKLOG #2193),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
@@ -10243,6 +10326,20 @@ def security_loosenings(
             "these hops. It never lifts a cleartext or verify-off refusal",
         )
         for switch, hops, reason in vault_revocation_attestations(store, secrets)
+    )
+    # BACKLOG #2193 (owner ruling 2026-10-27): the [alerts] SMTP login and webhook attestations,
+    # named whenever the flag is set, as the Vault pairs are, with the reason in the entry.
+    out.extend(
+        (
+            switch,
+            f"revocation of the certificate of {hop} is attested as covered outside the engine "
+            f"(reason: {reason}) -- the engine verifies that certificate but its own handshake "
+            "checks no OCSP, and no CRL unless [tls].crl_file reaches the SMTP hop; the "
+            "attestation adds no check. Wherever the revocation refusal would apply to that hop it "
+            "is lifted, so a revoked certificate is caught only if what the reason names really "
+            "covers it. It never lifts a cleartext or verify-off refusal",
+        )
+        for switch, hop, reason in alert_revocation_attestations(alerts)
     )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
     # acknowledgment of it are different facts and an operator can hold either without the other. A hop

@@ -173,9 +173,18 @@ def test_webhook_notifier_threads_posture(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Negative control: an https webhook is never refused, whatever the posture.
+    # Negative control: the cleartext gate never refuses an https webhook, whatever the posture.
+    # Since BACKLOG #2193 an off-box https webhook on an enforcing posture also takes the revocation
+    # guard, so the attestation pair is set here to keep this a test of the cleartext gate alone;
+    # tests/test_alert_revocation_guard.py holds that guard's arms.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    WebhookTransport("https://hooks.example/x", posture=PROD_PHI)
+    WebhookTransport(
+        "https://hooks.example/x",
+        posture=PROD_PHI,
+        revocation_attested=True,
+        revocation_attested_reason="synthetic: the hook host certificate is short-lived",
+    )
+    WebhookTransport("https://hooks.example/x", posture=STAGING_PHI)
 
 
 # --- Cell (4): AI-broker cleartext http credential hop (refused in every posture, #3533) ---------

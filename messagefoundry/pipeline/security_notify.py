@@ -51,11 +51,16 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
-from messagefoundry.config.tls_policy import TrustAnchorPolicy, warn_smtp_verification_off
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorPolicy,
+    warn_smtp_verification_off,
+)
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alert_sinks import (
     ALERTS_SMTP_CELL,
     _BackgroundDispatcher,
+    _refuse_alert_smtp_revocation,
     send_plain_email,
 )
 from messagefoundry.store.base import AuditStore
@@ -581,7 +586,23 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         tls_ca_file: str | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
         audit: AuditStore | None = None,
+        posture: HopPosture | None = None,
+        revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
     ) -> None:
+        # BACKLOG #2193 slice (c): the login rides the alerts SMTP hop, so it takes that hop's
+        # revocation guard, with the same [alerts] pair. First, so a refused build starts nothing.
+        _refuse_alert_smtp_revocation(
+            host=host,
+            use_tls=use_tls,
+            username=username,
+            tls_verify=tls_verify,
+            tls_ca_file=tls_ca_file,
+            trust_anchor_policy=trust_anchor_policy,
+            posture=posture,
+            attested=revocation_attested,
+            attested_reason=revocation_attested_reason,
+        )
         super().__init__()
         self._host = host
         self._port = port
@@ -788,6 +809,7 @@ def security_notifier_from_settings(
     secret_provider: SecretProvider | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     audit: AuditStore | None = None,
+    posture: HopPosture | None = None,
 ) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
     server/sender is configured (then nothing is emailed; ``auth/notifications.py`` states which events
@@ -796,7 +818,9 @@ def security_notifier_from_settings(
     ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
     ``email_password``, byte-identical to before. ``audit`` is where a dropped or failed notice is
-    recorded (BACKLOG #2383); ``None`` records nothing."""
+    recorded (BACKLOG #2383); ``None`` records nothing. ``posture`` keys the SMTP login's
+    revocation guard (BACKLOG #2193), as on the alerts sink; ``None`` with none stamped is the
+    guard's no-op."""
     if not (alerts.email_smtp_host and alerts.email_from):
         return None
     # The sender is MAIL FROM on every notice, and send_plain_email refuses one that fails the address
@@ -822,4 +846,7 @@ def security_notifier_from_settings(
         tls_ca_file=alerts.email_tls_ca_file,
         trust_anchor_policy=trust_anchor_policy,
         audit=audit,
+        posture=posture,
+        revocation_attested=alerts.email_tls_revocation_attested,
+        revocation_attested_reason=alerts.email_tls_revocation_attested_reason,
     )
