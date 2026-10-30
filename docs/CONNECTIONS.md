@@ -1749,11 +1749,15 @@ An entry with no port admits its host at any port. On the generic dialect the eg
   could read as octal. A pin in an entry may keep a leading zero: the engine alone reads it.
 - No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
-- `odbc_driver` is not a driver the engine knows reads `PORT`, and the entry pins a port. The
-  engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case; any other
-  name, an odbcinst alias or a library path included, reads no port. The default `ODBC Driver 18
-  for SQL Server` is one of those: the SQL Server drivers ignore `PORT`, so use
-  `dialect="sqlserver"`. A host-only entry still admits any driver.
+- The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
+  The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
+  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
+  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
+  host-only entry still admits any driver.
+
+The check reads the driver **name** as written, an odbcinst alias or a library path included, and
+cannot see which library that name loads. A name that misdescribes its driver, such as a path
+holding `mysql` to a library that ignores `PORT`, is outside what the check can catch.
 
 A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
 so no entry can name it, and it is refused as unlisted.

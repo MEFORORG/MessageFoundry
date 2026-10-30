@@ -58,11 +58,15 @@ def port_or_zero(text: str) -> int:
 
 
 def _preset_port(value: object) -> int | None:
-    """The port the SQL Server preset's connection string sends for a ``port`` setting, or ``None``.
+    """The ``port`` setting of the SQL Server preset as a port, or ``None``.
 
-    ``_build_dsn`` writes ``int(port)``, so this reads it with the same ``int()``: a float, a sign or
-    a non-ASCII digit that ``int()`` accepts is the port sent. A value ``int()`` refuses fails that
-    build too, and a number outside 1 to 65535 is not a port."""
+    ``_build_dsn`` writes ``int(port)`` into ``SERVER`` and checks neither the type nor the range.
+    This applies ``int()`` only to an int, a float or a str, and not to a bool, and returns ``None``
+    for a value ``int()`` refuses or one outside 1 to 65535. So where both read a number, they read
+    the same one: a float, a sign or a non-ASCII digit included. They part on a bool, another type
+    ``int()`` accepts (bytes, Decimal) and an out-of-range number: the connection string still
+    sends a port there, and this reads none. Against a pinned entry that refuses the hop; a
+    host-only entry admits it, as it admits any port."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     try:
@@ -135,17 +139,34 @@ class DialEndpoint(NamedTuple):
 
 
 #: Words in an ``odbc_driver`` name that mark a driver the engine knows reads the ``PORT`` keyword:
-#: psqlODBC, MySQL Connector/ODBC and MariaDB Connector/ODBC. A list of what is KNOWN, on purpose:
-#: a driver that ignores ``PORT`` (the SQL Server drivers do) may be named by an odbcinst alias or a
-#: library path that no list of refused names would catch, so an unknown name reads no port.
+#: psqlODBC, MySQL Connector/ODBC and MariaDB Connector/ODBC. A list of what is KNOWN, on purpose: a
+#: name with none of these words reads no port, whatever driver it names.
 _PORT_KEYWORD_DRIVERS = ("postgres", "psqlodbc", "mysql", "mariadb")
+
+#: Words that mark a Microsoft SQL Server driver, which ignores ``PORT``. They win over the words
+#: above, so a name holding both reads no port.
+_SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server")
+
+
+def _sqlserver_driver_name(name: object) -> bool:
+    """Whether ``odbc_driver``, as written, names a SQL Server driver
+    (:data:`_SQLSERVER_DRIVER_WORDS`)."""
+    folded = odbc_keyword_name(str(name or ""))
+    return any(word in folded for word in _SQLSERVER_DRIVER_WORDS)
 
 
 def _reads_port_keyword(name: object) -> bool:
-    """Whether ``odbc_driver`` names a driver the engine knows reads ``PORT``, in any case and
-    spacing (:data:`_PORT_KEYWORD_DRIVERS`)."""
+    """Whether ``odbc_driver``, as written, names a driver the engine knows reads ``PORT``, in any
+    case and spacing (:data:`_PORT_KEYWORD_DRIVERS`), and not a SQL Server driver.
+
+    The engine reads the driver NAME, not the driver. An odbcinst alias or a library path is read
+    by its words like any name; which library it loads is not visible here. A name that misdescribes
+    its driver, such as a path holding ``mysql`` to a library that ignores ``PORT``, is outside what
+    this check can catch."""
     folded = odbc_keyword_name(str(name or ""))
-    return any(word in folded for word in _PORT_KEYWORD_DRIVERS)
+    return not _sqlserver_driver_name(name) and any(
+        word in folded for word in _PORT_KEYWORD_DRIVERS
+    )
 
 
 def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> DialEndpoint:
@@ -157,8 +178,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     Server preset, whatever ``settings`` say.
 
     **The SQL Server preset** sends ``SERVER={server},{port}``, so the ``port`` setting is the port
-    sent, defaulting to 1433 as the connection string does, and read with the same ``int()`` the
-    connection string uses (:func:`_preset_port`).
+    sent, defaulting to 1433 as the connection string does, read as :func:`_preset_port` says.
 
     **The generic dialect** sends ``SERVER={server}`` and never reads the ``port`` setting, so it is
     ignored here. The port is the ``PORT`` keyword's, the one value the connection string sends as a
@@ -168,11 +188,11 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     ``[v6]:port`` is refused too. ``PORT`` given twice, in any case, is refused, as the build
     refuses it, and so is a ``PORT`` value with a leading zero, which a driver could read as octal.
     With no usable ``PORT`` the port is ``None``: the engine does not know the port the driver then
-    uses. The port is ``None`` too when ``odbc_driver`` is not a driver the engine knows reads
-    ``PORT`` (:func:`_reads_port_keyword`). The factory default, ``ODBC Driver 18 for SQL Server``,
-    is one: the SQL Server drivers ignore ``PORT`` and dial their own default, and the generic
-    dialect gives them no way to send a port, so for a name holding ``sql server`` the remedy names
-    the SQL Server preset.
+    uses. The port is ``None`` too when the ``odbc_driver`` name, as written, is not one the
+    engine knows reads ``PORT`` (:func:`_reads_port_keyword`, which says what a name cannot tell).
+    The factory default, ``ODBC Driver 18 for SQL Server``, is one: the SQL Server drivers ignore
+    ``PORT`` and dial their own default, and the generic dialect gives them no way to send a port,
+    so for a SQL Server name the remedy names the SQL Server preset.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this
     change, so an entry is matched on its host as written."""
@@ -218,7 +238,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
         )
     driver = settings.get("odbc_driver")
     if not _reads_port_keyword(driver):
-        sqlserver = "sql server" in odbc_keyword_name(str(driver or ""))
+        sqlserver = _sqlserver_driver_name(driver)
         return DialEndpoint(
             host,
             None,

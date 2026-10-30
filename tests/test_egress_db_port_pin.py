@@ -255,10 +255,12 @@ def test_generic_with_a_sql_server_driver_reads_no_port(check: Check) -> None:
 def test_generic_with_a_driver_not_known_to_read_port_reads_no_port(
     check: Check, driver: str
 ) -> None:
-    # An odbcinst alias or a library path can name a driver that ignores PORT; main refused these
-    # against db:5432 (it read the defaulted port), so admitting them would loosen it. Fail closed.
+    # A name with no known word reads no port, whatever it loads. main refused these against
+    # db:5432 (it read the defaulted port), so admitting them would loosen it. Fail closed.
     kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
-    with pytest.raises(WiringError, match="use a driver known to read the PORT keyword"):
+    with pytest.raises(
+        WiringError, match="use a driver known to read the PORT keyword|use dialect sqlserver"
+    ):
         check(kw, PINNED)
     check(kw, HOST_ONLY)
 
@@ -268,6 +270,7 @@ def test_generic_with_a_driver_not_known_to_read_port_reads_no_port(
     ["PostgreSQL ANSI", "psqlodbcw.so", "MySQL ODBC 8.0 Unicode Driver", "MariaDB ODBC 3.1"],
 )
 def test_generic_with_a_driver_known_to_read_port_is_admitted(check: Check, driver: str) -> None:
+    # The check reads the name as written: it cannot see which library a name loads.
     check(_generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"}), PINNED)
 
 
@@ -335,3 +338,20 @@ def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[st
     assert endpoint.conflict is None
     assert endpoint.host == server
     assert (endpoint.port or 0) == generic_hop_endpoint(server, params)[1]
+
+
+@pytest.mark.parametrize(
+    "driver",
+    [
+        "/opt/mysql-compat/libmsodbcsql-18.so",
+        "PostgreSQL via SQL Server gateway",
+        "MSODBCSQL-mariadb",
+    ],
+)
+def test_a_sql_server_word_wins_over_a_known_driver_word(check: Check, driver: str) -> None:
+    # The reviewer's path shape: a name holding mysql but naming msodbcsql. A SQL Server word in the
+    # name reads no port, so the pin refuses it; a host-only entry still admits it.
+    kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
+    with pytest.raises(WiringError, match="use dialect sqlserver, or a driver that reads the PORT"):
+        check(kw, PINNED)
+    check(kw, HOST_ONLY)
