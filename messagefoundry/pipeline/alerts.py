@@ -881,7 +881,7 @@ class AlertSink(Protocol):
         :mod:`messagefoundry.pipeline.security_signals`). ``signal`` is the alert event type, one of
         ``SECURITY_SIGNAL_TYPES``, so each detector routes on its own. ``name`` is the subject that
         stands in for "connection": ``signin:<client address>``, ``account:<username>``,
-        ``listener:<inbound>``, ``logging:debug`` or ``posture:start``, the last with ``@node:<id>``
+        ``inbound:<name>``, ``logging:debug`` or ``posture:start``, the last with ``@node:<id>``
         or ``@shard:<id>`` appended where several engine processes share the store. ``count`` is
         how many rows or refusals tripped it. ``detail`` is a fixed sentence built from counts, a
         level name or switch names.
@@ -899,8 +899,8 @@ class AlertSink(Protocol):
         **auto-resolves** the open ``posture_loosened`` instance for the same ``name``, which is
         ``posture:start`` with this process's ``@node:<id>`` or ``@shard:<id>`` suffix where several
         engine processes share the store, so one process's clean start never clears another's. An
-        unpinned cluster node's id changes on every start, so its next start cannot resolve the
-        alert an earlier start raised. A start that could not read its list raises neither. No
+        unpinned cluster node's id changes on every start, so it raises this for its own alert as it
+        stops; its next start could not. A start that could not read its list raises neither. No
         PHI."""
         ...
 

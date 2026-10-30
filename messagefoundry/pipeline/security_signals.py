@@ -54,7 +54,7 @@ from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.alerts import AlertSink
-from messagefoundry.pipeline.intake_bound import process_alert_subject
+from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
 from messagefoundry.transports.admission import add_refusal_observer, remove_refusal_observer
 
@@ -216,10 +216,13 @@ _BODIES = _Burst(
 _EXPORT = _Burst(
     BULK_EXPORT, "account", "{total} messages exported by this account within {window}"
 )
+#: Prefixed ``inbound``, so the subject is spelled as ``connection_names.inbound_record_name``
+#: spells an inbound; a test pins the two together.
 _REFUSED = _Burst(
     PEER_REFUSED_BURST,
-    "listener",
-    "{total} peers refused by this inbound's source allowlist or connection caps within {window}",
+    "inbound",
+    "{total} connections refused by this inbound's source allowlist or connection caps "
+    "within {window}; once raised, it is quiet for the rest of the window",
 )
 
 
@@ -294,6 +297,13 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         self._clock = clock
         self._identity = identity
+        #: The posture_loosened subject this detector last raised and has not seen resolved.
+        self._posture_raised: str | None = None
+        #: Listeners whose refusal burst raised, mapped to when their quiet ends. A refused
+        #: connection costs the peer nothing, so without it a flood would raise, and write an alert
+        #: row, every ``peer_refusals`` refusals. Keyed by inbound name, so bounded by the graph,
+        #: and trimmed past :data:`MAX_SUBJECTS` all the same.
+        self._refusals_quiet: OrderedDict[str, float] = OrderedDict()
         windows = {
             _SIGNIN: _Window(t.signin_failures, t.window_seconds),
             _DENIED: _Window(t.denials, t.window_seconds),
@@ -360,22 +370,33 @@ class SecuritySignalDetector:
         """A :data:`~messagefoundry.transports.admission.RefusalObserver`: the inbound
         ``connection`` refused a peer at its source allowlist or a connection cap."""
         try:
-            self._on_burst(_REFUSED, self._refused, connection, 1)
+            now = self._clock()
+            quiet = self._refusals_quiet
+            if quiet.get(connection, now) > now:
+                return  # raised this window: not even counted, which is the cheap path
+            quiet.pop(connection, None)
+            if self._on_burst(_REFUSED, self._refused, connection, 1):
+                quiet[connection] = now + self._refused.window_seconds
+                if len(quiet) > MAX_SUBJECTS:
+                    quiet.popitem(last=False)
         except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the listener
             log.warning("security-signal detector failed: %s", type(exc).__name__)
 
-    def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> None:
+    def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
+        """Count ``weight`` for ``key``; True when that raised the alert."""
         key = key or "unknown"
         now = self._clock()
         total = window.hit(key, now, weight)
         if total is None:
-            return
-        subject = _bounded(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
+            return False
+        # A checksum keeps two long keys with one head apart, where a plain cut would merge them.
+        subject = shorten_with_checksum(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
         sentence = burst.sentence.format(total=total, window=self._window_label)
         if not window.named(subject, now):
             subject = f"{burst.prefix}:*"
             sentence += f"; {MAX_SUBJECT_ALERTS} other subjects already raised this window"
         self._raise(burst.signal, subject, total, sentence)
+        return True
 
     def _on_level(self, actor: str | None, detail: str | None, key: str, sentence: str) -> None:
         if str(_detail_of(detail).get(key, "")).upper() == "DEBUG":
@@ -386,17 +407,34 @@ class SecuritySignalDetector:
         # None means the start could not read its list; that is no finding either way.
         if not isinstance(switches, list):
             return
-        subject = process_alert_subject("posture:start", self._identity())
+        try:
+            identity = self._identity()
+        except Exception as exc:  # noqa: BLE001 - fail toward raising: the bare subject still pages
+            log.warning("the engine identity could not be read: %s", type(exc).__name__)
+            identity = None
+        subject = process_alert_subject("posture:start", identity)
         if not switches:
-            self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
+            self._restore(subject)
             return
         names = _bounded(", ".join(str(s) for s in switches), _SWITCH_LIST_LIMIT)
+        self._posture_raised = subject
         self._raise(
             POSTURE_LOOSENED,
             subject,
             len(switches),
             f"the engine started with {len(switches)} security loosening(s): {names}",
         )
+
+    def release(self) -> None:
+        """Resolve the ``posture_loosened`` this detector raised, as its process stops. For a
+        process whose identity changes on every start, an unpinned cluster node: its next start
+        reports under a new subject, so nothing could resolve the old one later."""
+        if self._posture_raised is not None:
+            self._restore(self._posture_raised)
+
+    def _restore(self, subject: str) -> None:
+        self._posture_raised = None
+        self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
 
     def _raise(self, signal: str, subject: str, count: int, detail: str) -> None:
         self._notify(
@@ -420,9 +458,15 @@ def install_security_signals(
     loop: asyncio.AbstractEventLoop,
     *,
     identity: Callable[[], str | None] = lambda: None,
+    resolve_on_stop: bool = False,
 ) -> Callable[[], None]:
     """Register a :class:`SecuritySignalDetector` on the audit tee, and on the listeners' refusal
     observers while it counts refusals; returns the function that removes it.
+
+    ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
+    cluster node: removing the detector then resolves the ``posture_loosened`` it raised, as
+    :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts. The
+    removal must run on ``loop``'s thread, before the store closes.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
     onto ``loop``, so the detector's state and the sink are only touched from one thread."""
@@ -459,5 +503,7 @@ def install_security_signals(
     def _remove() -> None:
         remove_audit_observer(_observe)
         remove_refusal_observer(_refused)
+        if resolve_on_stop:
+            detector.release()
 
     return _remove

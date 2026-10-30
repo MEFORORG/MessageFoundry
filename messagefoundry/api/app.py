@@ -1499,7 +1499,7 @@ def _managed_teardown_steps(
     background: Sequence[asyncio.Future[None]],
     upload_retention_runner: UploadRetentionRunner | None,
     security_notifier: SecurityEventNotifier | None,
-    remove_security_signals: Callable[[], None] | None,
+    remove_security_signals: Callable[[], None],
     notifier: NotifierAlertSink | None,
 ) -> list[_TeardownStep]:
     """The managed lifespan's shutdown steps, in order, each optional one left out when its part
@@ -1554,10 +1554,9 @@ def _managed_teardown_steps(
                 "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
-    if remove_security_signals is not None:
-        steps.append(
-            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
-        )
+    # Before engine.stop(): on an unpinned cluster node the removal resolves its posture alert,
+    # and engine.stop() drains that write before the store closes.
+    steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
     steps.append(
         _TeardownStep(
             "engine.stop()",
@@ -11989,6 +11988,10 @@ def create_managed_app(
             SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
             asyncio.get_running_loop(),
             identity=lambda: engine.instance_identity,
+            # An unpinned cluster node's id changes on every start, so it clears its own posture
+            # alert at stop, as the intake monitor does; nothing could clear it later.
+            resolve_on_stop=engine.coordinator.is_clustered()
+            and not (cluster_settings is not None and cluster_settings.node_id),
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

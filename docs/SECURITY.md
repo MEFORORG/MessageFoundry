@@ -6382,7 +6382,7 @@ when no transport is set. It is on by default. What each one counts is stated on
 | `access_denied_burst` | `security_denials` | `account:<username>` |
 | `body_view_burst` | `security_body_views` | `account:<username>` |
 | `bulk_export` | `security_export_messages` | `account:<username>` |
-| `peer_refused_burst` | `security_peer_refusals` | `listener:<inbound>` |
+| `peer_refused_burst` | `security_peer_refusals` | `inbound:<name>` |
 | `log_level_debug` | none | `logging:debug` |
 | `posture_loosened` | none | `posture:start`, plus `@node:<id>` or `@shard:<id>` where several engine processes share the store |
 
@@ -6402,16 +6402,19 @@ under `monitoring:diagnose`, and a lock alert there would show lock state to a r
 withholds it from.
 
 A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and a
-`connection_event` row only while capture is on. So the MLLP, raw-TCP, X12 and HTTP listeners and
-the DICOM server tell the layer directly, with the inbound's name and never the peer's address.
+`connection_event` row only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
+listeners and the DICOM server tell the layer directly, with the inbound's name and never the
+peer's address. Once a listener's burst raises, its refusals are not counted again until the window
+ends, so a flood raises one alert per listener per window.
 
 **Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
-a detector count of `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
+a detector count of `0` or above its default, or a window shorter than its default, is named in
+`GET /security/posture` and in the start's `config_loaded` row.
 With the layer off, every detector stops but the posture one, so that start still raises
 `posture_loosened` naming the switch. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
-process and pages nobody. An unpinned cluster node's identity changes on every start, so its alert
-stays open for an operator. `posture_loosened` does not fire, and nothing resolves, on a start whose
+process and pages nobody. An unpinned cluster node's identity changes on every start, so that
+node resolves its own alert as it stops instead. `posture_loosened` does not fire, and nothing resolves, on a start whose
 `config_loaded` row records its loosenings as unknown, such as one whose config snapshot could not
 be taken.
 

@@ -1941,9 +1941,10 @@ path, no git commit and no message content.
 | `security_denials` | int | 20 | raise `access_denied_burst` when one account has this many `auth.permission_denied`, `auth.channel_denied` and `auth.mfa_denied` rows inside the window. Keyed `account:<username>`. `0` = off |
 | `security_body_views` | int | 100 | raise `body_view_burst` when one account reads this many stored bodies inside the window: `message_body_view` and `attachment_download` rows, an `outbound.read` that returned a payload, and a `response.read` that returned reply bodies. `0` = off |
 | `security_export_messages` | int | 5000 | raise `bulk_export` when one account's `messages_export` calls select this many messages in total inside the window. `0` = off |
-| `security_peer_refusals` | int | 100 | raise `peer_refused_burst` when one inbound listener (MLLP, raw TCP, X12, HTTP or the DICOM server) refuses this many peers at its `source_ip_allowlist` or a connection cap inside the window, counted whether or not connection-event capture is on. Keyed `listener:<inbound>`, never the peer's address, which the throttled refusal log line names. `0` = off |
+| `security_peer_refusals` | int | 100 | raise `peer_refused_burst` when one inbound listener (at least MLLP, raw TCP, X12, HTTP and the DICOM server) refuses this many connections at its `source_ip_allowlist` or a connection cap inside the window, counted whether or not connection-event capture is on. One sender retrying counts once per attempt. Keyed `inbound:<name>`, never the peer's address, which the throttled refusal log line names for an allowlist or per-host refusal. Once raised, that listener's refusals are not counted until the window ends. At most `100000`. `0` = off |
 
-A count of `0`, or `security_signals = false`, is a loosening: `GET /security/posture` names it, as
+`security_signals = false`, and with the layer on a count of `0` or above its default, or a
+`security_window_seconds` below its default, is a loosening: `GET /security/posture` names it, as
 `alerts.<setting>`.
 
 The layer has two more detectors with no threshold. `log_level_debug` fires when `PATCH /logging/level`
@@ -1953,7 +1954,8 @@ pages on every start; suppress it with an `[[alerts.rules]]` row for `posture_lo
 the instance on the alert list. A later start that records an empty list resolves it, through the
 `posture_restored` inverse, which pages nobody and no rule can name. Its key carries `@node:<id>` or
 `@shard:<id>` where several engine processes share the store, so one process's clean start never
-resolves another's; an unpinned cluster node's id changes on every start, so its alert stays open.
+resolves another's; an unpinned cluster node's id changes on every start, so that node resolves its
+own alert as it stops.
 `log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
 resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a

@@ -71,6 +71,8 @@ RefusalObserver = Callable[[str], None]
 #: The observers this process has registered. A tuple, rebound whole on each change, so a call
 #: iterates a snapshot and needs no lock: the DICOM server refuses from its own threads.
 _REFUSAL_OBSERVERS: tuple[RefusalObserver, ...] = ()
+#: Whether this process has logged a refusal-observer failure; see :func:`notify_refusal`.
+_OBSERVER_FAILURE_LOGGED = False
 
 
 def add_refusal_observer(observer: RefusalObserver) -> None:
@@ -91,13 +93,22 @@ def remove_refusal_observer(observer: RefusalObserver) -> None:
 def notify_refusal(connection: str) -> None:
     """Tell every refusal observer that the inbound ``connection`` refused a peer.
 
-    It runs on the accept path, so an observer fault is logged at DEBUG and goes no further: a
-    refusal is already decided, and a peer that can trigger one must not be able to fill the log."""
+    It runs on the accept path, so an observer fault goes no further: the refusal is already
+    decided. The first fault is logged at WARNING, once per process, as the audit tee logs its
+    observers' faults: a peer that can trigger a refusal must not be able to fill the log, and a
+    broken security observer must not be silent either."""
+    global _OBSERVER_FAILURE_LOGGED
     for observer in _REFUSAL_OBSERVERS:
         try:
             observer(connection)
         except Exception as exc:  # noqa: BLE001 - the refusal stands; an observer is best-effort
-            logger.debug("a refusal observer failed: %s", type(exc).__name__)
+            if not _OBSERVER_FAILURE_LOGGED:
+                _OBSERVER_FAILURE_LOGGED = True
+                logger.warning(
+                    "a refusal observer failed (%s); further refusal-observer failures in this "
+                    "process are not logged",
+                    type(exc).__name__,
+                )
 
 
 class RefusalLog:

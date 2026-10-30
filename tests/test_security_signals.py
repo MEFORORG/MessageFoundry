@@ -30,6 +30,7 @@ from messagefoundry.config.settings import (
     AuthSettings,
     _security_signal_loosenings,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_signals import (
@@ -555,7 +556,7 @@ def test_peer_refused_burst_fires_per_listener_and_never_names_the_address() -> 
         det.observe_refusal("IB_ACME_ADT")
         det.observe_refusal(f"IB_OTHER_{i}")
     ((signal, subject, count, detail),) = sink.signals
-    assert (signal, subject, count) == ("peer_refused_burst", "listener:IB_ACME_ADT", 4)
+    assert (signal, subject, count) == ("peer_refused_burst", "inbound:IB_ACME_ADT", 4)
     assert "allowlist" in detail
 
 
@@ -567,6 +568,33 @@ def test_refusals_below_the_threshold_or_past_the_window_do_not_fire() -> None:
     for _ in range(3):
         det.observe_refusal("IB_ACME_ADT")
     assert sink.signals == []
+
+
+def test_a_flood_raises_once_per_listener_per_window() -> None:
+    det, sink, clock = _detector(peer_refusals=4, window_seconds=60)
+    for _ in range(400):
+        det.observe_refusal("IB_ACME_ADT")
+    det.observe_refusal("IB_OTHER")  # the control: another listener still counts
+    assert [n for _s, n, _c, _d in sink.signals] == ["inbound:IB_ACME_ADT"]
+    clock.now += 61
+    for _ in range(4):
+        det.observe_refusal("IB_ACME_ADT")
+    assert [n for _s, n, _c, _d in sink.signals] == ["inbound:IB_ACME_ADT"] * 2
+
+
+def test_the_refusal_subject_is_spelled_as_an_inbound_record_name() -> None:
+    det, sink, _ = _detector(peer_refusals=1)
+    det.observe_refusal("IB_ACME_ADT")
+    assert sink.signals[0][1] == inbound_record_name("IB_ACME_ADT")
+
+
+def test_two_long_inbound_names_with_one_head_keep_two_subjects() -> None:
+    det, sink, _ = _detector(peer_refusals=1)
+    head = "IB_" + "X" * 240
+    det.observe_refusal(head + "_A")
+    det.observe_refusal(head + "_B")
+    subjects = [n for _s, n, _c, _d in sink.signals]
+    assert len(set(subjects)) == 2 and all(len(n) <= 200 for n in subjects)
 
 
 def test_a_zero_peer_refusal_count_switches_that_detector_off() -> None:
@@ -587,7 +615,7 @@ async def test_allowlist_and_cap_refusals_reach_the_detector_and_a_stopping_one_
         full.admit("192.0.2.1")
         _refuse(full, 1)
         assert [(s, n, c) for s, n, c, _d in sink.signals] == [
-            ("peer_refused_burst", "listener:IB_ACME_ADT", 3)
+            ("peer_refused_burst", "inbound:IB_ACME_ADT", 3)
         ]
         # The controls: a stopping listener's refusal and an admitted peer are not counted.
         stopping = _admission(source_ip_allowlist=["10.0.0.0/8"])
@@ -618,7 +646,11 @@ def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
     assert seen == ["IB_PACS"]
 
 
-def test_a_failing_refusal_observer_never_reaches_the_listener() -> None:
+def test_a_failing_refusal_observer_never_reaches_the_listener(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(admission, "_OBSERVER_FAILURE_LOGGED", False)
+
     def broken(_connection: str) -> None:
         raise RuntimeError("observer down")
 
@@ -627,9 +659,12 @@ def test_a_failing_refusal_observer_never_reaches_the_listener() -> None:
         refusal = _admission(source_ip_allowlist=["10.0.0.0/8"]).check(
             cast(Any, _Writer("203.0.113.9")), "203.0.113.9"
         )
+        admission.notify_refusal("IB_ACME_ADT")  # a second fault logs nothing more
     finally:
         remove_refusal_observer(broken)
     assert refusal is not None and refusal.kind == "peer_not_allowlisted"
+    warned = [r for r in caplog.records if "refusal observer failed" in r.getMessage()]
+    assert len(warned) == 1 and warned[0].levelno == logging.WARNING
 
 
 # --- the layer switched off is a loosening, and the posture detector still reports it -------------
@@ -649,8 +684,34 @@ def test_the_layer_off_or_a_detector_at_zero_is_a_named_loosening() -> None:
         "alerts.security_denials",
         "alerts.security_peer_refusals",
     ]
-    for count in _SECURITY_SIGNAL_COUNTS:
-        assert count[0] in AlertsSettings.model_fields
+
+
+def test_a_count_above_its_default_or_a_shorter_window_is_a_named_loosening() -> None:
+    assert _loosenings(AlertsSettings(security_signin_failures=21)) == [
+        "alerts.security_signin_failures"
+    ]
+    assert _loosenings(AlertsSettings(security_window_seconds=60)) == [
+        "alerts.security_window_seconds"
+    ]
+    # The controls: a stricter count, and a longer window, loosen nothing.
+    assert _loosenings(AlertsSettings(security_signin_failures=5)) == []
+    assert _loosenings(AlertsSettings(security_window_seconds=600)) == []
+
+
+def test_the_count_table_covers_every_count_setting_and_only_signal_types() -> None:
+    counts = {
+        name
+        for name, field in AlertsSettings.model_fields.items()
+        if name.startswith("security_") and field.annotation is int
+    }
+    assert {field for field, _signal, _what in _SECURITY_SIGNAL_COUNTS} == counts
+    assert {signal for _field, signal, _what in _SECURITY_SIGNAL_COUNTS} <= SECURITY_SIGNAL_TYPES
+
+
+def test_the_peer_refusal_count_is_bounded() -> None:
+    AlertsSettings(security_peer_refusals=100_000)
+    with pytest.raises(ValidationError):
+        AlertsSettings(security_peer_refusals=100_001)
 
 
 def test_the_layer_off_still_raises_its_posture_and_nothing_else() -> None:
@@ -723,6 +784,42 @@ def test_the_posture_subject_names_the_process_where_several_share_the_store() -
     _start(det, [])
     assert [n for _s, n, _c, _d in sink.signals] == ["posture:start@node:a"]
     assert sink.restored == ["posture:start@node:a"]
+
+
+def test_an_identity_fault_still_raises_under_the_bare_subject() -> None:
+    def broken() -> str | None:
+        raise RuntimeError("coordinator down")
+
+    sink = _PostureSink()
+    _start(SecuritySignalDetector(sink, _thresholds(), identity=broken), ["security.allow_x"])
+    assert [(s, n) for s, n, _c, _d in sink.signals] == [("posture_loosened", "posture:start")]
+
+
+async def test_resolve_on_stop_clears_the_posture_alert_this_process_raised() -> None:
+    sink = _PostureSink()
+    loop = asyncio.get_running_loop()
+    remove = install_security_signals(
+        sink, _thresholds(), loop, identity=lambda: "node:h-1", resolve_on_stop=True
+    )
+    try:
+        detail = json.dumps({"loosenings": ["security.allow_x"]})
+        cast(Any, audit_tee).emit_audit_tee(
+            action="config_loaded",
+            actor="system",
+            channel_id=None,
+            detail=detail,
+            ts=0.0,
+            row_id=1,
+            seq=1,
+            row_hash="0" * 64,
+        )
+    finally:
+        remove()
+    assert sink.restored == ["posture:start@node:h-1"]
+    # The controls: without the flag, or with nothing raised, a stop resolves nothing.
+    quiet = _PostureSink()
+    install_security_signals(quiet, _thresholds(), loop, resolve_on_stop=True)()
+    assert quiet.restored == []
 
 
 def test_a_failing_posture_restored_never_reaches_the_audit_writer() -> None:
