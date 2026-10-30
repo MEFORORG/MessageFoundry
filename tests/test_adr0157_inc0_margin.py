@@ -563,14 +563,15 @@ async def test_the_fence_baseline_is_stamped_before_the_renew_not_after_it() -> 
 
 
 async def test_the_sqlserver_twin_stamps_the_baseline_from_the_same_instant() -> None:
-    """Lockstep, and it matters MORE on this backend. ``DbCoordinator`` also clamps its round trip;
-    the SQL Server renew still inherits ``[store].command_timeout`` from the ODBC connection, because
-    a per-statement override lives in ``store/sqlserver.py`` (an open ADR 0157 Inc 0 residual). So the
-    baseline stamp is, for now, the only thing keeping this backend's margin real."""
+    """Lockstep. The SQL Server renew is clamped too, but only its statement, in whole seconds, so
+    the borrow before it can still delay the response; the baseline stamp keeps the margin real
+    whatever that delay is."""
     mono = _Clock(0.0)
 
     class _Store:
-        async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object]:
+        async def _fetchone_clamped(
+            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        ) -> dict[str, object]:
             mono.t = 20.0  # the response returns 20 s after the claim was issued
             return {"owner": "A", "leader_epoch": 1}
 

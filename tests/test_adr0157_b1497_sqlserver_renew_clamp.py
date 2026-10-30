@@ -1,0 +1,330 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""ADR 0157 Inc 0 on SQL Server: the lease claim/renew runs under ``[cluster].lease_renew_timeout_seconds``.
+
+Until BACKLOG #1497 the clamp bound only the Postgres coordinator. The SQL Server claim inherited
+``[store].command_timeout`` (30 s by default) from the ODBC connection while it held the leadership
+lock, so a hung claim could hold a stepdown past that lock's fence-length wait.
+
+Most of this file needs no database. The store is built with ``__new__`` over a fake pool, the
+driverless idiom of ``tests/test_store_pool_acquire_timeout.py``. Its fake raw connection behaves as
+pyodbc does in the one way the clamp depends on: a cursor copies ``Connection.timeout`` when it is
+created, so the timeout a statement runs under is the one in force at that moment.
+
+The last test is gated on ``MEFOR_TEST_SQLSERVER`` and runs on the hosted ``sql server (store +
+connector)`` legs, whose catch-all step in ``.github/workflows/ci.yml`` names this file. It proves
+the driver really ends a statement at the clamp, which no fake can.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from messagefoundry.config.settings import ClusterSettings, StoreSettings, load_settings
+from messagefoundry.pipeline.cluster import build_coordinator
+from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.sqlserver import _clamped_statement_timeout
+
+# --- the whole-second conversion ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("clamp", "command_timeout", "expected"),
+    [
+        (4.5, 30, 4),  # the stock derived clamp rounds DOWN, never past the checked value
+        (1.0, 30, 1),
+        (8.9, 30, 8),
+        (0.5, 30, 1),  # never 0, which would mean no limit (the settings refuse this on SQL Server)
+        (4.5, 3, 3),  # a shorter command_timeout still wins
+        (4.5, 4, 4),
+        (4.5, 0, 4),  # command_timeout 0 is no limit, so the clamp is the only bound
+    ],
+)
+def test_the_clamp_becomes_whole_seconds_rounded_down(
+    clamp: float, command_timeout: int, expected: int
+) -> None:
+    assert _clamped_statement_timeout(clamp, command_timeout) == expected
+
+
+# --- the store seam, over a fake pyodbc connection ---------------------------
+
+
+class _Raw:
+    """The pyodbc ``Connection``: records every ``timeout`` assignment."""
+
+    def __init__(self) -> None:
+        self._timeout = 0
+        self.assigned: list[int] = []
+
+    @property
+    def timeout(self) -> int:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        assert isinstance(value, int), "pyodbc's Connection.timeout takes an int"
+        self._timeout = value
+        self.assigned.append(value)
+
+    def close(self) -> None:
+        pass
+
+
+class _Cursor:
+    def __init__(self, conn: _Conn) -> None:
+        self._conn = conn
+        self.timeout = conn._conn.timeout if conn._conn is not None else None  # copied at creation
+        self.description = [("owner",), ("leader_epoch",)]
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self._conn.statement_timeouts.append(self.timeout)
+        if self._conn.fail is not None:
+            raise self._conn.fail
+        if self._conn.hang is not None:
+            await self._conn.hang.wait()
+
+    async def fetchall(self) -> list[tuple[object, ...]]:
+        return [("A", 7)]
+
+    async def close(self) -> None:
+        pass
+
+
+class _Conn:
+    def __init__(self) -> None:
+        self._conn: _Raw | None = _Raw()
+        self.raw = self._conn
+        self.statement_timeouts: list[int | None] = []
+        self.fail: Exception | None = None
+        self.hang: asyncio.Event | None = None
+        self.rolled_back = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._conn is None
+
+    async def cursor(self) -> _Cursor:
+        return _Cursor(self)
+
+    async def commit(self) -> None:
+        pass
+
+    async def rollback(self) -> None:
+        self.rolled_back += 1
+
+
+class _Pool:
+    def __init__(self, conn: _Conn) -> None:
+        self.conn = conn
+        self.released: list[_Conn] = []
+
+    async def acquire(self) -> _Conn:
+        return self.conn
+
+    async def release(self, conn: _Conn) -> None:
+        self.released.append(conn)
+
+
+def _store(conn: _Conn, command_timeout: int = 30) -> Any:
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    store = SqlServerStore.__new__(SqlServerStore)
+    store._pool = _Pool(conn)
+    store._settings = StoreSettings(command_timeout=command_timeout)
+    store._acquire_wait = AcquireWaitHistogram()
+    store.committed_txns = 0
+    store.body_copies = 0
+    return store
+
+
+async def test_the_clamped_read_runs_under_the_clamp_and_restores_command_timeout() -> None:
+    conn = _Conn()
+    store = _store(conn)
+    row = await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+    assert row == {"owner": "A", "leader_epoch": 7}
+    assert conn.statement_timeouts == [4]
+    # _borrow applies command_timeout, the clamp replaces it for the statement, and it is put back.
+    assert conn.raw.assigned == [30, 4, 30]
+    assert conn.raw.timeout == 30
+
+
+async def test_a_shorter_command_timeout_still_ends_the_claim_first() -> None:
+    conn = _Conn()
+    store = _store(conn, command_timeout=2)
+    await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+    assert conn.statement_timeouts == [2]
+    assert conn.raw.timeout == 2
+
+
+async def test_the_timeout_is_restored_when_the_statement_raises() -> None:
+    """The driver's own timeout arrives as an ordinary exception, after the statement returned, so
+    the connection goes back to the pool and must carry command_timeout again."""
+    conn = _Conn()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+    assert conn.statement_timeouts == [4]
+    assert conn.rolled_back == 1
+    assert conn.raw.assigned == [30, 4, 30]
+    assert conn.raw.timeout == 30
+    assert conn.closed is False  # an ordinary error recycles the connection, as before
+
+
+async def test_a_cancelled_claim_quarantines_and_does_not_touch_the_timeout() -> None:
+    """A cancellation may leave the statement running on an executor thread, so setting the timeout
+    then would be an ODBC call beside it. The connection is quarantined instead and never lent."""
+    conn = _Conn()
+    raw = conn.raw
+    conn.hang = asyncio.Event()
+    store = _store(conn)
+    task = asyncio.create_task(
+        store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+    )
+    while not conn.statement_timeouts:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert raw.assigned == [30, 4], "no restore may run beside a cancelled statement"
+    assert conn.closed is True  # _borrow quarantined it
+
+
+async def test_the_unclamped_read_is_unchanged() -> None:
+    """Control: every other store read keeps command_timeout and assigns nothing more."""
+    conn = _Conn()
+    store = _store(conn)
+    await store._fetchone("SELECT owner, leader_epoch FROM leader_lease", ("k",))
+    assert conn.statement_timeouts == [30]
+    assert conn.raw.assigned == [30]
+
+
+# --- the coordinator ---------------------------------------------------------
+
+
+async def test_the_coordinator_claim_runs_under_its_renew_clamp_end_to_end() -> None:
+    """The coordinator over the real store seam: the MERGE runs at the clamp, rounded down."""
+    conn = _Conn()
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    await coord._maintain_leadership()
+    assert coord.is_leader() is True
+    assert coord.current_epoch() == 7
+    assert conn.statement_timeouts == [3]
+    assert conn.raw.timeout == 30
+
+
+async def test_the_paused_owner_read_is_not_clamped() -> None:
+    """Only the claim is in scope: the paused tick's owner read keeps its own BACKLOG #2540 bound."""
+    calls: list[str] = []
+
+    class _Store:
+        async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object]:
+            calls.append("plain")
+            return {"owner": "A"}
+
+        async def _fetchone_clamped(
+            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        ) -> dict[str, object]:
+            raise AssertionError("a paused node must not send the claim")
+
+    coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
+    coord._no_claim_until = 10.0
+    assert await coord._claim_or_renew_lease() is False
+    assert calls == ["plain"]
+
+
+class _SqlServerSettings:
+    backend = "sqlserver"
+    db_schema = None
+
+
+class _StubStore:
+    _pool = object()
+    _owner = "host:1:abcd"
+    _settings = _SqlServerSettings()
+
+
+def test_build_coordinator_threads_the_clamp_to_the_sqlserver_coordinator() -> None:
+    coord = build_coordinator(
+        _StubStore(), ClusterSettings(enabled=True, lease_renew_timeout_seconds=3.25)
+    )
+    assert isinstance(coord, SqlServerCoordinator)
+    assert coord._renew_timeout == 3.25
+
+
+def test_build_coordinator_threads_the_derived_clamp_to_the_sqlserver_coordinator() -> None:
+    coord = build_coordinator(_StubStore(), ClusterSettings(enabled=True))
+    assert isinstance(coord, SqlServerCoordinator)
+    assert coord._renew_timeout == 4.5
+
+
+# --- the config refusal --------------------------------------------------------
+
+_SQLSERVER = (
+    '[store]\nbackend = "sqlserver"\nserver = "s"\ndatabase = "d"\nauth = "integrated"\n'
+    "[cluster]\nenabled = true\n"
+)
+_POSTGRES = (
+    '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+    "[cluster]\nenabled = true\n"
+)
+
+
+def _load(tmp_path: Path, text: str) -> Any:
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(text, encoding="utf-8")
+    return load_settings(config_path=cfg, environ={})
+
+
+def test_a_sub_second_clamp_is_refused_on_sqlserver(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="whole seconds"):
+        _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 0.5\n")
+
+
+def test_a_one_second_clamp_and_the_derived_clamp_load_on_sqlserver(tmp_path: Path) -> None:
+    assert _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 1.0\n").cluster.enabled
+    assert _load(tmp_path, _SQLSERVER).cluster.lease_renew_timeout_seconds == 4.5
+
+
+def test_a_sub_second_clamp_still_loads_on_postgres(tmp_path: Path) -> None:
+    """Control: asyncpg takes a fractional timeout, so the refusal is SQL Server's alone."""
+    s = _load(tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 0.5\n")
+    assert s.cluster.lease_renew_timeout_seconds == 0.5
+
+
+# --- against a real server -----------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not os.getenv("MEFOR_TEST_SQLSERVER"),
+    reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* connection env) to run SQL Server tests",
+)
+async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
+    """A statement slower than the clamp ends at the clamp, not at command_timeout, and the pooled
+    connection that ran it comes back with command_timeout and still works."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    store = await SqlServerStore.open(settings)
+    try:
+        assert settings.command_timeout == 0 or settings.command_timeout > 4
+        started = time.monotonic()
+        with pytest.raises(Exception, match="(?i)timeout|HYT00"):
+            await store._fetchone_clamped(
+                "WAITFOR DELAY '00:00:04'; SELECT 1 AS x", (), timeout_clamp=1.5
+            )
+        assert time.monotonic() - started < 3.5, "the clamp did not end the statement"
+        # The connection that timed out is reusable, and back under command_timeout.
+        async with store._acquire() as conn:
+            assert conn._conn.timeout == settings.command_timeout
+        assert await store._fetchone("SELECT 1 AS x") == {"x": 1}
+    finally:
+        await store.close()

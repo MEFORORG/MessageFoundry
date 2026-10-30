@@ -1048,6 +1048,20 @@ def _applock_timeout_ms(command_timeout: int) -> int:
     return int(command_timeout * 1000) if command_timeout else -1
 
 
+def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
+    """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
+    (ADR 0157 Inc 0: the cluster lease claim/renew).
+
+    pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
+    rounded up could land past the detection margin the clamp was checked against. It never drops
+    below 1, because 0 means no limit at all. A clamp under one second cannot be expressed, and
+    ``ServiceSettings._sqlserver_renew_clamp_whole_seconds`` refuses one at config load. A
+    ``command_timeout`` shorter than the clamp still wins, and ``command_timeout == 0`` (no limit)
+    leaves the clamp as the only bound."""
+    whole = max(1, math.floor(clamp_seconds))
+    return min(whole, command_timeout) if command_timeout > 0 else whole
+
+
 def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
     return (resource, timeout_ms)
 
@@ -5386,15 +5400,60 @@ class SqlServerStore:
                 except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
                     log.debug("cursor close on connection release failed", exc_info=True)
 
+    @asynccontextmanager
+    async def _statement_timeout(self, conn: Any, seconds: int | None) -> AsyncIterator[None]:
+        """Run the body with ``seconds`` as this connection's statement timeout, then put back the
+        one :meth:`_borrow` applied (ADR 0157 Inc 0). ``None`` changes nothing.
+
+        Enter it BEFORE :meth:`_cursor`: pyodbc copies ``Connection.timeout`` onto a statement handle
+        when the cursor is created, so a timeout set after that would not bind the statement.
+
+        **A cancellation skips the restore.** The cancelled statement may still be running on an
+        executor thread, and setting the attribute is an ODBC call on the same connection handle
+        (BACKLOG #2049). :meth:`_borrow` quarantines that connection on the same exit, so it is never
+        lent again and the timeout left on it is never read."""
+        if seconds is None:
+            yield
+            return
+        raw = getattr(conn, "_conn", None)
+        if raw is None:
+            log.warning(
+                "sqlserver: cannot reach the raw pyodbc connection to apply a %ds statement"
+                " timeout; the statement runs under [store].command_timeout instead",
+                seconds,
+            )
+            yield
+            return
+        previous = raw.timeout
+        raw.timeout = seconds
+        try:
+            yield
+        except Exception:
+            raw.timeout = previous
+            raise
+        raw.timeout = previous
+
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        return await self._fetch_rows(sql, params)
+
+    async def _fetch_rows(
+        self, sql: str, params: tuple[Any, ...], statement_timeout: int | None = None
+    ) -> list[dict[str, Any]]:
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``statement_timeout`` is
+        ``None`` for every caller but the cluster lease claim/renew (:meth:`_statement_timeout`)."""
+        async with (
+            self._acquire() as conn,
+            self._statement_timeout(conn, statement_timeout),
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(sql, params) if params else await cur.execute(sql)
                 columns = [c[0] for c in cur.description]
                 rows = await cur.fetchall()
                 # Read-snapshot release, NOT a durable write — commit without counting (A1). This is the
-                # single read helper (_fetchone delegates here); routing every read through _commit was
-                # what made committed_txns a superset of the write cost model on a live SQL Server.
+                # single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here); routing
+                # every read through _commit was what made committed_txns a superset of the write cost
+                # model on a live SQL Server.
                 await self._commit_read(conn)
             except Exception:
                 # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
@@ -5406,6 +5465,17 @@ class SqlServerStore:
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = await self._fetchall(sql, params)
+        return rows[0] if rows else None
+
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> dict[str, Any] | None:
+        """:meth:`_fetchone` with the statement bounded by ``timeout_clamp`` rather than
+        ``[store].command_timeout``, whichever is shorter (ADR 0157 Inc 0). The cluster lease
+        claim/renew is its only caller: :func:`_clamped_statement_timeout` says how the clamp becomes
+        whole seconds, and :meth:`_statement_timeout` how it is applied and put back."""
+        seconds = _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout)
+        rows = await self._fetch_rows(sql, params, seconds)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:

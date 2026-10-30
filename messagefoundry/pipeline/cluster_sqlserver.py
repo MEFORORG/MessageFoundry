@@ -26,7 +26,7 @@ caching) are copied verbatim and only the DB layer differs:
   analog of PG's ``pg_advisory_xact_lock``.
 
 It is duck-typed on the store (``store._acquire`` / ``store._applock`` / ``store._fetchone`` /
-``store._fetchall`` / ``store._execute``) so this module imports cleanly without
+``store._fetchone_clamped`` / ``store._fetchall`` / ``store._execute``) so this module imports cleanly without
 the optional ``aioodbc`` extra and never hard-imports the concrete store.
 
 .. note::
@@ -110,6 +110,7 @@ class SqlServerCoordinator:
         node_timeout_seconds: float = 30.0,
         leader_lease_ttl_seconds: float = 30.0,
         leader_fence_timeout_seconds: float = 20.0,
+        lease_renew_timeout_seconds: float = 5.0,
         acquire_delay_seconds: float = 0.0,
         promotable: bool = True,
         monotonic: Callable[[], float] = time.monotonic,
@@ -134,6 +135,10 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
+        # ADR 0157 Inc 0: the clamp on the claim/renew statement alone, in place of the inherited
+        # [store].command_timeout; SqlServerStore._fetchone_clamped says how it is applied. Unlike
+        # DbCoordinator._renew_timeout it bounds neither the borrow nor the loop's other statements.
+        self._renew_timeout = lease_renew_timeout_seconds
         # BACKLOG #2540: the whole-call budget for the paused tick's owner read. The store's own
         # [store].command_timeout still ends the statement first when it is the shorter of the two;
         # paused_read_budget_seconds says why that matters here.
@@ -430,10 +435,10 @@ class SqlServerCoordinator:
             # conservative direction. In lockstep with DbCoordinator._maintain_leadership, whose
             # docstring carries the full argument.
             #
-            # It matters MORE here: this backend has no clamp on the round trip. DbCoordinator passes
-            # asyncpg a per-statement timeout; _fetchone below inherits the ODBC connection's
-            # [store].command_timeout (30 s, the stock lease TTL itself), and a per-statement override
-            # would have to live in store/sqlserver.py. That clamp is an open ADR 0157 Inc 0 residual.
+            # The claim's statement is clamped at _renew_timeout (whole seconds, rounded down) rather
+            # than [store].command_timeout (30 s, the stock lease TTL itself), so this lock is held
+            # for that clamp plus the borrow, which [store].acquire_timeout bounds. A stepdown waits
+            # on this lock for the fence timeout (acquire_leadership_lock).
             issued_at = self._monotonic()
             held = await self._claim_or_renew_lease()
             if held:
@@ -488,7 +493,8 @@ class SqlServerCoordinator:
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
             return False
-        row = await self._store._fetchone(
+        # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout.
+        row = await self._store._fetchone_clamped(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
             " MERGE leader_lease WITH (HOLDLOCK) AS t USING (SELECT ? AS lease_key) AS s"
@@ -512,6 +518,7 @@ class SqlServerCoordinator:
                 self.node_id,  # INSERT owner
                 self._lease_ttl,  # INSERT lease_expires_at
             ),
+            timeout_clamp=self._renew_timeout,
         )
         if row is None or row["owner"] != self.node_id:
             # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).

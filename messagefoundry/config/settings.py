@@ -6209,11 +6209,12 @@ class ClusterSettings(_Section):
     # stamped before the renew is issued, so the detection margin holds either way) — a standby cannot
     # take over until the lease it just re-extended expires again.
     #
-    # SCOPE, stated because a control that claims more than it covers is worse than none: this clamps
-    # the POSTGRES coordinator, where it is asyncpg's own per-statement `timeout=`. The SQL Server
-    # coordinator's renew still inherits `[store].command_timeout` from the ODBC connection, because a
-    # per-statement override there lives in `store/sqlserver.py`. That is a NAMED, open residual of
-    # ADR 0157 Inc 0 — not something this setting silently covers.
+    # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
+    # this is asyncpg's own per-statement `timeout=`, and it bounds every maintenance-loop statement
+    # with its borrow (BACKLOG #2523). On SQL SERVER it is the ODBC statement timeout of the
+    # claim/renew statement alone, in WHOLE SECONDS rounded down (pyodbc's timeout is an integer), so
+    # a value under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds). On
+    # both, a shorter `[store].command_timeout` still ends the statement first.
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -6360,10 +6361,11 @@ class ClusterSettings(_Section):
         **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157 Inc 4/5) is derived
         from the same margin and bounds the source phase only.
 
-        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the Postgres coordinator's renew.
-        The SQL Server coordinator's renew still inherits ``[store].command_timeout``, an open ADR 0157
-        Inc 0 residual, so on that backend this checks a value the renew does not yet use. Said here
-        rather than left to be inferred from a green config load."""
+        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the renew on both coordinators. On
+        SQL Server the bound is the clamp rounded DOWN to whole seconds, so it is never above the value
+        checked here; a clamp under one second cannot be expressed there, and
+        :meth:`ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses it, because this section
+        cannot see ``[store]``."""
         tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
         margin = _detection_margin_seconds(
             self.leader_fence_timeout_seconds, self.leader_lease_ttl_seconds
@@ -7607,6 +7609,28 @@ class ServiceSettings(_InputHidingModel):
                     "workers) against the pool, so a pool of 1 would serialize everything — prefer "
                     "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _sqlserver_renew_clamp_whole_seconds(self) -> ServiceSettings:
+        """On SQL Server the renew clamp is the claim statement's pyodbc timeout, an integer number of
+        seconds, rounded down and never below 1 (ADR 0157 Inc 0). A clamp under one second would
+        therefore run at 1 s, a bound above the value ``ClusterSettings._renew_fits_the_margin``
+        checked, so it is refused here rather than quietly widened. The derived clamp is floored at
+        1 s and never trips this. Spans two sections, so it lives here."""
+        clamp = self.cluster.lease_renew_timeout_seconds
+        if (
+            self.cluster.enabled
+            and self.store.backend == StoreBackend.SQLSERVER
+            and clamp is not None
+            and not clamp >= 1.0
+        ):
+            raise ValueError(
+                "[cluster].lease_renew_timeout_seconds must be >= 1 on [store].backend = 'sqlserver' "
+                f"(got {clamp}): there it is the ODBC statement timeout, which counts whole seconds, "
+                "so a sub-second clamp cannot be applied. Raise it, or unset it to derive it from the "
+                "detection margin"
+            )
         return self
 
     @model_validator(mode="after")
