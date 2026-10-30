@@ -280,7 +280,9 @@ async def test_mtls_subject_reads_the_certificate_after_either_handshake(
         tmp_path,
         tls_ca_file=str(tmp_path / "c.pem"),
         intake_auth="mtls_subject",
-        intake_client_subjects=[subject],
+        # Keyed by the issuing CA's DN (vault BACKLOG #2287). The client presents the self-signed
+        # c.pem, which is also the loaded anchor, so it is its own issuer.
+        intake_client_subjects={"CN=127.0.0.1": [subject]},
     )
     intake = _Intake()
     await source.start(intake)
