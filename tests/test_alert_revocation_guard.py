@@ -298,6 +298,30 @@ def test_an_attested_webhook_crosses_and_is_recorded() -> None:
     assert REASON in log.audit and _WEBHOOK_CELL in log.audit, log.state()
 
 
+@pytest.mark.parametrize("reason", [None, "   ", "covered\nFORGED LINE"])
+def test_a_direct_build_cannot_attest_without_a_recordable_reason(reason: str | None) -> None:
+    """The settings load refuses these; a transport built directly is refused at its guard too,
+    as the AI broker is, so no crossing is recorded with no reason or a forged line."""
+    with pytest.raises(ValueError, match="webhook_tls_revocation_attested") as exc:
+        WebhookTransport(
+            WEBHOOK, posture=ENFORCING, revocation_attested=True, revocation_attested_reason=reason
+        )
+    assert not isinstance(exc.value, InsecureHopRefused)
+    with pytest.raises(ValueError, match="email_tls_revocation_attested") as exc:
+        _email(ENFORCING, revocation_attested=True, revocation_attested_reason=reason)
+    assert not isinstance(exc.value, InsecureHopRefused)
+
+
+def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        WebhookTransport(
+            WEBHOOK,
+            posture=ENFORCING,
+            revocation_attested="yes",  # type: ignore[arg-type]  # a direct build's wrong type
+            revocation_attested_reason=REASON,
+        )
+
+
 def test_a_reason_without_the_flag_does_not_cross() -> None:
     with pytest.raises(InsecureHopRefused, match="revocation"):
         WebhookTransport(WEBHOOK, posture=ENFORCING, revocation_attested_reason=REASON)

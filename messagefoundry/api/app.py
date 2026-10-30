@@ -4205,6 +4205,9 @@ def create_app(
         if ai_settings is not None
         else None
     )
+    # BACKLOG #2193: the posture the alerts test send's SMTP login guard reads, for an embedding
+    # of create_app alone. The managed lifespan sets it again from the same derivation.
+    app.state.alert_hop_posture = _phi_read_posture
     app.state.phi_read_hop_disposition = phi_read_hop_disposition(
         _phi_read_posture,
         serve_hop_secure=phi_read_hop_secure,

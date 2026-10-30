@@ -57,6 +57,7 @@ from messagefoundry.config.tls_policy import (
     smtp_login_approved,
 )
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
@@ -383,6 +384,27 @@ def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
     return ambient if ambient is not None else HopPosture.fail_closed(enforcing=None)
 
 
+def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) -> bool:
+    """Whether an ``[alerts]`` revocation attestation counts, refusing one that cannot be recorded.
+
+    The settings load refuses a flag with no reason, a blank one, or one holding a control
+    character or a lone surrogate; a transport built directly skips that load, so the guard
+    refuses them here too, as the AI broker does. The reason is written into the attested-crossing
+    WARNING, where a CR or LF could forge a log line. Only the value ``True`` counts."""
+    if attested is not True:
+        return False
+    if not (reason and reason.strip()):
+        raise ValueError(
+            f"[alerts].{flag}=true requires an [alerts].{flag}_reason that says what covers "
+            "revocation of the hop's certificate"
+        )
+    if has_control_char(reason) or has_lone_surrogate(reason):
+        raise ValueError(
+            f"[alerts].{flag}_reason must not contain control characters or lone surrogates"
+        )
+    return True
+
+
 def _refuse_webhook_revocation(
     url: str, *, posture: HopPosture | None, attested: bool, attested_reason: str | None
 ) -> None:
@@ -410,7 +432,9 @@ def _refuse_webhook_revocation(
             "carries the alert webhook's path token over verified https but performs no "
             "certificate revocation checking"
         ),
-        attested=attested,
+        attested=_attested_with_a_reason(
+            attested, attested_reason, flag="webhook_tls_revocation_attested"
+        ),
         context=None,
         posture=_alert_hop_posture(posture),
         ways_across=_WEBHOOK_WAYS_ACROSS,
@@ -486,7 +510,9 @@ def _refuse_alert_smtp_revocation(
             "carries the [alerts] SMTP login password over verified STARTTLS but performs no "
             "certificate revocation checking"
         ),
-        attested=attested,
+        attested=_attested_with_a_reason(
+            attested, attested_reason, flag="email_tls_revocation_attested"
+        ),
         context=_alerts_smtp_context(
             host=host,
             verify=True,

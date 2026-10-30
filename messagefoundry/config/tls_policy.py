@@ -2568,9 +2568,9 @@ class RevocationHopGuard:
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
-    #: ``tls_revocation_attested`` — **both are inapplicable to the non-connection hops that pass
-    #: this field**. The ones that do (at least the IdP, the syslog forwarder and the
-    #: store) each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
+    #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
+    #: hop that passes this field, and ``[tls].crl_file`` to most of them**. At least the IdP, the
+    #: syslog forwarder and the store each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
     #: never reaches their contexts, and there is no connection to carry the flag; check any new one
     #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
     #: cannot be performed, which is the SDS-3.7 false-premise defect wearing a helpful voice. A
