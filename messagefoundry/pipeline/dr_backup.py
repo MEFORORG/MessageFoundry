@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import errno
 import functools
 import hmac
@@ -55,6 +56,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -530,27 +532,9 @@ class BackupRunner:
                 raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything in one staging directory: the data dir on a SQLite store, `.mefor-staging`
-        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). First the sweep removes
-        # what a crashed or killed run left there. It goes by each directory's lock, never by age, so
-        # a sibling engine shard's live run survives it. Both run off the loop.
+        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). This run's own
+        # directory is opened first, because the sweeps below take only what has its owner.
         staging_root, secure = self._staging_root(dest_dir)
-        await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
-        # After the sweep, which frees what a dead run left, and before anything is written: a run
-        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write. It
-        # runs before the OS temp sweep below, which needs this run's own directory to know which
-        # account to sweep for; on a box where the temp dir shares the data volume, a killed
-        # standalone verify's leftovers are still counted as used here.
-        shortfall = await asyncio.to_thread(
-            self._space_shortfall,
-            staging_root,
-            dest_dir,
-            config_only=config_only,
-            config_dir=config_dir,
-        )
-        if shortfall is not None:
-            raise BackupError(
-                "space", f"not enough free space to stage this backup: it {shortfall}"
-            )
         loop = asyncio.get_running_loop()
         opening = loop.run_in_executor(
             None,
@@ -584,10 +568,29 @@ class BackupRunner:
         # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
         staging_leftover: str | None = None
         try:
+            # The sweep removes what a crashed or killed run left in the staging root. It goes by each
+            # directory's lock, never by age, so a sibling engine shard's live run survives it, and
+            # only by this run's owner: `.mefor-staging` inherits whatever the destination grants, so
+            # another account could plant a directory there for the teardown to run on (BACKLOG
+            # #2420). Off the loop, like the rest.
+            await asyncio.to_thread(_sweep_abandoned_staging, staging_root, owned_like=work.path)
             # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
-            # leaves its decrypted copy there. Each backup sweeps it too, taking only what this
-            # account owns (see `_sweep_abandoned_staging`).
+            # leaves its decrypted copy there. Each backup sweeps it too, by the same owner rule.
             await asyncio.to_thread(_sweep_os_temp, work.path)
+            # After both sweeps, which free what dead runs left, and before anything is written: a run
+            # that cannot fit fails here, naming the volume, not half-way through a multi-GB write.
+            # Inside the try, so a refusal here still releases this run's empty directory.
+            shortfall = await asyncio.to_thread(
+                self._space_shortfall,
+                staging_root,
+                dest_dir,
+                config_only=config_only,
+                config_dir=config_dir,
+            )
+            if shortfall is not None:
+                raise BackupError(
+                    "space", f"not enough free space to stage this backup: it {shortfall}"
+                )
             snap_path: Path | None = None
             if not config_only:
                 snap_path = work.path / _STORE_MEMBER
@@ -1595,57 +1598,233 @@ def _remove_tree(path: Path) -> bool:
     return not os.path.lexists(path)
 
 
-#: ``os.walk``, named here so a test can refuse a listing without patching every caller's walk.
-_walk = os.walk
+#: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
+#: every caller's walk. On POSIX it is ``os.fwalk``: each directory comes with a descriptor, a child is
+#: opened relative to it, and a child directory swapped for a link after it was listed is not entered.
+#: Windows has no ``fwalk``, so there the walk goes by path and each file's final path is checked
+#: instead (see :func:`_empty_files_in_place`).
+if sys.platform == "win32":
+    _walk = os.walk
+else:
+    _walk = os.fwalk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
     """Truncate every regular file under ``staging`` to zero bytes. Returns what could NOT be shown
     empty: a file that refused, or a directory that could not be listed.
 
-    Walked with ``os.walk`` and ``os.lstat`` rather than ``Path.rglob`` and ``Path.is_file``, which on
-    Python 3.14 swallow ``OSError``: a directory that cannot be listed would read as empty, and a file
-    that cannot be stat'ed as absent, and both would be reported clean while still full."""
+    Walked with a walk that reports a listing error, and an ``lstat``, rather than ``Path.rglob`` and
+    ``Path.is_file``, which on Python 3.14 swallow ``OSError``: a directory that cannot be listed would
+    read as empty, and a file that cannot be stat'ed as absent, and both would be reported clean while
+    still full.
+
+    The sweep runs this on directories it did not make this run, so it truncates the object it
+    checked, never a name it checked a moment earlier (BACKLOG #2420). Each file is opened without
+    following a link, and the OPEN handle must be a regular file with one link before it is truncated:
+
+    - POSIX: ``os.fwalk`` hands over a descriptor per directory and does not enter one swapped for a
+      link after it was listed; each file is opened with ``O_NOFOLLOW`` relative to that descriptor.
+    - Windows: ``staging`` itself is opened without following a reparse point and must be a real
+      directory. Each file is opened the same way and must not be a reparse point, and its final path
+      must lie under the directory's, so a parent swapped for a junction after its listing is caught.
+
+    What stays open: a hard link added to a file AFTER its handle was checked names the object the
+    engine checked, so it cannot point the truncate at anything else, but that object is then emptied
+    under its new name too."""
     unproven: list[str] = []
 
     def _unlisted(exc: OSError) -> None:
-        unproven.append(f"{Path(exc.filename or staging).name}/ (not listed)")
+        # A descriptor-based walk can name the failure by descriptor, which is no name at all.
+        named = exc.filename if isinstance(exc.filename, (str, os.PathLike)) else None
+        unproven.append(f"{Path(named or staging).name}/ (not listed)")
 
-    for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
-        # Never descend through a link or, on Windows, a junction, which `os.walk` follows even
-        # with `followlinks=False`: truncating there would empty files outside the directory.
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
-        ]
-        for name in filenames:
-            entry = Path(dirpath) / name
-            try:
-                st = os.lstat(entry)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                unproven.append(name)
-                continue
-            # A link is never followed: truncating through one would empty a file outside the
-            # directory, and the link itself holds no plaintext.
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            # Nor is a HARD link truncated: it shares its bytes with a name outside this directory.
-            # No file the engine stages has a second link, so one here was put there by someone
-            # else, and the orphan sweep runs this on directories it did not make this run.
-            if st.st_nlink > 1:
-                unproven.append(f"{name} (hard-linked, not truncated)")
-                continue
-            try:
-                with open(entry, "r+b") as fh:
-                    fh.truncate(0)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                unproven.append(name)
+    def _report(reason: str | None) -> None:
+        # Once each: the reason for a file reached through a junction carries no name.
+        if reason is not None and reason not in unproven:
+            unproven.append(reason)
+
+    walked = False
+    if sys.platform == "win32":
+        try:
+            inside = _win_real_directory(staging)
+        except OSError as exc:
+            _unlisted(exc)
+            return unproven
+        for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+            walked = True
+            # Never descend through a link or a junction, which `os.walk` follows even with
+            # `followlinks=False`. A swap after this filter is caught by the final-path check.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
+            ]
+            for name in filenames:
+                _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
+    else:
+        try:
+            for dirpath, _dirnames, filenames, dirfd in _walk(
+                staging, onerror=_unlisted, follow_symlinks=False
+            ):
+                walked = True
+                for name in filenames:
+                    _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
+        except OSError as exc:  # `fwalk` raises, rather than reports, a root it cannot open
+            _unlisted(exc)
+    if not walked and not unproven:
+        # A root that is no directory, or that was swapped for a link, yields nothing at all.
+        unproven.append(f"{staging.name}/ (not listed)")
     return unproven
+
+
+def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
+    """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
+    it. ``None`` when it was emptied or holds nothing to empty, else what to report.
+
+    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
+    path on Windows, as :func:`_win_real_directory` returns it. The ``lstat`` first only skips a link or a hard link without opening it; the
+    check that decides is the one on the open handle."""
+    name = entry.name
+    try:
+        st = (
+            os.lstat(entry)
+            if dir_fd is None
+            else os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return name
+    # A link is never followed: truncating through one would empty a file outside the directory, and
+    # the link itself holds no plaintext.
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. No file
+    # the engine stages has a second link, so one here was put there by someone else.
+    if st.st_nlink > 1:
+        return f"{name} (hard-linked, not truncated)"
+    try:
+        fd = _open_unfollowed(entry, dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return name
+    try:
+        opened = os.fstat(fd)
+        attributes = getattr(opened, "st_file_attributes", 0)
+        if not stat.S_ISREG(opened.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return f"{name} (changed while being emptied, not truncated)"
+        if opened.st_nlink > 1:
+            return f"{name} (hard-linked, not truncated)"
+        if inside is not None and not _win_final_path(fd).startswith(inside):
+            # Not named: it lives outside the staging directory, wherever a junction pointed.
+            return "a file outside the directory (reached through a link, not truncated)"
+        os.ftruncate(fd, 0)
+    except OSError:
+        return name
+    finally:
+        os.close(fd)
+    return None
+
+
+def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
+    """Open ``entry`` for writing without following a link at its last component, and return a
+    descriptor. POSIX opens ``entry.name`` relative to ``dir_fd`` with ``O_NOFOLLOW``, so a link there
+    fails with ``ELOOP``. Windows opens ``entry`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a link or
+    junction there is opened as itself, which the caller's check then refuses. A test seam."""
+    if sys.platform == "win32":
+        # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
+        return _win_open(entry, 0x80000000 | 0x40000000, 0, os.O_RDWR)
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    return os.open(entry.name, flags, dir_fd=dir_fd)
+
+
+@functools.cache
+def _win_api() -> Any:
+    """``kernel32`` with the prototypes the Windows half of :func:`_empty_files_in_place` uses."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    return kernel32
+
+
+def _win_open(path: Path, access: int, extra_flags: int, fd_flags: int) -> int:
+    """Open ``path`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, sharing everything, and return a
+    descriptor that owns the handle. A link or junction at ``path`` is opened as itself."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    import msvcrt
+
+    api = _win_api()
+    handle = api.CreateFileW(
+        str(path),
+        access,
+        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000 | extra_flags,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, fd_flags | os.O_BINARY)
+    except BaseException:
+        api.CloseHandle(handle)
+        raise
+
+
+def _win_final_path(fd: int) -> str:
+    """The final path of the file open on ``fd``, every link and junction resolved, in
+    ``os.path.normcase`` form."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    import msvcrt
+
+    size = 32768
+    buf = ctypes.create_unicode_buffer(size)
+    got = _win_api().GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, size, 0)
+    if got == 0 or got >= size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return os.path.normcase(buf.value)
+
+
+def _win_real_directory(path: Path) -> str:
+    """The final path of ``path`` with a trailing separator, for a prefix test. Opened without
+    following a reparse point; raises ``OSError`` when it cannot be opened, is not a directory, or is
+    itself a link or junction."""
+    # FILE_READ_ATTRIBUTES, with FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
+    fd = _win_open(path, 0x00000080, 0x02000000, os.O_RDONLY)
+    try:
+        attributes = getattr(os.fstat(fd), "st_file_attributes", 0)
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT or not (
+            attributes & stat.FILE_ATTRIBUTE_DIRECTORY
+        ):
+            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", str(path))
+        return _win_final_path(fd).rstrip("\\") + "\\"
+    finally:
+        os.close(fd)
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
@@ -2104,7 +2283,7 @@ def _owner_of(path: Path) -> object | None:
     return _resolve_sid(found.group(1)) if found else None
 
 
-def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> int:
+def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
@@ -2113,20 +2292,17 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
     never consulted. Returns how many directories were removed.
 
-    ``owned_like`` names a directory this run just created. When given, only a directory with the same
-    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify and
-    each backup pass it for the OS temp dir, which can be shared: another account could plant a
-    directory there holding a lock file and a marker, and the teardown must never run on a tree it
-    controls."""
+    ``owned_like`` names a directory this run just created. Only a directory with the same owner is a
+    candidate, and nothing is swept if that owner cannot be read. It is required (BACKLOG #2420): a
+    standalone verify and each backup for the OS temp dir, which can be shared, and each backup for
+    its own staging root, whose `.mefor-staging` inherits what the destination grants (BACKLOG
+    #2420). Another account could plant a directory in either holding a lock file and a marker, and
+    the teardown must never run on a tree it controls."""
     swept = 0
-    owner: object | None = None
-    if owned_like is not None:
-        owner = _owner_of(owned_like)
-        if owner is None:
-            log.warning(
-                "DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root
-            )
-            return 0
+    owner = _owner_of(owned_like)
+    if owner is None:
+        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
+        return 0
     try:
         entries = list(os.scandir(root))
     except FileNotFoundError:
@@ -2143,13 +2319,13 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
         except OSError:
             continue
         path = Path(entry.path)
-        if owned_like is not None and path == owned_like:
+        if path == owned_like:
             continue  # this run's own directory, held live
         # No lock file is no proof either way. Checked before the owner, which on Windows costs a
         # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
         if not os.path.lexists(path / _LOCK_NAME):
             continue
-        if owner is not None and _owner_of(path) != owner:
+        if _owner_of(path) != owner:
             continue  # not this account's: another account's run, or a plant
         try:
             fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0))

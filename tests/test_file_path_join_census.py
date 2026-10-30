@@ -675,9 +675,10 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        3,
+        4,
         INTERNAL,
-        "Names from walking a staging directory this module made, never through a link.",
+        "Names from walking a staging directory this module made, never through a link; each "
+        "file is then opened without following one (BACKLOG #2420).",
     ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
