@@ -219,6 +219,10 @@ def test_userinfo_is_kept_in_the_rebuilt_url() -> None:
         "http:/" + LISTED,
         "socks5://" + LISTED,
         "u:p@" + LISTED,
+        "http://010.0.0.1:3128",  # octal to a resolver
+        "http://2130706433:3128",  # a bare integer address
+        "http://127.1:3128",  # fewer than four parts
+        "http://0x7f.1:3128",  # a hex label
     ],
 )
 def test_strict_shape_refusals(proxy_url: str) -> None:
@@ -294,6 +298,7 @@ def test_the_reader_is_the_parser_the_handler_runs(monkeypatch: pytest.MonkeyPat
     assert calls == [PLAIN]
     assert req.host == f"{LISTED}:3128"
     assert read_like_urllib(PLAIN) == real(PLAIN)
+    assert calls == [PLAIN, PLAIN]  # the reader went through the same function
 
 
 def test_the_static_hop_label_names_the_dialled_host() -> None:

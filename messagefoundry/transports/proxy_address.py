@@ -24,9 +24,9 @@ static-credential hop label and at least the ``bounded_read`` send-time checks r
 module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s label and the
 ``requests``/``hvac`` path in ``strict_requests``.
 
-``urlsplit`` is called with its cache taken off, as ``strict_requests`` does (vault BACKLOG
-#3454): the value may carry the proxy password, and a refused value should not stay a key in a
-process-wide cache. Other readers of the same value still use the cached function.
+``urlsplit`` is called here with its cache taken off, as ``strict_requests`` does (vault BACKLOG
+#3454), so this parse adds no key to the process-wide cache. That is all it does: every caller
+reads the scheme first through the cached function, so the value is a cache key all the same.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.
@@ -55,6 +55,8 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 #: A host name or a dotted IPv4 address, with an optional trailing dot. No percent-escape, no
 #: underscore and no other character that a later reader could decode into something else.
 _NAME_HOST = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.?")
+#: A label a resolver's IPv4 shorthand reads as a number: decimal, octal or hex.
+_NUMERIC_LABEL = re.compile(r"(?:0[xX][0-9A-Fa-f]*|[0-9]+)")
 #: A port as digits only. Its range is checked apart, so ``0`` and ``99999`` read as refused.
 _PORT = re.compile(r"[0-9]{1,5}")
 
@@ -128,7 +130,17 @@ def _is_strict_host(host: str) -> bool:
         except ValueError:
             return False
         return True
-    return len(host) <= 253 and _NAME_HOST.fullmatch(host) is not None
+    if len(host) > 253 or _NAME_HOST.fullmatch(host) is None:
+        return False
+    # A host of numeric labels only is an IPv4 address to a resolver, which reads shorthand such as
+    # a bare integer, an octal or hex label, or fewer than four parts as another address. So only
+    # the canonical dotted quad is taken, and the text judged is the address dialled.
+    if all(_NUMERIC_LABEL.fullmatch(label) for label in host.rstrip(".").split(".")):
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return False
+    return True
 
 
 def parse_proxy_url(value: str) -> ProxyAddress:
