@@ -1,7 +1,7 @@
 - **The engine AI broker's endpoint hop now takes a revocation guard, with an `[ai]` attestation
   pair.** Every assist call sends `[ai].api_key` over https that verifies the endpoint's
-  certificate, but stdlib `ssl` checks no CRL or OCSP, so a revoked endpoint certificate was
-  accepted with no refusal and no record. On an instance at `[security].enforcement = enforce`,
+  certificate, but stdlib `ssl` checks no CRL or OCSP, so the shipped code would have accepted a
+  revoked endpoint certificate with no refusal and no record. On an instance at `[security].enforcement = enforce`,
   an `[ai].endpoint` whose host is not loopback is now refused at `POST /ai/chat`, answered 503,
   unless `[ai].endpoint_revocation_attested = true` is set with an
   `[ai].endpoint_revocation_attested_reason`. No CRL lever is built for this hop, so

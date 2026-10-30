@@ -1003,11 +1003,10 @@ bind-guard ladder above:
   **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
   off-box `[ai].endpoint` is refused under `enforce` unless
   `[ai].endpoint_revocation_attested = true` is set with an
-  `[ai].endpoint_revocation_attested_reason`. That pair is the only lever: no CRL lever is built,
-  so `[tls].crl_file` does not reach it, and `MEFOR_TLS_REVOCATION_ATTESTED` does not cross it
-  under `enforce`. The broker is built for each assist request, so the refusal comes at
-  `POST /ai/chat`, which answers 503, not at start; `messagefoundry check` does not report it. A
-  broker built with no instance posture is judged as enforcing.
+  `[ai].endpoint_revocation_attested_reason`, the only lever. The refusal comes at
+  `POST /ai/chat`, not at start, and `messagefoundry check` does not report it.
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) is the one place that says what the pair can
+  rest on and what does not cross this hop.
 
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine

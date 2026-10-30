@@ -648,16 +648,36 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
     ``models.require_hop_reason`` holds a connection's reason to. A lone surrogate cannot be
     encoded as UTF-8, so the route could not serialize its answer; an environment value with a
     byte that is not UTF-8 decodes to one."""
-    flag_name = f"[{section}].vault_revocation_attested"
-    reason_name = f"[{section}].vault_revocation_attested_reason"
+    _check_revocation_attestation_pair(
+        flag,
+        reason,
+        flag_name=f"[{section}].vault_revocation_attested",
+        reason_name=f"[{section}].vault_revocation_attested_reason",
+        flag_means="attest revocation checking for this Vault hop",
+        why="say what covers revocation of the Vault server certificate (for example, that the "
+        "certificate is short-lived, with its lifetime), so the record says what was relied on",
+    )
+
+
+def _check_revocation_attestation_pair(
+    flag: bool,
+    reason: str | None,
+    *,
+    flag_name: str,
+    reason_name: str,
+    flag_means: str,
+    why: str,
+) -> None:
+    """The load rules every settings-scoped revocation attestation pair shares: the Vault pairs
+    (:func:`_check_vault_revocation_attestation` says why each rule holds) and
+    ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e))."""
     _check_flag_with_reason(
         flag,
         reason,
         flag_name=flag_name,
         reason_name=reason_name,
-        flag_means="attest revocation checking for this Vault hop",
-        why="say what covers revocation of the Vault server certificate (for example, that the "
-        "certificate is short-lived, with its lifetime), so the record says what was relied on",
+        flag_means=flag_means,
+        why=why,
     )
     if reason is not None and (has_control_char(reason) or has_lone_surrogate(reason)):
         raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
@@ -4708,33 +4728,27 @@ class AiSettings(_Section):
     # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
     # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
-    # Setting it adds no check on the wire. The reason is MANDATORY; a flag without one, a blank
-    # one, or a reason without the flag refuses at load. It is a LOOSENING: security_loosenings()
+    # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
+    # blank one, a reason without the flag, or a control character in the reason refuses at load.
+    # It is a LOOSENING: security_loosenings()
     # names it, with the reason. Not a secret.
     endpoint_revocation_attested: bool = False
     endpoint_revocation_attested_reason: str | None = None
 
     @model_validator(mode="after")
     def _endpoint_revocation_attestation_pair(self) -> AiSettings:
-        """The flag and its reason travel together (BACKLOG #2193 slice (e)). The rules are the
-        Vault pair's, :func:`_check_vault_revocation_attestation`, which says why each holds."""
-        flag_name = "[ai].endpoint_revocation_attested"
-        reason_name = "[ai].endpoint_revocation_attested_reason"
-        reason = self.endpoint_revocation_attested_reason
-        _check_flag_with_reason(
+        """The flag and its reason travel together (BACKLOG #2193 slice (e)), under the rules the
+        Vault pairs follow: :func:`_check_revocation_attestation_pair`."""
+        _check_revocation_attestation_pair(
             self.endpoint_revocation_attested,
-            reason,
-            flag_name=flag_name,
-            reason_name=reason_name,
+            self.endpoint_revocation_attested_reason,
+            flag_name="[ai].endpoint_revocation_attested",
+            reason_name="[ai].endpoint_revocation_attested_reason",
             flag_means="attest revocation checking for the AI endpoint hop",
             why="say what covers revocation of the AI endpoint's server certificate (for "
             "example, that the certificate is short-lived, with its lifetime), so the record says "
             "what was relied on",
         )
-        if reason is not None and (has_control_char(reason) or has_lone_surrogate(reason)):
-            raise ValueError(
-                f"{reason_name} must not contain control characters or lone surrogates"
-            )
         return self
 
     @field_validator("provider")

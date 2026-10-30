@@ -22,7 +22,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.api.tls import _generated_pair
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.config.retention_classification import warn_only_windows
-from messagefoundry.config.settings import AiSettings, load_settings, security_loosenings
+from messagefoundry.config.settings import load_settings, security_loosenings
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_refusal
 from messagefoundry.scaffold import scaffold
 from scripts.release.tag_spelling import allowed
@@ -940,7 +940,7 @@ def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
             cert_monitor=settings.cert_monitor,
             backup=settings.backup,
             secrets=settings.secrets,
-            ai=AiSettings(),
+            ai=settings.ai,
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

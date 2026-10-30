@@ -182,7 +182,14 @@ def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -
 
 _HTTP_ENDPOINT = "http://ai.internal/v1/messages"
 _HTTPS_ENDPOINT = "https://ai.internal/v1/messages"
+# BACKLOG #2193 slice (e): the https controls below would otherwise be refused for revocation under
+# an enforcing posture, so they carry the attestation pair. The http tests carry none: the
+# cleartext refusal comes first.
 _AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
+_AI_ATTESTED: dict[str, object] = {
+    "endpoint_revocation_attested": True,
+    "endpoint_revocation_attested_reason": _AI_ATTESTED_REASON,
+}
 
 
 def _managed_ai(**over: object) -> AiSettings:
@@ -192,10 +199,6 @@ def _managed_ai(**over: object) -> AiSettings:
         "endpoint": _HTTP_ENDPOINT,
         "api_key": "sk-synthetic-key",
         "allowed_endpoints": ["ai.internal"],
-        # BACKLOG #2193 slice (e): an off-box https endpoint is otherwise refused for revocation
-        # under an enforcing posture, which would hide the cleartext refusal these tests pin.
-        "endpoint_revocation_attested": True,
-        "endpoint_revocation_attested_reason": _AI_ATTESTED_REASON,
     }
     kw.update(over)
     return AiSettings(**kw)  # type: ignore[arg-type]
@@ -218,7 +221,7 @@ def test_ai_broker_cleartext_is_refused_in_every_posture_even_with_escape(
 
 def test_ai_broker_https_secure_path_unaffected() -> None:
     # Negative control: an https endpoint builds through the factory and the constructor alike.
-    ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT), posture=PROD_PHI)
+    ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT, **_AI_ATTESTED), posture=PROD_PHI)
     AiBroker(
         endpoint=_HTTPS_ENDPOINT,
         api_key="k",
@@ -287,7 +290,11 @@ async def test_ai_chat_route_allows_https(
     # Companion control: the same setup over an HTTPS endpoint is NOT 503, so the 503 above is the
     # cleartext refusal, not a blanket refusal of the route.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    app = create_app(engine, ai_settings=_managed_ai(endpoint=_HTTPS_ENDPOINT), allow_no_auth=True)
+    app = create_app(
+        engine,
+        ai_settings=_managed_ai(endpoint=_HTTPS_ENDPOINT, **_AI_ATTESTED),
+        allow_no_auth=True,
+    )
     async with _client(app) as c:
         r = await c.post("/ai/chat", json={"prompt": "hi"})
     assert r.status_code == 200

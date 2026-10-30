@@ -124,8 +124,9 @@ def _first_crossing(kind: str, host: str) -> bool:
 
 
 class AiBrokerError(ValueError):
-    """The engine broker is mis-configured (missing endpoint/key, an endpoint outside the SSRF allowlist,
-    a cleartext-http endpoint, which always carries the key) or the provider call failed. Raised with a PHI-/secret-safe
+    """The engine broker is mis-configured (at least: missing endpoint/key, an endpoint outside the SSRF
+    allowlist, a cleartext-http endpoint, which always carries the key, or an off-box endpoint the
+    revocation guard refuses) or the provider call failed. Raised with a PHI-/secret-safe
     message (redacted host + status only) so it can surface as a clean API error without leaking the
     prompt, the response, or the key."""
 
@@ -152,6 +153,7 @@ def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
 def _refuse_an_unrevoked_ai_hop(
     endpoint: str,
     *,
+    opener: urllib.request.OpenerDirector,
     posture: HopPosture | None,
     revocation_attested: bool,
     revocation_reason: str | None,
@@ -175,9 +177,11 @@ def _refuse_an_unrevoked_ai_hop(
     * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
-    * ``crl_checked`` is read off the context the broker really dials with, the https handler of
-      rest.py's shared import-time opener, never off a setting. That opener loads no CRL, so it
-      is ``False`` today, and no CRL lever is built for this hop.
+    * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
+      through, never off a setting. Today that is rest.py's shared import-time opener, which
+      loads no CRL, so it is ``False``, and no CRL lever is built for this hop.
+    * An attestation with no reason, or a blank one, is refused here as at settings load, so a
+      broker built directly cannot cross with no recorded reason.
     * ``posture`` is the instance posture the caller holds, or ``None``. **An unknown posture
       counts as enforcing**, as on the Vault hops: the broker is built per request, outside the
       construction gate, so there is no ambient posture to read.
@@ -201,8 +205,14 @@ def _refuse_an_unrevoked_ai_hop(
     except ValueError as exc:
         # hop_url_host's text names no part of the URL; this module's single error type carries it.
         raise AiBrokerError(str(exc)) from None
-    held = HopPosture.fail_closed(enforcing=None) if posture is None else posture
     attested = revocation_attested is True
+    if attested and not (revocation_reason and revocation_reason.strip()):
+        raise AiBrokerError(
+            "[ai].endpoint_revocation_attested=true requires an "
+            "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
+            "endpoint's certificate"
+        )
+    held = HopPosture.fail_closed(enforcing=None) if posture is None else posture
     on_box = is_loopback_hop_host(host)
     # capture() reads the process-wide variable into its own field and the CRL flag off the
     # context; disposition() asks revocation_hop_disposition, logging and raising nothing. It is
@@ -212,7 +222,7 @@ def _refuse_an_unrevoked_ai_hop(
         cell=_AI_HOP_CELL,
         description="sends [ai].api_key over verified https",
         attested=attested,
-        context=opener_tls_context(_NO_REDIRECT_OPENER, connector="AI endpoint"),
+        context=opener_tls_context(opener, connector="AI endpoint"),
         posture=held,
         connection=None,  # the [ai] endpoint, not a connection
     ).disposition()
@@ -248,10 +258,11 @@ def _refuse_an_unrevoked_ai_hop(
 class AiBroker:
     """Broker one code_only assist prompt to a customer-managed / self-hosted LLM (ADR 0135).
 
-    Built once from the loaded ``[ai]`` settings (:func:`ai_broker_from_settings`). Construction validates
-    the endpoint scheme, the credential, and — the SSRF gate — that the endpoint host is on
-    ``allowed_endpoints`` (fail-closed). :meth:`chat` performs the blocking POST; the API route awaits
-    :meth:`chat_async`."""
+    Built from the loaded ``[ai]`` settings (:func:`ai_broker_from_settings`), once for each
+    ``POST /ai/chat`` request. Construction validates at least the endpoint scheme, the
+    credential, that the endpoint host is on ``allowed_endpoints`` (the SSRF gate, fail-closed),
+    and, last, the revocation guard (:func:`_refuse_an_unrevoked_ai_hop`). :meth:`chat` performs
+    the blocking POST; the API route awaits :meth:`chat_async`."""
 
     def __init__(
         self,
@@ -311,10 +322,14 @@ class AiBroker:
                 f"[ai] {violation.kind} is {violation.length} chars, over the "
                 f"{violation.limit}-char limit; check [ai].endpoint / the api_key env() value"
             )
+        # The opener is chosen before the guard and handed to it, so the guard judges the context
+        # this broker really dials with, whichever opener that later becomes.
+        opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
         # Last, so an endpoint refused for any reason above never logs a revocation crossing, and
         # the operator is never sent to attest a hop that is refused anyway (BACKLOG #2193 (e)).
         _refuse_an_unrevoked_ai_hop(
             endpoint,
+            opener=opener,
             posture=posture,
             revocation_attested=revocation_attested,
             revocation_reason=revocation_attested_reason,
@@ -325,7 +340,7 @@ class AiBroker:
         self.model = model or "claude-opus-4-8"
         self.max_output_tokens = max(1, int(max_output_tokens))
         self.timeout_seconds = timeout_seconds
-        self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
+        self._opener: urllib.request.OpenerDirector = opener
 
     @property
     def endpoint_host(self) -> str:

@@ -209,9 +209,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         "CRL lever is built for this hop, so off the box it crosses an enforcing posture only on "
         "its [ai].endpoint_revocation_attested pair; an unknown posture counts as enforcing"
     ),
-    "messagefoundry/transports/ai_broker.py::_refuse_an_unrevoked_ai_hop": Guarded(
-        note="reads the shared opener's own context and decides through RevocationHopGuard.capture"
-    ),
     "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
         note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
     ),

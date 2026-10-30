@@ -11,6 +11,7 @@ for this hop. All endpoints and keys here are synthetic.
 
 from __future__ import annotations
 
+import json
 import logging
 import ssl
 from collections.abc import AsyncIterator, Iterator
@@ -191,9 +192,11 @@ def test_the_decision_reads_the_context_the_broker_dials_with(
         return True
 
     monkeypatch.setattr(tls_policy, "context_checks_revocation", checks)
-    _broker(posture=_ENFORCING)
+    broker = _broker(posture=_ENFORCING)
     expected = opener_tls_context(_NO_REDIRECT_OPENER, connector="AI endpoint")
     assert seen == [expected]
+    # The context judged is the one this broker dials through.
+    assert seen[0] is opener_tls_context(broker._opener, connector="AI endpoint")
     assert expected is not None
     assert not expected.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -204,6 +207,14 @@ def test_earlier_refusals_still_win_over_the_revocation_refusal() -> None:
         _broker(endpoint="http://ai.internal/v1/messages", posture=_ENFORCING)
     with pytest.raises(AiBrokerError, match="allowed_endpoints"):
         _broker(allowed=("other.internal",), posture=_ENFORCING)
+
+
+@pytest.mark.parametrize("reason", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_a_broker_built_directly_cannot_attest_without_a_reason(reason: str | None) -> None:
+    """The settings load refuses this pair; the constructor is a second way in, so it refuses it
+    too. Mutation: delete the reason check in ``_refuse_an_unrevoked_ai_hop``. Red: DID NOT RAISE."""
+    with pytest.raises(AiBrokerError, match="endpoint_revocation_attested=true requires"):
+        _broker(posture=_ENFORCING, attested=True, reason=reason)
 
 
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
@@ -236,10 +247,11 @@ def test_the_factory_threads_the_posture_and_the_pair() -> None:
 @pytest.mark.parametrize(
     ("flag", "reason", "fragment"),
     [
-        (True, None, "endpoint_revocation_attested_reason"),
-        (True, "   ", "endpoint_revocation_attested_reason"),
-        (False, _REASON, "endpoint_revocation_attested"),
-        (True, "line one\nforged line", "control characters"),
+        # Each phrase belongs to one rule only, so a rule answered with another's text reds.
+        (True, None, r"endpoint_revocation_attested=true requires"),
+        (True, "   ", r"endpoint_revocation_attested_reason must be non-empty"),
+        (False, _REASON, r"endpoint_revocation_attested_reason is set without"),
+        (True, "line one\nforged line", "must not contain control characters"),
     ],
     ids=["flag-no-reason", "blank-reason", "reason-no-flag", "control-char"],
 )
@@ -355,3 +367,47 @@ async def test_the_route_answers_503_for_a_refused_hop_and_200_once_attested(
     async with _client(attested) as c:
         assert (await c.post("/ai/chat", json={"prompt": "attested"})).status_code == 200
     assert sent == ["warned", "attested"]
+
+
+# --- the reporting surfaces ----------------------------------------------------------------------
+
+_SWITCH = "ai.endpoint_revocation_attested"
+
+
+async def test_the_posture_route_names_the_pair(engine: Engine) -> None:
+    """``GET /security/posture`` reads the ``[ai]`` section ``create_app`` stashed. Mutation:
+    pass ``ai=AiSettings()`` in ``_posture_loosenings``. Red: the switch is absent."""
+
+    async def switches(ai: AiSettings) -> list[str]:
+        app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+        async with _client(app) as c:
+            resp = await c.get("/security/posture")
+        assert resp.status_code == 200
+        return [e["switch"] for e in resp.json()["loosenings"]]
+
+    held = _managed_ai(
+        endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON
+    )
+    assert _SWITCH in await switches(held)
+    assert _SWITCH not in await switches(_managed_ai())
+
+
+def test_security_show_names_the_pair_from_the_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``security show`` resolves ``[ai]`` from the whole file. Mutation: drop ``_ai = _full.ai``.
+    Red: the switch is absent."""
+    from messagefoundry.__main__ import main
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        "[ai]\nendpoint_revocation_attested = true\n"
+        f'endpoint_revocation_attested_reason = "{_REASON}"\n',
+        encoding="utf-8",
+    )
+    assert main(["security", "show", "--service-config", str(toml), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["loosenings_partial"] is False
+    entries = {e["switch"]: e["risk"] for e in data["loosenings"]}
+    assert _SWITCH in entries
+    assert _REASON in entries[_SWITCH]
