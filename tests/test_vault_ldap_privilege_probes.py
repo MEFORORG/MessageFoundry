@@ -66,7 +66,6 @@ from messagefoundry.store import crypto_transit, keyprovider_vault
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.privilege import StorePrivilegeReport
-from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._vault_hop_env import SECRETS, STORE, supply_vault_hop
 from tests.test_revocation_guard_remaining_hops import bare_crl as bare_crl  # noqa: F401  (fixture)
 
@@ -454,23 +453,19 @@ def test_an_unreachable_vault_is_unobservable_and_names_only_the_type() -> None:
     assert _TOKEN not in _out(hop)
 
 
-@pytest.mark.skipif(
-    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
-    reason="the marked refusal's module needs the [vault] extra (requests + urllib3)",
-)
 def test_a_refused_hop_stops_the_probe_after_one_call() -> None:
     """A hop refusal, such as the proxy leg's CA load refusal (BACKLOG #3090), would refuse the
     capabilities read the same way, so that read is not sent and the cause is reported once.
     Red with ``InsecureHopRefused`` dropped from the early-return arm: the probe then asks for
-    capabilities and the reading carries two problems. The refusal is the hop's marked type, the
-    one whose text is kept (BACKLOG #3471)."""
-    from messagefoundry.transports.strict_requests import VaultHopRefused
+    capabilities and the reading carries two problems. A base-type refusal is named by its type
+    alone (BACKLOG #3471); tests/test_b3471_key_and_hop_refusal_text.py holds the marked one."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
 
-    refusal = VaultHopRefused("Vault test hop: fixed text")
+    refusal = InsecureHopRefused("Vault test hop: fixed text")
     vault = _FakeVault(caps=_least_caps(), lookup_error=refusal)
     reading = _reading(vault)
     assert vault.asked == [], "the capabilities read was sent after the hop was refused"
-    assert reading.problems == ("token lookup-self failed: Vault test hop: fixed text",)
+    assert reading.problems == ("token lookup-self failed: InsecureHopRefused",)
 
 
 def test_a_client_that_cannot_be_built_is_unobservable_with_the_engines_own_text() -> None:

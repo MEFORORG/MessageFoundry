@@ -49,6 +49,8 @@ from tests.test_keyless_chain_every_command import shell as shell  # noqa: F401 
 
 #: What a DPAPI key file unprotects to here: base64-looking text with one byte that is not ASCII.
 _KEY_BYTES = b"c3ludGhldGljLWtleQ\xd7=="
+#: A store key with one character that is not ASCII, the same code point as that byte.
+_NON_ASCII_KEY = "c3ludGhl×dGljLWtleQ=="
 #: Every spelling of that byte a decode error's text, its repr or a print could carry.
 _BYTE_SPELLINGS = ("0xd7", "\\xd7", "\xd7")
 
@@ -152,6 +154,22 @@ def test_any_other_build_error_keeps_its_text_and_chain(monkeypatch: pytest.Monk
     assert caught.value.__cause__ is error
 
 
+def test_a_key_with_a_character_that_is_not_ascii_leaves_no_codec_error_on_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The base64 decode of such a key failed with a UnicodeEncodeError as its context, which
+    names the character and holds the whole key; the refusal carried it on its chain."""
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", raising=False)
+    with pytest.raises(StoreCipherConfigError) as caught:
+        build_store_cipher(StoreSettings(encryption_key=_NON_ASCII_KEY))
+    assert "must be valid base64" in str(caught.value)
+    _assert_no_key_byte(_whole(caught.value))
+    link: BaseException | None = caught.value
+    while link is not None:
+        assert not isinstance(link, UnicodeError), "a codec error is on the refusal's chain"
+        link = link.__cause__ or link.__context__
+
+
 @pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
 def test_the_four_commands_print_no_byte_of_the_key(
     command: str,
@@ -209,7 +227,7 @@ def test_a_key_that_does_not_resolve_is_could_not_start(
     rc = main(argv(key_file.parent))
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
-    assert "the store key could not be resolved" in captured.out, captured.out
+    assert "the store key or cipher could not be resolved" in captured.out, captured.out
     _assert_no_key_byte(captured.out + captured.err)
 
 
@@ -251,6 +269,24 @@ def test_a_vault_client_that_cannot_be_built_is_a_key_provider_error(
     text = str(caught.value)
     assert "the Vault client could not be built" in text and str(error) in text, text
     assert "envelope-decrypt" not in text, "a configuration refusal read as a Vault-side failure"
+
+
+def test_a_client_build_hop_refusal_or_library_error_keeps_no_raw_text(
+    vault_key_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unmarked hop refusal is named by its type, and an OSError is rendered by safe_exc, which
+    keeps the type and bounds the text; neither is printed as it was raised."""
+    from messagefoundry.store import keyprovider_vault
+
+    monkeypatch.setattr(keyprovider_vault, "_build_client", _raising(_host_echoing()))
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
+    assert _HOST not in str(caught.value) and "InsecureHopRefused" in str(caught.value)
+
+    monkeypatch.setattr(keyprovider_vault, "_build_client", _raising(OSError("x" * 500)))
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
+    assert "OSError" in str(caught.value) and "x" * 500 not in str(caught.value)
 
 
 def test_a_codec_error_from_the_vault_client_build_names_no_byte(
@@ -352,7 +388,7 @@ def test_provision_admin_shows_only_a_marked_cause(
     if marked:
         assert "Vault test hop: fixed text" in str(caught.value)
     else:
-        assert str(caught.value) == cli._PROVISION_AUTH_REFUSALS["reference"]
+        assert _HOST not in str(caught.value) and "InsecureHopRefused" in str(caught.value)
 
 
 @_vault

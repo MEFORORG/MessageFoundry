@@ -8596,14 +8596,18 @@ def _build_provision_auth_service(
     except SecretProviderError as exc:
         # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
         # Its text is fixed and names no part of the address, so it is shown. Only for exactly
-        # the Vault hop's marked refusal (BACKLOG #3471): any other hop refusal as the cause gets
-        # the canned line, as `vault_failure_text` keeps no other refusal's text.
+        # the Vault hop's marked refusal (BACKLOG #3471): any other hop refusal as the cause is
+        # named by its type, as `vault_failure_text` keeps no other refusal's text.
         cause = exc.__cause__
-        refusal = (
-            _sentence(cause)
-            if is_vault_hop_refusal(cause)
-            else _PROVISION_AUTH_REFUSALS["reference"]
-        )
+        if is_vault_hop_refusal(cause):
+            refusal = _sentence(cause)
+        elif isinstance(cause, InsecureHopRefused):
+            refusal = (
+                f"the [secrets] Vault hop was refused ({type(cause).__name__}); its text is not "
+                "shown, because it is not the Vault hop's own fixed refusal"
+            )
+        else:
+            refusal = _PROVISION_AUTH_REFUSALS["reference"]
     except LdapError:
         refusal = _PROVISION_AUTH_REFUSALS["ldap"]
     except FileNotFoundError:
@@ -10736,7 +10740,9 @@ def _restore_verify(args: argparse.Namespace) -> int:
             run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
         )
     except _key_unresolved() as exc:
-        # The keyring is resolved before the archive is read, so this is not a FAIL (BACKLOG #3471).
+        # The keyring is resolved before the archive is read, so this is "could not start", not a
+        # FAIL (BACKLOG #3471). A --full verify builds the cipher again for its open, outside that
+        # check's own handler, so a key error there lands here too, after the archive was read.
         return _emit_key_unresolved(exc, as_json=args.json)
     payload = {
         "status": result.status,
@@ -12024,7 +12030,9 @@ def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
     no byte of what it decoded."""
     from messagefoundry.redaction import codec_safe_str
 
-    _emit_error(f"the store key could not be resolved: {codec_safe_str(exc)}", as_json=as_json)
+    _emit_error(
+        f"the store key or cipher could not be resolved: {codec_safe_str(exc)}", as_json=as_json
+    )
     return 2
 
 

@@ -161,6 +161,7 @@ def load_protected_key(path: str | Path) -> str:
     # refusal is fixed text with no chain for a traceback to print (BACKLOG #3471).
     plain = dpapi_unprotect(blob)
     if not plain.isascii():
+        del plain  # so no frame-locals renderer finds the key on the refusal's traceback
         raise DpapiError(
             f"encryption_key_file {p} unprotected to bytes that are not ASCII, so it does not hold "
             "a base64 store key; write it again with `messagefoundry protect-key`"

@@ -3295,16 +3295,30 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
 
     **A codec error is not chained (BACKLOG #3471).** Its own text names a byte of what it decoded,
     and its ``.object`` holds all of it, so a key source that yields bytes that are not text would
-    put key material in the refusal and in any traceback of it. Such an error, or one that holds
-    one, is rendered with :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the
-    handler. Every other build error keeps its text and its chain."""
+    put key material in the refusal and in any traceback of it. Such an error, one that holds one,
+    or one with one on its chain, is rendered with
+    :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the handler. Every other
+    build error keeps its text and its chain."""
     try:
         return _build_store_cipher(settings, posture)
     except ValueError as exc:
-        if not (isinstance(exc, UnicodeError) or prints_a_codec_error(exc)):
+        if not _carries_a_codec_error(exc):
             raise StoreCipherConfigError(str(exc)) from exc
         refusal = codec_safe_str(exc)
     raise StoreCipherConfigError(refusal)
+
+
+def _carries_a_codec_error(exc: BaseException) -> bool:
+    """Whether ``exc``, or any error on its ``__cause__`` and ``__context__`` chain, is a codec
+    error or prints one (BACKLOG #3471)."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, UnicodeError) or prints_a_codec_error(link):
+            return True
+        link = link.__cause__ or link.__context__
+    return False
 
 
 class StoreCipherConfigError(ValueError):
