@@ -832,8 +832,8 @@ _SCHEMA: list[str] = [
     )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. This is the backend
-    # a real sharded deployment runs: `require_unified_store` makes a server DB mandatory past one
-    # shard. No PHI (two ids, a size and a timestamp).
+    # a real engine-sharded deployment runs: `require_unified_store` makes a server DB mandatory
+    # past one engine shard. No PHI (two ids, a size and a timestamp).
     # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
     # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
     "DROP TABLE IF EXISTS upload_quota",
@@ -8766,10 +8766,9 @@ class PostgresStore:
             applied = await conn.fetchval(
                 "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
                 f" SELECT $1::text, $2::text, $3::bigint, {_PG_EPOCH_NOW}"
-                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = $2::text)"
-                " + 1 <= $4::bigint"
-                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
-                " WHERE uploader_id = $2::text) + $3::bigint <= $5::bigint"
+                " FROM (SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                " FROM upload_reservation WHERE uploader_id = $2::text) AS held"
+                " WHERE held.n + 1 <= $4::bigint AND held.b + $3::bigint <= $5::bigint"
                 " RETURNING 1",
                 reservation_id,
                 uploader_id,
@@ -8779,10 +8778,12 @@ class PostgresStore:
             )
         return applied is not None
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
         await self._execute(
-            "DELETE FROM upload_reservation WHERE reservation_id = $1", reservation_id
+            "DELETE FROM upload_reservation WHERE reservation_id = $1 AND uploader_id = $2",
+            reservation_id,
+            uploader_id,
         )
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
