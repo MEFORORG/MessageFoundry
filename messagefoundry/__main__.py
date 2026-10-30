@@ -3230,6 +3230,7 @@ def _serve(args: argparse.Namespace) -> int:
         cert_monitor=settings.cert_monitor,
         backup=settings.backup,
         secrets=settings.secrets,
+        ai=settings.ai,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -11288,6 +11289,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        AiSettings,
         AlertsSettings,
         ApiSettings,
         ApprovalsSettings,
@@ -11304,7 +11306,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets]/[ai] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -11330,6 +11332,9 @@ def _security(args: argparse.Namespace) -> int:
     _backup = BackupSettings()
     # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
     _secrets = SecretsSettings()
+    # BACKLOG #2193 slice (e): [ai].endpoint_revocation_attested is a loosening too. Same read and
+    # marker.
+    _ai = AiSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -11345,6 +11350,7 @@ def _security(args: argparse.Namespace) -> int:
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
             _secrets = _full.secrets
+            _ai = _full.ai
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -11378,6 +11384,7 @@ def _security(args: argparse.Namespace) -> int:
                 cert_monitor=_cert_monitor,
                 backup=_backup,
                 secrets=_secrets,
+                ai=_ai,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

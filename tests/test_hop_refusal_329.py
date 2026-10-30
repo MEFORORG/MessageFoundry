@@ -182,6 +182,7 @@ def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -
 
 _HTTP_ENDPOINT = "http://ai.internal/v1/messages"
 _HTTPS_ENDPOINT = "https://ai.internal/v1/messages"
+_AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
 
 
 def _managed_ai(**over: object) -> AiSettings:
@@ -191,6 +192,10 @@ def _managed_ai(**over: object) -> AiSettings:
         "endpoint": _HTTP_ENDPOINT,
         "api_key": "sk-synthetic-key",
         "allowed_endpoints": ["ai.internal"],
+        # BACKLOG #2193 slice (e): an off-box https endpoint is otherwise refused for revocation
+        # under an enforcing posture, which would hide the cleartext refusal these tests pin.
+        "endpoint_revocation_attested": True,
+        "endpoint_revocation_attested_reason": _AI_ATTESTED_REASON,
     }
     kw.update(over)
     return AiSettings(**kw)  # type: ignore[arg-type]
@@ -214,7 +219,13 @@ def test_ai_broker_cleartext_is_refused_in_every_posture_even_with_escape(
 def test_ai_broker_https_secure_path_unaffected() -> None:
     # Negative control: an https endpoint builds through the factory and the constructor alike.
     ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT), posture=PROD_PHI)
-    AiBroker(endpoint=_HTTPS_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    AiBroker(
+        endpoint=_HTTPS_ENDPOINT,
+        api_key="k",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
 
 
 # --- The real create_app ai_chat route refuses an http endpoint at every posture ------------------

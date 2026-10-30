@@ -21,6 +21,10 @@ the vetted network call.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST); the API route awaits
   :meth:`AiBroker.chat_async`, which runs it via :func:`asyncio.to_thread`, so the engine loop never
   blocks.
+* **Revocation (BACKLOG #2193 slice (e)).** The endpoint's certificate is verified, but stdlib ssl
+  checks no CRL and no OCSP, and the shared opener carries no CRL. So an off-box endpoint is refused
+  under an enforcing or unknown posture unless ``[ai].endpoint_revocation_attested`` is set with its
+  reason: :func:`_refuse_an_unrevoked_ai_hop`.
 * **Secrets / PHI.** The prompt, the reply, and the provider ``api_key`` are NEVER logged. A failure names
   only the redacted endpoint host + HTTP status — never the request or response body (either may echo
   content or the key).
@@ -42,11 +46,20 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
+from messagefoundry.config.tls_policy import (
+    HopDisposition,
+    HopPosture,
+    RevocationHopGuard,
+    hop_url_host,
+    is_loopback_hop_host,
+    log_attested_crossing,
+)
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
 
@@ -56,6 +69,7 @@ from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _redact_url,
     find_outbound_length_violation,
+    opener_tls_context,
     refuse_url_credentials,
     url_host_label,
     url_scheme,
@@ -63,7 +77,6 @@ from messagefoundry.transports.rest import (
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
     from messagefoundry.config.settings import AiSettings
-    from messagefoundry.config.tls_policy import HopPosture
 
 __all__ = [
     "AiBroker",
@@ -79,6 +92,35 @@ logger = logging.getLogger(__name__)
 _ANTHROPIC_VERSION = "2023-06-01"
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 _DEFAULT_TIMEOUT = 60.0
+
+
+#: The cell the AI hop's revocation refusal and its log lines name. PHI-free and fixed.
+_AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
+
+#: The one way across that refusal under an enforcing posture, besides an endpoint on this machine.
+#: No CRL lever is built for this hop (owner ruling 2026-10-27, on the ADR 0173 section 12
+#: pattern), so the text offers neither ``[tls].crl_file`` nor a connection's attestation: neither
+#: reaches it, and naming either would be a remedy the operator cannot perform.
+_AI_REVOCATION_LEVER = (
+    "No CRL can reach this hop. Set [ai].endpoint_revocation_attested = true with an "
+    "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
+    "endpoint's certificate, or use an endpoint on this machine."
+)
+
+#: Each crossing line already logged, keyed by its kind and the endpoint host, so each is written
+#: once per process for each hop, as the Vault hop's are. The broker is built for every request, so
+#: without this an attested or warned hop would log a WARNING on every assist call.
+_LOGGED_CROSSINGS: set[tuple[str, str]] = set()
+_LOGGED_CROSSINGS_LOCK = threading.Lock()
+
+
+def _first_crossing(kind: str, host: str) -> bool:
+    """``True`` the first time ``(kind, host)`` is seen in this process, and ``False`` after."""
+    with _LOGGED_CROSSINGS_LOCK:
+        if (kind, host) in _LOGGED_CROSSINGS:
+            return False
+        _LOGGED_CROSSINGS.add((kind, host))
+        return True
 
 
 class AiBrokerError(ValueError):
@@ -107,6 +149,102 @@ def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
     return False
 
 
+def _refuse_an_unrevoked_ai_hop(
+    endpoint: str,
+    *,
+    posture: HopPosture | None,
+    revocation_attested: bool,
+    revocation_reason: str | None,
+) -> None:
+    """Refuse a verifying AI endpoint hop that checks no revocation and carries no attestation
+    (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
+
+    Every call sends ``[ai].api_key`` and the code sent for assistance over https that verifies
+    the endpoint's certificate. Stdlib ssl checks no CRL and no OCSP, so a revoked but unexpired
+    certificate would be accepted with no refusal and no record.
+
+    The decision is ``tls_policy.revocation_hop_disposition``, the authority every revocation
+    guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
+
+    * **On the box** is :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` on the
+      endpoint's host. Every opener dials a loopback host direct, whatever proxy it has (vault
+      BACKLOG #2579), so a proxy does not move a loopback endpoint off the box.
+    * ``revocation_attested`` goes in the per-hop ``attested`` slot. It is
+      ``[ai].endpoint_revocation_attested``, which load refuses without a reason. Only the value
+      ``True`` counts, so a truthy string cannot cross.
+    * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
+      only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
+      cross this hop under an enforcing or unknown posture.
+    * ``crl_checked`` is read off the context the broker really dials with, the https handler of
+      rest.py's shared import-time opener, never off a setting. That opener loads no CRL, so it
+      is ``False`` today, and no CRL lever is built for this hop.
+    * ``posture`` is the instance posture the caller holds, or ``None``. **An unknown posture
+      counts as enforcing**, as on the Vault hops: the broker is built per request, outside the
+      construction gate, so there is no ambient posture to read.
+
+    **The three answers.** REFUSE raises :class:`AiBrokerError`, which the route answers 503.
+    WARN crosses and logs a WARNING that names the pair; that is an off-box, unattested hop on an
+    instance whose ``[security].enforcement`` is ``warn``. ALLOW crosses; a hop that crossed an
+    enforcing or unknown posture on its attestation logs a WARNING through
+    ``tls_policy.log_attested_crossing``, with the reason. A hop on the box logs nothing, and
+    neither does a hop the process-wide variable crossed on a warn instance. Each line is written
+    once per process for each host. Any other answer refuses, so a new one fails closed.
+
+    It acts on the answer itself rather than through ``RevocationHopGuard.enforce_construction``,
+    for three reasons: that method's attested-crossing line names a connection's
+    ``tls_revocation_attested`` as the declaration, where this hop's lever is the ``[ai]`` pair; it
+    logs on every build, and the broker is built per request; and it raises
+    ``InsecureHopRefused``, which the route does not map, so a refusal would surface as an
+    unhandled 500. :class:`AiBrokerError` is answered 503."""
+    try:
+        host = hop_url_host(endpoint, cell="[ai].endpoint")
+    except ValueError as exc:
+        # hop_url_host's text names no part of the URL; this module's single error type carries it.
+        raise AiBrokerError(str(exc)) from None
+    held = HopPosture.fail_closed(enforcing=None) if posture is None else posture
+    attested = revocation_attested is True
+    on_box = is_loopback_hop_host(host)
+    # capture() reads the process-wide variable into its own field and the CRL flag off the
+    # context; disposition() asks revocation_hop_disposition, logging and raising nothing. It is
+    # never None here, since a posture is held. The texts below are this hop's own.
+    disposition = RevocationHopGuard.capture(
+        host=host,
+        cell=_AI_HOP_CELL,
+        description="sends [ai].api_key over verified https",
+        attested=attested,
+        context=opener_tls_context(_NO_REDIRECT_OPENER, connector="AI endpoint"),
+        posture=held,
+        connection=None,  # the [ai] endpoint, not a connection
+    ).disposition()
+    enforcing = held.enforcing
+    detail = (
+        f"the AI endpoint {host!r} is sent [ai].api_key over https that verifies its "
+        "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
+    )
+    if disposition is HopDisposition.ALLOW:
+        if attested and enforcing and not on_box and _first_crossing("attested", host):
+            log_attested_crossing(
+                logger,
+                crossing="verified TLS hop crossed without certificate revocation checking",
+                connection=None,
+                detail=f"{_AI_HOP_CELL}: {detail}",
+                reason=revocation_reason,
+                declaration="[ai].endpoint_revocation_attested",
+            )
+        return
+    if disposition is HopDisposition.WARN:
+        if _first_crossing("warn", host):
+            logger.warning(
+                "insecure transport hop permitted -- %s: %s; under [security].enforcement = "
+                "enforce this hop is refused unless [ai].endpoint_revocation_attested is true "
+                "with its reason",
+                _AI_HOP_CELL,
+                detail,
+            )
+        return
+    raise AiBrokerError(f"{_AI_HOP_CELL}: {detail}. {_AI_REVOCATION_LEVER}")
+
+
 class AiBroker:
     """Broker one code_only assist prompt to a customer-managed / self-hosted LLM (ADR 0135).
 
@@ -125,6 +263,9 @@ class AiBroker:
         model: str = "claude-opus-4-8",
         max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT,
+        posture: HopPosture | None = None,
+        revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
     ) -> None:
         if not endpoint:
             raise AiBrokerError(
@@ -170,6 +311,14 @@ class AiBroker:
                 f"[ai] {violation.kind} is {violation.length} chars, over the "
                 f"{violation.limit}-char limit; check [ai].endpoint / the api_key env() value"
             )
+        # Last, so an endpoint refused for any reason above never logs a revocation crossing, and
+        # the operator is never sent to attest a hop that is refused anyway (BACKLOG #2193 (e)).
+        _refuse_an_unrevoked_ai_hop(
+            endpoint,
+            posture=posture,
+            revocation_attested=revocation_attested,
+            revocation_reason=revocation_attested_reason,
+        )
         self.endpoint = endpoint
         self.api_key = api_key
         self.provider = provider or "claude"
@@ -292,14 +441,16 @@ def ai_broker_from_settings(ai: AiSettings, *, posture: HopPosture | None = None
     when the engine broker is not fully configured. Settings arrive already ``env()``-resolved (the API
     lifespan stashes the resolved :class:`AiSettings` on ``app.state.ai``).
 
-    ``posture`` is not read. It clamped the insecure-TLS escape on the cleartext-http refusal (#329),
-    and no escape reaches that refusal since vault BACKLOG #3533 item 5. The create_app ai_chat route
-    in ``api/app.py`` still passes it; drop the parameter with that argument."""
-    del posture
+    ``posture`` keys the revocation refusal (BACKLOG #2193 slice (e)), and ``None`` counts as
+    enforcing there: :func:`_refuse_an_unrevoked_ai_hop` says why. It no longer reaches the
+    cleartext-http refusal, which takes no escape in any posture since vault BACKLOG #3533 item 5."""
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",
         allowed_endpoints=list(ai.allowed_endpoints),
         provider=ai.provider,
         model=ai.model,
+        posture=posture,
+        revocation_attested=ai.endpoint_revocation_attested,
+        revocation_attested_reason=ai.endpoint_revocation_attested_reason,
     )

@@ -113,6 +113,7 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         "_refuse_idp_revocation",
         "idp_revocation_guards",
         "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
+        "_refuse_an_unrevoked_ai_hop",  # transports/ai_broker.py, the AI endpoint (BACKLOG #2193)
         # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
         "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
         "mount_strict_reply_adapter",
@@ -203,6 +204,14 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
+    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
+        note="the AI endpoint, through _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). No "
+        "CRL lever is built for this hop, so off the box it crosses an enforcing posture only on "
+        "its [ai].endpoint_revocation_attested pair; an unknown posture counts as enforcing"
+    ),
+    "messagefoundry/transports/ai_broker.py::_refuse_an_unrevoked_ai_hop": Guarded(
+        note="reads the shared opener's own context and decides through RevocationHopGuard.capture"
+    ),
     "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
         note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
     ),
@@ -220,9 +229,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         f"the [alerts] SMTP sink and the security notifier, built outside every "
         f"active_hop_posture scope. A guard could take the posture explicitly, as the syslog "
         f"forwarder's does; none is built: {_UNGATED}"
-    ),
-    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
-        f"the AI-broker endpoint: {_UNGATED}"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(

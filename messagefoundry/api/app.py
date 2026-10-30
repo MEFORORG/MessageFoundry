@@ -2032,6 +2032,9 @@ def _posture_loosenings(
             # Vault BACKLOG #2983: the secret provider's Vault revocation attestation, off the
             # [secrets] section the managed lifespan stashed. The same stash-or-default rule.
             secrets=getattr(state, "secrets_settings", None) or SecretsSettings(),
+            # BACKLOG #2193 slice (e): the AI endpoint's revocation attestation, off the [ai]
+            # section create_app stashed. The same stash-or-default rule.
+            ai=getattr(state, "ai", None) or AiSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -4521,11 +4524,11 @@ def create_app(
             )
         # Build the broker from the SERVER's settings (never the request body). The SSRF endpoint-allowlist
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
-        # #329: thread the derived instance posture (the same _phi_read_posture derived at create_app time
-        # from ai_settings, which == app.state.ai == `ai` on the managed path) so the broker's cleartext-
-        # http credential refusal is clamped on an enforcing-PHI instance — the escape can no longer put
-        # the api_key on the wire. Without this the route would build the broker with an unclamped escape
-        # (green and inert), the exact failure mode #329 exists to close.
+        # BACKLOG #2193 slice (e): the derived instance posture (the same _phi_read_posture derived at
+        # create_app time from ai_settings, which == app.state.ai == `ai` on the managed path) keys
+        # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
+        # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
+        # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         try:
             broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
