@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter, check_http_intake_auth
 from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpRequestError, HttpSource
-from tests.test_api_tls import _NOW, _dn, _new_ca, _pem
+from tests.test_api_tls import _NOW, _CaPair, _dn, _new_ca, _pem
 
 KEY = "acme-intake-key"
 #: The issuing CA's DN that keys ``intake_client_subjects`` (vault BACKLOG #2287).
@@ -621,9 +621,8 @@ def _peercert(common_name: str) -> dict[str, object]:
     return {"subject": ((("commonName", common_name),),)}
 
 
-def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes]:
-    """A real index over a CA named :data:`PARTNER_CA`, and the DER of a leaf that CA signed."""
-    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
+def _leaf_der(ca: _CaPair) -> bytes:
+    """The DER of a leaf ``ca`` signed."""
     leaf_key = ec.generate_private_key(ec.SECP256R1())
     leaf = (
         x509.CertificateBuilder()
@@ -635,8 +634,16 @@ def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes]:
         .not_valid_after(_NOW + datetime.timedelta(days=1))
         .sign(ca[1], hashes.SHA256())
     )
+    return leaf.public_bytes(serialization.Encoding.DER)
+
+
+def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes, bytes]:
+    """A real index over a CA named :data:`PARTNER_CA`, the DER of a leaf that CA signed, and the
+    DER of a leaf an unloaded CA carrying the SAME name signed."""
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
+    unloaded = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
     index = IssuerIndex(_pem(ca[0]).decode("ascii"))
-    return index, leaf.public_bytes(serialization.Encoding.DER)
+    return index, _leaf_der(ca), _leaf_der(unloaded)
 
 
 def test_valid_chain_unlisted_subject_is_403() -> None:
@@ -660,7 +667,7 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
         )
     )
     # Without tls the listener loads no client CA, so it holds no index; give it a real one.
-    src._issuer_index, der = _partner_ca_index_and_leaf()
+    src._issuer_index, der, foreign = _partner_ca_index_and_leaf()
 
     # A chain the CA signed, carrying an allow-listed subject: accepted.
     assert src._authorize_peer_cert(_writer(_peercert("partner.example"), der), "10.0.0.1") is None
@@ -679,9 +686,13 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
     assert missing.kind == "intake_auth_failed"
 
     # A listed subject whose leaf no loaded CA signed names no issuer, so it is refused too.
-    unsigned = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
+    unsigned = src._authorize_peer_cert(_writer(_peercert("partner.example"), foreign), "10.0.0.1")
     assert isinstance(unsigned, HttpRequestError)
     assert unsigned.status == 403
+    # ... and so is one presenting no leaf bytes at all.
+    no_der = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
+    assert isinstance(no_der, HttpRequestError)
+    assert no_der.status == 403
 
     # A spoofed commonName cannot collide with a pinned SAN — the namespaces are disjoint.
     src._intake_subjects = {PARTNER_CA: {"SAN:DNS:partner.example": "SAN:DNS:partner.example"}}

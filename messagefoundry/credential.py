@@ -34,7 +34,6 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
-    "CERT_NAME_PREFIXES",
     "QUALIFIED_CERT_NAME",
     "VERIFIED_ISSUER_KEY",
     "constant_time_equal",
@@ -125,10 +124,6 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
     b_bytes = b.encode("utf-8", "surrogatepass") if isinstance(b, str) else b
     return hmac.compare_digest(a_bytes, b_bytes)
 
-
-#: The qualified name spaces :func:`cert_name_candidates` yields. A configured name outside them can
-#: never match, so the loaders that take one refuse it.
-CERT_NAME_PREFIXES = ("CN:", "SAN:")
 
 #: A configured name :func:`cert_name_candidates` can actually yield: ``CN:<value>`` or
 #: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).

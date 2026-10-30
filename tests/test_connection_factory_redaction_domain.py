@@ -176,7 +176,16 @@ def _takes_a_spec(fn: Any) -> bool:
 GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {
     ("FHIR", "allowed_entry_methods"): (["POST"], {"interaction": "transaction"}),
     ("FHIR", "allowed_entry_types"): (["Patient"], {"interaction": "transaction"}),
-    ("Http", "intake_client_subjects"): ({"CN=Probe CA": ["CN:x-probe"]}, {}),
+    # mtls_subject and its TLS settings, or the factory refuses the table and the walk sees none.
+    ("Http", "intake_client_subjects"): (
+        {"CN=Probe CA": ["CN:x-probe"]},
+        {
+            "intake_auth": "mtls_subject",
+            "tls": True,
+            "tls_cert_file": "server.pem",
+            "tls_ca_file": "ca.pem",
+        },
+    ),
 }
 
 
@@ -411,6 +420,11 @@ HANDLED_CONTAINERS: dict[str, str] = {
     "allowed_entry_types": (
         "FHIR resource TYPE names a Bundle entry may name (vault BACKLOG #2804) -- ASCII letters "
         "only by construction, public by nature"
+    ),
+    "intake_client_subjects": (
+        "issuing-CA DNs mapped to certificate subject names that may submit (vault BACKLOG #2287) -- "
+        "topology, not a secret (ADR 0154 D6): both are in every handshake's certificates, and "
+        "masking them would hide the access-control decision from the operator who audits it"
     ),
 }
 

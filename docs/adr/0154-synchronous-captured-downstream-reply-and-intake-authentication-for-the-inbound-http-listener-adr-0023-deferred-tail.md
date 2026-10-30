@@ -1360,6 +1360,9 @@ one `Http()` listener would have let any of them speak for any listed partner.
   of an issuing CA, as `cryptography`'s `Name.rfc4514_string()` renders that CA's subject, and each
   value is a list of qualified subject names. The factory holds a key to the same canonical-form round
   trip the API loader uses (`pki.canonical_dn`), and refuses one that does not round-trip to itself.
+- **The table is refused outside `mtls_subject`.** D6 already refused it under `none`, as a control
+  configured but never consulted. `api_key` and `bearer` never read a certificate either, so they now
+  refuse it too.
 - **The flat list is refused, with no compatibility shim.** It is refused at load with a message naming
   the table to write. Nothing is deployed, so the break costs no one.
 - **The factory checks the whole shape itself.** The `connections.toml` type check stops one level in,

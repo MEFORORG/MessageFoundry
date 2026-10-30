@@ -3093,7 +3093,9 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
     * an unqualified subject entry — ``cert_name_candidates`` yields ``"CN:<v>"`` / ``"SAN:DNS:<v>"``, so
       a bare ``partner.example`` matches nothing and 403s every request from the very partner it names;
     * a credential configured while ``intake_auth="none"`` — nothing would ever check it, and an
-      operator reading that config would reasonably believe the listener was protected.
+      operator reading that config would reasonably believe the listener was protected;
+    * ``intake_client_subjects`` under ``api_key`` or ``bearer`` — the same reason: only
+      ``mtls_subject`` reads a client certificate (vault BACKLOG #2287).
 
     The secret itself must be an ``env()`` reference with no default and no cast, mirroring
     ``File(credential_password=...)`` (ADR 0132): a fallback credential is a silent credential.
