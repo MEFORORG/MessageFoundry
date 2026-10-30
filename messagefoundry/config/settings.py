@@ -4803,6 +4803,14 @@ def vault_revocation_attestations(
     ]
 
 
+#: What each ``[alerts]`` hop's own handshake can check, for its loosening entry (BACKLOG #2193):
+#: a CRL reaches the SMTP hop's context, and none can reach the webhook's import-time opener.
+_ALERT_HOP_CRL_NOTE: Final[dict[str, str]] = {
+    "alerts.email_tls_revocation_attested": "and no CRL unless [tls].crl_file is set",
+    "alerts.webhook_tls_revocation_attested": "and no CRL, which cannot reach this hop",
+}
+
+
 def alert_revocation_attestations(alerts: AlertsSettings) -> list[tuple[str, str, str | None]]:
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers and
     its reason (BACKLOG #2193). The ``[alerts]`` sibling of :func:`vault_revocation_attestations`,
@@ -10334,10 +10342,10 @@ def security_loosenings(
             switch,
             f"revocation of the certificate of {hop} is attested as covered outside the engine "
             f"(reason: {reason}) -- the engine verifies that certificate but its own handshake "
-            "checks no OCSP, and no CRL unless [tls].crl_file reaches the SMTP hop; the "
-            "attestation adds no check. Wherever the revocation refusal would apply to that hop it "
-            "is lifted, so a revoked certificate is caught only if what the reason names really "
-            "covers it. It never lifts a cleartext or verify-off refusal",
+            f"checks no OCSP, {_ALERT_HOP_CRL_NOTE[switch]}; the attestation adds no check. "
+            "Wherever the revocation refusal would apply to that hop it is lifted, so a revoked "
+            "certificate is caught only if what the reason names really covers it. It never lifts "
+            "a cleartext or verify-off refusal",
         )
         for switch, hop, reason in alert_revocation_attestations(alerts)
     )

@@ -389,6 +389,8 @@ def _refuse_webhook_revocation(
     is no certificate, and the cleartext refusal owns that hop."""
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         return
+    if posture is None and current_hop_posture() is None:
+        return  # the unstamped no-op, before hop_url_host can refuse anything (as the SMTP guard)
     RevocationHopGuard.capture(
         # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
         # refused before this runs (refuse_url_credentials).

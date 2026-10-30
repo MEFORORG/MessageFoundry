@@ -1454,6 +1454,42 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   partial and lists no attestation from that file.
 - **Reversible:** yes. Delete both lines and restart. An off-box Vault hop then refuses again.
 
+### `[alerts].email_tls_revocation_attested = true` or `[alerts].webhook_tls_revocation_attested = true` — revocation of an alert hop's certificate is taken on trust
+> **Settings-scoped, one pair per hop** (BACKLOG #2193, owner ruling 2026-10-27). The `email`
+> pair covers the `[alerts]` SMTP relay when `email_username` is set, for the alert notifier, the
+> per-user security notifier and the alerts test send. The `webhook` pair covers the https
+> `webhook_url`. Each flag needs its own `_reason`.
+- **What the engine refuses without it:** each hop verifies the peer's certificate, and its
+  handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
+  off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
+  A relay with no login takes no guard at all, so the `email` pair does nothing there.
+- **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
+  offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
+  instance's own posture. A build that holds no posture, such as an embedding that passes no
+  `[ai]`, does not refuse: it is the unstamped no-op the LDAPS bind and the OIDC legs share. This
+  differs from the Vault pairs above, where no posture counts as enforcing.
+- **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
+  something outside the engine stops it. The SMTP hop carries the login password; the webhook
+  carries its path token. **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** for the SMTP relay, prefer `[tls].crl_file`,
+  which reaches that hop and adds a real check. For the webhook no CRL can reach the hop, so the
+  flag is the only way across, and the honest basis is the same as for the Vault hops: a
+  short-lived certificate, with its lifetime in the reason. A public SaaS webhook host's
+  certificate is issued by a public CA you do not run; say what you relied on.
+- **What it cannot do:** it never lifts the cleartext or verify-off refusals, and a login is
+  refused outright beside either. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross these hops under
+  `enforce`; under `warn` it turns the WARNING into a silent crossing.
+- **How it is reported:** `security_loosenings()` names it as `alerts.email_tls_revocation_attested`
+  or `alerts.webhook_tls_revocation_attested`, with the reason, so `security show`,
+  `GET /security/posture` and the serve-time loosening WARNING list it. It is named whenever the
+  flag is set, whether or not the hop it covers is configured. A hop that crosses an enforcing
+  posture on it logs a WARNING carrying the reason. That line names the declaration as
+  `tls_revocation_attested`, the shared guard's spelling, with no connection; its cell names the
+  `[alerts]` hop. `messagefoundry check` has no line for these pairs.
+- **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
+  holding a control character or a lone surrogate is refused.
+- **Reversible:** yes. Delete both lines and restart.
+
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
 > (vault BACKLOG #2599). It is honoured only when `MEFOR_SECURITY_ENFORCEMENT=warn` is set in the

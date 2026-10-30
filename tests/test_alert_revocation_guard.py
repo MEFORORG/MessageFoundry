@@ -428,7 +428,14 @@ def _engine_builds(name: str) -> list[tuple[str, ast.Call]]:
         if name not in source:
             continue
         rel = path.relative_to(_ROOT).as_posix()
-        found.extend((rel, call) for call in call_sites(parse_source(source), name))
+        tree = parse_source(source)
+        found.extend((rel, call) for call in call_sites(tree, name))
+        # A build handed to a worker thread, as the alerts test send does: to_thread(name, ...).
+        found.extend(
+            (rel, call)
+            for call in call_sites(tree, "to_thread")
+            if call.args and isinstance(call.args[0], ast.Name) and call.args[0].id == name
+        )
     return found
 
 
@@ -448,20 +455,83 @@ def test_every_engine_build_passes_a_posture(name: str) -> None:
     assert not missing, f"{name} built with no posture: {missing}"
 
 
-def test_the_alerts_test_send_reads_the_posture_a_live_alert_reads() -> None:
-    """The test-email route's EmailTransport reads ``app.state.alert_hop_posture``, which the
-    lifespan sets to the posture it hands the live notifier. A diagnostic on another posture
-    would pass a relay the live sink refuses."""
+def test_the_lifespan_hands_the_test_send_its_posture() -> None:
+    """The lifespan stores the posture it hands the live notifier where the test-email route
+    reads it. Read from source: building the managed lifespan here would start an engine. The
+    route's own behaviour is the test below."""
     source = (_ROOT / "messagefoundry" / "api" / "app.py").read_text(encoding="utf-8")
     assert "app.state.alert_hop_posture = _hop_posture" in source
-    assert 'getattr(request.app.state, "alert_hop_posture", None)' in source
+
+
+async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
+    tmp_path: Path,
+) -> None:
+    """On the posture a live alert reads, the test send meets the same refusal and reports it as a
+    failed test, not a 500, so it cannot pass a relay the live sink refuses."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    engine = await Engine.create(
+        tmp_path / "alerts.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        alerts = AlertsSettings(
+            email_smtp_host=RELAY,
+            email_from="alerts@example.test",
+            email_to=["ops@example.test"],
+            email_username="alerts-relay",
+            email_password="synthetic-not-a-secret",
+        )
+        app = create_app(engine, allow_no_auth=True, alerts_settings=alerts)
+        app.state.alert_hop_posture = ENFORCING
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            reply = await client.post("/alerts/test-email")
+        assert reply.status_code == 200
+        body = reply.json()
+        assert body["success"] is False
+        assert "revocation" in (body["detail"] or ""), body
+        assert "synthetic-not-a-secret" not in reply.text
+    finally:
+        await engine.stop()
+
+
+def test_an_offline_notifier_with_no_posture_reads_the_instance_posture(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``admin reset-totp`` passes no posture. The offline notifier then derives the instance's
+    own, so the guard refuses (and the notice is dropped with a WARNING) rather than being the
+    unstamped no-op."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import ServiceSettings
+
+    alerts = AlertsSettings(
+        email_smtp_host=RELAY,
+        email_from="alerts@example.test",
+        email_username="alerts-relay",
+        email_password="synthetic-not-a-secret",
+    )
+    assert _offline_security_notifier(ServiceSettings(alerts=alerts)) is None
+    assert "revocation" in capsys.readouterr().err
+    attested = alerts.model_copy(
+        update={
+            "email_tls_revocation_attested": True,
+            "email_tls_revocation_attested_reason": REASON,
+        }
+    )
+    assert _offline_security_notifier(ServiceSettings(alerts=attested)) is not None
 
 
 def test_the_guarded_send_still_sends(monkeypatch: pytest.MonkeyPatch) -> None:
     """An admitted login is not otherwise changed: the send still runs STARTTLS then AUTH."""
     from tests.test_alert_smtp_tls import _RecordingSMTP
 
-    _RecordingSMTP.captured = {}
+    # Class state shared with tests/test_alert_smtp_tls.py: reset here, restored after.
+    monkeypatch.setattr(_RecordingSMTP, "captured", {})
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks.smtplib.SMTP", _RecordingSMTP)
     transport = _email(ENFORCING, revocation_attested=True, revocation_attested_reason=REASON)
     asyncio.run(transport.send({"type": "connection_stopped", "connection": "OB_X"}))

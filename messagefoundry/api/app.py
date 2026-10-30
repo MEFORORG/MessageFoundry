@@ -6289,7 +6289,11 @@ def create_app(
                 literal=alerts.email_password,
                 label="[alerts].email_password",
             )
-            transport = EmailTransport(
+            tls_settings = getattr(request.app.state, "tls_settings", None)
+            # Built off the event loop (BACKLOG #2193): with a login, the constructor's revocation
+            # guard builds the hop's TLS context, which reads the trust store and any CRL from disk.
+            transport = await asyncio.to_thread(
+                EmailTransport,
                 host=alerts.email_smtp_host,
                 port=alerts.email_smtp_port,
                 sender=alerts.email_from,
@@ -6308,12 +6312,7 @@ def create_app(
                 # about. Same fields, same source, same factory.
                 tls_verify=alerts.email_tls_verify,
                 tls_ca_file=alerts.email_tls_ca_file,
-                trust_anchor_policy=(
-                    tls_settings.policy()
-                    if (tls_settings := getattr(request.app.state, "tls_settings", None))
-                    is not None
-                    else None
-                ),
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
                 # BACKLOG #2193: the login's revocation guard too, on the posture a live alert
                 # reads, so this test cannot pass a relay the live sink would refuse.
                 posture=getattr(request.app.state, "alert_hop_posture", None),
