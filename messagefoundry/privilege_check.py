@@ -123,7 +123,11 @@ class HopPrivilege:
 
     ``refusing`` holds the over-grant reasons in the class that refuses a start under ``enforce``
     (ADR 0216). Only a Vault hop fills it; it is empty for every other hop, and for a Vault hop
-    whose over-grants are all in the warning class."""
+    whose over-grants are all in the warning class.
+
+    ``unexcused`` names each probe failure on a Vault hop that is not a network failure, a timeout
+    or a 403 (:func:`~messagefoundry.privilege_probes.excused_failure`). It left the token unjudged,
+    so it refuses a start under ``enforce`` (:func:`vault_preflight_outcome`)."""
 
     hop: str
     state: HopState
@@ -131,6 +135,7 @@ class HopPrivilege:
     minimal: str
     detail: str
     refusing: tuple[str, ...] = ()
+    unexcused: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, str | list[str]]:
         return {
@@ -140,6 +145,7 @@ class HopPrivilege:
             "minimal": self.minimal,
             "detail": self.detail,
             "refusing": list(self.refusing),
+            "unexcused": list(self.unexcused),
         }
 
 
@@ -482,7 +488,13 @@ def vault_hop(
     # carries the value itself (json.dumps escapes it there).
     detail = ". ".join(parts)
     return HopPrivilege(
-        consumer.hop, state, consumer.identity, consumer.minimal, detail, refusing=tuple(grave)
+        consumer.hop,
+        state,
+        consumer.identity,
+        consumer.minimal,
+        detail,
+        refusing=tuple(grave),
+        unexcused=reading.unexcused,
     )
 
 
@@ -516,31 +528,47 @@ def vault_preflight_outcome(
     preflight and ``check-privileges`` cannot disagree.
 
     A hop with no finding is CLEAN. Under ``enforcement = warn`` every finding warns. Under
-    ``enforce`` a grant in the refusing class refuses unless ``over_grant_accepted``
-    (``[security].allow_over_granted_vault_token``) accepts it; the warning class and an
-    unobservable probe warn. The outcomes are the store preflight's own
-    :class:`~messagefoundry.store.privilege.PreflightOutcome`.
-
-    This judges the grants seen. The startup preflight also refuses, under ``enforce``, a hop whose
-    probe failed for a reason other than a network failure, a timeout or a 403
-    (:func:`~messagefoundry.privilege_probes.excused_failure`), because that token was never
-    judged; ``check-privileges`` reports such a hop as one it could not read."""
+    ``enforce`` a probe failure in :attr:`HopPrivilege.unexcused` refuses, whatever the opt-out
+    says: the opt-out accepts a grant that was seen, and that token was never fully read. Otherwise
+    a grant in the refusing class refuses unless ``over_grant_accepted``
+    (``[security].allow_over_granted_vault_token``) accepts it, and the warning class and a probe
+    stopped by a network failure, a timeout or a 403 warn. The outcomes are the store preflight's
+    own :class:`~messagefoundry.store.privilege.PreflightOutcome`."""
     if hop.state not in (HopState.OVER_GRANTED, HopState.UNOBSERVABLE):
         return PreflightOutcome.CLEAN
-    if not enforcing or not hop.refusing:
+    if not enforcing:
+        return PreflightOutcome.WARN
+    if hop.unexcused:
+        return PreflightOutcome.REFUSE
+    if not hop.refusing:
         return PreflightOutcome.WARN
     return PreflightOutcome.ACCEPTED if over_grant_accepted else PreflightOutcome.REFUSE
 
 
-def vault_refusal_reason(hops: Iterable[str]) -> str:
-    """Why :attr:`PreflightOutcome.REFUSE` applies to the named Vault hops, in the words the
-    refusal and ``check-privileges`` both print."""
-    return (
-        f"a Vault token on {', '.join(hops)} holds the root policy or a grant on an administrative "
-        "path, under [security].enforcement = 'enforce'. Reduce the token's policy to the grant "
-        f"docs/SECURITY.md prescribes, or set {VAULT_OVER_GRANT_OPT_OUT} = true to accept it "
-        "(audited)"
-    )
+def vault_refusal_reason(hops: Iterable[HopPrivilege], *, over_grant_accepted: bool) -> str:
+    """Why :attr:`PreflightOutcome.REFUSE` applies to the given Vault hops, every cause, in the
+    words the refusal and ``check-privileges`` both print. A hop holding a grave grant and an
+    unexcused failure is named under both, so fixing one cause does not reveal the other only at
+    the next start."""
+    hops = list(hops)
+    granted = [h.hop for h in hops if h.refusing and not over_grant_accepted]
+    unjudged = [h.hop for h in hops if h.unexcused]
+    reasons: list[str] = []
+    if granted:
+        reasons.append(
+            f"a Vault token on {', '.join(granted)} holds the root policy or a grant on an "
+            "administrative path, under [security].enforcement = 'enforce'. Reduce the token's "
+            f"policy to the grant docs/SECURITY.md prescribes, or set {VAULT_OVER_GRANT_OPT_OUT} "
+            "= true to accept it (audited)"
+        )
+    if unjudged:
+        reasons.append(
+            f"the Vault privilege probe on {', '.join(unjudged)} failed for a reason that is not a "
+            "network failure, a timeout or a 403, so the token was never judged, under "
+            f"[security].enforcement = 'enforce'. {VAULT_OVER_GRANT_OPT_OUT} does not accept "
+            "this. Fix the cause the preflight's warning names"
+        )
+    return "; and ".join(reasons)
 
 
 # --- LDAP: the AD bind account ------------------------------------------------------------------
@@ -769,27 +797,30 @@ def serve_verdict(
     hops = list(hops)
     security = settings.security
     enforcing = security.enforcement is SecurityEnforcement.ENFORCE
+    accepting = security.allow_over_granted_vault_token
     vault: dict[PreflightOutcome, list[str]] = {}
-    unread: list[str] = []
+    refused_hops: list[HopPrivilege] = []
+    unread: list[HopPrivilege] = []
     for h in hops:
         if not h.hop.startswith("vault"):
             continue
         if h.state is HopState.UNOBSERVABLE:
             # Not "warns only": what this run could not read says nothing about the token serve
-            # will read, which may be a different one (a scheduled task often lacks it).
-            unread.append(h.hop)
+            # will read, which may be a different one (a scheduled task often lacks it). That holds
+            # for an unexcused failure too, such as an unset token variable here.
+            unread.append(h)
             continue
-        outcome = vault_preflight_outcome(
-            h, enforcing=enforcing, over_grant_accepted=security.allow_over_granted_vault_token
-        )
+        outcome = vault_preflight_outcome(h, enforcing=enforcing, over_grant_accepted=accepting)
         vault.setdefault(outcome, []).append(h.hop)
+        if outcome is PreflightOutcome.REFUSE:
+            refused_hops.append(h)
     store_outcome, store = _store_verdict(report, settings)
-    refused = vault.get(PreflightOutcome.REFUSE, [])
     notes: list[str] = []
-    if refused and store_outcome is PreflightOutcome.REFUSE:
-        verdict = f"{store}; and {vault_refusal_reason(refused)}"
-    elif refused:
-        verdict = f"would REFUSE to start: {vault_refusal_reason(refused)}"
+    why = vault_refusal_reason(refused_hops, over_grant_accepted=accepting)
+    if refused_hops and store_outcome is PreflightOutcome.REFUSE:
+        verdict = f"{store}; and {why}"
+    elif refused_hops:
+        verdict = f"would REFUSE to start: {why}"
         if store_outcome is not PreflightOutcome.CLEAN:
             # An accepted or warned store finding must not drop out of the line because a Vault
             # token refuses first.
@@ -805,9 +836,14 @@ def serve_verdict(
         notes.append(f"{', '.join(warned)} warns only; it does not refuse a start")
     if unread:
         notes.append(
-            f"{', '.join(unread)} could not be read here, so this line cannot say what serve "
-            "would do with it; serve reads the token again at start"
+            f"{', '.join(h.hop for h in unread)} could not be read here, so this line cannot say "
+            "what serve would do with it; serve reads the token again at start"
         )
+        if enforcing and any(h.unexcused for h in unread):
+            notes.append(
+                "a probe failure other than a network failure, a timeout or a 403 refuses an "
+                "enforcing start if serve's own probe meets it"
+            )
     ungated = [
         h.hop
         for h in hops

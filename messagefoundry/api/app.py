@@ -11666,7 +11666,9 @@ def create_managed_app(
         # probe check-privileges runs and a client from the provider's own constructor, in the same
         # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
         # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
-        # it (audited); every other finding warns and audits. It names the consumers from the
+        # it (audited), and so does a probe failure that is not a network failure, a timeout or a
+        # 403, which the opt-out does not lift; every other finding warns and audits
+        # (vault_preflight_outcome). It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has
         # no Vault consumer this lifespan could name.
         _security = security_settings or SecuritySettings()

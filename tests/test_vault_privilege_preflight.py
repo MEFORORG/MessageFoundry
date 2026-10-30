@@ -452,23 +452,94 @@ async def test_a_network_timeout_or_403_failure_only_warns_under_enforce(
 def test_the_real_library_classes_are_excused() -> None:
     """The fakes above stand in for these: requests' timeouts and connection errors are OSErrors,
     and hvac's 403 is ``Forbidden``. A change to either library that moves them fails here."""
+    import socket
+
+    from messagefoundry.privilege_probes import excused_failure
+    from messagefoundry.transports.bounded_read import TruncatedResponseError
+
     hvac_exceptions = pytest.importorskip("hvac.exceptions")
     requests = pytest.importorskip("requests")
-    from messagefoundry.privilege_probes import excused_failure
 
     for error in (
         requests.ConnectionError("synthetic"),
         requests.ConnectTimeout("synthetic"),
         requests.ReadTimeout("synthetic"),
+        requests.exceptions.ChunkedEncodingError("synthetic"),
+        requests.exceptions.ProxyError("synthetic"),
+        TruncatedResponseError("synthetic"),
+        socket.gaierror("synthetic"),
         hvac_exceptions.Forbidden("synthetic"),
     ):
         assert excused_failure(error), type(error).__name__
+    # Configuration and code, not the network: OSErrors among them are not excused for being one.
     for error in (
+        requests.exceptions.InvalidHeader("synthetic"),
+        requests.exceptions.InvalidURL("synthetic"),
+        requests.exceptions.MissingSchema("synthetic"),
+        requests.exceptions.SSLError("synthetic"),
+        FileNotFoundError("synthetic"),
         hvac_exceptions.InternalServerError("synthetic"),
         TypeError("synthetic"),
         AttributeError("synthetic"),
     ):
         assert not excused_failure(error), type(error).__name__
+
+
+def test_an_unexcused_failure_is_named_once_however_often_it_recurs() -> None:
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    def unset() -> str:
+        raise KeyProviderError("synthetic: the variable is not set")
+
+    def no_paths() -> dict[str, frozenset[str]]:
+        raise KeyProviderError("synthetic: the key name is not set")
+
+    reading = read_vault_token(unset, unset, lambda a, t: _FakeVault(), no_paths)
+    assert reading.unexcused == ("KeyProviderError",)
+    assert len(reading.problems) == 3
+
+
+def _over_granted_and_unjudged(**kwargs: Any) -> Any:
+    """A token whose lookup read and showed a grant, and whose capabilities read then failed with
+    a code defect."""
+    hop = _hop(caps_error=TypeError("synthetic"), **kwargs)
+    assert hop.unexcused == ("TypeError",)
+    return hop
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_check_privileges_and_serve_agree_on_a_read_hop_with_an_unexcused_failure(
+    accepted: bool,
+) -> None:
+    """Review round one: serve refused a hop that check-privileges said would start, because the
+    failure was judged outside the shared decision. Both now read it from vault_preflight_outcome,
+    and the opt-out lifts neither."""
+    hop = _over_granted_and_unjudged(policies=("root",))
+    assert hop.state is HopState.OVER_GRANTED
+    assert vault_preflight_outcome(hop, enforcing=True, over_grant_accepted=accepted) is (
+        PreflightOutcome.REFUSE
+    )
+    settings = _VAULT_SETTINGS.model_copy(
+        update={"security": SecuritySettings(allow_over_granted_vault_token=accepted)}
+    )
+    verdict = serve_verdict(_sqlite_report(), settings, [hop])
+    assert verdict.startswith("would REFUSE to start")
+    assert "not a network failure" in verdict
+    # Without the opt-out the grave grant is named too, so fixing one cause does not hide the other.
+    assert ("holds the root policy" in verdict) is (not accepted)
+
+
+async def test_the_refusal_names_both_causes_of_one_hop() -> None:
+    with pytest.raises(VaultPrivilegeError) as refused:
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            _AuditStore(),
+            enforcing=True,
+            over_grant_accepted=False,
+            probe=_probe(_FakeVault(policies=("root",), caps_error=TypeError("synthetic"))),
+        )
+    assert "holds the root policy" in str(refused.value)
+    assert "not a network failure" in str(refused.value)
 
 
 @pytest.mark.parametrize("enforcing", [True, False])

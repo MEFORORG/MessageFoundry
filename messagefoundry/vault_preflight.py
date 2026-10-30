@@ -12,15 +12,12 @@ replaced between the store open and this read is the one judged. It judges the r
 :func:`messagefoundry.privilege_check.vault_hops`.
 
 **What it refuses is** :func:`~messagefoundry.privilege_check.vault_preflight_outcome` **and nothing
-else.** Under ``[security].enforcement = enforce`` a grant in the refusing class -- the root policy,
-any grant on an administrative path, a Transit key's ``config``, ``rotate``, ``export`` or
-``backup`` -- refuses the start, unless ``[security].allow_over_granted_vault_token`` accepts it
-(audited). Every other over-grant warns and writes an audit row. So does a probe that could not
-observe the token for a reason the ruling excuses: a network failure, a timeout or a 403
-(:func:`~messagefoundry.privilege_probes.excused_failure`). Any other failure -- a ``TypeError``
-after an hvac signature drift, an engine refusal, any other Vault error -- left the token unjudged,
-so under ``enforce`` it refuses the start, and the opt-out does not lift that refusal. Under
-``warn`` nothing refuses.
+else**, which ADR 0216 and ``docs/SECURITY.md`` (*What serve does with a Vault finding*) describe:
+under ``[security].enforcement = enforce``, a grant in the refusing class unless
+``[security].allow_over_granted_vault_token`` accepts it (audited), and a probe failure that is not
+a network failure, a timeout or a 403 (:func:`~messagefoundry.privilege_probes.excused_failure`),
+which the opt-out does not lift. Every other finding warns and writes an audit row. Under ``warn``
+nothing refuses.
 
 **Not here yet:** the alert, with its auto-resolving inverse, that the row also asks for. It needs
 a new alert event type in the notifier, which is a separate slice.
@@ -75,8 +72,9 @@ _AUDIT_DETAIL_LIMIT = 2000
 
 
 class VaultPrivilegeError(RuntimeError):
-    """Raised by the preflight when a Vault token holds a grant in the refusing class under
-    ``enforce``, with no accepted opt-out. The caller refuses to start before any listener binds."""
+    """Raised by the preflight when ``vault_preflight_outcome`` refuses a Vault hop under
+    ``enforce``: a grant in the refusing class with no accepted opt-out, or an unexcused probe
+    failure. The caller refuses to start before any listener binds."""
 
 
 class VaultAuditStore(Protocol):
@@ -107,16 +105,6 @@ def _probe_all(
     return out
 
 
-def _unjudged_reason(hops: list[str]) -> str:
-    """Why an enforcing start refuses the named Vault hops, whose probe failed unexcused."""
-    return (
-        f"the Vault privilege probe on {', '.join(hops)} failed for a reason that is not a network "
-        "failure, a timeout or a 403, so the token was never judged, under [security].enforcement "
-        f"= 'enforce'. {VAULT_OVER_GRANT_OPT_OUT} does not accept this; fix the cause the "
-        "preflight's warning names, or set enforcement = 'warn'"
-    )
-
-
 async def run_vault_privilege_preflight(
     settings: ServiceSettings,
     store: VaultAuditStore,
@@ -126,8 +114,7 @@ async def run_vault_privilege_preflight(
     probe: Callable[[VaultConsumer], VaultTokenReading],
 ) -> list[HopPrivilege]:
     """Probe every Vault token ``settings`` puts to use, report each, and refuse where
-    :func:`~messagefoundry.privilege_check.vault_preflight_outcome` says so, and, under ``enforce``,
-    where a reading names a failure in ``unexcused``.
+    :func:`~messagefoundry.privilege_check.vault_preflight_outcome` says so.
 
     ``probe`` is :func:`~messagefoundry.privilege_probes.probe_vault` bound to the settings and the
     instance hop posture; it makes network calls and an hvac client, so it runs off the event loop.
@@ -143,18 +130,11 @@ async def run_vault_privilege_preflight(
         return []
     readings = await asyncio.to_thread(_probe_all, consumers, probe)
     hops = vault_hops(consumers, readings)
-    refused: list[str] = []
-    unjudged: list[str] = []
-    for hop, reading in zip(hops, readings, strict=True):
+    refused: list[HopPrivilege] = []
+    for hop in hops:
         outcome = vault_preflight_outcome(
             hop, enforcing=enforcing, over_grant_accepted=over_grant_accepted
         )
-        if enforcing and reading.unexcused:
-            # Not the opt-out's to lift: it accepts a grant that was seen, and this token was never
-            # fully read. A grave grant seen beside the failure still refuses for its own reason.
-            if outcome is not PreflightOutcome.REFUSE:
-                unjudged.append(hop.hop)
-            outcome = PreflightOutcome.REFUSE
         refusing = outcome is PreflightOutcome.REFUSE
         if outcome is PreflightOutcome.CLEAN:
             log.info("vault privilege preflight: %s %s", hop.hop, hop.state.value)
@@ -179,7 +159,7 @@ async def run_vault_privilege_preflight(
             "hop": hop.hop,
             "state": hop.state.value,
             "refusing": list(hop.refusing),
-            "unexcused": list(reading.unexcused),
+            "unexcused": list(hop.unexcused),
             "detail": hop.detail[:_AUDIT_DETAIL_LIMIT],
             "enforcing": enforcing,
             "refused": refusing,
@@ -198,12 +178,9 @@ async def run_vault_privilege_preflight(
             message="vault privilege preflight: failed to record the audit row",
             defects=(),
         )
-        if refusing and hop.hop not in unjudged:
-            refused.append(hop.hop)
-    reasons = [
-        *([vault_refusal_reason(refused)] if refused else []),
-        *([_unjudged_reason(unjudged)] if unjudged else []),
-    ]
-    if reasons:
-        raise VaultPrivilegeError(f"{'; and '.join(reasons)}; refusing to start")
+        if refusing:
+            refused.append(hop)
+    if refused:
+        reason = vault_refusal_reason(refused, over_grant_accepted=over_grant_accepted)
+        raise VaultPrivilegeError(f"{reason}; refusing to start")
     return hops

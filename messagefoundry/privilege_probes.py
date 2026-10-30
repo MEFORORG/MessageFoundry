@@ -111,15 +111,36 @@ def _is_forbidden(exc: BaseException) -> bool:
 
 def excused_failure(exc: BaseException) -> bool:
     """Whether a Vault probe failure is one the owner ruling of 2026-10-04 lets only warn (ADR
-    0216): a network failure or a timeout, which are all ``OSError`` here (requests' errors,
-    socket errors, ``TimeoutError`` and TLS errors), or a 403 (:func:`_is_forbidden`).
+    0216): a network failure, a timeout, or a 403 (:func:`_is_forbidden`).
+
+    A network failure or a timeout is a refused, reset or dropped connection, a name that did not
+    resolve, a connect or read timeout, or a reply cut short of its declared length. That is the
+    builtin ``ConnectionError`` and ``TimeoutError``, ``socket.gaierror``, requests'
+    ``ConnectionError``, ``Timeout`` and ``ChunkedEncodingError``, and the strict reply adapter's
+    ``TruncatedResponseError``. It is not every ``OSError``: requests' ``InvalidHeader`` and
+    ``InvalidURL``, a missing CA file and a TLS verification failure are configuration, and requests'
+    ``SSLError`` is left out though it subclasses its ``ConnectionError``.
 
     Any other failure left the token unjudged for a reason the ruling does not excuse. At least
     these are in that class: a ``TypeError`` or ``AttributeError`` after an hvac rename or a
     signature drift, an engine refusal such as an unset token variable, and any other Vault error
     status. The startup preflight refuses on one under ``enforce``
-    (:mod:`messagefoundry.vault_preflight`)."""
-    return isinstance(exc, OSError) or _is_forbidden(exc)
+    (:func:`~messagefoundry.privilege_check.vault_preflight_outcome`)."""
+    import socket
+
+    from messagefoundry.transports.bounded_read import TruncatedResponseError
+
+    if _is_forbidden(exc):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):
+        return True
+    try:
+        from requests import exceptions as rex
+    except ImportError:  # no requests, so none of its errors can be the one raised
+        return False
+    if isinstance(exc, rex.SSLError):
+        return False
+    return isinstance(exc, (rex.ConnectionError, rex.Timeout, rex.ChunkedEncodingError))
 
 
 def _why(exc: BaseException) -> str:
@@ -207,9 +228,13 @@ def read_vault_token(
     problems: list[str] = []
     unexcused: list[str] = []
 
+    def unjudged(cause: str) -> None:
+        if cause not in unexcused:
+            unexcused.append(cause)
+
     def why(exc: BaseException) -> str:
         if not excused_failure(exc):
-            unexcused.append(type(exc).__name__)
+            unjudged(type(exc).__name__)
         return _why(exc)
 
     needed: dict[str, frozenset[str]] = {}
@@ -294,9 +319,7 @@ def read_vault_token(
                 capabilities[path] = _strings(caps)
             else:
                 # Not a network, timeout or 403 failure either: this path went unjudged.
-                gap = "an answer naming no capabilities for a path"
-                if gap not in unexcused:
-                    unexcused.append(gap)
+                unjudged("an answer naming no capabilities for a path")
                 problems.append(_problem(f"capabilities-self returned nothing for {path}"))
     except Exception as exc:  # Vault refused or could not be reached: reported, never raised
         problems.append(_problem(f"capabilities-self failed: {why(exc)}"))

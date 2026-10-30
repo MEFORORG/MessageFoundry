@@ -7227,7 +7227,9 @@ class SecuritySettings(_Section):
     # the startup preflight (messagefoundry/vault_preflight.py) found a Vault token the engine uses
     # holding the root policy, a grant on an administrative path, or a Transit key's config, rotate,
     # export or backup, and the operator accepts that in writing. It lifts that one refusal and
-    # nothing else: every other Vault over-grant and an unobservable probe only warn. Default FALSE.
+    # nothing else: every other Vault over-grant only warns, and so does a probe stopped by a network
+    # failure, a timeout or a 403; a probe that failed otherwise refuses under enforce whatever this
+    # says (privilege_probes.excused_failure). Default FALSE.
     # Setting it TRUE is a LOOSENING: an AUDIT: line at every start that uses it,
     # over_grant_accepted=true on the vault_privilege_preflight audit row, and a
     # security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
