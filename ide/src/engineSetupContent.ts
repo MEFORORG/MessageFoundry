@@ -103,8 +103,11 @@ export const SETUP_SECTIONS: readonly SetupSection[] = [
       "If no engine store exists here, you'll be asked to confirm creating a NEW database; if one " +
         "exists, this starts that engine.",
       // ADR 0183 Wave 5: the engine creates no account on its own, so Start provisions one first.
-      "Either way, if the store has no enabled administrator, you can provision one before the " +
-        "engine starts: a terminal opens where you type its password.",
+      // Vault BACKLOG #3849 B3: the Start dialog asks about a LOCAL administrator with a usable
+      // password, since directory ones do not count (vault BACKLOG #2711 step 1). A locked-out
+      // one still counts, so this does not say "can sign in".
+      "Either way, if the store has no enabled local administrator with a usable password, you " +
+        "can provision one before the engine starts: a terminal opens where you type its password.",
     ],
     button: {
       id: "start-dev-engine",

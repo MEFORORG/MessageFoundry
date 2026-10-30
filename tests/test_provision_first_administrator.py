@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
+import threading
 import time
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -2092,24 +2094,36 @@ def test_cli_raises_administrator_granted_beside_a_directory_administrator(
 ) -> None:
     """Vault BACKLOG #3849 B5: an Administrator added at the host beside a directory one pages, on
     the notifier ``serve`` would wire, and lands as an open alert instance in the store. RED on the
-    code before #3849, which raised no alert from this command."""
+    code before #3849, which raised no alert from this command.
+
+    The notifier is built with the posture the command derived, that object and not one made up on
+    the way (item 8 of the #3849 B5 review): the builder resolves the transports' secrets with it."""
+    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
     db = tmp_path / "p.db"
     _keyed_store_with_directory_administrator(db, key)
-    transport = _AlertTransport()
+    derived = HopPosture(enforcing=True)
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_alert_notifier",
-        lambda _settings, _posture: NotifierAlertSink([transport]),
+        "messagefoundry.config.settings.hop_posture_from_ai", lambda _ai, *, enforcement: derived
     )
+    transport = _AlertTransport()
+    postures: list[object] = []
+
+    def build(_settings: object, posture: object) -> NotifierAlertSink:
+        postures.append(posture)
+        return NotifierAlertSink([transport])
+
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", build)
     monkeypatch.setattr("getpass.getuser", lambda: "host-operator")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
     assert main([*argv, "--email", "operator@example.invalid"]) == 0
     body = json.loads(capsys.readouterr().out)
     assert body["administrator_granted_alerted"] is True
+    assert len(postures) == 1 and postures[0] is derived
 
     assert len(transport.events) == 1
     event = transport.events[0]
@@ -2117,8 +2131,13 @@ def test_cli_raises_administrator_granted_beside_a_directory_administrator(
     assert event["connection"] == "user:site-admin"
     assert event["via"] == "provision_admin"
     assert event["granted_by"] == "cli:host-operator"
+    assert ("administrator_granted", "user:site-admin") in _open_instances(db, key)
 
-    async def open_instances() -> list[tuple[str, str]]:
+
+def _open_instances(db: Path, key: str) -> list[tuple[str, str]]:
+    """The open alert instances in a keyed store, as ``(event type, connection)``."""
+
+    async def read() -> list[tuple[str, str]]:
         cipher = make_cipher(key)
         store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
@@ -2127,7 +2146,7 @@ def test_cli_raises_administrator_granted_beside_a_directory_administrator(
         finally:
             await store.close()
 
-    assert ("administrator_granted", "user:site-admin") in asyncio.run(open_instances())
+    return asyncio.run(read())
 
 
 def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
@@ -2157,34 +2176,282 @@ def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
     )
 
 
-def test_a_failing_alert_still_shows_the_recovery_codes(
+def test_a_failing_alert_still_prints_the_json_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The alert runs after the grant committed and before the codes are shown, so a notifier
-    that breaks its never-raise contract must not cost the operator the codes. Nor may it be
+    """The alert runs after the grant committed and after the codes are shown, so a notifier
+    that breaks its never-raise contract must not cost the operator the --json body. Nor may it be
     reported as paging anyone: the alert falls back to the log, and the output says so (review
-    round 1 of vault BACKLOG #3849)."""
+    round 1 of vault BACKLOG #3849). The failure is logged by class only, as the rest of this
+    alert's failures are: a provider's or driver's text can carry an address."""
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 
     class _Broken(NotifierAlertSink):
         def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
             raise RuntimeError("synthetic sink fault")
 
-    monkeypatch.chdir(tmp_path)
-    key = _key_in_this_shell(monkeypatch)
-    db = tmp_path / "p.db"
-    _keyed_store_with_directory_administrator(db, key)
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "messagefoundry.__main__._offline_alert_notifier",
         lambda _settings, _posture: _Broken([_AlertTransport()]),
     )
-    _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
-    assert main([*argv, "--email", "operator@example.invalid"]) == 0
-    body = json.loads(capsys.readouterr().out)
+    body, err = _alert_run(argv, capsys)
     assert body["ok"] is True
-    # The log fallback itself is pinned, without --json, by the no-notifier test above.
     assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert "synthetic sink fault" not in err
+    assert "RuntimeError" in err
+
+
+def _alert_run(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[dict[str, object], str]:
+    """Run the --json argv, which must succeed, and return its body and its stderr.
+
+    Under --json the command's log goes to stderr, through the redacting handler that replaces
+    the root's (BACKLOG #1489), so the log is read there and not from ``caplog``."""
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    body: dict[str, object] = json.loads(captured.out)
+    return body, captured.err
+
+
+def _timed_alert_run(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[dict[str, object], str]:
+    """:func:`_alert_run`, which must return well before a hung step's 30 s release."""
+    started = time.monotonic()
+    body, err = _alert_run(argv, capsys)
+    assert time.monotonic() - started < 20
+    return body, err
+
+
+@pytest.fixture
+def release() -> Iterator[threading.Event]:
+    """An event a hung step waits on for up to 30 s, set when the test ends, pass or fail. The
+    released step thread is then joined, so nothing it logs lands in a later test."""
+    event = threading.Event()
+    yield event
+    event.set()
+    for thread in threading.enumerate():
+        if thread.name == "provision-admin-alert":
+            thread.join(timeout=10)
+
+
+def _beside_a_directory_administrator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A keyed store run by a directory Administrator, a terminal, and the --json argv that adds a
+    local Administrator beside it, so every run of the argv raises administrator_granted."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    return [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--db",
+        str(db),
+        "--json",
+        "--email",
+        "operator@example.invalid",
+    ]
+
+
+def _logged_the_fallback(err: str) -> bool:
+    """Whether the logging sink's administrator_granted line, the page's fallback, was written."""
+    return any(
+        "ALERT administrator_granted" in line and "provision_admin" in line
+        for line in err.splitlines()
+    )
+
+
+def _counted_store_opens(
+    monkeypatch: pytest.MonkeyPatch, third: Callable[[], object] | None = None
+) -> list[int]:
+    """Count ``open_store`` calls; the third, the alert's own, runs ``third`` first when given.
+
+    The command opens the store to ask whether an Administrator exists, then to write, then for
+    the alert's open instance, so the third open is the alert's."""
+    from messagefoundry.store import base
+
+    real = base.open_store
+    calls: list[int] = []
+
+    async def counted(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 3 and third is not None:
+            await asyncio.to_thread(third)
+        return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(base, "open_store", counted)
+    return calls
+
+
+def test_a_send_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Review of vault BACKLOG #3849 B5, item 1: a send stuck in a worker thread past the wait
+    bound used to hold the command at ``asyncio.run``'s executor shutdown, for up to 300 s, before
+    it printed anything. The result now comes after the bound, the log fallback is written, and the
+    open instance the emit scheduled still lands in the store (item 5)."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Hung(_AlertTransport):
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
+            await asyncio.to_thread(release.wait, 30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([_Hung()]),
+    )
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    key = os.environ["MEFOR_STORE_ENCRYPTION_KEY"]
+    assert ("administrator_granted", "user:site-admin") in _open_instances(tmp_path / "p.db", key)
+
+
+def test_a_notifier_build_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: a notifier build that hangs, a secret provider that never answers, was bounded by
+    nothing. The whole alert step now is, and the fallback is logged when it runs out."""
+
+    def hung_build(_settings: object, _posture: object) -> None:
+        release.wait(30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_STEP_SECONDS", 0.5)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", hung_build)
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+
+
+def test_a_store_reopen_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: the reopen for the open instance, a server store that never answers, has a bound
+    of its own, so it costs that record and not the page."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    def hung_open() -> None:
+        release.wait(30)
+        # Released at the test's end: fail rather than open a store pytest may be removing.
+        raise RuntimeError("released")
+
+    transport = _AlertTransport()
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    _counted_store_opens(monkeypatch, third=hung_open)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_REOPEN_SECONDS", 0.2)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport]),
+    )
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert [e["type"] for e in transport.events] == ["administrator_granted"]
+    assert "could not reopen the store" in err and "TimeoutError" in err
+
+
+def test_an_interrupt_during_the_alert_keeps_the_json_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: Ctrl-C while the alert step runs used to escape the command, after the account was
+    created, with no --json success body. It now ends the wait: the fallback is logged and the
+    body is printed."""
+    import _thread
+    import signal
+
+    def interrupted_build(_settings: object, _posture: object) -> None:
+        _thread.interrupt_main()
+        release.wait(30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", interrupted_build)
+    # interrupt_main does nothing where SIGINT is ignored, as a runner may start pytest; pin the
+    # handler that raises KeyboardInterrupt, so the precondition is this test's, not the runner's.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        # Timed, so a wait the interrupt did not end, which runs out the 30 s step bound, fails.
+        body, err = _timed_alert_run(argv, capsys)
+    except KeyboardInterrupt:
+        pytest.fail("the interrupt escaped the command, so the --json body was never printed")
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert body["ok"] is True
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+
+
+def test_a_notifier_factory_that_raises_still_logs_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 2: an exception out of the notifier build sat outside the step's try, so it skipped the
+    log fallback, and its text reached the log. Now it is the fallback, and the class only."""
+
+    def raising_build(_settings: object, _posture: object) -> None:
+        raise RuntimeError("synthetic build fault naming vault.example.invalid")
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", raising_build)
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert "vault.example.invalid" not in err
+    assert "RuntimeError" in err
+
+
+def test_no_alert_transport_opens_the_store_no_third_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 4: with no [alerts] transport there is no notifier to record an open instance, so the
+    store is not reopened for one. The fallback is still logged."""
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    opens = _counted_store_opens(monkeypatch)
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert len(opens) == 2
+    assert _logged_the_fallback(err)
+
+
+def test_a_store_reopen_that_fails_logs_its_class_and_still_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 7: the reopen failure logged its full exception, and a driver's text can carry the
+    server's address. It is the class now, and the page still goes without the open instance."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    def refuse() -> None:
+        raise RuntimeError("synthetic driver text naming db.example.invalid")
+
+    transport = _AlertTransport()
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    _counted_store_opens(monkeypatch, third=refuse)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport]),
+    )
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert [e["type"] for e in transport.events] == ["administrator_granted"]
+    assert "db.example.invalid" not in err
+    assert "RuntimeError" in err
 
 
 def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
