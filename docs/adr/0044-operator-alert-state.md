@@ -118,6 +118,20 @@ the existing inverse signals the engine already emits (the `connection_event` li
 "hasn't re-fired in N cooldowns ⇒ stale" sweep is **deferred** (it needs a timer and a policy — out of scope
 here, like ADR 0014's deferred durable cross-node dedup).
 
+> **Amendment (2026-10-30, BACKLOG #3756) -- an inverse's background write is retried within a
+> bound.** This adds to D2 and changes none of it: an emit method still never raises into its
+> caller and never blocks on the store, because it only schedules the write. What changed is that
+> background write, for an inverse only. `NotifierAlertSink._run_state` now tries an auto-resolve
+> up to 4 times, waiting 0.25 s, 0.5 s and 1 s between tries, 1.75 s in all, which fits inside the
+> 5 s the engine gives `drain_state` at stop. The tries and their waits run under the instance
+> key's lock, so a write emitted later for the same key still lands after the resolve (BACKLOG
+> #2272 defect 8). When the last try fails, the sink logs an ERROR naming the alert type and the
+> connection, and the alert stays open until the next inverse resolves it. At stop, `drain_state`
+> cancels a write still running at its deadline and logs that at ERROR, so no retry outlives the
+> store. Three things are unchanged. An upsert is still tried once. Nothing persists a resolve
+> across a restart. An emit made with no running event loop still drops the write, and a retry
+> cannot help that case, because there is no loop to run one on.
+
 ### D3 — `GET /alerts/active` + ack/resolve, RBAC `MONITORING_DIAGNOSE`
 
 Three additive API routes ([`api/app.py`](../../messagefoundry/api/app.py)), an `AlertInstance`/`AlertInstanceList`
