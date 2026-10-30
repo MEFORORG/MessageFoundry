@@ -1330,7 +1330,7 @@ async def test_a_busy_kerberos_sign_in_is_audited_as_a_login_error(
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "alice")
     _install_fakes(monkeypatch)
     _answer_with(monkeypatch, RESULT_BUSY, when=lambda _kw: True)
-    settings = _ad_settings(kerberos_enabled=True)
+    settings = _ad_settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))

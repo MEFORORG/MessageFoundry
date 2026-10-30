@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# The values AuthService's reset clear passes (vault BACKLOG #2946), written out so this store
-# contract stays free of the auth service; tests/test_login_new_ip.py pins that they match.
+from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER as _RESET_MARKER
+
+# Larger than any ``last_seen``, and finite, because SQL Server's FLOAT holds no infinity.
 _FOREVER = 1e18
-_RESET_MARKER = "cleared by reset"
 
 
 async def _account(store: Any, user_id: str, username: str) -> None:
@@ -74,18 +74,28 @@ async def _assert_login_address_contract(store: Any) -> None:
     assert await store.list_known_login_addresses("ka-u2", since=0.0) == []
     await store.forget_login_addresses("ka-u2", before=7000.0)
 
-    # The clear an administrator's reset runs (vault BACKLOG #2946): every backend binds the finite
-    # bound (SQL Server's FLOAT holds no infinity) and deletes every row, then keeps the
-    # epoch-stamped marker out of a lookback read and in an any-age one.
+    # The clear an administrator's reset runs (vault BACKLOG #2946), one transaction since vault
+    # BACKLOG #3849 B4: every row goes, and the epoch-stamped marker is written, out of a lookback
+    # read and in an any-age one. A second reset leaves one marker, not two.
     await store.remember_login_address("ka-u2", "192.0.2.1", now=9000.0)
-    await store.forget_login_addresses("ka-u2", before=_FOREVER)
-    assert await store.list_known_login_addresses("ka-u2", since=0.0) == []
-    await store.remember_login_address("ka-u2", _RESET_MARKER, now=0.0)
+    await store.remember_login_address("ka-u2", "192.0.2.2", now=9000.0)
+    await store.reset_login_addresses("ka-u2")
     assert await store.list_known_login_addresses("ka-u2", since=1.0) == []
     assert await store.list_known_login_addresses("ka-u2", since=0.0) == [_RESET_MARKER]
+    await store.reset_login_addresses("ka-u2")
+    assert await store.list_known_login_addresses("ka-u2", since=0.0) == [_RESET_MARKER]
+    # No prune removes the marker, even one past every row: a sign-in's prune that raced the reset
+    # must not leave the record empty, which would read as no baseline (vault BACKLOG #3849 B4).
+    await store.remember_login_address("ka-u2", "192.0.2.3", now=9500.0)
     await store.forget_login_addresses("ka-u2", before=_FOREVER)
+    assert await store.list_known_login_addresses("ka-u2", since=0.0) == [_RESET_MARKER]
+    # Another account's rows are untouched by the reset.
+    assert await store.list_known_login_addresses("ka-u1", since=0.0) == ["198.51.100.9"]
 
-    # Deleting the account deletes its rows; a re-created namesake under a new id inherits none.
+    # Deleting the account deletes its rows, the marker included; a re-created namesake under a new
+    # id inherits none.
+    await store.delete_user("ka-u2")
+    assert await store.list_known_login_addresses("ka-u2", since=0.0) == []
     await store.delete_user("ka-u1")
     assert await store.list_known_login_addresses("ka-u1", since=0.0) == []
     await _account(store, "ka-u3", "ka-alice")

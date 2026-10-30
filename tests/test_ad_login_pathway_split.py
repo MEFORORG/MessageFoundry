@@ -45,6 +45,7 @@ def _ad_settings(**over: object) -> AuthSettings:
         "ad_user_search_base": "OU=Staff,DC=test,DC=invalid",
         "ad_bind_dn": "CN=svc-mefor,OU=Service,DC=test,DC=invalid",
         "ad_bind_password": "synthetic",
+        "kerberos_realm": "TEST.INVALID",
     }
     base.update(over)
     return AuthSettings(**base)  # type: ignore[arg-type]

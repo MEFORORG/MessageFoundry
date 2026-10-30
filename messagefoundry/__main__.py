@@ -94,14 +94,17 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    import asyncio
+
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
-    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.settings import AlertsSettings, ServiceSettings, StoreSettings
     from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.store import UserRecord
@@ -1215,6 +1218,44 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="run the heavier full restore-verify (open the embedded store through open_store)",
     )
     restore_verify.add_argument("--json", action="store_true", help="emit JSON")
+
+    cipher_audit = sub.add_parser(
+        "cipher-audit",
+        help="read every sealed value in the LIVE SQLite store back through the store cipher, "
+        "read-only, and report per-cell counts and the first failing row, never a value. Exit 0 "
+        "PASS, 1 FAIL (a value that does not decrypt, a non-blank value with no at-rest marker on a "
+        "surface the keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, an "
+        "unreadable row or the key service), 2 could not start, 3 NOT COVERED (a PostgreSQL or SQL "
+        "Server store: this "
+        "command reads SQLite only), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
+        "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
+        "'vault_transit' every value is one Transit request (BACKLOG #1719)",
+    )
+    cipher_audit.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source",
+    )
+    cipher_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    cipher_audit.add_argument(
+        "--table",
+        action="append",
+        default=None,
+        help="audit only this table's cipher cells (repeatable; default: every cipher-covered table)",
+    )
+    cipher_audit.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=None,
+        help="rows read per statement, each its own short read transaction (default 500)",
+    )
+    cipher_audit.add_argument(
+        "--busy-timeout",
+        type=float,
+        default=5.0,
+        help="seconds a read waits on a lock the running service holds (default 5)",
+    )
+    cipher_audit.add_argument("--json", action="store_true", help="emit JSON")
 
     restore = sub.add_parser(
         "restore",
@@ -7639,8 +7680,11 @@ def _check_privileges(args: argparse.Namespace) -> int:
     probe could not observe its principal. 3 wins when both apply.
 
     A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
-    store observation under these settings (ADR 0199). Only the store finding gates a start; the
-    line says so when another hop is over-granted. The exit code does not follow it."""
+    store and Vault observations under these settings (ADR 0199, ADR 0216). The store finding and a
+    Vault grant in the refusing class gate a start; the line names a Vault finding that only warns
+    and an LDAP over-grant, which do not, and a Vault probe failure that is not a network failure,
+    a timeout or a 403, which gates serve's start only where serve's own probe meets it. The exit
+    code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
@@ -7956,40 +8000,12 @@ def _offline_security_notifier(
     alerts = settings.alerts
     if not (settings.auth.notify_security_events and alerts.email_smtp_host and alerts.email_from):
         return None
-    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
-    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
-        print(
-            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
-            "email_tls_verify is false), so no security notice is sent from this command. Set "
-            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
-            file=sys.stderr,
-        )
+    if not _offline_smtp_hop_unauthenticated_permitted(settings, what="security notice"):
         return None
-    if unauthenticated:
-        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
-        print(
-            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
-            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice can be read "
-            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
-            "when settings load.",
-            file=sys.stderr,
-        )
     try:
         # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
         # drops the notice, as any other failure here does; the recovery itself goes on.
-        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
-        from messagefoundry.config.settings import SecurityEnforcement
-        from messagefoundry.controlchars import scrub_control_chars
-
-        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
-        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
-        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
-            # The refusal's text is written for a start. This command does not stop on it.
-            print(
-                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
-                "sends no security notice over that relay.",
-                file=sys.stderr,
-            )
+        if not _offline_smtp_relay_ca_accepted(settings, what="security notice"):
             return None
         return security_notifier_from_settings(
             alerts,
@@ -8003,6 +8019,446 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
         return None
+
+
+def _offline_smtp_hop_unauthenticated_permitted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether an offline command may send a ``what`` over the ``[alerts]`` SMTP hop as configured.
+
+    False, with a WARNING, for a hop that does not authenticate the relay (``email_use_tls`` or
+    ``email_tls_verify`` false) unless ``[security].allow_unverified_alert_smtp_tls`` acknowledges
+    it. :func:`_offline_security_notifier` says why an offline command refuses that hop at every
+    posture. An acknowledged one is sent over, and said so, never silently."""
+    alerts = settings.alerts
+    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
+    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
+        print(
+            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
+            f"email_tls_verify is false), so no {what} is sent from this command. Set "
+            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
+            file=sys.stderr,
+        )
+        return False
+    if unauthenticated:
+        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
+        print(
+            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
+            f"permitted by [security].allow_unverified_alert_smtp_tls=true. The {what} can be read "
+            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
+            "when settings load.",
+            file=sys.stderr,
+        )
+    return True
+
+
+def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether the ``[alerts]`` relay's CA passes the trust-anchor checks ``serve`` gives it
+    (BACKLOG #3470). False, with a WARNING, when they refuse it: the command goes on and sends no
+    ``what`` over that relay. May raise what the checks raise; the callers treat that as a channel
+    that could not be built."""
+    from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.controlchars import scrub_control_chars
+
+    relay_ca = smtp_hop_anchor_spec(settings.alerts, settings.auth, settings.tls)
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+        # The refusal's text is written for a start. This command does not stop on it.
+        print(
+            f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+            f"sends no {what} over that relay.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+#: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
+_PROVISION_ADMIN_GRANT_VIA = "provision_admin"
+#: How long ``provision-admin``'s alert step waits, in all, for the alert's sends and its
+#: open-instance write before it closes the store. The recovery codes are shown before the step
+#: starts, so this bound protects the command's result and not the codes; the step as a whole is
+#: bounded by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
+_OFFLINE_ALERT_WAIT_SECONDS = 15.0
+#: How long the alert step waits for each of the store reopen its open-instance record needs and
+#: that store's close. A store that does not open in time costs that record, not the page. It
+#: bounds an await only: a synchronous hop inside the open, such as the key provider's, is bounded
+#: by its own client's timeout and by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
+_OFFLINE_ALERT_REOPEN_SECONDS = 5.0
+#: How long ``provision-admin`` waits for its whole alert step, the notifier build, the store
+#: reopen, the sends, the open-instance write and the close, before it prints its result without
+#: the step's answer. The build has no bound of its own, so a slow build can run a step past this
+#: that would have answered True; the command then reports no confirmed delivery and logs the
+#: fallback, the safe direction.
+_OFFLINE_ALERT_STEP_SECONDS = 30.0
+
+
+def _offline_alert_notifier(
+    settings: ServiceSettings, posture: HopPosture | None
+) -> NotifierAlertSink | None:
+    """The ``[alerts]`` notifier ``serve`` would wire, built for an offline command (vault BACKLOG
+    #3849 B5), or ``None`` when no transport is configured, as ``serve`` then falls back to its
+    logging sink. Synchronous, and it may read anchor files and reach a secret provider, so an
+    async caller runs it off the loop.
+
+    The email transport is dropped, and any webhook kept, when the SMTP hop is one an offline command
+    refuses (:func:`_offline_smtp_hop_unauthenticated_permitted`) or its relay CA is refused
+    (:func:`_offline_smtp_relay_ca_accepted`), as the ``serve`` lifespan drops it for a refused CA.
+    The checks run only when the email transport would be built at all. A build failure with both
+    transports configured is WARNED and retried with each one alone, the webhook first, so a secret
+    this shell cannot resolve for the relay does not also cost the webhook, nor a webhook refused at
+    construction the relay. A failure with nothing left to drop yields ``None``, and the caller's
+    alert reaches the log instead: the grant it reports has already been written, and a recovery
+    command must not die on its page.
+    """
+    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.pipeline.alert_sinks import (
+        alerts_without_email,
+        alerts_without_webhook,
+        configured_alert_transport_names,
+        notifier_from_settings,
+    )
+
+    def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
+        # The provider is resolved only for a build that names a secret reference, which only the
+        # email transport does: a provider this shell cannot reach must not cost the webhook.
+        return notifier_from_settings(
+            alerts,
+            secret_provider=(
+                resolve_secret_provider(settings.secrets, posture=posture)
+                if alerts.email_password_secret
+                else None
+            ),
+            trust_anchor_policy=settings.tls.policy(),
+            posture=posture,
+        )
+
+    alerts = settings.alerts
+    names = configured_alert_transport_names(alerts)
+    if not names:
+        # As `serve` with no transport: the logging sink. Nothing is resolved for it.
+        return None
+    emails = "email" in names
+    if emails:
+        try:
+            hop_accepted = _offline_smtp_hop_unauthenticated_permitted(
+                settings, what="alert email"
+            ) and _offline_smtp_relay_ca_accepted(settings, what="alert email")
+        except Exception as exc:  # noqa: BLE001 - a check that cannot decide costs the email only
+            print(
+                f"WARNING: the [alerts] SMTP hop could not be checked ({type(exc).__name__}), so "
+                "no alert email is sent from this command.",
+                file=sys.stderr,
+            )
+            hop_accepted = False
+        if not hop_accepted:
+            alerts, emails = alerts_without_email(alerts), False
+    # The class only, here and below, as `_build_provision_auth_service` names a secret failure:
+    # the text of a provider's error can carry its address or a reference.
+    failures: list[str] = []
+    try:
+        return build(alerts)
+    except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
+        failures.append(type(exc).__name__)
+    if emails and len(names) > 1:
+        print(
+            f"WARNING: the [alerts] notifier could not be built ({failures[0]}); this command "
+            "tries again with the webhook alone, then with the email transport alone.",
+            file=sys.stderr,
+        )
+        for alone, dropped in (
+            (alerts_without_email(alerts), "email"),
+            (alerts_without_webhook(alerts), "webhook"),
+        ):
+            try:
+                built = build(alone)
+            except Exception as retry:  # noqa: BLE001 - as above
+                failures.append(type(retry).__name__)
+                continue
+            print(
+                f"WARNING: the [alerts] notifier was built without the {dropped} transport, so "
+                f"this command's alert is not sent by {dropped}.",
+                file=sys.stderr,
+            )
+            return built
+    print(
+        f"WARNING: the [alerts] notifier could not be built ({', '.join(failures)}), so this "
+        "command's alert goes to the log only.",
+        file=sys.stderr,
+    )
+    return None
+
+
+#: Tasks :func:`_within` stopped waiting for, held so the loop's weak task references cannot drop
+#: one before it settles.
+_LATE_TASKS: set[Any] = set()
+
+
+async def _within[T](
+    awaitable: Awaitable[T], timeout: float, on_late: Callable[[asyncio.Future[T]], None]
+) -> T:
+    """``awaitable``'s result, waited on for at most ``timeout`` seconds, else
+    :class:`TimeoutError`; ``on_late`` gets the task once it settles, when this stopped waiting first.
+
+    Not ``asyncio.timeout`` around the await (vault BACKLOG #3849, repair 3): a cancel that lands
+    after the awaited call finished but before the awaiting coroutine resumed throws into it, and
+    the result, an opened store, is discarded with nothing to close it. Nor is the task cancelled
+    at the bound: a driver cancelled mid-open can drop a handle it already holds, and a close
+    cancelled mid-way leaves one half closed. The work runs as its own task, left to finish while
+    the loop runs, so a result that lands in that time is never thrown away. It does not outlive
+    the loop: ``provision-admin``'s step loop ends once the step answers, and a task still running
+    then is cancelled by that shutdown, its own cancel handling then owning the cleanup."""
+    import asyncio
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        _hold_late(task, on_late)
+        raise
+    if not task.done():
+        _hold_late(task, on_late)
+        raise TimeoutError
+    return task.result()
+
+
+def _hold_late[T](task: asyncio.Future[T], on_done: Callable[[asyncio.Future[T]], None]) -> None:
+    """Hold ``task`` in :data:`_LATE_TASKS` until it settles, then hand it to ``on_done``."""
+    _LATE_TASKS.add(task)
+    task.add_done_callback(_LATE_TASKS.discard)
+    task.add_done_callback(on_done)
+
+
+def _close_late_store(opened: asyncio.Future[Store]) -> None:
+    """``on_late`` for the alert's store open: close a store that opened after its bound, and name
+    the class of an open that failed after it, which the caller logged only as a timeout."""
+    import asyncio
+
+    if opened.cancelled():
+        return
+    if (exc := opened.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store reopen failed after its bound (%s)", type(exc).__name__
+        )
+        return
+    _hold_late(asyncio.ensure_future(opened.result().close()), _log_late_close)
+
+
+def _log_late_close(closing: asyncio.Future[None]) -> None:
+    """``on_late`` for the alert's store close, and for a late store's: name a failure's class."""
+    if not closing.cancelled() and (exc := closing.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store did not close cleanly (%s)", type(exc).__name__
+        )
+
+
+async def _raise_offline_administrator_granted(
+    settings: ServiceSettings,
+    posture: HopPosture | None,
+    open_alert_store: Callable[[], Awaitable[Store]],
+    *,
+    username: str,
+    granted_by: str,
+) -> bool:
+    """Raise ``administrator_granted`` for an Administrator ``provision-admin`` just granted (vault
+    BACKLOG #3849 B5), and return whether an ``[alerts]`` transport confirmed delivering it.
+
+    Every role grant the web console makes raises this alert. Since vault BACKLOG #2711 step 1 this
+    command can add an Administrator beside directory ones that still sign in, and before this
+    nobody was paged. It is raised on every successful run, a first install included, because the
+    console pages every grant too and a "beside others" condition would be one more read that can
+    race.
+
+    The notifier is the one ``serve`` wires. When one is built, ``open_alert_store`` is called so
+    the alert also lands as an open alert instance the web console lists once the engine runs (ADR
+    0044), best effort: a store that does not open within :data:`_OFFLINE_ALERT_REOPEN_SECONDS`
+    costs that record, not the page. With no notifier nothing would record one, so the store is
+    not opened. The notifier is started, fed and drained here, because the loop ends with the
+    step, within :data:`_OFFLINE_ALERT_WAIT_SECONDS`. No suspend window is primed: a muted key
+    would page anyway, the safe direction for one alert.
+
+    True only when a transport confirmed delivery in time (:func:`_feed_offline_alert`). False
+    when no notifier was built, it raised, no transport confirmed, or nothing answered in time: the
+    CALLER then writes the logging sink's line,
+    so the line is written once whether or not this step answers at all. It never raises. Its own
+    failure lines name the exception's class only, because a provider's or driver's text can carry
+    an address. The notifier's lines are not this step's: a failed send or open-instance write is
+    logged inside :class:`NotifierAlertSink` as ``serve`` logs it, through the command's redacting
+    handler."""
+    import asyncio
+
+    log = logging.getLogger(__name__)
+    try:
+        notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
+    except Exception as exc:  # noqa: BLE001 - the grant is written; the log carries the alert
+        log.warning(
+            "the [alerts] notifier could not be built (%s), so the administrator_granted alert "
+            "goes to the log only",
+            type(exc).__name__,
+        )
+        return False
+    if notifier is None:
+        return False
+    store: Store | None = None
+    try:
+        store = await _within(open_alert_store(), _OFFLINE_ALERT_REOPEN_SECONDS, _close_late_store)
+    except Exception as exc:  # noqa: BLE001 - the page goes on without the open-instance record
+        log.warning(
+            "could not reopen the store for the administrator_granted open alert (%s); the alert "
+            "is sent without it",
+            type(exc).__name__,
+        )
+    try:
+        return await _feed_offline_alert(notifier, store, username=username, granted_by=granted_by)
+    finally:
+        if store is not None:
+            try:
+                # Bounded: the answer is read only once this returns, and a close that waits on a
+                # write still running would otherwise hold a True answer past the step's bound. A
+                # close still running at the bound is not cancelled here; see `_within` for what
+                # the loop's shutdown then does to it.
+                await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
+            except Exception as exc:  # noqa: BLE001 - the alert's answer stands
+                log.warning("the alert's store did not close cleanly (%s)", type(exc).__name__)
+
+
+async def _feed_offline_alert(
+    notifier: NotifierAlertSink, store: Store | None, *, username: str, granted_by: str
+) -> bool:
+    """Start ``notifier``, raise the one alert on it, and drain it within
+    :data:`_OFFLINE_ALERT_WAIT_SECONDS`. Whether a transport confirmed delivery in that time.
+
+    The open-instance write is scheduled at the emit, so it is drained BESIDE the close, on every
+    path, each against the same deadline: a hung send cannot take the write's time, nor a slow
+    write the sends'. A write still running at the deadline is left to fail as
+    :meth:`NotifierAlertSink.drain_state` says. A send still running in a worker thread at the
+    deadline cannot be recalled: it may yet page, after the caller has logged the fallback line.
+    Both, never neither.
+
+    The answer is whether at least one transport CONFIRMED delivery before the deadline: its send
+    returned without raising, so the relay accepted every recipient or the webhook answered 2xx
+    (vault BACKLOG #3849, repair 3). A notifier that only accepted the alert is not enough: a send
+    the relay refuses, a rule that routes the alert to no transport, and a send still running at
+    the deadline each answer False, and the caller then logs the fallback and warns."""
+    import asyncio
+
+    log = logging.getLogger(__name__)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _OFFLINE_ALERT_WAIT_SECONDS
+    key = f"user:{username}"
+    confirmed = False
+
+    def observe(_transport: str, event: dict[str, Any]) -> None:
+        nonlocal confirmed
+        if event.get("type") == "administrator_granted" and event.get("connection") == key:
+            confirmed = True
+
+    try:
+        notifier.set_store(store)
+        notifier.set_delivery_observer(observe)
+        notifier.start()
+        notifier.administrator_granted(key, via=_PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by)
+    except Exception as exc:  # noqa: BLE001 - never raise past the caller's own output
+        log.warning(
+            "the [alerts] notifier failed on the administrator_granted alert (%s)",
+            type(exc).__name__,
+        )
+    drained = asyncio.ensure_future(notifier.drain_state(timeout=max(0.0, deadline - loop.time())))
+    try:
+        async with asyncio.timeout_at(deadline):
+            await notifier.aclose()
+    except TimeoutError:
+        log.warning(
+            "the [alerts] notifier did not finish within %.0f s, so a send still running when it "
+            "stopped waiting is not counted as delivered",
+            _OFFLINE_ALERT_WAIT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - as above
+        log.warning("the [alerts] notifier failed while closing (%s)", type(exc).__name__)
+    await drained  # never raises, and ends by the deadline
+    # A send the deadline cut off is not counted, even one the relay accepted just before it: the
+    # cancel can land before the drain resumes to tell the observer. The safe direction.
+    return confirmed
+
+
+def _log_administrator_granted(username: str, granted_by: str) -> None:
+    """The logging sink's ``administrator_granted`` line, ``serve``'s fallback when no notifier
+    takes the alert. Builds the key and swallows a sink fault, as the reconciler's raise does."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
+
+    administrator_granted_alert(LoggingAlertSink(), granted_by=granted_by)(
+        username, _PROVISION_ADMIN_GRANT_VIA
+    )
+
+
+def _run_offline_alert_step(step: Callable[[], Awaitable[bool]]) -> bool:
+    """Run ``provision-admin``'s alert step on its own event loop in a daemon thread, and wait for
+    its answer for at most :data:`_OFFLINE_ALERT_STEP_SECONDS`. The step's answer, or False, with
+    a WARNING naming why, when it did not answer in time, raised, or the wait was interrupted
+    (Ctrl-C).
+
+    In a thread because nothing inside a loop can bound the command: a send left running in a
+    worker thread at the step's own deadline held ``asyncio.run`` at its executor shutdown, for up
+    to 300 s, and a hung notifier build or store reopen held it with no bound at all. The answer is
+    read when the step's coroutine finishes, not when its loop has shut down, so the command prints
+    its result then. The process can still wait at EXIT for a call already in a worker thread, a
+    send, the notifier build or a store driver's, until that call's own timeouts end it; the result
+    is printed before that. Bounding exit too would need the process killed or the transports
+    rewritten, which this step does not do.
+
+    The wait polls, so a Ctrl-C is taken between polls on every platform. It ends the wait, not
+    the command: the account is written and its codes shown, so the caller still prints its
+    result. A thread that cannot be started is the same: no answer, and False."""
+    import threading
+    import time
+
+    from messagefoundry.last_resort import run_guarded
+
+    log = logging.getLogger(__name__)
+    answered = threading.Event()
+    answer: list[bool] = []
+
+    async def answering() -> None:
+        try:
+            answer.append(await step())
+        except Exception as exc:  # noqa: BLE001 - named now, before the loop's teardown can wait
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # Here, so the answer is read before the loop's executor shutdown.
+            answered.set()
+
+    def run() -> None:
+        try:
+            run_guarded(answering())
+        except Exception as exc:  # noqa: BLE001 - the caller logs the fallback on False
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # And here, for a failure before the coroutine ran at all.
+            answered.set()
+
+    deadline = time.monotonic() + _OFFLINE_ALERT_STEP_SECONDS
+    try:
+        try:
+            threading.Thread(target=run, name="provision-admin-alert", daemon=True).start()
+        except RuntimeError as exc:  # "can't start new thread": the account is written regardless
+            log.warning(
+                "the administrator_granted alert step did not start (%s)", type(exc).__name__
+            )
+            return False
+        while not answered.wait(min(0.25, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "the administrator_granted alert step did not finish within %.0f s, so the "
+                    "alert may not have been sent",
+                    _OFFLINE_ALERT_STEP_SECONDS,
+                )
+                return False
+    except KeyboardInterrupt:
+        log.warning(
+            "the administrator_granted alert step was interrupted, so the alert may not have "
+            "been sent"
+        )
+        return False
+    return bool(answer) and answer[0]
 
 
 class _ProvisionStore:
@@ -8425,6 +8881,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
+    actor = f"cli:{getpass.getuser()}"
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
@@ -8452,8 +8910,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
             # notice, so this command wires the same notifier `serve` does, from the same settings.
             # Started and drained here, because the loop ends when this command does. Built only when
-            # a row with the name exists, so a fresh install resolves no SMTP secret and prints
-            # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
+            # a row with the name exists, so a fresh install prints nothing about a notice it does
+            # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
+            # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
             security_notifier = (
                 _offline_security_notifier(settings, posture) if existing is not None else None
@@ -8467,7 +8926,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     password=password,
                     display_name=args.display_name,
                     notify_email=email,
-                    actor=f"cli:{getpass.getuser()}",
+                    actor=actor,
                     totp_secret=totp_secret,
                     totp_code=totp_code,
                     totp_code_read_at=totp_read_at,
@@ -8541,6 +9000,31 @@ def _provision_admin(args: argparse.Namespace) -> int:
         "a lost authenticator is replaced by another Administrator, or at the host by "
         "`admin-reset-totp`, so create a second Administrator soon.",
     )
+
+    async def reopen() -> Store:
+        # The store opened again, as `serve` opens it, only so the alert's open instance lands in
+        # it. Called only when a notifier was built.
+        return await open_store(
+            settings.store,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
+
+    # The name alone: the step's thread can outlive this function, and `outcome` holds the codes.
+    granted = outcome.username
+
+    async def alert() -> bool:
+        # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every console
+        # grant does. AFTER the codes are shown, and bounded with an interrupt taken, so a slow
+        # relay or a Ctrl-C here costs neither the codes nor the result printed below.
+        return await _raise_offline_administrator_granted(
+            settings, posture, reopen, username=granted, granted_by=actor
+        )
+
+    alerted = _run_offline_alert_step(alert)
+    if not alerted:
+        # Here, not in the step, so the line is written once, whether or not the step answered.
+        _log_administrator_granted(granted, actor)
     if args.json:
         _print_json(
             {
@@ -8558,6 +9042,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # True only when recovery codes were issued AND reached the console; false with
                 # --no-totp (none issued) and when the console failed before showing them.
                 "recovery_codes_shown": codes_shown,
+                # Vault BACKLOG #3849 B5: true when an [alerts] transport confirmed delivery of the
+                # administrator_granted alert, as `_feed_offline_alert` defines it; false when the
+                # fallback went to the log.
+                "administrator_granted_alerted": alerted,
             },
             compact=True,
         )
@@ -8590,6 +9078,25 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
+    # Vault BACKLOG #3849 B5.
+    if alerted:
+        _safe_print(
+            "An [alerts] transport accepted the administrator_granted alert for this grant. A "
+            "transport that failed shows as a WARNING above."
+        )
+    elif outcome.administrators_at_check:
+        _safe_print(
+            "WARNING: no [alerts] transport confirmed delivery of the administrator_granted alert "
+            "for this grant (none is configured, a rule routes it to none, or a WARNING or ERROR "
+            "above says why), so it went to the log and nobody may have been paged. Tell the "
+            "site's other Administrators yourself: "
+            + ", ".join(repr(name) for name in outcome.administrators_at_check)
+        )
+    else:
+        _safe_print(
+            "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
+            "grant, so it went to the log."
+        )
     return 0
 
 
@@ -8820,11 +9327,21 @@ ADMIN_TOTP_RESET_ACTION = "auth.admin_totp_reset"
 
 class _ResetTarget(NamedTuple):
     """The account ``admin-reset-totp`` checked before the key was shown, pinned for its write. The
-    write refuses a row whose id or enrolment instant differs (ADR 0171 Amendment B)."""
+    write refuses a row whose id, enrolment instant or seed differs (ADR 0171 Amendment B, BACKLOG
+    #3778). The seed is pinned by its digest, so the old seed is not held across the prompt."""
 
     user_id: str
     username: str
     enrolled_at: float | None
+    secret_digest: str
+
+
+class _SeedPin(NamedTuple):
+    """An account's stored TOTP cell and the digest of the seed it opens to, read from one record
+    (BACKLOG #3778). Named fields, since both are ``str`` and a swap would still type-check."""
+
+    cell: str
+    digest: str
 
 
 def _admin_reset_totp(args: argparse.Namespace) -> int:
@@ -8848,11 +9365,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     **IT NEVER LEAVES THE ACCOUNT WITHOUT A FACTOR.** The new seed is generated in memory, shown on
     the console device and proved with a code BEFORE the store is written. One transaction,
     :meth:`replace_totp_enrolment`, then swaps the seed, the recovery codes and the step high-water
-    mark while TOTP stays on, so no reader ever sees the account with TOTP off. The write is a
-    compare-and-set on the id and the enrolment instant read before the prompt, so a removal or a
-    re-enrolment that lands while the operator types is never overwritten. A wrong code, a lost
-    console or a refusal writes nothing and the old seed still works. The proving code's step is
-    recorded, so that code is spent.
+    mark while TOTP stays on, so no reader ever sees the account with TOTP off. Before the prompt it
+    pins the account's id, enrolment instant and seed; after it, it refuses unless the account
+    still holds them, and the write is a compare-and-set on the instant and the stored cell read
+    then. So a removal or a re-enrolment that lands while the operator types is never overwritten,
+    even one stamped with the same instant (BACKLOG #3778; ADR 0171's correction of 2026-10-29 says
+    how). A wrong code, a lost console or a refusal writes nothing and the old seed still works. The proving code's step is recorded, so that code is
+    spent.
 
     **It replaces the recovery codes too.** A leaked seed or a stolen device usually means the codes
     kept beside it are exposed as well, and a seed rotation that left them valid would revoke nothing
@@ -8878,6 +9397,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from the swap itself is read back first, because on a server backend it can follow the COMMIT;
     the ADR's table gives the three outcomes.
     """
+    import asyncio
     import getpass
     import time as _time
 
@@ -8885,7 +9405,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.auth.notifications import MFA_ENABLED, SecurityEvent
     from messagefoundry.auth.passwords import hash_password
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -8967,7 +9489,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 f"the account {user.username!r} has no authenticator app enrolled, so there is no "
                 "seed to replace; nothing was written. Enrol one from the web console"
             )
-        if await store.get_totp_secret(user.id) is None:
+        # The record's own cell, the one seed_pin opens, not a second read (BACKLOG #3778). An
+        # empty cell is no seed either: the store passes "" through as a blank value.
+        if user.row is None or not user.row.totp_secret:
             return (
                 f"the account {user.username!r} has TOTP turned on but no seed stored, a state no "
                 "supported path leaves; nothing was written. This command replaces a seed and "
@@ -8986,6 +9510,17 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
         return None
 
+    async def seed_pin(store: Store, user: UserRecord) -> _SeedPin | None:
+        """``user``'s :class:`_SeedPin`, from the record that gave the stamp, or ``None`` with no
+        seed. ADR 0171's correction of 2026-10-29 says which half pins what. The decrypt runs off
+        the event loop, as ``judge_totp``'s does: a Transit open is a blocking HTTP call. A cell
+        that does not open raises ``CipherError``, a refusal with nothing written."""
+        cell = None if user.row is None else user.row.totp_secret
+        if not cell:
+            return None
+        held = await asyncio.to_thread(store.open_totp_secret, user.id, cell)
+        return None if held is None else _SeedPin(cell, hash_token(held))
+
     async def check() -> _ResetTarget | str:
         """The account to replace, pinned, or why not. Read before any key is shown."""
         store = await opened()
@@ -8997,7 +9532,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             if refusal is not None:
                 return refusal
             _refuse_an_unauditable_write(store)  # before the key is shown, not after the write
-            return _ResetTarget(user.id, user.username, user.totp_enrolled_at)
+            pin = await seed_pin(store, user)
+            if pin is None:
+                return (
+                    f"the authenticator of {user.username!r} changed while it was read; nothing "
+                    "was written. Run the command again"
+                )
+            return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin.digest)
         finally:
             await store.close()
 
@@ -9085,6 +9626,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             again = await refusal_for(store, user)
             if again is not None:
                 return _sentence(again) + unused_entry
+            pin = await seed_pin(store, user)
+            if pin is None or not constant_time_equal(pin.digest, target.secret_digest):
+                return (
+                    f"the authenticator of {user.username!r} was removed or enrolled again while "
+                    "this command ran, so nothing was replaced; nothing was written. Stop the "
+                    "engine and run the command again." + unused_entry
+                )
             _refuse_an_unauditable_write(store)
             report: dict[str, Any] = {
                 "recovery_codes_issued": len(plain_codes),
@@ -9101,6 +9649,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     recovery_code_hashes=code_hashes,
                     step=step,
                     expected_enrolled_at=target.enrolled_at,
+                    expected_secret_cell=pin.cell,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
             except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
@@ -9133,10 +9682,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     unknown.append(user)
                 raise
             if ended is None:
+                # The stored cell or the instant moved after the re-read just above: a removal, a
+                # re-enrolment, or a store-key rotation re-encrypting the cell (BACKLOG #3778).
                 return (
-                    f"the authenticator of {user.username!r} was removed or enrolled again while "
-                    "this command ran, so nothing was replaced; nothing was written. Stop the "
-                    "engine and run the command again." + unused_entry
+                    f"the authenticator of {user.username!r} changed in the moment before the "
+                    "write (removed, enrolled again, or re-encrypted by a store-key rotation), so "
+                    "nothing was replaced; nothing was written. Stop the engine and run the "
+                    "command again." + unused_entry
                 )
             swapped.append((user, {**report, "sessions_ended": ended}))
             return None
@@ -10201,6 +10753,228 @@ def _restore_verify(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _cipher_audit(args: argparse.Namespace) -> int:
+    """Read every sealed value in the LIVE SQLite store back through the store cipher (BACKLOG #1719).
+
+    ``PRAGMA quick_check``, row counts and ``audit-verify`` all pass a store whose AEAD tag no longer
+    authenticates a cell, so without this a damaged value surfaces only when something next reads
+    it. This walks the same cell inventory the full restore-verify does
+    (:data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`) on a read-only connection, in
+    short chunks, so it can run beside the service. It reports per-cell counts and each cell's first
+    failing row by its locator, never a value. In a keyed store it also counts the non-blank text
+    values that carry no marker, which a walk selecting by the marker never reads: a FAIL on a
+    surface the store has sealed, which refuses them at read, and reported only on one no keyed
+    open has sealed yet. A BLOB in a cipher-covered cell fails as one, under any cipher. A VACUUM
+    part way, or the key service going unreachable, stops it with a FAIL rather than a count over
+    a subset.
+
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server backend), 4 KEY_MISMATCH (a
+    sealed value and no key resolved, the usual cause being a shell without the service's key)."""
+    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.store.base import build_store_cipher
+    from messagefoundry.store.cipher_cells import (
+        DEFAULT_CHUNK_ROWS,
+        SQLITE_CIPHER_CELLS,
+        CipherAudit,
+        CipherWalkInterrupted,
+        audit_cipher_cells,
+        cell_present,
+        connect_readonly,
+        store_tables,
+    )
+    from messagefoundry.store.crypto import CipherError
+
+    as_json = bool(args.json)
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        _emit_error(detail or "could not load the service settings", as_json=as_json)
+        return 2
+    store = settings.store
+    if store.backend != StoreBackend.SQLITE:
+        # NOT exit 0, and not 1 either: nothing was read, so a job keying on the code must neither
+        # read this as a clean store nor as a damaged one.
+        reason = (
+            f"cipher-audit reads a SQLite store only, and [store].backend is "
+            f"{store.backend.value!r}; no cell of {_store_label(store)} was read"
+        )
+        if as_json:
+            _print_json({"status": "NOT_COVERED", "reason": reason}, compact=True)
+        else:
+            print(f"NOT COVERED: {reason}")
+        return 3
+    chunk_rows = DEFAULT_CHUNK_ROWS if args.chunk_rows is None else args.chunk_rows
+    if chunk_rows < 1 or args.busy_timeout < 0:
+        _emit_error(
+            "--chunk-rows must be at least 1 and --busy-timeout not negative", as_json=as_json
+        )
+        return 2
+    cells = SQLITE_CIPHER_CELLS
+    if args.table:
+        known = sorted({c.table for c in SQLITE_CIPHER_CELLS})
+        unknown = sorted(set(args.table) - set(known))
+        if unknown:
+            _emit_error(
+                f"no cipher-covered table named {', '.join(unknown)}; the tables are "
+                f"{', '.join(known)}",
+                as_json=as_json,
+            )
+            return 2
+        cells = tuple(c for c in SQLITE_CIPHER_CELLS if c.table in set(args.table))
+    path = store.path
+    if not Path(path).is_file():
+        # Checked first so the message names the cause; the read-only open would refuse it too, and
+        # neither creates a file.
+        _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
+        return 2
+    # The instance's own posture, derived as `serve` derives it, for the Vault hops the cipher
+    # build can dial (vault BACKLOG #2983).
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    try:
+        cipher = build_store_cipher(store, posture=posture)
+    except _key_unresolved() as exc:
+        # Through `codec_safe_str`, as rotate-key prints it: a DPAPI key file that unprotects to
+        # bytes that are not ASCII raises a decode error whose text quotes a byte of the key.
+        from messagefoundry.redaction import codec_safe_str
+
+        _emit_error(f"the store key could not be resolved: {codec_safe_str(exc)}", as_json=as_json)
+        return 2
+    try:
+        conn = connect_readonly(path, busy_timeout=args.busy_timeout)
+    except sqlite3.Error as exc:
+        return _emit_store_open_error(exc, path, as_json=as_json)
+    stopped: str | None = None
+    audit = CipherAudit()
+    key_service_down: tuple[type[Exception], ...] = (CipherError, *_key_unresolved())
+    try:
+        try:
+            # A file that is not a database fails here, before any cell is read: could not start.
+            tables = store_tables(conn)
+        except sqlite3.Error as exc:
+            return _emit_store_open_error(exc, path, as_json=as_json)
+        if not any(cell_present(conn, c, tables) for c in cells):
+            # An empty file is a valid SQLite database, so a typo'd --db or a failed copy would
+            # otherwise read every cell as absent and PASS: a store this command cannot read.
+            _emit_error(
+                f"{path} holds none of the cipher-covered tables asked for, so it is not a "
+                "MessageFoundry store this command can audit (check --db / [store].path)",
+                as_json=as_json,
+            )
+            return 2
+        audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
+    except sqlite3.Error as exc:
+        # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot read.
+        # The rendering quotes no row's content.
+        stopped = _store_error_text(exc)
+    except CipherWalkInterrupted as exc:
+        stopped = str(exc)
+    except key_service_down as exc:
+        # The key service failing part way: unreachable Transit (the walk raises that rather than
+        # count every later value as damaged), or a key provider. Its classes only: under Transit
+        # the error is raised for one value, and its text is not this command's to print.
+        cause = exc.__cause__
+        stopped = type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+    finally:
+        conn.close()
+
+    if audit.key_mismatch is not None:
+        status, code = "KEY_MISMATCH", 4
+        reason = (
+            f"{audit.key_mismatch}. Run cipher-audit with the key the service runs with; a shell "
+            "without it resolves keyless"
+        )
+    elif stopped is not None:
+        status, code = "FAIL", 1
+        reason = (
+            f"the audit stopped part way on an error ({stopped}). The values after it were not "
+            "read, and the counts are not reported: treat the store as unaudited until a run that "
+            "finishes says otherwise"
+        )
+    elif audit.failed or audit.blob:
+        status, code = "FAIL", 1
+        first = next(t.first_failure for t in audit.tallies if t.first_failure)
+        reason = (
+            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
+            f"store writes only text; the first: {first}"
+        )
+    elif audit.unmarked and not store.allow_unmarked_ciphertext:
+        status, code = "FAIL", 1
+        first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
+        reason = (
+            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
+            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
+            f"planted row (BACKLOG #1169); the first: {first}"
+        )
+    else:
+        status, code = "PASS", 0
+        reason = f"{audit.opened} sealed value(s) decrypted and authenticated"
+        if not cipher.encrypts:
+            reason += "; the store settings resolved no key, and no cell read holds a sealed value"
+        elif audit.unmarked:
+            reason += (
+                f"; {audit.unmarked} unmarked value(s) are read as plaintext under "
+                "[store].allow_unmarked_ciphertext"
+            )
+    if code in (0, 1) and stopped is None:
+        if audit.legacy:
+            reason += (
+                f"; {audit.legacy} plaintext value(s) on surfaces no keyed open has sealed yet, "
+                "which the service's next keyed open seals"
+            )
+        if audit.absent:
+            reason += f"; not in this store, so not read: {', '.join(audit.absent)}"
+
+    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
+    # would read as an empty store.
+    counted = stopped is None and audit.key_mismatch is None
+    cell_rows = audit.tallies if counted else []
+    if as_json:
+        _print_json(
+            {
+                "status": status,
+                "reason": reason,
+                "keyed": cipher.encrypts,
+                "opened": audit.opened if counted else None,
+                "failed": audit.failed if counted else None,
+                "blob": audit.blob if counted else None,
+                "unmarked": audit.unmarked if counted else None,
+                "legacy": audit.legacy if counted else None,
+                "cells": [
+                    {
+                        "cell": t.name,
+                        "present": t.present,
+                        "opened": t.opened,
+                        "failed": t.failed,
+                        "blob": t.blob,
+                        "unmarked": t.unmarked,
+                        "legacy": t.legacy,
+                        "first_failure": t.first_failure,
+                        "first_unmarked": t.first_unmarked,
+                    }
+                    for t in cell_rows
+                ],
+            },
+            compact=True,
+        )
+    else:
+        print(f"{status}: {reason}")
+        for t in cell_rows:
+            if not t.present:
+                print(f"  {t.name} not in this store, not read")
+                continue
+            print(
+                f"  {t.name} opened={t.opened} failed={t.failed} blob={t.blob} "
+                f"unmarked={t.unmarked} legacy={t.legacy}"
+            )
+            for line in (t.first_failure, t.first_unmarked):
+                if line:
+                    print(f"    {line}")
+    return code
+
+
 def _restore(args: argparse.Namespace) -> int:
     """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
 
@@ -10488,6 +11262,7 @@ def _connection(args: argparse.Namespace) -> int:
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
         insecure_bind_escape,
+        settings_file_path,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -10512,6 +11287,15 @@ def _connection(args: argparse.Namespace) -> int:
     # upsert / remove: validate the candidate dir against this instance's [egress] allowlist + active
     # environment before persisting, so a GUI edit pointing at a non-allowlisted host fails at edit
     # time exactly as it would at reload.
+    # A blank --service-config would name the working directory itself, and the open then fails
+    # with an OS error that does not say the name was blank. The IDE passes a blank
+    # messagefoundry.serviceConfig setting through (vault BACKLOG #2908), so refuse it by name.
+    if args.service_config is not None and not args.service_config.strip():
+        return _emit_error(
+            "--service-config is blank; name the instance's settings file "
+            "(in the VS Code extension, the messagefoundry.serviceConfig setting)",
+            as_json=args.json,
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -10596,33 +11380,42 @@ def _connection(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:
         message = str(exc)
-        # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
-        # --service-config, the IDE's usual call, the edit was checked against whatever settings
-        # load_settings found, so say where the list belongs rather than leave the analyst guessing.
-        # The keep-forever retention refusal (vault BACKLOG #2368) reads [security] the same way, so
-        # it gets the same account of which settings were read.
+        # At least these three refusals say which settings file the edit was checked against and
+        # what to change there: the deny default's unlisted outbound (vault BACKLOG #2605), the
+        # keep-forever retention refusal (vault BACKLOG #2368) and the exposure refusal. They say it
+        # whether or not --service-config named the file (vault BACKLOG #2908).
         advice = None
         if BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
-            advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
+            advice = "list the refused destination's host in that file's [egress] allowed_* list for its transport"
         elif BODY_ACKNOWLEDGEMENT_SETTING in message:
-            advice = "this edit is then checked against that instance's [security] settings"
+            advice = (
+                f"{BODY_ACKNOWLEDGEMENT_SETTING} and [security].enforcement are read from that file"
+            )
         elif INSECURE_BIND_FLAG in message:
             # BACKLOG #3063 item 7: the exposure refusal names serve's flag, which this command
             # does not take (item 1), so say which escape it does read and where it was read from.
             message = insecure_bind_note(message, "connection")
-            advice = "the cleartext escape is then read from that instance's [security] settings"
-        if args.service_config is None and advice is not None:
-            # load_settings falls back to ./messagefoundry.toml, so say which case this was.
-            local = Path("messagefoundry.toml")
-            read = (
-                f"against {local.resolve()}, the settings file in the working directory"
-                if local.is_file()
-                else "with no instance settings file, since none was found"
-            )
-            message += (
-                f". No --service-config was given, so this edit was checked {read}. Pass "
-                f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
-            )
+            advice = "the cleartext escape is read from that file's [security] settings"
+        if advice is not None:
+            # The path load_settings read, made absolute but not resolved: resolve() follows links
+            # and can turn a mapped drive into a UNC name the operator never typed.
+            read_from = settings_file_path(args.service_config).absolute()
+            if args.service_config is None:
+                # load_settings falls back to ./messagefoundry.toml, so say which case this was.
+                read = (
+                    f"against {read_from}, the settings file in the working directory"
+                    if read_from.is_file()
+                    else "with no instance settings file, since none was found"
+                )
+                message += (
+                    f". No --service-config was given, so this edit was checked {read}. Pass "
+                    f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
+                )
+            else:
+                message += (
+                    f". This edit was checked against {read_from}, the file --service-config "
+                    f"named, with any MEFOR_* environment override applied over it; {advice}"
+                )
         return _emit_error(message, as_json=args.json)
     except OSError as exc:
         return _emit_error(str(exc), as_json=args.json)
@@ -11479,6 +12272,7 @@ _DISPATCH = {
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,
+    "cipher-audit": _cipher_audit,
     "restore": _restore,
     "ai-policy": _ai_policy,
     "cluster-vip": _cluster_vip,

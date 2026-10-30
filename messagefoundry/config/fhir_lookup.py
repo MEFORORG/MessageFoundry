@@ -53,6 +53,7 @@ __all__ = [
     "FhirLookupError",
     "FhirLookupRunner",
     "fhir_lookup",
+    "is_available",
     "set_active",
     "reset",
     "activated",
@@ -113,6 +114,13 @@ def activated(runner: FhirLookupRunner | None) -> Iterator[None]:
         yield
     finally:
         _active.reset(token)
+
+
+def is_available() -> bool:
+    """Whether a FHIR-lookup runner is published here, so :func:`fhir_lookup` would run rather than
+    raise its "unavailable here" error. The ``mode=isolated`` broker asks this before any refusal of
+    its own (ADR 0147)."""
+    return _active.get() is not None
 
 
 def fhir_lookup(

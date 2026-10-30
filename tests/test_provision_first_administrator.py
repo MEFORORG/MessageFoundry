@@ -15,12 +15,15 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
+import threading
 import time
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -43,7 +46,11 @@ from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, WebAuthnCredential
+from messagefoundry.store.store import (
+    LOGIN_ADDRESS_RESET_MARKER,
+    MessageStore,
+    WebAuthnCredential,
+)
 from tests._admin_account import PROVISION_EMAIL, PROVISION_TOTP_SECRET, provision_totp
 from tests._totp_clock import fresh_totp
 
@@ -2046,6 +2053,696 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
 
 
+# --- vault BACKLOG #3849 B5: the grant raises administrator_granted -----------------------------
+
+
+class _AlertTransport:
+    """An ``[alerts]`` transport that records the events the notifier hands it."""
+
+    name = "webhook"
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    async def send(self, event: dict[str, object], **_kw: object) -> None:
+        self.events.append(dict(event))
+
+
+def _keyed_store_with_directory_administrator(db: Path, key: str) -> None:
+    """A store run only by a directory Administrator: provision-admin runs beside it (#2711)."""
+
+    async def create() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await store.create_user(
+                user_id="dir-a",
+                username="dir-a",
+                auth_provider=AuthProvider.AD.value,
+                password_hash=None,
+                password_generated=False,
+            )
+            await AuthService(store, AuthSettings()).initialize()
+            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+        finally:
+            await store.close()
+
+    asyncio.run(create())
+
+
+def test_cli_raises_administrator_granted_beside_a_directory_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 B5: an Administrator added at the host beside a directory one pages, on
+    the notifier ``serve`` would wire, and lands as an open alert instance in the store. RED on the
+    code before #3849, which raised no alert from this command.
+
+    The notifier is built with the posture the command derived, that object and not one made up on
+    the way (item 8 of the #3849 B5 review): the builder resolves the transports' secrets with it."""
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    derived = HopPosture(enforcing=True)
+    monkeypatch.setattr(
+        "messagefoundry.config.settings.hop_posture_from_ai", lambda _ai, *, enforcement: derived
+    )
+    transport = _AlertTransport()
+    postures: list[object] = []
+
+    def build(_settings: object, posture: object) -> NotifierAlertSink:
+        postures.append(posture)
+        return NotifierAlertSink([transport])
+
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", build)
+    monkeypatch.setattr("getpass.getuser", lambda: "host-operator")
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
+    assert main([*argv, "--email", "operator@example.invalid"]) == 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["administrator_granted_alerted"] is True
+    assert len(postures) == 1 and postures[0] is derived
+
+    assert len(transport.events) == 1
+    event = transport.events[0]
+    assert event["type"] == "administrator_granted"
+    assert event["connection"] == "user:site-admin"
+    assert event["via"] == "provision_admin"
+    assert event["granted_by"] == "cli:host-operator"
+    assert ("administrator_granted", "user:site-admin") in _open_instances(db, key)
+
+
+def _open_instances(db: Path, key: str) -> list[tuple[str, str]]:
+    """The open alert instances in a keyed store, as ``(event type, connection)``."""
+
+    async def read() -> list[tuple[str, str]]:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            rows = await store.list_active_alert_instances(allowed_channels=None)
+            return [(r.event_type, r.connection) for r in rows]
+        finally:
+            await store.close()
+
+    return asyncio.run(read())
+
+
+def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The control on the test above: no ``[alerts]`` transport, so the alert reaches the log
+    sink, as ``serve``'s fallback, and the command says nobody was paged."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
+    with caplog.at_level("WARNING"):
+        assert main([*argv, "--email", "operator@example.invalid"]) == 0
+    out = capsys.readouterr().out
+    # Beside another Administrator, so it is a WARNING that names who to tell; a first install's
+    # plain run is pinned to print no WARNING by test_cli_provisions_and_names_the_store_it_wrote_to.
+    assert "WARNING: no [alerts] transport confirmed delivery of the administrator_granted" in out
+    assert "'dir-a'" in out
+    assert any(
+        "ALERT administrator_granted" in r.getMessage() and "provision_admin" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_a_failing_alert_still_prints_the_json_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The alert runs after the grant committed and after the codes are shown, so a notifier
+    that breaks its never-raise contract must not cost the operator the --json body. Nor may it be
+    reported as paging anyone: the alert falls back to the log, and the output says so (review
+    round 1 of vault BACKLOG #3849). The failure is logged by class only, as the rest of this
+    alert's failures are: a provider's or driver's text can carry an address."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Broken(NotifierAlertSink):
+        def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+            raise RuntimeError("synthetic sink fault")
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: _Broken([_AlertTransport()]),
+    )
+    body, err = _alert_run(argv, capsys)
+    assert body["ok"] is True
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert "synthetic sink fault" not in err
+    assert "RuntimeError" in err
+
+
+def _alert_run(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[dict[str, object], str]:
+    """Run the --json argv, which must succeed, and return its body and its stderr.
+
+    Under --json the command's log goes to stderr, through the redacting handler that replaces
+    the root's (BACKLOG #1489), so the log is read there and not from ``caplog``."""
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    body: dict[str, object] = json.loads(captured.out)
+    return body, captured.err
+
+
+def _timed_alert_run(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[dict[str, object], str]:
+    """:func:`_alert_run`, which must return well before a hung step's 30 s release."""
+    started = time.monotonic()
+    body, err = _alert_run(argv, capsys)
+    assert time.monotonic() - started < 20
+    return body, err
+
+
+@pytest.fixture
+def release() -> Iterator[threading.Event]:
+    """An event a hung step waits on for up to 30 s, set when the test ends, pass or fail. The
+    released step thread is then joined, so nothing it logs lands in a later test."""
+    event = threading.Event()
+    yield event
+    event.set()
+    for thread in threading.enumerate():
+        if thread.name == "provision-admin-alert":
+            thread.join(timeout=10)
+
+
+def _beside_a_directory_administrator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A keyed store run by a directory Administrator, a terminal, and the --json argv that adds a
+    local Administrator beside it, so every run of the argv raises administrator_granted."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_directory_administrator(db, key)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    return [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--db",
+        str(db),
+        "--json",
+        "--email",
+        "operator@example.invalid",
+    ]
+
+
+def _logged_the_fallback(err: str) -> bool:
+    """Whether the logging sink's administrator_granted line, the page's fallback, was written."""
+    return any(
+        "ALERT administrator_granted" in line and "provision_admin" in line
+        for line in err.splitlines()
+    )
+
+
+def _counted_store_opens(
+    monkeypatch: pytest.MonkeyPatch, third: Callable[[], object] | None = None
+) -> list[int]:
+    """Count ``open_store`` calls; the third, the alert's own, runs ``third`` first when given.
+
+    The command opens the store to ask whether an Administrator exists, then to write, then for
+    the alert's open instance, so the third open is the alert's."""
+    from messagefoundry.store import base
+
+    real = base.open_store
+    calls: list[int] = []
+
+    async def counted(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 3 and third is not None:
+            await asyncio.to_thread(third)
+        return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(base, "open_store", counted)
+    return calls
+
+
+def test_a_send_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Review of vault BACKLOG #3849 B5, item 1: a send stuck in a worker thread past the wait
+    bound used to hold the command at ``asyncio.run``'s executor shutdown, for up to 300 s, before
+    it printed anything. The result now comes after the bound, the log fallback is written, and the
+    open instance the emit scheduled still lands in the store (item 5)."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Hung(_AlertTransport):
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
+            await asyncio.to_thread(release.wait, 30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([_Hung()]),
+    )
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    key = os.environ["MEFOR_STORE_ENCRYPTION_KEY"]
+    assert ("administrator_granted", "user:site-admin") in _open_instances(tmp_path / "p.db", key)
+
+
+def test_a_notifier_build_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: a notifier build that hangs, a secret provider that never answers, was bounded by
+    nothing. The whole alert step now is, and the fallback is logged when it runs out."""
+
+    def hung_build(_settings: object, _posture: object) -> None:
+        release.wait(30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_STEP_SECONDS", 0.5)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", hung_build)
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+
+
+def test_a_store_reopen_that_hangs_does_not_hold_the_commands_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: the reopen for the open instance, a server store that never answers, has a bound
+    of its own, so it costs that record and not the page."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    def hung_open() -> None:
+        release.wait(30)
+        # Released at the test's end: fail rather than open a store pytest may be removing.
+        raise RuntimeError("released")
+
+    transport = _AlertTransport()
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    _counted_store_opens(monkeypatch, third=hung_open)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_REOPEN_SECONDS", 0.2)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport]),
+    )
+    body, err = _timed_alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert [e["type"] for e in transport.events] == ["administrator_granted"]
+    assert "could not reopen the store" in err and "TimeoutError" in err
+
+
+def test_an_interrupt_during_the_alert_keeps_the_json_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    release: threading.Event,
+) -> None:
+    """Item 3: Ctrl-C while the alert step runs used to escape the command, after the account was
+    created, with no --json success body. It now ends the wait: the fallback is logged and the
+    body is printed."""
+    import _thread
+    import signal
+
+    def interrupted_build(_settings: object, _posture: object) -> None:
+        _thread.interrupt_main()
+        release.wait(30)
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", interrupted_build)
+    # interrupt_main does nothing where SIGINT is ignored, as a runner may start pytest; pin the
+    # handler that raises KeyboardInterrupt, so the precondition is this test's, not the runner's.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        # Timed, so a wait the interrupt did not end, which runs out the 30 s step bound, fails.
+        body, err = _timed_alert_run(argv, capsys)
+    except KeyboardInterrupt:
+        pytest.fail("the interrupt escaped the command, so the --json body was never printed")
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert body["ok"] is True
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+
+
+def test_a_notifier_factory_that_raises_still_logs_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 2: an exception out of the notifier build sat outside the step's try, so it skipped the
+    log fallback, and its text reached the log. Now it is the fallback, and the class only."""
+
+    def raising_build(_settings: object, _posture: object) -> None:
+        raise RuntimeError("synthetic build fault naming vault.example.invalid")
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr("messagefoundry.__main__._offline_alert_notifier", raising_build)
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert "vault.example.invalid" not in err
+    assert "RuntimeError" in err
+
+
+def test_no_alert_transport_opens_the_store_no_third_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 4: with no [alerts] transport there is no notifier to record an open instance, so the
+    store is not reopened for one. The fallback is still logged."""
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    opens = _counted_store_opens(monkeypatch)
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert len(opens) == 2
+    assert _logged_the_fallback(err)
+
+
+def test_a_store_reopen_that_fails_logs_its_class_and_still_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 7: the reopen failure logged its full exception, and a driver's text can carry the
+    server's address. It is the class now, and the page still goes without the open instance."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    def refuse() -> None:
+        raise RuntimeError("synthetic driver text naming db.example.invalid")
+
+    transport = _AlertTransport()
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    _counted_store_opens(monkeypatch, third=refuse)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport]),
+    )
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert [e["type"] for e in transport.events] == ["administrator_granted"]
+    assert "db.example.invalid" not in err
+    assert "RuntimeError" in err
+
+
+def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A build failure with email configured, such as an SMTP password secret this shell cannot
+    resolve, costs the email transport only (review round 1 of vault BACKLOG #3849)."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.pipeline import alert_sinks
+
+    real = alert_sinks.notifier_from_settings
+
+    def refuse_email(alerts: AlertsSettings, **kw: object) -> object:
+        if alerts.email_to:
+            raise ValueError("synthetic unresolved SMTP secret")
+        return real(alerts, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alert_sinks, "notifier_from_settings", refuse_email)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert "tries again with the webhook alone" in err
+    # The class only: a provider's error text can carry its address or a reference.
+    assert "synthetic unresolved SMTP secret" not in err and "ValueError" in err
+
+
+def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webhook(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An SMTP hop an offline command refuses costs the email transport only: the webhook still
+    carries the alert, as the ``serve`` lifespan keeps it for a refused relay CA."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_use_tls=False,
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    assert "no alert email is sent" in capsys.readouterr().err
+
+
+def test_a_webhook_that_cannot_build_keeps_the_email(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 3: the retry after a failed build only ever dropped the
+    email, so a webhook refused at construction also cost a relay that would have worked. The
+    email transport alone is now tried too. RED before repair 3, which returned no notifier."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.pipeline import alert_sinks
+
+    real = alert_sinks.notifier_from_settings
+
+    def refuse_webhook(alerts: AlertsSettings, **kw: object) -> object:
+        if alerts.webhook_url:
+            raise ValueError("synthetic refused webhook naming hooks.example.invalid")
+        return real(alerts, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alert_sinks, "notifier_from_settings", refuse_webhook)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["email"]
+    err = capsys.readouterr().err
+    assert "hooks.example.invalid" not in err and "ValueError" in err
+    assert "built without the webhook transport" in err
+
+
+@pytest.mark.parametrize("muted", [False, True], ids=["send-refused", "rule-routes-to-none"])
+def test_an_alert_no_transport_delivered_logs_the_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    muted: bool,
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 2: an alert the notifier accepted but no transport
+    delivered, because the send raised or a rule routes it to no transport, counted as paged, so
+    the fallback line and the WARNING naming the other Administrators were skipped. Only a
+    transport's confirmed delivery counts now. RED before repair 3, which answered True."""
+    from messagefoundry.config.settings import AlertRule
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Refused(_AlertTransport):
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
+            raise RuntimeError("synthetic relay refusal")
+
+    transport = _AlertTransport() if muted else _Refused()
+    rules = [AlertRule(event_type="administrator_granted", transports=[])] if muted else None
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport], rules=rules),
+    )
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert transport.events == []
+
+
+class _LateStore:
+    """A store the alert's open instance lands in, recording whether it was closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def upsert_alert_instance(self, **_kw: object) -> None:
+        return None
+
+    async def resolve_alert_instances_for(self, **_kw: object) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_a_store_that_opens_as_its_bound_ends_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 6: ``asyncio.timeout`` around the reopen threw the cancel
+    into the awaiting coroutine when the bound ran out after the open had finished but before that
+    coroutine resumed, so the opened store was discarded and never closed. This reproduces that
+    ordering exactly: the open's result is set, then the bound expires, before the resume. RED
+    before repair 3. The reopen now runs as its own task and keeps its result, so the spy finds no
+    reopen timeout to expire and the store is used and closed as usual; the late-arrival path is
+    pinned by the next test."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+    from messagefoundry.store import base
+
+    bound = 4.25  # distinctive, so the spy below picks out the reopen's own timeout
+    timeouts: list[Any] = []
+    real_timeout = asyncio.timeout
+
+    def spy(delay: float | None) -> Any:
+        cm = real_timeout(delay)
+        if delay == bound:
+            timeouts.append(cm)
+        return cm
+
+    late = _LateStore()
+    real_open = base.open_store
+    opens: list[int] = []
+
+    async def opening(*args: object, **kwargs: object) -> object:
+        opens.append(1)
+        if len(opens) < 3:
+            return await real_open(*args, **kwargs)  # type: ignore[arg-type]
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[object] = loop.create_future()
+        loop.call_soon(done.set_result, late)  # the open finishes...
+        if timeouts and not timeouts[-1].expired():
+            timeouts[-1].reschedule(loop.time())  # ...and the bound expires before the resume
+        return await done
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(asyncio, "timeout", spy)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_REOPEN_SECONDS", bound)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([_AlertTransport()]),
+    )
+    body, _err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert len(opens) == 3
+    assert late.closed
+
+
+async def test_a_store_that_opens_after_its_bound_is_closed_when_it_arrives() -> None:
+    """Item 6: an open that finishes after the bound raises TimeoutError to the caller, and the
+    open is not cancelled: a real driver cancelled mid-open can drop a handle it holds. The store
+    it opens late is closed when it arrives, rather than leaked."""
+    from messagefoundry.__main__ import _close_late_store, _within
+
+    late = _LateStore()
+    finish = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def slow_open() -> Any:
+        try:
+            await finish.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return late
+
+    with pytest.raises(TimeoutError):
+        await _within(slow_open(), 0.01, _close_late_store)
+    assert not late.closed
+    finish.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert cancelled == []
+    assert late.closed
+
+
+async def test_a_close_still_running_at_its_bound_is_left_to_finish() -> None:
+    """Review round 1 of repair 3: the alert's store close used ``asyncio.timeout`` too, so a slow
+    close was cancelled half way at the bound. It is left to finish while the loop runs, and the
+    caller is told it timed out. This loop outlives the call; the command's step loop does not,
+    and its shutdown cancels a close still running then, as ``_within`` says."""
+    from messagefoundry.__main__ import _log_late_close, _within
+
+    finish = asyncio.Event()
+    closed: list[bool] = []
+
+    async def slow_close() -> None:
+        await finish.wait()
+        closed.append(True)
+
+    with pytest.raises(TimeoutError):
+        await _within(slow_close(), 0.01, _log_late_close)
+    finish.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert closed == [True]
+
+
+def test_a_secret_provider_this_shell_cannot_reach_costs_the_email_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 2 of repair 3: the provider was resolved for every build, the webhook alone
+    included, so one this shell cannot reach cost the webhook that needs no secret. It is resolved
+    only for a build that names a secret reference."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config import secretprovider
+    from messagefoundry.config.settings import ServiceSettings
+
+    def unreachable(*_a: object, **_k: object) -> None:
+        raise SecretProviderError("synthetic unreachable provider at vault.example.invalid")
+
+    monkeypatch.setattr(secretprovider, "resolve_secret_provider", unreachable)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_password_secret="alerts/smtp",
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert "vault.example.invalid" not in err and "SecretProviderError" in err
+
+
+def test_a_hop_check_that_raises_costs_the_email_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 1 of repair 3: a relay CA check that raises, rather than refusing, cost the
+    webhook too once the checks moved out of the build's retry. It costs the email only."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import ServiceSettings
+
+    def raising_check(_settings: object, *, what: str) -> bool:
+        raise RuntimeError("synthetic anchor parse fault naming ca.example.invalid")
+
+    monkeypatch.setattr(cli, "_offline_smtp_relay_ca_accepted", raising_check)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert "no alert email is sent" in err and "RuntimeError" in err
+    assert "ca.example.invalid" not in err
+
+
 def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:
     """An [alerts] block with a relay configured, so the notifier can be built."""
     return AlertsSettings(
@@ -2520,6 +3217,8 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         )
         kept = await service.login("site-admin", "the-earlier-holders-passphrase")
         assert kept.ok and kept.token is not None
+        # Vault BACKLOG #3849 B2: an address the earlier holder signed in from.
+        await store.remember_login_address("earlier", "10.9.9.9", now=time.time())
 
         on = AuthService(store, AuthSettings())
         outcome = await on.provision_first_administrator(
@@ -2537,6 +3236,41 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         assert row is not None and row.totp_enabled
         assert await store.get_totp_secret("earlier") == totp.new_enrolment(PROVISION_TOTP_SECRET)
         assert "h1" not in await store.get_recovery_code_hashes("earlier")
+        # B2: the earlier holder's known addresses are gone, down to the reset's marker row, so a
+        # sign-in from one of them is judged first-seen. RED before #3849.
+        assert await store.list_known_login_addresses("earlier", since=0.0) == [
+            LOGIN_ADDRESS_RESET_MARKER
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_refused_takeover_leaves_the_holders_known_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3849 B2, review round 1: the clear runs once the role is granted, so a run
+    refused at the grant takes nothing over and must not reset the holder's record."""
+    from messagefoundry.store.store import AdminGrant
+
+    store = await MessageStore.open(":memory:")
+    try:
+        await _roleless_account(store, email=None)
+        await store.remember_login_address("roleless", "10.9.9.9", now=time.time())
+        service = AuthService(store, AuthSettings())
+
+        async def refuse(*_a: object, **_k: object) -> AdminGrant:
+            return AdminGrant.ADMIN_EXISTS
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", refuse)
+        with pytest.raises(FirstAdministratorRefused, match="granted no role"):
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=PROVISION_EMAIL,
+                actor="test",
+                **provision_totp(),
+            )
+        assert await store.list_known_login_addresses("roleless", since=0.0) == ["10.9.9.9"]
     finally:
         await store.close()
 

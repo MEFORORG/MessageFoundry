@@ -1813,13 +1813,21 @@ async def admin_guard_counts(
     sealer: RowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
     counts: AdminHolderTest | None = None,
+    *,
+    role_id: str,
 ) -> tuple[int, int]:
     """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
     rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
     ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
     counting it would let the last usable administrator be removed. With ``counts``, it must also
     pass that test (the first-administrator grant's); the removal guard passes none, so it counts
-    every sealed holder."""
+    every sealed holder.
+
+    **The record it counts is the record it judged** (vault BACKLOG #3849 C4). The holder list
+    comes from a join that reads ``users.disabled`` and ``user_roles`` once, and the record is read
+    after it, so the record must itself be enabled and hold ``role_id``, the role the join selected
+    on. The seal vouches for the record, not for the join: before this, a holder the join listed
+    counted whatever the sealed record then said about either."""
     target = others = 0
     for holder_id, is_target in holders:
         if is_target:
@@ -1827,6 +1835,8 @@ async def admin_guard_counts(
             continue
         record = await read_record(holder_id)
         if record is None or not user_seal_ok(sealer, record):
+            continue
+        if record.row.disabled or role_id not in record.role_ids:
             continue
         if counts is None or counts(record.row):
             others += 1
@@ -1972,8 +1982,10 @@ class UserRecord:
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
     #: Every column of the row as it was read, for the integrity seal (BACKLOG #2592). Carries the
-    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared, and nothing
-    #: but the seal check and the store's write helper reads it. ``None`` on a record built by hand.
+    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared as a whole.
+    #: Beyond the seal check and the store's write helper, at least the TOTP cell is read from it
+    #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
+    #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
 
     def sign_in_locked(self, now: float) -> bool:
@@ -3332,14 +3344,30 @@ def totp_replace(
     recovery_code_hashes: Sequence[str],
     step: int,
     expected_enrolled_at: float | None,
+    expected_secret_cell: str | None,
     now: float,
 ) -> UserChange:
-    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, with a
-    seed, still enrolled at ``expected_enrolled_at``. The session epoch is raised in the same
-    write, since the caller ends every session with it."""
+    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, still
+    enrolled at ``expected_enrolled_at``, and still holding the stored cell
+    ``expected_secret_cell``, byte for byte, the compare :func:`totp_enable` makes. The session
+    epoch is raised in the same write, since the caller ends every session with it.
+
+    The cell is what tells apart two enrolments sharing a stamp (BACKLOG #3778). On a keyed store
+    every write of it draws a fresh nonce; on a keyless one it is the seed, drawn at random by at
+    least every enrolment path built today. A store-key rotation re-encrypts it, so one landing
+    between the caller's read and this write makes this write nothing, which fails closed. A
+    caller that must hold an enrolment across a long wait pins the opened seed instead and reads
+    the cell again just before calling, as ``admin-reset-totp`` does. ``None`` or an empty cell
+    matches nothing. An empty secret raises, as :func:`totp_stage` refuses one."""
+    if not sealed_secret:
+        raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if not r.row.totp_enabled or r.row.totp_secret is None:
+        # An empty cell is no seed (the store passes "" through as a blank value), so it is never
+        # matched: this replaces a seed and never creates one.
+        if not r.row.totp_enabled or not expected_secret_cell:
+            return None
+        if r.row.totp_secret != expected_secret_cell:
             return None
         if r.row.totp_enrolled_at != _opt_float(expected_enrolled_at):
             return None
@@ -3568,6 +3596,14 @@ def existing_roles_only(
 #: The ``roles`` columns a role seal leaves out, each with its reason (BACKLOG #2592).
 #: ``tests/test_role_seal.py`` pins this list.
 ROLE_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
+
+#: The one row an administrator's reset, or a provision-admin takeover, leaves in an account's
+#: known sign-in address record (vault BACKLOG #2946, #3849). It holds no host, is stamped at the
+#: epoch, and is never a match; it is the baseline for an account that never stamped
+#: ``last_login_at``. Defined in the store because the store keeps it: ``forget_login_addresses``
+#: never prunes it, and ``reset_login_addresses`` writes it in the transaction that empties the
+#: record (vault BACKLOG #3849 B4).
+LOGIN_ADDRESS_RESET_MARKER: Final = "cleared by reset"
 
 #: The AD group-to-role map: its table, and the name its seal is stored under in
 #: ``authority_set_seal``. The name is inside the sealed bytes too, so a seal made for one map
@@ -16150,6 +16186,7 @@ class MessageStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -16160,16 +16197,19 @@ class MessageStore:
         The secret, the recovery codes and the step high-water mark change together, and TOTP stays
         on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
         the code that proved the new secret, so that code is spent. The write matches only a row
-        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
-        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
-        never be turned on for an account that did not have it. The audit row and the session sweep
-        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
+        where TOTP is on, still enrolled at ``expected_enrolled_at`` and still holding the stored
+        cell ``expected_secret_cell`` (:func:`totp_replace` says why both, BACKLOG #3778): a
+        removal or a re-enrolment that landed after the caller read the row is never overwritten,
+        and TOTP can never be turned on for an account that did not have it. The audit row and the
+        session sweep commit or roll back with the swap, so a refused audit append leaves the old
+        seed in place."""
         now = time.time() if now is None else now
         change = totp_replace(
             sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
+            expected_secret_cell=expected_secret_cell,
             now=now,
         )
         async with _writer_txn(self._db, self._lock):
@@ -16441,8 +16481,19 @@ class MessageStore:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-                (user_id, before),
+                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<? AND address<>?",
+                (user_id, before, LOGIN_ADDRESS_RESET_MARKER),
+            )
+            await self._commit()
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+            await self._db.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES (?, ?, 0, 0) ON CONFLICT(user_id, address) DO NOTHING",
+                (user_id, LOGIN_ADDRESS_RESET_MARKER),
             )
             await self._commit()
 
@@ -16470,7 +16521,7 @@ class MessageStore:
                 cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                 holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                 target, others = await admin_guard_counts(
-                    holders, self._row_sealer, self._read_user_record
+                    holders, self._row_sealer, self._read_user_record, role_id=admin_role_id
                 )
                 if target and not others:
                     await self._db.rollback()
@@ -16519,7 +16570,11 @@ class MessageStore:
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
-                        holders, self._row_sealer, self._read_user_record, counts_as_admin
+                        holders,
+                        self._row_sealer,
+                        self._read_user_record,
+                        counts_as_admin,
+                        role_id=admin_role_id,
                     )
                     if others:
                         await self._db.rollback()

@@ -2308,9 +2308,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
-    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
-    # caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset or a provision-admin
+    # takeover, one marker row that holds no host (``store.store.LOGIN_ADDRESS_RESET_MARKER``, vault
+    # BACKLOG #2946, #3849). The caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
@@ -2324,7 +2324,16 @@ class AuthStore(Protocol):
     # row outside the reader's lookback can never match. A separate call and transaction from the
     # upsert, because in one transaction two writes for one account from different hosts could each
     # lock its own row and then wait on the other's in the prune, a deadlock on both server backends.
+    # It NEVER deletes the reset marker row (vault BACKLOG #3849 B4): that row
+    # is stamped at the epoch, so a prune from a sign-in that raced a reset would otherwise delete
+    # it and could leave the record empty, which reads as no baseline. Only
+    # :meth:`reset_login_addresses` and ``delete_user`` remove it.
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None: ...
+
+    # Delete every row of the account and write the reset marker row, stamped
+    # at the epoch, in ONE transaction (vault BACKLOG #3849 B4), so a failure leaves the record as it
+    # was and never empty. What an administrator's reset and a provision-admin takeover run.
+    async def reset_login_addresses(self, user_id: str) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
     # CONDITIONAL (BACKLOG #3025): stages ``secret``, sealed, only where TOTP is still off, and
@@ -2361,10 +2370,11 @@ class AuthStore(Protocol):
     # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
     # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
     # account never passes through zero factors. The same transaction ends the account's sessions
-    # and appends `audit`, so the swap is never live unrecorded. Conditional on TOTP being on and
-    # on `totp_enrolled_at` still being `expected_enrolled_at` (compare-and-set against the
-    # caller's read). Returns the sessions ended, or None when nothing was written; a caller must
-    # refuse on None.
+    # and appends `audit`, so the swap is never live unrecorded. Conditional on TOTP being on, on
+    # `totp_enrolled_at` still being `expected_enrolled_at`, and on the stored `totp_secret` cell
+    # still being `expected_secret_cell`, byte for byte (compare-and-set against the caller's read;
+    # store.totp_replace says why both, BACKLOG #3778). An empty `secret` raises ValueError.
+    # Returns the sessions ended, or None when nothing was written; a caller must refuse on None.
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -2373,6 +2383,7 @@ class AuthStore(Protocol):
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None: ...

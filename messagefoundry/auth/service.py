@@ -62,6 +62,7 @@ from messagefoundry.auth.ldap import (
     PAGING_TOO_MANY_PAGES,
     AdPrincipal,
     DirectoryAnswer,
+    KerberosPrincipalRefused,
     KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
@@ -168,6 +169,7 @@ from messagefoundry.store.row_seal import (
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AdMap,
@@ -503,15 +505,6 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
-# The one row an administrator's password or MFA reset leaves in the account's known-address record
-# (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
-# so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
-# never a match: it is stamped at the epoch, outside every lookback, ``_mark_login_address_known``
-# never writes a client whose text equals it, and the next real write's prune usually removes it.
-_LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
-# Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
-# because SQL Server's FLOAT cannot hold an infinity.
-_LOGIN_ADDRESS_FOREVER = 1e18
 
 
 class _LoginAddress(Enum):
@@ -2293,6 +2286,11 @@ class ProvisionedAdministrator:
     #: enrolled no TOTP (``--no-totp``, which only a site with ``require_mfa`` off may pass). Never
     #: in ``--json`` output, never logged, never audited.
     recovery_codes: tuple[str, ...] = ()
+    #: Every enabled Administrator when the run checked, as the audit row's
+    #: ``administrators_at_check`` records them (vault BACKLOG #2711 step 1). Non-empty means this
+    #: one was added beside them, so the CLI warns when its ``administrator_granted`` alert reached
+    #: only the log (vault BACKLOG #3849 B5).
+    administrators_at_check: tuple[str, ...] = ()
 
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
@@ -2475,6 +2473,18 @@ def _log_totp_malformed(username: str) -> None:
         "gate still counts it as an enabled TOTP, and an administrator's factor reset clears it",
         username,
     )
+
+
+def _same_totp_columns(a: VerifiedUser, b: VerifiedUser) -> bool:
+    """Whether ``a`` and ``b`` store one TOTP enrolment: on or off, its stamp and its cell, so no
+    cell is opened to tell (BACKLOG #3929). The cells are compared in constant time (ASVS 11.2.4):
+    on a keyless store a cell is the secret itself."""
+    if (a.totp_enabled, a.totp_enrolled_at) != (b.totp_enabled, b.totp_enrolled_at):
+        return False
+    cell_a, cell_b = a.totp_secret_cell, b.totp_secret_cell
+    if (cell_a is None) != (cell_b is None):
+        return False
+    return constant_time_equal(cell_a or "", cell_b or "")
 
 
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
@@ -2700,13 +2710,20 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     """The audit fields for an OIDC callback the floor exemption let through, empty when it did not
     apply (BACKLOG #2388).
 
-    BACKLOG #3220: the success row carries it, and so does each refusal row written after the
-    exemption applied, a directory lock refusal included since BACKLOG #3726 gave that row its own
-    whole-hidden action (see :meth:`AuthService._refuse_directory_row`). So the review
-    ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed. At least the
-    role-resync and session-rotation rows the attempt writes do not carry it. The values are the
-    CONFIGURED ones the token matched, never the token's own."""
+    ``docs/SECURITY.md``, *What these floors do not do*, is the source of record for which audit
+    rows carry them (BACKLOG #3220, #3728). ``tests/test_oidc_callback_floor_exempt_amr.py`` reads
+    this module's syntax trees and fails on an outcome writer, in the shapes it names, that does not
+    pass them. The values are the CONFIGURED ones the token matched, never the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
+
+
+#: BACKLOG #3728: the field on each step-up outcome row written after an opted-in site deferred a
+#: too-early callback's floor decision past the code exchange. It says the decision waited, not that
+#: the exemption applied, so a refusal that comes before any ``amr`` is known, such as a failed
+#: exchange, still shows the deferral.
+_FLOOR_DEFERRED_MARKER: Final[Mapping[str, object]] = MappingProxyType(
+    {"callback_floor_deferred": True}
+)
 
 
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
@@ -3932,7 +3949,9 @@ class AuthService:
         always covers an administrator.
 
         **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
-        recovery codes, every passkey, and every session on the row. Before this, the branch revoked
+        recovery codes, every passkey, every session on the row, and since vault BACKLOG #3849 B2 the
+        account's known sign-in addresses, as a reset clears them, once the role is granted. Before
+        this, the branch revoked
         no session, and ``_build_identity`` re-reads roles on every request, so a live session the
         earlier holder kept became an Administrator session when the role was written -- an ADR 0183
         defect this amendment fixes because it edits this branch.
@@ -4261,9 +4280,27 @@ class AuthService:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
+            # below, so the row is read again first. Only a read of this very row without the role
+            # shows the store wrote none and took nothing over, and leaves the record, as
+            # SECURITY.md says. Anything else, a read that raises or finds no verified row of this
+            # id, leaves it unknown, and the record is cleared, the side that challenges: a re-run
+            # refuses a row that holds the role, so nothing else would clear it.
+            row: VerifiedUser | None = None
+            may_hold_role = True
+            try:
+                row = (await self._lookup_by_username(username)).user
+                may_hold_role = not (
+                    row is not None
+                    and row.id == user_id
+                    and Role.ADMINISTRATOR.value not in row.role_ids
+                )
+            finally:
+                if repaired and may_hold_role:
+                    await self._clear_login_addresses(user_id, username=username)
             raise FirstAdministratorRefused(
                 await self._unexpected_grant_refusal(
-                    username, user_id, enrolled=totp_secret is not None
+                    username, user_id, row, enrolled=totp_secret is not None
                 )
             )
         if repaired:
@@ -4272,6 +4309,15 @@ class AuthService:
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator.
             await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
+            # not the new Administrator's, so they go too, as after an administrator's reset
+            # (#2946). Otherwise a sign-in from one of them would read as known and skip the
+            # first-seen challenge. HERE, after the grant, and not with the first clear: a sign-in
+            # the earlier holder finished before ``set_password`` can still record its address.
+            # A run the grant refuses (ADMIN_EXISTS, ACCOUNT_CHANGED) has already replaced the
+            # password, the TOTP and the notification address, but it wrote no role, so the
+            # addresses are left as they were. Best effort, as at a reset.
+            await self._clear_login_addresses(user_id, username=username)
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
@@ -4301,17 +4347,19 @@ class AuthService:
             repaired=repaired,
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
+            administrators_at_check=standing_admins,
         )
 
     async def _unexpected_grant_refusal(
-        self, username: str, user_id: str, *, enrolled: bool
+        self, username: str, user_id: str, row: VerifiedUser | None, *, enrolled: bool
     ) -> str:
         """The operator-facing text for a first-admin grant that answered out of contract (#3078).
 
-        Such a store MAY still have written a role, so the row is read again, through the same
-        seal-checked loader a re-run uses, and the advice matches what it holds. The read runs
-        after the grant's transaction, so it can also see another run's work; the text says
-        "may" for that reason. "Keep the entry and re-run" is wrong in at least two states: a re-run
+        Such a store MAY still have written a role, so the caller reads the row again, through the
+        same seal-checked loader a re-run uses, and passes it as ``row``; the advice matches what
+        it holds. The caller's read runs after the grant's transaction, so it can also see another
+        run's work; the text says "may" for that reason. "Keep the entry and re-run" is wrong in at
+        least two states: a re-run
         refuses a row that holds the Administrator role, and on a roleless row it clears the
         authenticator this run enrolled.
         """
@@ -4323,8 +4371,6 @@ class AuthService:
             "If the command is refused the same way again, the store has a fault this command "
             "cannot repair"
         )
-        lookup = await self._lookup_by_username(username)
-        row = lookup.user
         if row is None or row.id != user_id:
             return f"{prefix}, and could not read what that account holds now. {again}"
         if Role.ADMINISTRATOR.value in row.role_ids:
@@ -5234,7 +5280,7 @@ class AuthService:
         # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
         # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
         try:
-            secret = self._totp_secret(user)
+            secret = await self._totp_secret(user)
             step = (
                 totp.verify_totp_step(
                     secret,
@@ -5532,6 +5578,17 @@ class AuthService:
             # only in a DEBUG traceback.
             await self._directory_reject_audit(
                 "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
+            )
+            return LoginOutcome(ok=False, error="SSO authentication failed")
+        except KerberosPrincipalRefused as exc:
+            # BACKLOG #2610: another realm, no realm, or not a bare account name. The directory is
+            # never asked. The row names the closed-set refusal, never the principal's text.
+            await self._directory_reject_audit(
+                "<kerberos>",
+                "kerberos",
+                "no_principal",
+                client=client,
+                extra={"refusal": exc.reason},
             )
             return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
@@ -5962,8 +6019,8 @@ class AuthService:
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
-        # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
-        # each refusal after this point (BACKLOG #3220), a lock refusal included (BACKLOG #3726).
+        # in oidc_callback_floor_exempt_amr) is exempt. Each outcome row written after the too-early
+        # refusal below passes floor_marker (see _floor_exempt_marker); that refusal has none to pass.
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(
                 self._oidc_callback_floor_exempt_values(), principal_claims.amr
@@ -5971,7 +6028,6 @@ class AuthService:
             if signed_in_during_flow and arrived_too_early
             else ()
         )
-        floor_marker = _floor_exempt_marker(floor_exempt_amr)
         if signed_in_during_flow and arrived_too_early and not floor_exempt_amr:
             # With the client address, as the token_refused arm records it: a run of these is
             # automation, and the operator needs to see where it comes from.
@@ -5982,6 +6038,7 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=TOO_EARLY)
+        floor_marker = _floor_exempt_marker(floor_exempt_amr)
 
         # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
         username = principal_claims.username
@@ -6167,8 +6224,6 @@ class AuthService:
             "sub": principal_claims.subject,
             "mfa_verified": mfa_verified,
         }
-        # BACKLOG #2388: present only when the exemption let a too-early callback through.
-        evidence.update(floor_marker)
         return await self._complete_ad_login(
             principal,
             client,
@@ -6183,7 +6238,7 @@ class AuthService:
             idp_auth_time=principal_claims.auth_time,
             # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
-            refusal_extra=floor_marker,
+            outcome_extra=floor_marker,
         )
 
     # --- the federated step-up leg (BACKLOG #296, ADR 0142 Amendment B) ---------------------------
@@ -6368,7 +6423,8 @@ class AuthService:
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
         #2301), a check that moves after the exchange when ``oidc_callback_floor_exempt_amr`` is set,
         because only the exchange yields the ``amr`` it exempts by (BACKLOG #2388), so a too-early
-        callback whose exchange fails is then refused with that failure's reason, not ``too_early``;
+        callback whose exchange fails is then refused with that failure's reason, not ``too_early``,
+        on a row that carries ``callback_floor_deferred`` (BACKLOG #3728);
         the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
         ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA claim when that gate
         is on); the session is still live by every test :meth:`identity_for_token` applies, and
@@ -6421,6 +6477,12 @@ class AuthService:
         )
         if arrived_too_early and not exempt_values:
             return await refuse(TOO_EARLY)
+        # BACKLOG #3728: past this line a too-early callback is one whose floor decision waits for
+        # the exchange, so each outcome row says so, a failed exchange's included: that row comes
+        # before any amr is known, and would otherwise record nothing of the deferral. Bound as
+        # `floor`, which no arm's `extra` can replace.
+        floor_fields: Mapping[str, object] = _FLOOR_DEFERRED_MARKER if arrived_too_early else {}
+        refuse = partial(refuse, floor=floor_fields)
         try:
             principal_claims = await asyncio.to_thread(
                 self._exchange_and_validate, code, flow, self._oidc_redirect_uri(public_origin)
@@ -6445,11 +6507,12 @@ class AuthService:
             if arrived_too_early
             else ()
         )
-        # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
-        # so a failed exempted step-up is as visible to the loosening's review as a served one.
-        floor_marker = _floor_exempt_marker(floor_exempt_amr)
-        # Bound once, as the address fields are above, so a new arm cannot leave the marker out.
-        refuse = partial(refuse, extra=floor_marker)
+        # BACKLOG #3220: every outcome row past the floor carries the marker when the exemption
+        # applied, so a failed exempted step-up is as visible to the loosening's review as a served
+        # one. This second binding REPLACES the first's `floor`, so it keeps the deferral by merging
+        # it in; the floor-exempt test file pins both bindings and their order.
+        floor_fields = {**floor_fields, **_floor_exempt_marker(floor_exempt_amr)}
+        refuse = partial(refuse, floor=floor_fields)
         if arrived_too_early and not floor_exempt_amr:
             # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
             return await refuse(TOO_EARLY)
@@ -6573,6 +6636,10 @@ class AuthService:
         # refusing a move, or anchoring to the start address, would change ADR 0142 Amendment B
         # and needs a ruling first.
         detail: dict[str, object] = {
+            # BACKLOG #2388, #3728: present only when the floor was deferred or the exemption let a
+            # too-early callback through, holding only configured values, never the token's own.
+            # First, so it can never overwrite a field this row sets, as on the refusal rows.
+            **floor_fields,
             "ok": elevation.ok,
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
@@ -6582,9 +6649,6 @@ class AuthService:
             "session_revoked": False,
             **self._step_up_address_fields(flow, client),
         }
-        # BACKLOG #2388: present only when the exemption let a too-early callback through, and
-        # holding only configured values, never the token's own.
-        detail.update(floor_marker)
         await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
@@ -6625,20 +6689,27 @@ class AuthService:
         extra: Mapping[str, object] | None = None,
         flow_consumed: bool = True,
         flow: PendingFlow | None = None,
+        floor: Mapping[str, object] | None = None,
     ) -> OidcStepUp:
         """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
 
         ``extra`` adds fields to the audit row only, such as a received status or an exception
         type (BACKLOG #1948). It never carries IdP text.
 
+        ``floor`` adds the callback-floor fields (``_floor_exempt_marker`` and
+        ``_FLOOR_DEFERRED_MARKER``). It is a keyword of its own so :meth:`complete_oidc_step_up` can
+        bind it with ``partial`` while an arm still passes ``extra``, which would replace a bound
+        ``extra``.
+
         ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
         BACKLOG #3145). Only a refusal made after a STEP-UP flow was redeemed passes it: before
         ``state`` matched, the callback is not shown to belong to the flow; a sign-in flow refused
         as ``flow_purpose_mismatch`` started another ceremony, so its address is not a step-up's;
         and some refusals have no flow at all. Those rows carry neither field."""
-        # `extra` first, so it can never overwrite a closed-set field.
+        # `extra` and `floor` first, so neither can overwrite a closed-set field.
         detail: dict[str, object] = {
             **(extra or {}),
+            **(floor or {}),
             "ok": False,
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
@@ -6738,11 +6809,11 @@ class AuthService:
         # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
         # federated caller passes it; a Kerberos session has no IdP clock to compare.
         idp_auth_time: float | None = None,
-        # BACKLOG #3220: extra fields for the refusal rows this login writes, a lock refusal
-        # included since BACKLOG #3726 (see _refuse_directory_row). The federated caller passes the
-        # callback_floor_exempt_amr marker when the floor exemption let it through, so a refused
-        # exempted attempt carries it as the success row does. Kerberos passes nothing.
-        refusal_extra: Mapping[str, object] | None = None,
+        # BACKLOG #3220, #3728: extra fields for every OUTCOME row this login writes, each refusal
+        # and the success row, at their top level. The federated caller passes the
+        # callback_floor_exempt_amr marker (see _floor_exempt_marker). Kerberos passes nothing, so
+        # its rows are unchanged.
+        outcome_extra: Mapping[str, object] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
@@ -6768,7 +6839,7 @@ class AuthService:
             # BACKLOG #2592: the name's row fails its integrity seal. It is refused, and never
             # adopted or re-created over: the store will not re-seal it.
             return await self._refuse_directory_row(
-                principal.username, ACCOUNT_REFUSED, client=client, extra=refusal_extra
+                principal.username, ACCOUNT_REFUSED, client=client, extra=outcome_extra
             )
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -6776,7 +6847,7 @@ class AuthService:
                 "auth.login_failed",
                 actor=principal.username,
                 detail=_json(
-                    {**(refusal_extra or {}), "provider": "ad", "reason": "local_account_conflict"}
+                    {**(outcome_extra or {}), "provider": "ad", "reason": "local_account_conflict"}
                 ),
                 client=client,
             )
@@ -6809,13 +6880,13 @@ class AuthService:
                     "oidc",
                     DIRECTORY_OBJECT_ID_MISSING,
                     client=client,
-                    extra=refusal_extra,
+                    extra=outcome_extra,
                 )
                 return LoginOutcome(
                     ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
                 )
             return await self._refuse_directory_row(
-                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client, extra=refusal_extra
+                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client, extra=outcome_extra
             )
         if existing is not None and existing.directory_object_id != principal.directory_object_id:
             # BACKLOG #1471. THE ROW HOLDING THIS NAME MUST AGREE WITH THE PRESENTED IDENTITY.
@@ -6853,7 +6924,7 @@ class AuthService:
                 actor=principal.username,
                 detail=_json(
                     {
-                        **(refusal_extra or {}),
+                        **(outcome_extra or {}),
                         "provider": "ad",
                         "reason": DIRECTORY_IDENTITY_CONFLICT,
                     }
@@ -6890,7 +6961,7 @@ class AuthService:
             refusal = _directory_login_refusal(existing, time.time(), federated=federated)
             if refusal is not None:
                 return await self._refuse_directory_row(
-                    principal.username, refusal, client=client, extra=refusal_extra
+                    principal.username, refusal, client=client, extra=outcome_extra
                 )
         try:
             user = await self._upsert_ad_user(
@@ -6904,7 +6975,7 @@ class AuthService:
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({**(refusal_extra or {}), "provider": "ad", "reason": exc.reason}),
+                detail=_json({**(outcome_extra or {}), "provider": "ad", "reason": exc.reason}),
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict", reason=exc.reason)
@@ -6913,7 +6984,7 @@ class AuthService:
             # audit row carries the caller's ``client`` and every directory refusal in this method
             # has one shape.
             return await self._refuse_directory_row(
-                principal.username, exc.reason, client=client, extra=refusal_extra
+                principal.username, exc.reason, client=client, extra=outcome_extra
             )
         if (
             federated_subject is not None
@@ -6945,7 +7016,7 @@ class AuthService:
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
             await self._directory_reject_audit(
-                principal.username, "oidc", reason, client=client, extra=refusal_extra
+                principal.username, "oidc", reason, client=client, extra=outcome_extra
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
@@ -7059,7 +7130,7 @@ class AuthService:
                     principal.username,
                     FEDERATED_SIGN_IN_REQUIRED,
                     client=client,
-                    extra=refusal_extra,
+                    extra=outcome_extra,
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
@@ -7067,7 +7138,7 @@ class AuthService:
                 "oidc",
                 "federated_subject_unbound",
                 client=client,
-                extra=refusal_extra,
+                extra=outcome_extra,
             )
             return LoginOutcome(
                 ok=False,
@@ -7077,8 +7148,9 @@ class AuthService:
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
-        # Only the federated path passes mech/evidence, so it alone grows the row.
-        detail: dict[str, object] = {"provider": "ad", "roles": role_ids}
+        # Only the federated path passes mech/evidence/outcome_extra, so it alone grows the row.
+        # `outcome_extra` first, so it can never overwrite a field this row sets.
+        detail: dict[str, object] = {**(outcome_extra or {}), "provider": "ad", "roles": role_ids}
         if mech is not None:
             detail["mech"] = mech
         if evidence:
@@ -10506,13 +10578,20 @@ class AuthService:
         await self._user_seal_failed(user.id)
         return None
 
-    def _totp_secret(self, user: VerifiedUser) -> str | None:
+    async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
+        """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
+        OFF THE EVENT LOOP (BACKLOG #3929). The service's one way to open it: under a Transit cipher
+        the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the combined
+        sign-in reaches it with a username alone. Raises what the store's opener raises."""
+        return await asyncio.to_thread(self._store.open_totp_secret, user.id, user.totp_secret_cell)
+
+    async def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
         be checked against no seal, and its codes would sign in. A secret whose enrolment marker
         is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
         so this line is what names the cause."""
-        secret = self._store.open_totp_secret(user.id, user.totp_secret_cell)
+        secret = await self._open_totp_cell(user)
         # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
         if (
             secret is not None
@@ -10522,30 +10601,31 @@ class AuthService:
             _log_totp_refused(user.username)
         return secret
 
-    def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
+    async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
         #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
         across the check. ``None`` when the cell does not open, logged by
         :func:`_log_totp_undecryptable`."""
         try:
-            secret = self._totp_secret(user)
+            secret = await self._totp_secret(user)
         except CipherError:
             _log_totp_undecryptable(user.username)
             return None
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
-    def _totp_enrolment_moved(
-        self, verified: _TotpEnrolment | None, current: VerifiedUser
+    async def _totp_enrolment_moved(
+        self, verified: _TotpEnrolment, current: VerifiedUser
     ) -> _TotpMoved | None:
         """Why the TOTP factor :meth:`verify_mfa` checked a code against is no longer the one row
         ``current`` holds, or ``None`` when it still is: ``"factor_removed"`` (turned off),
-        ``"factor_unverified"`` (either reading's cell does not open, checked first, so an
+        ``"factor_unverified"`` (``current``'s cell does not open, checked first, so an
         unopenable cell is never read as a change) or ``"factor_replaced"`` (enrolled again, told
-        apart by the stamp or the opened secret). BACKLOG #3068, #3780."""
+        apart by the stamp or the opened secret). ``verified`` is the reading taken before the
+        check, which :meth:`verify_mfa` requires to have opened. BACKLOG #3068, #3780."""
         if not current.totp_enabled:
             return "factor_removed"
-        enrolment_now = self._totp_enrolment(current)
-        if verified is None or enrolment_now is None:
+        enrolment_now = await self._totp_enrolment(current)
+        if enrolment_now is None:
             return "factor_unverified"
         if not _same_totp_enrolment(verified, enrolment_now):
             return "factor_replaced"
@@ -12552,7 +12632,7 @@ class AuthService:
             # A client text equal to the reset marker (a forged forwarded header can carry any
             # text) is not written, or the upsert would move the marker into the lookback.
             if (
-                key == _LOGIN_ADDRESS_RESET_MARKER
+                key == LOGIN_ADDRESS_RESET_MARKER
                 or len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX
             ):
                 return
@@ -12587,34 +12667,37 @@ class AuthService:
         """Empty the account's known-address record after an administrator's password or MFA reset
         (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
         the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
-        session does not call this, because revoking is routine.
+        session does not call this, because revoking is routine. A ``provision-admin`` takeover
+        calls it too (vault BACKLOG #3849 B2): the addresses are the earlier holder's.
 
-        It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
+        It leaves one row, the store's ``LOGIN_ADDRESS_RESET_MARKER`` (vault BACKLOG #2946,
+        #3849), stamped at the epoch so the lookback
         read never returns it. An account that never stamped ``last_login_at`` would otherwise read
         as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
-        rather than be judged NEW. In the usual case the prune after the next real write removes
-        it, and that write has just added a real row; ``delete_user`` and a later reset also remove
-        it. Every reset leaves it, an account that never signed in included, as the ruling asks.
+        rather than be judged NEW. The store's prune never removes it, so it stays until
+        ``delete_user`` or a later reset (vault BACKLOG #3849 B4); it is never a match. Every reset
+        leaves it, an account that never signed in included, as the ruling asks.
+
+        **The delete and the marker are one store transaction** (``reset_login_addresses``, vault
+        BACKLOG #3849 B4). Before that they were two calls, so a failure between them, or a
+        sign-in's prune racing the marker, could leave the record empty, which reads as no
+        baseline. A sign-in's prune can no longer remove the marker either.
 
         Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
         reset's credential write has committed, and its reply carries the one-time credential. A
-        failure is logged at ERROR with the username, and the reset stands with the record as the
-        failure left it: unchanged, or emptied with no marker. The two calls are separate
-        transactions, so any record write still in flight for the account, from a sign-in, a
-        step-up, a factor proof or an enrolment, can land after the delete."""
+        failure is logged at ERROR with the username, and the reset stands with the record
+        unchanged. Any record write still in flight for the account, from a sign-in, a step-up, a
+        factor proof or an enrolment, can still land after the reset's transaction."""
         # The notice debounce goes too, so the first NEW sign-in after the reset is also mailed.
         for key in [k for k in self._login_new_ip_noticed if k[0] == user_id]:
             del self._login_new_ip_noticed[key]
         try:
-            await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
-            # Stamped at the epoch, so the lookback read never returns it and only the any-age
-            # baseline read sees it.
-            await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+            await self._store.reset_login_addresses(user_id)
         except Exception:
             _log.exception(
-                "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
-                "and the next sign-in may read an address seen before it as known, or find no "
-                "baseline",
+                "could not clear the known sign-in addresses of %s after a reset or takeover; it "
+                "stands, the record is unchanged, and the next sign-in may read an address seen "
+                "before it as known",
                 username,
             )
 
@@ -12902,19 +12985,17 @@ class AuthService:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one this checked
-        record's seal covered (BACKLOG #3510), opened OFF THE EVENT LOOP, since a Transit cipher's
-        decrypt is a blocking HTTP call (CLAUDE.md section 6). The service's way-past
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is opened by
+        :meth:`_open_totp_cell`, off the event loop. The service's way-past
         decisions ask this: the rotation and removal gates, the last-factor rule and the lock
         notice; the store's conditional writes and the lock escalation ask the same rule
         (``totp_usable``) on the cell they lock."""
-        cell = user.totp_secret_cell
         if not user.totp_enabled:
             return None
-        if cell is None:
+        if user.totp_secret_cell is None:
             return "refused"
         try:
-            secret = await asyncio.to_thread(self._store.open_totp_secret, user.id, cell)
+            secret = await self._open_totp_cell(user)
         except CipherError:
             log_unopened_totp(user.id)
             return "unknown"
@@ -13311,7 +13392,7 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
-        secret = self._totp_secret(user)
+        secret = await self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
         # The stored cell this code is checked against. The enable below turns TOTP on only while
@@ -13622,17 +13703,29 @@ class AuthService:
             # ``replace_totp_enrolment``'s compare-and-set relies on, and the opened secret is
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
-            verified_enrolment = self._totp_enrolment(user)
+            verified_enrolment = await self._totp_enrolment(user)
+            if verified_enrolment is None:
+                # The cell did not open (logged by _totp_enrolment), so nothing after the check
+                # could tell whether the code proved the factor the row holds then. Refused before
+                # the check, so no code is spent and nothing is charged, even where a later open
+                # would succeed (BACKLOG #3929 review): a recovery code spent here was lost.
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_unverified"}),
+                    client=client,
+                )
+                return Elevation()
             match = _CodeMatch()
             try:
                 proved = await self._verify_second_factor(
                     user, code, client=client, arrived=arrived, match=match
                 )
             except CipherError:
-                # The cell did not open for the check either (logged just above). The check raises
-                # at its TOTP decrypt, before any recovery code is read, so nothing is spent and
-                # nothing is charged. Refused with the reason the after-side gives, rather than
-                # raised past the "never raises" contract.
+                # The cell opened above but not for the check. The check raises at its TOTP
+                # decrypt, before any recovery code is read, so nothing is spent and nothing is
+                # charged. Refused with the reason the after-side gives, rather than raised past
+                # the "never raises" contract.
                 await self._audit(
                     "auth.mfa_failed",
                     actor=user.username,
@@ -13661,7 +13754,26 @@ class AuthService:
                 # no longer holds. It is spent by now, so the refusal is audited with its reason.
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
-                refusal = self._totp_enrolment_moved(verified_enrolment, fresh)
+                refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
+                # BACKLOG #3929: each comparison opens the cell in a worker thread, so a revocation,
+                # a disable or a lock can land during it. The holder is read again after each one
+                # until a read finds the stored enrolment the comparison judged, so the last read
+                # before the write is a store read, and the write is for the enrolment compared.
+                while refusal is None:
+                    settled = await self._factor_holder_current(
+                        token,
+                        actor=fresh.username,
+                        event="auth.mfa_failed",
+                        client=client,
+                        report_lock=True,
+                    )
+                    if isinstance(settled, Elevation):
+                        return settled
+                    unmoved = _same_totp_columns(settled, fresh)
+                    fresh = settled
+                    if unmoved:
+                        break
+                    refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
@@ -13748,7 +13860,7 @@ class AuthService:
                     )
                     if isinstance(held, Elevation):
                         return held
-                    change = self._totp_enrolment_moved(verified_enrolment, held)
+                    change = await self._totp_enrolment_moved(verified_enrolment, held)
                 except Exception:  # noqa: BLE001 - any re-read failure is charged, never raised
                     _log.exception("verify_mfa: the factor re-read after a failed spend raised")
                 else:
@@ -14182,7 +14294,7 @@ class AuthService:
         if not code:
             return False
         totp_refused = False
-        secret = self._totp_secret(user)
+        secret = await self._totp_secret(user)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);
@@ -14471,7 +14583,7 @@ class AuthService:
         # verify, and _totp_secret logs it at every code check.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
-                secret = self._totp_secret(user)
+                secret = await self._totp_secret(user)
             except CipherError:
                 _log_totp_undecryptable(user.username)
                 secret = None

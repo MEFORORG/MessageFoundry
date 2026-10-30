@@ -407,6 +407,14 @@ while the repair ran. Before that change
 it did neither. A session the earlier holder kept then became an Administrator session when the role
 was written, because every request re-reads the account's roles.
 
+The repair also empties the account's known sign-in addresses, as an administrator's reset does
+(vault BACKLOG #3849). It does so once the role is written, beside the second session revoke, so a
+run whose grant writes no role leaves the record alone. That run has still replaced the password,
+the TOTP and the notification address. When the store answers the grant out of contract, the
+command reads the row again and leaves the record only when that read finds this account without
+the role. A read that fails, or finds no verified row for it, clears the record. The earlier holder's addresses then read as new at the next sign-in, so a
+sign-in from one of them faces the first-seen challenge rather than passing as known.
+
 #### Keep a local Administrator
 
 **Create a local Administrator before you need one.** If every Administrator signs in through
@@ -419,7 +427,32 @@ credentials. While the directory is up, create it from the web console instead.
 
 The command can now add an Administrator beside directory ones that still sign in. Its
 `auth.first_administrator_provisioned` audit row lists, in `administrators_at_check`, every
-enabled Administrator the run found. No alert goes to them, so read that row.
+enabled Administrator the run found. Every run that grants the role also raises the
+`administrator_granted` alert, keyed `user:<username>`, with `via` set to `provision_admin` and
+`granted_by` set to `cli:<OS user>` (vault BACKLOG #3849). It is raised after the recovery codes
+are shown. The command builds the `[alerts]` notifier as `serve` does, and also tries to record
+the alert as an open alert the web console lists once the engine runs; that record is best
+effort. The store reopen, the notifier's close and the whole alert step each have a bound, set
+beside `_raise_offline_administrator_granted` in `messagefoundry/__main__.py`; when the step runs
+out, the command prints its result without it. A Ctrl-C during the step ends that wait, not the
+command. The process can still wait at exit for a call already in a worker thread, such as a
+send, the notifier build or a store driver's, until that call ends. The alert counts as paged
+only when at least one transport confirms delivery in time: the relay accepts it for every
+recipient, or the webhook answers 2xx. Otherwise it goes to the command's log output instead. At
+least these land there: no `[alerts]` transport configured, one this shell cannot build, a send
+the relay or webhook refuses, a rule that routes the alert to no transport, and a step that has
+not answered in time. When both transports are configured and the notifier cannot be built, the
+command tries the webhook alone, then the email alone.
+The command then says so: as a WARNING naming the other
+enabled Administrators when there are any, as a plain note on a first install, and under `--json`
+as `administrator_granted_alerted` set to false.
+**CORRECTED 2026-10-29:** this read "No alert goes to them, so read that row."
+
+A local Administrator that is locked out, or must change its password, still blocks the command,
+as long as its password would still be accepted at sign-in. A lockout does not take the password
+away, and `admin-unlock` at the host clears it. At least these do not block it: a must-change
+password past its deadline, an account with no password, a disabled account, a directory account,
+and an account whose record fails its integrity seal.
 
 - Keep at least one enabled local Administrator with a password, held by someone who can reach the
   host during an outage.
@@ -789,14 +822,22 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   `amr` names a listed value skips the floor, and every other callback keeps it. The exemption proves
   a device or a stored credential answered, not that a person acted, so it is a named loosening
   ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). A value `oidc_mfa_amr_values` also accepts is
-  refused at load while the claim gate is on. Each exempted pass records the matched values as
-  `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
-  the top of the `auth.reauth` row of a step-up. A pass the exemption let through that is then
-  refused carries it too, at the top of its refusal row (BACKLOG #3220), a directory lock refusal
-  included: that row has its own action, `auth.directory_login_locked`, which the audit read
-  routes show only to `users:manage` ([Audit](#audit) names them), so the marker shows a reader
-  without it no lock there (BACKLOG #3726). With the list set, a too-early step-up's code is
-  redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
+  refused at load while the claim gate is on. **This paragraph is the source of record for which
+  audit rows carry the exemption's fields**; other documents link here. Each exempted pass records
+  the matched values as `callback_floor_exempt_amr`, at the top level of its outcome rows: at least
+  the `auth.login_success` or `auth.reauth` row when it is served, and its refusal row when it is
+  refused (BACKLOG #3220, #3728). That includes a directory lock refusal: that row has its own
+  action, `auth.directory_login_locked`, which the audit read routes show only to `users:manage`
+  ([Audit](#audit) names them), so the marker shows a reader without it no lock there (BACKLOG
+  #3726). The other rows the attempt writes, such as a role resync or a session rotation, do not
+  carry it. With the list set, a too-early step-up's code is redeemed before the refusal, because
+  only the exchange yields the `amr`. The outcome rows of such a step-up carry
+  `callback_floor_deferred: true`: at least each refusal and the success row (BACKLOG #3728). It
+  says the floor decision waited for the exchange, not that the exemption applied: a refusal the
+  exchange itself causes comes before any `amr` is known and carries only this field, and so does
+  a `too_early` refusal whose `amr` named no listed value. A review of exempted step-ups reads both
+  fields. The sign-in leg has no such field, because there the floor always waits for the
+  exchange's `auth_time`, whether or not the list is set. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
   the exempt value is refused as `mfa_claim_missing`.
@@ -933,7 +974,8 @@ except that a Vault token missing a capability the engine calls is noted.
 
 - **The store principal.** The engine reads its roles and permissions at every start, and the
   command runs the same read on demand.
-- **Each Vault token.** The command reads the token's own policies, TTL and renewability
+- **Each Vault token.** The engine reads it at every start, and the command runs the same read on
+  demand ([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md)). The probe reads the token's own policies, TTL and renewability
   (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
   calls and on administrative paths it never calls. The token, its id and its accessor are
   never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`,
@@ -957,9 +999,9 @@ backend hops that present a static credential or none (the *Delegated identity* 
 | Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
-| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.secrets`); reported only, never gates a start |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.store`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.store`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.secrets`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
 | LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | **Partly**, by `check-privileges`: identity and administrative groups; delegated ACLs not read; never gates a start |
 | SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
 | IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
@@ -967,9 +1009,9 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
 more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
-one key does both jobs. The two `check-privileges` paths are in Vault's `default` policy. A token
-made with `-no-default-policy` needs them granted, or its hop reads as not observed. Neither path
-lets a token change anything.
+one key does both jobs. The two paths the probe reads are in Vault's `default` policy. A token
+made with `-no-default-policy` needs them granted, or its hop reads as not observed, at every
+`serve` start as well as in `check-privileges`. Neither path lets a token change anything.
 
 A Vault token is **over-granted** when any of these holds:
 
@@ -1042,9 +1084,11 @@ engine's own:
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when a probe
 could not read its principal, and 1 when the settings do not load. Clean means no grant beyond the
 documented set. A hop marked not probed never changes the exit code. Its last line, `serve:`, says
-what `serve` would do with the store observation. **Only the store finding gates a start**; a Vault
-or LDAP over-grant is reported, and the `serve:` line says it does not gate a start. The runbook step
-that runs it for the gMSA is [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+what `serve` would do with the store and Vault observations. **The store finding and a Vault grant
+in the refusing class gate a start** (the two paragraphs below); a Vault finding that only warns and
+an LDAP over-grant are named after the verdict, and the `serve:` line says they do not refuse a
+start. The runbook step that runs it for the gMSA is [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md)
+§1.1 step 6.
 
 **What `serve` does with the store finding ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27).** Under
 the shipped `[security].enforcement = enforce`, an over-granted store login **refuses to start**. The
@@ -1054,6 +1098,35 @@ marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is na
 `[store].require_least_privilege = true` refuses on that too, and outranks the opt-out. Under
 `enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
 is a PHI instance. SQLite has no login, so nothing here applies to it.
+
+**What `serve` does with a Vault finding ([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-10-04).** At every
+start, after the store preflight and before any listener binds, `serve` probes each Vault token it
+uses with the probe `check-privileges` runs. It builds its client with the provider's own
+constructor and reads the token from the same variable or secrets-directory file the provider reads,
+at that moment. The over-grants above fall in two classes:
+
+- **The refusing class:** the `root` policy, and any grant on an administrative path the probe asks
+  about, which includes a write of the token's own policies and a Transit key's `config`, `rotate`,
+  `export` and `backup`. Under the shipped `enforcement = enforce` such a token **refuses to start**.
+  The audited opt-out is `[security].allow_over_granted_vault_token = true`: it logs an `AUDIT:`
+  line, marks the `vault_privilege_preflight` audit row `over_grant_accepted`, and is named on
+  `GET /security/posture`.
+- **The warning class:** everything else the probe calls over-granted, at least one token serving
+  both hops, an extra capability on a path the engine calls, and a policy name the probe cannot tell
+  apart from `root` by reading it. These log a warning and write the audit row; they never refuse.
+
+A probe that could not read the token because of a network failure, a timeout or a 403 also only
+warns. Any other failure leaves the token unjudged for a reason the ruling does not excuse: at
+least a code defect such as a `TypeError` after an hvac change, an engine refusal such as an unset
+token variable, another Vault error status, and an answer that names no capabilities for a path.
+Under `enforce` such a failure **refuses to start**, the audit row names it under `unexcused`, and
+the opt-out does not lift it.
+
+Under `enforcement = warn` nothing refuses. The probe's limits stay: it asks about exact paths only,
+so a wildcard grant such as `secret/data/*` would read clean, and a token made with `-no-default-policy` reads
+as not observed at every start unless its policy grants the two paths the probe reads. Neither
+limit was measured against a live Vault. No alert is raised for a Vault finding yet; the log line
+and the audit row are the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 
@@ -2719,7 +2792,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made. A resolution of an `interrupted` release does the same for the resolver's account (BACKLOG #2125) | Audit row against the approver or resolver, with their `client` address (ADR 0150). Its `act` field is `release` or `resolve`. Alert keyed `approval:<id>` for a release and `approval:<id>:resolve` for a resolution, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync or a directory reconcile pass newly gives an account the role (vault BACKLOG #2610, #3141) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in or reconcile pass |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync or a directory reconcile pass newly gives an account the role (vault BACKLOG #2610, #3141), or `provision-admin` grants it at the host (vault BACKLOG #3849) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, `<directory>` for a directory sign-in or reconcile pass, or `cli:<OS user>` for `provision-admin` |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -4007,7 +4080,7 @@ slack.
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP); on an IdP step-up's return, which has no session, the user id its staged flow names | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s, on each of the actor's keys (the *Credential ceremonies* row of [Business-logic limits](#business-logic-limits-asvs-213) names them); **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
 | Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes, with one exception: while the credential in force is engine-generated (set by an administrator's account creation, `POST /users`, and by both resets), sign-in failures are counted and audited but arm no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account holding a discoverable passkey under the configured relying party (BACKLOG #3937), and the sign-in lock on a local account with a TOTP enrolled, unless the engine KNOWS this release refuses that enrolment (a TOTP it cannot judge still escalates, and a known-refused one escalates too in the races listed under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), BACKLOG #3422), double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — on the password path the uniform `auth.login_failed` (`bad_credentials`) row every refused sign-in writes and then `auth.login_locked`, which only `users:manage` reads ([Audit](#audit)), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on at least the TOTP/recovery and assertion legs, and on a directory account's two enrolment legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in, either the password and a TOTP code in one request on a local account with TOTP enrolled, or the password and a passkey assertion in one request on a local account holding a discoverable passkey under the request's relying party ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), ADR 0197 Amendment A wave 2); and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.directory_login_locked` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638, its own action since #3726); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (as [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) defines it) | **CHALLENGE** — force a fresh step-up on a step-up route, a PHI read (`require_phi_read`, a monitoring `reveal`, the console's `phi=True` pages) or a paced write (`require_paced`, the console's writes), since vault BACKLOG #2620 for the last two; the base gate never asks, so the monitoring polls are not refused. A first sighting also writes `auth.new_address_reverify_required` + an out-of-band notice, debounced and capped per session as that section states; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
-| First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the account's known-address record (the `known_login_addresses` table, vault BACKLOG #2145): one row per host from which the account finished a sign-in, passed a step-up, or confirmed a factor enrolment, keyed on the account id and deleted with the account. An administrator's password reset or MFA reset deletes every address in it (vault BACKLOG #2946). It then writes one marker row stamped at the epoch. No lookback read returns that row, and it still counts as a row of any age. Revoking every session clears nothing. These events write a row: a local sign-in that owed no factor, from a known address or with no baseline yet; a directory sign-in that owes nothing more, whatever the verdict except a failed read, so a first-seen address and an account's first sign-in both write (no directory session is seeded, so there is no challenge to skip); a combined sign-in; a second factor proved (a TOTP or recovery code at the MFA gate, or a passkey assertion), whether it finishes a sign-in or is a step-up on a session that has already met its factor; a factor enrolment confirmed, TOTP or passkey, first or later, from a known address or by an account with no baseline yet (not from a first-seen address, because a holder of the password alone may enrol an authenticator, ADR 0197 Amendment A; this only delays such a holder until a code from that authenticator is proved, and the enrolment sends its own notice); and a step-up, by password or at the IdP, by an account that owes no second factor. That test is asked of the account, not of this session. Under `require_mfa` every directory account owes a factor, so no directory step-up by password or at the IdP writes, even one that re-proved the MFA claim. At the sign-in itself a failed record read writes nothing, on either leg. A combined sign-in is the exception, because it proved its second factor from that address. A factor proved afterwards still writes. Nothing is written for a request with no client address. A host compares as one key: an IPv4-mapped form is its IPv4 address, and every loopback form is one host. Only a row seen within the lookback (`_LOGIN_ADDRESS_LOOKBACK_SECONDS` in `auth/service.py`, 90 days) counts as a match, and each write prunes the account's older rows. The no-baseline test reads rows of any age, so an account whose only row came from an enrolment and has aged out is still judged, not failed open. Read through the record's primary key at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no known address seen within the lookback is the same host **and** the account has a baseline: it has finished a sign-in before, or holds a row of any age. With neither, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and a TOTP code or a passkey assertion in one request, under the conditions of [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753); ADR 0197 and its Amendment A), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The challenged sign-in does not make its address known, so a second sign-in from it is challenged again; a step-up from that address passes the challenge and records it (vault BACKLOG #2145) | on | (no knob) |
+| First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the account's known-address record (the `known_login_addresses` table, vault BACKLOG #2145): one row per host from which the account finished a sign-in, passed a step-up, or confirmed a factor enrolment, keyed on the account id and deleted with the account. An administrator's password reset or MFA reset, or a `provision-admin` takeover, deletes every address in it (vault BACKLOG #2946, #3849). In the same transaction it writes one marker row stamped at the epoch. No lookback read returns that row, it still counts as a row of any age, and no prune deletes it. Revoking every session clears nothing. These events write a row: a local sign-in that owed no factor, from a known address or with no baseline yet; a directory sign-in that owes nothing more, whatever the verdict except a failed read, so a first-seen address and an account's first sign-in both write (no directory session is seeded, so there is no challenge to skip); a combined sign-in; a second factor proved (a TOTP or recovery code at the MFA gate, or a passkey assertion), whether it finishes a sign-in or is a step-up on a session that has already met its factor; a factor enrolment confirmed, TOTP or passkey, first or later, from a known address or by an account with no baseline yet (not from a first-seen address, because a holder of the password alone may enrol an authenticator, ADR 0197 Amendment A; this only delays such a holder until a code from that authenticator is proved, and the enrolment sends its own notice); and a step-up, by password or at the IdP, by an account that owes no second factor. That test is asked of the account, not of this session. Under `require_mfa` every directory account owes a factor, so no directory step-up by password or at the IdP writes, even one that re-proved the MFA claim. At the sign-in itself a failed record read writes nothing, on either leg. A combined sign-in is the exception, because it proved its second factor from that address. A factor proved afterwards still writes. Nothing is written for a request with no client address. A host compares as one key: an IPv4-mapped form is its IPv4 address, and every loopback form is one host. Only a row seen within the lookback (`_LOGIN_ADDRESS_LOOKBACK_SECONDS` in `auth/service.py`, 90 days) counts as a match, and each write prunes the account's older rows. The no-baseline test reads rows of any age, so an account whose only row came from an enrolment and has aged out is still judged, not failed open. Read through the record's primary key at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no known address seen within the lookback is the same host **and** the account has a baseline: it has finished a sign-in before, or holds a row of any age. With neither, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and a TOTP code or a passkey assertion in one request, under the conditions of [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753); ADR 0197 and its Amendment A), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The challenged sign-in does not make its address known, so a second sign-in from it is challenged again; a step-up from that address passes the challenge and records it (vault BACKLOG #2145) | on | (no knob) |
 | First-seen sign-in address — sign-in owes a second factor, or any directory sign-in | as the row above | as the row above | **LOG** — the same audit row and notice. A directory sign-in that owes nothing more also records the address, so the next one from it is not reported again; nothing else changes. **Under the shipped `require_mfa` a Kerberos sign-in always owes a factor**, and so does an OIDC one while `oidc_require_mfa_claim` is off. Such a sign-in records nothing; the factor leg that finishes it records the address instead: a TOTP or recovery code, a passkey, or a factor enrolment, under the conditions in the row above. So on this leg, as on the local one, every sign-in is unjudged (`no_baseline`) until one finishes, and a sign-in abandoned at the factor prompt records nothing. Under the same default no directory step-up records an address (see the row above). Such a session is born without step-up freshness anyway. A later proof stamps the window, for example a TOTP or recovery code, or a step-up (a passkey alone does not). On an OIDC session only the IdP step-up does (BACKLOG #2142). A Kerberos or password session steps up with the account password; an `oidc` session steps up at the IdP. Under the shipped `require_mfa` scope (`every_local_account`) this is the path every password-only local sign-in takes. A combined sign-in (password and a TOTP code or a passkey assertion in one request) owes nothing more, so it takes the row above instead and is seeded from any address. **Never** refuses the login (BACKLOG #288) | on | (no knob) |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`; an `oidc` session's JSON refusal names the IdP leg, see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by a successful step-up, on the **monotonic** clock: `reauth(purpose=…)` for the password or re-bind leg (`POST /me/reauth`, `POST /ui/reauth`), and `complete_oidc_step_up` for an `oidc` session's IdP leg, for the action the operator started from. Never by a sign-in or by `verify_mfa` | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
@@ -4176,17 +4249,21 @@ The honest limits of that model, one sentence each:
     that never stamped `last_login_at`, so that sign-in is judged first-seen rather than failed
     open as `no_baseline`. That includes an account reset before its first sign-in, whose first
     sign-in then sends a `login_new_ip` notice.
-  - Only those two resets clear it. Revoking every session does not, because revoking is routine.
-    At least these do not either, because the ruling did not name them: the first-administrator
-    repair, the host-side `admin-reset-totp` seed replacement, a self-service password change or
-    factor removal, and `admin-unlock`.
-  - The clear runs straight after the reset's session revoke, before its audit row. It is two
-    store calls, a delete and the marker write, in separate transactions. A failed clear is
-    logged at ERROR with the username and does not refuse the reset. If the delete fails, an
-    address seen before the reset may still read as known. If the marker write fails, the record
-    is empty, and an account with no `last_login_at` fails open as `no_baseline` at its next
-    sign-in. Any record write still in flight for the account can land after the delete: at
-    least a sign-in, a step-up, a factor proof or an enrolment confirm.
+  - Those two resets clear it, and so does the first-administrator repair, when `provision-admin`
+    takes over a roleless local account (vault BACKLOG #3849). Revoking every session does not,
+    because revoking is routine. At least these do not either: the host-side `admin-reset-totp`
+    seed replacement, a self-service password change or factor removal, and `admin-unlock`.
+    **CORRECTED 2026-10-29:** this read "Only those two resets clear it", and listed the
+    first-administrator repair among those that do not.
+  - The clear runs straight after the reset's session revoke, before its audit row. The delete
+    and the marker write are one store transaction (vault BACKLOG #3849). A failed clear is logged
+    at ERROR with the username, leaves the record unchanged, and does not refuse the reset; an
+    address seen before the reset may then still read as known. The prune each later write runs
+    never deletes the marker, so the record is never left empty by a sign-in that raced the
+    reset. The marker stays until the account is deleted or reset again. Any record write still in
+    flight for the account can land after the reset: at least a sign-in, a step-up, a factor proof
+    or an enrolment confirm. **CORRECTED 2026-10-29:** this said the clear was two store calls in
+    separate transactions, and that a failed marker write left the record empty.
   - A client whose text equals the marker is never written to the record, so a forged forwarded
     header cannot move the marker into the lookback.
 - The operator-surface network gate is **inert** behind an undeclared proxy or NAT (see layer 1 of
@@ -4371,6 +4448,21 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   (`channel_bindings=None` — EPA is structurally broken behind a TLS-terminating proxy; the
   acceptor-enforcement question is a recorded ADR 0068 spike). Still experimental + off by
   default; mock-seam test coverage only (no AD test infrastructure exists).
+  **Realm (BACKLOG #2610):** the ticket's client principal must read `user@REALM`, split at the
+  last `@`, with `REALM` equal to `[auth].kerberos_realm` up to ASCII case. That key is required
+  once `kerberos_enabled` is on and is never taken from `ad_domain`, a UPN suffix that often
+  differs from the realm. The engine used to drop the realm unread, so on a KDC that trusts another
+  realm, `admin@PARTNER` would have signed in as the local `admin`. Refused with no directory
+  lookup, at least: another realm, a non-ASCII realm, a principal with no realm, and an account
+  part that is empty or holds `@`, `/` or `\`. Each is the `auth.login_failed` row with reason
+  `no_principal` and a `refusal` field naming the case from a closed set (`realm_mismatch`,
+  `no_realm`, `domain_backslash_form`, `not_a_bare_account_name`); neither that row nor the
+  WARNING the engine logs holds any of the principal's text. **The `DOMAIN\user` form is refused
+  too, and what Windows reports is UNVERIFIED.** On a Windows host, pyspnego's SSPI acceptor reads
+  the client's name from `SECPKG_ATTR_NAMES`, which is likely to hold that form, but nobody has run
+  this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
+  closed until a lab run decides how to read it. That is no looser than before, when its directory
+  lookup missed.
 
 ### AD-group → role mapping
 

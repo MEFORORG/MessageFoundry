@@ -3272,12 +3272,11 @@ def test_a_rule_naming_a_missing_transport_still_refuses_with_no_transport_left(
     transport this instance lacks. The notifier still refuses that rule, so the lifespan logs the
     error in this start. Red on 84590597630d: every rule was dropped, and the error waited a
     restart."""
-    from messagefoundry.api.app import _alerts_without_email
-    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+    from messagefoundry.pipeline.alert_sinks import alerts_without_email, notifier_from_settings
 
     typo = AlertRule(transports=["webhook"])
     alerts = AlertsSettings(rules=[AlertRule(transports=["email"]), typo], **_SMTP)
-    stripped = _alerts_without_email(alerts)
+    stripped = alerts_without_email(alerts)
     assert [r.transports for r in stripped.rules] == [["webhook"]]
     with pytest.raises(ValueError, match="unconfigured transport"):
         notifier_from_settings(stripped)
@@ -3293,10 +3292,10 @@ def test_a_refused_alerts_ca_never_makes_an_email_only_alert_quieter(
     there is no notifier, so the engine's logging sink logs it at WARNING, and nothing tells the
     operator to configure the email they did configure. Red on c53d91e21c: the rule became an
     empty list, which suppresses with a webhook and logs that advice without one."""
-    from messagefoundry.api.app import _alerts_without_email
     from messagefoundry.pipeline.alert_sinks import (
         AlertRuleSet,
         NotifierAlertSink,
+        alerts_without_email,
         notifier_from_settings,
     )
 
@@ -3311,7 +3310,7 @@ def test_a_refused_alerts_ca_never_makes_an_email_only_alert_quieter(
         ],
         **_SMTP,
     )
-    stripped = _alerts_without_email(alerts)
+    stripped = alerts_without_email(alerts)
     with caplog.at_level("WARNING", logger="messagefoundry.pipeline.alert_sinks"):
         sink = notifier_from_settings(stripped)
     assert "no transport is configured" not in caplog.text

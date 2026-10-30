@@ -63,12 +63,13 @@ from messagefoundry.pipeline.alerts import (
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
 )
+from messagefoundry.transports.base import NegativeAckError
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
-from messagefoundry.transports.email import checked_envelope
+from messagefoundry.transports.email import checked_envelope, partial_refusal_under
 
 __all__ = [
     "AlertTransport",
@@ -565,29 +566,59 @@ def send_plain_email(
         else None
     )
     msg = EmailMessage()
-    msg["Subject"] = subject
+    # The Subject header refuses some lone surrogates as it is set, and set_content() and
+    # add_alternative() encode with a bare str.encode(). Each raises a UnicodeEncodeError whose text
+    # names the character and whose `.object` is the whole value, and the notifier logs a failed
+    # send with exc_info. Keep only the type name, and raise outside the handler so neither chain
+    # link holds that error (vault BACKLOG #3011). The subject and the body get separate arms, as
+    # the Email destination's headers and body do, so the refusal names the right one.
+    failure = ""
+    try:
+        msg["Subject"] = subject
+    except UnicodeError as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"{ALERTS_SMTP_CELL}: the alert subject could not be encoded ({failure})")
     envelope.address(msg)
-    msg.set_content(body)  # plain-text part is always kept (never HTML-only)
-    if html_body is not None:
-        msg.add_alternative(html_body, subtype="html")
-    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-        if use_tls:
-            # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
-            smtp.starttls(context=tls_context)
-        if username is not None:
-            # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
-            # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
-            # channel_encrypted is not merely asserted -- it is the same value that gate read.
-            # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this cell
-            # has no escape, and neither do the two connectors.
-            smtp_login_approved(
-                smtp,
-                username,
-                password or "",
-                channel_encrypted=use_tls,
-                cell=ALERTS_SMTP_CELL,
-            )
-        envelope.send(smtp, msg)
+    try:
+        msg.set_content(body)  # plain-text part is always kept (never HTML-only)
+        if html_body is not None:
+            msg.add_alternative(html_body, subtype="html")
+    except UnicodeError as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
+    partial: NegativeAckError | None = None
+    try:
+        with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+            if use_tls:
+                # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
+                smtp.starttls(context=tls_context)
+            if username is not None:
+                # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
+                # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
+                # channel_encrypted is not merely asserted -- it is the same value that gate read.
+                # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this
+                # cell has no escape, and neither do the two connectors.
+                smtp_login_approved(
+                    smtp,
+                    username,
+                    password or "",
+                    channel_encrypted=use_tls,
+                    cell=ALERTS_SMTP_CELL,
+                )
+            # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts,
+            # never an address (vault BACKLOG #2924). A refusal of EVERY recipient is still
+            # smtplib's own SMTPRecipientsRefused, whose args hold each address and the reply.
+            envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
+    except smtplib.SMTPException as exc:
+        # A QUIT refused after a partial refusal must not hide it; raised below, outside this
+        # handler. Any other SMTP failure propagates unchanged.
+        partial = partial_refusal_under(exc)
+        if partial is None:
+            raise
+    if partial is not None:
+        raise partial
 
 
 class EmailTransport:
@@ -858,6 +889,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
+        # raising. None, as `serve` leaves it, changes nothing.
+        self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
 
@@ -1463,6 +1497,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         None disables control actions (a ``control_action`` rule then no-ops, logged)."""
         self._control_cb = cb
 
+    def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
+        """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
+        returns without raising: the relay accepted every recipient, or the webhook answered 2xx
+        (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
+        from one the notifier only accepted. Called on the drain task; an observer that raises is
+        logged and never stops the drain."""
+        self._delivery_observer = observer
+
     # --- #143 (ADR 0044 amendment) windowed suspend / mute (notification-only) ---
 
     def suspend(self, event_type: str, connection: str, *, until: float) -> None:
@@ -1870,6 +1912,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("connection"),
                     exc_info=True,
                 )
+                continue
+            observer = self._delivery_observer
+            if observer is not None:
+                try:
+                    observer(transport.name, event)
+                except Exception:
+                    log.warning("alert delivery observer failed", exc_info=True)
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
@@ -1888,6 +1937,69 @@ def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
         names.add("email")
     return names
+
+
+def alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
+    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
+    (BACKLOG #3470), or an offline command that refuses the SMTP hop (vault BACKLOG #3849). A
+    refused CA must never suppress an alert.
+
+    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
+      transport it lacks, and the other transports would go with it.
+    * A rule or tier that named only email now names every transport left. An empty list means
+      suppress, and the operator never asked for that. ``None`` would not do for a tier: it keeps
+      its rule's transports, which may be an empty list. An explicit empty list stays one.
+    * With no transport left there is no notifier, and the engine's logging sink logs each
+      alert. Only a rule that names a transport is kept then. The notifier refuses it, and the
+      lifespan logs that refusal. The rest route only the notifier, and kept they would log
+      advice to configure the email that is configured.
+    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
+      not built. A secret store that is down cannot abort the start before the CA refusal."""
+    return _alerts_without(
+        alerts,
+        "email",
+        {
+            "email_to": [],
+            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
+        },
+    )
+
+
+def alerts_without_webhook(alerts: AlertsSettings) -> AlertsSettings:
+    """``alerts`` with the webhook transport dropped, as :func:`alerts_without_email` drops email,
+    for an offline command whose webhook cannot be built (vault BACKLOG #3849): a webhook refused
+    at construction must not also cost a relay that would have taken the alert."""
+    return _alerts_without(alerts, "webhook", {"webhook_url": None})
+
+
+def _alerts_without(alerts: AlertsSettings, name: str, unset: dict[str, Any]) -> AlertsSettings:
+    """``alerts`` with transport ``name`` dropped by ``unset``, its rules re-routed as
+    :func:`alerts_without_email` says."""
+    left = sorted(configured_alert_transport_names(alerts) - {name})
+
+    def _without(transports: list[str] | None) -> list[str] | None:
+        if transports is None:
+            return None
+        kept = [t for t in transports if t != name]
+        if transports and not kept:
+            return list(left)
+        return kept
+
+    rules = [
+        rule.model_copy(
+            update={
+                "transports": _without(rule.transports),
+                "escalate": [
+                    tier.model_copy(update={"transports": _without(tier.transports)})
+                    for tier in rule.escalate
+                ],
+            }
+        )
+        for rule in alerts.rules
+    ]
+    if not left:
+        rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
+    return alerts.model_copy(update={**unset, "rules": rules})
 
 
 def check_rule_recipients(rule: AlertRule, sender: str, where: str) -> None:

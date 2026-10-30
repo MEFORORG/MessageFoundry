@@ -40,6 +40,7 @@ __all__ = [
     "DbLookupError",
     "LookupRunner",
     "db_lookup",
+    "is_available",
     "set_active",
     "reset",
     "activated",
@@ -91,6 +92,13 @@ def activated(runner: LookupRunner | None) -> Iterator[None]:
         yield
     finally:
         _active.reset(token)
+
+
+def is_available() -> bool:
+    """Whether a lookup runner is published here, so :func:`db_lookup` would run rather than raise
+    its "unavailable here" error. The ``mode=isolated`` broker asks this before any refusal of its
+    own, so a call that would fail that way at ``mode=off`` fails that way there too (ADR 0147)."""
+    return _active.get() is not None
 
 
 def db_lookup(

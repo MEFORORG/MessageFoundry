@@ -2347,6 +2347,15 @@ Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox h
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
 connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
 
+A relay that refuses **some** of the recipients, and accepts the message for the rest, makes the delivery
+a **permanent** `partial-refusal` `NegativeAckError`: the row dead-letters on the first attempt and reads as
+`ERROR`, never as delivered. It is not retried, because each retry would re-send to the recipients that
+already have it. A replay is the operator's choice, and re-sends to **every** recipient. The error names the
+relay's host and port and two counts (*"Email relay.example:587: 1 of 2 recipients refused"*), never an
+address or the relay's reply; the delivery worker's log line names the connection. A
+refusal of **every** recipient is still an ordinary SMTP failure, retried like one. The Direct destination
+fails a partial refusal the same way, and the `[alerts]` mail logs it as a failed send.
+
 ```python
 # samples/config/connections.py (excerpt)
 from messagefoundry import outbound, Email, env
@@ -2424,7 +2433,8 @@ never the material or a cert subject (which can identify a patient's provider).
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
-failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A message that cannot be
+failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A relay that refuses some
+recipients and accepts the rest is a permanent `partial-refusal`, as on the Email destination. A message that cannot be
 **built** raises a **permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry
 would fail the same way. That is a body the `encoding` cannot represent, or a crypto failure that began
 after construction. Its error names the failure class, or the codec and character position, and never the

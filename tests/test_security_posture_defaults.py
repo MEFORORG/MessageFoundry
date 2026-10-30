@@ -19,18 +19,23 @@ switch be added at an insecure value with nothing reporting it.
 
 from __future__ import annotations
 
+import base64
 import ipaddress
+import json
 import math
 import re
 from collections.abc import Collection
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from messagefoundry.api import create_app
+from messagefoundry.auth.oidc.jwks import JwksCache, JwksError
+from messagefoundry.auth.reconcile import breaker_tripped
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
@@ -440,6 +445,12 @@ _LOOSER_THAN_DEFAULT = [
     ("initial_password_expiry_hours", 1_000_000),
     ("initial_password_expiry_hours", 0),  # no expiry at all
     ("initial_password_expiry_hours", -1),
+    # Vault BACKLOG #2600 step 4, the rest: more standing recovery codes, a shorter password floor.
+    ("mfa_recovery_code_count", 11),
+    ("mfa_recovery_code_count", 50),  # the load refuses anything above
+    ("password_min_length", 14),
+    ("password_min_length", 1),
+    ("password_min_length", 0),  # no length floor at all
 ]
 
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
@@ -495,6 +506,12 @@ _STRICTER_OR_DEFAULT = [
     ("initial_password_expiry_hours", 72),
     ("initial_password_expiry_hours", 71),
     ("initial_password_expiry_hours", 1),
+    # 0 mints no recovery code, so an administrator's reset is the only way back: stricter.
+    ("mfa_recovery_code_count", 10),
+    ("mfa_recovery_code_count", 9),
+    ("mfa_recovery_code_count", 0),
+    ("password_min_length", 15),
+    ("password_min_length", 64),
 ]
 _SIGN_IN_FIELDS = {
     field for field, _ in _SIGN_IN_OFF_VALUES + _LOOSER_THAN_DEFAULT + _STRICTER_OR_DEFAULT
@@ -663,6 +680,362 @@ def test_the_temporary_password_direction_is_the_consumers(
     later one for a longer life. The method reads only its settings, so a stand-in carries them."""
     holder = SimpleNamespace(_settings=AuthSettings(initial_password_expiry_hours=hours))
     assert AuthService.initial_credential_deadline(holder, 0.0) == deadline  # type: ignore[arg-type]
+
+
+# --- vault BACKLOG #2600 step 4, the remaining numeric [auth] knobs ------------------------------
+
+
+@pytest.mark.parametrize("field", ["mfa_recovery_code_count", "password_min_length"])
+def test_the_secret_named_entries_never_quote_the_configured_value(field: str) -> None:
+    """``mfa_*`` and ``*password*`` read as secret sources to the clear-text-logging query, and the
+    entry reaches a log line and stdout, so its text is a literal: two loose values, one text."""
+    loose = (37, 41) if field == "mfa_recovery_code_count" else (7, 3)
+    first = _risk(AuthSettings(**{field: loose[0]}), field)  # type: ignore[arg-type]
+    assert first is not None
+    assert first == _risk(AuthSettings(**{field: loose[1]}), field)  # type: ignore[arg-type]
+    assert str(loose[0]) not in first and str(loose[1]) not in first
+
+
+#: ([security] switch, the [auth] field it desugars into, a longer value). The relocated [auth]
+#: spellings are refused at load, so each entry carries the [security] name an operator sets.
+_SESSION_LIMITS = [
+    ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", 31),
+    ("max_session_hours", "session_absolute_hours", 13),
+]
+
+
+@pytest.mark.parametrize(("switch", "field", "longer"), _SESSION_LIMITS)
+def test_a_session_limit_above_its_default_is_named_under_its_security_name(
+    switch: str, field: str, longer: int
+) -> None:
+    """Named alone, under the [security] name, with the value and the default. At or below the
+    default, or at 0 or less (a session that dies at once), it is not named."""
+    risks = dict(_pairs(auth=AuthSettings(**{field: longer})))  # type: ignore[arg-type]
+    assert list(risks) == [switch]
+    assert f"is {longer}" in risks[switch]
+    assert "above the default of" in risks[switch]
+    default = AuthSettings.model_fields[field].default
+    for value in (default, default - 1, 0, -1):
+        assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("switch", "field", "longer"), _SESSION_LIMITS)
+def test_a_session_limit_set_in_security_reaches_the_registry(
+    tmp_path: Path, switch: str, field: str, longer: int
+) -> None:
+    """The loaded path: the operator sets the [security] key, the desugar copies it into [auth], and
+    the registry names it."""
+    settings = _load(tmp_path, f"[security]\n{switch} = {longer}\n")
+    assert getattr(settings.auth, field) == longer
+    assert switch in _names(sec=settings.security, auth=settings.auth)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "named"),
+    [
+        ("ad_session_recheck_seconds", 300, False),
+        ("ad_session_recheck_seconds", 60, False),
+        ("ad_session_recheck_seconds", 301, True),
+        ("ad_session_recheck_seconds", 86_400, True),
+        ("ad_session_recheck_strikes", 2, False),
+        ("ad_session_recheck_strikes", 1, False),
+        ("ad_session_recheck_strikes", 3, True),
+        ("ad_session_recheck_strikes", 10, True),  # the load refuses anything above
+        ("ad_session_recheck_max_users", 200, False),
+        ("ad_session_recheck_max_users", 10_000, False),
+        ("ad_session_recheck_max_users", 199, True),
+        ("ad_session_recheck_max_users", 6, True),
+        # A higher brake threshold ends more sessions and keeps none: stricter for revocation.
+        ("ad_session_revoke_max", 5, False),
+        ("ad_session_revoke_max", 6, False),
+        ("ad_session_revoke_max", 150, False),
+        ("ad_session_revoke_max", 4, True),
+        ("ad_session_revoke_max", 0, True),
+        ("ad_session_revoke_max_fraction", 0.34, False),
+        ("ad_session_revoke_max_fraction", 0.99, False),  # the load refuses 1.0 while it runs
+        ("ad_session_revoke_max_fraction", 0.33, True),
+        ("ad_session_revoke_max_fraction", 0.01, True),
+        # BACKLOG #3709's page on a run of unreachable passes: a longer run pages later.
+        ("ad_reconcile_outage_passes", 3, False),
+        ("ad_reconcile_outage_passes", 2, False),
+        ("ad_reconcile_outage_passes", 4, True),
+        ("ad_reconcile_outage_passes", 100, True),  # the load refuses anything above
+    ],
+)
+def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
+    field: str, value: float, named: bool
+) -> None:
+    """Each is named alone, while the reconciler runs (AD on, a non-zero interval)."""
+    assert _names(auth=_ad(**{field: value})) == ([field] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ad_session_recheck_strikes", 10),
+        ("ad_session_recheck_max_users", 6),
+        ("ad_session_revoke_max", 0),
+        ("ad_session_revoke_max_fraction", 0.01),
+        ("ad_reconcile_outage_passes", 100),
+    ],
+)
+def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, value: float) -> None:
+    """With AD off nothing reads them, and with the interval at 0 only that off entry is named. The
+    last line is the control that the same value fires once the reconciler runs."""
+    assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+    off = _ad(ad_session_recheck_seconds=0, **{field: value})
+    assert _names(auth=off) == ["ad_session_recheck_seconds"]
+    assert _names(auth=_ad(**{field: value})) == [field]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "named"),
+    [
+        ("oidc_clock_skew_seconds", 60, False),
+        ("oidc_clock_skew_seconds", 0, False),
+        ("oidc_clock_skew_seconds", 61, True),
+        ("oidc_clock_skew_seconds", 300, True),  # the load refuses anything above
+        ("oidc_jwks_ttl_seconds", 3600, False),
+        ("oidc_jwks_ttl_seconds", 0, False),
+        ("oidc_jwks_ttl_seconds", 3601, True),
+        ("oidc_jwks_ttl_seconds", 10_000_000, True),
+        ("oidc_jwks_min_refetch_seconds", 300, False),
+        ("oidc_jwks_min_refetch_seconds", 3600, False),  # no longer than the default TTL
+        ("oidc_jwks_min_refetch_seconds", 299, True),
+        ("oidc_jwks_min_refetch_seconds", 0, True),  # no amplification bound at all
+        ("oidc_jwks_min_refetch_seconds", -1, True),
+        ("oidc_jwks_min_refetch_seconds", 3601, True),  # a withdrawn key verifies longer
+        ("oidc_flow_ttl_seconds", 300, False),
+        ("oidc_flow_ttl_seconds", 30, False),
+        ("oidc_flow_ttl_seconds", 301, True),
+        ("oidc_flow_ttl_seconds", 1800, True),  # the load refuses anything above
+        ("oidc_max_age_seconds", 43_200, False),
+        ("oidc_max_age_seconds", 300, False),
+        ("oidc_max_age_seconds", 43_201, True),
+        ("oidc_max_age_seconds", 86_400, True),  # the load refuses anything above
+        # Only ever lowers a session's end below what the token and the absolute cap allow.
+        ("oidc_session_max_hours", None, False),
+        ("oidc_session_max_hours", 0, False),
+        ("oidc_session_max_hours", 1, False),
+        ("oidc_session_max_hours", 1000, False),
+        ("oidc_session_max_hours", -1, False),
+    ],
+)
+def test_an_oidc_knob_is_named_only_in_its_looser_direction(
+    field: str, value: int | None, named: bool
+) -> None:
+    """Each is named alone, while OIDC is on."""
+    assert _names(auth=_oidc(**{field: value})) == ([field] if named else [])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("oidc_clock_skew_seconds", 300),
+        ("oidc_jwks_ttl_seconds", 10_000_000),
+        ("oidc_jwks_min_refetch_seconds", 0),
+        ("oidc_flow_ttl_seconds", 1800),
+        ("oidc_max_age_seconds", 86_400),
+    ],
+)
+def test_an_oidc_knob_is_not_named_without_oidc(field: str, value: int) -> None:
+    """Nothing reads them with OIDC off. The second line is the control."""
+    assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
+    assert _names(auth=_oidc(**{field: value})) == [field]
+
+
+def test_the_two_jwks_refetch_entries_say_which_way_they_loosen() -> None:
+    """One field, two directions, and the text tells them apart."""
+    field = "oidc_jwks_min_refetch_seconds"
+    off = _risk(_oidc(**{field: 0}), field)
+    fast = _risk(_oidc(**{field: 30}), field)
+    slow = _risk(_oidc(**{field: 7200}), field)
+    assert off is not None and fast is not None and slow is not None
+    assert "no least time" in off
+    assert "30 s, shorter than the default of 300 s" in fast
+    assert "7200 s, longer than the default JWKS lifetime of 3600 s" in slow
+    assert "withdrew" in slow
+
+
+def test_the_breaker_direction_is_the_consumers() -> None:
+    """The direction the breaker entries rest on, read from ``breaker_tripped``: a lower cap or a
+    smaller share aborts a wave of revocations the default lets through."""
+    wave = {"revoke_count": 4, "probed": 10}
+    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.34)
+    assert breaker_tripped(**wave, max_absolute=3, max_fraction=0.34)
+    assert not breaker_tripped(**wave, max_absolute=5, max_fraction=0.01)
+    assert breaker_tripped(revoke_count=6, probed=100, max_absolute=5, max_fraction=0.01)
+    assert not breaker_tripped(revoke_count=6, probed=100, max_absolute=5, max_fraction=0.34)
+
+
+def test_a_password_floor_of_zero_says_there_is_none() -> None:
+    """At 0 or less ``PasswordPolicy`` refuses nothing for length, so the entry says off, not
+    shorter. Still no configured value in either text."""
+    off = _risk(AuthSettings(password_min_length=0), "password_min_length")
+    assert off is not None and "NO length floor" in off
+    assert off == _risk(AuthSettings(password_min_length=-3), "password_min_length")
+    shorter = _risk(AuthSettings(password_min_length=8), "password_min_length")
+    assert shorter is not None and "shorter than the default of 15" in shorter
+    assert "NO length floor" not in shorter
+
+
+def test_the_strike_entry_does_not_claim_to_delay_a_role_change() -> None:
+    """``plan_pass`` strikes only the outcomes in ``REVOKE_REASONS``; a role change revokes at once."""
+    risk = _risk(_ad(ad_session_recheck_strikes=5), "ad_session_recheck_strikes")
+    assert risk is not None
+    assert "groups" not in risk and "at least one absent, disabled" in risk
+
+
+def test_the_interval_entry_says_it_delays_the_outage_page_too() -> None:
+    """A run of ``ad_reconcile_outage_passes`` unreachable passes pages, so the interval multiplies
+    that page's delay as well as a revocation's (BACKLOG #3709)."""
+    risk = _risk(_ad(ad_session_recheck_seconds=600), "ad_session_recheck_seconds")
+    assert risk is not None
+    assert "at least 3 passes" in risk and "no sooner than 1200 s after the first" in risk
+
+
+def test_the_outage_entry_quotes_the_run_and_its_delay() -> None:
+    """The run length, the default, and the least the run costs at the configured interval: the
+    page comes on the tenth pass, nine intervals after the first, and each pass's own run adds to
+    that, so the text gives a floor."""
+    risk = _risk(_ad(ad_reconcile_outage_passes=10), "ad_reconcile_outage_passes")
+    assert risk is not None
+    assert "at least 10 passes" in risk and "default of 3" in risk
+    assert "no sooner than 2700 s after the first" in risk
+
+
+def test_a_breaker_threshold_is_not_named_while_the_breaker_cannot_trip() -> None:
+    """A budget at or below the cap disarms the breaker, so a low share aborts nothing. The control:
+    the same share with an armed breaker is named."""
+    dead = _ad(ad_session_revoke_max=1000, ad_session_revoke_max_fraction=0.01)
+    assert _names(auth=dead) == []
+    assert _names(auth=_ad(ad_session_revoke_max_fraction=0.01)) == [
+        "ad_session_revoke_max_fraction"
+    ]
+
+
+def _ad_grouped(**over: object) -> AuthSettings:
+    """AD with a paged nested-group search, the only case that reads its deadline."""
+    return _ad(ad_group_search_base="OU=Groups,DC=test,DC=invalid", **over)
+
+
+def _oidc_on(**over: object) -> AuthSettings:
+    """:func:`_oidc`, which is defined further down, looked up when called."""
+    return _oidc(**over)
+
+
+#: Every numeric [auth] field the registry names: field -> (settings builder, a value looser than
+#: the default, the switch it is named under). A new numeric field reds the census below until
+#: someone reads its consumer and adds it here, with a looser value the registry must report, or
+#: to the exempt set with a reason. The bool floor cannot see these: it iterates booleans.
+_NUMERIC_AUTH_NAMED: dict[str, tuple[Any, object, str]] = {
+    "session_idle_timeout_minutes": (AuthSettings, 31, "sign_out_after_idle_minutes"),
+    "session_absolute_hours": (AuthSettings, 13, "max_session_hours"),
+    "max_sessions_per_user": (AuthSettings, 6, "max_sessions_per_user"),
+    "step_up_max_age_seconds": (AuthSettings, 301, "step_up_max_age_seconds"),
+    "totp_skew_steps": (AuthSettings, 1, "totp_skew_steps"),
+    "mfa_recovery_code_count": (AuthSettings, 11, "mfa_recovery_code_count"),
+    "mfa_verify_min_elapsed_seconds": (AuthSettings, 0.5, "mfa_verify_min_elapsed_seconds"),
+    "password_min_length": (AuthSettings, 14, "password_min_length"),
+    "lockout_threshold": (AuthSettings, 6, "lockout_threshold"),
+    "lockout_minutes": (AuthSettings, 14, "lockout_minutes"),
+    "lockout_max_minutes": (AuthSettings, 1439, "lockout_max_minutes"),
+    "initial_password_expiry_hours": (AuthSettings, 73, "initial_password_expiry_hours"),
+    "ad_connect_timeout": (_ad, 11.0, "ad_connect_timeout"),
+    "ad_receive_timeout": (_ad, 11.0, "ad_receive_timeout"),
+    "ad_group_search_deadline": (_ad_grouped, 121.0, "ad_group_search_deadline"),
+    "ad_session_recheck_seconds": (_ad, 301, "ad_session_recheck_seconds"),
+    "ad_session_recheck_strikes": (_ad, 3, "ad_session_recheck_strikes"),
+    "ad_session_recheck_max_users": (_ad, 199, "ad_session_recheck_max_users"),
+    "ad_session_revoke_max": (_ad, 4, "ad_session_revoke_max"),
+    "ad_session_revoke_max_fraction": (_ad, 0.33, "ad_session_revoke_max_fraction"),
+    "ad_reconcile_outage_passes": (_ad, 4, "ad_reconcile_outage_passes"),
+    "oidc_clock_skew_seconds": (_oidc_on, 61, "oidc_clock_skew_seconds"),
+    "oidc_jwks_ttl_seconds": (_oidc_on, 3601, "oidc_jwks_ttl_seconds"),
+    "oidc_jwks_min_refetch_seconds": (_oidc_on, 299, "oidc_jwks_min_refetch_seconds"),
+    "oidc_flow_ttl_seconds": (_oidc_on, 301, "oidc_flow_ttl_seconds"),
+    "oidc_callback_min_elapsed_seconds": (_oidc_on, 0.5, "oidc_callback_min_elapsed_seconds"),
+    "oidc_flow_cache_max": (_oidc_on, 513, "oidc_flow_cache_max"),
+    "oidc_max_age_seconds": (_oidc_on, 43_201, "oidc_max_age_seconds"),
+    "login_rate_limit_per_ip": (AuthSettings, 11, "login_rate_limit_per_ip"),
+    "login_rate_limit_global": (AuthSettings, 61, "login_rate_limit_global"),
+    "login_rate_limit_window_seconds": (AuthSettings, 59.0, "login_rate_limit_window_seconds"),
+    "phi_read_rate_limit_per_actor": (AuthSettings, 121, "phi_read_rate_limit_per_actor"),
+    "phi_read_rate_limit_window_seconds": (
+        AuthSettings,
+        59.0,
+        "phi_read_rate_limit_window_seconds",
+    ),
+    "admin_write_rate_limit_per_actor": (AuthSettings, 13, "admin_write_rate_limit_per_actor"),
+    "admin_write_rate_limit_window_seconds": (
+        AuthSettings,
+        14.0,
+        "admin_write_rate_limit_window_seconds",
+    ),
+    "admin_write_min_interval_seconds": (AuthSettings, 0.1, "admin_write_min_interval_seconds"),
+}
+_NUMERIC_AUTH_EXEMPT = {
+    # Only lowers a session's end: the sign-in takes the earlier of it and the token's expiry.
+    "oidc_session_max_hours": "never looser",
+    # Ships OFF (0), so no value of it is looser than the default.
+    "phi_read_rate_limit_global": "ships off",
+}
+
+
+def _is_numeric(annotation: object) -> bool:
+    """An int or a float, alone or in a union (``int | None``, ``int | float``). bool is its own
+    annotation, so the bool floor's fields stay out."""
+    return annotation in (int, float) or any(a in (int, float) for a in get_args(annotation))
+
+
+def test_every_numeric_auth_field_is_named_or_exempt() -> None:
+    numeric = {n for n, f in AuthSettings.model_fields.items() if _is_numeric(f.annotation)}
+    assert numeric == set(_NUMERIC_AUTH_NAMED) | set(_NUMERIC_AUTH_EXEMPT)
+    assert not set(_NUMERIC_AUTH_NAMED) & set(_NUMERIC_AUTH_EXEMPT)
+
+
+@pytest.mark.parametrize("field", sorted(_NUMERIC_AUTH_NAMED))
+def test_each_census_field_is_named_at_its_looser_value(field: str) -> None:
+    """The behavioural arm: a field listed as named must really be named at its looser value, so
+    adding a name to the census without a registry entry still reds."""
+    build, value, switch = _NUMERIC_AUTH_NAMED[field]
+    assert switch in _names(auth=build(**{field: value}))
+
+
+def _jwk(kid: str) -> dict[str, str]:
+    """A synthetic P-256 verification key as a JWK."""
+    numbers = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+
+    def b64u(n: int) -> str:
+        return base64.urlsafe_b64encode(n.to_bytes(32, "big")).rstrip(b"=").decode("ascii")
+
+    return {"kty": "EC", "crv": "P-256", "kid": kid, "x": b64u(numbers.x), "y": b64u(numbers.y)}
+
+
+@pytest.mark.parametrize(
+    ("ttl", "min_refetch", "served"),
+    [(3600, 300, False), (60, 300, False), (60, 4000, True), (4000, 300, True)],
+)
+def test_the_jwks_direction_is_the_consumers(ttl: int, min_refetch: int, served: bool) -> None:
+    """``JwksCache`` keeps verifying with a key the IdP has withdrawn until both its TTL and its
+    refetch floor have passed since the last fetch, so either one past 3600 s keeps that key in use
+    longer than the defaults allow. Read at 3601 s."""
+    old, new = _jwk("old"), _jwk("new")
+    bodies = [{"keys": [old, new]}, {"keys": [new]}]  # the second fetch withdraws "old"
+    now = [0.0]
+    cache = JwksCache(
+        lambda: json.dumps(bodies.pop(0)).encode(),
+        ttl_seconds=ttl,
+        min_refetch_seconds=min_refetch,
+        clock=lambda: now[0],
+    )
+    cache.get_key("old")
+    now[0] = 3601.0
+    if served:
+        cache.get_key("old")
+    else:
+        with pytest.raises(JwksError):
+            cache.get_key("old")
 
 
 def test_the_near_off_values_the_vault_measured_are_named() -> None:

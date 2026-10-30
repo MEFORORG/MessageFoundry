@@ -429,7 +429,7 @@ from messagefoundry.pipeline import (
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
-    configured_alert_transport_names,
+    alerts_without_email,
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import (
@@ -472,6 +472,7 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
+from messagefoundry.privilege_probes import probe_vault
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
     RemoteDebugPosture,
@@ -536,6 +537,7 @@ from messagefoundry.uploads import (
     browse_messages,
     split_uploaded,
 )
+from messagefoundry.vault_preflight import run_vault_privilege_preflight
 
 __all__ = ["create_app", "create_managed_app"]
 
@@ -10335,8 +10337,9 @@ def create_app(
             # this project's own wheel, which is what takes it out of dependency-confusion territory.
             # The previous wording here said to "point at the path install" while the string beneath it
             # already named the distribution; the comment is corrected rather than the string (BACKLOG
-            # #1193). tests/test_install_instruction_provenance.py holds that classification and fails
-            # if this drifts back to an extra that does not exist or a name nobody has claimed.
+            # #1193). messagefoundry/security/audit_all_platforms.py holds that classification
+            # (PUBLISHED_DISTRIBUTIONS), and tests/test_install_instruction_provenance.py fails if
+            # this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
                 "distribution: `pip install messagefoundry-webconsole`, or set "
@@ -11248,54 +11251,6 @@ def _chain_registry_preflights(
     return chained
 
 
-def _alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
-    """``alerts`` with the email transport dropped, for a lifespan whose SMTP CA was refused
-    (BACKLOG #3470). A refused CA must never suppress an alert.
-
-    * Each rule and escalation tier stops naming ``email``. The notifier refuses a rule naming a
-      transport it lacks, and the other transports would go with it.
-    * A rule or tier that named only email now names every transport left. An empty list means
-      suppress, and the operator never asked for that. ``None`` would not do for a tier: it keeps
-      its rule's transports, which may be an empty list. An explicit empty list stays one.
-    * With no transport left there is no notifier, and the engine's logging sink logs each
-      alert. Only a rule that names a transport is kept then. The notifier refuses it, and the
-      lifespan logs that refusal. The rest route only the notifier, and kept they would log
-      advice to configure the email that is configured.
-    * The SMTP password reference is dropped, so no secret is resolved for a transport that is
-      not built. A secret store that is down cannot abort the start before the CA refusal."""
-    left = sorted(configured_alert_transport_names(alerts) - {"email"})
-
-    def _no_email(transports: list[str] | None) -> list[str] | None:
-        if transports is None:
-            return None
-        kept = [t for t in transports if t != "email"]
-        if transports and not kept:
-            return list(left)
-        return kept
-
-    rules = [
-        rule.model_copy(
-            update={
-                "transports": _no_email(rule.transports),
-                "escalate": [
-                    tier.model_copy(update={"transports": _no_email(tier.transports)})
-                    for tier in rule.escalate
-                ],
-            }
-        )
-        for rule in alerts.rules
-    ]
-    if not left:
-        rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
-    return alerts.model_copy(
-        update={
-            "email_to": [],
-            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
-            "rules": rules,
-        }
-    )
-
-
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -11412,7 +11367,9 @@ def create_managed_app(
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
     trust-anchor audit row. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it.
+    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
+    Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
     (``serve`` passes the log forwarder's, BACKLOG #3470). A non-empty tuple always refuses the
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
@@ -11498,7 +11455,7 @@ def create_managed_app(
         notifier_alerts = alerts_settings
         if smtp_anchor_refusal is not None and alerts_settings is not None:
             # Keep the webhook: drop only the email transport, which would load the refused CA.
-            notifier_alerts = _alerts_without_email(alerts_settings)
+            notifier_alerts = alerts_without_email(alerts_settings)
             _log.warning(
                 "alert email is off: the CA it reads was refused. The start check below refuses "
                 "the start. Until then a rule that sent only by email uses the other transports, "
@@ -11657,25 +11614,40 @@ def create_managed_app(
         # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
         # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
         # server principal), so the default single-node path is a log line and nothing else.
+        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
+        # probe check-privileges runs and a client from the provider's own constructor, in the same
+        # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+        # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
+        # it (audited), and so does a probe failure that is not a network failure, a timeout or a
+        # 403, which the opt-out does not lift; every other finding warns and audits
+        # (vault_preflight_outcome). It names the consumers from the
+        # resolved service settings, which serve always passes; an embedding that passes none has
+        # no Vault consumer this lifespan could name.
+        _security = security_settings or SecuritySettings()
+        # The dial falls back to [security].enforcement when no explicit one was passed, so an
+        # embedder that sets only security_settings gets its own dial.
+        _enforcing = (security_enforcement or _security.enforcement) is SecurityEnforcement.ENFORCE
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    # The dial falls back to [security].enforcement when no explicit one was
-                    # passed, so an embedder that sets only security_settings gets its own dial.
-                    enforcing=(
-                        security_enforcement
-                        or (security_settings or SecuritySettings()).enforcement
-                    )
-                    is SecurityEnforcement.ENFORCE,
-                    over_grant_accepted=(
-                        security_settings or SecuritySettings()
-                    ).allow_over_granted_store_principal,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
+            if static_credential_settings is not None:
+                await run_vault_privilege_preflight(
+                    static_credential_settings,
+                    store,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_vault_token,
+                    probe=partial(
+                        probe_vault, settings=static_credential_settings, posture=_hop_posture
+                    ),
+                )
         except BaseException:
             if notifier is not None:
                 await notifier.aclose()
