@@ -7,10 +7,11 @@ The contract is ``tests/_keyed_reopen_contract.py``. The server legs run it from
 leg, where its negative control is cheap enough to cover every cell: a contract that cannot go red
 proves nothing on any backend, and all three backends share its whole body.
 
-**Why the controls are few.** One run with every pass removed reaches every cell's at-rest check and
-read path together, so one control per cell would buy little for its store opens. Measured once per
-cell when this file was written: with any one pass removed, the at-rest check named that cell alone
-on 16 of SQLite's 18 cells, and the keyed open refused on the other two, the warmed cells.
+**Why the controls are few.** One run with every pass removed reaches every cell's at-rest check, and
+one control per cell would buy little beyond that for its store opens. It proves less for the read
+half: a read can refuse on a sibling column it opens first. Measured once per cell when this file was
+written: with any one pass removed, the at-rest check named that cell alone on 16 of SQLite's 18
+cells, the read path reported it too, and the keyed open refused on the other two, the warmed cells.
 """
 
 from __future__ import annotations
@@ -61,10 +62,15 @@ async def _report(db: Path) -> KeyedReopenReport:
     )
 
 
-def test_the_contract_reads_exactly_the_written_cells() -> None:
-    """The scope is the parity guard's, so a new written cell reds here, on the plain leg, with no
-    database, and a reader for a cell no backend writes any more reds here as dead code."""
-    assert set(READERS) == {cell for backend in _BACKENDS for cell in cells_in_scope(backend)}
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_the_contract_reads_exactly_each_backends_written_cells(backend: str) -> None:
+    """Per backend, because a union would stay equal while one backend's scope narrowed. A new
+    written cell reds here on the plain leg with no database, and so does a cell that stopped being
+    written. Only SQLite writes ``shared_body``; tests/test_phi_at_rest_inventory.py pins why."""
+    expected = set(READERS)
+    if backend != "store.py":
+        expected.discard(("shared_body", "body"))
+    assert set(cells_in_scope(backend)) == expected
 
 
 async def test_every_written_cell_is_sealed_and_reads_back(tmp_path: Path) -> None:
@@ -74,7 +80,8 @@ async def test_every_written_cell_is_sealed_and_reads_back(tmp_path: Path) -> No
 async def test_removing_every_pass_reds_every_cell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The negative control over the whole scope. Each cell must be reported by BOTH halves."""
+    """The negative control over the whole scope. The read half may name a cell for a sibling's
+    refusal, as the module docstring says, so only the at-rest half proves that cell's own check."""
     cells = [cell for cell in cells_in_scope("store.py") if cell not in WARMED_AT_OPEN]
     remove_seal_passes(monkeypatch, MessageStore, cells)
     report = await _report(tmp_path / "msg.db")

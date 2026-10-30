@@ -70,7 +70,7 @@ _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 _BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
 
 #: The two passes. Both are reached only on a KEYED handle, and the routine CI legs open keyless, so
-#: only the named migration tests in the module docstring ever execute either body.
+#: only a test that opens its own keyed handle, as the module docstring says, executes either body.
 _SWEEPS = ("_encrypt_existing_rows", "reencrypt_to_active")
 
 #: Every statement shape a backend uses to put a row into a table; the capture is that table.
@@ -310,7 +310,7 @@ def test_every_written_cipher_cell_is_swept(backend: str, sweep: str) -> None:
         f"{backend}: {sweep} never names these cipher-covered cells, so a value written to them "
         "is left behind by that transition (plaintext at rest, or stranded under a retired key). "
         "The server legs open keyless by default, so nothing there executes the sweep body except "
-        f"the named migration tests in the module docstring.\n  unswept: {unswept}"
+        f"a test that opens its own keyed handle.\n  unswept: {unswept}"
     )
 
 

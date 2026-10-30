@@ -9,18 +9,22 @@ every written cell through that cell's real writer, a keyed handle re-opens the 
 must then be sealed at rest and read back through its real read path.
 
 **The scope is the parity guard's own instrument, not a list here.** The cells come from
-``_written_cells``, per backend, so a new cipher-covered cell cannot quietly fall outside this. Until
-it has an entry in :data:`READERS` the report names it unreadable, and the plain leg reds on the gap
-with no database. ``shared_body`` is in scope on SQLite alone for the same reason it is there: only
-that backend writes a row into it.
+``_written_cells``, per backend, so a new cipher-covered cell cannot quietly fall outside this. Its
+absence from :func:`write_every_cell` stops the keyless half on every leg, and its absence from
+:data:`READERS` reds the plain leg with no database. ``shared_body`` is in scope on SQLite alone for
+the same reason it is there: only that backend writes a row into it.
 
 **The cipher is the cell-bound writer, ``write_v2=True``, and that is what makes the read-back mean
 anything.** ``make_cipher`` defaults to the v1 format, which binds no AAD, so a v1 read-back would
 pass over a sweep that rebuilt a cell's AAD wrongly. Sealed cells are therefore held to the v4 prefix
 rather than the bare marker.
 
-**Every failure is collected, not the first.** The report names every unsealed and every unreadable
-cell in one run, so a server leg nobody can run locally says everything it found the first time.
+**Once a keyed open completes, every failure is collected, not the first.** The report names every
+unsealed and every unreadable cell in one run, so a server leg nobody can run locally says all of that
+the first time. A keyed open that raises ends the run instead, as a failed writer does.
+
+**A value reads back exactly or not at all.** Containment would pass a sweep that damaged a value
+around the text being looked for, so each read is compared with :func:`value_of` by equality.
 
 **A fresh store is a precondition.** A surface with a ``keyed_surface`` marker (BACKLOG #3383) has its
 unmarked values refused rather than sealed, so a marker left behind would turn this contract into a
@@ -83,6 +87,22 @@ def plain(cell: Cell) -> str:
     return f"SYNTH-PLAIN-{cell[0]}-{cell[1]}"
 
 
+#: The cells whose writer takes :func:`plain` in another shape.
+_SHAPES: dict[Cell, Callable[[str], Any]] = {
+    ("messages", "raw"): lambda text: f"MSH|^~\\&|{text}",
+    ("messages", "metadata"): lambda text: json.dumps({"synth": text}),
+    ("search_presets", "criteria"): lambda text: json.dumps({"synth": text}),
+    ("state", "value"): lambda text: {"synth": text},
+    ("response", "resp_headers"): lambda text: {"X-Synth": text},
+}
+
+
+def value_of(cell: Cell) -> Any:
+    """What ``cell``'s writer is handed, and so exactly what its read path must return."""
+    shape = _SHAPES.get(cell)
+    return plain(cell) if shape is None else shape(plain(cell))
+
+
 @dataclass(frozen=True)
 class Written:
     """What :func:`write_every_cell` leaves behind for the readers to find."""
@@ -123,10 +143,10 @@ async def write_every_cell(store: Any) -> Written:
 
     dead = await store.enqueue_message(
         channel_id=_CHANNEL,
-        raw=f"MSH|^~\\&|{plain(('messages', 'raw'))}",
+        raw=value_of(("messages", "raw")),
         deliveries=[(_DEAD, "SYNTH-DEAD-PAYLOAD")],
         summary=plain(("messages", "summary")),
-        metadata=json.dumps({"synth": plain(("messages", "metadata"))}),
+        metadata=value_of(("messages", "metadata")),
     )
     await store.record_message_event(dead, "failed", detail=plain(("message_events", "detail")))
     item = await _one_claim(store, _DEAD)
@@ -154,7 +174,7 @@ async def write_every_cell(store: Any) -> Written:
         body=plain(("response", "body")),
         outcome="accepted",
         detail=plain(("response", "detail")),
-        response_headers={"X-Synth": plain(("response", "resp_headers"))},
+        response_headers=value_of(("response", "resp_headers")),
     )
 
     transformed = await store.enqueue_ingress(channel_id=_CHANNEL, raw="MSH|^~\\&|SYNTH-STATE")
@@ -174,7 +194,7 @@ async def write_every_cell(store: Any) -> Written:
         message_id=transformed,
         channel_id=_CHANNEL,
         deliveries=[("OB_STATE", "SYNTH-STATE-PAYLOAD")],
-        state_ops=[(_STATE_NS, _STATE_KEY, {"synth": plain(("state", "value"))})],
+        state_ops=[(_STATE_NS, _STATE_KEY, value_of(("state", "value")))],
     )
 
     await store.write_reference_snapshot(
@@ -200,7 +220,7 @@ async def write_every_cell(store: Any) -> Written:
         preset_id=_PRESET,
         owner_user_id=_PRESET_OWNER,
         name="synth",
-        criteria=json.dumps({"synth": plain(("search_presets", "criteria"))}),
+        criteria=value_of(("search_presets", "criteria")),
     )
     await store.create_user(
         user_id=_USER,
@@ -242,8 +262,11 @@ async def _reference(store: Any) -> Any:
     return store.reference_view()[_REFERENCE][_REFERENCE_KEY]
 
 
-async def _event_details(store: Any, message_id: str) -> list[Any]:
-    return [event["detail"] for event in await store.events_for(message_id)]
+async def _event_detail(store: Any, message_id: str) -> Any:
+    """The written detail if an event holds it, else every detail, for the report to show. The
+    message's routine events have details of their own."""
+    details = [event["detail"] for event in await store.events_for(message_id)]
+    return next((d for d in details if d == value_of(("message_events", "detail"))), details)
 
 
 async def _last_error(store: Any, message_id: str) -> Any:
@@ -265,7 +288,7 @@ async def _preset_criteria(store: Any) -> Any:
     return row["criteria"]
 
 
-#: One real read path per cell. Each must return, or contain, :func:`plain` for that cell.
+#: One real read path per cell. Each must return exactly :func:`value_of` that cell.
 READERS: dict[Cell, Callable[[Any, Written], Awaitable[Any]]] = {
     ("messages", "raw"): lambda s, w: _message_field(s, w.dead, "raw"),
     ("messages", "error"): lambda s, w: _message_field(s, w.errored, "error"),
@@ -280,7 +303,7 @@ READERS: dict[Cell, Callable[[Any, Written], Awaitable[Any]]] = {
     ("response", "detail"): lambda s, w: _response_field(s, w.replied, "detail"),
     ("response", "resp_headers"): lambda s, w: _response_field(s, w.replied, "headers"),
     ("attachment_chunk", "ciphertext"): lambda s, w: _attachment(s, w.attachment),
-    ("message_events", "detail"): lambda s, w: _event_details(s, w.dead),
+    ("message_events", "detail"): lambda s, w: _event_detail(s, w.dead),
     ("connection_event", "reason"): lambda s, w: _connection_reason(s),
     ("alert_instance", "reason"): lambda s, w: _alert_reason(s),
     ("search_presets", "criteria"): lambda s, w: _preset_criteria(s),
@@ -322,7 +345,7 @@ async def _unreadable(store: Any, written: Written, cells: Sequence[Cell]) -> di
         except (CipherError, LookupError) as exc:
             unreadable[cell] = f"{type(exc).__name__}: {exc}"
             continue
-        if plain(cell) not in str(value):
+        if value != value_of(cell):
             unreadable[cell] = f"read back {value!r}"
     return unreadable
 

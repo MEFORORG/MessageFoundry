@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 pytest.register_assert_rewrite("tests._content_free")
 # The same for the request-deadline helper the cut-off tests share (vault BACKLOG #3871).
 pytest.register_assert_rewrite("tests._deadline_capture")
+# The same for the keyed-reopen contract, whose failures land on server legs nobody runs locally, so
+# they must print what they compared (BACKLOG #1723).
+pytest.register_assert_rewrite("tests._keyed_reopen_contract")
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
