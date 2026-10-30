@@ -34,6 +34,7 @@ from messagefoundry.tls_handshake_failures import (
     handshake_cause,
     watch_loop_handshakes,
 )
+from messagefoundry.transports import http_listener as http_module
 from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPDestination
@@ -469,7 +470,11 @@ def test_no_listener_is_kept_alive_by_its_hook_or_its_counter(tmp_path: Path) ->
         return source
 
     def http() -> object:
-        return _http_tls_source(tmp_path / "http")[0]  # hooks its context at construction
+        source, _cert_path = _http_tls_source(tmp_path / "http")
+        # What start() does where the loop runs the handshake.
+        assert source._ssl is not None
+        source._tls_failures.watch(source._ssl)
+        return source
 
     for sub in ("mllp", "http", "api"):
         (tmp_path / sub).mkdir()
@@ -519,7 +524,8 @@ async def test_a_plain_function_emitter_is_held_as_it_is() -> None:
 # --- the HTTP intake listener -----------------------------------------------------------------
 
 
-def _http_tls_source(tmp_path: Path) -> tuple[HttpSource, str]:
+def _http_tls_source(tmp_path: Path, **extra: object) -> tuple[HttpSource, str]:
+    """A TLS HTTP listener, and the cert a client pins to reach it."""
     cert, key = _cert(tmp_path)
     source = HttpSource(
         Source(
@@ -530,6 +536,7 @@ def _http_tls_source(tmp_path: Path) -> tuple[HttpSource, str]:
                 "tls": True,
                 "tls_cert_file": cert,
                 "tls_key_file": key,
+                **extra,
             },
         )
     )
@@ -540,12 +547,21 @@ async def _no_reply(_raw: bytes) -> str | None:
     return None
 
 
-async def test_the_http_listener_records_a_failed_handshake(tmp_path: Path) -> None:
+@pytest.mark.parametrize("runner", ["listener", "loop"])
+async def test_the_http_listener_records_a_failed_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
+) -> None:
+    """On the stdlib loop the listener runs its own handshakes since BACKLOG #2479, and counts a
+    failure with its peer. ``loop`` forces the path uvloop takes, where the context's hook counts
+    it and knows no peer."""
+    if runner == "loop":
+        monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, cert = _http_tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
     await source.start(_no_reply)
     try:
+        assert source._upgrade_tls is (runner == "listener")
         # The control: a completed handshake is no failure.
         assert await _tls_peer(source.sockport, _pinned_client(cert))
         await asyncio.sleep(0.1)
@@ -557,7 +573,8 @@ async def test_the_http_listener_records_a_failed_handshake(tmp_path: Path) -> N
         failed = [e for e in events.seen if e[0] == "tls_handshake_failed"]
         assert len(failed) == 1
         (_kind, peer, reason) = failed[0]
-        assert peer is None  # the loop's TLS object knows no peer
+        # The listener's own handshake knows its peer; the loop's TLS object knows none.
+        assert peer == ("127.0.0.1" if runner == "listener" else None)
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "GET" not in reason  # a cause, never the peer's bytes
         assert source.tls_handshake_failures == 1
