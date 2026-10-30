@@ -405,7 +405,8 @@ the management API, and it does not inherit the API's auth: harden it deliberate
 - **Built:** per-connection TLS (`tls = true` + `tls_cert_file`/`tls_key_file`), opt-in **mTLS** via
   `tls_ca_file`, a per-connection `source_ip_allowlist`, partner authentication by `intake_auth`
   (`api_key` or `bearer` with an `intake_api_key` read through `env()`, or `mtls_subject` with
-  `tls_ca_file` and `intake_client_subjects`), DoS caps (`max_connections`, `receive_timeout`,
+  `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
+  certificate), DoS caps (`max_connections`, `receive_timeout`,
   `max_body_bytes`, `max_header_bytes`), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the

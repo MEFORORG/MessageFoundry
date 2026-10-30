@@ -11,6 +11,10 @@
   active mode's credential header more than once is answered **`400`**, not the `401` of **AC-11**.
   AC-11 keeps its original text, with a dated note in place. See
   [Amendment 2026-09-29](#amendment-2026-09-29-a-repeated-credential-header-is-answered-400).
+- **Amended 2026-10-30 (vault BACKLOG #2287, Manager decision in batch 463):** `intake_client_subjects`
+  is keyed by the issuing CA's DN, and a subject is admitted only under the loaded CA whose key signed
+  the leaf. D6 and **AC-14** keep their original text. See
+  [Amendment 2026-10-30](#amendment-2026-10-30-intake_client_subjects-is-keyed-by-the-issuing-ca).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -1337,3 +1341,48 @@ attempt, so while `intake_auth_rate_limit` is on the same budget bounds it as an
 **Where the original text stays.** AC-11 keeps its wording, with a dated italic note in place. It now
 links a second test,
 `tests/test_inbound_http_intake_auth.py::test_a_repeated_credential_header_is_refused_before_any_comparison`.
+
+## Amendment 2026-10-30: `intake_client_subjects` is keyed by the issuing CA
+
+**A Manager seat decided the shape in batch 463, on 2026-10-30, building vault BACKLOG #2287.** The
+setting's operator-facing description is in [`CONNECTIONS.md`](../CONNECTIONS.md), in the `Http()`
+settings table. Read it there.
+
+**Why it was needed.** D6's allow-list matched a subject name alone. Every CA in the listener's
+`tls_ca_file` could issue a certificate with a listed subject, and the listener admitted it as that
+partner. This is the flaw BACKLOG #2237 closed on the operator API ([ADR 0083](0083-mtls-client-certificate-identity.md),
+Amendment 1), on a second surface. On a first deployment, a site loading more than one client CA into
+one `Http()` listener would have let any of them speak for any listed partner.
+
+**Decision.**
+
+- **The shape mirrors `[api].tls_client_cert_identities`.** The setting is a table: each key is the DN
+  of an issuing CA, as `cryptography`'s `Name.rfc4514_string()` renders that CA's subject, and each
+  value is a list of qualified subject names. The factory holds a key to the same canonical-form round
+  trip the API loader uses (`pki.canonical_dn`), and refuses one that does not round-trip to itself.
+- **The flat list is refused, with no compatibility shim.** It is refused at load with a message naming
+  the table to write. Nothing is deployed, so the break costs no one.
+- **The factory checks the whole shape itself.** The `connections.toml` type check stops one level in,
+  and `_reject_envref_in_lists` scans only list-valued settings. So `Http()` checks each key and each
+  item: types, non-empty, and an `env()` reference at any level, without repeating its default.
+- **The issuer is found by signature, from the bytes the context loaded.** `pki.IssuerIndex`, the
+  index the API uses, is built once from the exact `cadata` text the listener's `SSLContext` loaded as
+  its client trust store. The context builder hands that text back through a callback, so the listener
+  never reads `tls_ca_file` a second time, where a swapped file could differ. A loaded CA is the
+  issuer only when its subject equals the leaf's issuer name exactly and its key verifies the leaf.
+  The listener reads the leaf from `getpeercert(binary_form=True)`. It never reads
+  `getpeercert()["issuer"]`, which OpenSSL matches to a CA loosely, and never `get_verified_chain()`,
+  which is empty on a resumed session. The match itself is `client_cert_principal_under_issuer`, the
+  API's matcher.
+- **Only a loaded CA counts.** A leaf signed by an intermediate the client sends is refused, even when a
+  key names that intermediate's DN, because any loaded CA could mint an intermediate with another CA's
+  name. An operator whose partners use an intermediate loads it into `tls_ca_file` and keys by its DN.
+- **The listener warns at start about a key that cannot match,** as the API does: one naming no loaded
+  CA, or naming two loaded CAs with one subject and different keys. Either would otherwise deny every
+  certificate under it with nothing in the log.
+- **Only the HTTP listener builds the index, and only under `mtls_subject`.** The MLLP listener calls the
+  same context builder without the callback, so its TLS behaviour is unchanged.
+
+**Where the original text stays.** D6 and AC-14 keep their wording. AC-14's test still covers the
+unlisted-subject `403`. The issuer cases, each with a control, are in
+`tests/test_inbound_http_intake_issuer.py`.
