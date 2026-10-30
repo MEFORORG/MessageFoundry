@@ -2201,34 +2201,35 @@ def _read_only_poll_refusal(statement: str) -> str | None:
     """Why a DATABASE source ``poll_statement`` is refused, or None when it passes (BACKLOG #2178).
 
     The poll runs on the autocommit pool, so a write in it commits at execute, before any row reaches
-    the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, marks every row it matches,
-    but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the rows past
-    the ceiling are marked and never ingested. The rows a failed handler or a stop leaves behind are
-    lost the same way. That is accept-and-drop. Only the per-row ``mark_statement``, run after the
-    handler returns, may mark a row.
+    the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
+    matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
+    rows past the ceiling would be marked and never ingested, and so would the rows a failed handler
+    or a stop leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
+    the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
-    ``poll_max_rows`` is. It refuses at least a write keyword, ``EXEC`` and ``{CALL}``, a chained
-    second statement, and a locking ``FOR UPDATE`` read (``UPDATE`` is a keyword; on this autocommit
-    connection the lock ends with the statement, so refusing it loses nothing). **It reads the
-    statement's shape only, and it is the only guard here**: a ``SELECT`` that calls a function which
-    writes passes it, and the login cannot be read-only, because ``mark_statement`` writes on the same
-    connection. The operator must keep the poll free of writes.
+    ``poll_max_rows`` is; its docstring says what it refuses. A locking ``FOR UPDATE`` read is refused
+    with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
+    statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
+    ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
+    verb is not in :data:`_SQL_WRITE_KEYWORDS`, pass it. With a ``mark_statement`` the login must be
+    able to write, so it cannot backstop the poll; a feed with no mark can use a read-only login.
 
     ``DatabasePoll`` tests a literal statement when declared, so ``messagefoundry check`` refuses it
-    without a build; ``DatabaseSource`` tests again at construction. The text is the fixed refusal
-    vocabulary, never the statement. It is returned, not raised, so each caller raises its own type
-    with no ``DbLookupError`` chain."""
+    without a build; ``DatabaseSource`` tests every statement, an ``env()`` value included, at
+    construction. The text is the fixed refusal vocabulary, never the statement. It is returned, not
+    raised, so each caller raises its own type with no ``DbLookupError`` chain."""
     try:
         _require_read_only(statement, subject="DATABASE source poll_statement")
     except DbLookupError as exc:
         return (
-            f"{exc}. The poll runs on an autocommit connection, so a write in it, such as "
-            "UPDATE ... RETURNING or OUTPUT, commits before any row is handed off, and the rows it "
-            "marks past poll_max_rows, or behind a failed hand-off or a stop, are never ingested. "
-            "Poll with a SELECT and mark each handled row with mark_statement. At least a "
-            "stored-procedure poll (EXEC, {CALL ...}), a second statement and a locking read "
-            "(FOR UPDATE, whose lock ends with the statement here) are refused too"
+            f"{exc}. A poll must only read: it runs on an autocommit connection, so a write in it, "
+            "such as UPDATE ... RETURNING or OUTPUT, would commit before any row is handed off, "
+            "and the rows it marked past poll_max_rows, or behind a failed hand-off or a stop, "
+            "would never be ingested. Poll with a SELECT and mark each handled row with "
+            "mark_statement. At least a stored-procedure poll (EXEC, {CALL ...}), a second "
+            "statement and a locking read (FOR UPDATE, whose lock ends with the statement here) "
+            "are refused too"
         )
     return None
 

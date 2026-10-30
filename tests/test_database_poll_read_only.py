@@ -2,11 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A DATABASE source refuses a ``poll_statement`` that could write (BACKLOG #2178).
 
-The poll runs on an autocommit pool, so a write in it commits at execute. ``UPDATE ... RETURNING``
-marks every row it matches while ``_select`` hands off at most ``poll_max_rows``, so the rows past the
-ceiling were marked and never ingested, and so were the rows behind a failed hand-off or a stop. The
-poll must now pass the ``db_lookup`` read-only test, whatever ``poll_max_rows`` is: ``DatabasePoll``
-tests it when declared, and ``DatabaseSource`` tests it again when built."""
+Why, and what is refused: ``transports.database._read_only_poll_refusal``. ``DatabasePoll`` tests a
+literal statement when declared, and ``DatabaseSource`` tests every statement when built."""
 
 from __future__ import annotations
 
