@@ -105,21 +105,35 @@ async def test_a_failing_sink_never_stops_the_quarantine(monkeypatch: pytest.Mon
     assert f"/in/.error/{_NAME}" in client.files
 
 
+@pytest.mark.parametrize(
+    ("body", "listed", "cap", "scan_rejects"),
+    [a[2:6] for a in _ARMS],
+    ids=[a[0] for a in _ARMS],
+)
+@pytest.mark.usefixtures("_no_scan_hook")
 async def test_a_quarantine_whose_move_failed_records_nothing(
     monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+    listed: int | None,
+    cap: int,
+    scan_rejects: bool,
 ) -> None:
     """A file the server would not rename (locked, error dir unwritable) is still in the poll
     directory and is examined again next poll. Recording it as quarantined would be false, and would
     write one row per poll for as long as it stays.
 
-    Mutation: emit regardless of the move's result. Red: an event is recorded."""
+    Mutation: emit regardless of the move's result in any one arm. Red: an event is recorded."""
     client = _FakeClient(
-        files={_PATH: _HL7}, rename_exc=_RemoteError("permission denied", permanent=False)
+        files={_PATH: body},
+        sizes={} if listed is None else {_PATH: listed},
+        rename_exc=_RemoteError("permission denied", permanent=False),
     )
-    src = _src(monkeypatch, client, max_file_bytes=10)
+    src = _src(monkeypatch, client, max_file_bytes=cap)
     sink = _Sink()
     src.on_connection_event = sink
     src._handler = _RecordingHandler()
+    if scan_rejects:
+        set_scan_hook(_reject)
     await _settle(src)
     await src._poll_once()
 

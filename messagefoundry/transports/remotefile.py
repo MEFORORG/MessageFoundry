@@ -3204,10 +3204,8 @@ class RemoteFileSource(SourceConnector):
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
 
         The same kinds and rules as
-        :meth:`~messagefoundry.transports.file.FileSource._emit_event`: the reason is a size, a
-        content type or a scrubbed scanner message, never the file name, which a partner may build
-        from an MRN. An emit problem never wedges the poll loop, a missing sink is a no-op, and
-        ``peer_host`` stays ``NULL``: this source dials out, as the DATABASE poll source does."""
+        :meth:`~messagefoundry.transports.file.FileSource._emit_event`, which states them,
+        including what a reason may carry."""
         sink = self.on_connection_event
         if sink is None:
             return
