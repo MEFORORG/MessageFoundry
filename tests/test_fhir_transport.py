@@ -1216,8 +1216,9 @@ _KEY_HASHES = """
 import json, sys
 from messagefoundry.transports.fhir import _KeepFirstKey
 hook = _KeepFirstKey()
-json.loads('{"a": [1, [2.5, "x"]], "b": {"c": 1, "d": [true]}, "b": {"c": 1, "d": [true]},'
-           ' "e": ["", {}, [], null]}', object_pairs_hook=hook)
+# Only occurrences of a repeated key are interned, so every kind sits inside one.
+x = '{"a": [1, [2.5, "x"]], "c": 1, "d": [true], "e": ["", {}, [], null]}'
+json.loads('{"b": ' + x + ', "b": ' + x + '}', object_pairs_hook=hook)
 fixed = lambda v: type(v) in (bool, type(None)) or v in ("", b"")
 print(json.dumps([[getattr(k[0], "__name__", "?"), hash(k[1]), fixed(k[1])] for k in hook.ids._table]))
 """
@@ -1265,30 +1266,91 @@ def test_every_interning_key_but_six_fixed_ones_hashes_by_the_process_seed() -> 
     assert fixed == 5  # true, null, "", {} and []: the six less false, which this reply lacks
 
 
-def _with_many_values(count: int) -> bytes:
-    """A reply with one repeated key and ``count`` more integers beside it."""
-    return _reply_with(
-        '{"status": "200 OK"}', meta='{"t": 1, "t": 1, "w": [' + ", ".join(["0"] * count) + "]}"
-    )
+def _with_many_values(count: int, item: str = "0") -> bytes:
+    """A reply that repeats a key twice, each occurrence a list of ``count`` copies of ``item``."""
+    many = "[" + ", ".join([item] * count) + "]"
+    return _reply_with('{"status": "200 OK"}', meta='{"t": ' + many + ', "t": ' + many + "}")
 
 
 async def test_a_reply_past_the_node_budget_is_dead_lettered(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # At the 16 MiB read cap a reply took about 1.5 GiB and most of a minute to judge here, so the
-    # id work is bounded and fails closed past it (ADR 0095 B.1).
+    # Control for the delivery below: repeated occurrences too large to judge fail closed, as a
+    # backstop on the interning work (ADR 0095 B.1).
     import messagefoundry.transports.fhir as fhir_module
 
     dest = _dest(interaction="update")
-    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET))  # type: ignore[assignment]
+    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET // 2))  # type: ignore[assignment]
     with caplog.at_level("WARNING"), pytest.raises(NegativeAckError) as ei:
         await dest.send(UPDATE_1965)
     assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
     # The budget ran out inside the keep-first parse, and the refusal says so in the log.
     assert any("too large to judge (_TooManyNodes)" in r.getMessage() for r in caplog.records)
+    # Containers trip the backstop while they are collected, before any of them is interned.
+    caplog.clear()
+    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET, "[]"))  # type: ignore[assignment]
+    with caplog.at_level("WARNING"), pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key"
+    assert any("too large to judge (_TooManyNodes)" in r.getMessage() for r in caplog.records)
     # Control: the same shape, well inside the budget, is delivered.
     dest._opener = _FakeOpener(body=_with_many_values(1000))  # type: ignore[assignment]
     assert await dest.send(UPDATE_1965) is None
+
+
+def test_the_refusal_does_not_hold_the_parsed_trees_on_its_traceback() -> None:
+    # The dead-letter path holds the error while it writes to the store, so its traceback must not
+    # keep the two parsed trees, the id tables or the hook alive.
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _reply_with('{"status": "200 OK", "status": "404 Not Found"}').decode()
+    with pytest.raises(NegativeAckError) as ei:
+        fhir_module._agreed_reading(reply)
+    tb = ei.value.__traceback__
+    while tb is not None:
+        for value in tb.tb_frame.f_locals.values():
+            assert not isinstance(value, (dict, fhir_module._KeepFirstKey, fhir_module._NodeIds))
+        tb = tb.tb_next
+
+
+async def test_a_large_agreeing_reply_with_a_small_repeat_is_judged_without_its_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A review of this branch at eb8ba6a7 measured it: an updated Patient with 60,000 extensions
+    # beside one harmless repeat in meta, about 2.3 MB, which main delivers. Interning the whole
+    # reply dead-lettered it on the budget. Only the repeated occurrences and the compared values
+    # are interned, so it is delivered again, in a handful of steps.
+    import messagefoundry.transports.fhir as fhir_module
+
+    calls = 0
+    intern = fhir_module._NodeIds._intern
+
+    def _counting(self: Any, key: object) -> int:
+        nonlocal calls
+        calls += 1
+        return intern(self, key)
+
+    monkeypatch.setattr(fhir_module._NodeIds, "_intern", _counting)
+    extensions = ", ".join(
+        f'{{"url": "http://example.org/fhir/ext-{n}", "valueString": "synthetic value {n}"}}'
+        for n in range(60_000)
+    )
+    resource = '{"resourceType": "Patient", "id": "p1", "extension": [' + extensions + "]}"
+    reply = (
+        '{"resourceType": "Bundle", "type": "transaction-response", "meta": {"tag": 1, "tag": 1}, '
+        '"entry": [{"resource": ' + resource + ', "response": {"status": "200 OK"}}]}'
+    ).encode()
+    assert len(reply) > 2_000_000
+    for capture in (True, False):
+        dest = _dest(interaction="update", capture_response=capture)
+        dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+        calls = 0
+        resp = await dest.send(UPDATE_1965)
+        if capture:
+            assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+        else:
+            assert resp is None
+        assert 0 < calls < 50  # the two tag occurrences and the compared values, nothing else
 
 
 async def test_the_node_budget_also_bounds_the_compare_of_the_two_readings(

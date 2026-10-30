@@ -451,28 +451,34 @@ beside a repeat, reads one way and is judged as any other. `NaN` against a numbe
 `Infinity` is a disagreement. A number is the value `json` parses it to: a numeral with a fraction
 or an exponent is a double, so `1.0` and `1.00`, or two such numerals that round to one double,
 are one value; an integer numeral is an exact integer, so `-0` is the integer `0` and one value
-with `0`. Each value gets one id, interned bottom-up: in the keep-first parse for that reading, and
-in one walk afterwards for the values compared from the plain reading. Nothing recurses past the
-depth `json` itself parses (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
+with `0`. Only two parts of a reply get ids: every occurrence of a repeated key, with everything
+below it, interned bottom-up in the keep-first parse as the object that repeats it closes; and the
+values the two readings are compared on (the resource type, the judgment, and the entry's `etag`,
+`location` and `lastModified`), interned after the parses. The rest of the reply, however large,
+gets no id and costs only the two parses. Nothing recurses past the depth `json` itself parses
+(`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
 
 The work of judging is bounded in at least these ways. Every interning key hashes through a
 string or a byte string, whose hash Python seeds per process, except six with a fixed hash:
 `true`, `false`, `null`, and the empty string, object and list. So a reply cannot be built in
 advance to make the keys collide. That holds only while `PYTHONHASHSEED` is unset or random, and
 it is not proof against a sender who learns the seed. An object's key is its sorted pairs of key
-and value ids, so the expected work is at most the reply's size times the log of its widest
-object. And at most 250,000 interning steps run for one reply, one per key, value and container,
-repeats included (`_NODE_BUDGET`): past that, or when the process runs out of memory judging the
-reply, it fails closed with this code. The two `json` parses are not bounded here; they ran before
-vault BACKLOG #3796 too, and the 16 MiB read cap bounds them.
+and value ids, so the expected work is at most the size of what is interned times the log of its
+widest object. And, as a backstop, at most 250,000 interning steps run for one reply
+(`_NODE_BUDGET`), counting each string, number, `true`, `false`, `null`, object, list and object
+key that is interned, repeats included, and one walk collecting containers to intern stops once
+it holds more than 250,000: past either, or when the process runs out of memory judging the reply,
+it fails closed with this code. The two
+`json` parses are not bounded here; they ran before vault BACKLOG #3796 too, and the 16 MiB read
+cap bounds them.
 
 **CORRECTED 2026-10-30 (vault BACKLOG #3796).** The paragraph before this said the three-or-more
 occurrence rule held *"at any depth"* and compared each occurrence's *"value"*. It held in every
 object, but it compared an occurrence only by its keep-first reading, with Python equality. So a
 middle object that read `404` only keeping the last key was delivered, as were `1` against `true`,
 `1` against `1.0` and `0.0` against `-0.0` at every level, the top-level object included, and in
-the compared `etag`, `location` and `lastModified`. And a `NaN` beside a repeat refused, since a `NaN` is unequal to
-itself there.
+the compared `etag`, `location` and `lastModified`. And a `NaN` beside a repeat refused, since a
+`NaN` is unequal to itself there.
 
 It fails closed only on disagreement because a reply that reads one way under both rules carries
 no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
@@ -492,13 +498,18 @@ the keep-first hook (13 before vault BACKLOG #3796); both depend on the platform
 that differs with capture off refuses, though nothing reads it in that mode. An occurrence that
 reads two ways refuses even where the reply's two readings reach one judgment, for example a first
 `response` repeating `status` as `200 OK` then `201 Created`, beside a second `response` that does
-not repeat it. A reply that repeats a key and needs more than 250,000 interning steps refuses
-although its readings may agree. Measured on 2026-10-30 at the 16 MiB read cap, under
-`tracemalloc` on the same Windows box, with replies of `[]`, `{}`, `[1]` or `{"a":1}` items beside
-one repeated key. `_agreed_reading` alone (the plain read, the keep-first parse and the compare,
-not FhirPeek's parse before it) peaked at 1.1 to 1.6 GiB and took 36 to 56 s before the budget.
-With it, 0.4 to 0.8 GiB and 5 to 21 s, because the keep-first parse now stops at the budget. For
-scale, two complete plain parses of the same reply took 0.7 to 0.8 GiB and 6 to 12 s.
+not repeat it. A reply whose repeated occurrences or compared values need more than the backstop
+allows refuses although its readings may agree; the rest of the reply does not count toward it.
+
+Measured on 2026-10-30 at the 16 MiB read cap, under `tracemalloc` on the same Windows box, for
+`_agreed_reading` alone (the plain read, the keep-first parse and the compare, not FhirPeek's parse
+before it), with replies of `[]`, `{}`, `[1]` or `{"a":1}` items. Where the items sit in a list
+beside one small repeated key, it now delivers at a peak of 0.68 to 0.76 GiB in 5 to 10 s. That is
+what holding both parsed trees costs, which the code on `main` also did: two plain parses kept
+alive together took 0.68 to 0.76 GiB here. An earlier draft that interned the whole reply peaked
+at 1.1 to 1.6 GiB and took 36 to 56 s. Where the items fill the two occurrences of the repeated key
+instead, the backstop refuses it at a peak of 0.51 to 0.57 GiB in 6 to 13 s, because the keep-first
+parse stops partway.
 
 It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
 `read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the sections headed vault BACKLOG
