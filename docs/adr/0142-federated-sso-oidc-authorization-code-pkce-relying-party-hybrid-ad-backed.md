@@ -595,6 +595,13 @@ sessions and no user is left half deleted.
 [SECURITY.md](../SECURITY.md#federated-sign-in-oidc-browser-only--adr-0142) is the source of
 record for both.
 
+**CORRECTED 2026-10-30 (BACKLOG #2738).** The paragraph above is kept as written, and three of
+its claims are wrong. A missed session does not last until it expires: the session epoch refuses
+it the next time it is presented (BACKLOG #2592). The deadlock with a user delete is closed on
+both server stores (BACKLOG #2733, #2738). And nothing retries a deadlock. It also did not say
+that both limits were read from the code and not run. The SQL Server sweep can still miss a
+rotated session; SECURITY.md, linked above, states what that still costs.
+
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
 [ADR 0207](0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) takes

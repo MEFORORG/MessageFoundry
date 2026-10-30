@@ -537,13 +537,21 @@ def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
 
 def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     """RED when: the claim that nothing minted before a bind outlives it loses the limits written
-    beside it. The claim is true of the sweep as designed, and the two limits are what a reader
-    planning on it has to know."""
+    beside it. The claim is true of the sweep as designed, and the limit is what a reader planning
+    on it has to know.
+
+    BACKLOG #2738 closed the second limit, the deadlock with a user delete, and corrected the
+    first. So the old collision bullet must be gone, and the sweep's bullet must name the false
+    alarm a missed session's ending raises."""
     text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
         encoding="utf-8"
     )
     assert "**Limits of the session sweep.**" in text
-    assert "**A bind and a user delete can collide on the SQL Server and Postgres stores.**" in text
+    assert "can collide on the SQL Server and Postgres stores" not in text
+    assert "fails and is retried" not in text
+    assert "lasts until it expires" not in text
+    assert "**That is a known false alarm, not intended behaviour:**" in text
+    assert "**A bind and a user delete take one lock order on every store**" in text
 
 
 def test_the_security_doc_says_a_bound_administrator_does_not_block_provision_admin() -> None:

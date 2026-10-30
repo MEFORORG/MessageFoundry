@@ -4583,7 +4583,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
   account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that the next bullet states. The
+  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -4596,18 +4596,32 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed, and it then lasts until it expires. The same
-  holds on that store for an unbind and for an administrator's revoke of a user's sessions,
-  which run the same sweep. The Postgres store follows a rotated row and the SQLite store runs
-  one writer at a time, so neither has this limit. This was read from the code and not run
-  against a server. A bind ends sessions only: an engine factor already enrolled on the
-  account stays.
-- **A bind and a user delete can collide on the SQL Server and Postgres stores.** A bind locks
-  the account's row and then its sessions, and deleting a user locks the sessions and then
-  the row. If both run against one account at the same moment, the database ends one of
-  them, so one administrator request fails and is retried. No bound account keeps its
-  sessions and no user is left half deleted. The SQLite store runs one writer at a time and
-  does not have this.
+  in the instant the sweep runs can be missed by it. The same holds on that store for an
+  unbind and for every other whole-account revoke, which run the same sweep: at least an
+  administrator's revoke of a user's sessions, a role change and a password reset. **The missed session does not stay usable** (BACKLOG
+  #2738). Each of these raises the account's session epoch in the same transaction, and a
+  rotation keeps the epoch the session was sealed under. So the next time the session is
+  presented it is refused and ended, and the user's own session list hides it and ends it the
+  same way. **Three things are still wrong about it.** Its ending is reported as a seal
+  failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
+  alert. **That is a known false alarm, not intended behaviour:** nothing was altered, and
+  neither the alert nor the audit row says which case it is, so an operator cannot tell it
+  from tampering. A follow-up row, not yet filed, is to carry the fix: a sweep that follows a
+  rotated session, so nothing is missed and nothing is refused later. The count the bind, the
+  unbind or the revoke reports is one short. And until the session is presented or listed,
+  the store still holds it as live. The Postgres store follows a rotated row and the SQLite
+  store runs one writer at a time, so neither has this limit. The skip and the refusal were
+  read from the code; the skip has not been reproduced against a server. A bind ends sessions
+  only: an engine factor already enrolled on the account stays.
+- **A bind and a user delete take one lock order on every store** (BACKLOG #2738). A bind, an
+  unbind and a whole-account revoke lock the account's row and then its sessions. Deleting a
+  user now takes the account's row first too, on SQL Server since BACKLOG #2733 and on
+  Postgres since #2738, so the two cannot deadlock against one account. The order was read
+  from the code, and `test_bind_and_user_delete_take_one_lock_order` checks it on both server
+  legs: it pauses a bind while it holds the row and checks that the delete waits for it. Nothing in
+  the engine retries a deadlock, so a deadlock from another pair of writes still fails one
+  administrator request, which the administrator repeats by hand. The SQLite store runs one
+  writer at a time and has no lock order to get wrong.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.

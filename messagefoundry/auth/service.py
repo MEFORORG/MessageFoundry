@@ -11326,8 +11326,11 @@ class AuthService:
           gate refuses it for that reason, and does not audit it as a lapse.
         - ``"epoch"``: a whole-account revoke raised the account's epoch after this session was
           sealed, so the session belongs to sessions that were ended (BACKLOG #2592). That revoke
-          blanked every seal under the account's lock, so no write of the store's own leaves such
-          a row live: it is ended and reported like a row that fails its seal.
+          blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
+          a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
+          epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal, so its
+          ending raises the seal-failure alert as a known false alarm (docs/SECURITY.md,
+          *Limits of the session sweep*).
 
         :meth:`logout` and :meth:`_supersede_session_hash` act on ``"credential"`` only. They read
         the account after their own revoke committed, so a whole-account revoke landing between
@@ -16319,7 +16322,10 @@ class AuthService:
         sign-in that read the row unbound either inserts its session before that transaction,
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
-        routes refuse a caller binding its own account.
+        routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
+        the sweep can miss a session rotated mid-scan. The session epoch the bind raises refuses
+        that session the next time it is presented; docs/SECURITY.md, *Limits of the session
+        sweep*, states what that costs.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
