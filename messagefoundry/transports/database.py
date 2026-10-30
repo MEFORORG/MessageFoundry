@@ -2227,7 +2227,8 @@ def _read_only_poll_refusal(statement: str) -> str | None:
             "such as UPDATE ... RETURNING or OUTPUT, would commit before any row is handed off, "
             "and the rows it marked past poll_max_rows, or behind a failed hand-off or a stop, "
             "would never be ingested. Poll with a SELECT and mark each handled row with "
-            "mark_statement. At least a stored-procedure poll (EXEC, {CALL ...}), a second "
+            "mark_statement. A stored-procedure poll (EXEC, {CALL ...}) is refused even when the "
+            "procedure only reads, because this test cannot see its body. At least a second "
             "statement and a locking read (FOR UPDATE, whose lock ends with the statement here) "
             "are refused too"
         )

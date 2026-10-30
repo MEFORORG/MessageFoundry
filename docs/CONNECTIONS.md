@@ -2092,7 +2092,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: those past `poll_max_rows`, and those behind a failed hand-off or a stop. So a statement that fails the `db_lookup` read-only test is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a locking `FOR UPDATE` read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: those past `poll_max_rows`, and those behind a failed hand-off or a stop. So a statement that fails the `db_lookup` read-only test is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a locking `FOR UPDATE` read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. The test models T-SQL quoting, so on a `dialect='generic'` poll it can refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
@@ -2109,8 +2109,11 @@ just runs whatever statement you declare, bound from the row.
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
-**unmarked** so it retries — never marked-and-dropped. A poll error is **logged, not fatal** — a bad
-`poll_statement` or a dropped connection never kills the poller; it retries next interval.
+**unmarked** so it retries — never marked-and-dropped, as long as `poll_statement` itself does not
+write (see the `poll_statement` row above). A `poll_statement` the read-only test refuses never
+reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
+run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
+kills the poller; it retries next interval.
 
 **Security.** TLS is **on by default**; weakening it (`encrypt=false` / `trust_server_certificate=true`)
 is **refused at construction** through the same cell as the `Database(...)` destination, and the
@@ -3993,7 +3996,10 @@ text that is not a number are refused when the connection is built, before it st
 is cut down to a whole number.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
-the poll does not fetch is still in the table, unmarked. The next tick takes it. On `DatabasePoll(...)`
+the poll does not fetch is still in the table, unmarked. The next tick takes it. That holds only while
+`poll_statement` does not write: at least a `SELECT` that calls a writing function passes the
+build-time read-only test and would mark rows it never hands off (see the
+[`poll_statement`](#database-source--databasepoll) row). On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
 least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of

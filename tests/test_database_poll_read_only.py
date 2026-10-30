@@ -71,7 +71,8 @@ _WRITING_POLLS = [
 def _assert_refusal_text(message: str) -> None:
     assert "poll_statement must be a read-only SELECT/WITH" in message
     assert "mark_statement" in message  # points at the pattern that works
-    assert "EXEC" in message and "{CALL" in message  # stored procedures are refused too
+    assert "EXEC" in message and "{CALL" in message  # stored procedures are refused too,
+    assert "even when the procedure only reads" in message  # a read-only one included, with why
     assert "FOR UPDATE" in message  # and a locking read, with the reason
     assert "mf_inbox" not in message  # PHI-free: never echoes the statement
 
