@@ -363,11 +363,10 @@ async def test_the_long_operations_drain_splits_its_share_by_its_named_wait_shar
 async def test_a_stuck_non_upload_operation_does_not_hold_the_upload_straggler_drain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The upload drain settles only the ``upload.create`` rows, the one long operation whose arm
-    starts an upload removal. A DR change or reload still rolling back at shutdown is not waited
-    for there, so it does not spend the slack the later audit-writing steps get. Red before:
-    the settle waited on every long operation, so the step ran on for its whole wait share,
-    about 1.3 s here, although its only straggler had finished at 0.2 s."""
+    """Vault BACKLOG #3740 item 6: the upload drain settles the ``upload.create`` operations, at
+    least one kind whose arm starts an upload removal, and not a DR change or reload still rolling
+    back at shutdown, which would hold the step for its whole wait share, about 1.3 s here,
+    although its only straggler had finished at 0.2 s."""
     from messagefoundry.api.app import _app_drain_steps
     from messagefoundry.api.outlive import OutlivingOperations
     from messagefoundry.store.crypto import generate_key, make_cipher

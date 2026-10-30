@@ -2,8 +2,8 @@
   before it looks.** An `upload.create` row that the long-operations drain cancelled could still
   be unwinding when that drain stopped waiting. Its removal of the stored file then started after
   the upload drain had returned, and only the event loop's final cancel ended it. The upload
-  drain now spends its wait on those rows first, and on no other long operation, so a removal
-  they start is held and drained. One whose operation is still running when that wait ends
+  drain now spends its wait on those operations first, so a removal they start is held and
+  drained. One whose operation is still running when that wait ends
   can still start late.
   Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
   counted it.

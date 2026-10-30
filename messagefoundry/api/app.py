@@ -1437,10 +1437,8 @@ def _app_drain_steps(
         # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
         # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
         # its bound, so it cancels what it owns before the cut. It settles the upload.create rows
-        # first, as item 2 above says, and no other long operation, so a DR change or reload
-        # still rolling back does not spend the slack the later audit-writing steps get. The
-        # cost: that rollback no longer gets this wait too, so a DR arm still in its hook reap
-        # has a little less time to land its 'interrupted' row before the store closes.
+        # first, as item 2 above says; a DR change or reload still rolling back gets only the
+        # long-operations drain's grace.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
