@@ -2700,19 +2700,17 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     """The audit fields for an OIDC callback the floor exemption let through, empty when it did not
     apply (BACKLOG #2388).
 
-    They sit at the top level of every OUTCOME row the attempt writes after the exemption applied:
-    the success row and each refusal row (BACKLOG #3220, #3728), a directory lock refusal included
-    (BACKLOG #3726). At least the role-resync and session-rotation rows the attempt writes do not
-    carry them. ``docs/SECURITY.md``, *What these floors do not do*, is the source of record for
-    which rows those are; ``tests/test_oidc_callback_floor_exempt_amr.py`` derives the outcome
-    writers from this module's code and fails on one that drops the fields. The values are the
-    CONFIGURED ones the token matched, never the token's own."""
+    ``docs/SECURITY.md``, *What these floors do not do*, is the source of record for which audit
+    rows carry them (BACKLOG #3220, #3728). ``tests/test_oidc_callback_floor_exempt_amr.py`` reads
+    this module's syntax trees and fails on an outcome writer, in the shapes it names, that does not
+    pass them. The values are the CONFIGURED ones the token matched, never the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
 
 
-#: BACKLOG #3728: the field on every step-up outcome row written after an opted-in site deferred a
-#: too-early callback's floor decision past the code exchange, so a refusal that comes before any
-#: ``amr`` is known, such as a failed exchange, is still tied to the exemption.
+#: BACKLOG #3728: the field on each step-up outcome row written after an opted-in site deferred a
+#: too-early callback's floor decision past the code exchange. It says the decision waited, not that
+#: the exemption applied, so a refusal that comes before any ``amr`` is known, such as a failed
+#: exchange, still shows the deferral.
 _FLOOR_DEFERRED_MARKER: Final[Mapping[str, object]] = MappingProxyType(
     {"callback_floor_deferred": True}
 )
@@ -5971,8 +5969,8 @@ class AuthService:
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
-        # in oidc_callback_floor_exempt_amr) is exempt. Every outcome row from here on carries the
-        # marker (see _floor_exempt_marker).
+        # in oidc_callback_floor_exempt_amr) is exempt. Each outcome row written after the too-early
+        # refusal below passes floor_marker (see _floor_exempt_marker); that refusal has none to pass.
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(
                 self._oidc_callback_floor_exempt_values(), principal_claims.amr
@@ -6429,10 +6427,10 @@ class AuthService:
         )
         if arrived_too_early and not exempt_values:
             return await refuse(TOO_EARLY)
-        # BACKLOG #3728: past this line a too-early callback is one whose floor decision the
-        # exemption deferred, so every outcome row says so, a failed exchange's included: that row
-        # comes before any amr is known, and would otherwise record nothing tying it to the exemption.
-        # Bound as `floor`, which no arm's `extra` can replace.
+        # BACKLOG #3728: past this line a too-early callback is one whose floor decision waits for
+        # the exchange, so each outcome row says so, a failed exchange's included: that row comes
+        # before any amr is known, and would otherwise record nothing of the deferral. Bound as
+        # `floor`, which no arm's `extra` can replace.
         floor_fields: Mapping[str, object] = _FLOOR_DEFERRED_MARKER if arrived_too_early else {}
         refuse = partial(refuse, floor=floor_fields)
         try:
@@ -6461,7 +6459,8 @@ class AuthService:
         )
         # BACKLOG #3220: every outcome row past the floor carries the marker when the exemption
         # applied, so a failed exempted step-up is as visible to the loosening's review as a served
-        # one. Bound once, as the address fields are above, so a new arm cannot leave it out.
+        # one. This second binding REPLACES the first's `floor`, so it keeps the deferral by merging
+        # it in; the floor-exempt test file pins both bindings and their order.
         floor_fields = {**floor_fields, **_floor_exempt_marker(floor_exempt_amr)}
         refuse = partial(refuse, floor=floor_fields)
         if arrived_too_early and not floor_exempt_amr:
@@ -6648,7 +6647,8 @@ class AuthService:
 
         ``floor`` adds the callback-floor fields (``_floor_exempt_marker`` and
         ``_FLOOR_DEFERRED_MARKER``). It is a keyword of its own so :meth:`complete_oidc_step_up` can
-        bind it once while an arm still passes ``extra``, which would replace a bound ``extra``.
+        bind it with ``partial`` while an arm still passes ``extra``, which would replace a bound
+        ``extra``.
 
         ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
         BACKLOG #3145). Only a refusal made after a STEP-UP flow was redeemed passes it: before

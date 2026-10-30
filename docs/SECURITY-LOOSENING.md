@@ -1046,8 +1046,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   that provider really uses with no human step.
 - **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
   method stays floored. Each exempted pass records the matched values on its audit rows, failed
-  attempts included; [SECURITY.md](SECURITY.md), *What these floors do not do*, says which rows and
-  which fields. Review those rows. One of them, the directory lock refusal, is shown by the trail's
+  attempts included, and a too-early step-up whose code exchange then failed records only that the
+  floor waited for it; [SECURITY.md](SECURITY.md), *What these floors do not do*, says which rows
+  and which fields. Review those rows. One of them, the directory lock refusal, is shown by the trail's
   read routes (at least `GET /audit`, the exports and `/ui/audit`) only to a reader holding
   `users:manage`, such as an Administrator; the account holder's own `/me/security-events` feed is
   unfiltered. An Auditor reading the trail does not see it (owner ruling 2026-09-28),
