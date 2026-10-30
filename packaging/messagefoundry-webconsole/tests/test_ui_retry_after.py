@@ -7,7 +7,8 @@ A ``require_ui(phi=True)`` view sent a literal ``Retry-After: 10`` and ``POST /u
 and been refused again. The PHI view now sends the account's own wait, as BACKLOG #2144 did for the
 admin-write floor (``test_ui_admin_write_pacing.py``). ``POST /ui/login`` sends the whole sign-in
 window (owner ruling 2026-10-20). ``POST /ui/mfa``, ``/ui/reauth`` and ``/ui/reauth/webauthn`` keep
-the constant ``30`` (a Lander decision under the owner's Driver delegation, 2026-10-20).
+the constant ``30`` (a Lander decision under the owner's Driver delegation, 2026-10-20), and
+``/ui/account/webauthn/verify``, on the same budget, sends it too (BACKLOG #3690 item 5).
 docs/SECURITY.md gives the reasons.
 
 Every window here is 37.5 s, not the shipped 60 s, so no literal can pass by matching an exact wait.
@@ -170,6 +171,10 @@ _CEREMONIES: dict[str, Callable[[httpx.AsyncClient], Awaitable[httpx.Response]]]
     "POST /ui/reauth/webauthn": lambda c: c.post(
         "/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN
     ),
+    # The passkey registration finish draws the same budget (BACKLOG #3690 item 5).
+    "POST /ui/account/webauthn/verify": lambda c: c.post(
+        "/ui/account/webauthn/verify", json={"label": "k", "response": {}}, headers=SAME_ORIGIN
+    ),
 }
 
 
@@ -177,7 +182,7 @@ _CEREMONIES: dict[str, Callable[[httpx.AsyncClient], Awaitable[httpx.Response]]]
 async def test_ceremony_429_is_the_constant_30(
     engine: Engine, clock: list[float], route: str
 ) -> None:
-    """The three console ceremony 429s send ``Retry-After: 30`` whatever the per-actor bucket
+    """The four console ceremony 429s send ``Retry-After: 30`` whatever the per-actor bucket
     holds: just after it fills, where the exact wait would be 18, and just before it drains, where
     it would be 1. The budget is spent through the service, so the test is about the header and not
     about what a failed ceremony does to the session."""
