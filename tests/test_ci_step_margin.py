@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -912,31 +913,40 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("event", "script_rc", "step_rc", "warns"),
+    ("event", "script_rcs", "step_rc", "warns"),
     [
-        ("pull_request", 1, 1, False),  # a LOW margin still blocks before enqueue
-        ("merge_group", 1, 0, True),  # ... and is a warning in the queue
-        ("merge_group", 2, 2, False),  # a gate that could not measure still fails, queue or not
-        ("merge_group", 0, 0, False),
-        ("push", 1, 1, False),
+        ("pull_request", "0", 0, False),
+        ("pull_request", "1 0", 0, True),  # under 1.30x, at or over 1.20x: a warning
+        ("pull_request", "1 1", 1, False),  # under 1.20x blocks before enqueue
+        ("pull_request", "1 2", 2, False),  # the second call could not measure: never a pass
+        ("pull_request", "2", 2, False),  # the first could not, so there is no second opinion
+        ("merge_group", "1", 0, True),  # a warning in the queue, with no second floor
+        ("merge_group", "2", 2, False),  # a gate that could not measure still fails, queue or not
+        ("merge_group", "0", 0, False),
+        ("push", "1", 1, False),  # 1.30x still blocks, and nothing asks about 1.20x
+        ("push", "2", 2, False),
+        ("schedule", "1", 1, False),
+        ("workflow_dispatch", "1", 1, False),
     ],
 )
-def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_group(
-    bash: Path, tmp_path: Path, event: str, script_rc: int, step_rc: int, warns: bool
+def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
+    bash: Path, tmp_path: Path, event: str, script_rcs: str, step_rc: int, warns: bool
 ) -> None:
-    """The owner ruling of 2026-10-29 (quoted beside the step in ci.yml), pinned until #3515's
-    re-measure reverts it. Runs the step's REAL run body under the runner's own `bash -eo
-    pipefail`, with `python` stubbed to the script's exit code, so the pin is on behaviour rather
-    than on a spelling.
+    """The owner ruling of 2026-10-29 and the 1.20x floor decided under the delegation of 2026-10-30
+    (both beside the step in ci.yml), pinned until #3515's re-measure reverts them. Runs the step's
+    REAL run body under the runner's own `bash -eo pipefail`, with `python` stubbed to one exit code
+    per call, so the pin is on behaviour rather than on a spelling.
 
-    Falsified by widening the branch to `"$rc" -ne 0`, and separately by deleting the `::warning`
-    line: RED both times. Restored.
+    Falsified by widening the merge_group branch to `"$rc" -ne 0`, by deleting the `::warning` line,
+    by widening the pull_request branch to every event, by passing a second-call exit 2, and by
+    dropping `--min-margin 1.20`: RED each time. Restored.
     """
     check = _margin_check("test")
     assert "continue-on-error" not in check, "continue-on-error would also pass exit 2 in the queue"
     assert (check.get("env") or {}).get("EVENT_NAME") == "${{ github.event_name }}"
     summary = tmp_path / "summary.md"
     summary.write_text("", encoding="utf-8")
+    calls = tmp_path / "calls.txt"
     env = probe_env(
         bash,
         dict(
@@ -946,9 +956,16 @@ def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_grou
             STEP_CAP="46",
             TESTS_OUTCOME="success",
             GITHUB_STEP_SUMMARY=summary.as_posix(),
+            STUB_CALLS=calls.as_posix(),
         ),
     )
-    stub = f"python() {{ return {script_rc}; }}\n"
+    # One line per call, so the argv each call received can be asserted. The exit codes are consumed
+    # from a shell variable, which survives between calls because `||` does not open a subshell.
+    stub = (
+        f"stub_rcs='{script_rcs}'\n"
+        """python() { printf '%s\\n' "$*" >> "$STUB_CALLS"; """
+        """this=${stub_rcs%% *}; stub_rcs=${stub_rcs#* }; return "$this"; }\n"""
+    )
     done = subprocess.run(
         [str(bash), "-eo", "pipefail", "-c", stub + str(check["run"])],
         capture_output=True,
@@ -957,18 +974,87 @@ def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_grou
         env=env,
         check=False,
     )
-    print(f"[step-margin] {event} rc {script_rc}: step {done.returncode}; {done.stdout.strip()!r}")
+    print(
+        f"[step-margin] {event} rcs {script_rcs}: step {done.returncode}; {done.stdout.strip()!r}"
+    )
     assert done.returncode == step_rc, done.stdout + done.stderr
     assert ("::warning" in done.stdout) is warns, done.stdout
     assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
+    if warns:
+        assert f"title=Step margin advisory ({event})::" in done.stdout, done.stdout
+    argv = calls.read_text(encoding="utf-8").splitlines()
+    # push and merge_group never make a second call
+    assert len(argv) == len(script_rcs.split()), argv
+    assert "--min-margin" not in argv[0], argv[0]
+    assert all("--step Tests (pytest) --leg ubuntu-latest" in line for line in argv), argv
+    if len(argv) == 2:
+        assert argv[1].endswith(f"--min-margin {_pull_request_floor()}"), argv[1]
+
+
+def _pull_request_floor() -> str:
+    """The floor the engine step's run body passes, read from the step rather than restated."""
+    found = re.search(r"^\s*pr_floor=(\S+)$", str(_margin_check("test")["run"]), re.MULTILINE)
+    assert found, "the engine margin step no longer names pr_floor"
+    return found.group(1)
+
+
+@pytest.mark.parametrize(
+    ("margin", "second_rc"),
+    [(1.25, 0), (1.15, 1)],
+)
+def test_the_real_script_answers_both_calls_of_the_pull_request_path(
+    tmp_path: Path, margin: float, second_rc: int
+) -> None:
+    """The stubbed test above proves the step's branches, and this one proves the two calls they
+    make. The second only runs after a slow step, so nothing else would exercise it: if the self-check
+    stopped holding at this floor, or a call consumed the mark or truncated the summary, the first
+    slow PR would get exit 2 or lose a block rather than a warning.
+
+    Falsified by setting pr_floor to 1.10 in ci.yml: RED, the second call exits 2. Restored.
+    """
+    assert _pull_request_floor() == "1.20"
+    cap_minutes = 46
+    baseline = tmp_path / "baseline.toml"
+    baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
+    summary = tmp_path / "summary.md"
+    write_mark("before-tests", tmp_path, at=time.time() - cap_minutes * 60 / margin)
+    call = [
+        "--step",
+        "<fixture step>",
+        "--leg",
+        "<fixture leg>",
+        "--cap-minutes",
+        str(cap_minutes),
+        "--outcome",
+        "success",
+        "--since",
+        "before-tests",
+        "--until",
+        "now",
+        "--clock-dir",
+        str(tmp_path),
+        "--baseline",
+        str(baseline),
+        "--summary-file",
+        str(summary),
+    ]
+    first = main(call)
+    second = main([*call, "--min-margin", _pull_request_floor()])
+    print(f"[step-margin] margin {margin}x: first exit {first}, second exit {second}")
+    assert (first, second) == (1, second_rc)
+    text = summary.read_text(encoding="utf-8")
+    assert "floor 1.30x" in text and "floor 1.20x" in text, text
 
 
 def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
-    """The ruling names the engine suite's check only. Falsified by adding a merge_group branch or
-    a `continue-on-error` to this step: RED. Restored."""
+    """The ruling and the 1.20x floor name the engine suite's check only. Falsified by adding a
+    merge_group branch, a pull_request branch or a `continue-on-error` to this step: RED. Restored."""
     check = _margin_check("webconsole")
     assert "continue-on-error" not in check, check.get("continue-on-error")
-    assert "merge_group" not in str(check.get("run", ""))
+    run = str(check.get("run", ""))
+    assert "merge_group" not in run
+    assert "pull_request" not in run
+    assert "--min-margin" not in run
 
 
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:

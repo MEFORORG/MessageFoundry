@@ -293,6 +293,12 @@ What that costs, stated so nobody reads the record as more than it is:
   keeps python-hl7's answer for the `adv:trailing-escape` case. `DELIBERATE_DIVERGENCES` in the
   parity suite names each changed read and checks the record's old answer too. The fix changed
   those six reads and nothing else across the 39 cases.
+- **A second divergence is outside the record (BACKLOG #2589, #2998).** python-hl7 read a header
+  line with no separator after its encoding characters (`MSH|^~\&`) through a `find` that returned
+  `-1`: field 2 lost its last character and the whole line reappeared as field 3 onward. The
+  built-in parser reads field 2 to the end of that line and writes it back as it came. A header
+  ending in that separator (`MSH|^~\&|`) now keeps an empty field 3, so a rewrite keeps its
+  trailing separator too. No case in the record has either shape.
 
 ### Other things that moved with it
 

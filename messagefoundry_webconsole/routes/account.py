@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import time
 from collections import OrderedDict
 
@@ -56,7 +57,9 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _refusal_error
+
+_log = logging.getLogger(__name__)
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -762,11 +765,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
-        # alone). JSON, so the page's fetch can read `error`.
+        # alone). JSON, so the page's fetch can read `error`, with the ceremony routes' constant
+        # Retry-After (BACKLOG #3690 item 5).
+        #
+        # Not drawn for a session the factor rule refuses (item 6, the #1973 rule), which the
+        # service then answers without verifying anything. The rule fails closed on a dead session,
+        # so that is skipped too. The service is told this read refused, and refuses on it rather
+        # than on its own later read, so a state change between the two (the account's factor
+        # deleted or reset) cannot let an uncharged request finish. Skipping the draw skips
+        # _rate_limited's WARNING, so each such request writes one of its own: a log line, not an
+        # audit row, for _rate_limited's reason (a flood must not grow the audit log). The service
+        # still audits the refusal that ends a staged ceremony.
         client = client_ip(request)
-        if not allow_reauth_attempt(service, identity):
+        factor_refused = await service.factor_binding_is_blocked(
+            token, STEP_UP_ACTION_WEBAUTHN_ENROLL
+        )
+        if factor_refused:
+            _log.warning("factor-refused passkey-enroll attempt from client=%s", client)
+        elif not allow_reauth_attempt(service, identity):
             exc = _rate_limited(request, "passkey-enroll")
-            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
+            return JSONResponse(
+                {"ok": False, "error": exc.detail},
+                status_code=exc.status_code,
+                headers={"Retry-After": _CEREMONY_RETRY_AFTER},
+            )
         try:
             elevation = await service.finish_webauthn_registration(
                 identity,
@@ -776,6 +798,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 client=client,
                 rp_id=rp[0],
                 origin=rp[1],
+                factor_refused=factor_refused,
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or

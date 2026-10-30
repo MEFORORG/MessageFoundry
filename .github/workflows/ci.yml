@@ -1023,11 +1023,12 @@ jobs:
       #
       # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
       # FOR: `scripts/ci/step_margin.py` runs after the gated step below and reds the leg when a
-      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). In
-      # merge_group the engine leg only warns, until #3515; the margin step says why. It used to run
-      # after BOTH gated steps; the web console suite moved to its own `webconsole` job and took its
-      # half of the check with it, so each job now measures the one gated step it owns. Three PRs
-      # each adding a minute of Windows time is still individually blameless -- the difference is that
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). Until #3515
+      # the engine leg only warns in merge_group, and on pull_request warns down to 1.20x; the margin
+      # step says why. It used to run after BOTH gated steps; the web console suite moved to its own
+      # `webconsole` job and took its half of the check with it, so each job now measures the one
+      # gated step it owns. Three PRs each adding a minute of Windows time is still individually
+      # blameless -- the difference is that
       # the third one now says so instead of the fourth one dying at the cap with zero failing
       # assertions. It is NOT a request to raise a cap; the underlying slowness is #320.
       #
@@ -1171,24 +1172,46 @@ jobs:
       # ratio, and the script runs its own red/green control pair on every invocation and prints both
       # into the job summary -- a gate that has never been red is a claim, not a control.
       #
-      # ADVISORY IN THE MERGE QUEUE ONLY, BLOCKING EVERYWHERE ELSE. Owner ruling 2026-10-29, verbatim:
+      # ADVISORY IN THE MERGE QUEUE, A 1.20x FLOOR ON A PULL REQUEST, 1.30x ON EVERY OTHER EVENT.
+      # Owner ruling 2026-10-29, verbatim:
       # "Go on fix 1: make the Step margin guard advisory in merge_group until #3515 re-measures the
       # cap, and quarantine the recurring timing tests under #4773." Over the engine merge_group runs
       # of 2026-10-27 16Z to 10-29 15Z, 14 of the 34 failed jobs were this step with every test
-      # passed. A pull_request run still gates before the entry is enqueued, so the margin is still
-      # enforced once per change, against that PR's own base. WHAT THIS GIVES UP, stated so it is not
-      # mistaken for free: a queue entry tests the PR merged onto the queue head, a tree no
-      # pull_request run saw. Two PRs that each pass alone can together breach the margin, and only
-      # the queue run sees that sum; while this is advisory it lands, and the next pull_request run
-      # is the first blocking check to red, on a change that did not cause it.
+      # passed. A pull_request run still gates before the entry is enqueued, so a margin is still
+      # enforced once per change, against that PR's own base, at the 1.20x floor below. WHAT THIS
+      # GIVES UP, stated so it is not mistaken for free: a queue entry tests the PR merged onto the
+      # queue head, a tree no pull_request run saw. Two PRs that each pass alone can together breach
+      # the margin, and only the queue run sees that sum; while this is advisory it lands. If the sum
+      # is under 1.20x, the next pull_request run is the first blocking check to red, on a change that
+      # did not cause it. If it is between the floors, no pull_request check blocks at all.
+      # THE PULL REQUEST FLOOR. Decided under the owner's delegation of 2026-10-30, by the Lander after
+      # adversarial review. The question, as the Lander put it: extend the advisory timing ruling to a
+      # PR's own run (A), or keep it blocking (B). The owner's answer: "/driver". The decision is
+      # neither pure option: on pull_request a margin from 1.30x down to 1.20x warns, and below 1.20x
+      # it blocks. WHAT THIS GIVES UP: a PR can now land with less than the 1.30x this gate exists to
+      # keep. Its push run on main then still judges 1.30x, so a change in that band can red `test` on
+      # main with every test passed and no PR to own the red. That is at least the cost accepted until
+      # #3515. The floor is passed to the script rather than compared here, so the self-check runs
+      # against that floor.
+      # tests/test_ci_step_margin.py runs the real script at it. 1.10 is not available as a floor: the
+      # self-check's negative control is 1.111x, so it exits 2. The warning is raised here rather than
+      # left to the script's RE-SIZE escalation, because a censored row never escalates, and the
+      # windows-2025 row is censored. On an uncensored row a run over its record gets a RE-SIZE
+      # annotation from EACH call, each naming its own floor's red line, beside this warning.
       # ONLY THE VERDICT IS ADVISORY, NOT THE INSTRUMENT. In merge_group the run body below turns exit
-      # 1 (LOW margin) into a warning annotation plus a summary line and exits 0, so the job, and so
-      # the required `test` context, stays green while the miss stays visible. Exit 2 (the script
-      # could not measure: a missing mark, a failed self-check control, no baseline row) still fails
-      # the step in the queue too, because the ruling is about the cap, not a broken gate. Not
+      # 1 (LOW margin) into a warning annotation plus a summary line and exits 0, and on pull_request
+      # the second call does the same when it exits 0, so the job, and so the required `test` context,
+      # stays green while the miss stays visible. Both calls then appear in the log and the summary:
+      # the first says LOW against 1.30x, and its "reddened this leg" wording is the script's, not
+      # the step's conclusion. Exit 2 (the script could not measure: a missing mark, a failed
+      # self-check control, no baseline row) still fails the step from either call on every event,
+      # because the ruling is about the cap, not a broken gate. An uncaught Python exception is not
+      # that case: it exits 1, so this step reads it as LOW, and that is a limit of this branch. Not
       # `continue-on-error`, which would have let exit 2 through as well. `ci-gate` does not need
       # `test` at all: each `test` leg is its own required context, judged by its job conclusion.
-      # REVERT THIS (drop the merge_group branch below) when #3515's re-measure of the cap lands.
+      # REVERT THIS when #3515's re-measure of the cap lands: drop both event branches, `pr_floor`,
+      # and the `warn` and `margin` functions, restore the single call, and take the matching tests
+      # and the exception in docs/CI.md with them.
       # tests/test_ci_step_margin.py pins the condition.
       - name: Step margin -- engine suite
         if: always()
@@ -1199,17 +1222,30 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           rc=0
+          pr_floor=1.20
+          margin() {
+            python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
+              --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
+              --since before-tests --until now "$@"
+          }
+          warn() {
+            echo "::warning title=$1::$2"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '\n**WARNING:** %s\n' "$2" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
           # `set -e` or absorbed into a pipeline.
-          python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
-            --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
-            --since before-tests --until now || rc=$?
+          margin || rc=$?
           if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "merge_group" ]; then
-            msg="Step margin -- engine suite found a LOW margin on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; it still blocks on pull_request."
-            echo "::warning title=Step margin advisory (merge_group)::$msg"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '\n**WARNING:** %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            warn "Step margin advisory (merge_group)" "Step margin -- engine suite found a LOW margin on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; pull_request blocks below ${pr_floor}x, and every other event below 1.30x."
+            exit 0
+          fi
+          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "pull_request" ]; then
+            # Only exit 0 from this second call passes. Exit 1 is below 1.20x, and exit 2 is an
+            # instrument failure, which is never a pass.
+            margin --min-margin "$pr_floor" || exit $?
+            warn "Step margin advisory (pull_request)" "Step margin -- engine suite is under the 1.30x floor but at or over the ${pr_floor}x pull_request floor on $LEG. It passes here until #3515 re-measures the cap; below ${pr_floor}x it blocks, and the push run on main still reds below 1.30x."
             exit 0
           fi
           exit $rc
