@@ -148,7 +148,7 @@ async def test_a_finish_the_route_left_uncharged_never_completes(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The race the skip opens: the route reads the session as refused and draws nothing, then the
-    rule stops refusing before the service reads it (the factor proven in another tab, say). Here
+    rule stops refusing before the service reads it (the account's factor deleted or reset). Here
     the route's read is stubbed to answer refused and the service's own reads stay real, and owe
     nothing. RED when: that request stores a passkey or stamps the session, so one finish per
     race window costs the budget nothing (BACKLOG #3690). The refusal is the one the route's read
@@ -183,10 +183,10 @@ async def test_a_finish_the_route_left_uncharged_never_completes(
 async def test_the_route_does_not_charge_a_session_that_died_before_its_read(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rule fails closed on a dead session, so the route skips the draw for one that died
+    """The rule fails closed on a dead session, so the route skips the draw for one revoked
     between the gate and its read, and the service answers it lost. RED when: that request is
-    charged, or answered as anything but the 401 a lost session gets (BACKLOG #3690 critic note 8).
-    """
+    charged, or answered as anything but the 401 a lost session gets (BACKLOG #3690). Nothing
+    else pins the route's half of that fail-closed branch."""
     service = await _service(engine)
     identity, token = await _sign_in(service)
     body = await _staged_body(service, identity, token)

@@ -36,7 +36,8 @@ this line.**
   `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, and skips
   the draw for a refused session, logging a WARNING for each such request instead. It passes that
   reading on as `finish_webauthn_registration(factor_refused=True)`, and the finish refuses on it,
-  so a factor proven between the two reads cannot let a request nothing charged finish. This route
+  so the account losing its factor between the two reads cannot let a request nothing charged
+  finish. This route
   no longer spends the real user's budget for such a session; at least `POST /ui/mfa`,
   `POST /ui/reauth` and `POST /ui/reauth/webauthn`, which a pending session also reaches, still
   draw it, and the admin-write floor this route's gate charges first is unchanged. Its 429 now

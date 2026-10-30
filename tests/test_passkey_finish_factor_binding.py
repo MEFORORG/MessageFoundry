@@ -38,7 +38,11 @@ from webauthn.helpers import base64url_to_bytes  # noqa: E402
 from messagefoundry.auth import reconcile, totp  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe  # noqa: E402
-from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
+from messagefoundry.auth.service import (  # noqa: E402
+    STEP_UP_ACTION_WEBAUTHN_ENROLL,
+    AuthService,
+    Elevation,
+)
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord, WebAuthnCredential  # noqa: E402
@@ -175,6 +179,52 @@ async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a
     # BACKLOG #3807: this first guard is audited as the second one is. RED when it is silent.
     rows = await store.list_audit(action="auth.webauthn_failed")
     assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
+
+
+async def test_a_caller_refused_finish_is_refused_though_the_rule_no_longer_refuses(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #3690: ``factor_refused=True`` is the console route saying its own read refused this
+    session, so it charged nothing. The account here holds no factor, so the service's own read
+    would let it through, as it would after a factor was deleted between the two reads. RED when:
+    the finish proceeds on its own read and binds a passkey nothing charged, or the refusal is not
+    the factor refusal (challenge taken, ``auth.mfa_denied`` row). A dead session is still lost
+    first, so the flag never turns a revoked session into a factor refusal."""
+    service = await _service(store, require_mfa=True)
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    assert await service.factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL) is False
+
+    with pytest.raises(ValueError, match="already has a second factor"):
+        await service.finish_webauthn_registration(
+            identity,
+            response,
+            label="key",
+            token=token,
+            rp_id=_RP,
+            origin=_ORIGIN,
+            factor_refused=True,
+        )
+
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
+
+    other_identity, other = await _sign_in(service)
+    other_response = await _stage_passkey(service, other_identity, other)
+    await store.revoke_session(hash_token(other))
+    lost = await service.finish_webauthn_registration(
+        other_identity,
+        other_response,
+        label="key",
+        token=other,
+        rp_id=_RP,
+        origin=_ORIGIN,
+        factor_refused=True,
+    )
+    assert lost.session_lost is True and lost.ok is False
+    assert len(await store.list_audit(action="auth.mfa_denied")) == len(rows)
 
 
 async def test_a_session_that_proves_the_existing_factor_first_still_finishes(

@@ -634,10 +634,10 @@ route is not covered:** `POST /ui/account/webauthn/verify`, on `require_ui_reaut
 charges the floor before `finish_webauthn_registration` refuses such a session (BACKLOG #3014).
 It does not charge the per-actor ceremony budget for that session: the route asks the same rule
 first, skips the draw, and logs a WARNING for each such request (BACKLOG #3690 item 6). The rule
-fails closed, so a session that ended after the gate is skipped and logged the same way, and the
-finish answers it lost. The finish refuses on the route's reading, not a later one of its own, so a
-factor proven between the two
-cannot let an uncharged request finish. At least
+fails closed, so a session revoked after the gate is skipped and logged the same way, and the
+finish does not complete it. The finish refuses on the route's reading, not a later one of its own,
+so the account losing its factor between the two (a delete on another session, or an
+administrator's reset) cannot let an uncharged request finish. At least
 `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn` still draw that budget for a
 pending session.
 

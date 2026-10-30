@@ -14669,9 +14669,11 @@ class AuthService:
 
         ``factor_refused`` is the caller saying its own :meth:`factor_binding_is_blocked` read
         refused this session, so it drew nothing from its ceremony budget. The first factor check
-        then refuses on that read rather than its own (BACKLOG #3690): otherwise a factor proven
-        between the two reads would let a request nothing charged finish. A dead session is still
-        answered lost first, as the rule's fail-closed read predicted."""
+        then refuses on that read rather than its own (BACKLOG #3690): otherwise the account losing
+        its factor between the two reads (a delete on another session, an administrator's reset)
+        would let a request nothing charged finish. Proving the factor on this session instead
+        re-keys it, so that interleaving is answered lost. A revoked session is still answered lost
+        first, whatever the caller read."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:

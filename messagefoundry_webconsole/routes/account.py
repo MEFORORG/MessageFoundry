@@ -771,11 +771,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Not drawn for a session the factor rule refuses (item 6, the #1973 rule), which the
         # service then answers without verifying anything. The rule fails closed on a dead session,
         # so that is skipped too. The service is told this read refused, and refuses on it rather
-        # than on its own later read, so a state change between the two (a factor proven in another
-        # tab) cannot let an uncharged request finish. Skipping the draw skips _rate_limited's
-        # WARNING, so each such request writes one of its own: a log line, not an audit row, for
-        # _rate_limited's reason (a flood must not grow the audit log). The service still audits
-        # the refusal that ends a staged ceremony.
+        # than on its own later read, so a state change between the two (the account's factor
+        # deleted or reset) cannot let an uncharged request finish. Skipping the draw skips
+        # _rate_limited's WARNING, so each such request writes one of its own: a log line, not an
+        # audit row, for _rate_limited's reason (a flood must not grow the audit log). The service
+        # still audits the refusal that ends a staged ceremony.
         client = client_ip(request)
         factor_refused = await service.factor_binding_is_blocked(
             token, STEP_UP_ACTION_WEBAUTHN_ENROLL
