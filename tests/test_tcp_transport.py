@@ -261,11 +261,11 @@ def test_codec_refuses_a_trailer_equal_to_the_start_byte() -> None:
         _dest(9, framing=None, **same)
 
 
-@pytest.mark.parametrize("trailer", [0x04, 0x0D])
+@pytest.mark.parametrize("trailer", [0x03, 0x04, 0x0D])
 def test_a_distinct_trailer_decodes_three_frames_as_three_payloads(trailer: int) -> None:
     # The control for the refusal above: the same start and end with a trailer that differs from
     # the start byte builds at every layer, and three framed messages in one read decode to three
-    # payloads with no frame left open.
+    # payloads with no frame left open. 0x03 is the end byte: a trailer equal to end stays allowed.
     settings = {"start": 0x02, "end": 0x03, "trailer": trailer}
     codec = FrameCodec(**settings)
     assert tcp_mod._codec_from_settings(dict(settings)) == codec
