@@ -55,6 +55,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -320,6 +321,43 @@ class RestoreResult:
     key_id: str | None
     config_dir: str | None
     config_files: int
+    #: BACKLOG #2614: the SHA-256 of the archive bytes this restore read, the archive's own
+    #: ``created_utc`` as epoch seconds, and the newest audit row it held; each time ``None`` when
+    #: the archive did not say. The restore writes them into the store's restore marker.
+    archive_sha256: str = ""
+    archive_created_at: float | None = None
+    last_audit_at: float | None = None
+
+
+class _HashingReader:
+    """A read-only view of ``raw`` that hashes every byte it hands out (BACKLOG #2614). The restore
+    reads the archive through it, so the hash it records is of the bytes it decrypted, not of a
+    second read that a replaced file could answer differently."""
+
+    def __init__(self, raw: io.BufferedReader) -> None:
+        import hashlib
+
+        self._raw = raw
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.digest.update(data)
+        return data
+
+
+def _manifest_time(manifest: dict[str, object]) -> float | None:
+    """The archive's ``created_utc`` as epoch seconds, or ``None`` when it is absent or not the
+    ``YYYY-MM-DDTHH:MM:SSZ`` the backup writes (BACKLOG #2614)."""
+    import calendar
+
+    value = manifest.get("created_utc")
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
 
 
 class BackupRunner:
@@ -2940,7 +2978,12 @@ def _restore_blocking(
     store and bundle intact."""
     import sqlite3
 
-    from messagefoundry.store.store import _secure_file, forget_store_salt
+    from messagefoundry.store.store import (
+        _secure_file,
+        forget_store_salt,
+        newest_audit_time,
+        write_restore_marker,
+    )
 
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
@@ -3016,7 +3059,8 @@ def _restore_blocking(
         ) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
-            with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as dst:
+                src = _HashingReader(raw_src)
                 _secure_file(tar_path)
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
@@ -3033,7 +3077,10 @@ def _restore_blocking(
                     # _MAX_RESTORE_PLAINTEXT_BYTES.
                     try:
                         decrypt_stream(
-                            src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                            cast(BinaryIO, src),
+                            dst,
+                            match_key,
+                            max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES,
                         )
                     except BackupCodecError as exc:
                         raise _codec_refusal(exc) from exc
@@ -3111,6 +3158,25 @@ def _restore_blocking(
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
+            # BACKLOG #2614: the archive's accounts, password hashes, roles, factors and sessions
+            # come back as they were. Mark the store so its first engine start ends every session
+            # and records the restore (`MessageStore.consume_restore_record`). Written after the
+            # checks, like the salt drop, so the bytes checked are the archive's; the marker is
+            # this restore's own row.
+            archive_sha256 = src.digest.hexdigest()
+            archive_created_at = _manifest_time(manifest)
+            try:
+                last_audit_at = newest_audit_time(snap)
+                write_restore_marker(
+                    snap,
+                    archive_sha256=archive_sha256,
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    restored_at=time.time(),
+                )
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            row_counts = {**row_counts, "restore_marker": 1}
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -3168,6 +3234,9 @@ def _restore_blocking(
         key_id=key_id,
         config_dir=str(config_dest) if config_dest is not None else None,
         config_files=config_files,
+        archive_sha256=archive_sha256,
+        archive_created_at=archive_created_at,
+        last_audit_at=last_audit_at,
     )
 
 

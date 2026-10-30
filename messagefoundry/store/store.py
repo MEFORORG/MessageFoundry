@@ -6212,6 +6212,68 @@ def forget_store_salt(path: Path) -> bool:
     return removed
 
 
+def newest_audit_time(path: Path) -> float | None:
+    """The ``ts`` of the newest audit row in a CLOSED SQLite store file, or ``None`` when it has no
+    audit table or no row (BACKLOG #2614). Read-only. The restore prints it, because every account
+    change made after it on the source is missing from the restored store."""
+    conn = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'"
+        ).fetchone():
+            return None
+        row = conn.execute("SELECT MAX(ts) FROM audit_log").fetchone()
+    finally:
+        conn.close()
+    return None if row is None or row[0] is None else float(row[0])
+
+
+def write_restore_marker(
+    path: Path,
+    *,
+    archive_sha256: str,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    restored_at: float,
+) -> None:
+    """Mark a CLOSED SQLite store file as placed by ``restore`` and not yet recorded (BACKLOG #2614).
+
+    The marker is a row in the store itself, not a file beside it, because the store is what an
+    operator moves: a store copied or renamed after the restore keeps its marker, and the first
+    engine start on it, wherever it lands, still records the restore and ends every session. One
+    row only; a second restore of the same file replaces it.
+
+    Call it after :func:`forget_store_salt`, which leaves the file out of WAL mode, so the write
+    lands in the main file. It is proven there the same way: a non-empty ``-wal`` beside it, or a
+    re-read that finds no row, raises ``sqlite3.OperationalError``."""
+    wal = path.with_name(path.name + "-wal")
+    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
+    try:
+        mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+        if mode != "delete":
+            raise sqlite3.OperationalError(
+                f"could not take {path} out of WAL mode (it is still {mode!r}), so its restore "
+                "marker cannot be written"
+            )
+        conn.executescript(_RESTORE_MARKER_DDL)
+        conn.execute(
+            "INSERT OR REPLACE INTO restore_marker (id, archive_sha256, archive_created_at,"
+            " last_audit_at, restored_at) VALUES (1, ?, ?, ?, ?)",
+            (archive_sha256, archive_created_at, last_audit_at, restored_at),
+        )
+    finally:
+        conn.close()
+    if wal.exists() and wal.stat().st_size:
+        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+    proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
+    try:
+        written = proof.execute("SELECT archive_sha256 FROM restore_marker WHERE id = 1").fetchone()
+    finally:
+        proof.close()
+    if written is None or written[0] != archive_sha256:
+        raise sqlite3.OperationalError(f"{path} holds no restore marker after it was written")
+
+
 def _secure_file(path: Path) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -6842,6 +6904,26 @@ _SQLITE_APPROVAL_TOMBSTONE = (
 _SQLITE_APPROVAL_TOMBSTONE_RESEAL = (
     "UPDATE pending_approvals SET seal = ? WHERE id = ? AND status = 'rejected' AND seal = ?"
 )
+
+
+#: The audit action of a restore recorded at the first engine start after it (BACKLOG #2614).
+STORE_RESTORED_ACTION: Final = "store_restored"
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreRecord:
+    """What :meth:`MessageStore.consume_restore_record` found and did at the first engine start
+    after a ``messagefoundry restore`` (BACKLOG #2614). PHI-free: a hash, three times and a count.
+
+    ``archive_created_at`` is when the archive was taken, from its manifest, and
+    ``last_audit_at`` the time of the newest audit row it carried; each is ``None`` when the
+    archive did not say. ``sessions_revoked`` is how many sessions the start ended."""
+
+    archive_sha256: str
+    archive_created_at: float | None
+    last_audit_at: float | None
+    restored_at: float
+    sessions_revoked: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -7662,7 +7744,23 @@ _LAST_RECEIVED_SQL: Final[str] = (
     " FROM ch WHERE channel_id IS NOT NULL"
 )
 
-_SCHEMA = """
+#: A restore the engine has not yet recorded (BACKLOG #2614). ``messagefoundry restore`` writes the
+#: one row into the store it places (:func:`write_restore_marker`), and the first engine start
+#: after it consumes the row (:meth:`MessageStore.consume_restore_record`). Kept apart from the
+#: script below because the restore writes it into an archive's store, which an earlier build may
+#: have written without this table. Non-secret: a hash and three times.
+_RESTORE_MARKER_DDL: Final = """
+CREATE TABLE IF NOT EXISTS restore_marker (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    archive_sha256     TEXT NOT NULL,     -- the .mfbak file the restore read, hex
+    archive_created_at REAL,              -- the archive manifest's created_utc; NULL when absent
+    last_audit_at      REAL,              -- the newest audit row the archive held; NULL for none
+    restored_at        REAL NOT NULL
+);
+"""
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
     channel_id   TEXT NOT NULL,
@@ -8305,6 +8403,8 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
 """
+    + _RESTORE_MARKER_DDL
+)
 
 # The latest event of each listed message, for the tracking view (list_messages, search_messages).
 # BACKLOG #1726: MAX(id) reads ix_events_message as a covering scan and fetches one row by primary key,
@@ -17652,6 +17752,55 @@ class MessageStore:
             epoch = await self._session_epoch(str(owner[0]))
             await self._write_session(except_token_hash, lambda s: replace(s, user_epoch=epoch))
         return revoked
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record a restore once: revoke every session, append ``store_restored`` and delete the
+        marker, in one writer transaction (BACKLOG #2614). See
+        :meth:`AuthStore.consume_restore_record`.
+
+        One transaction, so a start that dies part-way leaves the marker for the next start: the
+        sessions are not ended without the row that says why, and the row is never written twice."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at"
+                " FROM restore_marker WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._commit()
+                return None
+            record = RestoreRecord(
+                archive_sha256=str(row[0]),
+                archive_created_at=None if row[1] is None else float(row[1]),
+                last_audit_at=None if row[2] is None else float(row[2]),
+                restored_at=float(row[3]),
+                sessions_revoked=await self._revoke_all_sessions_in_txn(None, now),
+            )
+            audit = AuditAppend(
+                action=STORE_RESTORED_ACTION,
+                actor="system",
+                detail=json.dumps(
+                    {
+                        "archive_sha256": record.archive_sha256,
+                        "archive_created_at": record.archive_created_at,
+                        "archive_age_seconds": (
+                            None
+                            if record.archive_created_at is None
+                            else round(record.restored_at - record.archive_created_at)
+                        ),
+                        "last_audit_at": record.last_audit_at,
+                        "restored_at": record.restored_at,
+                        "sessions_revoked": record.sessions_revoked,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            appended = await self._append_audits((audit,), now=now)
+            await self._db.execute("DELETE FROM restore_marker")
+            await self._commit()
+        tee_audits((audit,), appended, ts=now)
+        return record
 
     async def _session_epoch(self, user_id: str) -> int:
         """The account's session epoch, read on the writer connection inside the caller's

@@ -683,6 +683,14 @@ decrypts it, and writes the store. It **refuses to overwrite** an existing store
 `--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
+**A restore brings back the archive's accounts as they were (BACKLOG #2614)**: users, password
+hashes, roles, second factors and sessions. So the restore writes a marker into the store it places,
+and the first `serve` on that store, wherever it has been moved, revokes every session, writes one
+`store_restored` audit row naming the archive's SHA-256, its age and the time of its newest audit
+row, and raises a `store_restored` alert. Every user signs in again. Other commands that open the
+store, such as `provision-admin`, leave the marker for that start. The engine does not re-apply
+changes made after the archive was taken.
+
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI
 key file**. Back the key up in a different location/system from the data, with its own access control.

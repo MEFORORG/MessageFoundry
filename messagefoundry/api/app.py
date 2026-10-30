@@ -433,12 +433,15 @@ from messagefoundry.pipeline.alert_sinks import (
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import (
+    STORE_RESTORED_SUBJECT,
     AlertSink,
     LoggingAlertSink,
     administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
+    store_restored_detail,
+    utc_or_unknown,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
@@ -3085,6 +3088,43 @@ def _raise_config_changed(
         )
     except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
         _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
+
+
+async def _record_a_restore(store: Store, sink: AlertSink) -> None:
+    """Record a restore at the first start after it (BACKLOG #2614): end every session, write the
+    ``store_restored`` audit row and raise the alert.
+
+    HOW "THE FIRST OPEN AFTER A RESTORE" IS DETECTED. ``restore`` writes a one-row marker into the
+    store it places (``store.store.write_restore_marker``), and the store's consume reads it,
+    acts and deletes it in one transaction. The marker lives in the store, not beside it, so it
+    travels with a store that is copied or renamed after the restore.
+
+    It is consumed HERE, at the engine's start, and not in the store's ``open``. Every other
+    command that opens the store, such as ``provision-admin`` or ``admin-unlock`` run against the
+    restored file first, would otherwise consume it, and the alert would be lost: only a serving
+    engine holds the alert sink. No session is honoured before this runs, because only this
+    process's API checks one, and the lifespan reaches its first request after it.
+
+    A store write that fails here raises, so the start fails rather than serving the archive's
+    sessions. The alert itself never raises: the record is already committed."""
+    record = await store.consume_restore_record()
+    if record is None:
+        return
+    detail = store_restored_detail(
+        archive_created_at=record.archive_created_at,
+        last_audit_at=record.last_audit_at,
+        restored_at=record.restored_at,
+        revoked=record.sessions_revoked,
+    )
+    _log.warning("started on a restored store: %s", detail)
+    try:
+        sink.store_restored(
+            STORE_RESTORED_SUBJECT,
+            detail=detail,
+            last_audit_at=utc_or_unknown(record.last_audit_at),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
+        _log.warning("the store_restored alert could not be raised: %s", safe_exc(exc))
 
 
 async def _record_start_audit(
@@ -11968,6 +12008,9 @@ def create_managed_app(
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            # BACKLOG #2614: the first start on a restored store ends the archive's sessions and
+            # records the restore, before the auth service exists and so before any request.
+            await _record_a_restore(store, notifier or LoggingAlertSink())
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
             # (the OIDC revocation guard, #1887) stops startup before any connection starts.
             # BACKLOG #2131 moved initialize() and the notice gate up here too, below.

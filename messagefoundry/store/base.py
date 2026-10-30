@@ -106,6 +106,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -144,6 +145,7 @@ __all__ = [
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
     "ResendSourceNotFound",
+    "RestoreRecord",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -3110,6 +3112,20 @@ class AuthStore(Protocol):
         raises :class:`~messagefoundry.store.row_seal.RowSealError` and the whole transaction,
         revokes included, rolls back. An account whose record fails its seal keeps its old epoch
         and still has its sessions revoked, because ending a session needs no key."""
+        ...
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record, once, a restore the engine has not yet recorded (BACKLOG #2614).
+
+        ``messagefoundry restore`` writes a one-row marker into the store it places. The first
+        call after that reads the marker, revokes every session as :meth:`revoke_all_sessions`
+        does, appends one ``store_restored`` audit row and deletes the marker, all in one
+        transaction, and returns what it found. Every later call, and every call on a store no
+        restore placed, returns ``None`` and writes nothing.
+
+        Only the SQLite backend can hold a marker: a server database's backup and restore are the
+        DBA's (BACKLOG #52), so ``restore`` never places one there, and those backends return
+        ``None``."""
         ...
 
     async def enforce_session_cap(

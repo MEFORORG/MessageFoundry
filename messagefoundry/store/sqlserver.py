@@ -249,6 +249,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -15163,6 +15164,11 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return revoked
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Always ``None``: ``restore`` places only a SQLite store, and a SQL Server database's
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        return None
 
     async def enforce_session_cap(
         self,
