@@ -969,6 +969,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > | `login_rate_limit_per_ip = 0`, or above `10` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. `0` turns both off. |
 > | `login_rate_limit_global = 0`, or above `60` | The all-clients sign-in limit. `0` turns it off. |
 >
+> Each value above also loosens, the same way, the two audit-row budgets built on these keys:
+> the repeated-credential budget and the IdP step-up return's (controls 10 and 11 of the
+> [6.1.1 protection set](SECURITY.md#the-documented-protection-set-asvs-611), BACKLOG #2454,
+> #3965). The report names only the limits in the table.
+>
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
 > limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a

@@ -722,12 +722,17 @@ from typing import Any
 #: 36c5fa9d74fc1625; this branch at 7c5b0091271a1294). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3965: the ``/ui/oidc/callback`` route calls the new
+#: ``AuthService.allow_step_up_return_audit`` before it writes a step-up return's
+#: ``non_navigation_fetch`` row. A newer console on an older engine would raise AttributeError on
+#: that branch, so it forces a bump. Re-derived with ``--write`` (from 9cd9fe02e6e90c18).
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "9cd9fe02e6e90c18"
+ENGINE_UI_SEAM: str = "449ea6021c083aa8"
 
 
 @dataclass(frozen=True, slots=True)
