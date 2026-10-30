@@ -615,12 +615,15 @@ def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
     assert built._cleartext_guard is None  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("params", [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}])
+@pytest.mark.parametrize(
+    "params",
+    [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}, {"sslmode": ["disable"]}],
+)
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
-def test_generic_blank_mode_refused_when_enforcing(
-    params: dict[str, str], connector: Callable[[Any], object], config: Callable[..., Any]
+def test_generic_blank_or_non_scalar_mode_refused_when_enforcing(
+    params: dict[str, object], connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
-    # The DSN would carry the keyword with nothing in it, which is no evidence of a mode.
+    # The DSN would carry the keyword with no usable mode in it, which is no evidence of one.
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),

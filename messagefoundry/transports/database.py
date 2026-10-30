@@ -357,6 +357,7 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   psqlODBC `sslmode`  : disable (never) / allow (plaintext first) / prefer (opportunistic, silent fallback)
 #   MySQL    `SSLMODE`  : DISABLED / PREFERRED (same two shapes)
 #   assorted `Encrypt`  : no / 0 / false / off
+#   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
@@ -372,6 +373,7 @@ _ODBC_NO_TLS_VALUES: tuple[str, ...] = (
     "prefer",
     "preferred",
     "no",
+    "optional",
     "off",
     "false",
     "0",
@@ -403,11 +405,12 @@ def _is_tls_keyword(name: str) -> bool:
 
 
 def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a value. A blank or ``None`` one
-    sets nothing, and the engine has no evidence of how a driver reads it. Whether the value is a
-    good one is :func:`generic_odbc_no_tls_params`'s question, not this one."""
+    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a value. A blank, ``None`` or
+    non-scalar one sets nothing: the engine has no evidence of how a driver reads it, and
+    :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good one is
+    :func:`generic_odbc_no_tls_params`'s question, not this one."""
     modes = (_odbc_param(params, keyword) for keyword in _ODBC_TLS_MODE_KEYWORDS)
-    return any(mode is not None and str(mode).strip() for mode in modes)
+    return any(isinstance(mode, str | int) and str(mode).strip() for mode in modes)
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -415,7 +418,7 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     ``["KEY=value", ...]`` (#333). Empty when the operator set no such value. The value is rendered
     as the lower-case constant from :data:`_ODBC_NO_TLS_VALUES` it matched, never as supplied, and a
     keyword :data:`_ODBC_SECRET_KEY_RE` names is skipped. What a report can carry is therefore a
-    keyword name and one of those nine words; a secret keyword that regex does not name could still
+    keyword name and one of those words; a secret keyword that regex does not name could still
     be reported as ``KEY=<word>`` when its value is one of them.
 
     The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's

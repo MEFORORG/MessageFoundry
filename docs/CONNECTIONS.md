@@ -1837,7 +1837,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. So the
 > delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
 > when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
-> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
+> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`optional`/`0`/`false`/`off`) —
 > dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **Those two
 > are the only keywords that can set a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`,
 > `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode and

@@ -317,6 +317,7 @@ def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureF
         ("SSLMODE", "DISABLED"),  # MySQL Connector/ODBC
         ("SSLMODE", "PREFERRED"),  # MySQL Connector/ODBC: opportunistic
         ("Encrypt", "no"),
+        ("Encrypt", "Optional"),  # Microsoft ODBC 18 documents this as a synonym for `no`
         ("Encrypt", "0"),
         ("Encrypt", "false"),
         ("Encrypt", "  Off  "),  # value classification tolerates case + surrounding whitespace
@@ -440,7 +441,18 @@ def test_generic_destination_warning_names_the_connection(
     assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
 
 
-_NO_TLS_WORDS = ("disable", "disabled", "allow", "prefer", "preferred", "no", "off", "false", "0")
+_NO_TLS_WORDS = (
+    "disable",
+    "disabled",
+    "allow",
+    "prefer",
+    "preferred",
+    "no",
+    "optional",
+    "off",
+    "false",
+    "0",
+)
 
 
 def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
@@ -547,10 +559,19 @@ def test_a_lone_sslrootcert_is_not_ownership() -> None:
         {"sslmode": None},
         {"SSLmode": "", "sslcert": "c.pem"},
         {"sslmode": "", "Encrypt": "  "},
+        {"sslmode": ["disable"]},
+        {"Encrypt": ["yes"]},
+        {"sslmode": {"mode": "require"}},
     ],
 )
-def test_a_blank_mode_keyword_sets_no_mode(params: dict[str, str | None]) -> None:
+def test_a_blank_or_non_scalar_mode_keyword_sets_no_mode(params: dict[str, object]) -> None:
     assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
+
+
+@pytest.mark.parametrize("params", [{"Encrypt": True}, {"sslmode": 1}])
+def test_a_scalar_mode_value_that_is_not_a_string_still_counts(params: dict[str, object]) -> None:
+    # The control for the non-scalar cases above: TOML can spell a mode as a bool or an integer.
+    assert generic_odbc_tls_unenforced(params) is None
 
 
 def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
