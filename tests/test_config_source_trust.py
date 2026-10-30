@@ -41,6 +41,7 @@ import pytest
 from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
     SECURITY_ENFORCEMENT_ENV,
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -639,6 +640,7 @@ def _loosening_names(sec: SecuritySettings | None = None) -> list[str]:
         cert_monitor=CertMonitorSettings(),
         backup=BackupSettings(),
         secrets=SecretsSettings(),
+        ai=AiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,

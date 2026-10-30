@@ -51,6 +51,7 @@ from messagefoundry.auth.oidc.flow import _MAX_TOKEN_RESPONSE_BYTES as _OIDC_TOK
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
@@ -86,9 +87,17 @@ FHIR_BASE = "https://fhir.example.org/fhir"
 DICOMWEB_BASE = "https://pacs.example.org/dicom-web"
 TOKEN_URL = "https://auth.example.com/token"
 AI_ENDPOINT = "https://ai.internal/v1/messages"
+# BACKLOG #2193 slice (e): the off-box AI endpoint is refused unless its revocation is attested.
+# These tests read the reply, so their brokers carry the pair.
+_AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
 
 
 # --- the fakes ----------------------------------------------------------------------------------
+
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _UnboundedResp:
@@ -508,7 +517,11 @@ def test_ai_broker_maps_an_over_cap_reply_onto_its_own_error_type() -> None:
     """A DeliveryError escaping the broker would be unmapped at the API route, so the refusal is
     re-raised as AiBrokerError -- still naming only the redacted host and the bound."""
     broker = AiBroker(
-        endpoint=AI_ENDPOINT, api_key="sk-secret-key-value", allowed_endpoints=["ai.internal"]
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
     )
     broker._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as err:
@@ -526,7 +539,7 @@ def test_alert_webhook_drain_is_bounded(
     """The drain stops one byte past the bound. Before #3040 the over-cap reply then raised, and
     the notifier reported an alert the host had taken with a 2xx as failed. Owner ruling
     2026-10-12 (#3040 item 1): it counts as delivered, with a WARNING that carries no reply byte."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
@@ -554,7 +567,7 @@ def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
     closed without one. urllib never hands the webhook such a reader, since it raises every
     non-2xx as HTTPError first. So it is the 2xx, and not the size alone, that makes the alert
     delivered."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     resp = _UnboundedResp()
     resp.status = status  # type: ignore[assignment]
     import messagefoundry.pipeline.alert_sinks as sinks
@@ -863,7 +876,7 @@ def test_an_alert_already_accepted_is_not_reported_as_a_failed_send(
 ) -> None:
     """The webhook POST is accepted before the drain runs, so raising here would tell an operator
     the alert failed when the host took it."""
-    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(
@@ -888,7 +901,11 @@ def test_the_ai_broker_maps_a_truncated_reply_onto_its_own_error_type() -> None:
     """A DeliveryError escaping chat() is unmapped at the /ai/assist route, so it would surface as
     an unhandled 500 rather than the mapped 502."""
     broker = AiBroker(
-        endpoint=AI_ENDPOINT, api_key="sk-secret-key-value", allowed_endpoints=["ai.internal"]
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
     )
     broker._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as err:
@@ -1061,7 +1078,13 @@ def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: st
         provider.access_token()
     assert str(token_err.value).startswith("SMART token endpoint returned")
     assert "auth.example.com" not in str(token_err.value)
-    broker = AiBroker(endpoint=AI_ENDPOINT, api_key="sk-x", allowed_endpoints=["ai.internal"])
+    broker = AiBroker(
+        endpoint=AI_ENDPOINT,
+        api_key="sk-x",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
     broker._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as ai_err:
         broker.chat("def handle(msg): ...")
