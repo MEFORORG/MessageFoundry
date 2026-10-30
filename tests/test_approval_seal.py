@@ -30,6 +30,7 @@ from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import RowSealer, RowSealError
 from messagefoundry.store.store import (
@@ -66,7 +67,7 @@ async def keyed(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, Path]]:
         await store.close()
 
 
-def _gate(store: Any) -> ApprovalGate:
+def _gate(store: Any, sink: AlertSink | None = None) -> ApprovalGate:
     async def run(_params: Any) -> dict[str, Any]:
         return {}
 
@@ -74,6 +75,7 @@ def _gate(store: Any) -> ApprovalGate:
         _StandingStore(store),
         ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
         resolve_identity=_resolve,
+        alert_sink=sink,
     )
     gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
     return gate
@@ -469,17 +471,7 @@ async def test_a_seal_failed_reject_writes_one_row_and_raises_one_alert(
     which says it was rejected. The control is a sound request, whose reject raises neither."""
     store, path = keyed
     sink = _Sink()
-    gate = ApprovalGate(
-        _StandingStore(store),
-        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
-        resolve_identity=_resolve,
-        alert_sink=sink,
-    )
-
-    async def run(_params: Any) -> dict[str, Any]:
-        return {}
-
-    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    gate = _gate(store, sink)
     sound = await _request(gate, "sound")
     await gate.reject(sound, approver="a")
     assert sink.reasons == [] and await _seal_failed_rows(store, sound) == 0  # control
@@ -503,17 +495,7 @@ async def test_the_was_rejected_alert_is_not_held_back_by_the_cooldown(
     store, path = keyed
     transport = _RecordingTransport("t")
     sink = NotifierAlertSink([transport], realert_seconds=10_000.0)
-    gate = ApprovalGate(
-        _StandingStore(store),
-        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
-        resolve_identity=_resolve,
-        alert_sink=sink,
-    )
-
-    async def run(_params: Any) -> dict[str, Any]:
-        return {}
-
-    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    gate = _gate(store, sink)
     ids = [await _request(gate, nonce) for nonce in ("first", "second")]
     for approval_id in ids:
         await _raw_for(path)(
@@ -555,17 +537,7 @@ async def test_a_seal_failed_reject_whose_write_raises_still_reports_it(
                 raise fault
             return bool(await store.reject_seal_failed_approval(approval_id, **kw))
 
-    gate = ApprovalGate(
-        _StandingStore(_Raising()),
-        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
-        resolve_identity=_resolve,
-        alert_sink=sink,
-    )
-
-    async def run(_params: Any) -> dict[str, Any]:
-        return {}
-
-    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    gate = _gate(_Raising(), sink)
     approval_id = await _request(gate, "raises")
     await _raw_for(path)(
         "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 5}', approval_id)
@@ -612,17 +584,7 @@ async def test_a_seal_failed_reject_that_loses_its_write_still_reports_it(
             )
             return bool(await store.reject_seal_failed_approval(approval_id, **kw))
 
-    gate = ApprovalGate(
-        _StandingStore(_Racing()),
-        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
-        resolve_identity=_resolve,
-        alert_sink=sink,
-    )
-
-    async def run(_params: Any) -> dict[str, Any]:
-        return {}
-
-    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    gate = _gate(_Racing(), sink)
     approval_id = await _request(gate, "race")
     await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": 2}', approval_id))
 
