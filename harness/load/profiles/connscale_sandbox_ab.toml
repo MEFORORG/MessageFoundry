@@ -1,0 +1,52 @@
+# Sandbox A/B (ADR 0087, BACKLOG #3132): [sandbox].mode off versus subprocess at 750 and 1500 inbound
+# MLLP connections, against a real engine the harness OWNS per step. It answers ADR 0052 AC-2 for
+# the subprocess sandbox. 1500 is the AC-2 target read as inbound connections; 750 is the inbound
+# count if AC-2 counts inbound plus outbound, since a sandbox worker exists per inbound only.
+#
+# This is an OPERATOR sweep (multi-minute, large port budget, SERVER-DB store) -- never CI:
+#
+#   MEFOR_STORE_BACKEND=postgres MEFOR_STORE_* ... \
+#     python -m harness --connscale connscale_sandbox_ab --report-json out/connscale_sandbox_ab.json
+#
+# Before running it, read BACKLOG #3132's prerequisites. At least these hold today: a POSIX arm
+# waits on the worker CPU budget fix (#3133), a Windows arm waits on the job race fix (#3065), and
+# the row's control run (a small subprocess arm on the env route, which must fail) is a separate
+# step. Each step writes its graph into a generated config directory, so the worker builds the
+# engine's graph; the warm-up brings every worker up before the hold and records the first-delivery
+# latency beside [sandbox].startup_seconds; the `sandbox_workers` SLO fails a subprocess step that
+# did not start a process per driven inbound. A subprocess arm that cannot reach the top count is a
+# valid result: its records and SLOs say where it stopped.
+#
+# All values synthetic + generic. See docs/LOAD-TESTING.md.
+
+[connscale]
+name = "connscale_sandbox_ab"
+description = "Sandbox A/B (ADR 0087): [sandbox].mode off vs subprocess at 750/1500, pooled, fixed aggregate"
+counts = [750, 1500]
+# The A/B axis. Off first, so the baseline arm is stable in the report.
+sandbox_modes = ["off", "subprocess"]
+# Pinned to the engine default, so the claim mode is never a second variable between the arms.
+claim_modes = ["pooled"]
+sweep_mode = "fixed_aggregate"
+aggregate_rate = 400.0
+per_conn_rate = 0.35
+hold_seconds = 60.0
+# One message per connection before the hold. Under subprocess that is 1500 worker spawns, which
+# share the engine's default executor, so the bound is generous; a warm-up that runs out is
+# recorded, not raised.
+warmup_timeout_s = 600.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+base_port = 2600
+transform = "cheap"
+# Reload latency is a different question; leave wall #5 off.
+reload_probe = false
+store_backend = "postgres"
+corpus_count_per_trigger = 20
+
+[connscale.slo]
+# Correctness gate only. The walls are recorded per arm, not graded: their values are host-variable.
+# The vs-N slope checks are not armed, because they group records without the sandbox arm.
+zero_loss = true

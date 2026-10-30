@@ -128,6 +128,70 @@ class NoLoss:
 
 
 @dataclass(frozen=True)
+class SandboxReading:
+    """One step's ``[sandbox]`` arm and the evidence that it ran as asked (BACKLOG #3132).
+
+    ``requested`` is the arm the profile named; ``effective`` is what the engine's own settings
+    parser reads from the environment the step gave the engine, ``None`` when that did not parse.
+    The two are stamped separately so a record cannot claim a mode nobody checked.
+
+    The process counts are the engine's process subtree, walked before and after the warm-up. A
+    worker spawns on its inbound's first dispatch, so before the warm-up there are none, and the
+    difference is the processes the warm-up started. Under ``subprocess`` that must be at least one
+    per driven inbound, or the arm ran in-process (the ``sandbox_workers`` SLO). On Windows from a
+    venv a worker tree is two processes (the launcher stub and the interpreter), so the difference
+    divided by the driven inbounds is also ADR 0187's processes-per-worker-tree reading, on a live
+    engine. ``None`` where no warm-up ran or the walk failed.
+
+    The warm-up sends one message on every connection and waits for it to be delivered. Under
+    ``subprocess`` each of those first deliveries includes its worker's spawn, so
+    ``warmup_first_delivery_max_ms`` is an UPPER BOUND on the slowest spawn, to read beside
+    ``startup_seconds`` (a spawn past that bound fails, and its message dead-letters). It is not a
+    spawn time on its own: the ``off`` arm's figure is the same path with no spawn in it.
+    """
+
+    requested: str
+    effective: str | None
+    startup_seconds: float | None
+    processes_before_warmup: int | None = None
+    processes_after_warmup: int | None = None
+    warmup_sent: int = 0
+    warmup_delivered: int = 0
+    warmup_seconds: float | None = None
+    warmup_first_delivery_p50_ms: float | None = None
+    warmup_first_delivery_max_ms: float | None = None
+
+    @property
+    def warmup_ran(self) -> bool:
+        return self.warmup_seconds is not None
+
+    @property
+    def processes_started(self) -> int | None:
+        """Processes the warm-up added to the engine's subtree, ``None`` when either walk is absent."""
+        if self.processes_before_warmup is None or self.processes_after_warmup is None:
+            return None
+        return self.processes_after_warmup - self.processes_before_warmup
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "requested": self.requested,
+            "effective": self.effective,
+            "startup_seconds": self.startup_seconds,
+            "processes_before_warmup": self.processes_before_warmup,
+            "processes_after_warmup": self.processes_after_warmup,
+            "processes_started": self.processes_started,
+            "warmup": {
+                "ran": self.warmup_ran,
+                "sent": self.warmup_sent,
+                "delivered": self.warmup_delivered,
+                "seconds": _round_or_none(self.warmup_seconds, 3),
+                "first_delivery_p50_ms": _round_or_none(self.warmup_first_delivery_p50_ms, 3),
+                "first_delivery_max_ms": _round_or_none(self.warmup_first_delivery_max_ms, 3),
+            },
+        }
+
+
+@dataclass(frozen=True)
 class ConnScaleRecord:
     """One sweep step: the 6 connection-scale walls at connection count ``count`` for ``sweep_mode``."""
 
@@ -306,6 +370,14 @@ class ConnScaleRecord:
     # predicted herd floor, so #1415 needs it pinned across every counted run. None means not
     # recorded: a two-box cell, a record built by hand, or an older artifact.
     per_lane_wake: bool | None = None
+    # The [sandbox] arm this step ran and the evidence it ran that way (BACKLOG #3132). None means
+    # not recorded: a two-box cell, a record built by hand, or an older artifact.
+    sandbox: SandboxReading | None = None
+
+    @property
+    def sandbox_mode(self) -> str:
+        """The arm this step asked for; ``off``, the engine default, where nothing was recorded."""
+        return "off" if self.sandbox is None else self.sandbox.requested
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -313,6 +385,7 @@ class ConnScaleRecord:
             "fuse_thread_hops": self.fuse_thread_hops,
             "batch_handoff_statements": self.batch_handoff_statements,
             "per_lane_wake": self.per_lane_wake,
+            "sandbox": None if self.sandbox is None else self.sandbox.to_json_dict(),
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),

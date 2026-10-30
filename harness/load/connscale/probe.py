@@ -633,6 +633,17 @@ class FdSampler:
         return pages * int(page_size)
 
 
+def subtree_size(pid: int) -> int | None:
+    """How many processes are in ``pid``'s subtree right now, root included, from ONE fresh walk.
+
+    A fresh sampler, so no cached walk answers. ``None`` when the walk failed: a root-only fallback
+    would read as "no children", which is the very reading a sandbox arm that ran in-process gives
+    (BACKLOG #3132). Synchronous, like every walk here; call it off the event loop."""
+    sampler = FdSampler(pid)
+    pids = sampler._resolve_pids()  # noqa: SLF001 -- this module's own sampler
+    return None if sampler._resolve_errored else len(pids)  # noqa: SLF001
+
+
 def _validated_descendants(rows: list[ProcRow], root: int) -> list[int] | None:
     """BFS the ppid→children map built from ``rows``, returning every descendant PID that PASSES the
     provenance check (root excluded, so the caller prepends it once). ``None`` means the ROOT's own
