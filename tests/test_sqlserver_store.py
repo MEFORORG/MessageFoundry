@@ -1122,14 +1122,10 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         return int(rows[0][0])
 
     async def _is_blocking(spid: object) -> bool:
-        async with store._pool.acquire() as conn:
-            cur = await conn.cursor()
-            await cur.execute(
-                "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE blocking_session_id = ?", (spid,)
-            )
-            row = await cur.fetchone()
-            await conn.commit()
-        return bool(row[0])
+        row = await store._fetchone(
+            "SELECT COUNT(*) AS n FROM sys.dm_exec_requests WHERE blocking_session_id = ?", (spid,)
+        )
+        return bool(row and row["n"])
 
     await _assert_bind_and_user_delete_take_one_lock_order(
         store, holder_of=_session_id, is_blocking=_is_blocking

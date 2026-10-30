@@ -110,6 +110,18 @@ async def _service(
     return service
 
 
+async def _bound_fed_account(service: AuthService, engine: Engine) -> str:
+    """Make the ``fed`` account by a Windows SSO sign-in and bind it to :data:`FED_PAIR`; its id.
+
+    A federated mint carries the verified pair, and its insert requires the row to hold it
+    (BACKLOG #2738 item 8), so a federated test needs a bound row first."""
+    await service._complete_ad_login(_principal("fed"), None, mfa_verified=False)
+    account = await engine.store.get_user_by_username("fed")
+    assert account is not None
+    assert await engine.store.set_user_federated_subject(account.id, *FED_PAIR) is not None
+    return account.id
+
+
 def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=("127.0.0.1", 123))
     return httpx.AsyncClient(transport=transport, base_url="http://t")
@@ -172,12 +184,7 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
     missing constant would seed, and the Kerberos test above (always ``mfa_verified=False``) could
     not see."""
     service = await _service(engine)
-    # A federated mint carries the verified pair, and its insert requires the row to hold it
-    # (BACKLOG #2738 item 8). So the account is made by a Windows SSO sign-in and bound first.
-    await service._complete_ad_login(_principal("fed"), None, mfa_verified=False)
-    account = await engine.store.get_user_by_username("fed")
-    assert account is not None
-    assert await engine.store.set_user_federated_subject(account.id, *FED_PAIR) is not None
+    await _bound_fed_account(service, engine)
     out = await service._complete_ad_login(
         _principal("fed"),
         None,
@@ -221,10 +228,7 @@ async def test_an_oidc_mint_without_the_verified_pair_is_refused(engine: Engine)
     call, carrying the pair the row holds, signs in, so the refusal comes from the missing pair
     and not from anything else about the row."""
     service = await _service(engine)
-    await service._complete_ad_login(_principal("fed"), None, mfa_verified=False)
-    account = await engine.store.get_user_by_username("fed")
-    assert account is not None
-    assert await engine.store.set_user_federated_subject(account.id, *FED_PAIR) is not None
+    account_id = await _bound_fed_account(service, engine)
 
     with pytest.raises(ValueError, match="verified federated_subject"):
         await service._complete_ad_login(
@@ -235,7 +239,7 @@ async def test_an_oidc_mint_without_the_verified_pair_is_refused(engine: Engine)
             session_mechanism=SessionMechanism.OIDC,
             idp_auth_time=time.time(),
         )
-    live = await engine.store.list_sessions(account.id)
+    live = await engine.store.list_sessions(account_id)
     assert live == [], "the refused mint wrote a session"
 
     # CONTROL: the same call carrying the pair the row holds mints a session.

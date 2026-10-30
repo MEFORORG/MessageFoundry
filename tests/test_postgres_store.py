@@ -1312,14 +1312,13 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         return conn.get_server_pid()
 
     async def _is_blocking(pid: object) -> bool:
-        async with store._pool.acquire() as probe:
-            return bool(
-                await probe.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
-                    " AND $1::int = ANY(pg_blocking_pids(pid)))",
-                    pid,
-                )
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
             )
+        )
 
     await _assert_bind_and_user_delete_take_one_lock_order(
         store, holder_of=_backend_pid, is_blocking=_is_blocking
