@@ -1720,12 +1720,23 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
+    async def _dropped_anywhere():
+        # A count over every message, so a stray write against another message would show. It
+        # reads no detail, so no ciphertext comes back.
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM message_events WHERE event = 'reply_dropped'"
+        )
+        return int(rows[0]["n"])
+
+    assert await _dropped_anywhere() == 1
     assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
-    assert await store.events_for(mid) == after_drop  # the vanished row wrote nothing
+    assert await store.events_for(mid) == after_drop
+    assert await _dropped_anywhere() == 1  # the vanished row wrote nothing anywhere
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
     assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert await _dropped_anywhere() == 1
 
 
 async def test_routed_to_filtered_collapse(store) -> None:

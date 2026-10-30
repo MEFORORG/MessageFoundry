@@ -110,6 +110,10 @@ def test_setstate_rejects_a_trailing_space_and_names_no_value() -> None:
     # Control: a space anywhere else, and a trailing tab, are still accepted; only U+0020 pads.
     for ns, key in (("ns", " k"), ("ns", "k k"), (" ns", "k"), ("n s", "k"), ("ns", "k\t")):
         assert SetState(ns, key, "v").key == key
+    # The JSON check beside it names no value either.
+    with pytest.raises(WiringError, match="JSON-serializable") as json_exc:
+        SetState("MRN-NS", "MRN-KEY", object())
+    assert "MRN" not in str(json_exc.value)
 
 
 # --- write side: applied in the handoff transaction --------------------------

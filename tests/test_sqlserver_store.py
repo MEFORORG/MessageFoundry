@@ -1633,12 +1633,23 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
+    async def _dropped_anywhere() -> int:
+        # A count over every message, so a stray write against another message would show. It
+        # reads no detail, so no ciphertext comes back.
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM message_events WHERE event = 'reply_dropped'"
+        )
+        return int(rows[0]["n"])
+
+    assert await _dropped_anywhere() == 1
     assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
-    assert await store.events_for(mid) == after_drop  # the vanished row wrote nothing
+    assert await store.events_for(mid) == after_drop
+    assert await _dropped_anywhere() == 1  # the vanished row wrote nothing anywhere
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
     assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert await _dropped_anywhere() == 1
 
 
 async def test_all_declined_finalizes_not_deployed(store) -> None:
@@ -1918,20 +1929,24 @@ async def test_state_merge_collapses_case_variants_under_a_ci_default(store) -> 
     probe = f"state_collation_probe_{uuid4().hex[:12]}"
     merge = _SQL_STATE_MERGE.replace("MERGE state ", f"MERGE {probe} ", 1)
     assert merge != _SQL_STATE_MERGE, "the MERGE no longer targets `state`; re-point the probe"
-    await store._execute(
-        f"CREATE TABLE {probe} ("
-        " namespace NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
-        " [key] NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
-        " value NVARCHAR(MAX) NOT NULL, set_at FLOAT NOT NULL, message_id NVARCHAR(64) NULL,"
-        f" CONSTRAINT pk_{probe} PRIMARY KEY (namespace, [key]))"
-    )
-    try:
-        for key in ("MRN-abc", "mrn-ABC"):
-            await store._execute(merge, _state_merge_params("ns", key, "v", 1.0, "m"))
-        collapsed = await store._fetchall(f"SELECT [key] FROM {probe}")
-    finally:
-        await store._execute(f"DROP TABLE IF EXISTS {probe}")
-    assert [r["key"] for r in collapsed] == ["MRN-abc"], (
+    # One transaction, never committed: DDL is transactional here, so the scratch table cannot
+    # outlive the test even if the run is killed mid-way.
+    async with store._acquire() as conn, store._cursor(conn) as cur:
+        try:
+            await cur.execute(
+                f"CREATE TABLE {probe} ("
+                " namespace NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+                " [key] NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+                " value NVARCHAR(MAX) NOT NULL, set_at FLOAT NOT NULL,"
+                f" message_id NVARCHAR(64) NULL, CONSTRAINT pk_{probe} PRIMARY KEY (namespace, [key]))"
+            )
+            for key in ("MRN-abc", "mrn-ABC"):
+                await cur.execute(merge, _state_merge_params("ns", key, "v", 1.0, "m"))
+            await cur.execute(f"SELECT [key] FROM {probe}")
+            collapsed = [str(r[0]) for r in await cur.fetchall()]
+        finally:
+            await conn.rollback()
+    assert collapsed == ["MRN-abc"], (
         f"collation {collation} is case-insensitive, so the two spellings must merge into the"
         " stored one; if they did not, this control no longer shows the defect"
     )
@@ -1940,7 +1955,9 @@ async def test_state_merge_collapses_case_variants_under_a_ci_default(store) -> 
 async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
     """BACKLOG #1588: ``state.namespace`` and ``state.[key]`` are BIN2, so two spellings the cache
     holds apart stay two rows, and a keyed reopen decrypts each under the AAD it was sealed with.
-    Passes on every collation. Encryption is on because the keyed symptom of a merged row is a
+    Passes on every database collation, for a ``state`` table this build created: the DDL runs only
+    where the table is absent, so a reused database whose table predates it fails here, on purpose.
+    The CI legs create their database fresh. Encryption is on because the keyed symptom of a merged row is a
     CipherError when ``_load_state_cache`` rebuilds the AAD from the stored spelling. Accent and
     composed-versus-decomposed spellings ride along: BIN2 compares code points, as the cache does.
 

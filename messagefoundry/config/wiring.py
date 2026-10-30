@@ -4678,7 +4678,7 @@ class SetState:
             json.dumps(self.value)
         except (TypeError, ValueError) as exc:
             raise WiringError(
-                f"SetState({self.namespace!r}, {self.key!r}, ...): value must be JSON-serializable "
+                "SetState value must be JSON-serializable "
                 f"(str/int/float/bool/None/list/dict) — {exc}"
             ) from exc
 
