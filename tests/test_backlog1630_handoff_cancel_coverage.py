@@ -464,7 +464,7 @@ async def test_probe_discards_a_transaction_left_open(
         with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
             if probe == "next-writer":
                 await store.record_connection_event(
-                    connection="control", transport="mllp", direction="inbound", kind="probe"
+                    connection="control", transport="mllp", direction="inbound", kind="established"
                 )
                 assert not store._db.in_transaction
             else:

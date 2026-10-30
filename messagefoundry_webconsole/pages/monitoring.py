@@ -32,6 +32,7 @@ from messagefoundry.api.models import (
     ServiceStatusInfo,
     SystemStatus,
 )
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import (
@@ -366,41 +367,9 @@ def _alert_rules_section(config: AlertsConfig) -> list[Markup]:
     return [el("h2", "Rules"), summary, rules_table]
 
 
-#: The bounded connection-event vocabulary (mirrors the engine's emit kinds + the desktop
-#: event_log_page.py filter) for the /ui event-log kind dropdown (L6b, #75 parity).
-_EVENT_KINDS = (
-    "established",
-    "closed",
-    "idle_timeout",
-    "peer_not_allowlisted",
-    "at_capacity",
-    "frame_oversize",
-    "peer_reset",
-    "framing_error",
-    # BACKLOG #1619 -- the MLLP listener's inbound handler faulted on a frame it read cleanly (a
-    # store outage at the ingress commit is the reachable case). Not a framing fault, so not that kind.
-    "handler_error",
-    # vault BACKLOG #2613 and #3302 -- a TLS handshake on an MLLP or HTTP listener failed. Throttled
-    # to one per minute per listener; the reason carries the count since the last one.
-    "tls_handshake_failed",
-    # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
-    # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
-    "row_undecodable",
-    # BACKLOG #1621 - the FILE source's four quarantine arms, each moving a drop to `.error`. Also
-    # poll-source kinds, so their rows carry a NULL peer_host.
-    "file_oversize",
-    "file_decompress_failed",
-    "file_content_mismatch",
-    "file_scan_rejected",
-    # ADR 0154 D6 — inbound HTTP intake-auth refusals. CI asserts this tuple equals the set the
-    # engine actually emits, so these are not optional garnish: without them the vocabulary test
-    # fails. Each also writes an audit_log row, which is the copy that survives diagnostics being off.
-    "intake_auth_failed",
-    "auth_subject_denied",
-    "auth_rate_limited",
-    "connection_lost",
-    "connection_restored",
-)
+#: The /ui event-log kind dropdown's choices: the engine's one connection-event vocabulary, sorted
+#: so the order is stable across processes (a frozenset's iteration order is not). BACKLOG #1624.
+_EVENT_KINDS = tuple(sorted(CONNECTION_EVENT_KINDS))
 
 
 def _event_filter(connection: str, kind: str = "") -> Markup:
