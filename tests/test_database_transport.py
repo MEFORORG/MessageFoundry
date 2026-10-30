@@ -1165,7 +1165,9 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
-async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(fmt: str) -> None:
+async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(
+    fmt: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Through the engine's own handler chain, the traceback lands in ``exc_text``, so the text
     sink keeps one physical line per traceback line and the JSON sink has an ``exception`` key.
 
@@ -1179,6 +1181,10 @@ async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(fmt: 
     handler.setFormatter(_make_formatter(fmt))
     _install_phi_filters(handler)
     log = logging.getLogger("messagefoundry.transports.database")
+    # Pinned, since other tests move these: the record must reach the handler.
+    monkeypatch.setattr(logging.root.manager, "disable", logging.NOTSET)
+    monkeypatch.setattr(log, "disabled", False)
+    monkeypatch.setattr(log, "level", logging.DEBUG)
     log.addHandler(handler)
     try:
         await _run_one_failed_poll(
@@ -1210,7 +1216,8 @@ async def test_source_poll_failure_log_survives_an_unprintable_error(
     """The render runs in the poll loop's error arm, so an error that cannot be printed must not
     kill the poller: its line becomes a fixed note and its frames are kept.
 
-    Red mutation: drop the ``try`` in ``_safe_db_error``. ``_run`` raises here.
+    Red mutation: drop the ``try`` in ``_safe_db_error``. The ``message withheld`` assertion reds:
+    ``_safe_db_exc_info``'s own fallback then catches the failure, so the poller still survives.
     """
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
@@ -1218,6 +1225,54 @@ async def test_source_poll_failure_log_survives_an_unprintable_error(
     assert "poll failed" in caplog.text
     assert "message withheld: AttributeError while rendering it" in caplog.text
     assert "in _select" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
+async def test_source_poll_failure_log_survives_a_failed_copy(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that fails gives a fixed note naming the failure, and the poller keeps running.
+
+    Red mutation: drop the ``try`` in ``_safe_db_exc_info``. ``_run`` raises here.
+    """
+
+    def broken(exc: BaseException, made: dict[int, Any]) -> NoReturn:
+        raise RecursionError("too deep")
+
+    monkeypatch.setattr(database_module, "_redacted_copy", broken)
+    src = _src(body_column="payload")
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(src, _driver_exc("22018", _SQLSERVER_CONVERT))
+    assert "traceback withheld: RecursionError while rendering Exception" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
+class _AsyncpgShapedError(Exception):
+    """asyncpg's shape: the SQLSTATE in a class attribute, the message in ``args[0]``, and a
+    ``DETAIL`` line in ``str()`` that quotes the key."""
+
+    sqlstate = "23505"
+
+    def __str__(self) -> str:
+        return (
+            'duplicate key value violates unique constraint "ux_x"\n'
+            f"DETAIL:  Key (control_id)=(MRN{_SYNTHETIC_ID}) already exists."
+        )
+
+
+async def test_source_handler_failure_log_names_an_asyncpg_error_by_sqlstate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On a PostgreSQL store the handler's write raises asyncpg's error, whose SQLSTATE is not in
+    ``args[0]``, and ``safe_exc`` keeps its ``DETAIL`` line.
+
+    Red mutation: drop the ``sqlstate`` attribute read in ``_log_sqlstate``. Reds here.
+    """
+    src = _src(body_column="payload")
+    h = _RecordingHandler(exc=_AsyncpgShapedError("duplicate key value"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+    assert "_AsyncpgShapedError [23505]" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
 
 
@@ -1239,6 +1294,7 @@ def test_lookup_connect_failure_names_a_unicode_error_by_type_alone() -> None:
         UnicodeEncodeError("ascii", "MRN\xe9", 3, 4, "ordinal not in range(128)"),
         UnicodeDecodeError("utf-8", b"MRN\xfe", 3, 4, "invalid start byte"),
         RuntimeError(UnicodeEncodeError("ascii", "MRN\xe9", 3, 4, "ordinal not in range(128)")),
+        ValueError("ascii", UnicodeEncodeError("ascii", "MRN\xe9", 3, 4, "ordinal not in range")),
     ],
 )
 def test_safe_db_error_renders_a_unicode_error_as_safe_exc_does(exc: Exception) -> None:
