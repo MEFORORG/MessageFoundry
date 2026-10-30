@@ -56,7 +56,9 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Each test starts with no crossing logged and no process-wide attestation set."""
-    monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set())
+    # raising=False only so this file fails on its assertions, not in setup, where the set is
+    # absent; the once-per-process tests below go red if it is renamed.
+    monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 

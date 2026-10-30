@@ -949,7 +949,7 @@ Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF
 the policy is centrally governed and **posture-clamped**. `mode`/`data_scope` plus the active
 environment NAME + production tier (`environment` / `[security].production_instance`) govern the
 policy — there is no data-class axis left to clamp against ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); `provider`,
-`model`, `endpoint`, `api_key` and `allowed_endpoints` are **live** under `mode = managed_endpoint` — the
+`model`, `endpoint`, `api_key`, `allowed_endpoints` and the `endpoint_revocation_attested` pair are **live** under `mode = managed_endpoint` — the
 engine broker ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)).
 Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored).
 | Key | Type | Default | Notes |
@@ -965,6 +965,8 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
 | `api_key` | secret | — | the LLM credential — **env only** (`MEFOR_AI_API_KEY`), never the file. **Required** for `mode = managed_endpoint` |
 | `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which is permissive when empty and so can't gate this surface |
+| `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate and checks no CRL and no OCSP, so under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless this is set; no CRL lever is built, so `[tls].crl_file` does not reach this hop. Adds no check on the wire. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
+| `endpoint_revocation_attested_reason` | str | — | **required** with `endpoint_revocation_attested = true`: what covers revocation of the endpoint's certificate, for example its short lifetime. A flag without one, a blank one, a reason without the flag, or a control character in it is refused at load. Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED_REASON` |
 
 > Only `code_only` context is ever sent in the MVP (graph names + active editor code) — **never
 > message bodies**. The full resolution/clamping algorithm, the `GET /ai/policy` endpoint, the

@@ -241,6 +241,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
 | | `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested` | `false` / `false` (`true`, with its mandatory reason, lifts the revocation refusal on that section's Vault hops; named as `store.vault_revocation_attested` and `secrets.vault_revocation_attested`) |
+| | `[ai].endpoint_revocation_attested` | `false` (`true`, with its mandatory reason, lifts the revocation refusal on the AI-broker endpoint hop; named as `ai.endpoint_revocation_attested`) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -267,11 +268,12 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
-`[store].vault_revocation_attested` and `[secrets].vault_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[store].vault_revocation_attested`, `[secrets].vault_revocation_attested` and
+`[ai].endpoint_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]`/`[secrets]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]`/`[secrets]`/`[ai]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
@@ -1451,6 +1453,39 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` does not stop on a file that will not load: it marks its report
   partial and lists no attestation from that file.
 - **Reversible:** yes. Delete both lines and restart. An off-box Vault hop then refuses again.
+
+### `[ai].endpoint_revocation_attested = true` — revocation of the AI endpoint's certificate is taken on trust
+> **Settings-scoped** (BACKLOG #2193, owner ruling 2026-10-27, on the pattern of the Vault pairs
+> above). It needs its `[ai].endpoint_revocation_attested_reason`.
+- **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
+  sent for assistance over https that verifies the endpoint's certificate, and its handshake
+  checks no CRL and no OCSP. So an `[ai].endpoint` whose host is not loopback is refused under
+  `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
+  which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
+  comes there, answered 503; `serve` starts, and `messagefoundry check` does not report it.
+- **What you lose:** that refusal. A revoked but unexpired endpoint certificate is then accepted
+  unless something outside the engine stops it, and the API key crosses to whoever holds it.
+  **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
+  this hop, so `[tls].crl_file` does not reach it and the flag is the only way across under
+  `enforce`. A short-lived endpoint certificate is the main honest basis; put its lifetime in the
+  reason. A gateway on this machine that checks the upstream's revocation itself needs no
+  attestation at all: a loopback endpoint is not refused.
+- **What it cannot do:** it never lifts the broker's other refusals: an `http` endpoint, an
+  endpoint missing from `[ai].allowed_endpoints`, or credentials in the URL. The process-wide
+  `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
+  posture (BACKLOG #299). On a `warn` instance it turns the warning into a silent crossing.
+- **How it is reported:** at least four ways. `security_loosenings()` names it as
+  `ai.endpoint_revocation_attested`, with the reason, so `messagefoundry security show` and
+  `GET /security/posture` list it. The serve-time loosening WARNING prints that entry, reason
+  included, at each start. The start's `config_loaded` audit row lists the switch name. And a
+  broker that crosses an enforcing or unknown posture on the attestation logs a WARNING that
+  carries the reason, **once per process for each endpoint host**, not at each request.
+  `messagefoundry check` has no line for this pair. The entry is named whenever the flag is set,
+  whatever `[ai].mode` is.
+- **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
+  holding a control character or a lone surrogate is refused when the settings load.
+- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
