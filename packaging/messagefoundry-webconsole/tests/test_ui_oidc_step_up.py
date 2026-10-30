@@ -14,6 +14,7 @@ the step-up able to fail if the engine looked for the session anywhere but the s
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
@@ -422,7 +423,12 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
     """BACKLOG #3374. RED when: the step-up return draws no budget at all once it left the sign-in
     window. It draws a per-user key of the ceremony limiter, and a spent key refuses it with a 429
     that writes no audit row and consumes nothing. That key is the return's own, so the user's
-    other ceremonies keep their budget."""
+    other ceremonies keep their budget. The retry refills the key by moving the limiter's clock
+    past the window, so the limiter stays in place for it (vault BACKLOG #3913, finding 4)."""
+    clock = [time.monotonic()]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         token = await _federated_sign_in(service, c, monkeypatch)
@@ -455,7 +461,9 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         staged = service.oidc_step_up_flow(flow_id)
         assert staged is not None and staged.user_id == identity.user_id
         assert _flow_id(c) == flow_id
-        monkeypatch.setattr(service, "_reauth_limiter", None)  # the budget refilled
+        clock[0] += _settings().login_rate_limit_window_seconds + 1  # the key refilled
+        assert service._reauth_limiter is not None, "the retry must meet the limiter, not skip it"
+        assert _ceremony_budget_left(service, return_key)
         retry = await _callback(c, start.headers["location"])
         assert retry.status_code == 200, retry.text
         new = c.cookies.get("mf_session")
