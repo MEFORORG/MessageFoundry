@@ -226,6 +226,13 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
     return 2
 
 
+#: How old an archive ``restore`` accepts without ``--allow-old-archive`` (BACKLOG #2614). A week:
+#: a daily backup gives several archives inside it, so a refusal means the newest few backups are
+#: missing, which is worth a deliberate decision, and every account change made after the archive
+#: is undone by the restore.
+_RESTORE_MAX_AGE_DAYS = 7.0
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -1301,6 +1308,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
         "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
+    )
+    # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
+    # old archive is refused unless the operator says it is meant.
+    restore.add_argument(
+        "--max-age-days",
+        type=float,
+        default=_RESTORE_MAX_AGE_DAYS,
+        help=f"refuse an archive taken more than this many days ago (default "
+        f"{_RESTORE_MAX_AGE_DAYS:g}), or one that does not say when it was taken",
+    )
+    restore.add_argument(
+        "--allow-old-archive",
+        action="store_true",
+        help="restore an archive older than --max-age-days anyway. Every disable, delete, role "
+        "change and reset made after its newest audit row must then be re-applied by hand",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -11080,13 +11102,20 @@ def _restore(args: argparse.Namespace) -> int:
                 dest_store_path=args.to,
                 store_settings=settings.store,
                 config_dest=args.config_to,
+                max_age_seconds=None if args.allow_old_archive else args.max_age_days * 86400,
             )
         )
     except BackupError as exc:
         return _emit_error(f"restore failed ({exc.kind}): {exc}", as_json=args.json)
 
+    from messagefoundry.pipeline.alerts import utc_or_unknown
+    from messagefoundry.pipeline.dr_backup import RESTORED_ACCOUNTS_NOTICE
+
     payload = {
         "archive": result.archive_path,
+        "archive_sha256": result.archive_sha256,
+        "archive_created_at": utc_or_unknown(result.archive_created_at),
+        "last_audit_at": utc_or_unknown(result.last_audit_at),
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
@@ -11104,6 +11133,11 @@ def _restore(args: argparse.Namespace) -> int:
         )
         if result.config_dir is not None:
             print(f"  config: {result.config_files} file(s) into {result.config_dir}")
+        print(
+            f"  archive taken {payload['archive_created_at']}; newest audit row in it "
+            f"{payload['last_audit_at']}"
+        )
+        print(f"  {RESTORED_ACCOUNTS_NOTICE}")
     return 0
 
 

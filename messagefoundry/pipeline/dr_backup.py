@@ -2882,6 +2882,43 @@ _DECRYPT_REFUSAL = (
 )
 
 
+#: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
+RESTORED_ACCOUNTS_NOTICE = (
+    "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
+    "delete, role change and reset made after its newest audit row must be re-applied by hand. "
+    "The first engine start on this store ends every session."
+)
+
+
+def _refuse_an_old_archive(
+    *,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    max_age_seconds: float,
+    now: float,
+) -> None:
+    """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
+    say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
+    archive, so the older it is the more an operator must re-apply, and the refusal names the
+    time after which that is so. The CLI's ``--allow-old-archive`` skips this check."""
+    newest = _utc_iso(last_audit_at) if last_audit_at is not None else "unknown"
+    if archive_created_at is None:
+        taken = "the archive does not say when it was taken"
+    else:
+        age = now - archive_created_at
+        if age <= max_age_seconds:
+            return
+        taken = (
+            f"the archive was taken {_utc_iso(archive_created_at)}, {age / 86400:.1f} days ago, "
+            f"past the {max_age_seconds / 86400:g}-day limit"
+        )
+    raise BackupError(
+        "age",
+        f"{taken}. Its newest audit row is {newest}. {RESTORED_ACCOUNTS_NOTICE} Nothing was "
+        "written. Choose a newer archive, or pass --allow-old-archive to restore this one.",
+    )
+
+
 def _codec_refusal(exc: BackupCodecError) -> BackupError:
     """Translate a ``.mfbak`` codec failure into the restore path's refusal — the single seam, so both
     the header read and the decrypt word it once and order the arms once.
@@ -2903,9 +2940,14 @@ async def run_restore(
     dest_store_path: str | Path,
     store_settings: object,
     config_dest: str | Path | None = None,
+    max_age_seconds: float | None = None,
 ) -> RestoreResult:
     """Restore a ``.mfbak`` archive's store member to ``dest_store_path`` (ADR 0049's missing half; the
     primitive ADR 0048's cold seed consumes).
+
+    ``max_age_seconds`` refuses an archive taken longer ago than that, or one whose manifest does
+    not say when, before anything is written (BACKLOG #2614). ``None`` checks no age: the
+    ``restore`` CLI passes its limit unless the operator gave ``--allow-old-archive``.
 
     Resolves the store's decrypt-capable keyring exactly as :func:`run_restore_verify` does (active +
     retired, AC-5 "incl. retired keys"), then decrypts the archive ONCE and verifies the extracted
@@ -2940,6 +2982,7 @@ async def run_restore(
         dest_store_path=Path(dest_store_path),
         config_dest=Path(config_dest) if config_dest is not None else None,
         keys=keys,
+        max_age_seconds=max_age_seconds,
     )
 
 
@@ -2949,10 +2992,12 @@ def _restore_blocking(
     dest_store_path: Path,
     config_dest: Path | None,
     keys: list[bytes],
+    max_age_seconds: float | None = None,
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
     :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,
-    and ``cleanup`` for the one failure that follows a whole restore -- see below).
+    ``age`` for an archive past ``max_age_seconds`` (BACKLOG #2614), and ``cleanup`` for the one
+    failure that follows a whole restore -- see below).
 
     It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for
     two reasons. A .mfbak archive is the size of the store, so a verify pass followed by a restore pass
@@ -3145,6 +3190,20 @@ def _restore_blocking(
                 raise BackupError("restore", f"archive has no {_STORE_MEMBER} member to restore")
 
             row_counts = _verify_extracted_store(snap, manifest)
+            # BACKLOG #2614: when the archive was taken, and its newest audit row, read from the
+            # checked bytes. Both feed the age refusal, the restore marker and the summary.
+            archive_created_at = _manifest_time(manifest)
+            try:
+                last_audit_at = newest_audit_time(snap)
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            if max_age_seconds is not None:
+                _refuse_an_old_archive(
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    max_age_seconds=max_age_seconds,
+                    now=time.time(),
+                )
             # ADR 0196 (C+): the restored store must not seal a single value under the archive's data
             # sub-key. That key's persisted count is the archive's, which may trail the key's real use
             # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
@@ -3164,9 +3223,7 @@ def _restore_blocking(
             # checks, like the salt drop, so the bytes checked are the archive's; the marker is
             # this restore's own row.
             archive_sha256 = src.digest.hexdigest()
-            archive_created_at = _manifest_time(manifest)
             try:
-                last_audit_at = newest_audit_time(snap)
                 write_restore_marker(
                     snap,
                     archive_sha256=archive_sha256,
