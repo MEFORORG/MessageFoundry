@@ -3933,7 +3933,7 @@ security-event notifier has a second one of its own).
 work on at least **four** distinct thread pools, plus `aiosqlite`'s per-connection worker thread on the SQLite
 store, and only one of the pools carries a knob.
 
-1. **The event loop's default `ThreadPoolExecutor`**, bound to CPython's `min(32, os.cpu_count() + 4)`
+1. **The event loop's default `ThreadPoolExecutor`**, bound to CPython's `min(32, (os.process_cpu_count() or 1) + 4)`
    with **no setting for it** (the engine never calls `loop.set_default_executor` outside a bench-only,
    env-gated shim, `pipeline/connscale_shim.py`). It carries **five** classes of work:
    - **Router and Handler execution** — `route_only` and `transform_one` go through `asyncio.to_thread`

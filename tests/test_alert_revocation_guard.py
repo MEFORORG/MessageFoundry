@@ -203,6 +203,24 @@ def test_an_attested_smtp_login_crosses_and_is_recorded() -> None:
         _notifier(ENFORCING, revocation_attested=True, revocation_attested_reason=REASON)
     assert log.audit.count(REASON) == 2, log.state()
     assert _SMTP_CELL in log.audit, log.state()
+    # The record names what the operator set, at both builds: a connection's flag is no [alerts] key.
+    assert log.audit.count("([alerts].email_tls_revocation_attested; reason:") == 2, log.state()
+    assert "(tls_revocation_attested;" not in log.audit, log.state()
+
+
+def test_an_attested_login_whose_crl_reaches_its_context_records_no_crossing(
+    bare_crl: str,
+) -> None:
+    """The hop checks a CRL, so a line saying it crossed without one would be a false record."""
+    policy = TrustAnchorPolicy(crl_file=bare_crl)
+    with _guard_log() as log:
+        _email(
+            ENFORCING,
+            revocation_attested=True,
+            revocation_attested_reason=REASON,
+            trust_anchor_policy=policy,
+        )
+    assert not log.audit, log.state()
 
 
 def test_an_smtp_hop_with_no_login_takes_no_guard() -> None:
@@ -297,6 +315,8 @@ def test_an_attested_webhook_crosses_and_is_recorded() -> None:
             revocation_attested_reason=REASON,
         )
     assert REASON in log.audit and _WEBHOOK_CELL in log.audit, log.state()
+    assert "([alerts].webhook_tls_revocation_attested; reason:" in log.audit, log.state()
+    assert "(tls_revocation_attested;" not in log.audit, log.state()
 
 
 @pytest.mark.parametrize("reason", [None, "   ", "covered\nFORGED LINE", "lone \ud800 surrogate"])
