@@ -328,7 +328,7 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# The ONLY keywords whose value can set a generic hop's TLS mode, in the form
+# The ONLY keywords the engine counts as setting a generic hop's TLS mode, in the form
 # :func:`_odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
 # as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
 # docs/CONNECTIONS.md records what the drivers read so far do with one.
@@ -420,7 +420,7 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     keyword name and one of those words; a secret keyword that regex does not name could still
     be reported as ``KEY=<word>`` when its value is one of them.
 
-    The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's
+    One half of :func:`generic_odbc_tls_unenforced`, the verdict shared by this module's
     construction-time reminder (:func:`_warn_generic_tls_unenforced`) and by the posture readers that
     report the hop to an operator (``config.wiring.unverified_generic_db_hops`` ->
     ``security_loosenings`` / ``GET /security/posture`` / ``messagefoundry check``). One definition, so a
@@ -975,9 +975,9 @@ def _warn_generic_tls_unenforced(
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
-    is a deliberate operator-owned-TLS model, and it must not be *silent*.
+    is a deliberate operator-owned-TLS model.
 
-    So at construction we log the delegation loudly: a **WARNING** when :func:`generic_odbc_tls_unenforced`
+    So at construction we log the delegation: a **WARNING** when :func:`generic_odbc_tls_unenforced`
     says the hop may cross in plaintext — no TLS mode in ``odbc_params``, or one pinned to a no-TLS
     value like ``SSLmode=disable`` — dropped to **DEBUG** when a mode keyword has any other value.
 

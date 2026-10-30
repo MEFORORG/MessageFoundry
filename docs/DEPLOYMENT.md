@@ -570,7 +570,7 @@ self-signed placeholder).
 | **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
 | **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
 | **File source** | local filesystem | n/a (no network) | n/a | — | n/a |
-| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-verified** — a missing mode, **or one pinned to a no-TLS value**, logs a WARNING, and an enforcing instance refuses the hop off-loopback unless the connection declares `tls_hop_attested` with its reason; a hop with any other mode value is delegated to the driver and is neither gated nor reported | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
+| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-verified** — a missing mode, **or one pinned to a no-TLS value**, logs a WARNING, and an enforcing instance refuses the hop off-loopback unless the connection declares `tls_hop_attested` with its reason; a hop with any other mode value is delegated to the driver, not gated, and not on the `generic-db-tls` line | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
 
 ### Outbound (the engine dials a destination)
 
@@ -586,7 +586,7 @@ self-signed placeholder).
 | **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients and the sender's domain) |
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. `use_tls=false` is gated by the clamped `MEFOR_ALLOW_INSECURE_TLS`, read directly — it does **not** route through the cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` are not read (AUTH credentials stay refused). CORRECTED 2026-10-13: this row said the raw variable, not clamped | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
-| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-verified** — a hop with no TLS mode, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and is refused off-loopback on an enforcing instance unless the connection declares `tls_hop_attested` with its reason, or `cleartext_accepted`, which warns and audits; a hop with any other mode value is delegated to the driver and is neither gated nor reported | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
+| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-verified** — a hop with no TLS mode, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and is refused off-loopback on an enforcing instance unless the connection declares `tls_hop_attested` with its reason, or `cleartext_accepted`, which warns and audits; a hop with any other mode value is delegated to the driver, not gated, and not on the `generic-db-tls` line | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
 | **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused) | username/password or SSH key | `[egress].allowed_remote` |
 
@@ -617,8 +617,8 @@ REST obey the authority does not settle these:
   authority. A hop that sets no TLS mode, or pins one to a no-TLS value, goes there and is refused
   off-loopback on an enforcing instance, unless a per-connection declaration relaxes it (BACKLOG #1178). A hop with **any other mode value never reaches it**: if the
   driver ignored or misread that value, plaintext PHI to a Postgres / Oracle / MySQL ODBC target would
-  cross with no refusal, on any posture. **No reader reports that hop either**: construction logs it at
-  DEBUG only, and it has no entry on the surfaces named next. The hops the authority does see are also
+  cross with no refusal, on any posture. **The TLS readers do not name that hop either**: construction logs it at
+  DEBUG only, and neither the `generic_odbc_tls_unenforced` entry nor the `generic-db-tls` line lists it. The hops the authority does see are also
   reported: a construction WARNING naming the connection, plus an entry in
   `security_loosenings()` / `GET /security/posture` and a `generic-db-tls` line from
   `messagefoundry check`. The reporting covers **inbound `DatabasePoll` as well as outbound**, and reads
@@ -699,7 +699,7 @@ engine will not always refuse them for you:
   value, the connection logs a construction WARNING naming
   itself, and an enforcing instance refuses it off-loopback unless the connection declares
   `tls_hop_attested` with its reason, or, outbound only, `cleartext_accepted`. With any other mode value
-  the engine neither enforces nor verifies it, and no reader reports the hop. A hop the engine can judge
+  the engine neither enforces nor verifies it, and the `generic-db-tls` line does not list the hop. A hop the engine can judge
   **is** reported (`security_loosenings()` /
   `GET /security/posture` / `messagefoundry check`'s `generic-db-tls`), for **both** directions. Set
   `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / the equivalent, and treat it as
@@ -1106,7 +1106,7 @@ the Vault guard in `transports/strict_requests.py` calls that function itself an
 ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
 (`tls_allow_expired`) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other
-(a `dialect='generic'` DATABASE hop with a mode set is neither gated nor reported, so name it as that);
+(a `dialect='generic'` DATABASE hop with a mode set is not gated and not on the `generic-db-tls` line, so name it as that);
 and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:
 `tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it

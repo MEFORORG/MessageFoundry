@@ -131,8 +131,10 @@ authority rather than delegate.
 hop has been gated as well as logged since BACKLOG #1178. Only `sslmode` or `encrypt` with a value
 outside the no-TLS deny-list counts as the operator owning TLS. A lone key or certificate keyword,
 or a blank mode, now reads as no mode, because a driver's own default need not require TLS. This only
-adds refusals, so the No-loosen rule (§5) holds. `encrypt` stays on that list unproven;
-[CONNECTIONS.md](../CONNECTIONS.md#generic-odbc-postgresql--mysql) records the limits.
+adds refusals, so the No-loosen rule (§5) holds. `encrypt` stays one of the two mode keywords, unproven;
+[CONNECTIONS.md](../CONNECTIONS.md#generic-odbc-postgresql--mysql) records the limits. A hop with a mode
+outside the deny-list logs at `DEBUG` only and is not on the `generic-db-tls` line, so the delegation
+above is not visible for that hop at normal log levels.
 
 ## Amendment (2026-07-13) — the DEFERRED residuals closed (BACKLOG #200)
 

@@ -2975,7 +2975,7 @@ def _check_vault_revocation_attested(
 
 
 def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
-    """Surface every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced.
+    """Surface the generic-ODBC ``DATABASE`` connections the TLS classifier flags.
 
     #66 / ADR 0092's 2026-07-12 amendment delegates TLS to the operator's driver keyword on
     ``dialect='generic'``, because MessageFoundry cannot enumerate an arbitrary driver's keywords — that

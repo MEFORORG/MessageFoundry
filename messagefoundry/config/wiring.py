@@ -6372,7 +6372,7 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 
 
 def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+    """The generic-ODBC ``DATABASE`` connections the TLS classifier flags, as
     ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
 
     On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
