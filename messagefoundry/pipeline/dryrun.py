@@ -19,7 +19,6 @@ import os
 import threading
 import time
 from collections.abc import Collection, Mapping
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
@@ -619,7 +618,8 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             }
         except CodeSetError as exc:
             # A missing or unreadable file. Say so, or a later read of the set reports it missing
-            # with nothing to say why. Names the set and the redacted reason, never a row of it.
+            # with nothing to say why. The reason is the loader's own, redacted; it can quote a key
+            # of the set (a duplicate one, say), as the same error does when wiring loads the file.
             log.warning(
                 "dry-run: reference set %r skipped, its file did not load: %s",
                 spec.name,
@@ -921,27 +921,33 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     The thread is a **daemon** and not pooled. An expired one cannot be killed and runs on until the
     size and segment caps let it finish, as on the listener; a daemon is not joined at interpreter
     exit, so it cannot hold ``messagefoundry check`` open, where a ``concurrent.futures`` pool's
-    worker would be. The caller blocks for up to the timeout, so a caller on an event loop thread
-    would stall that loop; at least the ``dryrun`` and ``check`` CLIs, ``verify``'s self smoke and the
-    traced dry-run run off any loop."""
+    worker would be. What an expired one raises is dropped unread, as the listener's orphan drops it.
+    The caller blocks for up to the timeout, so a caller on an event loop thread would stall that
+    loop; at least the ``dryrun`` and ``check`` CLIs, ``verify``'s self smoke and the traced dry-run
+    run off any loop."""
     timeout = strict_validate_timeout(ic)
     version = ic.validation.hl7_version
     if timeout is None:
         result = validate(text, expected_version=version)
     else:
-        future: Future[ValidationResult] = Future()
+        outcome: list[ValidationResult | BaseException] = []
 
         def _run() -> None:
             try:
-                future.set_result(validate(text, expected_version=version))
-            except BaseException as exc:  # re-raised by future.result, as the inline call raised
-                future.set_exception(exc)
+                outcome.append(validate(text, expected_version=version))
+            except BaseException as exc:  # raised below on the caller's thread, as inline it raised
+                outcome.append(exc)
 
-        threading.Thread(target=_run, name="dryrun-strict-validate", daemon=True).start()
-        try:
-            result = future.result(timeout)
-        except TimeoutError:
+        worker = threading.Thread(target=_run, name="dryrun-strict-validate", daemon=True)
+        worker.start()
+        # join() raises OverflowError past threading.TIMEOUT_MAX (inf among them), a wait the
+        # listener's wait_for accepts and never ends, so such a timeout waits unbounded here too.
+        worker.join(timeout if timeout <= threading.TIMEOUT_MAX else None)
+        if not outcome:
             return f"strict-validation timed out after {timeout}s"
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        result = outcome[0]
     return None if result.ok else "; ".join(result.errors)[:200]
 
 
@@ -1017,7 +1023,10 @@ def dry_run(
 
     # strict_validation_due keeps the listener's header-only downgrade for a streaming body over its
     # threshold, so the preview never times a whole-body validate the engine does not run.
-    if strict_validation_due(ic, text) and (refused := _strict_validation_error(text, ic)):
+    if (
+        strict_validation_due(ic, text)
+        and (refused := _strict_validation_error(text, ic)) is not None
+    ):
         return DryRunResult(
             inbound=ic.name,
             disposition=MessageStatus.ERROR,

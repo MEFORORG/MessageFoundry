@@ -28,8 +28,8 @@ at :func:`decode_ingress`. The declared-type sniff, which the dry-run does not r
 check`` sends each fixture to every inbound, so adding the sniff there would fail an HL7 fixture on
 every X12 or FHIR inbound of a mixed config, and that choice is not this module's to make. The HL7
 parse step, which each caller runs itself: the stored ``parse error`` text differs, and the dry-run
-catches only ``HL7PeekError`` where the listener catches every peek-read fault. And the live guard
-below.
+catches only ``HL7PeekError`` where the listener catches every peek-read fault. And document detach,
+the live guard the last paragraph below names.
 
 **The strict-validation timeout is mirrored.** The listener runs ``hl7apy`` off the event loop under
 :func:`strict_validate_timeout` and records ``ERROR`` + ``AE`` on expiry. The dry-run stays

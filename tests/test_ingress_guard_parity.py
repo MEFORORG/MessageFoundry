@@ -545,29 +545,29 @@ def _strict_inbound(timeout: float | None, **kwargs: Any) -> InboundConnection:
     )
 
 
-def _stall_validate(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[bool]]:
+def _stall_validate(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[tuple[str, bool]]]:
     """Make hl7apy's validate stall until released, in BOTH callers' namespaces.
 
-    Returns the release event and, per call, whether it ran on a daemon thread. The stall is bounded,
-    so on the unfixed dry-run, which validates inline, the call returns valid after it and the test
-    fails on the RECEIVED it then previews rather than hanging. The imports are local so this block
-    stays an append to the file, which another branch edits."""
+    Returns the release event and, per call, the name of the thread it ran on and whether that thread
+    is a daemon. The stall is bounded, so on the unfixed dry-run, which validates inline, the call
+    returns valid after it and the test fails on the RECEIVED it then previews rather than hanging."""
     import threading
 
     from messagefoundry.parsing import validate as real
     from messagefoundry.pipeline import dryrun
 
     release = threading.Event()
-    daemon: list[bool] = []
+    threads: list[tuple[str, bool]] = []
 
     def stalled(*args: Any, **kwargs: Any) -> Any:
-        daemon.append(threading.current_thread().daemon)
+        current = threading.current_thread()
+        threads.append((current.name, current.daemon))
         release.wait(2.0)
         return real(*args, **kwargs)
 
     monkeypatch.setattr(dryrun, "validate", stalled)
     monkeypatch.setattr(wiring_runner, "validate", stalled)
-    return release, daemon
+    return release, threads
 
 
 @pytest.mark.parametrize("listener", _LISTENERS)
@@ -576,7 +576,7 @@ async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_side
 ) -> None:
     """The listener refuses a validate that outruns ``validation.strict_timeout_s`` (#89); a dry-run
     that validated un-timed previewed the same body as RECEIVED. Both must now say the same words."""
-    release, daemon = _stall_validate(monkeypatch)
+    release, threads = _stall_validate(monkeypatch)
     ic = _strict_inbound(0.05)
     try:
         preview = dry_run(_registry(ic), ADT_UTF8)
@@ -588,22 +588,55 @@ async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_side
     assert preview.error == "strict-validation timed out after 0.05s"
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     assert rows[0]["error"] == preview.error
-    # The dry-run's worker is a daemon, so an expired one cannot hold the process open at exit.
-    assert daemon[0] is True
+    # The dry-run's worker is a daemon, so an expired one cannot hold the process open at exit. Found
+    # by name: which of the two stalled calls appended first depends on thread scheduling.
+    assert ("dryrun-strict-validate", True) in threads
 
 
 def test_a_disabled_timeout_validates_un_timed_as_the_listener_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``strict_timeout_s <= 0`` turns the backstop off on the listener, so the preview waits too."""
-    release, daemon = _stall_validate(monkeypatch)
+    release, threads = _stall_validate(monkeypatch)
     release.set()
 
     result = dry_run(_registry(_strict_inbound(0)), ADT_UTF8)
 
     # The fixture has no PV1, so hl7apy refuses it; what matters is who ran it and that it finished.
     assert result.error is not None and "timed out" not in result.error
-    assert daemon == [False]  # inline on the caller's thread, no worker
+    assert [daemon for _, daemon in threads] == [False]  # inline on the caller's thread, no worker
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), 1e10], ids=["inf", "past-TIMEOUT_MAX"])
+def test_a_timeout_too_long_for_a_thread_wait_still_validates(
+    monkeypatch: pytest.MonkeyPatch, timeout: float
+) -> None:
+    """The listener's ``wait_for`` takes ``inf`` and any large timeout; ``Thread.join`` raises
+    ``OverflowError`` past ``threading.TIMEOUT_MAX``, so the preview must not hand it one."""
+    release, threads = _stall_validate(monkeypatch)
+    release.set()
+
+    result = dry_run(_registry(_strict_inbound(timeout)), ADT_UTF8)
+
+    assert result.error == "Missing required child ADT_A01.PV1"
+    assert threads == [("dryrun-strict-validate", True)]
+
+
+def test_an_invalid_result_with_empty_error_text_is_still_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``validate`` reports a fault as ``ok=False`` with the exception's text, which can be empty; the
+    listener refuses on ``ok`` alone, so the preview must not read the empty text as valid."""
+    from messagefoundry.parsing import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(
+        dryrun, "validate", lambda *a, **k: ValidationResult(ok=False, version=None, errors=[""])
+    )
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
 
 
 def test_a_validate_inside_the_timeout_still_reports_its_errors() -> None:
@@ -634,7 +667,7 @@ def test_a_streaming_body_over_its_threshold_is_not_whole_body_validated(
 ) -> None:
     """The listener validates only the header of such a body, so a whole-body validate the preview
     timed out on would refuse a message the engine takes."""
-    release, daemon = _stall_validate(monkeypatch)
+    release, threads = _stall_validate(monkeypatch)
     ic = _strict_inbound(0.05, stream_threshold_bytes=16)
     try:
         result = dry_run(_registry(ic), ADT_UTF8)
@@ -642,4 +675,4 @@ def test_a_streaming_body_over_its_threshold_is_not_whole_body_validated(
         release.set()
 
     assert result.disposition is MessageStatus.RECEIVED, result.error
-    assert daemon == []
+    assert threads == []

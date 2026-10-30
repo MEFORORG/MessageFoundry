@@ -683,7 +683,6 @@ def test_dryrun_logs_a_reference_file_it_skips(
     assert record.levelname == "WARNING"
     assert "'provider_npi'" in record.getMessage()
     assert reason in record.getMessage()
-    assert "DOE" not in caplog.text  # names the set and the reason, never the message
 
 
 # --- backend capability gate (ADR 0006 "Backend support") --------------------
