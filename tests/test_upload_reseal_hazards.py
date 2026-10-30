@@ -294,5 +294,5 @@ def test_the_command_reports_a_non_regular_file_and_completes(
     assert main(["rotate-key", "--db", str(db)]) == 0
     out = capsys.readouterr().out
     assert "OK:" in out and "PARTIAL:" not in out
-    assert "note: 1 uploaded file(s) have a body or sidecar that is a FIFO" in out
+    assert "note: 1 uploaded file(s) have a body or sidecar that is not a file" in out
     assert "Remove it by hand" in out

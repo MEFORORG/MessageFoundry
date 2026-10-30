@@ -265,8 +265,9 @@ def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool |
 
 
 async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> None:
-    """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before it changes
-    anything, so a crash or a failed step leaves the record standing (BACKLOG #3737).
+    """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before either data
+    pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737). The store
+    open has run by then and can already have written under the key.
 
     Skipped when the stored stamp already names ``key_id``, so there is nothing for
     :func:`reconcile_rotation_meta` to withhold. That is a run with the key already in use, or one a
@@ -327,8 +328,8 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
         return (
             "secret rotation: rotate-key has not completed for the store key in use, so its "
             "rotation date was not stamped and its age was not reset. Run `messagefoundry "
-            "rotate-key` until it exits 0. Do not simply put the prior key back: values may "
-            "already be under this one. docs/PHI.md says how to back out."
+            "rotate-key` until it exits 0, or rotate to a new key. Do not put the prior key back: "
+            "values may already be under this one, and docs/PHI.md says why there is no way back."
         )
     return None
 
@@ -521,7 +522,7 @@ async def reconcile_rotation_meta(
     BACKLOG #2242 re-key rule).
 
     **A changed DEK is not stamped while the rotation record names it (BACKLOG #3737).** ``rotate-key``
-    opens that record before it changes anything and closes it only when a whole run is done. The
+    opens that record before either data pass and closes it only when a whole run is done. The
     DEK row is left as it is, and this start reads its dates. A DEK changed with no record has
     no such hold, and stamps: one changed by hand, or a new key's first start before any
     ``rotate-key``. So a stamp proves a changed key, not a finished rotation.

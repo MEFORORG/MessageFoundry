@@ -5,10 +5,9 @@
 ``reconcile_rotation_meta`` stamped a changed store key at the next ``serve`` start whether or not
 ``rotate-key`` had finished, so a run's withheld stamp held only until then. The rotation record
 closes that: a ``secret_rotation_meta`` row the command opens first and closes last, which the
-reconcile honours. And a run that skipped an upload used to roll the audit chain anyway, which cannot
-be undone and took away the back-out to the prior key. At least the tests of those two behaviours
-fail on the code before #3737: the stamp is written, or the back-out refuses. The out-of-band tests
-pin what must not change.
+reconcile honours. At least the tests of that behaviour fail on the code before #3737, because the
+stamp is written. A run that skipped an upload rolls the audit chain as it did before, by owner
+ruling of 2026-10-30, and the tests of that and of the out-of-band stamp pin what must not change.
 
 The skipped upload is sealed under a key nobody supplies, a cause an operator can fix by removing
 it, and it fails the run the way any skip does."""
@@ -198,44 +197,61 @@ def test_a_refused_audit_step_leaves_the_record_open(
     assert asyncio.run(_serve_reconcile(db, key_b, key_a))[_DEK].last_rotated == _OLD_DATE
 
 
-def test_a_partial_run_leaves_the_prior_key_usable_for_a_back_out(
+def test_a_partial_run_rolls_the_chain_and_it_verifies_after_a_start_on_the_new_key_alone(
     rig: tuple[Path, Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A run that skipped an upload does not roll the audit chain. On the old code it did, and
-    making the prior key active again then failed for good: a key keys one audit range."""
+    """Owner ruling 2026-10-30. A Windows service runs with no retired key in its list, so a start
+    after a PARTIAL run can have the new key alone. Left unrolled, the first audit row it wrote
+    would break the chain for good. So a skip rolls, and this start's row must verify, by
+    ``audit-verify`` itself. The note must offer no way back to the prior key."""
+    db, uploads, key_a, key_b = rig
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "PARTIAL:" in captured.out and "OK:" not in captured.out
+    assert "a new range under the active key opens" in captured.out
+    assert "you cannot go back to the prior key" in captured.out
+    assert "back out" not in captured.out
+
+    async def a_start_on_the_new_key_alone() -> None:
+        store = await _open(db, key_b)
+        try:
+            await store.record_audit("test.after_partial", actor="u")
+        finally:
+            await store.close()
+
+    asyncio.run(a_start_on_the_new_key_alone())
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED")
+    assert main(["audit-verify", "--db", str(db)]) == 0, capsys.readouterr()
+
+
+def test_a_re_run_after_a_skip_finds_the_chain_rolled_and_completes(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The earlier run's roll must not refuse the next: the active key already keys the current
+    range, so the roll is a verified no-op, and the stamp and the close follow it."""
     db, uploads, key_a, key_b = rig
     planted = _plant_unopenable_upload(uploads)
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
-    captured = capsys.readouterr()
-    assert "PARTIAL:" in captured.out
-    assert "the audit chain was not rolled" in captured.out
-    assert "you can still back out: make that key active" in captured.out
-    assert "Do NOT remove" not in captured.err  # no roll was attempted, so none failed
+    capsys.readouterr()
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp from a skipped run
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
 
     for path in planted:
         path.unlink()
-    _env(monkeypatch, key_a, key_b, uploads)  # the back-out the note describes
-    assert main(["rotate-key", "--db", str(db)]) == 0, capsys.readouterr()
-    assert "OK:" in capsys.readouterr().out
-
-    async def under_the_prior_key_alone() -> tuple[int, bool, str | None]:
-        store = await _open(db, key_a)  # the new key is gone
-        try:
-            listed = await store.list_messages(allowed_channels=None)
-            ok, msg = await store.verify_audit_chain()
-            return len(listed), ok, msg
-        finally:
-            await store.close()
-
-    listed, ok, msg = asyncio.run(under_the_prior_key_alone())
-    assert listed == 1
-    assert ok, msg
-    rows = asyncio.run(_rows(db, key_a))
-    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
-    assert rows[_DEK].last_rotated == _OLD_DATE
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "OK: audit chain already under the active key" in out
+    rows = asyncio.run(_rows(db, key_b))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert rows[_DEK].last_rotated != _OLD_DATE
     assert rows[ROTATION_RECORD_ID].fingerprint == ""
 
 

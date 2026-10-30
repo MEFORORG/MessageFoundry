@@ -613,9 +613,9 @@ class ResealResult:
     rotation stamp while it is non-zero (BACKLOG #3181). It includes a value no configured key opens,
     which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
     text is not counted here when its sidecar is readable: no key reads that body and no re-run
-    changes it (``unsealable``, ``body_lost``), and neither is a FIFO, a directory or a device
-    (``not_regular``). At least a file too large for an upload, a symlink and a sidecar that is not
-    text are still skips.
+    changes it (``unsealable``, ``body_lost``), and neither is anything that is not a file, such as
+    a FIFO or a directory (``not_regular``). At least a file too large for an upload, a symlink and a
+    sidecar that is not text are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -642,9 +642,10 @@ class ResealResult:
     #: any other, so retiring the prior key loses nothing. The upload stays listed with a body that
     #: cannot be read until an operator deletes it or the retention prune removes it at expiry.
     body_lost: int = 0
-    #: How many UPLOADS have a body or sidecar that is a FIFO, a directory or a device (BACKLOG
-    #: #3737). It holds no value, so it is not a skip, and an operator removes it by hand. A symlink
-    #: is not counted here: its target may be under the prior key, so it is a skip.
+    #: How many UPLOADS have a body or sidecar that is neither a regular file nor a symlink, such as
+    #: a FIFO or a directory (BACKLOG #3737). It holds no value, so it is not a skip, and an operator
+    #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
+    #: it is a skip.
     not_regular: int = 0
 
 
@@ -657,7 +658,7 @@ class _Half(Enum):
     SEALED_PLAINTEXT = auto()  # the same, and it was plaintext
     LOST = auto()  # a body that is missing or is not text
     UNSEALABLE = auto()  # a plaintext sidecar over a lost body
-    NOT_REGULAR = auto()  # a FIFO, directory or device, or a plaintext sidecar over one; left as is
+    NOT_REGULAR = auto()  # no regular file or link, or a plaintext sidecar over one; left as is
     SKIPPED = auto()  # it may still be under the prior key
 
 
@@ -2178,9 +2179,9 @@ class UploadStore:
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
         that was. Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
 
-        ``lstat`` decides what is opened (BACKLOG #3737). A FIFO would block the open for good. It,
-        a directory and a device hold no value, so each is reported and left alone, and it is not
-        a skip, like a missing body. A symlink is not followed, because that would re-seal or read a
+        ``lstat`` decides what is opened (BACKLOG #3737). A FIFO would block the open for good.
+        Anything that is neither a regular file nor a symlink holds no value, so it is reported and
+        left alone, and it is not a skip, like a missing body. A symlink is not followed, because that would re-seal or read a
         file this store does not own. It is a skip, because its target may be a real upload still
         under the prior key. This guards an offline command against what is on disk when it looks,
         not against a writer racing it."""

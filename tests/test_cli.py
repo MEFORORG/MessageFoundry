@@ -681,9 +681,9 @@ def test_rotate_key_fails_when_no_key_opens_an_uploaded_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #3181: an upload no configured key opens used to abort the whole pass with the store
-    pass's "rotation aborted" message. It is now one skip, so the command fails the same way and
-    names both causes, and it leaves the audit chain unrolled (BACKLOG #3737). Here the upload was
-    sealed under a key that is not supplied at all."""
+    pass's "rotation aborted" message. It is now one skip, so the command fails the same way, names
+    both causes, and still runs the audit step. Here the upload was sealed under a key that is not
+    supplied at all."""
     import asyncio
 
     from messagefoundry.store.crypto import generate_key, make_cipher
@@ -707,7 +707,7 @@ def test_rotate_key_fails_when_no_key_opens_an_uploaded_file(
     assert "1 uploaded file(s) were NOT fully re-sealed" in captured.err
     assert "could not be read, written or decrypted" in captured.err
     assert "OK:" not in captured.out
-    assert "note: the audit chain was not rolled" in captured.out
+    assert "note: audit chain" in captured.out  # the audit step still ran, and is not an OK line
     assert _key_id_and_stamp(db, key_b)[1] is None
 
 

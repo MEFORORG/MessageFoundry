@@ -624,30 +624,33 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
    step did not complete (BACKLOG #3181). **A `serve` start does not stamp that key either (BACKLOG
-   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before it changes
-   anything and closes it only when a run completes, so a killed or failed run leaves it open. While
+   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
+   (the store open can already have written under the key) and closes it only when a run completes,
+   so a run killed or failed after that point leaves it open. While
    it names the key in use, or cannot be read, `serve` logs a WARNING and reads the key's age from
    the prior date, or from the date the record opened where there is none, and under
    `[security].enforcement = enforce` that date can refuse the start
    ([`[secret_rotation]`](CONFIGURATION.md)). A key changed with no record still stamps at the
    next start, including a start between setting the new key and the first run, so a stamp proves
    a changed key, not that a `rotate-key` ran. Do not start `serve` between setting a new key and
-   running `rotate-key`: that stamp stands however the run ends, and backing out to the prior key
-   then stamps that key as changed too. **A run that skipped an
-   upload does not roll the audit chain**, because that roll cannot be undone: a key keys one audit
-   range, so the prior key can never be active again after it. Until the chain rolls you can
-   back out: make the prior key active, keep the new key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`,
-   and re-run `rotate-key`. Setting the prior key back alone is not enough, because values may
-   already be under the new one. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
+   running `rotate-key`: that stamp stands however the run ends.
+   **After any run reaches the audit step, you cannot go back to the prior key (owner ruling
+   2026-10-30, BACKLOG #3737).** A run that skipped an upload rolls the audit chain like any other,
+   so an engine started on the new key alone keeps a chain that verifies. A key opens one audit
+   range, so the prior key can never open another. `rotate-key` under it re-seals the data and then
+   refuses at the audit step, and leaves you worse off. Recovery is forward: fix the cause and
+   re-run, where the roll is a verified no-op and the stamp follows, or rotate to a new key. Either
+   way, keep the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` until a run completes, because a
+   skipped upload may still be under it. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
    UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
    key will ever open it. Restore that upload, or remove its two files from the uploads directory.
    The log names each skipped file, and says whether the key its marker names is configured. A file
    larger than an upload can be is skipped too, unread; if it is a real upload from before
    `[store].max_upload_bytes` came down, raise that setting for the run. **A symlink at an upload's
    path is not followed, and it is a skip**, because its target may be a real upload under the
-   prior key. Put the file back, or remove the link. **A FIFO, a directory or a device there is not
-   opened and is not a skip**, because it holds no value. The command counts them in a note, and
-   you remove them by hand. **A body that is missing is treated as lost, not as
+   prior key. Put the file back, or remove the link. **Anything else there that is not a regular
+   file, such as a FIFO or a directory, is not opened and is not a skip**, because it holds no value.
+   The command counts them in a note, and you remove them by hand. **A body that is missing is treated as lost, not as
    waiting.** The run completes, and if that body later returns under a key you have since retired,
    no key reads it. So keep the prior key for as long as a missing body may come back.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
