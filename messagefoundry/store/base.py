@@ -2308,9 +2308,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
-    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
-    # caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset or a provision-admin
+    # takeover, one marker row that holds no host (``store.store.LOGIN_ADDRESS_RESET_MARKER``, vault
+    # BACKLOG #2946, #3849). The caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
@@ -2324,7 +2324,16 @@ class AuthStore(Protocol):
     # row outside the reader's lookback can never match. A separate call and transaction from the
     # upsert, because in one transaction two writes for one account from different hosts could each
     # lock its own row and then wait on the other's in the prune, a deadlock on both server backends.
+    # It NEVER deletes the reset marker row (vault BACKLOG #3849 B4): that row
+    # is stamped at the epoch, so a prune from a sign-in that raced a reset would otherwise delete
+    # it and could leave the record empty, which reads as no baseline. Only
+    # :meth:`reset_login_addresses` and ``delete_user`` remove it.
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None: ...
+
+    # Delete every row of the account and write the reset marker row, stamped
+    # at the epoch, in ONE transaction (vault BACKLOG #3849 B4), so a failure leaves the record as it
+    # was and never empty. What an administrator's reset and a provision-admin takeover run.
+    async def reset_login_addresses(self, user_id: str) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
     # CONDITIONAL (BACKLOG #3025): stages ``secret``, sealed, only where TOTP is still off, and

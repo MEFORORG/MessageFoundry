@@ -6,7 +6,8 @@ The revocation guard on the three Vault hops is keyed on the instance posture. T
 no ``[security]`` section, so the posture is handed down a chain of calls, from ``open_store`` and
 ``resolve_secret_provider`` to the guard in ``transports/strict_requests.py``. Each link takes it as
 an optional argument, and **leaving it out is the strict answer**: an unknown posture counts as
-enforcing.
+enforcing. At least ``_offline_alert_notifier`` and ``_raise_offline_administrator_granted`` take it
+as a required argument instead, so a caller cannot leave it out at all.
 
 So no caller can loosen the guard by forgetting the argument. What could loosen it is a caller that
 passes a posture it made up, or a new link that drops the one it was handed. This file lists every
@@ -98,6 +99,10 @@ _LINKS: dict[str, int | None] = {
     "Engine": None,
     # the offline commands' security notifier, which resolves an SMTP secret
     "_offline_security_notifier": 1,
+    # provision-admin's [alerts] notifier and the step that raises its administrator_granted
+    # alert, which resolve the alert transports' secrets (vault BACKLOG #3849 B5)
+    "_offline_alert_notifier": 1,
+    "_raise_offline_administrator_granted": 1,
 }
 _KEYWORDS = ("posture", "hop_posture")
 
@@ -186,12 +191,15 @@ class _Scan(ast.NodeVisitor):
         if name is not None and name in self.links:
             self.seen.add(id(node.func))
             self._row(name, self.shape(node, self.links[name]))
-        # A link handed to a runner as its first argument, with the link's own keywords after it:
-        # `asyncio.to_thread(link, ..., posture=...)` or `functools.partial(link, posture=...)`.
+        # A link handed to a runner as its first argument, with the link's own arguments after it:
+        # `asyncio.to_thread(link, ..., posture=...)` or `functools.partial(link, posture=...)`. A
+        # posture the link takes by position sits one place later there; read by keyword alone, it
+        # would record as `-`.
         target = _link_named(node.args[0], self.links) if node.args else None
         if target is not None:
             self.seen.add(id(node.args[0]))
-            self._row(target, _posture_of(node, None))
+            position = self.links[target]
+            self._row(target, self.shape(node, None if position is None else position + 1))
         self.generic_visit(node)
 
     def _reference(self, node: ast.Name | ast.Attribute) -> None:
@@ -272,6 +280,20 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "-"),
         ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
+        ("__main__.py", "_offline_alert_notifier.build", "resolve_secret_provider", "posture"),
+        (
+            "__main__.py",
+            "_raise_offline_administrator_granted",
+            "_offline_alert_notifier",
+            "posture",
+        ),
+        (
+            "__main__.py",
+            "_provision_admin.alert",
+            "_raise_offline_administrator_granted",
+            "posture",
+        ),
+        ("__main__.py", "_provision_admin.reopen", "open_store", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
         ("__main__.py", "_cipher_audit", "build_store_cipher", "posture"),
@@ -591,3 +613,45 @@ def test_the_scan_reads_a_keyword_or_the_links_own_position(
 ) -> None:
     (node,) = [n for n in ast.walk(parse_source(call)) if isinstance(n, ast.Call)]
     assert _posture_of(node, position) == shape
+
+
+@pytest.mark.parametrize(
+    ("call", "link", "shape"),
+    [
+        (
+            "asyncio.to_thread(_offline_alert_notifier, settings, posture)",
+            "_offline_alert_notifier",
+            "posture",
+        ),
+        (
+            "asyncio.to_thread(_offline_alert_notifier, settings, posture=relaxed)",
+            "_offline_alert_notifier",
+            "relaxed",
+        ),
+        ("asyncio.to_thread(_offline_alert_notifier, settings)", "_offline_alert_notifier", _NONE),
+        (
+            "functools.partial(_load_external_provider, name, settings, relaxed)",
+            "_load_external_provider",
+            "relaxed",
+        ),
+        ("asyncio.to_thread(open_store, settings, relaxed)", "open_store", _NONE),
+    ],
+)
+def test_the_scan_reads_a_runners_posture_one_place_after_the_link(
+    call: str, link: str, shape: str
+) -> None:
+    """A link handed to a runner is the runner's first argument, so a posture the link takes by
+    position sits one place later. Read by keyword alone, a posture passed there recorded as ``-``,
+    which the census accepts as none on purpose. A keyword-only link still reads ``-`` for a
+    positional argument, because that argument is not its posture."""
+    assert _scan(f"def f():\n    {call}\n", "x.py") == [("x.py", "f", link, shape)]
+
+
+def test_a_derivation_handed_to_a_runner_keeps_its_dial() -> None:
+    """A runner row is recorded in the scan's own shape, so the derivation census still reads a
+    constant dial passed through ``asyncio.to_thread``. Recorded as a posture, it read ``-``."""
+    source = (
+        "def f():\n"
+        "    asyncio.to_thread(hop_posture_from_ai, ai, enforcement=SecurityEnforcement.WARN)\n"
+    )
+    assert _derivations(source, "x.py") == [("x.py", "f", "SecurityEnforcement.WARN")]
