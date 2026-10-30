@@ -26,7 +26,7 @@ from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, Egr
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.proxy_address import parse_proxy_url
+from messagefoundry.transports.proxy_address import ProxyAddress, parse_proxy_url
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
     refuse_url_credentials,
@@ -276,14 +276,17 @@ def _check_forward_proxy_egress(
         # proxy parser read another host from some values, so the gate judges the parsed host and
         # port, and a value the two could read differently is refused here, at load. The refusal
         # is fixed text and carries no part of the value.
-        address = parse_proxy_url(proxy_url)
+        address: ProxyAddress | None = parse_proxy_url(proxy_url)
+        refusal = ""
     except ValueError as exc:
-        # exc is parse_proxy_url's fixed text, and it carries no chain of its own.
+        address, refusal = None, str(exc)
+    # Raised after the handler ends, so the refusal carries no exception context.
+    if address is None:
         log.warning("egress denied: %s forward proxy URL refused (vault BACKLOG #2965)", label)
         raise WiringError(
             f"{label}: the forward proxy URL is refused before the [egress].allowed_proxy check, "
-            f"and its host is withheld. {exc}"
-        ) from None
+            f"and its host is withheld. {refusal}"
+        )
     if not host_port_allowed(address.hostname, address.port, allowed_proxy):
         # The four HTTP-family allowlist arms in this module print the host through
         # url_host_label. refuse_url_credentials, which the other three run first and this one

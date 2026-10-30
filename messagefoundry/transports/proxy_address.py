@@ -158,7 +158,7 @@ def parse_proxy_url(value: str) -> ProxyAddress:
     except ValueError:
         parts = None
     if parts is None:
-        raise ValueError(_REFUSED) from None
+        raise ValueError(_REFUSED)
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https") or not value[len(parts.scheme) :].startswith("://"):
         raise ValueError(_REFUSED)
