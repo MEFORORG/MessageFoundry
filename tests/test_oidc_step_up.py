@@ -1498,6 +1498,9 @@ async def test_many_accounts_spending_the_backstop_still_leave_each_account_its_
         ceiling = service._settings.login_rate_limit_global
         spenders = ceiling // per_user + 1  # enough accounts to pass the backstop
         assert per_user * spenders > ceiling, "fixture: the per-user budgets alone pass it"
+        # An account that writes one row while the backstop has room, far below its own budget.
+        early = _stage_step_up_flow(service, "early-user", "203.0.113.40")
+        await _forged_return(service, early, 0)
         for i in range(spenders):
             flow_id = _stage_step_up_flow(service, f"user-{i}", f"198.51.100.{i}")
             for n in range(per_user):
@@ -1510,6 +1513,11 @@ async def test_many_accounts_spending_the_backstop_still_leave_each_account_its_
             assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
         assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 1, (
             "past the backstop, a fresh account must write exactly its first row"
+        )
+        # The floor is the FIRST row of a window: an account that already wrote one gets none.
+        await _forged_return(service, early, 1)
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 1, (
+            "past the backstop, an account that already wrote a row this window wrote another"
         )
     finally:
         await store.close()
@@ -1552,9 +1560,10 @@ async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
     rsa_key: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3965. RED when: the backstop across every key is spent and nothing is raised, so
-    the lost rows show only in the log. The first refusal past it in a window pages through the
-    alert callable the API lifespan injects, naming the action of the row it stopped. Later ones
-    in the same window do not page again."""
+    the lost rows show only in the log. The first row it stops in a window pages through the alert
+    callable the API lifespan injects, naming that row's action. A row it admits under the
+    per-account floor pages nothing, and later stops of the same action in the window do not page
+    again, while a stop of the other action does."""
     caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
     store = await MessageStore.open(":memory:")
     try:
@@ -1569,12 +1578,39 @@ async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
                 await _forged_return(service, flow_id, n)
         assert pages == [], "paged before the backstop was spent"
 
+        first = _stage_step_up_flow(service, "over-first", "203.0.113.99")
+        await _forged_return(service, first, 0)
+        assert pages == [], "paged for a row the per-account floor wrote"
+
         for i in range(3):
             flow_id = _stage_step_up_flow(service, f"over-{i}", f"203.0.113.{i}")
             for n in range(2):
                 await _forged_return(service, flow_id, n)
         assert pages == ["auth.reauth"], pages
         assert "backstop" in caplog.text
+        # The other action, stopped in the same window, pages on its own.
+        assert not service.allow_step_up_return_audit(
+            "over-0", client="203.0.113.0", reason="non_navigation_fetch"
+        )
+        assert pages == ["auth.reauth", "auth.login_failed"], pages
+    finally:
+        await store.close()
+
+
+async def test_a_step_up_return_audit_reason_outside_the_closed_set_fails_on_every_call(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3965. RED when: an unknown ``reason`` passes until the backstop is spent and only
+    then raises, inside the flood the budget exists for."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        with pytest.raises(KeyError):
+            service.allow_step_up_return_audit(
+                "user-1",
+                client="198.51.100.1",
+                reason="non_navigation",  # type: ignore[arg-type]
+            )
     finally:
         await store.close()
 

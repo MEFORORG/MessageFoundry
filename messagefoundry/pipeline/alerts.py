@@ -583,7 +583,7 @@ class AlertSink(Protocol):
         ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
         step-up return's audit budget uses ``step_up_return:audit_budget`` when its all-callers
-        backstop stops a row, at most once a window (BACKLOG #3965). ``action`` is
+        backstop stops a row, at most once a window per action (BACKLOG #3965). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
@@ -1489,7 +1489,7 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with the
     audit action of the row the step-up return audit budget's backstop stopped, raises
     :meth:`AlertSink.audit_write_failed` keyed :data:`STEP_UP_RETURN_AUDIT_KEY` (BACKLOG #3965).
-    The service calls it at most once a window.
+    The service calls it at most once a window per action.
 
     Carries the key and the action name only. Never raises: an alert failure must not change what a
     step-up return answers."""
@@ -1498,7 +1498,9 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
         try:
             sink.audit_write_failed(STEP_UP_RETURN_AUDIT_KEY, action=action)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
-            log.warning("the step-up return audit_write_failed alert could not be delivered")
+            log.warning(
+                "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+            )
 
     return _raise
 

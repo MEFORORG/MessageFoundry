@@ -977,7 +977,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > the repeated-credential budget and the IdP step-up return's (controls 10 and 11 of the
 > [6.1.1 protection set](SECURITY.md#the-documented-protection-set-asvs-611), BACKLOG #2454,
 > #3965). On the step-up return's budget, `login_rate_limit_global = 0` also removes the page its
-> backstop raises when reached. The report names only the limits in the table.
+> backstop raises when it stops a row. The report names only the limits in the table.
 >
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the

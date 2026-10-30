@@ -1426,8 +1426,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
         # for approval_too_early, so each request is its own instance. A resolution's lost
         # provenance row uses `approval:<id>:resolve`, its own instance (vault BACKLOG #3438). An
-        # inline config reload uses `config_reload:inline` (vault BACKLOG #2254). The action name
-        # lands in the reason column.
+        # inline config reload uses `config_reload:inline` (vault BACKLOG #2254), and the IdP
+        # step-up return audit budget's backstop `step_up_return:audit_budget` (BACKLOG #3965). The
+        # action name lands in the reason column.
         # The ERROR log line beside it carries the row's detail on some paths and only the exception
         # on others (docs/SECURITY.md). No PHI.
         self._emit(

@@ -505,9 +505,8 @@ def _drain_step_up_return_audit_budget(service: AuthService) -> None:
             service.allow_step_up_return_audit(
                 f"another-user-{i}", client="198.51.100.200", reason="state_mismatch"
             )
-    assert not service.allow_step_up_return_audit(
-        "another-user-0", client="198.51.100.200", reason="state_mismatch"
-    ), "fixture: not spent"
+    backstop = service._step_up_return_audit_backstop
+    assert backstop is not None and not backstop.would_allow("<all>"), "fixture: not spent"
 
 
 def _drain_own_step_up_return_audit_budget(service: AuthService, user_id: str) -> None:
@@ -541,8 +540,9 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
     """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row is not bounded
     per user, or other users spending the all-callers backstop stop this user's row. Within the
     user's budget the row is written. With the user's own budget spent it is not. With the
-    backstop spent by other users the user's first row is still written, and the backstop pages.
-    The refusal is otherwise the same: a 303 that consumes nothing and keeps the cookie."""
+    backstop spent by other users the user's first row is still written, and a second is stopped
+    and pages. The refusal is otherwise the same: a 303 that consumes nothing and keeps the
+    cookie."""
     caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole")
     service = await _service(engine, _FakeLdap())
     pages: list[str] = []
@@ -559,8 +559,8 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
             _drain_own_step_up_return_audit_budget(service, identity.user_id)
         elif spent == "others":
             _drain_step_up_return_audit_budget(service)
-            pages.clear()  # the drain itself paged; only the return's own call counts below
-            service._step_up_return_audit_paged_at = None
+            pages.clear()  # the drain itself paged; only the return's own calls count below
+            service._step_up_return_audit_paged_at.clear()
         rows_before = await service.store.count_audit(limit=None, action="auth.login_failed")
 
         r = await _fetch_return(c, start.headers["location"])
@@ -571,8 +571,16 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         # Past the budget the refusal still leaves a trace: the line, in place of the row.
         logged = "refused (non_navigation_fetch)" in caplog.text
         assert logged is (spent == "own"), caplog.text
-        # The backstop pages, naming the action of the row it would have stopped.
-        assert pages == (["auth.login_failed"] if spent == "others" else []), pages
+        # A row the per-account floor wrote pages nothing.
+        assert pages == [], pages
+        if spent == "others":
+            # The second is stopped: no row, the line, and the backstop pages with its action.
+            again = await _fetch_return(c, start.headers["location"])
+            assert again.status_code == 303
+            after = await service.store.count_audit(limit=None, action="auth.login_failed")
+            assert after == rows
+            assert "refused (non_navigation_fetch)" in caplog.text
+            assert pages == ["auth.login_failed"], pages
         # The row was charged under the staged user, the key the service's state_mismatch draws.
         limiter = service._step_up_return_audit_limiter
         assert limiter is not None
@@ -584,7 +592,7 @@ async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_retu
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3965. RED when: the step-up return audit budget gates the RETURN rather than its
-    row. A flood across many users that spends its global ceiling, and the sign-in window's, must
+    row. A flood across many users that spends its all-callers backstop, and the sign-in window, must
     still not refuse an operator's real IdP step-up return."""
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
