@@ -2745,8 +2745,8 @@ transition (the old leader's last in-flight poll vs. the new leader's first) is 
 at-least-once guarantees that cover a crash mid-poll — the file rename, the database source's
 mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
 duplicate, never data loss. For a `database` source that holds only while `poll_statement` does not
-write: the build-time read-only test reads its shape only, so at least a `SELECT` that calls a writing
-function passes it. The
+write, and the read-only test on it misses at least one writing shape; see the
+[`poll_statement` row](CONNECTIONS.md#database-source--databasepoll). The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
