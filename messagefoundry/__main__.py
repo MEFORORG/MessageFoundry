@@ -10622,7 +10622,6 @@ def _backup(args: argparse.Namespace) -> int:
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
     from messagefoundry import __version__
     from messagefoundry.config.settings import keyless_opt_out_refusal
-    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
@@ -10658,10 +10657,12 @@ def _backup(args: argparse.Namespace) -> int:
     async def run() -> BackupResult | None:
         # #1916: a backup writes a `dr_backup` audit row, even on failure, so on a fresh store it
         # would start the chain.
-        store = await open_store(
-            settings.store,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             _refuse_an_unauditable_write(store)  # its audit row is written even on failure
@@ -10686,7 +10687,7 @@ def _backup(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         KeylessAuditChainRefused,
         _UnauditableWrite,
-        InsecureHopRefused,
+        _StoreOpenRefused,
     ) as exc:
         # #1780, #1916, #2532: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
@@ -12064,12 +12065,13 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     refuses (BACKLOG #2532), into :class:`_StoreOpenRefused`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code, for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11), and
-    for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the OPEN is wrapped:
-    ``open_store`` resolves the key and judges the hop before the backend reads a row, so nothing a
-    database holds can turn a finding into "could not start". A malformed key is caught as
-    ``StoreCipherConfigError`` and a hop as ``InsecureHopRefused``, never as the bare ``ValueError``
-    the open raises for other reasons too.
+    code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11) and
+    ``backup``, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the
+    OPEN is wrapped: ``open_store`` resolves the key and judges the hop before the backend reads a
+    row, so nothing a database holds can turn a finding into "could not start". A malformed key is
+    caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
+    the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal is one of
+    those bare ones, so it still reaches the dispatch floor.
     """
     from messagefoundry.config.tls_policy import InsecureHopRefused
 

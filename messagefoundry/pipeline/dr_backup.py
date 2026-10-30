@@ -351,8 +351,8 @@ class BackupRunner:
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
         # The instance posture, for the Vault hop a key resolve or a full verify can dial on every
-        # pass (vault BACKLOG #2983). The engine passes its own. `None`, which the `backup`
-        # command passes, counts as enforcing on that hop.
+        # pass (vault BACKLOG #2983). The engine and the `backup` command pass their own. `None`
+        # counts as enforcing on that hop.
         self._hop_posture = hop_posture
         self._config_dir_source = config_dir
         self._engine_version = engine_version

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #2532: every command that opens the store passes the instance's hop posture.
+"""BACKLOG #2532: the commands in :data:`_COMMANDS` pass the instance's hop posture to the store.
 
 ``serve`` and ``provision-admin`` open a server store with the posture ``hop_posture_from_ai`` derives.
-The commands below opened it with none. ``None`` is the strict answer for a weakened-TLS check and
-for a Vault hop, but not for the PostgreSQL revocation guard, which is a no-op with no posture. So
-on a first deployment at ``enforce`` each of them would have crossed an off-box store hop with no
-revocation check, one ``serve`` itself refuses.
+These commands opened it with none. ``None`` is the strict answer for a weakened-TLS check and for
+a Vault hop, but not for the PostgreSQL revocation guard, which is a no-op with no posture. So on a
+first deployment at ``enforce`` each of them would have crossed an off-box store hop with no
+revocation check, one ``serve`` itself refuses. At least ``support-bundle`` and ``verify`` still pass
+none; ``tests/test_vault_posture_census.py`` lists what each caller passes.
 
 The tests drive each command through ``main`` to the real ``PostgresStore._create_pool``. Only the
 driver module is a stand-in, so what is proved is whether the guard let the command dial:
@@ -14,7 +15,9 @@ driver module is a stand-in, so what is proved is whether the guard let the comm
 * :func:`test_a_hop_serve_refuses_is_refused` refuses, exit 2, and dials nothing;
 * :func:`test_a_loopback_hop_is_accepted` is the control at the hop ``serve`` accepts;
 * :func:`test_warn_crosses_the_same_hop` is the control on the dial: the same hop crosses at
-  ``warn``, so the refusal above is the instance's posture and not a constant.
+  ``warn``, so the refusal above is the instance's posture and not a constant;
+* :func:`test_a_weakened_hop_is_refused` and :func:`test_warn_honours_the_escape` are the same pair
+  for the weakened-TLS check, which is the only posture check a SQL Server store has.
 
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 would have inherited.
@@ -29,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 from messagefoundry.store.crypto import generate_key
 from tests.test_store_ssl import _FakeAsyncpg
 
@@ -89,9 +93,11 @@ def shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _argv(command: str, tmp: Path, *, server: str, enforcement: str) -> list[str]:
+def _argv(
+    command: str, tmp: Path, *, server: str, enforcement: str, weakened: bool = False
+) -> list[str]:
     """``command`` pointed at a settings file for a PostgreSQL store on ``server``, verified TLS and
-    no CRL, at ``enforcement``."""
+    no CRL, or with verification off when ``weakened``, at ``enforcement``."""
     settings = tmp / "service.toml"
     settings.write_text(
         "[store]\n"
@@ -99,6 +105,7 @@ def _argv(command: str, tmp: Path, *, server: str, enforcement: str) -> list[str
         f'server = "{server}"\n'
         'database = "mefor"\n'
         'username = "mefor"\n'
+        f"trust_server_certificate = {'true' if weakened else 'false'}\n"
         "\n"
         "[security]\n"
         f'enforcement = "{enforcement}"\n',
@@ -136,8 +143,39 @@ def test_a_loopback_hop_is_accepted(command: str, shell: Path, asyncpg: _Refusin
 
 
 @pytest.mark.parametrize("command", _COMMANDS)
-def test_warn_crosses_the_same_hop(command: str, shell: Path, asyncpg: _RefusingAsyncpg) -> None:
+def test_warn_crosses_the_same_hop(
+    command: str,
+    shell: Path,
+    asyncpg: _RefusingAsyncpg,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The control on the dial: the refused hop crosses at ``warn``, as it does for ``serve``, so
-    the posture is the instance's own. A hard-coded enforcing posture would pass the test above."""
-    main(_argv(command, shell, server=_REMOTE, enforcement="warn"))
+    the posture is the instance's own. A hard-coded enforcing posture would pass the test above.
+    It crosses with the WARNING that is the only record of the crossing."""
+    with caplog.at_level("WARNING"):
+        main(_argv(command, shell, server=_REMOTE, enforcement="warn"))
+    assert asyncpg.pool_kwargs["host"] == _REMOTE
+    assert any("insecure transport hop permitted" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_a_weakened_hop_is_refused(
+    command: str, shell: Path, asyncpg: _RefusingAsyncpg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape is inert at ``enforce``, with a posture as it was with none. The exit is not
+    pinned: this refusal is a bare ``ValueError``, so it reaches the dispatch floor's 1."""
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    code = main(_argv(command, shell, server=_REMOTE, enforcement="enforce", weakened=True))
+    assert not asyncpg.pool_kwargs, "the command crossed a hop serve refuses"
+    assert code != 0
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_warn_honours_the_escape(
+    command: str, shell: Path, asyncpg: _RefusingAsyncpg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: at ``warn`` the escape works as it does for ``serve``. With no posture it was
+    refused whatever the dial said, so this is what passing the posture relaxes."""
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    main(_argv(command, shell, server=_REMOTE, enforcement="warn", weakened=True))
     assert asyncpg.pool_kwargs["host"] == _REMOTE

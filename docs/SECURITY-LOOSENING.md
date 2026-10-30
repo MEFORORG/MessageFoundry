@@ -1393,7 +1393,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `rotate-key`, `backup` and `audit-verify` hand it to the guard (BACKLOG #2532 added the last
   three). On an instance at `enforcement = warn` they cross an
   unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
-  Vault even on a `warn` instance.** That includes at least `support-bundle`, at least today.
+  Vault even on a `warn` instance.** That includes at least `support-bundle`, `restore` and
+  `restore-verify`, at least today.
   **`verify` passes no posture to either of its Vault hops, on
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
   `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,
