@@ -441,6 +441,73 @@ async def test_the_username_refresh_contract_on_sqlite() -> None:
         await store.close()
 
 
+class _RollbackFailed(Exception):
+    """Stands in for a driver error raised by the rollback after a failed append."""
+
+
+class _ReleaseFailed(Exception):
+    """Stands in for a driver error raised by the pool release after that rollback."""
+
+
+@pytest.mark.parametrize(
+    "release_fails", [False, True], ids=["rollback-fails", "rollback-and-release-fail"]
+)
+async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append(
+    release_fails: bool,
+) -> None:
+    """BACKLOG #3018 step 7. On PostgreSQL, after a failed append, a failure in the rollback or
+    the release after it replaces the append's error. With ``release_fails`` both fail, so the
+    append's error sits two levels down the chain. The store raises the append's
+    ``UsernameAuditAppendError`` either way, so the reconciler reads a refused row and goes on,
+    rather than a store fault that ends its pass. Driven against the real method with its I/O
+    seams replaced, because the live leg cannot make a rollback or a release fail on cue."""
+    from contextlib import asynccontextmanager
+
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import UsernameAuditAppendError
+
+    append_error = ConnectionResetError("synthetic: the audit append failed")
+
+    class _Transaction:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            if exc is not None:
+                raise _RollbackFailed("synthetic: the rollback failed")
+
+    class _Conn:
+        async def fetchrow(self, *_a: object) -> None:
+            return None  # nobody holds the name
+
+        def transaction(self) -> _Transaction:
+            return _Transaction()
+
+    @asynccontextmanager
+    async def _acquire(*, record: bool = True) -> Any:
+        try:
+            yield _Conn()
+        finally:
+            if release_fails:
+                raise _ReleaseFailed("synthetic: the release failed")
+
+    async def _write_user(*_a: object) -> object:
+        return object()  # the write landed
+
+    async def _append_audits(*_a: object, **_kw: object) -> list[object]:
+        raise append_error
+
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._timed_acquire = _acquire
+    store._write_user = _write_user
+    store._append_audits = _append_audits
+    with pytest.raises(UsernameAuditAppendError) as refused:
+        await store.set_user_username(
+            "u1", "jdoe-new", expected_username="jdoe", audits=(AuditAppend("x", actor="a"),)
+        )
+    assert refused.value.cause is append_error
+
+
 async def test_the_username_comparison_is_byte_exact_on_sqlite() -> None:
     """SQLite's guard is case-sensitive, so a name differing only in case is NOT a collision.
 
