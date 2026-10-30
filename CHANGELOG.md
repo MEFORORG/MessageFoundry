@@ -18,8 +18,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `SSLCA`, `SSLCAPATH`, `SSLCERT` or `SSLKEY` path on a mapped network drive, or behind a link, a
   chain of links or a `subst` drive that ends at a share, now fails the build as a share spelling
   already did. So does a path the check cannot read through. A CA path that leads to another host
-  is refused in every SSL mode, TLS off included. The Generic ODBC section of
-  [CONNECTIONS.md](docs/CONNECTIONS.md) says what is still not caught. (`BACKLOG #2705`)
+  is refused with TLS off too. The Generic ODBC section of [CONNECTIONS.md](docs/CONNECTIONS.md)
+  says what is still left to the driver with TLS off, and what is still not caught.
+  (`BACKLOG #2705`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

@@ -304,7 +304,7 @@ def test_a_file_keyword_that_leads_off_the_host_or_cannot_be_cleared_is_refused(
 ) -> None:
     """BACKLOG #2705, limb 4: a mapped drive or a link passes the spelling check, so where the path
     leads is judged too, and a path the walk cannot clear is refused. No check opens it either. The
-    cases of that judgement are pinned against the walk below. Red with ``_names_another_host``
+    cases of that judgement are pinned against the walk below. Red with ``names_another_host``
     back on the spelling alone."""
     sent = r"Z:\certs\ca.pem"
     monkeypatch.setattr(database, "_path_verdict", lambda p: verdict)
@@ -608,7 +608,7 @@ def _symlink_or_skip(target: str, link: Path, *, directory: bool = False) -> Non
 @pytest.mark.parametrize("shape", ["file", "folder", "chain"])
 def test_a_real_link_to_a_share_is_refused(tmp_path: Path, shape: str) -> None:
     """Real links on this host, read by the real probe. ``.invalid`` never resolves, so nothing
-    reaches a host whatever the walk does. Red with ``_names_another_host`` back on the spelling
+    reaches a host whatever the walk does. Red with ``names_another_host`` back on the spelling
     alone."""
     share = r"\\files.invalid\share"
     if shape == "file":

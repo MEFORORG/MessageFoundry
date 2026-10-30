@@ -1755,8 +1755,10 @@ at a share. So is a path the check cannot read through. The check reads links wi
 them and asks a drive's type rather than opening it. A missing folder, or a drive letter with no
 volume on this host, is left to the driver. These refusals hold in every SSL mode: an `SSLCA`
 or `SSLCAPATH` that leads to another host is refused even with TLS off, as under
-`SSLmode=disable`, although the driver then reads no CA. The driver still gets the value as you
-wrote it.
+`SSLmode=disable`, although the driver then reads no CA. There is at least one exception: under
+TLS off, an `SSLCA` path the check clears, but whose read then fails because Windows could not
+reach a share (errors 53 and 67), is left to the driver unread, as before this check existed.
+The driver still gets the value as you wrote it.
 
 At least these are not caught, so keep those files on a local disk:
 

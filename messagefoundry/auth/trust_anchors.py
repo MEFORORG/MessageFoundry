@@ -197,7 +197,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value that can name or lead to another host is refused here as a
-    setting, unread, in every ``sslmode``, as the build refuses it (BACKLOG #2705).
+    setting, unread, in every ``sslmode``, as the build refuses it (BACKLOG #2705). What the build
+    still leaves to the driver unread with TLS off is in ``docs/CONNECTIONS.md``, Generic ODBC.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -1723,7 +1724,8 @@ def database_ca_anchor_spec(
     :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers.
 
     A value that leads to another host, or that the walk cannot clear (BACKLOG #2705), raises
-    ``ValueError`` and is never opened here, in every ``sslmode``, as the build refuses it. It is
+    ``ValueError`` and is never opened here, in every ``sslmode``, as the build refuses it
+    (``docs/CONNECTIONS.md``, Generic ODBC, says what the build still leaves to the driver). It is
     checked again here, not taken from the build: a link swapped in after the build would
     otherwise leave this check with no spec and no row.
     The lane check turns the ``ValueError`` into a refused setting, as it does a bad pin. The path

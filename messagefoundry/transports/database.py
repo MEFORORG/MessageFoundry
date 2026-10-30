@@ -542,7 +542,7 @@ def _odbc_literal(value: object, *, what: str, connection: str | None, refused: 
 
 def _is_remote_spelling(value: object) -> bool:
     """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`_names_another_host` adds the resolved path."""
+    can name another host. The spelling only; :func:`names_another_host` adds the resolved path."""
     text = str(value).strip()
     return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
 
@@ -779,7 +779,8 @@ def _refuse_remote_paths(
 
     It refuses in every ``sslmode``. With TLS off the driver reads no CA, but an ``sslca`` or
     ``sslcapath`` that leads off the host, by its spelling or by the walk, is refused all the same,
-    as a client certificate or key is: the build never hands the driver a path to another host."""
+    as a client certificate or key is. What the build still leaves to the driver unread with TLS
+    off is stated once, in ``docs/CONNECTIONS.md`` under Generic ODBC."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
