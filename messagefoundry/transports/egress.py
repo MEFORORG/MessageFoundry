@@ -259,22 +259,30 @@ def _check_forward_proxy_egress(
     # A URL urlsplit cannot parse is said to be one, rather than reported as an allowlist miss that
     # no entry could ever clear. Its own ValueError quotes the netloc, so it is never let out.
     try:
-        url_scheme(
+        scheme = url_scheme(
             proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError
         )
+    except WiringError:
+        # The egress-denied WARNING this arm's other refusals write; it names the connection only.
+        log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
+        raise
+    if scheme not in ("http", "https"):
+        # The build's own refusal, said here because the gate is reached first. The scheme is not
+        # printed: a value with no scheme reads its user name as one.
+        log.warning("egress denied: %s forward proxy URL has no http(s) scheme", label)
+        raise WiringError(f"{label}: proxy_url must be 'default' or an http(s):// address")
+    try:
         # The one parse the connector dials from (vault BACKLOG #2965). urlsplit and urllib's
         # proxy parser read another host from some values, so the gate judges the parsed host and
         # port, and a value the two could read differently is refused here, at load. The refusal
         # is fixed text and carries no part of the value.
         address = parse_proxy_url(proxy_url)
     except ValueError as exc:
-        # The egress-denied WARNING this arm's other refusals write; it names the connection only.
-        log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
-        if isinstance(exc, WiringError):
-            raise
+        # exc is parse_proxy_url's fixed text, and it carries no chain of its own.
+        log.warning("egress denied: %s forward proxy URL refused (vault BACKLOG #2965)", label)
         raise WiringError(
-            f"{label}: the forward proxy host is withheld and cannot be checked against "
-            f"[egress].allowed_proxy. {exc}"
+            f"{label}: the forward proxy URL is refused before the [egress].allowed_proxy check, "
+            f"and its host is withheld. {exc}"
         ) from None
     if not host_port_allowed(address.hostname, address.port, allowed_proxy):
         # The four HTTP-family allowlist arms in this module print the host through

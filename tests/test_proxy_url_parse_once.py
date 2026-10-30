@@ -58,6 +58,14 @@ SPLIT_SHAPES = [
 PLAIN = f"http://{LISTED}:3128"
 
 
+@pytest.fixture(autouse=True)
+def _no_system_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin urllib's own bypass list off, as tests/test_outbound_forward_proxy.py does: on Windows
+    it reads the registry's proxy override list, and an entry there would send these requests
+    direct."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+
+
 @pytest.fixture
 def dials(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[tuple[str, int]]]:
     """Every ``(host, port)`` an opener tries to connect to. Each connection is refused."""
@@ -156,6 +164,12 @@ def test_a_plain_proxy_passes_and_is_the_host_dialled(dials: list[tuple[str, int
         {"url": DEST, "proxy_url": PLAIN, "proxy_user": "pu", "proxy_password": "pp"}
     )
     assert dials == [(LISTED, 3128)]
+
+
+def test_a_scheme_other_than_http_is_refused_at_the_gate_by_its_scheme() -> None:
+    with pytest.raises(WiringError, match="must be 'default' or an http") as refused:
+        check_egress_allowed(_rest(f"socks5://{LISTED}:1080"), EGRESS)
+    assert LISTED not in str(refused.value)
 
 
 def test_an_unlisted_plain_proxy_is_still_an_allow_list_miss() -> None:

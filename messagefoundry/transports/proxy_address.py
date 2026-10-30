@@ -19,8 +19,14 @@ no part of the value, because the value may carry a credential.
 
 :func:`read_like_urllib` is ``_parse_proxy`` itself, for the send-time readers that must read a
 value exactly as the handler does, including a value from the operating system's proxy settings
-that never passed through :func:`parse_proxy_url`. Keeping both here makes it one module that
-every proxy-URL reader goes through, so the pairing with urllib is pinned in one place.
+that never passed through :func:`parse_proxy_url`. The gate, the connector build, the
+static-credential hop label and at least the ``bounded_read`` send-time checks read through this
+module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s label and the
+``requests``/``hvac`` path in ``strict_requests``.
+
+``urlsplit`` is called with its cache taken off, as ``strict_requests`` does (vault BACKLOG
+#3454): the value may carry the proxy password, and a refused value should not stay a key in a
+process-wide cache. Other readers of the same value still use the cached function.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.
@@ -28,10 +34,12 @@ cycle.
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import re
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 __all__ = [
@@ -50,12 +58,18 @@ _NAME_HOST = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.?")
 #: A port as digits only. Its range is checked apart, so ``0`` and ``99999`` read as refused.
 _PORT = re.compile(r"[0-9]{1,5}")
 
+#: ``urlsplit`` without its ``functools.lru_cache`` layer; the module docstring says why.
+_UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = inspect.unwrap(
+    urllib.parse.urlsplit
+)
+
 #: The fixed refusal text. It names the setting and the rule, never the value.
 _REFUSED = (
     "proxy_url must be http(s)://[user:password@]host[:port] with nothing after the port but an "
     "optional '/': no path, query or fragment, a host that is a DNS name, an IPv4 address or a "
-    "bracketed IPv6 address, and a numeric port. Percent-encode any '/', '?', '#' or '@' in the "
-    "user or password, or set them in proxy_user/proxy_password (vault BACKLOG #2965)"
+    "bracketed IPv6 address, written in ASCII, and a port from 1 to 65535 with no leading zero. "
+    "Percent-encode any '/', '?', '#' or '@' in the user or password, or set them in "
+    "proxy_user/proxy_password (vault BACKLOG #2965)"
 )
 
 
@@ -127,7 +141,7 @@ def parse_proxy_url(value: str) -> ProxyAddress:
     host or port. A userinfo stays allowed. The caller strips the value and handles ``"default"``
     first. Neither the message nor the exception chain carries any part of the value."""
     try:
-        parts = urllib.parse.urlsplit(value)
+        parts = _UNCACHED_URLSPLIT(value)
         u_scheme, u_user, u_password, u_hostport = read_like_urllib(value)
     except ValueError:
         parts = None
@@ -163,23 +177,23 @@ def parse_proxy_url(value: str) -> ProxyAddress:
         port=port,
         userinfo=userinfo if at else None,
     )
-    # The two readings must agree, on the value as written and on the URL rebuilt from it. urllib
-    # unquotes the host port before it dials, so the unquoted form is compared.
+    # The two readings must agree, on the value as written and on the URL rebuilt from it, which
+    # is what is dialled. urllib unquotes the host port before it dials, so the unquoted form is
+    # compared. The rebuilt URL keeps the netloc as written, so urlsplit is not run on it again.
     try:
-        r_scheme, r_user, r_password, r_hostport = read_like_urllib(address.url)
-        s_parts = urllib.parse.urlsplit(address.url)
-        s_hostname, s_port = s_parts.hostname, s_parts.port
+        rebuilt: tuple[str | None, str | None, str | None, str] | None = read_like_urllib(
+            address.url
+        )
     except ValueError:
-        raise ValueError(_REFUSED) from None
+        rebuilt = None  # raised below, after the handler, so the chain holds no urllib text
     if (
-        (u_scheme or "").lower() != scheme
-        or (r_scheme or "").lower() != scheme
+        rebuilt is None
+        or (u_scheme or "").lower() != scheme
+        or (rebuilt[0] or "").lower() != scheme
         or urllib.parse.unquote(u_hostport) != address.hostport
-        or urllib.parse.unquote(r_hostport) != address.hostport
-        or (u_user, u_password) != (r_user, r_password)
+        or urllib.parse.unquote(rebuilt[3]) != address.hostport
+        or (u_user, u_password) != rebuilt[1:3]
         or (u_user, u_password) != (parts.username, parts.password)
-        or s_hostname != address.hostname
-        or s_port != port
         or parts.hostname != address.hostname
     ):
         raise ValueError(_REFUSED)
