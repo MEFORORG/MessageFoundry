@@ -195,7 +195,10 @@ class _Scan(ast.NodeVisitor):
         target = _link_named(node.args[0], self.links) if node.args else None
         if target is not None:
             self.seen.add(id(node.args[0]))
-            self._row(target, _posture_of(node, None))
+            # The link is the runner's first argument, so a posture it takes by position sits one
+            # place later. Read by keyword alone, a positional posture would record as `-`.
+            position = self.links[target]
+            self._row(target, _posture_of(node, None if position is None else position + 1))
         self.generic_visit(node)
 
     def _reference(self, node: ast.Name | ast.Attribute) -> None:
@@ -607,3 +610,35 @@ def test_the_scan_reads_a_keyword_or_the_links_own_position(
 ) -> None:
     (node,) = [n for n in ast.walk(parse_source(call)) if isinstance(n, ast.Call)]
     assert _posture_of(node, position) == shape
+
+
+@pytest.mark.parametrize(
+    ("call", "link", "shape"),
+    [
+        (
+            "asyncio.to_thread(_offline_alert_notifier, settings, posture)",
+            "_offline_alert_notifier",
+            "posture",
+        ),
+        (
+            "asyncio.to_thread(_offline_alert_notifier, settings, posture=relaxed)",
+            "_offline_alert_notifier",
+            "relaxed",
+        ),
+        ("asyncio.to_thread(_offline_alert_notifier, settings)", "_offline_alert_notifier", _NONE),
+        (
+            "functools.partial(_load_external_provider, name, settings, relaxed)",
+            "_load_external_provider",
+            "relaxed",
+        ),
+        ("asyncio.to_thread(open_store, settings, relaxed)", "open_store", _NONE),
+    ],
+)
+def test_the_scan_reads_a_runners_posture_one_place_after_the_link(
+    call: str, link: str, shape: str
+) -> None:
+    """A link handed to a runner is the runner's first argument, so a posture the link takes by
+    position sits one place later. Read by keyword alone, a posture passed there recorded as ``-``,
+    which the census accepts as none on purpose. A keyword-only link still reads ``-`` for a
+    positional argument, because that argument is not its posture."""
+    assert _scan(f"def f():\n    {call}\n", "x.py") == [("x.py", "f", link, shape)]
