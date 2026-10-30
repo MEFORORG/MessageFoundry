@@ -112,18 +112,21 @@ def make_connscale_shape(
     the env route (:func:`load_connscale_shape`) and the generated per-step config directory the
     connscale runner writes (``harness.load.connscale.stepconfig``, BACKLOG #3132), so a shape that
     one route refuses the other refuses too."""
+    # Each refusal names the knob both ways: the profile/CLI name the sweep runner sets, and the
+    # MEFOR_CONNSCALE_* variable the env route reads.
     if transform not in _TRANSFORMS:
         raise ValueError(
-            f"MEFOR_CONNSCALE_TRANSFORM must be one of {sorted(_TRANSFORMS)}, got {transform!r}"
+            f"transform (MEFOR_CONNSCALE_TRANSFORM) must be one of {sorted(_TRANSFORMS)}, "
+            f"got {transform!r}"
         )
-    _bounded("MEFOR_CONNSCALE_COUNT", count, minimum=_MIN_COUNT, maximum=_MAX_COUNT)
-    _bounded("MEFOR_CONNSCALE_BASE_PORT", base_port, minimum=1, maximum=_MAX_PORT)
-    _bounded("MEFOR_CONNSCALE_SINK_PORT", sink_port, minimum=1, maximum=_MAX_PORT)
-    _bounded("MEFOR_CONNSCALE_SINK_PORTS", sink_ports, minimum=1, maximum=4096)
+    _bounded("count (MEFOR_CONNSCALE_COUNT)", count, minimum=_MIN_COUNT, maximum=_MAX_COUNT)
+    _bounded("base_port (MEFOR_CONNSCALE_BASE_PORT)", base_port, minimum=1, maximum=_MAX_PORT)
+    _bounded("sink port (MEFOR_CONNSCALE_SINK_PORT)", sink_port, minimum=1, maximum=_MAX_PORT)
+    _bounded("sink ports (MEFOR_CONNSCALE_SINK_PORTS)", sink_ports, minimum=1, maximum=4096)
     if not _NAME_PREFIX_RE.match(name_prefix):
         raise ValueError(
-            f"MEFOR_CONNSCALE_NAME_PREFIX must match [A-Za-z0-9_]* (safe in a connection name), "
-            f"got {name_prefix!r}"
+            f"name prefix (MEFOR_CONNSCALE_NAME_PREFIX) must match [A-Za-z0-9_]* (safe in a "
+            f"connection name), got {name_prefix!r}"
         )
     # The N inbound ports occupy [base_port, base_port + count). Validate the block stays inside the
     # port space and does NOT overlap the sink port range — a collision would have an inbound listener
@@ -131,14 +134,15 @@ def make_connscale_shape(
     inbound_hi = base_port + count - 1
     if inbound_hi > _MAX_PORT:
         raise ValueError(
-            f"MEFOR_CONNSCALE_BASE_PORT={base_port} + COUNT={count} runs past port {_MAX_PORT} "
+            f"base_port {base_port} + count {count} runs past port {_MAX_PORT} "
             f"(highest inbound port would be {inbound_hi})"
         )
     sink_lo, sink_hi = sink_port, sink_port + sink_ports - 1
     if base_port <= sink_hi and sink_lo <= inbound_hi:
         raise ValueError(
             f"inbound port block [{base_port}, {inbound_hi}] overlaps the sink port range "
-            f"[{sink_lo}, {sink_hi}] — move MEFOR_CONNSCALE_BASE_PORT or MEFOR_CONNSCALE_SINK_PORT apart"
+            f"[{sink_lo}, {sink_hi}] — move base_port (MEFOR_CONNSCALE_BASE_PORT) or the sink "
+            f"port (--sink-port, MEFOR_CONNSCALE_SINK_PORT) apart"
         )
     return ConnScaleShape(
         count=count,

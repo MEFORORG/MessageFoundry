@@ -33,6 +33,9 @@ from harness.config.connscale._shape import ConnScaleShape, make_connscale_shape
 
 #: The generated config module's file name. Not ``_``-prefixed, so the loader loads it.
 GRAPH_MODULE = "connscale_graph.py"
+#: The prefix of the temp directory the runner generates per step. An engine serving one carries it
+#: on its command line, which is how the smoke's leak census finds a sweep engine.
+STEP_CONFIG_DIR_PREFIX = "mefor-connscale-cfg-"
 
 _TEMPLATE = '''# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors

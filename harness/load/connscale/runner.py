@@ -71,7 +71,7 @@ from harness.load.connscale.report import (
     herd_floor_readings,
     monotonic_pairs,
 )
-from harness.load.connscale.stepconfig import write_step_config_dir
+from harness.load.connscale.stepconfig import STEP_CONFIG_DIR_PREFIX, write_step_config_dir
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
@@ -267,6 +267,7 @@ async def run_connscale(
     # Counted at the swallow itself, so the run-level gate below does not depend on which of the
     # detail dicts above a later change keeps writing.
     ab_axis = bool(profile.ab_axes())
+    sandbox_ab = profile.ab_axes() == ("sandbox_modes",)
     steps_missed = 0
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
@@ -339,7 +340,13 @@ async def run_connscale(
                                 # sweep such as connscale.toml re-raises a setup fault exactly as
                                 # per_lane does: exit 2 at once, not a miss per cell and a late exit 1.
                                 # It keeps the RCSI attribution the miss note would have carried.
-                                if claim_mode != "pooled":
+                                # A sandbox A/B swallows only its SUBPROCESS arm, whatever the
+                                # claim mode: that arm failing to start is a result, and its
+                                # baseline failing is a setup fault (BACKLOG #3132).
+                                if sandbox_ab:
+                                    if sandbox_mode != SANDBOX_SUBPROCESS:
+                                        raise
+                                elif claim_mode != "pooled":
                                     raise
                                 if not ab_axis:
                                     raise ConnScaleError(_pooled_miss_reason(str(exc))) from exc
@@ -348,16 +355,12 @@ async def run_connscale(
                                 # conns, a DB-connect fault, a config error, a port-bind clash) so an
                                 # operator doesn't flip a DB setting and burn another multi-minute (or
                                 # per-box-dollar) run chasing a phantom RCSI problem.
-                                reason = _pooled_miss_reason(str(exc))
+                                reason = str(exc) if sandbox_ab else _pooled_miss_reason(str(exc))
                                 fuse_tag = "B1" if fuse_mode else "B0"
                                 batch_tag = "B1" if batch_mode else "B0"
                                 # A sandbox A/B varies the sandbox arm, not the claim mode, so
                                 # its miss is not labelled a pooled one (BACKLOG #3132).
-                                arm = (
-                                    "SANDBOX ARM MISSING"
-                                    if profile.ab_axes() == ("sandbox_modes",)
-                                    else "POOLED ARM MISSING"
-                                )
+                                arm = "SANDBOX ARM MISSING" if sandbox_ab else "POOLED ARM MISSING"
                                 notes.append(
                                     f"{arm} [{mode}] N={count} fuse={fuse_tag} "
                                     f"batch={batch_tag} sandbox={sandbox_mode}: {reason}"
@@ -490,7 +493,7 @@ async def _run_one_step(
     # (BACKLOG #3132): a sandbox worker never receives a MEFOR_ name, so on the env route it built the
     # default shape. Every arm serves a generated directory, so the off and subprocess arms load the
     # graph the same way. Removed in the `finally`.
-    config_dir = tempfile.mkdtemp(prefix="mefor-connscale-cfg-")
+    config_dir = tempfile.mkdtemp(prefix=STEP_CONFIG_DIR_PREFIX)
     try:
         write_step_config_dir(
             config_dir,
@@ -508,10 +511,52 @@ async def _run_one_step(
         raise ConnScaleError(f"connscale step {tag}: could not write its config: {exc}") from exc
     try:
         node = EngineNode(tag, api_port, env=node_env, config_dir=config_dir, cwd=cwd)
-    except BaseException:
-        # The `finally` below is not reached from here, and it is what removes the directory.
+        return await _run_started_step(
+            profile,
+            node=node,
+            corpus=corpus,
+            metrics=metrics,
+            correlator=correlator,
+            sink=sink,
+            node_env=node_env,
+            claim_mode=claim_mode,
+            fuse_mode=fuse_mode,
+            batch_mode=batch_mode,
+            sandbox_mode=sandbox_mode,
+            mode=mode,
+            count=count,
+            aggregate_rate=aggregate_rate,
+            sink_host=sink_host,
+            base_env=base_env,
+        )
+    finally:
+        # Disposable output this step made. Here, around everything that runs once it exists, so
+        # neither a constructor fault nor a cancelled stop leaves it behind. The step stops its
+        # engine before returning or raising, so nothing is reading it by now.
         shutil.rmtree(config_dir, ignore_errors=True)
-        raise
+
+
+async def _run_started_step(
+    profile: ConnScaleProfile,
+    *,
+    node: EngineNode,
+    corpus: Corpus,
+    metrics: LiveMetrics,
+    correlator: Correlator,
+    sink: CorrelationSink,
+    node_env: dict[str, str],
+    claim_mode: str,
+    fuse_mode: bool,
+    batch_mode: bool,
+    sandbox_mode: str,
+    mode: str,
+    count: int,
+    aggregate_rate: float,
+    sink_host: str,
+    base_env: Mapping[str, str],
+) -> ConnScaleRecord:
+    """The body of one step once its engine node exists; :func:`_run_one_step` owns its config
+    directory."""
     # Named rather than inlined: the OS probe now runs on its own task and stamps its readings with the
     # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
     # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
@@ -815,14 +860,8 @@ async def _run_one_step(
             await sink.stop()
         with contextlib.suppress(Exception):
             await poller.close()
-        try:
-            with contextlib.suppress(Exception):
-                await node.stop()
-        finally:
-            # After the stop, so the engine is not reading it, and in a `finally`, so a
-            # cancellation during the stop does not leave it behind. Disposable output this step
-            # made.
-            shutil.rmtree(config_dir, ignore_errors=True)
+        with contextlib.suppress(Exception):
+            await node.stop()
 
 
 def _sandbox_reading(sandbox_mode: str, node_env: Mapping[str, str]) -> SandboxReading:
@@ -2538,6 +2577,10 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     would pass every other check here. A walk that failed is a failure too: an instrument that did
     not read cannot vouch for the arm.
 
+    IT IS A FLOOR, NOT A PER-INBOUND PROOF. On a Windows venv a worker tree is two processes, so
+    workers on half the inbounds also clear it. It catches an arm with no workers or with far too
+    few; a per-inbound proof would group the started processes by worker root, which this does not.
+
     It grades TODAY'S worker shape, one worker tree per traffic-carrying inbound. ADR 0187 (option
     1, accepted) replaces that with a bounded shared pool; once the pool is built, a subprocess step
     starts far fewer processes than inbounds, and this floor must change with it.
@@ -2588,6 +2631,8 @@ def _warmup_slo(records: list[ConnScaleRecord]) -> SloCheck:
         for r in records
         if r.sandbox is None or not r.sandbox.warmup_ran or r.sandbox.warmup_delivered < r.count
     ]
+    if not records:
+        short.append("no step was recorded")
     observed = "; ".join(short) if short else f"ok ({len(records)} step(s))"
     return SloCheck("warmup_delivered", "one delivery per connection", observed, not short)
 

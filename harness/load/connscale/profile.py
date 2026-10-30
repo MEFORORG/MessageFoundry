@@ -487,6 +487,13 @@ def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
             f"-- each worker spawns on its inbound's first message, and without a warm-up that spawn "
             f"is charged to the hold"
         )
+    # A reload replaces every inbound's worker, so the reload probe would put N respawns inside
+    # the hold, the very cost the warm-up keeps out, with nothing in the record saying so.
+    if profile.reload_probe:
+        raise ConnScaleProfileError(
+            f"{where}: reload_probe = true with sandbox_modes naming {SANDBOX_SUBPROCESS!r}; a "
+            f"reload respawns every worker inside the hold, so leave reload_probe off for a sandbox arm"
+        )
     # The engine hard-disables fusion when [sandbox].mode is subprocess (it would run sandboxed code
     # in-process), so a fused subprocess arm would silently measure the unfused path.
     if FUSE_ON in profile.fuse_modes:

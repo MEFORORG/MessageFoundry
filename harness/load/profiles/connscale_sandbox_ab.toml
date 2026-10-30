@@ -43,7 +43,10 @@ connect_batch = 50
 connect_batch_pause_s = 0.05
 poll_interval_s = 1.0
 drain_timeout_s = 300.0
-base_port = 2600
+# The N inbound ports occupy [base_port, base_port + count). A base of 2600 would reach 4099 at
+# N=1500 and overlap the default `--sink-port 2700`, which the step's shape check refuses. 20000
+# matches batch_ab.toml, clear of the sink, the API port and the two-box `--sink-base 40000` band.
+base_port = 20000
 transform = "cheap"
 # Reload latency is a different question; leave wall #5 off.
 reload_probe = false

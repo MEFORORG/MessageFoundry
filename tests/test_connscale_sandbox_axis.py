@@ -107,6 +107,10 @@ def test_the_shipped_sandbox_ab_records_750_beside_1500_on_pooled() -> None:
     assert p.claim_modes == ("pooled",)
     assert set(p.counts) >= {750, 1500}
     assert p.warmup_timeout_s > 0.0
+    # Every step's shape is accepted with the CLI's default sink port, so the documented invocation
+    # does not miss every step at config generation.
+    for count in p.counts:
+        make_connscale_shape(count=count, base_port=p.base_port, sink_port=2700)
 
 
 # --- the environment and the stamp ----------------------------------------------------------------
@@ -410,3 +414,50 @@ async def test_a_sandbox_arm_miss_is_not_labelled_pooled(
     assert not any("POOLED ARM MISSING" in n for n in report.notes)
     assert "no subprocess step was recorded" in str(_check(report, "sandbox_workers").observed)
     assert not report.result_ok
+
+
+# --- review round 2 -------------------------------------------------------------------------------
+
+
+def test_a_reload_probe_with_a_subprocess_arm_is_refused() -> None:
+    with pytest.raises(ConnScaleProfileError, match="reload_probe"):
+        load_connscale_profile_text(_SANDBOX_AB + "reload_probe = true\n")
+
+
+_PER_LANE_SANDBOX_AB = _SANDBOX_AB.replace('claim_modes = ["pooled"]', 'claim_modes = ["per_lane"]')
+
+
+async def test_a_per_lane_sandbox_ab_records_a_subprocess_miss_rather_than_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _step(
+        _profile: object, *, sandbox_mode: str, count: int, **_kw: Any
+    ) -> ConnScaleRecord:
+        if sandbox_mode == "subprocess" and count == 20:
+            raise ConnScaleError("engine failed to start (synthetic)")
+        return _record(count, _reading(sandbox_mode, count, started=40 if count else 0))
+
+    monkeypatch.setattr(runner_mod, "_run_one_step", _step)
+    profile = _profile(base=_PER_LANE_SANDBOX_AB)
+    report = await run_connscale(profile, engine_api_port_base=9000, sink_port=8000)
+    # The subprocess arm stopping short of the top count is a result, recorded, not a crash.
+    assert len(report.records) == 3
+    assert any("SANDBOX ARM MISSING" in n and "N=20" in n for n in report.notes), report.notes
+    assert not report.result_ok
+
+
+async def test_a_failed_baseline_arm_of_a_sandbox_ab_is_a_setup_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _step(_profile: object, *, sandbox_mode: str, **_kw: Any) -> ConnScaleRecord:
+        raise ConnScaleError(f"engine failed to start (synthetic, {sandbox_mode})")
+
+    monkeypatch.setattr(runner_mod, "_run_one_step", _step)
+    with pytest.raises(ConnScaleError, match="synthetic, off"):
+        await run_connscale(_profile(), engine_api_port_base=9000, sink_port=8000)
+
+
+def test_a_warm_up_check_with_no_step_is_not_a_pass() -> None:
+    check = runner_mod._warmup_slo([])
+    assert not check.ok
+    assert "no step was recorded" in str(check.observed)
