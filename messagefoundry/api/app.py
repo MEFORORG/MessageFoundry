@@ -1894,7 +1894,8 @@ def _posture_loosenings(
             revocation_attested_hops=revocation_hops,
             path_form_fhir_hops=path_form_hops,
             api=api_settings,
-            # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
+            # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
+            # gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
             # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
             # live section. An app built without it (an embedding, or a test) is read at the

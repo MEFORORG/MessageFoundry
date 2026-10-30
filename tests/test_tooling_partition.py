@@ -90,6 +90,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # again. Either change arrives as an ENGINE or harness diff, which does not trip the
         # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
         "test_anon_doc_claims.py",
+        # Reads messagefoundry/config/settings.py off disk and parses the comment above
+        # AuthSettings.require_mfa (vault BACKLOG #3474). It fails when that comment gives the old
+        # exposure rule again, which arrives as an ENGINE diff the tooling path gate does not see.
+        # Its other arms read docs/SECURITY-LOOSENING.md and docs/CONFIGURATION.md, and they are
+        # not the reason it stays.
+        "test_exposure_rule_doc_drift.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE

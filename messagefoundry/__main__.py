@@ -49,7 +49,6 @@ __lazy_modules__ = ["sqlite3", "tomllib"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402
-import contextlib  # noqa: E402
 import functools  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -162,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         args,
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
+        author_prints_keep_stdout=_AUTHOR_PRINTS_KEEP_STDOUT,
         floor_code=_floor_error_code,
     )
 
@@ -1483,10 +1483,7 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        # This load imports the author's config modules ahead of the subcommand's own load, so a
-        # print() in one would reach stdout before any command redirects it (vault BACKLOG #2727).
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir)
+        reg = load_config(config_dir)
     except (WiringError, FileNotFoundError, OSError):
         # A config that doesn't load is reported by the subcommand's own validate/load path with a
         # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
@@ -2703,6 +2700,7 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
+        _approvals_loosenings,
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
@@ -4022,13 +4020,40 @@ def _serve(args: argparse.Namespace) -> int:
     # the sec-mfa-on / retention / notifications prod-refuse ladder above, returning 2) instead of
     # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
     # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
-    if admin_exposed and not settings.approvals.enabled:
+    #
+    # Dual control on with a narrowed or empty [approvals].operations leaves the same actions on one
+    # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
+    # wording are `_approvals_loosenings`', the one reader of that list against its default, so this
+    # arm does not compare the list itself. The off case's text still names the shipped pair. Still WARN-only: the arm's body holds no return.
+    # The serve-time loosenings warning above prints the same risk text; this is the exposure
+    # reminder beside it, as the MFA arm's is.
+    held_gap = (
+        next(
+            (
+                risk
+                for switch, risk in _approvals_loosenings(settings.approvals)
+                if switch == "approvals.operations"
+            ),
+            None,
+        )
+        if admin_exposed
+        else None
+    )
+    if admin_exposed and (not settings.approvals.enabled or held_gap is not None):
+        if not settings.approvals.enabled:
+            gap = (
+                "[approvals].enabled off — high-value actions (dead_letter_replay, "
+                "connection_purge) each complete on a single caller's authority with no second "
+                "sign-off (ASVS 2.3.5). Enable dual-control with [approvals].enabled=true"
+            )
+        else:
+            gap = (
+                f"[approvals].operations narrowed: {held_gap} (ASVS 2.3.5). Hold the default "
+                "operations in [approvals].operations"
+            )
         print(
-            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
-            "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) each "
-            "complete on a single caller's authority with no second sign-off (ASVS 2.3.5). Enable "
-            "dual-control with [approvals].enabled=true so a distinct approver (approvals:approve) must "
-            "release them before exposure.",
+            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with {gap} so "
+            "a distinct approver (approvals:approve) must release them before exposure.",
             file=sys.stderr,
         )
 
@@ -5472,8 +5497,7 @@ def _validate(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, _ = resolved
-    with _author_prints_to_stderr():
-        diags = validate_config(config_dir)
+    diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -5500,8 +5524,7 @@ def _graph(args: argparse.Namespace) -> int:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir, allow_empty=True)
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -5621,20 +5644,6 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
         return PipelineSettings().snapshot_on_send
 
 
-def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
-    """Send a print() in the author's own code to stderr for the duration of one call.
-
-    ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
-    one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
-    the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
-    ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
-
-    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
-    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
-    still lets a print reach stdout."""
-    return contextlib.redirect_stdout(sys.stderr)
-
-
 def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
     """The text ``dryrun`` reports for an error that stopped its per-message loop.
 
@@ -5667,8 +5676,7 @@ def _dryrun(args: argparse.Namespace) -> int:
         return resolved
     config_dir, service_config = resolved
     try:
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir)
+        reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -5696,14 +5704,13 @@ def _dryrun(args: argparse.Namespace) -> int:
         traced: list[dict[str, Any]] = []
         try:
             for source, path, raw in messages:
-                with _author_prints_to_stderr():
-                    entry = trace_dry_run(
-                        reg,
-                        raw,
-                        inbound=args.inbound,
-                        show_phi=show_phi,
-                        snapshot_on_send=snapshot_on_send,
-                    )
+                entry = trace_dry_run(
+                    reg,
+                    raw,
+                    inbound=args.inbound,
+                    show_phi=show_phi,
+                    snapshot_on_send=snapshot_on_send,
+                )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
             return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
@@ -5713,8 +5720,7 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            with _author_prints_to_stderr():
-                result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
             out.append(
                 {
                     "source": source,
@@ -11036,7 +11042,8 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
     # degradation marker.
     _api = ApiSettings()
-    # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
+    # BACKLOG #2489, vault #3123: [approvals] carries the dual-control dwell, expiry and held list.
+    # Same read, same marker.
     _approvals = ApprovalsSettings()
     # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
     _cert_monitor = CertMonitorSettings()
@@ -11430,6 +11437,17 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: docstring says what it covers. `supervise` calls
 #: `configure_logging` on its first line, so it has no such window.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
+
+#: The subcommands `run_cli` does NOT mark as carrying a result on stdout, so a print() in a config
+#: module, Router or Handler they run stays on stdout (`messagefoundry.author_output`, vault BACKLOG
+#: #3474). Every other entry in `_DISPATCH` sends such a print to stderr by default, so a new
+#: subcommand, or a new config load in an old one, is covered without anyone wrapping it.
+#: `tests/test_cli_author_prints.py` pins this set.
+#:
+#: Both run for as long as the service does, print no result, and log to the stdout NSSM captures.
+#: The redirect swaps the process's `sys.stdout`, and a `/config/reload` loads the graph in a worker
+#: thread while the engine runs, so under `serve` it would move other threads' output too.
+_AUTHOR_PRINTS_KEEP_STDOUT = frozenset({"serve", "supervise"})
 
 _DISPATCH = {
     "serve": _serve,
