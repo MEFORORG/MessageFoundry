@@ -6297,7 +6297,7 @@ def create_app(
         secret_provider = getattr(request.app.state, "secret_provider", None)
         success = False
         detail: str | None = None
-        transport: EmailTransport | None = None
+        building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
             smtp_password = resolve_connector_secret(
@@ -6309,6 +6309,7 @@ def create_app(
             tls_settings = getattr(request.app.state, "tls_settings", None)
             # Built off the event loop (BACKLOG #2193): with a login, the constructor's revocation
             # guard builds the hop's TLS context, which reads the trust store and any CRL from disk.
+            building = True
             transport = await asyncio.to_thread(
                 EmailTransport,
                 host=alerts.email_smtp_host,
@@ -6336,6 +6337,7 @@ def create_app(
                 revocation_attested=alerts.email_tls_revocation_attested,
                 revocation_attested_reason=alerts.email_tls_revocation_attested_reason,
             )
+            building = False
             # A fixed synthetic event — carries only a type/severity/connection label + a static detail
             # string; NO message body, NO PHI. The template-value allowlist maps these safely too.
             await transport.send(
@@ -6349,10 +6351,10 @@ def create_app(
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
             # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller. A hop refusal with no transport yet is
-            # the exception: nothing has dialled the relay, so it is the engine's own text, the
-            # operator's host and the remedy. A send's refusal can quote what the relay advertised.
-            if transport is None and isinstance(exc, InsecureHopRefused):
+            # host/credential hints) escapes to the caller. A hop refusal from the build is the
+            # exception: the build dials nothing, so it is the engine's own text, the operator's
+            # host and the remedy. A send's refusal can quote what the relay advertised.
+            if building and isinstance(exc, InsecureHopRefused):
                 detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
             else:
                 detail = safe_exc(exc)

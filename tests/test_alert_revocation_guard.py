@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from messagefoundry.api import app as app_module
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
@@ -571,7 +572,7 @@ _LONG_TEXT = " ".join(f"word-{i:05d}" for i in range(2000))
 
 
 def _raises(error: type[Exception]) -> Any:
-    def _raise(**_kwargs: Any) -> None:
+    def _raise(*_args: Any, **_kwargs: Any) -> None:
         raise error(_LONG_TEXT)
 
     return _raise
@@ -597,6 +598,16 @@ async def test_a_test_send_failure_that_is_not_the_builds_refusal_keeps_the_gene
     )
     detail = reply.json()["detail"]
     assert detail.startswith(f"{error.__name__}: word-00000"), detail  # the arm under test ran
+    assert "word-00300" not in detail, detail
+
+
+async def test_a_hop_refusal_from_the_secret_read_keeps_the_general_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The secret read comes before the build and can dial another hop, so it is not the build."""
+    monkeypatch.setattr(app_module, "resolve_connector_secret", _raises(InsecureHopRefused))
+    detail = (await _test_send(tmp_path)).json()["detail"]
+    assert detail.startswith("InsecureHopRefused: word-00000"), detail
     assert "word-00300" not in detail, detail
 
 
