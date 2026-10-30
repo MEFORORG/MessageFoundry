@@ -75,10 +75,12 @@ refusal into a browser answer.**
 
 - **Headers.** The console builds each sub-request with a fresh `Authorization: Bearer <token>`
   header from the session cookie and copies no browser header. One exception: a sub-request that
-  passes a browser body through, which is the file upload, carries that body's `Content-Type`,
-  because the multipart boundary is in it. The JSON plane's gates read no other request header:
-  `bearer_token` and `sole_authorization` read `Authorization`, and the body cap reads the length
-  headers the transport sets.
+  passes a browser body through, which is the file upload, carries that body's `Content-Type` and
+  `Content-Length`. The multipart boundary is in the first. The body cap refuses a chunked body with
+  no length (411), so the second keeps the pass-through from being refused, and the cap then judges
+  the same length it judged on the browser request. Both describe the body, not the browser. The
+  JSON plane's gates read no other request header: `bearer_token` and `sole_authorization` read
+  `Authorization`.
 - **The derived scope.** The sub-request's ASGI scope copies exactly these keys from the browser
   request's scope: `client`, `server`, `scheme`, `http_version` and `root_path`. It never copies
   `state`, `transport` or `headers`. `client` has already been through uvicorn's trusted-proxy
@@ -102,8 +104,10 @@ refusal into a browser answer.**
   transport saw `('127.0.0.1', 123)`. Left that way, the new-address check and the audit `client`
   column would read loopback for every console action. The build adds a small in-process transport
   in `apiclient` that derives the scope as above and streams the response body, for the attachment
-  download and the audit export. A handler exception reaches the console as a 500 response, never
-  as a re-raised exception.
+  download and the audit export. The transport owns the task that runs the inner app. When the
+  browser disconnects, the outer response stops, and the transport delivers `http.disconnect` to the
+  inner app's `receive` and cancels that task, so an aborted export holds no store cursor. A handler
+  exception reaches the console as a 500 response, never as a re-raised exception.
 - **The client.** `messagefoundry/apiclient`'s `EngineClient` is synchronous over `httpx.Client`.
   Calling it from an async console route would block the event loop (CLAUDE.md section 6). The
   build adds an async client to `apiclient` for the routes the console calls, over that transport.
@@ -112,16 +116,25 @@ refusal into a browser answer.**
 
 ### 2. What the console keeps
 
-**Every console route, other than the reviewed public set, makes at least one sub-request before
-it renders.** A route that shows no engine data of its own, such as the upload form or a
-confirmation page, sub-requests a new gate-only JSON route, `GET /auth/check`, naming the
-permissions of the action the page leads to. Its gate is `require` built from those permissions, so
-it runs, in `require`'s order, the MFA access gate with its `auth.mfa_denied` row, must-change
-confinement, the notification-address gate, the permission loop with its denial row, the idle-clock
-touch and the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
-from must-change confinement, and it names no permission, so it writes no grant row. The check
-route tells a caller nothing it cannot already read from its own `GET /auth/me`, which lists its
-permissions, and it answers a pending session before the permission loop, as `require` does. A form
+**Every console route makes at least one sub-request before it renders, except two reviewed
+sets.** One is the public set (sign-in and the like). The other is the confinement set: the pages
+a must-change, MFA-pending or address-less session must still reach, at least the change-password,
+notification-address and enrolment pages and the `/ui/session-status` heartbeat. Their actions call
+JSON routes that are themselves exempt from those gates (`/me/password`, the `/me/mfa` legs), and a
+check sub-request would send them back to themselves in a loop. The set is kept as
+`ENROL_FIRST_UI_ROUTES` is kept today.
+
+A route outside both sets that shows no engine data of its own, such as the upload form or a
+confirmation page, sub-requests a new gate-only route. Slice 2 registers one per permission,
+`GET /auth/check/<permission>`, in a loop over `Permission`, each gated `require(p)`, plus a bare
+`GET /auth/check` gated `require()`. Each is then a real static gate that the route walk and the
+policy table read, not a permission taken from the request. Each runs what `require` runs, in its
+order: the session resolution and idle-clock touch, must-change confinement, the MFA access gate
+with its `auth.mfa_denied` row, the notification-address gate, the permission loop with its denial
+row, and the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
+from must-change confinement, and it names no permission, so it writes no grant row. A check route
+tells a caller nothing it cannot already read from its own `GET /auth/me`, which lists its
+permissions, and a pending session is answered before the permission loop, as `require` does. A form
 that would lose an upload to a re-authentication asks the read-only step-up status route (slice 2,
 over `step_up_window_live`) first and sends the operator to `/ui/reauth` before showing the form.
 That is presentation. The action's own JSON gate is the control.
@@ -147,13 +160,14 @@ That is presentation. The action's own JSON gate is the control.
    | 403 with `X-Step-Up-Required`, reason new address | 303 to `/ui/reauth`, continuing as `_new_address_continuation` decides today: a PHI page returns to itself, and a write lands on `/ui` |
    | 403 with `X-Step-Up-Required`, any other reason (with `X-Step-Up-Action` and the IdP marker when set) | 303 to `/ui/reauth`, with a server-issued continuation when the `/ui` route is a registered continuation |
    | 403 with `X-Notify-Email-Required` | 303 to the notification-address page |
-   | 403 for a must-change session | 303 to the change-password page, or `/ui/mfa` first when a factor is owed |
+   | 403 for a must-change session | 303 to the target `must_change_target` picks today: the change-password page, `/ui/mfa` first when a factor is owed, or the enrolment page first when the account must enrol before rotating (ADR 0197 Amendment A) |
    | Any other 403 | the console's forbidden page |
    | 429 with `Retry-After` | the console's throttled page, carrying the same `Retry-After` |
    | Any other status | the status and detail the console renders for an `HTTPException` today; `/ui/nav-status` keeps its own "engine down" reading of a failed read |
 
    Two rows need a header the JSON plane does not send today, and slice 2 adds both. The
-   must-change refusal carries only a detail string. A new-address refusal and a stale step-up
+   must-change refusal carries only a detail string, so it gains a header whose value names which
+   of the three targets applies. A new-address refusal and a stale step-up
    window are the same 403 from `_step_up_refusal`, so the refusal gains a reason header. The
    console's continuation registry (`register_ui_action`) says only which `/ui` routes may be
    resumed after a re-authentication. That is navigation, not gate knowledge, and it stays.
@@ -162,20 +176,35 @@ ADR 0065 section 3's boundary holds unchanged. A browser request to a JSON route
 the cookie still gets a 401, which AC-8's existing test pins. Only the console's in-process transport
 turns a cookie into a bearer header, and only after steps 1 and 2.
 
-**What else leaves the console.** `UiDeps.get_engine`, `UiDeps.get_gate`, and every console read of
-`AuthService` outside the sign-in legs, such as `admin.py`'s direct `service.store.get_user` read,
-go too, each replaced by a JSON route. Otherwise a route could still read the engine behind a
-session check alone.
+**What else leaves the console.** `UiDeps.get_engine`, `UiDeps.get_gate`, and every console use of
+`AuthService` other than the sign-in legs and step 1's read-only `identity_for_token` go too, each
+replaced by a JSON route. At least `admin.py`'s direct `service.store.get_user` read and the account
+page's `count_other_sessions` and `store.list_webauthn_credentials` reads are in that set. Otherwise
+a route could still read the engine behind a session check alone. In-process Python can always
+reach `request.app.state` or a route's endpoint, so no design makes that impossible. What this one
+does is remove every injected handle and add a static guard (AC-1) that refuses a console module
+reading the engine, the approval gate or the auth store off `app.state`, or calling a route
+endpoint. A breach is then a visible diff, not a plausible gate choice.
+
+**Admin-write pacing.** `require_ui` charges the per-actor admin-write budget on every console
+non-GET today (#287). Some JSON twins of console writes are not paced, at least `POST /me/password`
+(`require()`) and the `require_reauth_only_action` lanes `/me/mfa/enroll`, `/me/mfa/confirm` and
+`DELETE /me/sessions`. Slice 2 paces them on the JSON plane, and the policy table's rule makes every
+non-GET JSON route at least a paced write. The console then loses no pacing, and a bearer client
+gains it.
 
 **Two console behaviours survive as presentation.** The JSON action gates spend an action-bound
 proof in the gate. Today `require_ui_step_up_action` can instead hold a proof unspent
 (`spend=False`, used by unlock pages) and tolerate a double-click (`repeat=`, vault #2625). Both
 become presentation over the JSON answer, never a way past it:
 
-- A double-click's second POST gets the JSON 403 for an action proof already spent. When the same
-  session's same `/ui` action succeeded within the window `repeat=` uses today, the console renders
-  "already submitted" rather than sending the operator to re-authenticate. The action is refused
-  either way.
+- A double-click's second POST must not reach the JSON gate as a fresh request, or it meets an
+  action proof the first one spent. The console marks the same session's same `/ui` action in
+  flight before its sub-request. A second POST that arrives while the first is in flight waits for
+  the first's outcome, up to the bound `repeat=` uses today, and renders it. It sends no
+  sub-request of its own. One that arrives after the first succeeded, within that window, renders
+  "already submitted". Neither acts, so neither passes a gate. That is today's #2625 behaviour,
+  moved from the gate into the page.
 - An unlock page asks the read-only step-up status route whether the session holds a live proof
   for an action, without spending it. Slice 2 adds that route, which also reports whether the
   session's step-up window is live.
@@ -210,12 +239,17 @@ as refused.
    - *Grant rows:* every sub-request writes its grant row, as a bearer request does. There is no
      deduplication: rows for different permissions or paths record different decisions, and
      dropping one would drop a decision. The volume is answered by composition instead. A polled
-     page that needs several JSON reads gets one JSON route that composes them, so each poll is one
-     sub-request. At least `/ui/nav-status` gets one, gated `monitoring:read`, with its alert count
-     present only under `monitoring:diagnose`, as the console checks inline today. That is 240
-     rows an hour per tab, and a bearer client gets the same one-call rollup. Each row records the
-     JSON path that was authorized and names the console route from the extension, so an
-     investigator can tell a console action from a bearer call.
+     page that needs several JSON reads of one permission gets one JSON route that composes them.
+     For `/ui/nav-status`, the `monitoring:read` reads (status, DR, cluster and nodes, each
+     `require(monitoring:read)` today) become one rollup route. The alert count stays its own
+     `monitoring:diagnose` route, called only when the display identity holds that permission, so
+     no permission is decided inline. That is 240 to 480 rows an hour per tab, and a bearer client
+     gets the same rollup. Each row records the JSON path that was authorized and names the console
+     route from the extension, so an investigator can tell a console action from a bearer call.
+   - The nav poll is not the heaviest. At least `/ui/monitoring/live` (`graph_edges` and
+     `metrics_history`) and `/ui/cluster/live` (`cluster_status` and `cluster_nodes`) poll every
+     5 seconds with two reads each: 1,440 sub-requests and grant rows an hour per open tab, or 720
+     composed. The `/ui/session-status` heartbeat is in the confinement set and makes none.
    - Whether timer-driven reads should write grant rows at all is a question for both planes
      together. It is listed for the owner below, not decided here.
 4. **One JSON encode and decode per call.** Measured on a stand-in FastAPI app, not the engine: a
@@ -244,9 +278,11 @@ config and state convergence workers (`pipeline/config_convergence.py`,
 no caller session. They would need a second mint path, and the guarantee would weaken to
 "`authorize()` or a system mint", the weaker guarantee bought at the larger cost. It would also
 re-sign about 110 handlers and the whole seam. The sub-request design gets the property that
-matters for the console more simply: the handlers are closures nested in `create_app` and
-`add_auth_routes`, and once `UiDeps` stops carrying them and the engine accessors, no console module
-holds a way in. AC-1 pins that.
+matters for the console more simply. The handlers are closures nested in `create_app` and
+`add_auth_routes`, so once `UiDeps` stops carrying them and the engine accessors, the console holds
+no injected handle. It could still reach one through `request.app`, as any in-process code can,
+and AC-1's static guard makes that a refused diff. Neither design stops in-process code determined
+to bypass it.
 
 ### 6. What it must not break
 
@@ -275,8 +311,10 @@ The files for AC-8 and AC-9 exist today. Each slice in the build order writes th
 
 - **AC-1** — WHEN the console is mounted, THE SYSTEM SHALL inject no engine handler and no engine
   or approval-gate accessor into it: `UiDeps` SHALL carry no `CoreHandlers`, `AdminHandlers`,
-  `get_engine` or `get_gate`, and the console's `AuthService` use SHALL be limited to a reviewed
-  list of sign-in-leg methods.
+  `get_engine` or `get_gate`; the console's `AuthService` use SHALL be limited to a reviewed list,
+  the sign-in legs plus the read-only `identity_for_token` of `require_ui`'s step 1; and a static
+  guard SHALL refuse a console module that reads the engine, the approval gate or the auth store off
+  `app.state`, or calls a route's endpoint, with a planted read as its positive control.
   → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-2** — WHEN a console route serves a browser request from address A, THE SYSTEM SHALL present
   A as the client of every sub-request it makes, so the new-address check and the audit `client`
@@ -284,10 +322,10 @@ The files for AC-8 and AC-9 exist today. Each slice in the build order writes th
   → `tests/test_inprocess_transport.py`
 - **AC-3** — WHEN the console makes a sub-request, THE SYSTEM SHALL send exactly one
   `Authorization` header built from the session cookie, no other browser header except a passed
-  body's `Content-Type`, and a scope holding no copied `state`.
+  body's `Content-Type` and `Content-Length`, and a scope holding no copied `state`.
   → `tests/test_inprocess_transport.py`
-- **AC-4** — WHEN a console route other than the reviewed public set serves a request, THE SYSTEM
-  SHALL make at least one sub-request before it renders.
+- **AC-4** — WHEN a console route outside the reviewed public and confinement sets serves a
+  request, THE SYSTEM SHALL make at least one sub-request before it renders.
   → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-5** — WHEN a timer-driven console poll makes a sub-request, THE SYSTEM SHALL leave the
   session's idle clock where it was, and SHALL write the grant row a bearer request would.
@@ -305,7 +343,8 @@ The files for AC-8 and AC-9 exist today. Each slice in the build order writes th
   fail the policy-table test, with a planted weaker gate as its positive control.
   → `tests/test_security_doc_drift.py`
 - **AC-10** — WHEN the console serves an attachment or the audit export, THE SYSTEM SHALL stream
-  the sub-response through the in-process transport without buffering it whole.
+  the sub-response through the in-process transport without buffering it whole; IF the browser
+  disconnects first, THEN THE SYSTEM SHALL cancel the inner request's task.
   → `tests/test_inprocess_transport.py`
 - **AC-11** — WHEN the console views a message body, THE SYSTEM SHALL record the body view's
   surface as `console`.
@@ -324,9 +363,10 @@ Each slice is one pull request, and each names what closes it.
    the helper into the console. *Closes:* a test pins each route's and each field's class.
 2. **Engine-side prerequisites, additive.** The extension reader in `api/security.py` (the poll
    flag; the console route on the grant row), the body-view surface read, the must-change refusal
-   header, the step-up refusal's reason header, `GET /auth/check`, the read-only step-up status
-   route, the composite poll routes (at least the nav rollup), and any JSON routes slice 1 found
-   missing. Each new route gets its gate, its policy class and its route-map row. With no
+   header, the step-up refusal's reason header, the `GET /auth/check` routes, the read-only step-up
+   status route, the composite poll routes (at least the nav rollup), admin-write pacing on the
+   unpaced JSON writes section 2 names, and any JSON routes slice 1 found missing. Each new route
+   gets its gate, its policy class and its route-map row. With no
    extension present, a bearer client sees no change beyond the new headers and routes. *Closes:*
    the JSON-plane halves of AC-5 and AC-11.
 3. **The transport and the async client.** The derived scope, response streaming, fresh headers.
@@ -343,7 +383,9 @@ Each slice is one pull request, and each names what closes it.
    routes with JSON routes, among them `_UI_JSON_COUNTERPARTS` and the tests that read it,
    `test_ui_gate_divergences_are_exactly_the_reviewed_set`, and the parity planted-weakening
    control. Shrink `authorize_ui_ws` to cookie and origin, and hand the token to the checks
-   `authorize_ws` runs, so the WebSocket writes its grant row too. Move the seam digest from
+   `authorize_ws` runs, so the WebSocket writes its grant row too. It passes `activity=False`, as
+   `authorize_ui_ws` does today, because `authorize_ws` resolves with `activity=True` and the
+   dashboard reopens the socket on a timer. Move the seam digest from
    handler signatures to the OpenAPI operations the console's client names, so a renamed query
    parameter or path moves it (FastAPI ignores an unknown query parameter, so a skewed console
    would otherwise lose a filter silently). Update `docs/SECURITY.md`'s `/ui` route map and
@@ -379,16 +421,18 @@ Each slice is one pull request, and each names what closes it.
 
 ## Consequences
 
-**Positive** — One gate family. The console cannot reach a handler, the engine or the approval
-gate without a JSON gate, and a future in-process caller has no handler reference to reach for.
+**Positive** — One gate family. The console holds no injected handle on a handler, the engine or
+the approval gate, and AC-1's guard refuses one reached through `app.state`.
 Route gates ship in the engine wheel. Every console action gets a grant row. Six drift rows' worth
 of hand-synchronised checks go away, with the parity tests that watched them. A later step that
 moves the JSON plane into a separate management process takes the console with it, and only the
 transport changes.
 
-**Negative / risks** — More work per console page: a session resolution per sub-request where there
-was one per page, and an encode and decode per call. The engine-side cost is unmeasured until slice
-5 measures it. The PHI budget is spent faster on pages that read two resources. The derived scope
+**Negative / risks** — More work per console page. Today a page resolves the session once. Under
+this design, step 1 resolves it once, and each sub-request resolves it at least once more: twice on
+a route that reads a body (the before-body step and the gate), with one more session read on a PHI
+or paced route for the new-address check. Add an encode and decode per call. The engine-side cost
+is unmeasured until slice 5 measures it. The PHI budget is spent faster on pages that read two resources. The derived scope
 is security-relevant code: if it copied the wrong key, or failed to copy `client`, it would silently
 weaken the new-address check, the audit trail or the mTLS identity. AC-2 and AC-3 are its guards.
 The same-origin check stays in the console wheel. Grant rows from the console add audit volume
@@ -405,11 +449,12 @@ enforcement is unchanged; it stays where the handlers apply it.
 
 - [ ] The owner accepts or rejects this design. Acceptance is the owner's, and this ADR stays
       Proposed until then.
-- [ ] Timer-driven reads: should they write a grant row (240 an hour per tab for `/ui/nav-status`
-      under this design, the same as a bearer client polling the rollup), or should both planes
-      exempt them under `audit_all_authz`? A console-only exemption would re-open a plane
-      difference, so this design does not take one.
+- [ ] Timer-driven reads: should they write a grant row (under this design, 240 to 480 an hour per
+      tab for `/ui/nav-status` and 720 composed for each 5-second live page, the same as a bearer
+      client polling those routes), or should both planes exempt them under `audit_all_authz`? A
+      console-only exemption would re-open a plane difference, so this design does not take one.
 - [ ] Is the grant row's form right: the authorized JSON path, with the console route named beside
       it?
-- [ ] After slice 5's measurement, is one session resolution per sub-request acceptable, or should
-      the gate memoise the session for the length of one browser request?
+- [ ] After slice 5's measurement, are the extra session reads (one to three per sub-request, plus
+      step 1's) acceptable, or should the gate memoise the session for the length of one browser
+      request?
