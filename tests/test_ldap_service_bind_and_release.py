@@ -155,7 +155,7 @@ async def _kerberos_sign_in(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr("messagefoundry.auth.service._sleep_until", no_sleep)
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "alice")
-    settings = _ad_settings(kerberos_enabled=True)
+    settings = _ad_settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))

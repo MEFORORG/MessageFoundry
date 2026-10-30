@@ -4379,6 +4379,21 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   (`channel_bindings=None` — EPA is structurally broken behind a TLS-terminating proxy; the
   acceptor-enforcement question is a recorded ADR 0068 spike). Still experimental + off by
   default; mock-seam test coverage only (no AD test infrastructure exists).
+  **Realm (BACKLOG #2610):** the ticket's client principal must read `user@REALM`, split at the
+  last `@`, with `REALM` equal to `[auth].kerberos_realm` up to ASCII case. That key is required
+  once `kerberos_enabled` is on and is never taken from `ad_domain`, a UPN suffix that often
+  differs from the realm. The engine used to drop the realm unread, so on a KDC that trusts another
+  realm, `admin@PARTNER` would have signed in as the local `admin`. Refused with no directory
+  lookup, at least: another realm, a non-ASCII realm, a principal with no realm, and an account
+  part that is empty or holds `@`, `/` or `\`. Each is the `auth.login_failed` row with reason
+  `no_principal` and a `refusal` field naming the case from a closed set (`realm_mismatch`,
+  `no_realm`, `domain_backslash_form`, `not_a_bare_account_name`); neither that row nor the
+  WARNING the engine logs holds any of the principal's text. **The `DOMAIN\user` form is refused
+  too, and what Windows reports is UNVERIFIED.** On a Windows host, pyspnego's SSPI acceptor reads
+  the client's name from `SECPKG_ATTR_NAMES`, which is likely to hold that form, but nobody has run
+  this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
+  closed until a lab run decides how to read it. That is no looser than before, when its directory
+  lookup missed.
 
 ### AD-group → role mapping
 

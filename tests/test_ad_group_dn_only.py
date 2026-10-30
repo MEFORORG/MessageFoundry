@@ -688,7 +688,7 @@ def test_kerberos_principal_needs_a_complete_context(
 
     monkeypatch.setattr(spnego, "server", lambda **_kw: _Server())
     monkeypatch.setattr(ldap_mod, "_kerberos_capable", lambda: True)
-    assert kerberos_principal(b"token", AuthSettings()) == expected
+    assert kerberos_principal(b"token", AuthSettings(kerberos_realm="EXAMPLE.INVALID")) == expected
 
 
 class _Inner:
@@ -749,4 +749,4 @@ def test_the_negotiate_wrapper_is_judged_by_its_inner_context(
     server = _negotiate_server(outer=outer, inner=inner, protocol=protocol)
     monkeypatch.setattr(spnego, "server", lambda **_kw: server)
     monkeypatch.setattr(ldap_mod, "_kerberos_capable", lambda: True)
-    assert kerberos_principal(b"token", AuthSettings()) == expected
+    assert kerberos_principal(b"token", AuthSettings(kerberos_realm="EXAMPLE.INVALID")) == expected

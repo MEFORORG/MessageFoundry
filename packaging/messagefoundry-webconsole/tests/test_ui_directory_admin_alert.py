@@ -70,6 +70,7 @@ async def _service(engine: Engine, *, held: Role | None, bind: bool) -> AuthServ
         require_mfa=False,
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",
