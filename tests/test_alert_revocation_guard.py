@@ -469,7 +469,8 @@ _POSTURE_BUILDS = {
         "messagefoundry/api/app.py",
         "messagefoundry/__main__.py",
     },
-    "notifier_from_settings": {"messagefoundry/api/app.py"},
+    # The offline alert notifier `provision-admin` builds (vault BACKLOG #3849 B5).
+    "notifier_from_settings": {"messagefoundry/api/app.py", "messagefoundry/__main__.py"},
 }
 
 

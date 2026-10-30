@@ -8129,11 +8129,16 @@ def _offline_alert_notifier(
     ``posture`` keys the transports' revocation guards (BACKLOG #2193). Where it is ``None`` the
     guards get the instance's own, derived from ``settings``, as :func:`_offline_security_notifier`
     gives its guard, so a ``warn`` instance warns rather than taking the guards' enforcing default
-    for no posture. A guard's refusal is printed in its own words, once: it names the hop, its host
-    and the setting that clears it, and reads no secret, as ``_build_provision_auth_service`` shows
-    one.
+    for no posture. The Vault read for the SMTP password keeps the caller's posture, where ``None``
+    counts as enforcing, as there. ``provision-admin`` always passes one, so the split is reached
+    only by a caller with none.
+
+    A revocation guard's refusal, bare or as the cause of a ``SecretProviderError`` from the Vault
+    hop, is printed in its own words, once: it names the hop, its host and the setting that clears
+    it, and reads no secret, as ``_build_provision_auth_service`` shows one. Every other failure is
+    named by its class only.
     """
-    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.controlchars import scrub_control_chars
@@ -8172,8 +8177,10 @@ def _offline_alert_notifier(
 
     def failed(exc: Exception) -> None:
         failures.append(type(exc).__name__)
-        if isinstance(exc, InsecureHopRefused):
-            refusal = scrub_control_chars(_sentence(exc))
+        # The Vault provider raises its revocation refusal as the cause of its own type (#2317).
+        hop = exc.__cause__ if isinstance(exc, SecretProviderError) else exc
+        if isinstance(hop, InsecureHopRefused):
+            refusal = scrub_control_chars(_sentence(hop))
             if refusal not in shown:
                 shown.add(refusal)
                 print(f"WARNING: {refusal}", file=sys.stderr)
@@ -8324,7 +8331,8 @@ async def _raise_offline_administrator_granted(
     CALLER then writes the logging sink's line,
     so the line is written once whether or not this step answers at all. It never raises. Its own
     failure lines name the exception's class only, because a provider's or driver's text can carry
-    an address. The notifier's lines are not this step's: a failed send or open-instance write is
+    an address; a revocation guard's refusal, which names its hop's host and reads no secret, is
+    the one text :func:`_offline_alert_notifier` prints (BACKLOG #2193). The notifier's lines are not this step's: a failed send or open-instance write is
     logged inside :class:`NotifierAlertSink` as ``serve`` logs it, through the command's redacting
     handler."""
     import asyncio

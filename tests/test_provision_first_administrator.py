@@ -2610,6 +2610,39 @@ def test_a_refused_smtp_login_costs_the_email_only_across_the_retry(
     assert _offline_alert_notifier(ServiceSettings(alerts=email_only), enforcing) is None
 
 
+def test_a_vault_hop_refusal_behind_a_secret_error_is_shown_but_not_the_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Vault provider raises its revocation refusal as the cause of a ``SecretProviderError``
+    (#2317). The alert step shows that refusal, which names the setting that clears it, and still
+    names the provider error by its class only. The email is lost and the webhook kept."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config import secretprovider
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    def refused(*_a: object, **_k: object) -> None:
+        cause = InsecureHopRefused("synthetic Vault hop: set [secrets].vault_revocation_attested")
+        raise SecretProviderError("synthetic provider text at vault.example.invalid") from cause
+
+    monkeypatch.setattr(secretprovider, "resolve_secret_provider", refused)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_password_secret="alerts/smtp",
+        webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert err.count("[secrets].vault_revocation_attested") == 1
+    assert "vault.example.invalid" not in err and "SecretProviderError" in err
+
+
 @pytest.mark.usefixtures("_no_blanket_revocation_attestation")
 @pytest.mark.parametrize("explicit", [False, True], ids=["derived-warn", "not-enforcing"])
 def test_a_warn_instance_builds_the_unattested_webhook_offline(explicit: bool) -> None:
