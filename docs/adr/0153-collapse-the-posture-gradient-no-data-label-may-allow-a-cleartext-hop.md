@@ -402,5 +402,7 @@ be `https`. A peer that cannot speak TLS is reached through a TLS-terminating pr
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
 #3416). The owner ruled on that credential on 2026-10-05 (vault BACKLOG #3007, R1): it is refused
 over cleartext unless the connection declares the cleartext acceptance with a reason. That ruling
-is the specific one for this leg, so it stays judged by the declarations as before.
+is the specific one for this leg, so a declaration still judges it. *Amended 2026-10-30:* the
+owner's B462 rulings took `tls_hop_attested` off this leg, which
+[ADR 0126](0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md) Amendment G records.
 `docs/SECURITY-LOOSENING.md` says so beside the credential rule.

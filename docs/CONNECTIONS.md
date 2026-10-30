@@ -1590,15 +1590,28 @@ legs only, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
 a leg it lets through and what it does not check.
 
-A credential in a connection's own `proxy_url` is not checked when the connection is built, so its
-sends meet the rule above. With `[security].require_nonstatic_credentials` on, `serve` refuses a
-credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
-the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
-the connection is built, for a proxy written either way. It is refused there unless the proxy is
-on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`, the owner's
-2026-10-05 ruling on the proxy credential (vault BACKLOG #3007). `[security].enforcement = warn`
-does not lift it: the HTTP family's no-loosen floor turns that WARN back into a refusal. A
-connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+**A credential written in a proxy URL has no way across, and `proxy_user` has one declared way
+(owner rulings of 2026-10-05 and 2026-10-30, vault BACKLOG #3007).** R1 of the vault's
+`ASVS-OWNER-RULINGS-2026-10-05.md` refuses a proxy credential over cleartext unless the connection
+declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault's
+`OWNER-RULINGS-2026-10-30-BATCH462.md` add to that ruling, and are stricter than its text:
+
+- **`proxy_url` plus `proxy_user` is the one declared route.** A `proxy_user` credential is checked
+  when the connection is built, for a proxy written either way. It is refused there unless the
+  proxy is on this machine or the connection declares `cleartext_accepted` with a
+  `cleartext_reason`. A build on that declaration writes the cleartext acceptance audit record.
+  `[security].enforcement = warn` does not lift the refusal: the HTTP family's no-loosen floor
+  turns that WARN back into a refusal.
+- **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses.
+- **No declaration lifts a credential written in a URL or the environment.** A user and password
+  in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build. That
+  holds at every `[security].enforcement` setting and for a proxy on this machine, and
+  `static_credential_accepted` does not lift it. A credential in `HTTP_PROXY`, `HTTPS_PROXY` or the
+  system proxy settings meets the send-time rule above.
+- **The alert webhook, the OIDC legs and the AI broker have no setting for this.** They refuse an
+  environment proxy credential outright.
+
+A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
 
 A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows

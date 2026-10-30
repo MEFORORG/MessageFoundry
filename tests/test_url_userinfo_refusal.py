@@ -59,6 +59,7 @@ from messagefoundry.transports.egress import (
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import (
+    ProxyConfig,
     RestDestination,
     _redact_url,
     ech_sidecar_url_from_settings,
@@ -347,20 +348,19 @@ def test_a_url_urlsplit_cannot_parse_is_refused_without_echoing_it() -> None:
 
 def test_the_proxy_config_repr_carries_no_credential() -> None:
     """``ProxyConfig.redacted`` is gone, and the dataclass repr is what a traceback or an assertion
-    diff would print. The URL and the Basic header stay out of it, as the digest recipe's do."""
-    cfg = proxy_config_from_settings(
-        {
-            "proxy_url": f"https://u:{SECRET}@proxy.example.invalid:3128",
-            "proxy_user": "pu",
-            "proxy_password": SECRET,
-        },
-        dest_scheme="https",
-        # The proxy_user credential crosses before any TLS, even to this https:// proxy, so it
-        # builds only with a declaration (vault BACKLOG #3416).
-        attested=True,
+    diff would print. The URL and the Basic header stay out of it, as the digest recipe's do.
+
+    Built directly: ``proxy_config_from_settings`` now refuses a credential in the URL (vault
+    BACKLOG #3007), and this holds for a config however it was made."""
+    url = f"https://u:{SECRET}@proxy.example.invalid:3128"
+    cfg = ProxyConfig(
+        proxies=(("http", url), ("https", url)),
+        use_default=False,
+        bypass=(),
+        auth_header=(("Proxy-Authorization", f"Basic {SECRET}"),),
+        digest=None,
         connection="OB_2686",
     )
-    assert cfg is not None
     assert SECRET not in repr(cfg), repr(cfg)
     assert "Basic" not in repr(cfg), repr(cfg)
 

@@ -361,24 +361,17 @@ def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
     assert not _skip_records(caplog)
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {
-            "proxy_url": "http://127.0.0.1:3128",
-            "proxy_user": "user-marker",
-            "proxy_password": "secret-marker",
-        },
-        {"proxy_url": "http://user-marker:secret-marker@127.0.0.1:3128"},
-    ],
-    ids=["credential-in-settings", "credential-in-proxy-url"],
-)
 def test_the_skipped_proxy_record_carries_nothing_from_a_url_or_a_credential(
-    caplog: pytest.LogCaptureFixture, settings: dict[str, object]
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The record names the connection and states the fact. It holds no part of the proxy URL, no
     credential, and no part of the destination URL. Read on the record itself, arguments
     included, so a value that a formatter would drop is still seen."""
+    settings = {
+        "proxy_url": "http://127.0.0.1:3128",
+        "proxy_user": "user-marker",
+        "proxy_password": "secret-marker",
+    }
     with caplog.at_level(logging.INFO, logger=rest.__name__):
         _rest("http://localhost:18080/x", **settings)
     records = _skip_records(caplog)

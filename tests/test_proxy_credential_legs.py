@@ -229,6 +229,11 @@ def test_admission_never_covers_a_credential_from_a_proxy_url() -> None:
 
 
 _OFF_BOX_HTTPS_PROXY = "https://proxy.example.com:3128"
+_PROXY_LOGIN: dict[str, Any] = {
+    "proxy_url": _OFF_BOX_HTTPS_PROXY,
+    "proxy_user": "u5er",
+    "proxy_password": "pa55w0rd",
+}
 
 
 def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is_built() -> None:
@@ -243,22 +248,60 @@ def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is
         )
 
 
-@pytest.mark.parametrize("declaration", ["accepted", "attested"])
-def test_control_a_declared_connection_builds_and_its_handler_admits_the_header(
-    declaration: str,
-) -> None:
-    """``cleartext_accepted`` with ``cleartext_reason``, or ``tls_hop_attested`` with
-    ``tls_hop_attested_reason``: the guard admits the credential, and the proxy handler carries that
-    admission to send time."""
-    dest = _rest(
-        _HTTPS_TARGET,
-        proxy_url=_OFF_BOX_HTTPS_PROXY,
-        proxy_user="u5er",
-        proxy_password="pa55w0rd",
-        **{declaration: True},  # type: ignore[arg-type]
-    )
+def test_control_a_declared_connection_builds_and_its_handler_admits_the_header() -> None:
+    """``cleartext_accepted`` with ``cleartext_reason``: the guard admits the credential, and the
+    proxy handler carries that admission to send time."""
+    dest = _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
     assert dest._headers["Proxy-Authorization"] == _HEADER
     assert _proxy_handler(dest).caller_header_admitted is True
+
+
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforce", "warn"])
+def test_tls_hop_attested_does_not_admit_a_proxy_credential(
+    caplog: pytest.LogCaptureFixture, enforcing: bool
+) -> None:
+    """B462-R1 of the 2026-10-30 rulings, for this cell only (vault BACKLOG #3007)."""
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(InsecureHopRefused, match="tls_hop_attested does not admit it"),
+    ):
+        _rest(_HTTPS_TARGET, posture=HopPosture(enforcing=enforcing), attested=True, **_PROXY_LOGIN)
+    assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
+
+
+def test_control_tls_hop_attested_still_carries_the_body_hop_past_a_credential_free_proxy() -> None:
+    """The attestation's other work is untouched: the cleartext body hop is what it declares."""
+    assert _rest(_HTTP_TARGET, attested=True, proxy_url=_OFF_BOX_HTTPS_PROXY)._hop_guard is not None
+
+
+def test_an_accepted_proxy_user_build_writes_the_cleartext_acceptance_audit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The destination is ``https``, so the only cleartext crossing on this connection is the leg
+    to the proxy, and the control with no ``proxy_user`` writes no record (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, proxy_url=_OFF_BOX_HTTPS_PROXY)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
+    audit = [r.getMessage() for r in caplog.records if marker in r.getMessage()]
+    assert len(audit) == 1
+    assert "'OB_REST'" in audit[0]
+    assert "web-proxy cleartext credentials" in audit[0]
+    assert "legacy partner listener has no TLS" in audit[0]
+    for part in ("u5er", "pa55w0rd", _HEADER):
+        assert part not in audit[0], part
+
+
+def test_enforcement_warn_with_no_declaration_refuses_a_proxy_credential() -> None:
+    """``_shipped_strict_disposition`` floors the dial's WARN back to REFUSE. The control is the same
+    connection, with the acceptance, on the same dial."""
+    warn = HopPosture(enforcing=False)
+    with pytest.raises(InsecureHopRefused, match="before any TLS"):
+        _rest(_HTTPS_TARGET, posture=warn, **_PROXY_LOGIN)
+    accepted = _rest(_HTTPS_TARGET, posture=warn, accepted=True, **_PROXY_LOGIN)
+    assert _proxy_handler(accepted).caller_header_admitted is True
 
 
 def test_control_a_proxy_written_https_with_no_proxy_user_builds_as_before() -> None:

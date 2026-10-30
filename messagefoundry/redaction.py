@@ -719,8 +719,8 @@ _REDACT_WINDOW = 64 * 1024
 #: :func:`_ends_with_name_token` asks a name-shaped question, and the fix is a second walk rather than
 #: a wider one. For an ENDPOINT URL the construction-time refusal in ``transports/rest.py``
 #: ``refuse_url_credentials`` is the primary control and is untouched; that refusal deliberately does
-#: not screen a ``proxy_url``, which legitimately carries its own credentials, so do not read it as
-#: covering every arm.
+#: not screen a ``proxy_url``, which has a refusal of its own there, and a proxy from the environment
+#: meets neither, so do not read it as covering every arm.
 #:
 #: **The test a new pattern has to pass, which is a property and not a count:** if a cut at a space
 #: falls inside your span, does what is left still MATCH you? Answer it, and pin the answer beside the

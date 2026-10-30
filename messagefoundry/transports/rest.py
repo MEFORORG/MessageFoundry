@@ -1034,6 +1034,15 @@ _CLEARTEXT_CREDENTIAL_CELL = "HTTP cleartext credentials"
 #: because a declaration can still lift this one.
 _PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
 
+#: The refusal of a credential written in a connection's ``proxy_url`` (vault BACKLOG #3007). Fixed
+#: text, naming no part of the URL, because the part it is about is a password.
+_PROXY_URL_CREDENTIAL_REFUSED = (
+    "web-proxy URL credentials: proxy_url holds a user and a password; refused, with no escape. "
+    "No declaration lifts a credential written in a proxy URL. Take it out of the URL. To log in "
+    "to the proxy, set proxy_user and proxy_password: a proxy off this machine then also takes "
+    "cleartext_accepted with a cleartext_reason"
+)
+
 
 def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
     """The host ``url`` names when it is cleartext ``http`` to a host off this machine, else ``None``.
@@ -2175,7 +2184,6 @@ def proxy_auth_handler_from_settings(
     proxy_url: str,
     proxy_scheme: str,
     dest_scheme: str,
-    attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2197,8 +2205,8 @@ def proxy_auth_handler_from_settings(
     scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
     send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
-    item 4), this leg still honours ``tls_hop_attested`` and ``cleartext_accepted``, under the
-    owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007)."""
+    item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
+    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -2217,16 +2225,16 @@ def proxy_auth_handler_from_settings(
     # A proxy credential over a cleartext http proxy hop crosses in the clear on the CONNECT/request —
     # refuse it REGARDLESS of destination scheme, posture-keyed (ADR 0092). Names only the proxy host.
     # ADR 0153: the proxy hop is a distinct crossing from the destination hop, but it belongs to the
-    # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly (like
-    # `attested` beside it) rather than read off the settings mapping — one declaration, one source.
+    # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly
+    # rather than read off the settings mapping — one declaration, one source.
     # Judged as http whatever proxy_scheme says (vault BACKLOG #3416). A proxy_url serves both schemes,
     # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
     # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
     # relied on. `proxy_scheme` now only words the refusal.
     # Not refuse_cleartext_credential_hop, which no declaration lifts (vault BACKLOG #3533 item 4).
-    # The owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007) refuses it over
-    # cleartext unless the connection declares the cleartext acceptance with a reason, so this leg
-    # is still judged by the declarations; ADR 0153's 2026-10-27 amendment records the split.
+    # The owner's rulings leave this leg one declaration, the cleartext acceptance with a reason, so
+    # attested is False here for every connection (vault BACKLOG #3007). ADR 0153's 2026-10-27
+    # amendment records the split from the destination's credentials.
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"
@@ -2238,10 +2246,10 @@ def proxy_auth_handler_from_settings(
         cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL,
         message=(
             f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
-            "destination's own credentials, this leg can be declared with tls_hop_attested or "
-            "cleartext_accepted"
+            "destination's own credentials, this leg can be declared with cleartext_accepted and "
+            "a cleartext_reason; tls_hop_attested does not admit it"
         ),
-        attested=attested,
+        attested=False,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
@@ -2348,7 +2356,6 @@ def proxy_config_from_settings(
     s: Mapping[str, Any],
     *,
     dest_scheme: str,
-    attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2356,10 +2363,15 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal); ``attested`` keys the cleartext-proxy-hop guard.
+    target's scheme (for the digest-over-https refusal).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
-    (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes."""
+    (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
+
+    A user and a password in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`, in
+    every posture and under every declaration, including one inherited from
+    ``[egress].proxy_url`` (vault BACKLOG #3007). At send they would meet a refusal that retries,
+    so a known fault is reported here rather than on each message."""
     raw = s.get("proxy_url")
     if not raw:
         return None
@@ -2387,12 +2399,13 @@ def proxy_config_from_settings(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
             "(ADR 0126)"
         )
+    if proxy_url_sends_userinfo(proxy_url):
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_CREDENTIAL_REFUSED}")
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,
         proxy_scheme=proxy_scheme,
         dest_scheme=dest_scheme,
-        attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
@@ -2498,7 +2511,6 @@ def egress_route_from_settings(
     s: Mapping[str, Any],
     *,
     dest_scheme: str,
-    attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2521,7 +2533,6 @@ def egress_route_from_settings(
     return proxy_config_from_settings(
         s,
         dest_scheme=dest_scheme,
-        attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
@@ -2585,7 +2596,6 @@ class RestDestination(DestinationConnector):
             else egress_route_from_settings(
                 s,
                 dest_scheme=scheme,
-                attested=attested,
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
                 connection=config.name,

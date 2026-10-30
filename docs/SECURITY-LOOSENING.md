@@ -116,11 +116,12 @@ engine has not verified, when the lever named beside each is set:
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`.
 
-**The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
+**The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
-#3416). The owner's ruling of 2026-10-05 (vault BACKLOG #3007) refuses it there unless the
-connection declares `cleartext_accepted` with a reason. The engine also lets it cross under
-`tls_hop_attested`, or to a proxy on this machine.
+#3416). It is refused there unless the connection declares `cleartext_accepted` with a reason, or
+the proxy is on this machine. `tls_hop_attested` does not admit it. A credential written in a
+proxy URL or the environment has no such way across. [CONNECTIONS.md](CONNECTIONS.md) states the
+rulings (vault BACKLOG #3007).
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.

@@ -268,8 +268,9 @@ def _check_forward_proxy_egress(
     if not _http_egress_allowed(proxy_url, allowed_proxy):
         # The four HTTP-family allowlist arms in this module print the host through
         # url_host_label. refuse_url_credentials, which the other three run first and this one
-        # cannot (a proxy may carry its own userinfo), still passes shapes whose hostname is a
-        # username or token head, so none of them may print it raw (BACKLOG #1793, #2686).
+        # does not (a proxy_url's userinfo has its own refusal, when the connector is built), still
+        # passes shapes whose hostname is a username or token head, so none of them may print it
+        # raw (BACKLOG #1793, #2686).
         host = url_host_label(proxy_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
