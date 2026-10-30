@@ -542,16 +542,21 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
 
     BACKLOG #2738 closed the second limit, the deadlock with a user delete, and corrected the
     first. So the old collision bullet must be gone, and the sweep's bullet must name the false
-    alarm a missed session's ending raises."""
+    alarm a missed session's ending raises. Its count claim must not assert an exact figure: on
+    SQL Server the bind's and the unbind's counts come from ``cursor.rowcount``, which a leaked
+    ``SET NOCOUNT ON`` turns into -1 (BACKLOG #2283)."""
     text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
         encoding="utf-8"
     )
+    flat = " ".join(text.split())
     assert "**Limits of the session sweep.**" in text
     assert "can collide on the SQL Server and Postgres stores" not in text
     assert "fails and is retried" not in text
     assert "lasts until it expires" not in text
     assert "**That is a known false alarm, not intended behaviour:**" in text
     assert "**A bind and a user delete take one lock order on both server stores**" in text
+    assert "is short by one for each session it missed" not in flat
+    assert "they report -1 instead (BACKLOG #2283)" in flat
 
 
 def test_the_security_doc_says_a_bound_administrator_does_not_block_provision_admin() -> None:

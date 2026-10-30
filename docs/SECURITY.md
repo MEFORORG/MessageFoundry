@@ -4607,12 +4607,16 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   sweep commits, waits for it and then stamps the session with the new epoch, so it stays
   usable. **At least three things are also wrong about a refused one.** Its ending is reported
   as a seal failure: a WARNING, an `integrity.authority_seal_failed` audit row and an
-  `integrity_drift` alert. **That is a known false alarm, not intended behaviour:** nothing
-  was altered, and neither the alert nor the audit row says which case it is, so an operator
-  cannot tell it from tampering. The count the bind, the unbind or the revoke reports is short
-  by one for each session it missed. And until the session is presented or listed, the store
-  still holds it as live. A follow-up row, not yet filed, is to carry the fix for all of this:
-  a sweep that follows a rotated session, so nothing is missed. The Postgres store follows a
+  `integrity_drift` alert. The report is rate-limited per session, and the alert goes through the
+  alert notifier's re-alert throttle, or only to the log where no alert notifier is running.
+  **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
+  alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
+  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
+  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
+  until the session is presented or listed, the store still holds it as live. A follow-up row,
+  not yet filed, is to carry the fix for all of this: a sweep that follows a rotated session, so
+  nothing is missed. The Postgres store follows a
   rotated row and the SQLite store runs one writer at a time, so neither has this limit. All
   of this was read from the code; the skip has not been reproduced against a server. A bind
   ends sessions only: an engine factor already enrolled on the account stays.
