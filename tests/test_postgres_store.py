@@ -47,6 +47,8 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -5541,6 +5543,47 @@ async def test_queue_tag_contract(store) -> None:
         await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
     finally:
         await keyed.close()
+
+
+def _erased_reply_adapters(s) -> tuple[object, object]:
+    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    from tests._session_seal_contract import dollar_placeholders
+
+    async def raw(sql: str, params: tuple[object, ...]) -> None:
+        async with s._pool.acquire() as conn:
+            await conn.execute(dollar_placeholders(sql), *params)
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+        async with s._pool.acquire() as conn:
+            return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+    return raw, fetch
+
+
+@pytest.mark.parametrize("case", ERASED_REPLY_CASES)
+async def test_erased_reply_contract(store, case) -> None:
+    """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
+    SQLite suite runs."""
+    raw, fetch = _erased_reply_adapters(store)
+    await case(store, fetch, raw)
+
+
+@pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
+async def test_keyless_blank_contract(store, case) -> None:
+    """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
+    runs. The ``store`` fixture is the keyless handle, and it clears ``keyed_surface`` on entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    key = generate_key()
+
+    async def open_keyed() -> PostgresStore:
+        return await PostgresStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+        )
+
+    raw, fetch = _erased_reply_adapters(store)
+    await case(store, open_keyed, fetch, raw)
 
 
 async def test_cell_tag_contract(store) -> None:
