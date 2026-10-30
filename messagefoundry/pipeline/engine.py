@@ -3482,7 +3482,24 @@ class Engine:
         # failure of the approved bytes themselves, so it is a bad config and not an edit.
         # With no snapshot (one could not be read strictly), load_config reads its own and refuses
         # a file it needs but cannot read.
-        registry = await asyncio.to_thread(load_config, path, snapshot=snapshot)
+        loaded: Registry | None
+        try:
+            loaded = await asyncio.to_thread(load_config, path, snapshot=snapshot)
+        except SystemExit:
+            # A config module called sys.exit() at top level (vault BACKLOG #3134). On a reload the
+            # engine is already serving, so this is a bad config like any other: refuse the reload
+            # and keep the running graph, rather than let asyncio re-raise it out of the event loop
+            # and stop every connection. config/wiring.py keeps SystemExit propagating on the load
+            # paths an operator runs; a reload is the place a serving engine imports config.
+            # KeyboardInterrupt keeps propagating. The code is not quoted, since it may be the
+            # author's text, and the refusal is raised after the handler, so it chains nothing.
+            loaded = None
+        if loaded is None:
+            raise WiringError(
+                "a config module called sys.exit() at import, so the reload is refused and the "
+                "running graph is unchanged"
+            )
+        registry = loaded
         fingerprint: dict[str, object] | None = None
         if not dry_run:
             # ADR 0041 D1 (config provenance, item C): fingerprint the bundle right after the load

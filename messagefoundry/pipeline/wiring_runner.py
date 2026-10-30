@@ -5786,6 +5786,13 @@ class RegistryRunner:
                 except Exception:
                     log.exception("alert sink raised on sandbox_worker_refused for %r", name)
             raise
+        except SystemExit as exc:
+            # The Router or Handler called sys.exit() (vault BACKLOG #3134): an ordinary fault for
+            # the caller's internal-error policy, never a stop of the event loop. _UserCodeExit says
+            # why this differs from the config-code rule. Raised after the handler ends, so the
+            # SystemExit, whose code may be the author's text, is on neither chain.
+            exited = _UserCodeExit.from_exit(exc)
+        raise exited
 
     async def stop(
         self,
@@ -10530,14 +10537,14 @@ class RegistryRunner:
         try:
             with run_contexts(rc, phase="router"):
                 names = route_only(self.registry, ic, item.payload)
-        except (
-            Exception
-        ) as exc:  # CONTENT: route_only raise → PR3 re-raises inside internal_error try
+        # CONTENT: route_only raise → PR3 re-raises inside internal_error try. SystemExit too: a
+        # Router's sys.exit() is a content fault here, not an engine stop (_UserCodeExit, #3134).
+        except (Exception, SystemExit) as exc:
             return _FusedRouteResult(
                 names=[],
                 disposition=None,
                 handed_off=False,
-                route_exc=exc,
+                route_exc=_as_content_fault(exc),
                 handoff_exc=None,
                 wake_target=None,
             )
@@ -10659,14 +10666,14 @@ class RegistryRunner:
                 deliveries_preview, state_preview, meta_preview, declined = transform_one(
                     self.registry, hname, item.payload, content_type
                 )
-        except (
-            Exception
-        ) as exc:  # CONTENT: transform_one raise → PR3 re-raises inside internal_error try
+        # CONTENT: transform_one raise → PR3 re-raises inside internal_error try. SystemExit too: a
+        # Handler's sys.exit() is a content fault here, not an engine stop (_UserCodeExit, #3134).
+        except (Exception, SystemExit) as exc:
             return _FusedTransformResult(
                 deliveries=[],
                 pt_deliveries=[],
                 applied_state=[],
-                xform_exc=exc,
+                xform_exc=_as_content_fault(exc),
                 handoff_exc=None,
                 outbound_wakes=(),
                 ingress_wakes=(),
@@ -11283,6 +11290,34 @@ class RegistryRunner:
 class _RedactedFault(Exception):
     """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class _UserCodeExit(Exception):
+    """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
+    #3134). Converted at each place that code runs, so the message takes the internal-error policy
+    as for any other raise.
+
+    **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
+    to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code
+    the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
+    or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
+    is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
+    re-raises it out of the event loop and every connection stops. ``KeyboardInterrupt`` and
+    ``CancelledError`` keep propagating: those are signals to the engine, not faults in a message.
+
+    The text names an integer exit code and nothing else: ``sys.exit("...")`` carries the author's
+    text, which could quote a field."""
+
+    @classmethod
+    def from_exit(cls, exc: SystemExit) -> _UserCodeExit:
+        code = exc.code
+        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
+
+
+def _as_content_fault(exc: Exception | SystemExit) -> Exception:
+    """``exc``, with a ``SystemExit`` from Router or Handler code turned into :class:`_UserCodeExit`."""
+    return _UserCodeExit.from_exit(exc) if isinstance(exc, SystemExit) else exc
 
 
 class _StoreReadFault(_RedactedFault):
