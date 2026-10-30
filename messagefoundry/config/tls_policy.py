@@ -2042,9 +2042,8 @@ def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
 # it carry PHI? is it production?) so every cell decides identically, and a legitimately-secure hop is
 # opted in per-connection (an AUDITED attestation) rather than via the blunt global escape.
 
-#: Host tokens that name the local box (loopback) with no DNS resolution, hoisted here from the REST
-#: transport by ADR 0092, so the HTTP-egress cell and this authority share ONE literal set.
-#: ``""`` (empty host) is treated as loopback (an on-box bind with no host component).
+#: Host tokens that name the local box (loopback) with no DNS resolution. ``""`` (empty host) is
+#: treated as loopback (an on-box bind with no host component).
 _LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost", ""})
 
 

@@ -1107,8 +1107,8 @@ def refuse_cleartext_credentials(
     2026-10-28); ``docs/SECURITY-LOOSENING.md``, *Accepted limit: a neutral header crosses plain
     http off this machine*, says why and defines which values are credential-shaped. A static
     ``Proxy-Authorization``, in any spelling, is left out when :func:`hop_reaches_a_proxy` answers
-    ``True``, since the send-time proxy rule judges it then; otherwise it counts. An
-    ``Authorization`` header in the built ``headers``,
+    ``True``, since the send-time proxy rule judges it then; otherwise it is judged like any other
+    header. An ``Authorization`` header in the built ``headers``,
     in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
@@ -1286,10 +1286,9 @@ def http_credentials_sent(
     proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
     own proxy login (vault BACKLOG #3416, #3457). The caller reads ``proxied`` with
     :func:`hop_reaches_a_proxy`, from the proxy destination and handlers its opener is built
-    with, so a ``proxy_url`` alone does not set it. With ``proxied`` false the header counts as
-    the credential it is, and :func:`refuse_cleartext_credentials` refuses an off-box cleartext
-    http hop at build. On any other hop it is left to the send-time rule, which refuses a header
-    on a direct request on each send, retryably, until the message dead-letters.
+    with, so a ``proxy_url`` alone does not set it. With ``proxied`` false the header is judged
+    like any other, so :func:`refuse_cleartext_credentials` can refuse an off-box cleartext http
+    hop at build, where the send-time rule would refuse a header on a direct request on each send.
 
     Each header key is shown by :func:`_shown_header_key`, never as written, since a credential
     may be typed into a key.
@@ -2060,9 +2059,9 @@ class ProxyConfig:
         (#128) — a bypassed host gets NO handler from this config and NO proxy credential
         (byte-identical to a connection with no ``proxy_url``).
 
-        ``None`` is not a direct hop. The opener then has at least the default proxy handler,
-        which reads the environment, so a proxy from the environment can still take a
-        ``proxy_no_proxy`` match, and under ``proxy_url = "default"`` that match changes no route.
+        ``None`` is not proof of a direct hop. The opener's own default then applies, which reads
+        the environment and the system proxy settings, so a proxy from either can still take a
+        ``proxy_no_proxy`` match, ``proxy_url = "default"`` included.
 
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
@@ -2150,15 +2149,15 @@ def hop_reaches_a_proxy(
     handlers: Sequence[urllib.request.BaseHandler],
     url: str,
 ) -> bool:
-    """Whether ``handlers`` hold a web proxy for a request to ``url`` (vault BACKLOG #3533, Lander
-    finding 2 on engine PR 2576).
+    """Whether a request to ``url`` goes to the proxy ``proxy_dest`` resolved, on an opener built
+    with it and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
 
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
     what its ``opener_handlers()`` built. A ``None`` or uncredentialed ``proxy_dest`` answers
-    ``False``. So does ``proxy_url = "default"`` with no system proxy for the scheme. ``False`` is
-    not proof of a direct hop: :meth:`ProxyConfig.for_host` says what those two results do to the
-    route. Otherwise the proxy for ``url``'s scheme is read off the built handler, which took the
-    system map when it was built, so this reads the map the opener holds, not a later one. An
+    ``False``, which is not proof of a direct hop: that method says what each does to the route.
+    Otherwise the proxy for ``url``'s scheme is read off the built handler, so
+    ``proxy_url = "default"`` with no system proxy for the scheme goes direct. The handler took
+    the system map when it was built, so this reads the map the opener holds, not a later one. An
     explicit ``proxy_url`` serves both schemes."""
     if proxy_dest is None or not proxy_dest.credentialed:
         return False
@@ -2326,7 +2325,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
 
 
 def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
-    """Does a ``proxy_no_proxy`` value take ``host`` off the connection's proxy (BACKLOG #1989)?
+    """Does :meth:`ProxyConfig.for_host` bypass ``host`` under a ``proxy_no_proxy`` value
+    (BACKLOG #1989)?
 
     The config half of :meth:`ProxyConfig.for_host`, the loopback rule and the ``proxy_no_proxy``
     match, public so the static-credential hop reader decides a bypass the way the transport does
