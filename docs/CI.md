@@ -405,14 +405,14 @@ Two limits, stated so nobody reads more into a green than it carries:
   and reds below 1.20x (decided under the owner's delegation of 2026-10-30). Every other event on
   that leg still reds below 1.30x, including the push run on `main`, so a change that lands between
   the two floors can red `main` with every test passed. The margin step in `ci.yml` says what each
-  gives up. The ruling of 2026-10-29 also moved the recurring timing tests
-  listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job (BACKLOG #4773). Each
-  gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
+  gives up. The ruling of 2026-10-29 also moved the recurring timing tests listed in
+  `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job
+  (BACKLOG #4773). Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),
   keys on that step's **own** `outcome`, and reds below 1.30x unless the exception above applies. It
-  prints the elapsed, the percent-of-cap and its own red/green control pair into the job summary. A **skipped** step (a
-  docs-only PR) reports `NO OBSERVATION` in words rather than a healthy-looking ratio. Recorded
+  prints the elapsed, the percent-of-cap and its own red/green control pair into the job summary. A
+  **skipped** step (a docs-only PR) reports `NO OBSERVATION` in words rather than a healthy-looking ratio. Recorded
   per-leg maxima — with their pool, their date, and whether they are right-censored — live in
   `scripts/ci/step_margin_baseline.toml`; a capped step with no row there fails the check closed.
   A success run over an uncensored recorded maximum raises a `::warning` annotation, graded

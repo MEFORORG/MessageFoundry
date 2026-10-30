@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -924,6 +925,8 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ("merge_group", "0", 0, False),
         ("push", "1", 1, False),  # 1.30x still blocks, and nothing asks about 1.20x
         ("push", "2", 2, False),
+        ("schedule", "1", 1, False),
+        ("workflow_dispatch", "1", 1, False),
     ],
 )
 def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
@@ -985,7 +988,7 @@ def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
     assert "--min-margin" not in argv[0], argv[0]
     assert all("--step Tests (pytest) --leg ubuntu-latest" in line for line in argv), argv
     if len(argv) == 2:
-        assert argv[1].endswith("--min-margin 1.20"), argv[1]
+        assert argv[1].endswith(f"--min-margin {_pull_request_floor()}"), argv[1]
 
 
 def _pull_request_floor() -> str:
@@ -996,43 +999,51 @@ def _pull_request_floor() -> str:
 
 
 @pytest.mark.parametrize(
-    ("margin", "want_rc"),
+    ("margin", "second_rc"),
     [(1.25, 0), (1.15, 1)],
 )
-def test_the_real_script_runs_at_the_pull_request_floor(
-    tmp_path: Path, margin: float, want_rc: int
+def test_the_real_script_answers_both_calls_of_the_pull_request_path(
+    tmp_path: Path, margin: float, second_rc: int
 ) -> None:
-    """The stubbed test above proves the step's branches, and this one proves the second call can
-    work. That call only runs after a slow step, so nothing else would exercise it: if the self-check
-    stopped holding at this floor, the first slow PR would get exit 2 instead of a warning.
+    """The stubbed test above proves the step's branches, and this one proves the two calls they
+    make. The second only runs after a slow step, so nothing else would exercise it: if the self-check
+    stopped holding at this floor, or a call consumed the mark or truncated the summary, the first
+    slow PR would get exit 2 or lose a block rather than a warning.
 
-    Falsified by setting pr_floor to 1.10 in ci.yml: RED, the script exits 2. Restored.
+    Falsified by setting pr_floor to 1.10 in ci.yml: RED, the second call exits 2. Restored.
     """
+    assert _pull_request_floor() == "1.20"
     cap_minutes = 46
     baseline = tmp_path / "baseline.toml"
     baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
-    rc = main(
-        [
-            "--step",
-            "<fixture step>",
-            "--leg",
-            "<fixture leg>",
-            "--cap-minutes",
-            str(cap_minutes),
-            "--outcome",
-            "success",
-            "--elapsed-seconds",
-            str(cap_minutes * 60 / margin),
-            "--baseline",
-            str(baseline),
-            "--summary-file",
-            str(tmp_path / "summary.md"),
-            "--min-margin",
-            _pull_request_floor(),
-        ]
-    )
-    print(f"[step-margin] floor {_pull_request_floor()}, margin {margin}x: exit {rc}")
-    assert rc == want_rc
+    summary = tmp_path / "summary.md"
+    write_mark("before-tests", tmp_path, at=time.time() - cap_minutes * 60 / margin)
+    call = [
+        "--step",
+        "<fixture step>",
+        "--leg",
+        "<fixture leg>",
+        "--cap-minutes",
+        str(cap_minutes),
+        "--outcome",
+        "success",
+        "--since",
+        "before-tests",
+        "--until",
+        "now",
+        "--clock-dir",
+        str(tmp_path),
+        "--baseline",
+        str(baseline),
+        "--summary-file",
+        str(summary),
+    ]
+    first = main(call)
+    second = main([*call, "--min-margin", _pull_request_floor()])
+    print(f"[step-margin] margin {margin}x: first exit {first}, second exit {second}")
+    assert (first, second) == (1, second_rc)
+    text = summary.read_text(encoding="utf-8")
+    assert "floor 1.30x" in text and "floor 1.20x" in text, text
 
 
 def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
