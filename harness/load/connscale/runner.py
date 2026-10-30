@@ -7,12 +7,17 @@ rate, and the harness OWNS the engine subprocess (the :class:`~harness.load.fail
 pattern) so it can install the executor boot-shim at boot and time cold-start/reload at scale. For
 each ``(sweep_mode, N)`` step it:
 
-1. env-injects ``MEFOR_CONNSCALE_COUNT=N`` (+ base/sink/transform + the executor-shim gate) and spawns
-   a fresh engine on ``harness/config/connscale``;
+1. writes the step's graph shape (N + base/sink/transform) into a generated config directory
+   (:mod:`harness.load.connscale.stepconfig`), pins the claim/fuse/batch/sandbox arms and the
+   executor-shim gate in the environment, and spawns a fresh engine on that directory. The shape is
+   in the module, not the environment, because a ``[sandbox].mode = "subprocess"`` worker never
+   receives a ``MEFOR_`` name (BACKLOG #3132);
 2. starts the :class:`~harness.load.sink.CorrelationSink`, opens the :class:`~harness.load.enginepoll.
    EnginePoller`, preflights that the engine serves all N inbound ports;
 3. ramps N :class:`~harness.load.sender.PersistentConnection`s open in batches (avoid a connect storm)
-   and waits until the engine's ``/connections`` reports N inbound rows;
+   and waits until the engine's ``/connections`` reports N inbound rows; then, when the profile sets
+   ``warmup_timeout_s``, sends one message per connection and waits for its delivery, so a sandbox
+   worker's spawn is not charged to the hold (BACKLOG #3132);
 4. HOLDS a steady aggregate rate for ``hold_seconds``, sampling the engine on one task and the OS
    probe on another (they shared a tick until BACKLOG #1430, which cost the step its samples);
 5. optionally fires a reload mid-hold and times it (wall #5). The reload closes every connection, so
@@ -28,9 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -38,6 +45,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from harness.config.connscale._shape import make_connscale_shape
 from harness.load.connscale import intake_audit
 from harness.load.connscale.compare import (
     ClaimModeComparison,
@@ -48,8 +56,8 @@ from harness.load.connscale.compare import (
 )
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.intake_audit import IntakeAudit, IntakeLedger, StoreReader
-from harness.load.connscale.probe import FdSampler, ProcSample, time_reload_outcome
-from harness.load.connscale.profile import ConnScaleProfile
+from harness.load.connscale.probe import FdSampler, ProcSample, subtree_size, time_reload_outcome
+from harness.load.connscale.profile import SANDBOX_OFF, SANDBOX_SUBPROCESS, ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
@@ -58,10 +66,12 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     HerdFloorReading,
     NoLoss,
+    SandboxReading,
     SloCheck,
     herd_floor_readings,
     monotonic_pairs,
 )
+from harness.load.connscale.stepconfig import STEP_CONFIG_DIR_PREFIX, write_step_config_dir
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
@@ -101,7 +111,12 @@ _SQLSERVER_PIPELINE_TABLES = (
     "messages",
 )
 
+# The env-route graph. The sweep runner itself serves a generated per-step directory instead
+# (`_run_one_step`, BACKLOG #3132); batchbox and multishard, which never run a sandbox arm, still
+# serve this one.
 _CONFIG_DIR = "harness/config/connscale"
+#: How often the warm-up re-reads the sink's delivery count (BACKLOG #3132).
+_WARMUP_POLL_S = 0.05
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let final ACKs/arrivals settle before the truly-final engine sample
 #: How long a step waits, AFTER the reload request returns, for every connection to come back from
@@ -204,6 +219,7 @@ def sweep_step_count(profile: ConnScaleProfile) -> int:
         len(profile.claim_modes)
         * len(profile.fuse_modes)
         * len(profile.batch_modes)
+        * len(profile.sandbox_modes)
         * len(profile.modes())
         * len(profile.counts)
         * profile.trials
@@ -251,6 +267,7 @@ async def run_connscale(
     # Counted at the swallow itself, so the run-level gate below does not depend on which of the
     # detail dicts above a later change keeps writing.
     ab_axis = bool(profile.ab_axes())
+    sandbox_ab = profile.ab_axes() == ("sandbox_modes",)
     steps_missed = 0
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
@@ -267,7 +284,11 @@ async def run_connscale(
     # so fusion stays OFF in both batching arms (the two levers don't compose, ADR 0075).
     for claim_mode in profile.claim_modes:
         for fuse_mode in profile.fuse_modes:
-            for batch_mode in profile.batch_modes:
+            # sandbox_mode (BACKLOG #3132) nests beside batch_mode: each cell runs each [sandbox].mode
+            # arm as a distinct step. The default single-arm ("off",) iterates once.
+            for batch_mode, sandbox_mode in itertools.product(
+                profile.batch_modes, profile.sandbox_modes
+            ):
                 for mode in profile.modes():
                     for count in profile.counts:
                         rate = profile.aggregate_rate_for(mode, count)
@@ -288,6 +309,7 @@ async def run_connscale(
                                     claim_mode=claim_mode,
                                     fuse_mode=fuse_mode,
                                     batch_mode=batch_mode,
+                                    sandbox_mode=sandbox_mode,
                                     mode=mode,
                                     count=count,
                                     trial=trial,
@@ -318,7 +340,13 @@ async def run_connscale(
                                 # sweep such as connscale.toml re-raises a setup fault exactly as
                                 # per_lane does: exit 2 at once, not a miss per cell and a late exit 1.
                                 # It keeps the RCSI attribution the miss note would have carried.
-                                if claim_mode != "pooled":
+                                # A sandbox A/B swallows only its SUBPROCESS arm, whatever the
+                                # claim mode: that arm failing to start is a result, and its
+                                # baseline failing is a setup fault (BACKLOG #3132).
+                                if sandbox_ab:
+                                    if sandbox_mode != SANDBOX_SUBPROCESS:
+                                        raise
+                                elif claim_mode != "pooled":
                                     raise
                                 if not ab_axis:
                                     raise ConnScaleError(_pooled_miss_reason(str(exc))) from exc
@@ -327,12 +355,15 @@ async def run_connscale(
                                 # conns, a DB-connect fault, a config error, a port-bind clash) so an
                                 # operator doesn't flip a DB setting and burn another multi-minute (or
                                 # per-box-dollar) run chasing a phantom RCSI problem.
-                                reason = _pooled_miss_reason(str(exc))
+                                reason = str(exc) if sandbox_ab else _pooled_miss_reason(str(exc))
                                 fuse_tag = "B1" if fuse_mode else "B0"
                                 batch_tag = "B1" if batch_mode else "B0"
+                                # A sandbox A/B varies the sandbox arm, not the claim mode, so
+                                # its miss is not labelled a pooled one (BACKLOG #3132).
+                                arm = "SANDBOX ARM MISSING" if sandbox_ab else "POOLED ARM MISSING"
                                 notes.append(
-                                    f"POOLED ARM MISSING [{mode}] N={count} fuse={fuse_tag} "
-                                    f"batch={batch_tag}: {reason}"
+                                    f"{arm} [{mode}] N={count} fuse={fuse_tag} "
+                                    f"batch={batch_tag} sandbox={sandbox_mode}: {reason}"
                                 )
                                 missing_detail[(mode, count)] = reason
                                 fuse_missing_detail[(claim_mode, mode, count)] = reason
@@ -403,6 +434,7 @@ async def _run_one_step(
     trial: int,
     aggregate_rate: float,
     api_port: int,
+    sandbox_mode: str = SANDBOX_OFF,
     sink_host: str,
     sink_port: int,
     sink_ports: int,
@@ -435,7 +467,7 @@ async def _run_one_step(
     # only string delta vs pre-ADR-0075 is the constant -bt0 insert; the measurements are unchanged.
     fuse_tag = "b1" if fuse_mode else "b0"
     batch_tag = "bt1" if batch_mode else "bt0"
-    tag = f"cs-{claim_mode}-{fuse_tag}-{batch_tag}-{mode}-{count}-t{trial}"
+    tag = f"cs-{claim_mode}-{fuse_tag}-{batch_tag}-sb{sandbox_mode}-{mode}-{count}-t{trial}"
     if profile.store_backend is None:
         db_dir = tempfile.mkdtemp(prefix="mefor-connscale-")
         db_path = str(Path(db_dir) / f"{tag}.db")
@@ -447,6 +479,7 @@ async def _run_one_step(
         claim_mode=claim_mode,
         fuse_mode=fuse_mode,
         batch_mode=batch_mode,
+        sandbox_mode=sandbox_mode,
         count=count,
         base_port=profile.base_port,
         transform=profile.transform,
@@ -456,7 +489,74 @@ async def _run_one_step(
         install_executor_shim=install_executor_shim,
         db_path=db_path,
     )
-    node = EngineNode(tag, api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
+    # The step's graph, written into its own config directory rather than read from MEFOR_CONNSCALE_*
+    # (BACKLOG #3132): a sandbox worker never receives a MEFOR_ name, so on the env route it built the
+    # default shape. Every arm serves a generated directory, so the off and subprocess arms load the
+    # graph the same way. Removed in the `finally`.
+    config_dir = tempfile.mkdtemp(prefix=STEP_CONFIG_DIR_PREFIX)
+    try:
+        write_step_config_dir(
+            config_dir,
+            make_connscale_shape(
+                count=count,
+                base_port=profile.base_port,
+                sink_host=sink_host,
+                sink_port=sink_port,
+                sink_ports=sink_ports,
+                transform=profile.transform,
+            ),
+        )
+    except (ValueError, OSError) as exc:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        raise ConnScaleError(f"connscale step {tag}: could not write its config: {exc}") from exc
+    try:
+        node = EngineNode(tag, api_port, env=node_env, config_dir=config_dir, cwd=cwd)
+        return await _run_started_step(
+            profile,
+            node=node,
+            corpus=corpus,
+            metrics=metrics,
+            correlator=correlator,
+            sink=sink,
+            node_env=node_env,
+            claim_mode=claim_mode,
+            fuse_mode=fuse_mode,
+            batch_mode=batch_mode,
+            sandbox_mode=sandbox_mode,
+            mode=mode,
+            count=count,
+            aggregate_rate=aggregate_rate,
+            sink_host=sink_host,
+            base_env=base_env,
+        )
+    finally:
+        # Disposable output this step made. Here, around everything that runs once it exists, so
+        # neither a constructor fault nor a cancelled stop leaves it behind. The step stops its
+        # engine before returning or raising, so nothing is reading it by now.
+        shutil.rmtree(config_dir, ignore_errors=True)
+
+
+async def _run_started_step(
+    profile: ConnScaleProfile,
+    *,
+    node: EngineNode,
+    corpus: Corpus,
+    metrics: LiveMetrics,
+    correlator: Correlator,
+    sink: CorrelationSink,
+    node_env: dict[str, str],
+    claim_mode: str,
+    fuse_mode: bool,
+    batch_mode: bool,
+    sandbox_mode: str,
+    mode: str,
+    count: int,
+    aggregate_rate: float,
+    sink_host: str,
+    base_env: Mapping[str, str],
+) -> ConnScaleRecord:
+    """The body of one step once its engine node exists; :func:`_run_one_step` owns its config
+    directory."""
     # Named rather than inlined: the OS probe now runs on its own task and stamps its readings with the
     # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
     # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
@@ -482,6 +582,8 @@ async def _run_one_step(
     sampler_tasks: list[asyncio.Task[Any]] = []
     hold_task: asyncio.Task[None] | None = None
     reload_task: asyncio.Task[_ReloadAccount] | None = None
+    # Stamped before anything can fail, so a step that never warmed up still says which arm it was.
+    sandbox = _sandbox_reading(sandbox_mode, node_env)
     try:
         await sink.start()
         # SERVER backend: empty the shared store so THIS step starts clean — the analog of the SQLite
@@ -527,6 +629,17 @@ async def _run_one_step(
         await driver.open(
             connect_batch=profile.connect_batch, batch_pause_s=profile.connect_batch_pause_s
         )
+        if profile.warmup_timeout_s > 0.0:
+            # BEFORE the samplers start, so neither the rate window nor the FD/RSS readings hold a
+            # spawn (BACKLOG #3132). Under subprocess every worker comes up here.
+            sandbox = await _warm_up(
+                sandbox,
+                driver=driver,
+                corpus=corpus,
+                metrics=metrics,
+                pid=pid,
+                timeout=profile.warmup_timeout_s,
+            )
         # TWO stop events. `sampler_stop` ends the ENGINE sampler, whose readings are the rate window,
         # and it fires when the hold ends. `probe_stop` ends the OS probe where it always ended, after
         # the reload probe returns, so the graded FD window is unchanged (BACKLOG #2024).
@@ -726,6 +839,7 @@ async def _run_one_step(
             audit_final=audit_final,
             reload_account=reload_account,
             per_lane_wake=_effective_per_lane_wake(node_env),
+            sandbox=sandbox,
         )
     finally:
         for task in sampler_tasks:
@@ -748,6 +862,89 @@ async def _run_one_step(
             await poller.close()
         with contextlib.suppress(Exception):
             await node.stop()
+
+
+def _sandbox_reading(sandbox_mode: str, node_env: Mapping[str, str]) -> SandboxReading:
+    """The step's sandbox arm, with the mode and spawn bound the engine's own settings parser reads
+    from the environment the step gave it (BACKLOG #3132). Only the ``MEFOR_SANDBOX_*`` keys go in,
+    mirroring :func:`_effective_per_lane_wake`, and the same limit applies: this parses what the
+    engine is given; the running engine reports no such value over its API."""
+    from messagefoundry.config.settings import load_settings
+
+    sandbox_env = {k: v for k, v in node_env.items() if k.startswith("MEFOR_SANDBOX_")}
+    try:
+        settings = load_settings(environ=sandbox_env).sandbox
+    except (ValueError, OSError) as exc:
+        log.warning("connscale: could not read the effective [sandbox] settings: %s", exc)
+        return SandboxReading(requested=sandbox_mode, effective=None, startup_seconds=None)
+    return SandboxReading(
+        requested=sandbox_mode,
+        effective=settings.mode,
+        startup_seconds=settings.startup_seconds,
+    )
+
+
+async def _warm_up(
+    sandbox: SandboxReading,
+    *,
+    driver: ConnScaleDriver,
+    corpus: Corpus,
+    metrics: LiveMetrics,
+    pid: int | None,
+    timeout: float,
+) -> SandboxReading:
+    """Send one message on every connection and wait, up to ``timeout``, for each to be delivered
+    (BACKLOG #3132). Returns ``sandbox`` with the warm-up's readings added.
+
+    A sandbox worker spawns on its inbound's first dispatch, so under ``subprocess`` this is where
+    every worker comes up, and the step's hold then measures running workers rather than spawns. The
+    process subtree is walked on each side of it, which is the evidence that workers exist. A warm-up
+    that times out is RECORDED, never raised: a subprocess arm that cannot bring its workers up is a
+    result, and the hold and reconcile that follow show what it cost.
+
+    The warm-up's ACK and delivery latencies go to their own histograms, so the hold's percentiles
+    hold no first dispatch. A delivery that arrives after a timed-out wait lands in the hold's.
+
+    NOT EVERY READING IS KEPT CLEAN. The engine's pool-wait figures (wall #2) are cumulative from
+    engine start, so the record's pool-wait peaks include the warm-up's acquires, spawn storm and
+    all. Compare the two arms' wall #2 with that in mind.
+    """
+    before = None if pid is None else await asyncio.to_thread(subtree_size, pid)
+    hold_ack, hold_e2e = metrics.ack, metrics.e2e
+    warm_e2e = Histogram()
+    metrics.ack, metrics.e2e = Histogram(), warm_e2e
+    received_before = metrics.counters.sink_received
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    try:
+        sent = driver.send_one_each(corpus=corpus, mix=_MIX)
+        deadline = start + timeout
+        while metrics.counters.sink_received - received_before < sent and loop.time() < deadline:
+            await asyncio.sleep(_WARMUP_POLL_S)
+        seconds = loop.time() - start
+    finally:
+        metrics.ack, metrics.e2e = hold_ack, hold_e2e
+    delivered = min(sent, metrics.counters.sink_received - received_before)
+    after = None if pid is None else await asyncio.to_thread(subtree_size, pid)
+    if delivered < sent:
+        log.warning(
+            "connscale warm-up [sandbox=%s]: %d of %d first deliveries in %.1fs",
+            sandbox.requested,
+            delivered,
+            sent,
+            seconds,
+        )
+    first = warm_e2e.summary() if warm_e2e.count > 0 else None
+    return replace(
+        sandbox,
+        processes_before_warmup=before,
+        processes_after_warmup=after,
+        warmup_sent=sent,
+        warmup_delivered=delivered,
+        warmup_seconds=seconds,
+        warmup_first_delivery_p50_ms=None if first is None else first.p50_ms,
+        warmup_first_delivery_max_ms=None if first is None else first.max_ms,
+    )
 
 
 def _effective_per_lane_wake(node_env: Mapping[str, str]) -> bool | None:
@@ -795,6 +992,7 @@ def _node_env(
     claim_mode: str = "per_lane",
     fuse_mode: bool = False,
     batch_mode: bool = False,
+    sandbox_mode: str = SANDBOX_OFF,
     count: int,
     base_port: int,
     transform: str,
@@ -841,6 +1039,10 @@ def _node_env(
     # fusion (ADR 0075), so the batch A/B keeps fuse OFF in both arms (the profile's one-multi-arm-axis
     # rule enforces it); this seam sets the two flags independently.
     env["MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS"] = "true" if batch_mode else "false"
+    # The [sandbox].mode A/B seam (ADR 0087, BACKLOG #3132), PINNED like the flags above: settings.py
+    # parses MEFOR_SANDBOX_MODE into SandboxSettings.mode. "off" is the engine default, so every
+    # pre-existing sweep runs as before; an inherited value can no longer decide an arm.
+    env["MEFOR_SANDBOX_MODE"] = sandbox_mode
     env["MEFOR_CONNSCALE_COUNT"] = str(count)
     env["MEFOR_CONNSCALE_BASE_PORT"] = str(base_port)
     env["MEFOR_CONNSCALE_TRANSFORM"] = transform
@@ -1528,6 +1730,7 @@ def _build_record(
     reload_account: _ReloadAccount | None = None,
     fd_probe_root_pid: int | None = None,
     per_lane_wake: bool | None = None,
+    sandbox: SandboxReading | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1657,6 +1860,7 @@ def _build_record(
         reload_not_applied=None if ra is None else ra.not_applied,
         rate_window=RATE_WINDOW,
         per_lane_wake=per_lane_wake,
+        sandbox=sandbox,
     )
 
 
@@ -2326,9 +2530,7 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         # the audit genuinely runs; this line is the operator-facing summary of it.
         audited = sum(1 for r in records if r.intake_audit.conclusive)
         if suspect:
-            observed = "; ".join(
-                f"{r.sweep_mode}@N={r.count} {r.intake_audit.summary()}" for r in suspect
-            )
+            observed = "; ".join(f"{r.step_label} {r.intake_audit.summary()}" for r in suspect)
         elif audited == 0:
             observed = (
                 f"NOT AUDITED -- 0 of {len(records)} step(s) carry an intake audit, so this says "
@@ -2356,7 +2558,81 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         out.append(_empty_claims_base_reading_slo(profile, records))
     if slo.empty_claims_herd_floor_legs:
         out.append(_empty_claims_herd_floor_slo(profile, records, current_leg()))
+    if SANDBOX_SUBPROCESS in profile.sandbox_modes:
+        out.append(_sandbox_workers_slo(records))
+    if profile.warmup_timeout_s > 0.0:
+        out.append(_warmup_slo(records))
     return out
+
+
+def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
+    """Every step ran the [sandbox] arm it asked for, and a subprocess arm proves its workers exist
+    (BACKLOG #3132). Graded only where the profile names ``subprocess``.
+
+    The engine must parse the mode the arm asked for. A ``subprocess`` step must also have started
+    at least one process per driven inbound during its warm-up, read from two walks of the engine's
+    process subtree. Without that, an arm whose engine silently ran Routers and Handlers in-process
+    would pass every other check here. A walk that failed is a failure too: an instrument that did
+    not read cannot vouch for the arm.
+
+    IT IS A FLOOR, NOT A PER-INBOUND PROOF. On a Windows venv a worker tree is two processes, so
+    workers on half the inbounds also clear it. It catches an arm with no workers or with far too
+    few; a per-inbound proof would group the started processes by worker root, which this does not.
+
+    It grades TODAY'S worker shape, one worker tree per traffic-carrying inbound. ADR 0187 (option
+    1, accepted) replaces that with a bounded shared pool; once the pool is built, a subprocess step
+    starts far fewer processes than inbounds, and this floor must change with it.
+    """
+    problems: list[str] = []
+    for r in records:
+        sb = r.sandbox
+        where = r.step_label
+        if sb is None:
+            problems.append(f"{where}: no sandbox reading")
+            continue
+        if sb.effective != sb.requested:
+            problems.append(f"{where}: the engine parses mode {sb.effective!r}")
+            continue
+        if sb.requested != SANDBOX_SUBPROCESS:
+            continue
+        started = sb.processes_started
+        if started is None:
+            problems.append(f"{where}: the process walk did not read, so no worker is proven")
+        elif started < r.count:
+            problems.append(
+                f"{where}: the warm-up started {started} process(es) for {r.count} driven inbounds"
+            )
+    graded = sum(1 for r in records if r.sandbox_mode == SANDBOX_SUBPROCESS)
+    if not graded:
+        # The profile asked for a subprocess arm and no step of it was recorded (it missed at
+        # startup): zero graded steps is not a pass.
+        problems.append("no subprocess step was recorded")
+    observed = "; ".join(problems) if problems else f"ok ({graded} subprocess step(s) graded)"
+    return SloCheck(
+        "sandbox_workers",
+        "the asked-for mode runs; subprocess starts >= 1 process per driven inbound",
+        observed,
+        not problems,
+    )
+
+
+def _warmup_slo(records: list[ConnScaleRecord]) -> SloCheck:
+    """Every step's warm-up delivered one message per connection (BACKLOG #3132). Under
+    ``subprocess`` a shortfall is the arm's workers failing to come up inside the warm-up."""
+    short = [
+        f"{r.step_label}: "
+        + (
+            "no warm-up ran"
+            if r.sandbox is None or not r.sandbox.warmup_ran
+            else f"{r.sandbox.warmup_delivered} of {r.count} delivered"
+        )
+        for r in records
+        if r.sandbox is None or not r.sandbox.warmup_ran or r.sandbox.warmup_delivered < r.count
+    ]
+    if not records:
+        short.append("no step was recorded")
+    observed = "; ".join(short) if short else f"ok ({len(records)} step(s))"
+    return SloCheck("warmup_delivered", "one delivery per connection", observed, not short)
 
 
 def _base_readings(

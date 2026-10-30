@@ -43,6 +43,11 @@ PW = "Sup3rSecret!!"
 # A fully-configured engine-broker [ai] section: managed_endpoint + an allow-listed https endpoint.
 _ENDPOINT = "https://ai.internal/v1/messages"
 
+# BACKLOG #2193 slice (e): an off-box endpoint is refused under an enforcing or unknown posture
+# unless its revocation is attested. The tests here are about other behaviour, so their brokers
+# carry the pair; tests/test_ai_broker_revocation_guard.py covers the refusal itself.
+_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
+
 
 def _managed_ai(**over: object) -> AiSettings:
     kw: dict[str, object] = {
@@ -51,6 +56,8 @@ def _managed_ai(**over: object) -> AiSettings:
         "endpoint": _ENDPOINT,
         "api_key": "sk-secret-key-value",
         "allowed_endpoints": ["ai.internal"],
+        "endpoint_revocation_attested": True,
+        "endpoint_revocation_attested_reason": _ATTESTED_REASON,
     }
     kw.update(over)
     return AiSettings(**kw)  # type: ignore[arg-type]
@@ -391,7 +398,13 @@ def test_broker_refuses_an_over_length_endpoint() -> None:
 
 def test_broker_ordinary_construction_still_works() -> None:
     """Byte-identity control. Mutation: drop MAX_OUTBOUND_URL_LEN to 8 -> this reds."""
-    broker = AiBroker(endpoint=_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    broker = AiBroker(
+        endpoint=_ENDPOINT,
+        api_key="k",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_ATTESTED_REASON,
+    )
     assert broker.endpoint_host == "ai.internal"
 
 
@@ -399,7 +412,13 @@ def test_broker_ordinary_construction_still_works() -> None:
 
 
 def _raising_broker(exc: Exception) -> AiBroker:
-    broker = AiBroker(endpoint=_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    broker = AiBroker(
+        endpoint=_ENDPOINT,
+        api_key="k",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_ATTESTED_REASON,
+    )
     broker._opener = RaisingOpener(exc)  # type: ignore[assignment]
     return broker
 

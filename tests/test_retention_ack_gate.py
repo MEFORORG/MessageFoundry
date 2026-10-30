@@ -24,6 +24,7 @@ from messagefoundry.config.retention_classification import (
     warn_only_windows,
 )
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -178,6 +179,7 @@ def test_each_switch_is_a_named_loosening() -> None:
                 cert_monitor=CertMonitorSettings(),
                 backup=BackupSettings(),
                 secrets=SecretsSettings(),
+                ai=AiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

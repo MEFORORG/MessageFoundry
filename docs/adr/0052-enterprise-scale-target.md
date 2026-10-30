@@ -72,9 +72,9 @@ enterprise market is **in-scope and not demand-gated**.
   → `harness/load/` + `docs/benchmarks/` (enterprise-hardware run pending — BACKLOG #40 / #28 / #29)
 - **AC-2** — THE SYSTEM SHALL support up to 1,500 concurrent connections without per-connection-worker
   exhaustion (fd/socket/worker-task limits).
-  → `harness/load/connscale/` (the connection-scale harness, built). It cannot yet run a
-  subprocess-sandbox arm; that axis, its other prerequisites and the two-arm 1,500-connection run
-  are BACKLOG #3132.
+  → `harness/load/connscale/` (the connection-scale harness, built). It has a `sandbox_modes` axis
+  and a shipped two-arm profile (`connscale_sandbox_ab`, 750 and 1,500 connections), but no
+  subprocess arm has been run. The runs and their remaining prerequisites are BACKLOG #3132.
 - **AC-3** — WHERE the deployment uses a remote production database, THE SYSTEM SHALL run the full staged
   pipeline (`ingress → routed → outbound`) with the store finalizer as the single disposition authority.
   → `tests/` Postgres + SQL Server store suites
@@ -107,6 +107,7 @@ durable-write); the 45M/day storage + IOPS footprint (ADR 0051); the 1,500-conne
 ## To resolve on acceptance
 
 - [x] The market commitment — resolved by owner decision 2026-06-29.
-- [ ] Connection-scale (1,500) validation. The harness is built (`harness/load/connscale/`) but has
-  no subprocess-sandbox arm yet; that arm and the 1,500-connection run with it are BACKLOG #3132.
+- [ ] Connection-scale (1,500) validation. The harness is built (`harness/load/connscale/`) and can
+  run a subprocess-sandbox arm. No such arm has been run, and the 1,500-connection run with it is
+  BACKLOG #3132.
 - [ ] Enterprise-hardware load run to measure the real single-engine ceiling vs the 45M target (#40 / #28 / #29).

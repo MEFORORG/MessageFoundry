@@ -1273,7 +1273,9 @@ def _first_out_of_order(source: str, landmarks: tuple[str, ...]) -> str | None:
 
 
 def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns() -> None:
-    source = inspect.getsource(runner._run_one_step)
+    # The step body lives in `_run_started_step` since BACKLOG #3132 moved the config-dir
+    # cleanup around it; the ordering is the same code.
+    source = inspect.getsource(runner._run_started_step)
     assert _first_out_of_order(source, _HOLD_ORDERING) is None
     # The probe runs BESIDE the hold. Awaited inline, it would hold the sampler open to its end.
     assert "await _reload_mid_hold(" not in source
