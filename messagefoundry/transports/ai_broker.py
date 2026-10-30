@@ -60,6 +60,7 @@ from messagefoundry.config.tls_policy import (
     is_loopback_hop_host,
     log_attested_crossing,
 )
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
 
@@ -180,8 +181,9 @@ def _refuse_an_unrevoked_ai_hop(
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
       through, never off a setting. Today that is rest.py's shared import-time opener, which
       loads no CRL, so it is ``False``, and no CRL lever is built for this hop.
-    * An attestation with no reason, or a blank one, is refused here as at settings load, so a
-      broker built directly cannot cross with no recorded reason.
+    * An attestation with no reason or a blank one, and a reason holding a control character or a
+      lone surrogate, are refused here as at settings load, so a broker built directly cannot
+      cross with no recorded reason or forge a log line through it.
     * ``posture`` is the instance posture the caller holds, or ``None``. **An unknown posture
       counts as enforcing**, as on the Vault hops: the broker is built per request, outside the
       construction gate, so there is no ambient posture to read.
@@ -200,11 +202,15 @@ def _refuse_an_unrevoked_ai_hop(
     logs on every build, and the broker is built per request; and it raises
     ``InsecureHopRefused``, which the route does not map, so a refusal would surface as an
     unhandled 500. :class:`AiBrokerError` is answered 503."""
+    # Each ValueError below is re-raised as this module's single error type OUTSIDE its handler,
+    # so neither __cause__ nor __context__ carries the original; its text names no URL part.
+    refusal: str | None = None
     try:
         host = hop_url_host(endpoint, cell="[ai].endpoint")
     except ValueError as exc:
-        # hop_url_host's text names no part of the URL; this module's single error type carries it.
-        raise AiBrokerError(str(exc)) from None
+        refusal = str(exc)
+    if refusal is not None:
+        raise AiBrokerError(refusal)
     attested = revocation_attested is True
     if attested and not (revocation_reason and revocation_reason.strip()):
         raise AiBrokerError(
@@ -212,27 +218,52 @@ def _refuse_an_unrevoked_ai_hop(
             "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
             "endpoint's certificate"
         )
+    # The settings load refuses these too; the reason is written into a WARNING below, where a
+    # CR or LF could forge a log line.
+    if revocation_reason is not None and (
+        has_control_char(revocation_reason) or has_lone_surrogate(revocation_reason)
+    ):
+        raise AiBrokerError(
+            "[ai].endpoint_revocation_attested_reason must not contain control characters or "
+            "lone surrogates"
+        )
     held = HopPosture.fail_closed(enforcing=None) if posture is None else posture
     on_box = is_loopback_hop_host(host)
+    # urllib_handler_context fails closed when it cannot read the handler's context; carried as
+    # this module's error type so the route answers 503, not an unhandled 500.
+    try:
+        context = opener_tls_context(opener, connector="AI endpoint")
+    except ValueError as exc:
+        context = None
+        refusal = str(exc)
+    if refusal is not None:
+        raise AiBrokerError(refusal)
     # capture() reads the process-wide variable into its own field and the CRL flag off the
-    # context; disposition() asks revocation_hop_disposition, logging and raising nothing. It is
-    # never None here, since a posture is held. The texts below are this hop's own.
-    disposition = RevocationHopGuard.capture(
+    # context, the same two reads every RevocationHopGuard hop makes; disposition() asks
+    # revocation_hop_disposition, logging and raising nothing. Its cell, description and
+    # connection are never rendered here: the texts below are this hop's own. disposition() is
+    # never None, since a posture is held.
+    guard = RevocationHopGuard.capture(
         host=host,
         cell=_AI_HOP_CELL,
         description="sends [ai].api_key over verified https",
         attested=attested,
-        context=opener_tls_context(opener, connector="AI endpoint"),
+        context=context,
         posture=held,
         connection=None,  # the [ai] endpoint, not a connection
-    ).disposition()
+    )
+    disposition = guard.disposition()
     enforcing = held.enforcing
     detail = (
         f"the AI endpoint {host!r} is sent [ai].api_key over https that verifies its "
         "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
     )
     if disposition is HopDisposition.ALLOW:
-        if attested and enforcing and not on_box and _first_crossing("attested", host):
+        # Not when the context checks a CRL: that hop crossed on a real check, not on the
+        # attestation, and the line would be a false record. No CRL reaches it today; a later CRL
+        # lever must revisit this arm and the refusal's lever text together.
+        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_checked
+        if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,
                 crossing="verified TLS hop crossed without certificate revocation checking",

@@ -1004,7 +1004,9 @@ bind-guard ladder above:
   off-box `[ai].endpoint` is refused under `enforce` unless
   `[ai].endpoint_revocation_attested = true` is set with an
   `[ai].endpoint_revocation_attested_reason`, the only lever. The refusal comes at
-  `POST /ai/chat`, not at start, and `messagefoundry check` does not report it.
+  `POST /ai/chat`, not at start, and `messagefoundry check` neither reports it nor lists the
+  pair. Unlike a Vault hop, a loopback endpoint is on the box even with a proxy set, because
+  every opener dials a loopback host direct.
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) is the one place that says what the pair can
   rest on and what does not cross this hop.
 

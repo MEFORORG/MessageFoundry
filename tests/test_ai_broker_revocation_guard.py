@@ -217,6 +217,21 @@ def test_a_broker_built_directly_cannot_attest_without_a_reason(reason: str | No
         _broker(posture=_ENFORCING, attested=True, reason=reason)
 
 
+def test_a_broker_built_directly_refuses_a_reason_that_could_forge_a_log_line() -> None:
+    with pytest.raises(AiBrokerError, match="must not contain control characters"):
+        _broker(posture=_ENFORCING, attested=True, reason="ok\nFORGED: synthetic line")
+
+
+def test_an_attested_hop_whose_context_checks_a_crl_logs_no_attested_crossing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """That hop crossed on a real check, so a line saying it crossed without one would be false."""
+    monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _broker(posture=_ENFORCING, attested=True, reason=_REASON)
+    assert _crossing_lines(caplog) == []
+
+
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
     with pytest.raises(AiBrokerError, match="no revocation check"):
         AiBroker(
