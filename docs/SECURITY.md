@@ -2380,9 +2380,11 @@ a client that polls it while such a request is held writes one row per poll. On 
 row is the listing's only record, because the console's gates write no grant row. On the JSON route
 it sits beside `auth.permission_granted` while `[diagnostics].audit_all_authz` is on, and it does
 not depend on that switch. A failed write of this row leaves the listing answering 200, and is
-logged and paged, as below. That covers this row alone: the JSON route writes its grant row first,
-so a store that refuses every audit write answers that route 500 before this row is reached, with
-no page. The value itself still needs no step-up.
+logged and paged, as below. That covers this row alone. While that switch is on, the JSON route
+writes its grant row first, so a store that refuses every audit write answers that route 500 before
+this row is reached, with no page. The write has no time bound of its own, so a write that stalls
+rather than fails holds the listing until the request timeout, with no row and no page. The value
+itself still needs no step-up.
 
 This row records what that listing disclosed, and only that. It does not record every route to the
 fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
@@ -2563,13 +2565,14 @@ commits in the same transaction as the re-queue. So when that row fails, nothing
 request moves to `failed`, and `approval.failed` names the error type. A released purge does the
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
 attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
-makes about its target (vault BACKLOG #3798). If no graph is loaded, or the outbound has left the graph, is
-running, or is owned by another engine shard, the release skips. It cancels nothing, writes no
+makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
+least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
+engine shard. It cancels nothing, writes no
 `connection_purge` row, and its `approval.approved` row records the route's refusal text as the
 skip. The operator clears the cause and requests the purge again. A held purge whose stored scope
-is neither `top` nor `all`, or that stores no outbound name, cancels nothing either. No request
-files one and no operator act clears it, so it answers 422, moves to `failed`, and `approval.failed`
-names the error type. The queue does not predict this refusal: `release_blocked` stays `null`, as
+is neither `top` nor `all`, or whose stored name the route would not admit, cancels nothing either.
+No request files one and no operator act clears it, so it answers 422, moves to `failed`, and
+`approval.failed` names the error type; a WARNING in the engine log says why. The queue does not predict this refusal: `release_blocked` stays `null`, as
 for the operation's other own refusals, and the request is claimed first.
 At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
 exception the claim has. The re-queue or the cancel and its row are then committed, and the gate

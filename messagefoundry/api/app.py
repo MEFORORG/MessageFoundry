@@ -403,7 +403,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
-from messagefoundry.connection_names import inbound_name_of
+from messagefoundry.connection_names import inbound_name_of, is_connection_name
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -1719,12 +1719,13 @@ def _build_approval_gate(
                 "this purge request records no requester, so its connection_purge row could not "
                 "name who ran it; it was not run",
             )
-        # Vault BACKLOG #3798: a scope the route does not admit, or no outbound name, is a stored row
-        # no request filed. No operator act clears it, and reading such a scope as "all" would
-        # cancel every queued row, so it raises. 422 is the approve route's "the released operation
-        # was refused".
-        scope, name = p.get("scope"), p.get("name")
-        if scope not in _PURGE_SCOPES or not isinstance(name, str) or not name:
+        # Vault BACKLOG #3798: a scope or outbound name the route does not admit is a stored row no
+        # request filed. No operator act clears it, and reading such a scope as "all" would cancel
+        # every queued row, so it raises. 422 is the approve route's "the released operation was
+        # refused". approval.failed names only the error type, so the log line says why.
+        scope, name = p.get("scope"), p.get("name", "")
+        if scope not in _PURGE_SCOPES or not is_connection_name(name):
+            _log.warning("released purge refused: its stored outbound or scope is not valid")
             raise ApprovalError(
                 422,
                 "this purge request records no valid outbound or scope, so what it would cancel "

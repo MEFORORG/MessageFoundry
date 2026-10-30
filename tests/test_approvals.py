@@ -519,6 +519,17 @@ async def test_a_released_purge_with_no_graph_loaded_cancels_nothing(engine: Eng
     await _assert_nothing_purged(engine, str(mid))
 
 
+async def test_a_purge_with_no_graph_loaded_says_so_at_the_route(engine: Engine) -> None:
+    """The route and the release read one refusal, so the 404 no longer reads as a wrong name."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    assert engine.registry_runner is None
+    async with _client(engine, service, ON) as c:
+        r = await c.post("/connections/OB/purge", headers=await _token(c, "op"))
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "no graph is loaded, so no outbound connection: OB"
+
+
 async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothing(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -545,7 +556,7 @@ async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothi
     await _assert_nothing_purged(engine, mid)
 
 
-async def test_a_released_purge_of_an_outbound_another_shard_owns_cancels_nothing(
+async def test_a_released_purge_of_an_outbound_another_engine_shard_owns_cancels_nothing(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """ADR 0073 at the release: a non-owning engine shard's quiesced signal is vacuous, so the
@@ -577,6 +588,7 @@ async def test_a_released_purge_of_an_outbound_another_shard_owns_cancels_nothin
         {"scope": "all"},
         {"name": None, "scope": "all"},
         {"name": "", "scope": "all"},
+        {"name": "bad\nname", "scope": "all"},
     ],
     ids=[
         "unknown-scope",
@@ -587,6 +599,7 @@ async def test_a_released_purge_of_an_outbound_another_shard_owns_cancels_nothin
         "absent-name",
         "null-name",
         "empty-name",
+        "name-the-route-refuses",
     ],
 )
 async def test_a_released_purge_with_an_unusable_stored_target_is_refused_and_fails(
