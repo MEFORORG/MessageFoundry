@@ -1297,6 +1297,12 @@ _PG_COUNT_USER_SESSIONS_SQL: Final = (
     "SELECT COUNT(*) FROM sessions WHERE user_id=$1 AND revoked_at IS NULL"
     " AND ($2::text IS NULL OR token_hash != $2)"
 )
+#: Every account's sweep at once, but for an optional kept session, for ``revoke_all_sessions``
+#: (BACKLOG #2614).
+_PG_REVOKE_ALL_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=$1, seal='' WHERE revoked_at IS NULL"
+    " AND ($2::text IS NULL OR token_hash != $2)"
+)
 #: Whether the account holds at least one passkey.
 _PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
@@ -10424,6 +10430,32 @@ class PostgresStore:
         return int(
             await self._fetchval(_PG_COUNT_USER_SESSIONS_SQL, user_id, except_token_hash) or 0
         )
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
+        :meth:`AuthStore.revoke_all_sessions`.
+
+        Every account's epoch is raised first, in id order, so the account row locks are taken
+        before any session row's, the order ``create_session`` takes them in, and two of these
+        take them in one order. The borrow is :meth:`_after_commit_txn`'s, for the reason it
+        gives."""
+        now = time.time() if now is None else now
+        async with self._after_commit_txn() as conn:
+            for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
+                await self._bump_session_epoch(conn, str(row["id"]))
+            status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
+            if except_token_hash is not None:
+                owner = await conn.fetchval(
+                    "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
+                )
+                if owner is not None:
+                    epoch = await self._session_epoch(conn, str(owner))
+                    await self._write_session(
+                        conn, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                    )
+        return _rowcount(status)
 
     async def enforce_session_cap(
         self,

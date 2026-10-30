@@ -1859,6 +1859,11 @@ _COUNT_USER_SESSIONS_SQL: Final = (
 )
 #: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
 _EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
+#: Every account's sweep at once, for ``revoke_all_sessions`` (BACKLOG #2614). It takes
+#: ``_EXCEPT_TOKEN_HASH_SQL`` for the kept session, as the per-account sweep does.
+_REVOKE_ALL_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL"
+)
 
 
 @dataclass(frozen=True)
@@ -17612,6 +17617,41 @@ class MessageStore:
                 )
             row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
+        :meth:`AuthStore.revoke_all_sessions`."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            revoked = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+            await self._commit()
+        return revoked
+
+    async def _revoke_all_sessions_in_txn(self, except_token_hash: str | None, now: float) -> int:
+        """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
+
+        Every account's epoch is raised first, as :meth:`revoke_user_sessions` raises one, then
+        one sweep ends the rows and the kept row is re-sealed under its own account's new epoch."""
+        cur = await self._db.execute("SELECT id FROM users ORDER BY id")
+        for row in await cur.fetchall():
+            await self._bump_session_epoch(str(row[0]))
+        if except_token_hash is None:
+            cur = await self._db.execute(_REVOKE_ALL_SESSIONS_SQL, (now,))
+            return int(cur.rowcount)
+        cur = await self._db.execute(
+            _REVOKE_ALL_SESSIONS_SQL + _EXCEPT_TOKEN_HASH_SQL, (now, except_token_hash)
+        )
+        revoked = int(cur.rowcount)
+        kept = await self._db.execute(
+            "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
+        )
+        owner = await kept.fetchone()
+        if owner is not None:
+            epoch = await self._session_epoch(str(owner[0]))
+            await self._write_session(except_token_hash, lambda s: replace(s, user_epoch=epoch))
+        return revoked
 
     async def _session_epoch(self, user_id: str) -> int:
         """The account's session epoch, read on the writer connection inside the caller's

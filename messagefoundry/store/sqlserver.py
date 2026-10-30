@@ -806,6 +806,12 @@ _MSSQL_COUNT_USER_SESSIONS_SQL: Final = (
 )
 #: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
 _MSSQL_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
+#: Every account's sweep at once, for ``revoke_all_sessions`` (BACKLOG #2614), counted from
+#: ``OUTPUT`` as the per-account sweep is. It takes ``_MSSQL_EXCEPT_TOKEN_HASH_SQL`` for the kept
+#: session.
+_MSSQL_REVOKE_ALL_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash WHERE revoked_at IS NULL"
+)
 #: Whether the account holds at least one passkey.
 _MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
     "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
@@ -15115,6 +15121,48 @@ class SqlServerStore:
                 (user_id, except_token_hash),
             )
         return int(row["n"]) if row else 0
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
+        :meth:`AuthStore.revoke_all_sessions`.
+
+        Every account's epoch is raised first, in id order, so the account row locks are taken
+        before any session row's, the order ``create_session`` takes them in. The count comes from
+        an ``OUTPUT`` rowset, as :meth:`revoke_user_sessions` counts. The borrow is
+        :meth:`_acquire_after_commit`'s, for the reason it gives."""
+        now = time.time() if now is None else now
+        async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute("SELECT id FROM users ORDER BY id")
+                for (user_id,) in await cur.fetchall():
+                    await self._bump_session_epoch(cur, str(user_id))
+                if except_token_hash is None:
+                    await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
+                    revoked = len(await cur.fetchall())
+                else:
+                    await cur.execute(
+                        _MSSQL_REVOKE_ALL_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
+                        (now, except_token_hash),
+                    )
+                    revoked = len(await cur.fetchall())
+                    await cur.execute(
+                        "SELECT s.user_id, u.session_epoch FROM sessions s"
+                        " JOIN users u ON u.id = s.user_id WHERE s.token_hash=?",
+                        (except_token_hash,),
+                    )
+                    kept = await cur.fetchall()
+                    if kept:
+                        epoch = int(kept[0][1])
+                        await self._write_session(
+                            cur, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                        )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return revoked
 
     async def enforce_session_cap(
         self,

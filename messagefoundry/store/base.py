@@ -3098,6 +3098,20 @@ class AuthStore(Protocol):
         so a concurrent sign-in can still move the number before the revoke runs."""
         ...
 
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke every unrevoked session of every account, but for ``except_token_hash`` when it is
+        given (BACKLOG #2614). Returns the number revoked.
+
+        :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises every
+        account's session epoch, so an older copy of any row resolves to nothing, and re-seals the
+        kept session under its account's new epoch. A kept session whose seal does not verify
+        raises :class:`~messagefoundry.store.row_seal.RowSealError` and the whole transaction,
+        revokes included, rolls back. An account whose record fails its seal keeps its old epoch
+        and still has its sessions revoked, because ending a session needs no key."""
+        ...
+
     async def enforce_session_cap(
         self,
         user_id: str,
