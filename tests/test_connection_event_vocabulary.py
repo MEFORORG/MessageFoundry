@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import connection_events
-from messagefoundry.connection_events import CONNECTION_EVENT_KINDS, check_connection_event_kind
+from messagefoundry.connection_events import (
+    CONNECTION_EVENT_KIND_ORDER,
+    CONNECTION_EVENT_KINDS,
+    check_connection_event_kind,
+)
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import ConnectionEventWrite
 from tests._ast_sites import code_strings, parse_source
@@ -70,20 +74,30 @@ def test_the_leaf_imports_nothing_from_the_engine() -> None:
     assert imported == {"__future__", "typing"}, imported
 
 
-def test_the_console_filter_offers_exactly_the_shared_set() -> None:
+def test_the_ordered_vocabulary_names_each_kind_once() -> None:
+    assert len(CONNECTION_EVENT_KIND_ORDER) == len(CONNECTION_EVENT_KINDS)
+
+
+def test_the_console_filter_offers_the_shared_vocabulary_in_order() -> None:
     monitoring = pytest.importorskip("messagefoundry_webconsole.pages.monitoring")
 
     rendered = str(monitoring._event_filter(""))
-    offered = set(re.findall(r'<option value="([a-z_]+)"', rendered))
-    assert offered == CONNECTION_EVENT_KINDS
+    offered = re.findall(r'<option value="([a-z_]+)"', rendered)
+    assert offered == list(CONNECTION_EVENT_KIND_ORDER)
+
+
+def _spelled_kinds(source: str) -> set[str]:
+    return set(code_strings(parse_source(source))) & CONNECTION_EVENT_KINDS
 
 
 def test_the_console_holds_no_copy_of_its_own() -> None:
     # Equality above would also pass for a hand-kept copy that happens to match today. The console
     # must not spell any kind in code, so the only way a kind reaches its filter is the shared set.
+    # The control shows the probe fires on a planted copy, so an empty answer is a reading.
+    assert _spelled_kinds('_EVENT_KINDS = ("established", "closed")\n') == {"established", "closed"}
     path = _ROOT / "messagefoundry_webconsole" / "pages" / "monitoring.py"
-    spelled = set(code_strings(parse_source(path.read_text(encoding="utf-8"))))
-    assert not spelled & CONNECTION_EVENT_KINDS, sorted(spelled & CONNECTION_EVENT_KINDS)
+    spelled = _spelled_kinds(path.read_text(encoding="utf-8"))
+    assert not spelled, sorted(spelled)
 
 
 # --- the store refuses an undeclared kind -------------------------------------------------------
@@ -111,7 +125,9 @@ async def test_sqlite_store_refuses_an_undeclared_kind_on_both_writers(
         await store.record_connection_event(
             connection="IB_VOCAB", transport="mllp", direction="inbound", kind=UNDECLARED
         )
-    # A burst is all-or-nothing: the declared row beside the undeclared one is not written either.
+    # The declared row beside the undeclared one is not written either. That is because the refusal
+    # comes while the parameters are built, before any row is stepped; the burst's rollback is
+    # pinned in tests/test_connection_event_burst.py, not here.
     with pytest.raises(ValueError, match=UNDECLARED):
         await store.record_connection_events([_event("established"), _event(UNDECLARED)])
     assert await store.list_connection_events(allowed_channels=None) == []

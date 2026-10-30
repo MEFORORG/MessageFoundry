@@ -1123,27 +1123,30 @@ class SourceConnector(abc.ABC):
     log/identify poll sources; the actual single-node gating is done by ``leader_gate`` below.
 
     **Never accept and drop** (CLAUDE.md section 1: every message a connection takes in is counted
-    and logged). A source hands every message it reads to ``handler``, and only after the handler
-    returns does it tell the sender the message was accepted or remove it from where it came from:
-    an ACK or ``202``, a file moved or deleted, a row marked. The handler is what counts and logs
-    the message, as a ``RECEIVED`` ingress row or an ``ERROR`` row. So a source never discards
-    something it read without handing it over. It has three other outcomes, and each is visible:
+    and logged). Here "the inbound handler" is the :data:`InboundHandler` callable :meth:`start`
+    receives, the engine's intake, not a code-first ``@handler``. A source hands every message it
+    reads to the inbound handler, and only after it returns does the source tell the sender the
+    message was accepted or remove it from where it came from: an ACK or ``202``, a file moved or
+    deleted, a row marked. The inbound handler is what counts and logs the message, as a
+    ``RECEIVED`` ingress row or an ``ERROR`` row. Any outcome that does not hand a message over must
+    leave it with the sender or keep the item. Those outcomes include at least these:
 
     * a **refusal before ingress** (a peer not on the allow-list, an oversize frame, a failed
-      intake authentication) is reported as a connection event and answered or closed, so the
+      intake authentication, a method the listener does not take) is answered or closed, so the
       sender knows nothing was accepted and keeps the message;
     * a **quarantine** (a file the source cannot read, moved to its error directory; a row it
-      cannot decode) is logged and reported as a connection event, and the item is kept;
+      cannot decode, left unmarked) keeps the item and logs why;
     * a **deferral** (a per-poll ceiling, an intake pause, a file not yet settled) leaves the item
       unread where it is, with the sender or in its directory or table, for a later read.
 
-    Each kind a source passes to :attr:`on_connection_event` must be a member of
-    :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
+    A source that emits connection events reports such outcomes through :attr:`on_connection_event`
+    too, where capture is on. Not every source emits them. Each kind passed there must be a member
+    of :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
 
-    **When the handler raises.** The handler records every message-level outcome itself (a parse
-    or validation failure is an ``ERROR`` row, and the handler returns). An exception escaping it
-    is therefore an infrastructure failure, most often a store write that did not commit, and the
-    message may not be recorded anywhere. A source must then:
+    **When the inbound handler raises.** The inbound handler records every message-level outcome
+    itself (a parse or validation failure is an ``ERROR`` row, and it returns). An exception
+    escaping it is therefore an infrastructure failure, most often a store write that did not
+    commit, and the message may not be recorded anywhere. A source must then:
 
     1. **not acknowledge it**: send no ACK or ``202``, and do not move, delete or mark the item.
        A listener whose sender waits for an answer sends a negative acknowledgement or an error
@@ -1151,8 +1154,8 @@ class SourceConnector(abc.ABC):
        place, so the next tick reads it again (at-least-once);
     2. **log it scrubbed**: ``safe_exc`` on the exception, never the message body;
     3. **stay alive**: catch it in the per-connection task or the poll loop, so one failed message
-       cannot stop intake while the connection still reports running. ``CancelledError`` is not a
-       handler failure and propagates.
+       cannot stop intake while the connection still reports running. ``CancelledError`` is not an
+       inbound-handler failure and propagates.
 
     The MLLP listener's ``handler_error`` arm, the FILE source's handler-failure arm and the
     DATABASE source's ``_ingest_row`` are worked examples."""

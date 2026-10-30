@@ -32,7 +32,7 @@ from messagefoundry.api.models import (
     ServiceStatusInfo,
     SystemStatus,
 )
-from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
+from messagefoundry.connection_events import CONNECTION_EVENT_KIND_ORDER
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import (
@@ -367,15 +367,11 @@ def _alert_rules_section(config: AlertsConfig) -> list[Markup]:
     return [el("h2", "Rules"), summary, rules_table]
 
 
-#: The /ui event-log kind dropdown's choices: the engine's one connection-event vocabulary, sorted
-#: so the order is stable across processes (a frozenset's iteration order is not). BACKLOG #1624.
-_EVENT_KINDS = tuple(sorted(CONNECTION_EVENT_KINDS))
-
-
 def _event_filter(connection: str, kind: str = "") -> Markup:
-    """A GET filter form for the event log (reuses the /events connection + kind query params)."""
+    """A GET filter form for the event log (reuses the /events connection + kind query params). The
+    kind choices are the engine's one connection-event vocabulary (BACKLOG #1624)."""
     options = [el("option", "All kinds", value="")] + [
-        el("option", k, value=k, selected=(k == kind) or None) for k in _EVENT_KINDS
+        el("option", k, value=k, selected=(k == kind) or None) for k in CONNECTION_EVENT_KIND_ORDER
     ]
     return el(
         "form",
