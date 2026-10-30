@@ -1082,6 +1082,8 @@ def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_au
         dest = MLLPDestination(
             _mllp(REMOTE, allow_expired=True, attested=True, policy=_crl_policy(bare_crl))
         )
+    # The CRL reached the context, so the missing credit is the relaxation's.
+    assert dest._ssl is not None and context_checks_revocation(dest._ssl) is True
     assert dest._revocation_guard is not None
     assert dest._revocation_guard.crl_checked is False
     shipped = _shipped(log.audit)
@@ -1126,9 +1128,11 @@ def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
 
     monkeypatch.setattr(RevocationHopGuard, "capture", staticmethod(recording_capture))
     with active_hop_posture(ENFORCING), _guard_log() as log:
-        DicomScuDestination(
+        dest = DicomScuDestination(
             _scu(REMOTE, allow_expired=True, attested=True, policy=_crl_policy(bare_crl))
         )
+    # The CRL reached the context, so the missing credit is the relaxation's.
+    assert context_checks_revocation(dest._ssl) is True
     assert [guard.crl_checked for guard in guards] == [False]
     shipped = _shipped(log.audit)
     assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
@@ -1140,8 +1144,11 @@ def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str
     take the same WARN as any unchecked hop on a non-enforcing instance."""
     policy = _crl_policy(bare_crl)
     with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
-        MLLPDestination(_mllp(REMOTE, allow_expired=True, policy=policy))
-        DicomScuDestination(_scu(REMOTE, allow_expired=True, policy=policy))
+        mllp = MLLPDestination(_mllp(REMOTE, allow_expired=True, policy=policy))
+        scu = DicomScuDestination(_scu(REMOTE, allow_expired=True, policy=policy))
+    # The CRL reached both contexts, so each WARNING is the relaxation's.
+    assert mllp._ssl is not None and context_checks_revocation(mllp._ssl) is True
+    assert context_checks_revocation(scu._ssl) is True
     revocation = [m for m in log.messages if "revocation" in m]
     assert any("verified MLLP-over-TLS egress" in m for m in revocation), log.state()
     assert any("verified DICOM-over-TLS association" in m for m in revocation), log.state()
