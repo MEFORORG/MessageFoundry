@@ -126,6 +126,15 @@ this line.**
   `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
   `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
 
+### Fixed
+
+- **The flag toggle's "audit log did not record the change" page keys on the refusal's type.**
+  The console gave that page for any 503 the engine's flag handler raised, relying on a comment
+  that the handler had no other. No other 503 reaches it today, so nothing an operator sees
+  changes; a 503 a later handler change adds is no longer named as the audit refusal. The console
+  now catches the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine
+  seam that carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+
 ## [0.5.0] — 2026-10-20 — Early Access
 
 **Requires engine 0.5.2. Supported engine UI seam: `6d8b36eb7bb94bf0`**, the value engine 0.5.2
@@ -248,11 +257,6 @@ digest moved.
 
 ### Fixed
 
-- **The flag toggle's "audit log did not record the change" page shows only for that refusal.**
-  The console gave that page for any 503 from the toggle, on the claim that the engine's flag
-  handler had no other. It now keys the page on the engine's `ConfigWriteNotRecorded`, and any
-  other 503 reaches the operator as itself. Needs the engine seam that carries
-  `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 - **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
   `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
   next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:

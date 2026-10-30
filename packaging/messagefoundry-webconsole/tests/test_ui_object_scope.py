@@ -129,4 +129,5 @@ async def test_ui_flag_gives_another_503_no_audit_page(
             headers=SAME_ORIGIN,
         )
     assert r.status_code == 503, r.text[:300]
+    assert "some other unavailable" in r.text
     assert "The audit log did not record the change" not in r.text

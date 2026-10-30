@@ -162,8 +162,11 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     ``alert_directory_administrator_granted`` joined with the directory sign-in grant alert (vault
     BACKLOG #2610). ``authorization_header`` joined with the repeated-header refusal on
     ``GET /ui/sso`` (BACKLOG #2454). ``RepeatedCredentialError`` and ``record_repeated_credential``
-    joined when the session-cookie read took the same rule (BACKLOG #2454)."""
+    joined when the session-cookie read took the same rule (BACKLOG #2454).
+    ``ConfigWriteNotRecorded`` joined when the console's flag route took the audit refusal by type
+    (BACKLOG #3811)."""
     assert surface.security_symbols == (
+        "ConfigWriteNotRecorded",
         "RepeatedCredentialError",
         "alert_directory_administrator_granted",
         "authorization_header",

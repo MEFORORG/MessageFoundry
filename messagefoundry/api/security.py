@@ -425,11 +425,13 @@ class ConfigWriteNotRecorded(HTTPException):
     BACKLOG #2945).
 
     The connection flag handler raises it in place of a plain 503, so the console's flag route can
-    name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). A status cannot
-    name it: the JSON route has other 503s, at least ``_get_engine``'s "engine not started" and
-    ``RequestTimeoutMiddleware``'s deadline, and a later handler change could add one the console
-    calls through. The HTTP answer is the ordinary 503 with ``detail``. Defined here because this
-    is the leaf module the console imports, and the seam snapshot records what it imports from it."""
+    name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). The JSON route
+    answers other 503s, at least ``_get_engine``'s "engine not started" and
+    ``RequestTimeoutMiddleware``'s deadline. Neither reaches the console, which calls the handler
+    in-process with its engine supplied, so keying on the status held only because nothing in the
+    handler itself raised another 503; a later change to the handler could. The HTTP answer is the
+    ordinary 503 with ``detail``. Defined here because this is the leaf module the console imports,
+    and the seam snapshot records what it imports from it."""
 
     def __init__(self, detail: str) -> None:
         super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
