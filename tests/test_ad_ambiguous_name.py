@@ -335,7 +335,7 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     _install_directory(monkeypatch, [], answer)
     store = await MessageStore.open(tmp_path / "tie-break.db")
     try:
-        settings = _settings(kerberos_enabled=True)
+        settings = _settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
         await service.initialize()
         await service.set_ad_group_map([(group.lower(), "operator")], actor="admin")
@@ -371,7 +371,11 @@ async def test_an_edited_row_on_a_keyed_store_breaks_no_tie(tmp_path: Path) -> N
     path = tmp_path / "sealed.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
-        service = AuthService(store, _settings(kerberos_enabled=True), ldap=_authenticator())
+        service = AuthService(
+            store,
+            _settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM"),
+            ldap=_authenticator(),
+        )
         await service.initialize()
         await store.create_user(
             user_id=uuid.uuid4().hex,
@@ -411,7 +415,11 @@ async def test_a_like_named_local_row_breaks_no_tie(
 
     store = await MessageStore.open(tmp_path / "local-row.db")
     try:
-        service = AuthService(store, _settings(kerberos_enabled=True), ldap=_authenticator())
+        service = AuthService(
+            store,
+            _settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM"),
+            ldap=_authenticator(),
+        )
         await service.initialize()
         current: SimpleNamespace | None = SimpleNamespace(
             auth_provider=AuthProvider.AD.value, directory_object_id=str(_GUID_X)

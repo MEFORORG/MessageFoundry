@@ -32,6 +32,13 @@ level is out of its reach in either mode; the safe-source DACL gate still covers
   child's own re-read of ``codesets/`` is never authoritative), runs the function, and describes its
   result back. The worker is *long-lived* (one child per inbound), never a per-message fork — a fork
   per message would destroy the throughput target.
+* ``isolated`` (ADR 0147, vault BACKLOG #3131) — the ``subprocess`` worker, with a Handler's
+  ``db_lookup``/``fhir_lookup`` brokered through the parent instead of refused: the worker writes a
+  ``lookup`` frame mid-dispatch and the parent answers it with the runner the in-process path uses
+  (:meth:`SandboxSession._serve_lookup`), refusing what :meth:`SandboxSession._lookup_refusal`
+  lists. **No OS-level confinement yet:** ADR 0147's Landlock/seccomp and AppContainer limbs are
+  unbuilt, so this mode confines exactly what ``subprocess`` does. Every check that means "runs in a
+  worker" reads ``is not SandboxMode.OFF``, so this mode takes every worker branch.
 
 **Both legs of the pipe are untrusted by contract.** The child runs exactly the code the sandbox
 exists to distrust: while it lives, a grandchild it spawns inherits fd 1 (the response pipe) and can
@@ -61,8 +68,8 @@ store/crypto). Its environment is an allowlist, not the engine's own
 On top of that address-space boundary the child adds defence-in-depth: a
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus a
 POSIX memory cap when available), and a fail-closed refusal of the live
-``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
-breaks — forwarding them over IPC is a documented next-phase residual). The import guard is
+``db_lookup``/``fhir_lookup`` bridges at ``mode=subprocess`` (they re-enter the event loop, which a
+process boundary breaks; ``mode=isolated`` forwards them over the pipe instead). The import guard is
 **defence-in-depth only** — a module imported before it goes up keeps a live reference, so the
 address-space boundary and the codec are the load-bearing controls.
 
@@ -85,6 +92,7 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
+import contextvars
 import enum
 import logging
 import queue
@@ -102,15 +110,22 @@ from typing import IO, Any, Final
 from messagefoundry import proctree
 from messagefoundry.childenv import python_child_argv, worker_environment
 from messagefoundry.config.code_sets import CodeSet
+from messagefoundry.config.db_lookup import DbLookupError, db_lookup
+from messagefoundry.config.db_lookup import is_available as db_lookup_available
+from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.fhir_lookup import is_available as fhir_lookup_available
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+    EgressSettings,
+    SandboxSettings,
     security_enforcement_env_names,
 )
 from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import GraphShape, SandboxCodecError, SandboxError
+from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "SandboxMode",
@@ -124,6 +139,7 @@ __all__ = [
     "graph_shape",
     "graph_differences",
     "run_sandboxed",
+    "policy_from_settings",
     "DEFAULT_FORBIDDEN_MODULES",
     "WORKER_MODULE",
 ]
@@ -161,6 +177,10 @@ class SandboxMode(str, enum.Enum):  # noqa: UP042
     # docstring's mode bullets; [sandbox].mode is engine-wide, so that escape is too).
     OFF = "off"  # in-process, byte-identical, zero overhead (default)
     SUBPROCESS = "subprocess"  # persistent per-inbound worker child
+    # The SUBPROCESS worker, with db_lookup/fhir_lookup brokered through the parent (ADR 0147). Every
+    # check that means "runs in a worker" is `is not SandboxMode.OFF`, so this mode can never take an
+    # in-process branch that only SUBPROCESS was excluded from (vault BACKLOG #3131).
+    ISOLATED = "isolated"
 
 
 @dataclass(frozen=True)
@@ -175,8 +195,8 @@ class SandboxPolicy:
     ``mode=off`` (the shipped default) is the zero-overhead, byte-identical parity mode.
     ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
-    pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
-    ``mode=subprocess``: the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
+    pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** in
+    a worker mode (``subprocess``, ``isolated``): the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
     ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
     (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
@@ -193,6 +213,30 @@ class SandboxPolicy:
     #: ``[sandbox].pass_environment``: the extra variable NAMES the worker is given. Settings load
     #: refuses the engine's own; this dataclass carries what it let through.
     pass_environment: tuple[str, ...] = ()
+    #: ``[egress].allowed_db`` and ``[egress].allowed_http``, read only by the parent's lookup broker
+    #: at ``mode=isolated`` (ADR 0147), which refuses a lookup while its list is empty
+    #: (:meth:`SandboxSession._lookup_refusal`). The hosts themselves are checked where the in-process
+    #: path checks them, when the lookup executors are built. Empty by default, so a policy built
+    #: without them brokers nothing. Never sent to the worker.
+    lookup_allowed_db: tuple[str, ...] = ()
+    lookup_allowed_http: tuple[str, ...] = ()
+
+
+def policy_from_settings(settings: SandboxSettings, egress: EgressSettings) -> SandboxPolicy:
+    """The :class:`SandboxPolicy` the engine renders from ``[sandbox]`` and ``[egress]``.
+
+    ``SandboxMode(settings.mode)`` raises ``ValueError`` on a mode it does not know, so a value
+    that reached this point without the settings model's own check still refuses to start rather
+    than being read as some other mode."""
+    return SandboxPolicy(
+        mode=SandboxMode(settings.mode),
+        wall_seconds=settings.wall_seconds,
+        mem_mb=settings.mem_mb,
+        startup_seconds=settings.startup_seconds,
+        pass_environment=settings.pass_environment,
+        lookup_allowed_db=tuple(egress.allowed_db),
+        lookup_allowed_http=tuple(egress.allowed_http),
+    )
 
 
 def graph_shape(registry: Any) -> GraphShape:
@@ -211,6 +255,23 @@ def graph_shape(registry: Any) -> GraphShape:
 #: How a refusal names a difference in the config modules' bytes alone.
 _CONTENT_DIFFERS: Final = "config module content"
 
+#: The accessor each lookup kind names, for the broker's refusals and log lines.
+_LOOKUP_FN: Final = {codec.LOOKUP_DB: "db_lookup", codec.LOOKUP_FHIR: "fhir_lookup"}
+
+#: Longest error text the broker sends back to a worker. A lookup error can quote the connection
+#: name the worker sent, and the worker chooses its length.
+_LOOKUP_ERROR_CAP: Final = 2048
+
+
+def _shown_name(name: str) -> str:
+    """A connection name a worker sent, scrubbed and cut, for a refusal or a log line."""
+    return scrub_control_chars(name)[:80]
+
+
+def _bounded(text: str) -> str:
+    return text if len(text) <= _LOOKUP_ERROR_CAP else text[:_LOOKUP_ERROR_CAP] + " [cut]"
+
+
 #: How many names a refusal lists per side of one part of the graph.
 _NAMES_SHOWN: Final = 3
 
@@ -218,7 +279,7 @@ _NAMES_SHOWN: Final = 3
 def _shown(names: set[str] | frozenset[str]) -> str:
     """Up to :data:`_NAMES_SHOWN` names for an error text. Half of them come from the worker, so
     each is scrubbed and cut before it reaches a log line."""
-    listed = [scrub_control_chars(name)[:80] for name in sorted(names)[:_NAMES_SHOWN]]
+    listed = [_shown_name(name) for name in sorted(names)[:_NAMES_SHOWN]]
     more = len(names) - len(listed)
     return ", ".join(listed) + (f" and {more} more" if more > 0 else "")
 
@@ -455,9 +516,21 @@ def _write_frame(stream: Any, body: bytes) -> None:
     pipe; the caller maps either to :class:`SandboxError`."""
     if len(body) > _MAX_FRAME:
         raise SandboxError(f"sandbox frame too large: {len(body)} bytes")
-    stream.write(_LEN.pack(len(body)))
-    stream.write(body)
+    _write_all(stream, _LEN.pack(len(body)))
+    _write_all(stream, body)
     stream.flush()
+
+
+def _write_all(stream: Any, data: bytes) -> None:
+    """Write every byte of ``data``. The parent's end of the worker pipe is unbuffered
+    (``bufsize=0``), and a raw ``write`` may return a short count, as a large one interrupted by a
+    signal can; dropping the remainder would hand the worker a torn frame."""
+    view = memoryview(data)
+    while view:
+        written = stream.write(view)
+        if not written:  # None is a non-blocking raw stream with no room; the pipes here block
+            raise OSError("sandbox pipe accepted no bytes")
+        view = view[written:]
 
 
 def _read_exact(stream: Any, n: int) -> bytes | None:
@@ -649,6 +722,12 @@ class SandboxSession:
         self._generation = 0
         self._lock = threading.Lock()
         self._closed = False
+        # The [egress] lists whose empty-list refusal this session has logged.
+        self._lookup_refusals_logged: set[str] = set()
+        # Per (kind, connection), the completion event of the runner call running on it, removed by
+        # that call when it returns: see _serve_lookup.
+        self._running_lookups: dict[tuple[str, str], threading.Event] = {}
+        self._running_lock = threading.Lock()
 
     @property
     def mode(self) -> SandboxMode:
@@ -677,6 +756,7 @@ class SandboxSession:
                 forbidden=self.policy.forbidden_modules,
                 mem_mb=self.policy.mem_mb,
                 code_sets=self._code_sets,
+                broker=self.policy.mode is SandboxMode.ISOLATED,
             )
         except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
@@ -952,6 +1032,298 @@ class SandboxSession:
         assert proc is not None
         return proc
 
+    # -- the lookup broker (mode=isolated, ADR 0147) ----------------------------
+
+    def _await_answer(
+        self, proc: subprocess.Popen[bytes], request_id: str, phase: str, name: str
+    ) -> codec.Response:
+        """The dispatch's ``ok``/``fail`` frame, after serving every ``lookup`` frame the worker
+        writes before it at ``mode=isolated``. Any other mode decodes with
+        :func:`codec.decode_response`, which refuses a ``lookup`` frame, so only an isolated session
+        ever brokers a lookup and no worker can ask another session to.
+
+        ``wall_seconds`` bounds the whole dispatch, the lookups the parent serves for it included
+        (:meth:`_serve_bounded`), so the cap stays the bound it is at ``mode=subprocess`` and a feed
+        whose lookups are slow needs a larger cap."""
+        brokered = self.policy.mode is SandboxMode.ISOLATED
+        deadline = time.monotonic() + self.policy.wall_seconds
+        expected_seq = 1
+        while True:
+            try:
+                frame = self._responses.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
+                # runaway child (a busy-loop can't wedge intake) and fail closed.
+                self._kill(proc)
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
+                ) from None
+            if frame is _EOF:
+                self._kill(proc)
+                served = expected_seq - 1
+                after = f", after {served} brokered lookup(s)" if served else ""
+                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
+            try:
+                # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
+                # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
+                answer = (
+                    codec.decode_answer(frame, request_id=request_id, phase=phase, name=name)
+                    if brokered
+                    else codec.decode_response(frame, request_id=request_id, phase=phase, name=name)
+                )
+                if isinstance(answer, codec.LookupRequest) and answer.seq != expected_seq:
+                    raise SandboxCodecError(
+                        f"sandbox lookup is out of sequence (expected {expected_seq})"
+                    )
+            except SandboxError as exc:
+                # A desynchronized or forged frame: the worker's stream can no longer be trusted to
+                # line up with our requests, so drop it and respawn on the next message.
+                self._kill(proc)
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} returned an invalid frame: {exc}"
+                ) from exc
+            if isinstance(answer, codec.Response):
+                return answer
+            expected_seq += 1
+            if not self._serve_bounded(proc, request_id, phase, name, answer, deadline):
+                self._kill(proc)
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap, "
+                    "which counts the lookups the engine served for it"
+                )
+
+    def _serve_bounded(
+        self,
+        proc: subprocess.Popen[bytes],
+        request_id: str,
+        phase: str,
+        name: str,
+        lookup: codec.LookupRequest,
+        deadline: float,
+    ) -> bool:
+        """Serve one lookup and write its reply, within the dispatch's wall cap; ``False`` if the
+        cap ran out first, and the caller then kills the worker.
+
+        Both halves run on a helper thread, because either can block past the cap while this thread
+        holds the session lock, and a reload's ``close`` waits on that lock. The lookup can wait on
+        its runner for the runner's own result timeout, longer than the default cap. The reply can
+        be larger than the pipe's buffer, and a worker that sent a ``lookup`` frame and then stopped
+        reading stdin would hold the write for good. The thread runs in a copy of this thread's
+        context, so it sees the lookup runner the transform worker published. Killing the worker
+        normally ends a blocked write. A broken pipe raises :class:`SandboxError` after the worker is
+        killed.
+
+        **Each lookup records itself per connection while its runner runs** (:meth:`_serve_lookup`
+        registers it, and says what a later lookup on that connection then does). The record is the
+        lookup half's completion, not the thread's: a reply write that never ends cannot keep the
+        connection marked busy.
+
+        **An unexpected fault in the engine fails the dispatch at once,** with a fixed cause and the
+        worker killed, rather than leave the worker waiting for a reply until the cap. The helper logs
+        it by exception type only, never its text, which could carry message content, and it does so
+        even when the cap has already cut the helper off."""
+        assert proc.stdin is not None
+        stdin = proc.stdin
+        failure: list[BaseException] = []
+        fault: list[BaseException] = []
+        # Set by this thread the moment it gives up on the helper. The helper checks it, with the
+        # deadline, before it registers and calls the runner, and checks it alone before it writes.
+        abandoned = threading.Event()
+
+        def report(exc: BaseException) -> None:
+            fault.append(exc)
+            log.error(
+                "inbound %r: the engine failed while serving a brokered lookup for %s %r (%s)",
+                self._inbound,
+                phase,
+                name,
+                type(exc).__name__,
+            )
+
+        def serve() -> None:
+            try:
+                reply = self._lookup_reply(request_id, phase, name, lookup, deadline, abandoned)
+            except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
+                report(exc)
+                return
+            if abandoned.is_set():
+                return  # the worker is being killed; nothing reads this reply
+            try:
+                _write_frame(stdin, reply)
+            except (OSError, ValueError, SandboxError) as exc:  # ValueError: a pipe closed under it
+                failure.append(exc)
+            except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
+                report(exc)
+
+        context = contextvars.copy_context()
+        helper = threading.Thread(
+            target=context.run,
+            args=(serve,),
+            name=f"mf-sandbox-lookup-{self._inbound}",
+            daemon=True,
+        )
+        helper.start()
+        helper.join(max(0.0, deadline - time.monotonic()))
+        if helper.is_alive():
+            abandoned.set()
+            return False
+        if fault:
+            self._kill(proc)
+            raise SandboxError(
+                f"sandbox {phase} {name!r} failed while serving its worker's lookup: an "
+                "unexpected engine error, logged by type"
+            )
+        if failure:
+            self._kill(proc)
+            raise SandboxError(f"could not answer the sandbox worker's lookup: {failure[0]}")
+        return True
+
+    def _lookup_reply(
+        self,
+        request_id: str,
+        phase: str,
+        name: str,
+        lookup: codec.LookupRequest,
+        deadline: float,
+        abandoned: threading.Event,
+    ) -> bytes:
+        """The ``lookupok``/``lookupfail`` frame answering one ``lookup``. A result that cannot cross
+        is a ``lookupfail`` the worker can report."""
+        ok, result, error = self._serve_lookup(phase, lookup, deadline, abandoned)
+        fn = _LOOKUP_FN[lookup.kind]
+        if ok:
+            try:
+                body = codec.encode_lookup_ok(
+                    request_id=request_id, phase=phase, name=name, seq=lookup.seq, result=result
+                )
+            except SandboxError as exc:
+                # At least a column type outside the closed grammar, such as a UUID.
+                error = f"{fn} result cannot cross the sandbox: {exc}"
+            else:
+                if len(body) <= _MAX_FRAME:
+                    return body
+                error = f"{fn} result is larger than a sandbox frame ({len(body)} bytes)"
+        return codec.encode_lookup_fail(
+            request_id=request_id, phase=phase, name=name, seq=lookup.seq, error=error
+        )
+
+    def _serve_lookup(
+        self,
+        phase: str,
+        lookup: codec.LookupRequest,
+        deadline: float,
+        abandoned: threading.Event,
+    ) -> tuple[bool, object, str]:
+        """Answer one brokered lookup in the parent: ``(ok, result, error)``.
+
+        The answer comes from the same ``db_lookup``/``fhir_lookup`` accessor a Handler calls at
+        ``mode=off``, in this dispatch's context, so it resolves the runner the transform worker
+        published for this transform and nothing else (ADR 0147 AC-2). Where none is published, as on
+        a Router, in a dry run, on the inline fast path or in a graph that declares no lookup, the call
+        raises exactly what it raises at ``mode=off``, and it is made before any refusal of the
+        broker's own, so that is the error the Handler sees. The executor behind the runner was built
+        against ``[egress]`` and runs its own statement test and row ceiling, so each applies here as
+        in-process. The slice-B seam: a broker-only check of a lookup's own arguments goes between the
+        refusals below and the call.
+
+        **One runner call at a time per connection.** Under ``_running_lock``, a lookup registers its
+        own completion event for its connection, then calls the runner, and removes the record when
+        the runner returns. A later lookup on that connection can only meet one the wall cap cut off,
+        since a session serves one dispatch at a time. It waits on that record by the rule
+        ``docs/CONFIGURATION.md`` states (section ``[sandbox]``, *``mode="isolated"``*), and is
+        refused if it still runs then. Every runner call is recorded, so a connection never has two in
+        one session (a reload replaces the session; ``docs/CONFIGURATION.md`` states the limits).
+        **A helper does not call the runner once its dispatch is over:** it checks ``abandoned`` and
+        the deadline just before it registers. That is a check, not a fence. A helper that passed it
+        an instant before the dispatch gave up still calls the runner, and that call is recorded and
+        holds the connection like any other."""
+        is_db = lookup.kind == codec.LOOKUP_DB
+        available = db_lookup_available() if is_db else fhir_lookup_available()
+        refusal = self._lookup_refusal(phase, lookup) if available else None
+        if refusal is not None:
+            return False, None, refusal
+        key = (lookup.kind, lookup.connection)
+        done = threading.Event()
+        if available:
+            margin = min(2.0, self.policy.wall_seconds / 4)
+            while True:
+                with self._running_lock:
+                    if abandoned.is_set() or time.monotonic() >= deadline:
+                        # The dispatch is over: its worker is being killed and nobody waits.
+                        return (
+                            False,
+                            None,
+                            f"{_LOOKUP_FN[lookup.kind]}: the call's wall cap ran out",
+                        )
+                    current = self._running_lookups.get(key)
+                    if current is None:
+                        self._running_lookups[key] = done
+                        break
+                if not current.wait(max(0.0, deadline - margin - time.monotonic())):
+                    return False, None, self._busy_refusal(lookup)
+        try:
+            if is_db:
+                return True, db_lookup(lookup.connection, lookup.target, lookup.params), ""
+            return True, fhir_lookup(lookup.connection, lookup.target, lookup.params), ""
+        except (DbLookupError, FhirLookupError) as exc:
+            # PHI-free by both types' contract: a connection name and a routing-safe reason.
+            return False, None, _bounded(str(exc))
+        except Exception as exc:  # noqa: BLE001 — the worker waits on this reply; report, never raise
+            return False, None, f"{_LOOKUP_FN[lookup.kind]} failed: {safe_exc(exc)}"
+        finally:
+            if available:
+                with self._running_lock:
+                    if self._running_lookups.get(key) is done:
+                        del self._running_lookups[key]
+                done.set()
+
+    @staticmethod
+    def _busy_refusal(lookup: codec.LookupRequest) -> str:
+        fn = _LOOKUP_FN[lookup.kind]
+        return (
+            # Short, scope first: a dead-letter keeps about the first 200 characters of this.
+            f"{fn}({_shown_name(lookup.connection)!r}) refused: this inbound's sandbox session "
+            "runs one lookup per connection, and one the wall cap cut off is still running "
+            "(ADR 0147)"
+        )
+
+    def _lookup_refusal(self, phase: str, lookup: codec.LookupRequest) -> str | None:
+        """Why the parent refuses a brokered lookup outright, or ``None`` to serve it.
+
+        A lookup is answered only for a Handler, so one bound to a Router or an ``accepts=`` dispatch
+        is refused even if a worker sends it; the child has no lookup runner in those phases either.
+        And one whose ``[egress]`` list is empty is refused, under the ruling ``docs/CONFIGURATION.md``
+        states in section ``[sandbox]``, *``mode="isolated"``* (vault BACKLOG #3131). The first such
+        refusal per session and list logs a WARNING."""
+        fn = _LOOKUP_FN[lookup.kind]
+        shown = _shown_name(lookup.connection)
+        if phase != "transform":
+            return (
+                f"{fn}({shown!r}) is unavailable here — the engine answers a brokered lookup only "
+                "for a Handler, never for a Router or an accepts= predicate (ADR 0147)"
+            )
+        if lookup.kind == codec.LOOKUP_DB:
+            allowed, key = self.policy.lookup_allowed_db, "allowed_db"
+        else:
+            allowed, key = self.policy.lookup_allowed_http, "allowed_http"
+        if allowed:
+            return None
+        if key not in self._lookup_refusals_logged:
+            # Keyed by the list, whatever connection a worker names, so it holds at most two entries.
+            self._lookup_refusals_logged.add(key)
+            log.warning(
+                "inbound %r: a brokered %s on %r was refused: [egress].%s is empty "
+                "([sandbox].mode=isolated, ADR 0147)",
+                self._inbound,
+                fn,
+                shown,
+                key,
+            )
+        return (
+            f"{fn}({shown!r}) refused: [egress].{key} is empty, and [sandbox].mode=isolated "
+            "brokers a lookup only to a host that list names (ADR 0147)"
+        )
+
     # -- dispatch -------------------------------------------------------------
 
     def dispatch(
@@ -1001,29 +1373,7 @@ class SandboxSession:
                 # reset the worker.
                 self._kill(proc)
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
-            try:
-                frame = self._responses.get(timeout=self.policy.wall_seconds)
-            except queue.Empty:
-                # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
-                # runaway child (a busy-loop can't wedge intake) and fail closed.
-                self._kill(proc)
-                raise SandboxError(
-                    f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
-                ) from None
-            if frame is _EOF:
-                self._kill(proc)
-                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}")
-            try:
-                # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
-                # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
-                resp = codec.decode_response(frame, request_id=request_id, phase=phase, name=name)
-            except SandboxError as exc:
-                # A desynchronized or forged frame: the worker's stream can no longer be trusted to
-                # line up with our requests, so drop it and respawn on the next message.
-                self._kill(proc)
-                raise SandboxError(
-                    f"sandbox {phase} {name!r} returned an invalid frame: {exc}"
-                ) from exc
+            resp = self._await_answer(proc, request_id, phase, name)
             # One request, one frame: a second FRAME already queued means the worker is writing frames
             # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
             # peer — it reaps the worker and leaves this proven answer standing.)
@@ -1058,9 +1408,9 @@ def run_sandboxed(
 
     With ``session is None`` or ``session.mode is OFF`` this is exactly ``fn(payload)`` — in-process,
     byte-identical, zero overhead (the parity default); nothing above that branch touches ``payload``,
-    ``origin``, or the codec. With ``session.mode is SUBPROCESS`` the call is marshalled to the
-    persistent worker via :meth:`SandboxSession.dispatch`, enforcing the forbidden-import / resource
-    caps and raising :class:`SandboxError` on any violation.
+    ``origin``, or the codec. In every other mode (``subprocess``, ``isolated``) the call is
+    marshalled to the persistent worker via :meth:`SandboxSession.dispatch`, enforcing the
+    forbidden-import / resource caps and raising :class:`SandboxError` on any violation.
 
     ``origin`` is the ``(raw, content_type)`` the caller built ``payload`` from — pass it **only** when
     the caller derived the payload itself, so the child can rebuild it byte-faithfully; ``None`` makes

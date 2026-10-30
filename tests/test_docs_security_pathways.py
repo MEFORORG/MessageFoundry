@@ -4100,6 +4100,7 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
             settings = AuthSettings(
                 ad_enabled=True,
                 kerberos_enabled=True,
+                kerberos_realm="EXAMPLE.COM",
                 ad_server="ldaps://x",
                 ad_user_search_base="DC=x",
                 ad_bind_dn="CN=svc,DC=x",

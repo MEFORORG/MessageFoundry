@@ -340,7 +340,7 @@ def _accepted(
         if pred is None:
             kept.append(hname)
             continue
-        if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+        if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
             # ADR 0087 parity: the predicate is user code and must run under the SAME isolation as the
             # Router/Handler it sits beside. Evaluating it here in the parent would let a predicate
             # reach the imports and resources the sandbox exists to deny.
@@ -431,7 +431,7 @@ def route_only(
     # its "not even an allocation" promise rather than paying for a seam it never crosses.
     origin: tuple[str | bytes, str] | None = None
     raw_result: list[str] | str | None
-    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+    if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
         if derived:
             origin = (raw, ic.content_type.value)
         raw_result = cast(
@@ -525,7 +525,7 @@ def transform_one(
     if payload is None:
         payload = _payload(raw, content_type)
     raw_result: HandlerResult
-    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+    if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
         raw_result = cast(
             "HandlerResult",
             run_sandboxed(

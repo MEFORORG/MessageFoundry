@@ -258,7 +258,7 @@ async def test_a_socket_fault_on_a_kerberos_sign_in_is_audited_as_a_login_error(
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "alice")
     _install_fakes(monkeypatch)
     _faulting(monkeypatch, at="open", fault=make())
-    settings = _ad_settings(kerberos_enabled=True)
+    settings = _ad_settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
