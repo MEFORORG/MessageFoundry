@@ -64,16 +64,44 @@ in the order the SCP applies them.
 | Control | When the SCP applies it | What a peer that fails it gets |
 |---|---|---|
 | `source_ip_allowlist` | when the connection is accepted, before the TLS handshake and before anything is read from the peer | the connection is closed. No association forms, so no object is sent |
+| the caps on connections with no association yet | when the connection is accepted, after the address check, on cleartext and on TLS | the connection is closed before a thread is started for it |
 | the TLS handshake (`tls=true`), with the client certificate when `tls_ca_file` is set | after the address check, on the connection's own thread, and within 10 seconds | the connection is closed. A handshake that is slow, or never starts, does not delay another sender's |
+| the deadline on the association request | on the connection's own thread, for the whole of the first PDU, within `timeout_seconds` | the connection is closed, and the refusal is logged. No association was started for it |
 | `calling_ae_allowlist` and `require_called_ae_title` | when the association request is read | the association is rejected. No object is sent |
 | `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
 
 The 10 second handshake bound is a deadline for the whole handshake. It is the same constant the
 MLLP listener uses, and it is not a setting.
 
-One SCP runs at most 256 TLS handshakes at once, and at most 32 from one peer address. A connection
-over either number is closed. Those are the MLLP listener's two connection caps. Here they count a
-connection only while it is in its handshake.
+One SCP holds at most 256 connections with no association yet, and at most 32 from one peer address.
+A connection counts from accept until its association starts.
+So that is also at most 256 TLS handshakes at once, and at most 32 from one peer.
+A connection over either number is closed. Those are the MLLP listener's two connection caps, and
+they are not settings.
+
+**A peer has `timeout_seconds` to deliver its whole association request.** That is a deadline, not
+an idle timer, so a peer that sends a byte at a time is ended on time, as a silent one is. The clock
+starts when the SCP starts to read, after any TLS handshake and any
+`max_associations_per_second` wait. An SCU sends its request as soon as it connects, so a working
+sender does not meet this. The first PDU has to be a well-formed association request of at most 512 KiB.
+PS3.8 sets no limit on that PDU, and the most a request can name is far smaller. Anything else is
+closed at once, with no association rejection.
+
+**A peer that stalls before its request is complete does not use up `max_associations`.** It never
+gets an association, so with `max_associations=2` and stalled peers still connected, a real sender
+is served. These are the limits of that:
+
+- A stalled peer holds one of the slots above until the deadline. Up to 32 stalled connections from
+  one address, or 256 in all, would refuse a sender that shares the address, or any sender, until
+  those deadlines run out. The sender succeeds once they do, while the stalled peers are still
+  connected. A sender behind one NAT address shares that address with every other sender there.
+- A connection waiting on `max_associations_per_second` has no association yet, so it holds a slot
+  too. A rate low enough to keep many senders waiting can fill the slots, and a connection over them
+  is closed.
+- **These bounds stop once the association is established.** A peer that finishes its association
+  and then stalls part way through a PDU is not ended by `timeout_seconds`, and it holds a
+  `max_associations` slot until it closes the connection. pynetdicom's reader is blocked in that
+  read, so its own timers cannot run. Measured at pynetdicom 3.0.4 on cleartext.
 
 **A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
 no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a

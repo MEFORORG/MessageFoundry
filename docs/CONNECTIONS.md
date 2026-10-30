@@ -3767,7 +3767,8 @@ Facts that are easy to get wrong, stated plainly first:
   listeners took the same key and default from vault BACKLOG #2606. **The HTTP listener has the key
   but it ships OFF**: it answers one request per connection, so behind a reverse proxy any per-host
   cap would be its whole capacity. Set it there only where the listener sees real client addresses.
-  The DICOM SCP has no per-host connection term.
+  The DICOM SCP has no such key. Its own per-host cap is a constant, and it counts only connections
+  with no association yet; see its paragraph below.
 - **An allowlist refusal is logged at most once per address per minute.** On the MLLP, raw-TCP, X12
   and HTTP listeners, a peer outside `source_ip_allowlist` earns one WARNING per 60 s however often
   it reconnects, and the listener writes at most 20 such lines per 60 s across every address. Each
@@ -3775,9 +3776,12 @@ Facts that are easy to get wrong, stated plainly first:
   connection event still records every refusal. The DICOM SCP uses the same throttle (vault BACKLOG
   #2606).
 - **The DICOM C-STORE SCP is a different shape** and none of the paragraph above describes it. It has
-  no `max_connections` and no engine-side active-client counter: its bound is `max_associations`
-  (**default 10**, `transports/dicom.py:165`), enforced inside pynetdicom, which **rejects the
-  association** rather than accepting it and closing at the application layer. Its idle/response bound
+  no `max_connections` key: its bound on established work is `max_associations`
+  (**default 10**), enforced inside pynetdicom, which **rejects the
+  association** rather than accepting it and closing at the application layer. Before that, the SCP
+  holds at most 256 connections with no association yet, and at most 32 from one address, and a
+  peer has `timeout_seconds` to deliver its whole association request. Neither cap is a setting, and
+  [DICOM.md](DICOM.md) section 3 states what they leave open. Its idle/response bound
   is `timeout_seconds` (**30 s**) applied to the ACSE/DIMSE/network timers, not `receive_timeout`. A
   peer failing the per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a
   `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP peer-control

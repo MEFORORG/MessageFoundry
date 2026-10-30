@@ -40,7 +40,8 @@ over-cap object is refused before any decode, re-encode or commit) + an **opt-in
 bound** (``max_associations_per_second``, ASVS 2.4.1 / BACKLOG #1114 — off by default, waits before the
 association request is read, and never drops or refuses; see :meth:`DicomScpSource._pace_association`
 for why the unit is an association and not a message) + DICOM-over-TLS, whose inbound handshake is
-bounded and runs off the accept loop. A non-loopback
+bounded and runs off the accept loop + a cap and a deadline on connections with no association yet
+(see :func:`_admitting_server_class`). A non-loopback
 cleartext SCP is refused at startup by the generalized bind-guard (see
 :func:`messagefoundry.pipeline.wiring_runner.check_dimse_tls_exposure`). All log lines carry only
 **routing-safe identifiers** (SOP class/instance UID, calling AE, peer IP) — **never** the dataset or
@@ -205,21 +206,38 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"
 #: The throttle is the one the socket listeners share (vault BACKLOG #2606), at its defaults.
 _REFUSAL_LOG_WINDOW_SECONDS = REFUSAL_LOG_WINDOW_SECONDS
 
-#: How often a pending inbound TLS handshake looks at whether the listener is stopping. It is a poll
-#: interval, not a bound: the bound is ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant,
-#: imported so the two listeners cannot drift apart. pynetdicom polls its own sockets at 0.5 s too.
-_HANDSHAKE_POLL_SECONDS = 0.5
+#: How often a pending inbound TLS handshake, and a read of a first PDU, look at whether the listener
+#: is stopping. It is a poll interval, not a bound. The handshake's bound is
+#: ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant, imported so the two listeners cannot drift
+#: apart. The first PDU's is ``timeout_seconds``. pynetdicom polls its own sockets at 0.5 s too.
+_STOP_POLL_SECONDS = 0.5
 
-#: Connections that may be inside their inbound TLS handshake at once: on one SCP, and from one peer
-#: address. The handshake runs on the connection's own thread, so these are what bound how many such
-#: threads exist. A connection over either is closed before a thread is started. They are the MLLP
-#: listener's two shipped connection caps, read from it so the numbers cannot drift apart; its
-#: constants say why 256 and why an eighth of it. Here they count a connection only while it is in
-#: its handshake. Constants, not settings, for the reason ``_TLS_HANDSHAKE_TIMEOUT`` gives. A
-#: handshake takes milliseconds, so senders that share one address behind a NAT do not meet the
-#: per-address number in normal use.
-_MAX_PENDING_HANDSHAKES = DEFAULT_MAX_CONNECTIONS
-_MAX_PENDING_HANDSHAKES_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
+#: Connections that may have no association yet, at once: on one SCP, and from one peer address. A
+#: connection counts from accept until its association has started: through the TLS handshake, any
+#: association-rate wait, and the read of its association request. All of that runs on the
+#: connection's own thread, so these are what bound how many such threads exist. A connection over
+#: either is closed before a thread is started. They are the MLLP listener's two shipped connection
+#: caps, read from it so the numbers cannot drift apart; its constants say why 256 and why an eighth
+#: of it. Here they count a connection only until its association starts, and from then on
+#: ``max_associations`` counts it. Constants, not settings, for the reason
+#: ``_TLS_HANDSHAKE_TIMEOUT`` gives. An SCU sends its request as soon as it connects, so senders that
+#: share one address behind a NAT do not meet the per-address number in normal use.
+_MAX_PENDING_CONNECTIONS = DEFAULT_MAX_CONNECTIONS
+_MAX_PENDING_CONNECTIONS_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
+
+#: The fixed head of every DICOM PDU (PS3.8 section 9.3): type, a reserved byte, a 4-byte length.
+_PDU_HEADER_BYTES = 6
+#: The PDU type of an A-ASSOCIATE-RQ, the only PDU a peer may open with (PS3.8 section 9.2).
+_PDU_TYPE_ASSOCIATE_RQ = 0x01
+#: The only protocol version an A-ASSOCIATE-RQ may name (PS3.8 section 9.3.2).
+_PROTOCOL_VERSION = 0x0001
+
+#: The most the SCP reads for one association request. PS3.8 sets no limit, and the PDU's length field
+#: can announce 4 GiB. A request names at most 128 presentation contexts, since their IDs are odd
+#: numbers in one byte. At 64-byte UIDs and 20 transfer syntaxes each, that is about 190 KiB, so this
+#: leaves room to spare for the user information items. Each connection this reads for is capped, so
+#: the memory it can hold is bounded too, and this also bounds the decode a request costs.
+_MAX_ASSOCIATE_RQ_BYTES = 512 * 1024
 
 #: The most refusal lines one SCP writes per window over every address together. The per-address
 #: bound alone would still let many addresses earn a line each.
@@ -239,6 +257,11 @@ _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 #: left out at every stage, so a peer that aborts earlier in the handshake is not counted either.
 #: On the MLLP listener it is that listener's own bound, and counted there.
 _HUNG_UP = (*HUNG_UP, ssl.SSLEOFError, ConnectionAbortedError)
+
+
+class _NoAssociationRequest(Exception):
+    """A peer did not deliver an association request the SCP will read. The message is the reason
+    the refusal line gives, so it never holds a byte the peer sent."""
 
 
 def _address_host(client_address: Any) -> str:
@@ -297,21 +320,54 @@ def _admitting_server_class() -> type[Any]:
       where the peer address is checked, so a peer outside ``source_ip_allowlist`` is closed before
       an association thread exists for it and before a byte is read from it.
     * ``ThreadingMixIn.process_request`` starts the connection's thread, still on the accept loop.
-      On a TLS listener the connection takes a handshake slot first, counted per listener and per
-      peer address against :data:`_MAX_PENDING_HANDSHAKES` and
-      :data:`_MAX_PENDING_HANDSHAKES_PER_HOST`. One over either is closed with no thread started.
+      The connection takes a slot first, on a cleartext listener as on a TLS one, counted per
+      listener and per peer address against :data:`_MAX_PENDING_CONNECTIONS` and
+      :data:`_MAX_PENDING_CONNECTIONS_PER_HOST`. One over either is closed with no thread started.
     * ``ThreadedAssociationServer.process_request_thread`` runs on the connection's own thread. The
       handshake runs there, against a deadline of ``_TLS_HANDSHAKE_TIMEOUT`` for the whole handshake.
       A peer that sends nothing, and one that sends its handshake slowly, are both dropped at it.
-      The slot is given back in a ``finally`` there, however the handshake ends.
+      The slot is given back in a ``finally`` there, because that thread's work ends when the
+      association has started: ``RequestHandler.handle`` returns right after ``assoc.start()``.
+    * ``RequestHandler.handle`` is replaced so that the association request is read BEFORE the
+      ``Association`` thread starts. pynetdicom reads a connection on the association's DUL thread,
+      in a loop of blocking ``recv`` calls on a socket with no timeout. That thread cannot reach
+      its own timers while it is blocked, and ``Association.kill()`` then waits on it for good, so
+      a peer that sent one byte and stopped would never be ended. Every started ``Association``
+      also counts at pynetdicom's ``maximum_associations`` check, so stalled peers could fill it
+      and turn a real sender away. Here the connection's own thread reads the first PDU under a
+      fixed deadline of ``timeout_seconds``, so a peer that stalls never starts an ``Association``.
+      It cannot use up ``max_associations``, and it costs one thread rather than two.
+    * That read consumes the PDU, and pynetdicom must still see it. ``_create_association`` names
+      ``AssociationSocket`` itself and ``Association.set_socket`` refuses a second socket, so the
+      socket it made is turned into a ``_ReplayingSocket``. A wrapper around the ``socket`` would
+      lose the ``ssl.SSLSocket`` check in ``AssociationSocket.ready``, and with it ``pending()``.
     * ``AE.start_server`` cannot start this class: its non-blocking branch names
       ``ThreadedAssociationServer`` itself. ``AE.make_server`` takes ``server_class`` and passes extra
       keywords to its constructor, and ``start_serving`` here does the rest of what that branch does.
     """
-    from pynetdicom.transport import ThreadedAssociationServer
+    from pynetdicom import evt
+    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.transport import AssociationSocket, RequestHandler, ThreadedAssociationServer
     from pynetdicom.utils import make_target
 
     _require_socketserver_routing(ThreadedAssociationServer)
+
+    class _ReplayingSocket(AssociationSocket):
+        """An association socket that first serves the PDU the server has already read."""
+
+        #: What is left of that PDU. It holds one whole PDU, and the DUL reads a PDU's header and
+        #: then its body, so a read never asks for more than is left.
+        replay: bytes
+
+        @property
+        def ready(self) -> bool:
+            return bool(self.replay) or super().ready
+
+        def recv(self, nr_bytes: int) -> bytearray:
+            if not self.replay:
+                return super().recv(nr_bytes)
+            served, self.replay = self.replay[:nr_bytes], self.replay[nr_bytes:]
+            return bytearray(served)
 
     class _AdmittingAssociationServer(ThreadedAssociationServer):
         def __init__(
@@ -331,11 +387,13 @@ def _admitting_server_class() -> type[Any]:
             #: The SCP's own stop signal, set before it calls shutdown(). shutdown() joins every
             #: connection thread, so a thread inside a handshake has to see this to end early.
             self._stopping = stopping
-            #: Handshakes in flight per peer address. Its values sum to the listener's total.
+            #: Connections with no association yet, per peer address. Its values sum to the
+            #: listener's total.
             self._pending: dict[str, int] = {}
             self._pending_lock = threading.Lock()
             #: When the next admission-check fault may be logged (monotonic). See verify_request.
             self._gate_fault_log_after = 0.0
+            kwargs["request_handler"] = _AdmittingRequestHandler
             super().__init__(*args, **kwargs)
 
         def start_serving(self) -> None:
@@ -375,13 +433,10 @@ def _admitting_server_class() -> type[Any]:
                 return False
 
         def process_request(self, request: Any, client_address: Any) -> None:
-            # On the accept loop, for a connection verify_request admitted. A TLS connection takes
-            # its handshake slot here, so one over a cap is closed before a thread exists for it.
-            if self.ssl_context is None:
-                super().process_request(request, client_address)
-                return
+            # On the accept loop, for a connection verify_request admitted. It takes its slot here,
+            # so one over a cap is closed before a thread exists for it.
             host = _address_host(client_address)
-            full = self._take_handshake_slot(host)
+            full = self._take_slot(host)
             if full is not None:
                 try:
                     self._refused(host, "a connection", full)
@@ -391,43 +446,148 @@ def _admitting_server_class() -> type[Any]:
             try:
                 super().process_request(request, client_address)
             except BaseException:
-                self._release_handshake_slot(host)  # no thread was started to give it back
+                self._release_slot(host)  # no thread was started to give it back
                 raise
 
         def process_request_thread(self, request: Any, client_address: Any) -> None:
-            context = self.ssl_context
-            if context is not None:
-                host = _address_host(client_address)
-                try:
+            host = _address_host(client_address)
+            try:
+                context = self.ssl_context
+                if context is not None:
                     request = self._handshake(context, request, host)
-                finally:
-                    self._release_handshake_slot(host)
-                if request is None:
-                    return
-            super().process_request_thread(request, client_address)
+                    if request is None:
+                        return
+                # Returns once the association's own thread has started, or the connection has
+                # ended. From there pynetdicom's maximum_associations counts it.
+                super().process_request_thread(request, client_address)
+            finally:
+                self._release_slot(host)
 
-        def _take_handshake_slot(self, host: str) -> str | None:
-            """Count one more handshake in flight for ``host``. Returns ``None`` when the slot is
-            taken, else the reason there is none, and then nothing was counted."""
+        def _take_slot(self, host: str) -> str | None:
+            """Count one more connection with no association yet for ``host``. Returns ``None`` when
+            the slot is taken, else the reason there is none, and then nothing was counted."""
             with self._pending_lock:
-                if sum(self._pending.values()) >= _MAX_PENDING_HANDSHAKES:
-                    return f"{_MAX_PENDING_HANDSHAKES} TLS handshakes are already in progress"
-                held = self._pending.get(host, 0)
-                if held >= _MAX_PENDING_HANDSHAKES_PER_HOST:
+                if sum(self._pending.values()) >= _MAX_PENDING_CONNECTIONS:
                     return (
-                        f"{_MAX_PENDING_HANDSHAKES_PER_HOST} TLS handshakes from this address "
-                        "are already in progress"
+                        f"{_MAX_PENDING_CONNECTIONS} connections with no association yet are "
+                        "already in progress"
+                    )
+                held = self._pending.get(host, 0)
+                if held >= _MAX_PENDING_CONNECTIONS_PER_HOST:
+                    return (
+                        f"{_MAX_PENDING_CONNECTIONS_PER_HOST} connections from this address with "
+                        "no association yet are already in progress"
                     )
                 self._pending[host] = held + 1
                 return None
 
-        def _release_handshake_slot(self, host: str) -> None:
+        def _release_slot(self, host: str) -> None:
             with self._pending_lock:
                 held = self._pending[host] - 1
                 if held:
                     self._pending[host] = held
                 else:
-                    del self._pending[host]  # so the table holds only addresses in a handshake
+                    del self._pending[host]  # so the table holds only addresses still pending
+
+        def read_association_request(self, sock: socket.socket, host: str) -> bytes | None:
+            """Read the connection's first PDU, on the connection's own thread. Returns it, with the
+            socket's own timeout restored, or ``None`` when no association should start.
+
+            A peer that closes, and a stop, are ordinary ends and leave a DEBUG line. A peer that
+            runs out the deadline, or opens with anything but an association request the SCP will
+            read, is logged as a refusal, throttled per address."""
+            try:
+                first_pdu = self._read_first_pdu(sock)
+                self._check_association_request(first_pdu)
+                return first_pdu
+            except _NoAssociationRequest as exc:
+                self._refused(host, "a connection", str(exc))
+            except OSError as exc:  # a timeout errno, a reset and an ssl.SSLError are all OSError
+                logger.debug("DICOM peer %s sent no association request: %s", host, safe_exc(exc))
+            return None
+
+        def _read_first_pdu(self, sock: socket.socket) -> bytes:
+            """Read one whole PDU within the deadline, however slowly the peer sends it.
+
+            The bound is a fixed monotonic deadline for the whole PDU, not an idle timer, because a
+            byte would restart an idle timer. The first byte is read alone, so a peer that is not
+            speaking DICOM is closed at once. It asks for no more than the PDU needs, so nothing
+            the association will read next is taken here."""
+            restore = sock.gettimeout()  # None: accept() returns a blocking socket
+            # The AE's value, not the setting: pynetdicom turns a negative timeout into 30 s.
+            seconds = cast(float, self.ae.acse_timeout)
+            deadline = time.monotonic() + seconds
+            expired = _NoAssociationRequest(f"no complete association request within {seconds:g}s")
+
+            pdu = self._read_exactly(sock, 1, deadline, expired)
+            if pdu[0] != _PDU_TYPE_ASSOCIATE_RQ:
+                raise _NoAssociationRequest("its first PDU is not an association request")
+            pdu += self._read_exactly(sock, _PDU_HEADER_BYTES - 1, deadline, expired)
+            body = int.from_bytes(pdu[2:], "big")
+            if _PDU_HEADER_BYTES + body > _MAX_ASSOCIATE_RQ_BYTES:
+                raise _NoAssociationRequest(
+                    f"its association request is over {_MAX_ASSOCIATE_RQ_BYTES} bytes"
+                )
+            pdu += self._read_exactly(sock, body, deadline, expired)
+            if self._stopping.is_set():  # finished after the stop began: start no association
+                raise OSError("the listener is stopping")
+            sock.settimeout(restore)
+            return pdu
+
+        def _read_exactly(
+            self, sock: socket.socket, count: int, deadline: float, expired: Exception
+        ) -> bytes:
+            """Read ``count`` bytes before ``deadline``, or raise ``expired``."""
+            received = bytearray()
+            while len(received) < count:
+                recv = functools.partial(sock.recv, count - len(received))
+                chunk: bytes = self._in_slices(sock, recv, deadline, expired)
+                if not chunk:
+                    raise ConnectionResetError("the peer closed the connection")
+                received += chunk
+            return bytes(received)
+
+        def _in_slices(
+            self, sock: socket.socket, step: Callable[[], Any], deadline: float, expired: Exception
+        ) -> Any:
+            """Run one socket ``step`` against ``deadline`` and return what it returns, or raise
+            ``expired`` when the deadline passes.
+
+            The step runs in slices of :data:`_STOP_POLL_SECONDS`, so that a stop is noticed without
+            closing a socket under the thread that is reading it. A slice that ends with nothing to
+            read raises a ``TimeoutError`` that carries no ``errno`` and leaves the socket, and any
+            TLS state on it, as it was, so the next slice takes the step up again. A ``TimeoutError``
+            that does carry one is the connection itself timing out, and ends the step."""
+            while True:
+                if self._stopping.is_set():
+                    raise OSError("the listener is stopping")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise expired
+                sock.settimeout(min(remaining, _STOP_POLL_SECONDS))
+                try:
+                    return step()
+                except TimeoutError as exc:
+                    if exc.errno is not None:
+                        raise
+
+        def _check_association_request(self, first_pdu: bytes) -> None:
+            """Refuse a request pynetdicom's reader would not hand to the association.
+
+            The DUL decodes the PDU, builds its primitive and checks the protocol version, and it
+            gives the association nothing unless all three pass. The ``Association`` thread then
+            waits out ``timeout_seconds`` with its socket already closed, and it counts against
+            ``max_associations`` all that time. Nothing caps that once the association has started,
+            so a peer repeating such a request could go round the slots. These are the same three
+            steps, so a request that passes here is one the association will be given."""
+            pdu = A_ASSOCIATE_RQ()
+            try:
+                pdu.decode(first_pdu)
+                pdu.to_primitive()
+            except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
+                raise _NoAssociationRequest("its association request does not decode") from exc
+            if pdu.protocol_version != _PROTOCOL_VERSION:
+                raise _NoAssociationRequest("its association request has the wrong protocol")
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -435,12 +595,8 @@ def _admitting_server_class() -> type[Any]:
             """Run the server side of the TLS handshake within the bound. Returns the TLS socket
             with the accepted socket's own timeout restored, or ``None`` after closing the connection.
 
-            The handshake runs in slices of :data:`_HANDSHAKE_POLL_SECONDS`, so that a stop is
-            noticed without closing a socket under the thread that is reading it. A slice that ends
-            with nothing to read raises a ``TimeoutError`` that carries no ``errno`` and leaves the
-            SSL object as it was, which is the state a non-blocking handshake is resumed from, so
-            the next slice resumes it. A ``TimeoutError`` that does carry one is the connection
-            itself timing out, and ends the handshake.
+            The handshake runs through :meth:`_in_slices`. A slice that ends with nothing to read
+            leaves the SSL object in the state a non-blocking handshake is resumed from.
 
             A handshake that fails is logged at DEBUG with its detail, and handed to
             ``handshake_failed`` to be counted (vault BACKLOG #3784), as the MLLP listener counts
@@ -455,20 +611,8 @@ def _admitting_server_class() -> type[Any]:
                 # No I/O: without do_handshake_on_connect this only builds the SSL object.
                 tls = context.wrap_socket(plain, server_side=True, do_handshake_on_connect=False)
                 deadline = time.monotonic() + _TLS_HANDSHAKE_TIMEOUT
-                while True:
-                    if self._stopping.is_set():
-                        raise OSError("the listener is stopping")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("the handshake did not finish within its bound")
-                    tls.settimeout(min(remaining, _HANDSHAKE_POLL_SECONDS))
-                    try:
-                        tls.do_handshake()
-                    except TimeoutError as exc:
-                        if exc.errno is not None:
-                            raise
-                        continue
-                    break
+                expired = TimeoutError("the handshake did not finish within its bound")
+                self._in_slices(tls, tls.do_handshake, deadline, expired)
                 if self._stopping.is_set():  # finished after the stop began: refuse it unread
                     raise OSError("the listener is stopping")
                 tls.settimeout(restore)
@@ -487,6 +631,31 @@ def _admitting_server_class() -> type[Any]:
             with contextlib.suppress(OSError):
                 (plain if tls is None else tls).close()
             return None
+
+    class _AdmittingRequestHandler(RequestHandler):
+        server: _AdmittingAssociationServer
+
+        def handle(self) -> None:
+            """``RequestHandler.handle``, with the association request read before the association
+            starts. Runs on the connection's own thread, which holds the connection's slot.
+
+            ``EVT_CONN_OPEN`` still fires before anything is read, so an association-rate wait
+            still comes first and does not spend the peer's deadline. A connection that ends here
+            never started its ``Association``, so there is no thread to stop and no ``kill()`` to
+            wait on, and only the socket needs closing."""
+            assoc = self._create_association()
+            evt.trigger(assoc, evt.EVT_CONN_OPEN, {"address": self.client_address})
+            server = self.server
+            first_pdu = server.read_association_request(
+                self.request, _address_host(self.client_address)
+            )
+            if first_pdu is None:
+                server.shutdown_request(self.request)
+                return
+            sock = cast(_ReplayingSocket, assoc.dul.socket)
+            sock.__class__ = _ReplayingSocket  # why not a new socket: _admitting_server_class
+            sock.replay = first_pdu
+            assoc.start()
 
     return _AdmittingAssociationServer
 
@@ -915,11 +1084,13 @@ class DicomScpSource(SourceConnector):
         capacity indefinitely.
 
         **Residual, stated because a knob that hides one is worse than no knob.** The waiting
-        connection is already counted against ``max_associations``, so a rate low enough to make waits
-        long needs a ``max_associations`` high enough to hold the peers waiting behind it — and a wait
-        that outlasts the SCU's own ACSE timeout becomes an abort on the sender's side, which is a
-        refusal this control is otherwise careful never to make. That is the DIMSE form of the general
-        residual: a bound that demands a number cannot demand a sensible one.
+        connection has no association yet, so it holds one of the slots
+        :data:`_MAX_PENDING_CONNECTIONS` and its per-address twin count (vault BACKLOG #2712). A rate
+        low enough to make waits long can fill them, and a connection over them is closed, which is
+        the cap refusing it, not this wait. A wait that outlasts the SCU's own ACSE timeout becomes an
+        abort on the sender's side, which is a refusal this control is otherwise careful never to
+        make. That is the DIMSE form of the general residual: a bound that demands a number cannot
+        demand a sensible one.
         """
         pacer = self._pacer
         if pacer is None:  # pragma: no cover - the handler is only registered when one exists

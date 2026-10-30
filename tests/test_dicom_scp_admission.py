@@ -413,13 +413,18 @@ async def test_a_handshake_that_does_not_finish_is_dropped_at_the_bound(
 
 def _send_a_handshake_slowly(port: int, *, gap: float, give_up: float) -> float | None:
     """Open a TLS record and feed it one byte every ``gap`` seconds, so the listener's handshake
-    always has a read pending and is never idle for longer than ``gap``. Returns the seconds until
-    the listener closed the connection, or ``None`` if it was still open at ``give_up``."""
+    always has a read pending and is never idle for longer than ``gap``. See :func:`_send_slowly`."""
+    # A TLS handshake record header announcing 512 bytes; far fewer are ever sent.
+    pending = b"\x16\x03\x01\x02\x00" + b"\x00" * 400
     sock = socket.create_connection(("127.0.0.1", port), timeout=gap)
+    return _send_slowly(sock, pending, give_up=give_up)
+
+
+def _send_slowly(sock: socket.socket, pending: bytes, *, give_up: float) -> float | None:
+    """Send ``pending`` one byte per timeout of ``sock``, then close it. Returns the seconds until
+    the listener closed the connection, or ``None`` if it was still open at ``give_up``."""
     started = time.monotonic()
     try:
-        # A TLS handshake record header announcing 512 bytes; far fewer are ever sent.
-        pending = b"\x16\x03\x01\x02\x00" + b"\x00" * 400
         for offset in range(len(pending)):
             if time.monotonic() - started > give_up:
                 return None
@@ -451,14 +456,14 @@ async def test_the_handshake_bound_is_a_deadline_for_the_whole_handshake(
 async def test_a_handshake_that_starts_late_but_inside_the_bound_completes(
     tmp_path: Path,
 ) -> None:
-    # The handshake is read in slices of _HANDSHAKE_POLL_SECONDS. A slice is a poll interval, not a
+    # The handshake is read in slices of _STOP_POLL_SECONDS. A slice is a poll interval, not a
     # bound: a peer that starts after several empty slices must still be served.
     async with _running_scp(_tls_settings(tmp_path)) as scp:
 
         def late_handshake() -> bool:
             raw = socket.create_connection(("127.0.0.1", scp.sockport), timeout=5)
             try:
-                time.sleep(dicom_module._HANDSHAKE_POLL_SECONDS * 3)
+                time.sleep(dicom_module._STOP_POLL_SECONDS * 3)
                 with _unverified_client_context().wrap_socket(raw) as tls:
                     return tls.version() is not None
             finally:
@@ -468,7 +473,9 @@ async def test_a_handshake_that_starts_late_but_inside_the_bound_completes(
 
 
 @pytest.mark.parametrize(
-    "cap", ["_MAX_PENDING_HANDSHAKES_PER_HOST", "_MAX_PENDING_HANDSHAKES"], ids=["host", "listener"]
+    "cap",
+    ["_MAX_PENDING_CONNECTIONS_PER_HOST", "_MAX_PENDING_CONNECTIONS"],
+    ids=["host", "listener"],
 )
 async def test_handshakes_in_flight_are_capped_and_the_slots_come_back(
     cap: str,
@@ -763,8 +770,8 @@ def test_the_doc_states_the_bounds_the_code_ships() -> None:
     assert f"The {_TLS_HANDSHAKE_TIMEOUT:g} second handshake bound" in doc
     assert f"per refused address per {window:g} seconds" in doc
     assert f"at most {ceiling} such lines per {window:g} seconds" in doc
-    listener_cap = dicom_module._MAX_PENDING_HANDSHAKES
-    host_cap = dicom_module._MAX_PENDING_HANDSHAKES_PER_HOST
+    listener_cap = dicom_module._MAX_PENDING_CONNECTIONS
+    host_cap = dicom_module._MAX_PENDING_CONNECTIONS_PER_HOST
     assert (
         f"at most {listener_cap} TLS handshakes at once, and at most {host_cap} from one peer"
         in doc
