@@ -29,6 +29,7 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -37,8 +38,10 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
+    vault_hop_refusal_text,
 )
 from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
+from messagefoundry.redaction import codec_safe_str
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
@@ -241,8 +244,9 @@ def _build_client(
         )
     except InsecureHopRefused as exc:
         # Raised as this module's own fail-closed type, which every caller handles (rotate-key,
-        # DR backups, open_store), with the refusal's fixed text kept whole.
-        raise KeyProviderError(str(exc)) from exc
+        # DR backups, open_store). Only the hop's own marked refusal keeps its fixed text whole;
+        # any other hop refusal keeps its type name (BACKLOG #3471).
+        raise KeyProviderError(vault_hop_refusal_text(exc, _VAULT_TRANSIT_CONNECTOR)) from exc
     return client
 
 
@@ -394,18 +398,34 @@ class VaultKeyProvider:
             )
         # BACKLOG #2851: an unset address or token refuses here, rather than let hvac fall back.
         addr, token = store_vault_hop()
-        # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
+        # OUTSIDE the try below on purpose. The TLS suite assertion inside `_build_client` raises
         # ValueError, and the `except Exception` below would relabel it "could not envelope-decrypt
         # the store DEK" — turning a configuration refusal into what reads as a Vault-side failure,
-        # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
-        # both paths propagate out of open_store and serve refuses to start.
-        client = _build_client(
-            addr,
-            token,
-            revocation_attested=self._settings.vault_revocation_attested,
-            posture=self._posture,
-            revocation_reason=self._settings.vault_revocation_attested_reason,
-        )
+        # the same mistake ADR 0180 records for the LDAPS site.
+        #
+        # Its own try instead (BACKLOG #3471). At least the outbound length bound and the TLS suite
+        # assertion refuse with a bare ValueError, and an OSError or re.error can come out of the
+        # build too. Each left the provider as itself, so a command with a key arm for this
+        # module's type and none for those reached the dispatch floor. Raised as KeyProviderError,
+        # with the refusal's own text through `codec_safe_str`, so it still reads as a
+        # configuration refusal. A KeyProviderError from the build is not caught.
+        refusal: str | None = None
+        try:
+            client = _build_client(
+                addr,
+                token,
+                revocation_attested=self._settings.vault_revocation_attested,
+                posture=self._posture,
+                revocation_reason=self._settings.vault_revocation_attested_reason,
+            )
+        except (ValueError, OSError, re.error) as exc:
+            refusal = (
+                f"[store].key_provider={_EXTRA!r}: the Vault client could not be built: "
+                f"{codec_safe_str(exc)}"
+            )
+        if refusal is not None:
+            # Raised outside the handler, so a codec error's bytes do not ride along as context.
+            raise KeyProviderError(refusal)
         try:
             # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit
             # cipher, this path paid for NO metadata round trip -- measured zero read_key calls at

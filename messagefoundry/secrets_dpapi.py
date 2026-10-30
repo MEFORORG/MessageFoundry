@@ -141,7 +141,8 @@ def protect_key_to_file(
 
 def load_protected_key(path: str | Path) -> str:
     """Read and DPAPI-decrypt a key file into its base64 store key. Raises :class:`DpapiUnavailable`
-    off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here.
+    off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here, or
+    decrypts to bytes that are not ASCII.
 
     Every command that opens the store reads the key here, so this is where a key file a broad
     group can read or change is WARNED about, whatever the command (vault BACKLOG #2601). Each file
@@ -155,7 +156,16 @@ def load_protected_key(path: str | Path) -> str:
         blob = p.read_bytes()
     except OSError as exc:
         raise DpapiError(f"cannot read encryption_key_file {p}: {exc}") from exc
-    key = dpapi_unprotect(blob).decode("ascii").strip()
+    # A base64 key is ASCII. Checked before the decode, because a decode error's text names the
+    # first byte that is not and its `.object` holds every byte the file unprotected to, so the
+    # refusal is fixed text with no chain for a traceback to print (BACKLOG #3471).
+    plain = dpapi_unprotect(blob)
+    if not plain.isascii():
+        raise DpapiError(
+            f"encryption_key_file {p} unprotected to bytes that are not ASCII, so it does not hold "
+            "a base64 store key; write it again with `messagefoundry protect-key`"
+        )
+    key = plain.decode("ascii").strip()
     if str(p) not in _checked_key_files:
         _checked_key_files.add(str(p))
         problem = broad_access_problem(p)
