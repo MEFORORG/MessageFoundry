@@ -2462,6 +2462,13 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 #: times over. The cut keeps the head, so an error longer than this still loses its tail.
 _REFUSAL_LOG_LIMIT: Final = 8192
 
+#: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
+#: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
+#: past ``safe_exc``'s default 200, so the default cut answered a refusal with no way across. Not
+#: :data:`_REFUSAL_LOG_LIMIT`: that one bounds a log line whose text the answer withholds, and this
+#: one bounds what the answer carries. 2048 leaves room for any DNS host name in that text.
+_TEST_SEND_BUILD_REFUSAL_LIMIT: Final = 2048
+
 
 async def _answer_refused_reload(
     engine: Engine, exc: Exception, req: ReloadRequest, request: Request, user: Identity
@@ -6290,6 +6297,7 @@ def create_app(
         secret_provider = getattr(request.app.state, "secret_provider", None)
         success = False
         detail: str | None = None
+        transport: EmailTransport | None = None
         start = time.perf_counter()
         try:
             smtp_password = resolve_connector_secret(
@@ -6341,8 +6349,13 @@ def create_app(
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
             # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller.
-            detail = safe_exc(exc)
+            # host/credential hints) escapes to the caller. A hop refusal with no transport yet is
+            # the exception: nothing has dialled the relay, so it is the engine's own text, the
+            # operator's host and the remedy. A send's refusal can quote what the relay advertised.
+            if transport is None and isinstance(exc, InsecureHopRefused):
+                detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
+            else:
+                detail = safe_exc(exc)
         duration_ms = (time.perf_counter() - start) * 1000.0
         # Best-effort metadata-only audit (no addresses, no bodies) — mirrors connection_test. Skipped in
         # a no-engine (embedded/test) deployment where there is no store to record into.

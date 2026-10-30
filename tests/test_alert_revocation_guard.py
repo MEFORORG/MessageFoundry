@@ -516,11 +516,8 @@ def test_the_lifespan_hands_the_test_send_its_posture() -> None:
     assert "app.state.alert_hop_posture = _hop_posture" in source
 
 
-async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
-    tmp_path: Path,
-) -> None:
-    """On the posture a live alert reads, the test send meets the same refusal and reports it as a
-    failed test, not a 500, so it cannot pass a relay the live sink refuses."""
+async def _test_send(tmp_path: Path, **overrides: Any) -> Any:
+    """``POST /alerts/test-email`` for an off-box login, on the posture a live alert reads."""
     import httpx
 
     from messagefoundry.api import create_app
@@ -537,20 +534,79 @@ async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
             email_to=["ops@example.test"],
             email_username="alerts-relay",
             email_password="synthetic-not-a-secret",
+            **overrides,
         )
         app = create_app(engine, allow_no_auth=True, alerts_settings=alerts)
         app.state.alert_hop_posture = ENFORCING
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://t"
         ) as client:
-            reply = await client.post("/alerts/test-email")
-        assert reply.status_code == 200
-        body = reply.json()
-        assert body["success"] is False
-        assert "revocation" in (body["detail"] or ""), body
-        assert "synthetic-not-a-secret" not in reply.text
+            return await client.post("/alerts/test-email")
     finally:
         await engine.stop()
+
+
+async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
+    tmp_path: Path,
+) -> None:
+    """On the posture a live alert reads, the test send meets the same refusal and reports it as a
+    failed test, not a 500, so it cannot pass a relay the live sink refuses."""
+    reply = await _test_send(tmp_path)
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["success"] is False
+    assert "revocation" in (body["detail"] or ""), body
+    assert "synthetic-not-a-secret" not in reply.text
+
+
+async def test_the_alerts_test_send_reports_the_whole_remedy(tmp_path: Path) -> None:
+    """The refusal runs to about 900 characters and its levers start past the 200 that ``safe_exc``
+    keeps by default, so the default cut left an operator a refusal with no way across."""
+    detail = (await _test_send(tmp_path)).json()["detail"]
+    assert "[tls].crl_file" in detail
+    assert "[alerts].email_tls_revocation_attested" in detail
+
+
+_LONG_TEXT = " ".join(f"word-{i:05d}" for i in range(2000))
+
+
+def _raises(error: type[Exception]) -> Any:
+    def _raise(**_kwargs: Any) -> None:
+        raise error(_LONG_TEXT)
+
+    return _raise
+
+
+@pytest.mark.parametrize(
+    ("seam", "error"),
+    [
+        # The send can quote what the relay advertised, so its refusal keeps the general cut.
+        ("send_plain_email", InsecureHopRefused),
+        # Only a hop refusal is lifted. Any other failure of the build is arbitrary text.
+        ("_refuse_alert_smtp_revocation", ValueError),
+    ],
+)
+async def test_a_test_send_failure_that_is_not_the_builds_refusal_keeps_the_general_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seam: str, error: type[Exception]
+) -> None:
+    monkeypatch.setattr(alert_sinks, seam, _raises(error))
+    reply = await _test_send(
+        tmp_path,
+        email_tls_revocation_attested=True,
+        email_tls_revocation_attested_reason=REASON,
+    )
+    detail = reply.json()["detail"]
+    assert detail.startswith(f"{error.__name__}: word-00000"), detail  # the arm under test ran
+    assert "word-00300" not in detail, detail
+
+
+async def test_the_lifted_cut_on_the_builds_refusal_is_a_bound_not_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alert_sinks, "_refuse_alert_smtp_revocation", _raises(InsecureHopRefused))
+    detail = (await _test_send(tmp_path)).json()["detail"]
+    assert "word-00100" in detail  # well past the general 200-character cut
+    assert "word-01999" not in detail
 
 
 async def test_a_create_app_embedding_hands_the_test_send_its_own_posture(
