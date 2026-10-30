@@ -412,18 +412,21 @@ class _ThirdReading(ValueError):
 class _NodeIds:
     """Canonical ids for JSON values, so two values compare by what they are as JSON (vault BACKLOG
     #3796). Python equality would not do: ``1 == True``, ``1 == 1.0``, ``0.0 == -0.0``, and a NaN is
-    unequal even to itself. Here the type is part of the id, a float is keyed by its exact bits, and
-    every NaN token is one value. An object's id ignores key order.
+    unequal even to itself. Here the type is part of the id, a float is keyed by the exact bits of
+    the double ``json`` parsed it to (so ``1.0`` and ``1.00`` are one value), and every NaN token is
+    one value. An object's id ignores key order.
 
     Ids are interned bottom-up, each container once, by walking with a stack rather than by
     recursion, so a value is judged in time linear in its size at any depth ``json`` itself parses
-    (vault BACKLOG #3796 records a reverted compare that recursed, and was exponential).
+    (vault BACKLOG #3796 records a compare, reverted in engine PR 2356, that recursed and was
+    exponential).
 
     Each container is held (``_memo``) for as long as this lives, so the ``id()`` it is looked up
     by cannot be reused by another object meanwhile. Each id also carries whether the value reads
     two ways: whether some object at or below it repeats a key whose first and last occurrences are
-    different nodes. Only :class:`_KeepFirstKey` sets that, since a plain ``json`` read keeps one
-    value of each key and so cannot hold a repeat."""
+    different nodes. Only :class:`_KeepFirstKey` finds such a repeat, since a plain ``json`` read
+    keeps one value of each key; :meth:`node` carries the flag up through the lists and objects
+    above it."""
 
     __slots__ = ("_memo", "_table")
 
@@ -460,10 +463,12 @@ class _NodeIds:
             stack: list[Any] = [value]
             while stack:
                 container = stack.pop()
-                if id(container) not in memo:
-                    order.append(container)
-                    items = container.values() if isinstance(container, dict) else container
-                    stack.extend(c for c in items if isinstance(c, (dict, list)))
+                order.append(container)
+                items = container.values() if isinstance(container, dict) else container
+                # A plain loop, for the reason :meth:`_KeepFirstKey.__call__` gives.
+                for child in items:
+                    if isinstance(child, (dict, list)) and id(child) not in memo:
+                        stack.append(child)
             for container in reversed(order):
                 items = container.values() if isinstance(container, dict) else container
                 two_ways = False
@@ -499,23 +504,37 @@ class _KeepFirstKey:
         self.ids = _NodeIds()
 
     def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        # Plain loops, not generator expressions: this runs at the innermost object, the deepest
+        # point on the stack, and a generator consumed by a C call re-enters the eval loop there,
+        # which lowers the depth this parse takes (measured 2026-10-30, vault BACKLOG #3796).
         node = self.ids.node
         first: dict[str, Any] = {}
-        occurrences: dict[str, list[tuple[int, bool]]] = {}
+        nodes: list[tuple[int, bool]] = []
+        two_ways = False
         for key, value in pairs:
             first.setdefault(key, value)
-            occurrences.setdefault(key, []).append(node(value))
-        two_ways = False
-        for seen in occurrences.values():
-            if len(seen) == 1:
-                two_ways = two_ways or seen[0][1]
+            seen = node(value)
+            nodes.append(seen)
+            two_ways = two_ways or seen[1]
+        if len(first) == len(pairs):
+            self.ids.record(
+                first, frozenset(zip(first, [n for n, _ in nodes], strict=True)), two_ways
+            )
+            return first
+        occurrences: dict[str, list[tuple[int, bool]]] = {}
+        for (key, _), seen in zip(pairs, nodes, strict=True):
+            occurrences.setdefault(key, []).append(seen)
+        kept: list[tuple[str, int]] = []
+        for key, each in occurrences.items():
+            kept.append((key, each[0][0]))
+            if len(each) == 1:
                 continue
-            ends = (seen[0][0], seen[-1][0])
-            if any(occurrence_two_ways or n not in ends for n, occurrence_two_ways in seen):
-                raise _ThirdReading
-            two_ways = two_ways or ends[0] != ends[1]
-        kept = frozenset((key, seen[0][0]) for key, seen in occurrences.items())
-        self.ids.record(first, kept, two_ways)
+            first_node, last_node = each[0][0], each[-1][0]
+            for n, occurrence_two_ways in each:
+                if occurrence_two_ways or (n != first_node and n != last_node):
+                    raise _ThirdReading
+            two_ways = two_ways or first_node != last_node
+        self.ids.record(first, frozenset(kept), two_ways)
         return first
 
 

@@ -33,6 +33,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import FHIR, WiringError
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
@@ -1125,14 +1126,14 @@ async def test_a_nan_against_another_value_is_dead_lettered(meta: str) -> None:
     dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}', meta=meta))  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(UPDATE_1965)
-    assert ei.value.code == "reply-repeats-a-key"
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
 
 
 def _deep_and_wide(depth: int, width: int, leaf: str) -> bytes:
     """A reply whose ``meta`` repeats a key three times, each occurrence a chain ``depth`` objects
     deep, the middle one ending in ``leaf``, beside a list of ``width`` objects that each repeat a
     key. Comparing two occurrences by recursion would pass Python's recursion limit here, and one
-    that compares both readings at every level, as the reverted 78dd64a5 did, takes 2**depth."""
+    that compares both readings at every level, as a compare reverted in engine PR 2356 did, takes 2**depth."""
 
     def chain(end: str) -> str:
         return '{"a": ' * depth + end + "}" * depth
@@ -1178,11 +1179,40 @@ async def test_a_deep_wide_reply_is_judged_in_linear_work_without_recursion(
 
 
 async def test_one_against_true_at_the_bottom_of_a_deep_occurrence_is_dead_lettered() -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _deep_and_wide(3000, 10, "true")
+    # The occurrence compare is what refuses it, not a depth refusal of the keep-first parse.
+    _, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=fhir_module._KeepFirstKey())
+    assert hint == "_ThirdReading"
+    _, control = json_loads_or_refusal(
+        _deep_and_wide(3000, 10, "1").decode(), object_pairs_hook=fhir_module._KeepFirstKey()
+    )
+    assert control is None
     dest = _dest(interaction="update")
-    dest._opener = _FakeOpener(body=_deep_and_wide(3000, 10, "true"))  # type: ignore[assignment]
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(UPDATE_1965)
-    assert ei.value.code == "reply-repeats-a-key"
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize(
+    ("reply", "hint"),
+    [
+        # Through a list: the flag climbs from the object inside it to the occurrence.
+        (
+            _reply_with('{"status": "200 OK"}', meta='{"k": [{"s": 1, "s": 2}], "k": [{"s": 1}]}'),
+            "_ThirdReading",
+        ),
+        (_reply_with('{"status": "200 OK"}', meta='{"k": [{"s": 1}], "k": [{"s": 1}]}'), None),
+    ],
+    ids=["two-ways-inside-a-list", "control"],
+)
+def test_an_occurrence_reads_two_ways_through_a_list(reply: bytes, hint: str | None) -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    _, got = json_loads_or_refusal(reply.decode(), object_pairs_hook=fhir_module._KeepFirstKey())
+    assert got == hint
 
 
 async def test_dynamic_if_match_on_plain_update_moves_into_the_entry() -> None:

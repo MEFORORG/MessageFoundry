@@ -448,8 +448,10 @@ on. A key seen only twice, with `1` then `true` in a value nothing reads, still 
 and is delivered, as above. An object's key order is not part of it. Every `NaN` token is one
 value, unlike under Python's float comparison: a key repeated with `NaN` each time, or a `NaN`
 beside a repeat, reads one way and is judged as any other. `NaN` against a number or against
-`Infinity` is a disagreement. Each value is compared once, by an id built bottom-up in the
-keep-first parse, so the work is linear in the reply's size and nothing recurses past the depth
+`Infinity` is a disagreement. A number is the double `json` parses it to, so `1.0` and `1.00`, or
+two numerals that round to one double, are one value. Each value gets one id, interned bottom-up:
+in the keep-first parse for that reading, and in one walk afterwards for the values compared from
+the plain reading. So the work is linear in the reply's size and nothing recurses past the depth
 `json` itself parses (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
 
 **CORRECTED 2026-10-30 (vault BACKLOG #3796).** The paragraph before this said the three-or-more
@@ -471,8 +473,10 @@ text. The owner has not ruled on it and may overturn it.**
 
 Costs, at least these. A reply nested in the narrow band between the hook's depth limit and plain
 `json`'s is refused with this code although it may repeat no key, and its text then says it does.
-That band was 25 to 26 levels of about 14,300 on the Windows box that measured it on 2026-10-30,
-against 13 before vault BACKLOG #3796, and it depends on the platform's stack. An ETag that differs with capture off refuses, though nothing
+A reply that repeats a key is likewise refused in the band between the keep-first hook's depth
+limit and plain `json`'s, although its two readings may agree. On the Windows box that measured
+them on 2026-10-30, of about 14,300 levels, the band was 13 levels for FhirPeek's hook and 15 for
+the keep-first hook (13 before vault BACKLOG #3796); both depend on the platform's stack. An ETag that differs with capture off refuses, though nothing
 reads it in that mode. An occurrence that reads two ways refuses even where the reply's two
 readings reach one judgment, for example a first `response` repeating `status` as `200 OK` then
 `201 Created`, beside a second `response` that does not repeat it.
