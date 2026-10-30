@@ -2498,7 +2498,7 @@ class RegistryRunner:
             names: Iterable[str],
             failed: Mapping[str, str] | None = None,
             *,
-            warn: bool = warn_query_credentials,
+            warn: bool,
         ) -> FhirLookupExecutor:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             resolved = {
@@ -2529,7 +2529,8 @@ class RegistryRunner:
             return executor
 
         try:
-            return build(specs)  # a healthy graph builds once, as it always did
+            # A healthy graph builds once, as it always did.
+            return build(specs, warn=warn_query_credentials)
         except Exception:
             if isolated is None:
                 raise
@@ -2547,7 +2548,8 @@ class RegistryRunner:
             except Exception as exc:
                 errors[name] = exc
         failed = {name: safe_exc(err) for name, err in errors.items()}
-        executor = build([name for name in specs if name not in errors], failed)
+        survivors = [name for name in specs if name not in errors]
+        executor = build(survivors, failed, warn=warn_query_credentials)
         isolated.update(errors)
         return executor
 

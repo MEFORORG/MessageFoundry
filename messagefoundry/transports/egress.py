@@ -331,10 +331,10 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
     the parameter NAMES, never a value or the URL.
 
-    This warns and does not refuse. Other code refuses the same names on two kinds of hop, with no
-    escape: ``transports.rest.refuse_verify_off`` on a ``verify_tls = false`` hop (vault BACKLOG
+    This warns and does not refuse. Other code refuses the same names with no escape, at least
+    ``transports.rest.refuse_verify_off`` on a ``verify_tls = false`` https hop (vault BACKLOG
     #3230) and ``transports.rest.refuse_cleartext_credentials`` over plain http off this machine
-    (vault BACKLOG #3533). On any other hop the warning is all there is, and the reason is the
+    (vault BACKLOG #3533). Elsewhere the warning is all there is, and the reason is the
     difference from the userinfo precedent. ``transports.rest.refuse_url_credentials`` REFUSES
     ``user:password@`` because that shape never authenticated anything: urllib reads it as part of
     the host, and the error text carried the password into ``queue.last_error``. A query credential

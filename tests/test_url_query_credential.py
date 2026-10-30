@@ -698,8 +698,8 @@ async def test_a_failed_fhir_lookup_leaves_each_survivor_one_warning_at_start(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The whole-graph build fails at ``LK_BAD``, then each lookup builds alone, then the survivors
-    build again, and the executor warns for every lookup it is given before it builds one: three
-    lines for a survivor and two for ``LK_BAD``. A lookup that did not build now logs nothing, and
+    build again. Each build used to warn for every lookup it was given: three lines for a survivor
+    and two for ``LK_BAD``. A lookup that did not build logs nothing, and
     docs/SECURITY-LOOSENING.md states what that costs."""
     reg = Registry()
     urls = {

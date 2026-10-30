@@ -1744,11 +1744,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   URL. The rule that decides which URL settings are withheld, and what a withheld one shows, is
   stated once, in `config/wiring.py` `_url_may_carry_a_credential`; it withholds more than this
   entry's URLs, and it does not reach a secret that is a bare path segment.
-- **Where it is refused, and why it is only reported elsewhere:** on a `verify_tls = false` hop, and
-  over plain `http` to a host off this machine, it is refused with no escape:
-  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
-  On those hops a name that only looks like a credential is refused too. On any other hop it is
-  reported. A credential in the URL's user part, `user:password@`, is refused at construction,
+- **Where it is refused, and why it is only reported elsewhere:** on the HTTP rows of
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer),
+  it is refused with no escape: at least `verify_tls = false` on an `https` URL, and a plain `http`
+  URL to a host off this machine. There, a name that only looks like a credential is refused too.
+  Where those rows do not apply, it is reported. A credential in the URL's user part,
+  `user:password@`, is refused at construction,
   because that shape never authenticated anything and its error text carried the password. A query
   credential does authenticate, and some partner APIs take it nowhere else, such as a shared-access
   `sig` or an API `key`. The detection is also a guess from the parameter name, and a wrong refusal
@@ -1761,13 +1762,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   parameter names, never a value. It is logged at least whenever a build check builds the connection
   (at least `messagefoundry check` when its `build-check` leg runs, and a reload, `dry_run`
   included) and whenever a connection is built without one (at least a start, an operator start and
-  a connection test). A reload skips it on the builds that follow its build check, which has
+  a connection test). A reload skips it on the builds it makes after its build check, which has
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
-  A `FhirLookup` that fails to build at a start logs no WARNING, because no read can go through it;
-  its failure is recorded and alerted, and each lookup that did build logs it once. An outbound that
-  fails to build logs it first, so the two differ here. An `env()` URL on such a lookup appears
-  nowhere until a later build or check logs it. There is also a
+  A reload of a runner that exists but is not started makes no builds, so the later start logs it
+  again. A `FhirLookup` that fails to build at a start logs no WARNING, because no read can go
+  through it; its failure is recorded and alerted, and each lookup that did build logs it once. An
+  outbound that fails to build may have logged it first. One that fails earlier, as on an unresolved
+  `env()` value or an unlisted forward proxy, logs none. An `env()` URL on a connection that logged
+  none appears nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
