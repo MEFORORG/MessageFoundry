@@ -9458,11 +9458,11 @@ class RegistryRunner:
         refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)
-            # getattr: a connector may raise a subclass built without a code, and a missing one
-            # must not turn this loop into an AttributeError after the dead-letter (as in
-            # _RefusalLog.warning).
+            # getattr and str, as _RefusalLog.warning reads it: a connector may raise a subclass
+            # built without a code, or with one that is not a string, and neither may turn this
+            # loop into an AttributeError or a TypeError after the dead-letter.
             reason = _MEMBER_REFUSAL_REASONS.get(
-                getattr(exc, "code", None) or "", _MEMBER_REFUSAL_REASON_OTHER
+                str(getattr(exc, "code", "?")), _MEMBER_REFUSAL_REASON_OTHER
             )
             self._refusal_log.warning(
                 name,

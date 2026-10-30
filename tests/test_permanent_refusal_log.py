@@ -32,8 +32,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from messagefoundry.transports.base import DestinationConnector, NegativeAckError
-from messagefoundry.transports.framing import MULTIPLE_MESSAGES_CODE
+from messagefoundry.transports.base import ENCODING_CODE, DestinationConnector, NegativeAckError
+from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._refusal_log_capture import TOKEN, until
 from tests._refusal_log_capture import assert_no_token as _assert_no_token
@@ -332,9 +332,9 @@ class _MllpRecorder(MLLPDestination):
 
 #: The reason each refused member's line gives, by its refusal's code.
 _REASONS = {
-    "framing": "its frame cannot carry it",
+    FRAMING_CODE: "its frame cannot carry it",
     MULTIPLE_MESSAGES_CODE: "it holds more than one message",
-    "encoding": "its charset cannot encode it",
+    ENCODING_CODE: "its charset cannot encode it",
 }
 
 
@@ -342,12 +342,12 @@ _REASONS = {
     ("bad", "encoding", "code"),
     [
         # ADR 0205 rule 1: a member holding a frame byte.
-        (_adt(2, name=TOKEN + chr(0x1C)), "utf-8", "framing"),
+        (_adt(2, name=TOKEN + chr(0x1C)), "utf-8", FRAMING_CODE),
         # ADR 0209: a member holding a second MSH line. The frame could carry it; the line must not
         # say otherwise, or triage looks for a frame byte that is not there (BACKLOG #3759 item 1).
         (_adt(2) + _adt(4), "utf-8", MULTIPLE_MESSAGES_CODE),
         # A member the outbound's charset cannot encode: no frame byte either.
-        (_adt(2, name=TOKEN + chr(0xE9)), "ascii", "encoding"),
+        (_adt(2, name=TOKEN + chr(0xE9)), "ascii", ENCODING_CODE),
     ],
     ids=["frame-byte", "two-messages", "charset"],
 )
@@ -370,6 +370,14 @@ async def test_a_refused_batch_member_logs_its_own_reason_content_free(
     _assert_no_token(caplog.records)
 
 
+def _unhashable_code_refusal() -> NegativeAckError:
+    """A connector's refusal whose code is not a string, nor hashable: the reason lookup must not
+    raise a TypeError after the dead-letter."""
+    refusal = NegativeAckError("refused", code="ZX", permanent=True)
+    refusal.code = ["ZX"]  # type: ignore[assignment]
+    return refusal
+
+
 class _RefusesMember2(DestinationConnector):
     """A connector whose own frame check refuses member 2 permanently, with ``refusal``."""
 
@@ -390,8 +398,12 @@ class _RefusesMember2(DestinationConnector):
 
 @pytest.mark.parametrize(
     "refusal",
-    [NegativeAckError("refused", code="ZX", permanent=True), _CodelessRefusal()],
-    ids=["unnamed-code", "no-code"],
+    [
+        NegativeAckError("refused", code="ZX", permanent=True),
+        _CodelessRefusal(),
+        _unhashable_code_refusal(),
+    ],
+    ids=["unnamed-code", "no-code", "unhashable-code"],
 )
 async def test_a_member_refused_with_another_code_logs_the_neutral_reason(
     store: MessageStore, caplog: pytest.LogCaptureFixture, refusal: NegativeAckError

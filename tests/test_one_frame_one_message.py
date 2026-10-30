@@ -175,8 +175,8 @@ async def _refused_before_any_dial(
     """Send ``payload`` through ``dest``'s real ``send()`` with a dial that fails the test, close
     ``dest``, and return the refusal. The send-path tests of ADR 0205 and ADR 0209 share it, so
     each keeps only the payload it sends and what it asserts of the refusal."""
-    monkeypatch.setattr(dest, "_dial", _never_dial)
     async with aclosing(dest):
+        monkeypatch.setattr(dest, "_dial", _never_dial)
         with pytest.raises(NegativeAckError) as caught:
             await dest.send(payload)
     return caught.value
