@@ -7960,7 +7960,9 @@ def _offline_security_notifier(
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
-    (vault BACKLOG #2983). ``None`` counts as enforcing there.
+    (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
+    (BACKLOG #2193) reads ``posture`` too, and where it is ``None`` it reads the instance's own,
+    derived from ``settings``, because that guard treats no posture as a no-op.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -8016,7 +8018,7 @@ def _offline_security_notifier(
         # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
         # drops the notice, as any other failure here does; the recovery itself goes on.
         from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
-        from messagefoundry.config.settings import SecurityEnforcement
+        from messagefoundry.config.settings import SecurityEnforcement, hop_posture_from_ai
         from messagefoundry.controlchars import scrub_control_chars
 
         relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
@@ -8033,6 +8035,16 @@ def _offline_security_notifier(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
+            # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
+            # every build failure here is: the notice is dropped and the recovery goes on. A
+            # caller with no posture (admin reset-totp) gets the instance's own, derived from
+            # these settings, so the guard is never the unstamped no-op here. The Vault read
+            # above keeps the caller's posture, where None counts as enforcing.
+            posture=(
+                posture
+                if posture is not None
+                else hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
         print(

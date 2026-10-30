@@ -6289,7 +6289,11 @@ def create_app(
                 literal=alerts.email_password,
                 label="[alerts].email_password",
             )
-            transport = EmailTransport(
+            tls_settings = getattr(request.app.state, "tls_settings", None)
+            # Built off the event loop (BACKLOG #2193): with a login, the constructor's revocation
+            # guard builds the hop's TLS context, which reads the trust store and any CRL from disk.
+            transport = await asyncio.to_thread(
+                EmailTransport,
                 host=alerts.email_smtp_host,
                 port=alerts.email_smtp_port,
                 sender=alerts.email_from,
@@ -6308,12 +6312,12 @@ def create_app(
                 # about. Same fields, same source, same factory.
                 tls_verify=alerts.email_tls_verify,
                 tls_ca_file=alerts.email_tls_ca_file,
-                trust_anchor_policy=(
-                    tls_settings.policy()
-                    if (tls_settings := getattr(request.app.state, "tls_settings", None))
-                    is not None
-                    else None
-                ),
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+                # BACKLOG #2193: the login's revocation guard too, on the posture a live alert
+                # reads, so this test cannot pass a relay the live sink would refuse.
+                posture=getattr(request.app.state, "alert_hop_posture", None),
+                revocation_attested=alerts.email_tls_revocation_attested,
+                revocation_attested_reason=alerts.email_tls_revocation_attested_reason,
             )
             # A fixed synthetic event — carries only a type/severity/connection label + a static detail
             # string; NO message body, NO PHI. The template-value allowlist maps these safely too.
@@ -11463,6 +11467,9 @@ def create_managed_app(
             if ai_settings is not None
             else None
         )
+        # BACKLOG #2193: the alerts test send builds an EmailTransport per request, and its SMTP
+        # login takes the revocation guard a live alert takes, so it reads this same posture.
+        app.state.alert_hop_posture = _hop_posture
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
@@ -12019,6 +12026,8 @@ def create_managed_app(
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
                         audit=store,
+                        # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
+                        posture=_hop_posture,
                     )
                 auth = AuthService(
                     store,
