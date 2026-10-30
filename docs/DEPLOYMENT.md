@@ -662,9 +662,15 @@ gated — nothing refuses the setting, and nothing takes it away again. It does 
 that sets it, a `[tls].crl_file` does not cross the revocation gate, so off the box on an enforcing
 instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13).
 
-Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in
-[Revocation-guard behavior](#revocation-guard-behavior), a PHI hop can be pinned to a certificate that
-is **both long-expired and revoked**, and nothing refuses it. **(2)** A two-week bridge set when a
+Two consequences worth stating plainly. **(1)** Every connector that takes `tls_allow_expired` runs the
+revocation guard on its verifying hop ([Revocation-guard behavior](#revocation-guard-behavior)), and a CRL earns that hop no
+credit there. A PHI hop can still be pinned to a certificate that is **both long-expired and revoked**
+with nothing refusing it, at least when the connection combines `tls_allow_expired` with
+`tls_revocation_attested` and its reason, on a loopback hop, and on an instance that does not enforce,
+where the hop logs a WARNING and crosses. A CRL that reaches the hop still refuses a leaf certificate it
+lists, but a CA may drop an expired certificate from its CRL, which is the certificate this setting
+accepts. CORRECTED 2026-10-30: this said the combination arose with "the ungated revocation hops"; no
+connector that takes the setting is ungated (vault BACKLOG #2978). **(2)** A two-week bridge set when a
 partner's certificate lapses has **nothing that expires it** — it is listed for as long as it is set,
 and it stays set until someone removes it. So put the removal **date** in your own risk register; the
 engine will keep the list of *which connections* have it, but it has no notion of *until when*.
@@ -1130,10 +1136,17 @@ covered by the "one authority" paragraph; **the same discipline applies to `Revo
 gated set is enumerable (grep the constructions, and also the calls to `revocation_hop_disposition`:
 the Vault guard in `transports/strict_requests.py` calls that function itself and builds no
 `RevocationHopGuard`) and every *other* verifying TLS hop must be named as
-ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
-(`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
-on it — **reported is not gated**, and the two must never be written as if either implied the other;
-and a field with no factory parameter and no `connections.toml`
+ungated, never covered by an "every verifying hop" sentence; a weakening whose setting no posture gate
+refuses (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no
+refusal keys on the setting itself — **reported is not gated**, and the two must never be written as if
+either implied the other. `tls_allow_expired` is not inert to the revocation guard, though: it also
+skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
+hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
+context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
+site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
+setting and hands the guard its relaxed context lets a stale CRL admit the hop. CORRECTED 2026-10-30:
+this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
+true when the guard gave such a hop no CRL credit (vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:
 `tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it
 when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refusal_revocation.py` and

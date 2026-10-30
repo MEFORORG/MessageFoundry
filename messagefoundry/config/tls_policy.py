@@ -934,8 +934,8 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
     destination and the DICOM SCU ask this of the context they dial with and, on True, hand the
     guard no context and name :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173
-    §13). The REST family and FTPS reach the same answer from the ``tls_allow_expired`` setting
-    instead (vault BACKLOG #2188), and of those only FTPS names that remedy."""
+    §13). The REST family (vault BACKLOG #2188) and FTPS (vault BACKLOG #2193) reach the same answer
+    from the ``tls_allow_expired`` setting instead, and of those only FTPS names that remedy."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
