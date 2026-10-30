@@ -1816,7 +1816,9 @@ class MLLPSource(SourceConnector):
         # interfaces (0.0.0.0) by accident, since MLLP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        self.encoding: str = s.get("encoding", "utf-8")
+        # Resolved as ingress_guards.ingress_encoding resolves it (an absent or None setting is utf-8),
+        # so the reply is encoded in the charset the runner decoded the body with (BACKLOG #2431).
+        self.encoding: str = s.get("encoding") or "utf-8"
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
         # The runner builds every other ACK itself.
         self.ack_mode: AckMode = config.ack_mode

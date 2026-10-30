@@ -75,6 +75,7 @@ __all__ = [
     "NUL_REJECTED_REASON",
     "STRICT_VALIDATE_TIMEOUT_SECONDS",
     "IngressBodyRejected",
+    "IngressCodecUnusable",
     "IngressFrameByteRejected",
     "IngressGuardError",
     "IngressMultipleMessagesRejected",
@@ -415,10 +416,10 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
     decode, so it passes through (HL7 still gets its line endings collapsed).
 
     Every failure to decode is the ``decode``-phase :class:`IngressGuardError` (BACKLOG #2431): bytes
-    invalid in the charset (``UnicodeDecodeError``), a registered codec that refuses the conversion
-    (``undefined`` raises a bare ``UnicodeError``) and a name naming no text codec (``LookupError``).
-    So a listener records each as an ``ERROR`` row and NAKs, rather than letting it escape into the
-    transport with no row at all."""
+    invalid in the charset (``UnicodeDecodeError``), and as its :class:`IngressCodecUnusable`
+    subclass a registered codec that refuses the conversion (``undefined`` raises a bare
+    ``UnicodeError``) or a name naming no text codec (``LookupError``). So a listener records each
+    as an ``ERROR`` row and NAKs, rather than letting it escape into the transport with no row."""
     if ic.content_type.is_binary:
         raise ValueError(
             f"inbound {ic.name!r} declares binary content_type {ic.content_type.value!r}; "
@@ -429,9 +430,23 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
         if ic.content_type is ContentType.HL7V2:
             return normalize(raw, encoding=encoding, errors="strict")
         return raw.decode(encoding) if isinstance(raw, bytes) else raw
+    except UnicodeDecodeError as exc:
+        refused, codec_unusable = _decode_refusal(encoding, exc), False
     except (UnicodeError, LookupError) as exc:
-        refused = _decode_refusal(encoding, exc)
+        refused, codec_unusable = _decode_refusal(encoding, exc), True
+    if codec_unusable:
+        raise IngressCodecUnusable(refused)
     raise IngressGuardError(refused, phase="decode")
+
+
+class IngressCodecUnusable(IngressGuardError):
+    """A ``decode``-phase refusal caused by the inbound's codec NAME, not by the body: it names no
+    text codec, or one that refuses every conversion (BACKLOG #2431). Every body would fail the same
+    way until the configuration changes, so the MLLP listener answers ``AE`` (resend later) where a
+    body invalid in a usable charset gets ``AR``."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, phase="decode")
 
 
 def _decode_refusal(encoding: str, exc: Exception) -> str:

@@ -384,6 +384,38 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
     assert [Message.parse(m).field("OBX-5.5") for m in members] == [a, b]  # both hydrated verbatim
 
 
+async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #2809: the permanent re-attach refusal is the one member's, as a frame refusal
+    # is, so its healthy sibling still goes out in the envelope.
+    from messagefoundry.parsing.split import split_batch
+
+    a = _big_b64(600)
+    ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
+    sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
+    sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
+    await store.enqueue_message(channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0)
+    await store.enqueue_message(channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0)
+
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert len(col.deliveries) == 1
+    assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
+    stats = await store.stats()
+    assert stats.get(OutboxStatus.DEAD.value, 0) == 1
+    assert stats.get(OutboxStatus.DONE.value, 0) == 1
+
+
 # --- end-to-end Shape A: doc present at ingress → detach → pass-through → delivery hydrates --------
 
 

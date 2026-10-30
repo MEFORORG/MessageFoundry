@@ -37,7 +37,11 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome, _UserCodeExit
+from messagefoundry.pipeline.wiring_runner import (
+    RegistryRunner,
+    UserCodeCalledSysExit,
+    _ItemOutcome,
+)
 from messagefoundry.store import MessageStore, OutboxItem, Stage
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
@@ -139,7 +143,7 @@ def test_the_fused_route_body_returns_sys_exit_as_a_content_fault(store: Message
 
     result = runner._run_fused_route("IB", ic, _item(Stage.INGRESS), RunContext(), None)
 
-    assert isinstance(result.route_exc, _UserCodeExit)
+    assert isinstance(result.route_exc, UserCodeCalledSysExit)
     assert result.handoff_exc is None and not result.handed_off
 
 
@@ -152,15 +156,15 @@ def test_the_fused_transform_body_returns_sys_exit_as_a_content_fault(
         "IB", _item(Stage.ROUTED, handler_name="h"), RunContext(), "hl7v2", None
     )
 
-    assert isinstance(result.xform_exc, _UserCodeExit)
+    assert isinstance(result.xform_exc, UserCodeCalledSysExit)
     assert result.handoff_exc is None
 
 
 def test_the_exit_code_is_named_only_when_it_is_an_integer() -> None:
     """``sys.exit("text")`` puts the text on the exception, and that text is the author's, so it
     could carry a field value; the stored reason names an integer code and nothing else."""
-    assert "code 3" in str(_UserCodeExit.from_exit(SystemExit(3)))
-    assert "PID" not in str(_UserCodeExit.from_exit(SystemExit("PID-5 was DOE^JANE")))
+    assert "code 3" in str(UserCodeCalledSysExit.from_exit(SystemExit(3)))
+    assert "PID" not in str(UserCodeCalledSysExit.from_exit(SystemExit("PID-5 was DOE^JANE")))
 
 
 def _write_config(cfg: Path, *, inbox: Path, outdir: Path, top_level: str = "") -> None:

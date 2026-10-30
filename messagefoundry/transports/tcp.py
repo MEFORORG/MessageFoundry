@@ -475,7 +475,9 @@ class TcpSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
         self.codec = _codec_from_settings(s)
-        self.encoding: str = s.get("encoding", "utf-8")
+        # Resolved as ingress_guards.ingress_encoding resolves it (an absent or None setting is utf-8),
+        # so the reply is encoded in the charset the runner decoded the body with (BACKLOG #2431).
+        self.encoding: str = s.get("encoding") or "utf-8"
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(

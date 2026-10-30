@@ -559,14 +559,22 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
 
 
 async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:
-    """The NAK half: the MLLP listener answers an AR, as it does for bytes invalid in the charset."""
+    """The NAK half: the MLLP listener answers AE, since the configuration and not the message is at
+    fault and a resend can succeed once it is fixed; bytes invalid in a usable charset stay AR."""
     ic = _inbound_declaring("not-a-real-codec")
     reg = _registry(ic)
     runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["in"], ADT_UTF8)
 
-    assert ack is not None and "MSA|AR|" in ack
+    assert ack is not None and "MSA|AE|" in ack
+    ic_utf8 = _inbound(encoding="utf-8")
+    reg_utf8 = _registry(ic_utf8)
+    runner_utf8 = wiring_runner.RegistryRunner(
+        reg_utf8, store, egress=EgressSettings(deny_by_default=False)
+    )
+    invalid = await runner_utf8._handle_inbound(reg_utf8.inbound["in"], ADT_LATIN1)
+    assert invalid is not None and "MSA|AR|" in invalid
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:

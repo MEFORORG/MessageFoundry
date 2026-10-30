@@ -9522,8 +9522,8 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # exit code is not quoted, since it may be the author's text.
         helpers.unregister(mod_name, module)
         withheld = WiringError(
-            f"error loading config module {path.name}: it called sys.exit() at import, which a "
-            "config module may not do"
+            f"error loading config module {path.name}: it, or a helper it loads, called sys.exit() "
+            "at import, which config code may not do"
         )
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
