@@ -1745,9 +1745,14 @@ An entry with no port admits its host at any port. On the generic dialect the eg
 - `server` holds a comma anywhere: `db,6432`, `[db],6432`, `db,` or `db,replica`, whatever the
   entry says. psqlODBC passes `SERVER` to libpq as a host, and libpq reads a comma there as a list
   of hosts. Name one host in `server` and put the port in `PORT`.
-- `PORT` is given more than once, in any case.
+- `PORT` is given more than once, in any case, or with a leading zero (`05432`), which a driver
+  could read as octal. A pin in an entry may keep a leading zero: the engine alone reads it.
 - No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
+- `odbc_driver` names a SQL Server driver (its name holds `SQL Server`, in any case, as the default
+  `ODBC Driver 18 for SQL Server` does) and the entry pins a port. Those drivers ignore `PORT`, so
+  no port is read. Use `dialect="sqlserver"`, or a driver that reads `PORT`. A host-only entry
+  still admits it.
 
 A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
 so no entry can name it, and it is refused as unlisted.

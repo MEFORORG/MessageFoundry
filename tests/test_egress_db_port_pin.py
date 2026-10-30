@@ -227,9 +227,26 @@ def test_generic_port_keyword_that_is_not_a_port_is_unreadable(check: Check, val
         )
 
 
-def test_generic_port_keyword_with_leading_zeros_is_the_port(check: Check) -> None:
-    # Drivers read 005432 as 5432, so the check must too; the digit bound counts after the zeros.
-    check(_generic(server=HOST, odbc_params={"PORT": "005432"}), PINNED)
+@pytest.mark.parametrize("entry", [HOST, f"{HOST}:5432", f"{HOST}:05432"])
+def test_generic_port_keyword_with_a_leading_zero_is_refused(check: Check, entry: str) -> None:
+    # Fail closed: a driver could read 05432 as octal (2842). b7adf1f6 admitted it as 5432.
+    with pytest.raises(WiringError, match="without a leading zero"):
+        check(
+            _generic(server=HOST, odbc_params={"PORT": "05432"}), EgressSettings(allowed_db=[entry])
+        )
+
+
+def test_generic_with_a_sql_server_driver_reads_no_port(check: Check) -> None:
+    # The factory default odbc_driver is a SQL Server driver, which ignores PORT and dials 1433.
+    # b7adf1f6 ADMITTED this against db:5432 (main refused it, by reading the defaulted port).
+    kw: dict[str, Any] = {"dialect": "generic", "server": HOST, "odbc_params": {"PORT": "5432"}}
+    with pytest.raises(WiringError, match="use dialect sqlserver, or a driver that reads the PORT"):
+        check(kw, PINNED)
+    for driver in ("sql server native client 11.0", "SQL  Server"):
+        with pytest.raises(WiringError, match="use dialect sqlserver"):
+            check({**kw, "odbc_driver": driver}, PINNED)
+    check(kw, HOST_ONLY)  # a host-only entry still admits it
+    check({**kw, "odbc_driver": "PostgreSQL Unicode"}, PINNED)  # a driver that reads PORT
 
 
 def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: Check) -> None:
@@ -283,7 +300,6 @@ def test_lookup_reads_the_port_setting_whatever_the_dialect_setting_says(label: 
         (HOST, {"PORT": "5432"}),
         (HOST, {"port": " 5432 "}),  # matched in any case, as the build matches it
         (HOST, {"PORT": "not-a-port"}),
-        (HOST, {"PORT": "005432"}),
         ("fe80::1", {"PORT": "5432"}),  # a bare v6 literal carries no port
     ],
 )

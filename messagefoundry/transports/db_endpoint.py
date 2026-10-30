@@ -126,8 +126,21 @@ class DialEndpoint(NamedTuple):
     #: matches an entry that names no port, and never one that pins a port.
     port: int | None
     #: Why the reading itself refuses the hop, or ``None``. Set when a generic ``server`` holds a
-    #: comma or a port, or ``odbc_params`` gives the ``PORT`` keyword more than once.
+    #: comma or a port, or ``odbc_params`` gives the ``PORT`` keyword more than once or with a
+    #: leading zero.
     conflict: str | None = None
+    #: What the author should do when ``port`` is ``None`` and an entry pins a port, written to
+    #: lead the refusal: the setting this dialect and driver read a port from.
+    remedy: str = "set the port setting to the pinned port"
+
+
+def _sqlserver_driver(name: object) -> bool:
+    """Whether ``odbc_driver`` names a Microsoft SQL Server driver, in any case and spacing: the
+    factory default ``ODBC Driver 18 for SQL Server``, the older numbered drivers, ``SQL Server``
+    and ``SQL Server Native Client``. The tree keeps no list of them, so the name is matched on
+    ``sql server``. Those drivers take a port only from ``SERVER=host,port`` and ignore a ``PORT``
+    keyword."""
+    return "sql server" in " ".join(str(name or "").split()).lower()
 
 
 def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> DialEndpoint:
@@ -148,8 +161,11 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     a host, and libpq reads a comma there as a list of hosts, so ``db,6432`` or ``[db],6432`` can
     name a second host, and ``db,`` an empty one. A ``server`` carrying a ``:port`` or
     ``[v6]:port`` is refused too. ``PORT`` given twice, in any case, is refused, as the build
-    refuses it. With no usable ``PORT`` the port is ``None``: the engine does not know the port the
-    driver then uses.
+    refuses it, and so is a ``PORT`` value with a leading zero, which a driver could read as octal.
+    With no usable ``PORT`` the port is ``None``: the engine does not know the port the driver then
+    uses. The port is ``None`` too when ``odbc_driver`` names a SQL Server driver, which ignores
+    ``PORT`` and dials its own default (:func:`_sqlserver_driver`); the generic dialect gives such a
+    driver no way to send a port, so the remedy names the SQL Server preset.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this
     change, so an entry is matched on its host as written."""
@@ -186,4 +202,24 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
                 "PORT keyword"
             ),
         )
-    return DialEndpoint(host, (port_or_zero(str(keywords[0])) or None) if keywords else None)
+    text = str(keywords[0]).strip() if keywords else ""
+    if len(text) > 1 and text.startswith("0") and text.isascii() and text.isdecimal():
+        return DialEndpoint(
+            host,
+            None,
+            conflict="give the PORT keyword without a leading zero: a driver can read it as octal",
+        )
+    if _sqlserver_driver(settings.get("odbc_driver")):
+        return DialEndpoint(
+            host,
+            None,
+            remedy=(
+                "use dialect sqlserver, or a driver that reads the PORT keyword; a SQL Server "
+                "driver ignores it"
+            ),
+        )
+    return DialEndpoint(
+        host,
+        (port_or_zero(text) or None) if keywords else None,
+        remedy="set the PORT keyword to the pinned port",
+    )
