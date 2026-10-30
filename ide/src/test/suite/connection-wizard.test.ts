@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import {
   WIZARD_TRANSPORTS,
   buildConnObj,
   coerceSetting,
+  connectionRemoveArgs,
+  connectionServiceConfig,
   connectionUpsertArgs,
   planWizardSave,
+  settingIsSet,
   settingKeysFor,
   shouldSaveConnection,
   validateName,
@@ -212,17 +217,143 @@ suite("connectionWizardModel — create-semantics collision gate (#240 c)", () =
   });
 });
 
+// BACKLOG #2908: a connection upsert or remove names the settings file `messagefoundry.serviceConfig`
+// points at, because the CLI checks the edit against that file's [egress] allowlist (deny by
+// default). Without the flag the CLI reads ./messagefoundry.toml only if one sits in the working
+// directory, so a workspace whose setting names another file would have its edit checked against the
+// wrong settings, or none. connectionServiceConfig decides when the flag is left off.
 suite("connectionWizardModel — upsert argv", () => {
-  test("matches the form's `connection upsert --config <dir> --data <json>` (runJson appends --json)", () => {
+  test("matches `connection upsert --config <dir> --service-config <toml> --data <json>` (runJson appends --json)", () => {
     const conn = buildConnObj({ direction: "inbound", transport: "mllp", name: "IB_X", port: "1", router: "r" });
-    const args = connectionUpsertArgs("samples/config", conn);
+    const args = connectionUpsertArgs("samples/config", "env/prod.toml", conn);
     assert.deepStrictEqual(args, [
+      "connection",
+      "upsert",
+      "--config",
+      "samples/config",
+      "--service-config",
+      "env/prod.toml",
+      "--data",
+      JSON.stringify(conn),
+    ]);
+    assert.ok(!args.includes("--json"));
+  });
+
+  test("leaves --service-config off when no file is to be named", () => {
+    const conn = buildConnObj({ direction: "inbound", transport: "mllp", name: "IB_X", port: "1", router: "r" });
+    assert.deepStrictEqual(connectionUpsertArgs("samples/config", undefined, conn), [
       "connection",
       "upsert",
       "--config",
       "samples/config",
       "--data",
       JSON.stringify(conn),
+    ]);
+  });
+});
+
+suite("connectionServiceConfig — which settings file a connection edit names", () => {
+  test("a set setting is passed whether or not its file exists", () => {
+    // The function probes nothing, so a missing file is passed and the CLI refuses it by name,
+    // rather than checking the edit against ./messagefoundry.toml, which the setting did not name.
+    assert.strictEqual(connectionServiceConfig("env/prod.toml", true), "env/prod.toml");
+    assert.strictEqual(connectionServiceConfig("messagefoundry.toml", true), "messagefoundry.toml");
+  });
+
+  test("an absolute or differently-spelt name for the default file is passed as written", () => {
+    // An implementation that compared the setting to the CLI's fallback name, and dropped the flag
+    // on a match, would return undefined here.
+    const absolute = path.resolve("ws-root", "messagefoundry.toml");
+    assert.strictEqual(connectionServiceConfig(absolute, true), absolute);
+    assert.strictEqual(connectionServiceConfig("MESSAGEFOUNDRY.TOML", true), "MESSAGEFOUNDRY.TOML");
+    assert.strictEqual(connectionServiceConfig("./messagefoundry.toml", true), "./messagefoundry.toml");
+  });
+
+  test("an unset setting leaves the flag off, so the CLI reads its default file where one exists", () => {
+    assert.strictEqual(connectionServiceConfig("messagefoundry.toml", false), undefined);
+    assert.strictEqual(connectionServiceConfig("env/prod.toml", false), undefined);
+  });
+
+  test("a blank setting is passed as it is, as the alert and security editors pass it", () => {
+    // The CLI refuses an empty or blank --service-config, so the edit is refused rather than
+    // checked against the fallback file.
+    assert.strictEqual(connectionServiceConfig("", true), "");
+    assert.strictEqual(connectionServiceConfig("   ", true), "   ");
+  });
+
+  test("settingIsSet reads a user or workspace value, never the default or a folder value", () => {
+    const def = { key: "messagefoundry.serviceConfig", defaultValue: "messagefoundry.toml" };
+    assert.strictEqual(settingIsSet(undefined), false);
+    assert.strictEqual(settingIsSet(def), false);
+    // The setting is window-scoped, so VS Code ignores a folder value; so does settingIsSet.
+    assert.strictEqual(settingIsSet({ ...def, workspaceFolderValue: "env/prod.toml" }), false);
+    assert.strictEqual(settingIsSet({ ...def, globalValue: "env/prod.toml" }), true);
+    assert.strictEqual(settingIsSet({ ...def, workspaceValue: "env/prod.toml" }), true);
+    // The default name, set explicitly, and a hand-written null both count as set.
+    assert.strictEqual(settingIsSet({ ...def, workspaceValue: "messagefoundry.toml" }), true);
+    assert.strictEqual(settingIsSet({ ...def, globalValue: null }), true);
+  });
+
+  test("a non-string setting from a hand-edited settings.json is passed as empty and does not throw", () => {
+    for (const bad of [null, undefined, 123, {}]) {
+      assert.strictEqual(connectionServiceConfig(bad, true), "");
+      assert.strictEqual(connectionServiceConfig(bad, false), undefined);
+    }
+  });
+});
+
+// The builders above pin the argv, but only if every writer uses them. Read the extension source and
+// pin that (1) no file but the model spells a `connection upsert|remove` argv by hand, and (2) every
+// call to a builder passes `serviceConfig()`, the workspace setting the alert, security and trust
+// editors pass, and `serviceConfigIsSet()` through connectionServiceConfig. A source scan, because
+// the callers import `vscode` and cannot run under plain mocha.
+suite("connection writers — every upsert and remove names the service settings (BACKLOG #2908)", () => {
+  const SRC = path.join(__dirname, "..", "..", "..", "src");
+  // Every extension source file, subdirectories included, but not the test tree.
+  const sources = (fs.readdirSync(SRC, { recursive: true }) as string[])
+    .map((f) => f.split(path.sep).join("/"))
+    .filter((f) => f.endsWith(".ts") && !f.startsWith("test/"))
+    .map((f) => ({ file: f, text: fs.readFileSync(path.join(SRC, f), "utf8") }));
+
+  test("only connectionWizardModel.ts spells the argv", () => {
+    const literal = /["'`]connection["'`]\s*,\s*["'`](upsert|remove)["'`]/;
+    const spellers = sources.filter((s) => literal.test(s.text)).map((s) => s.file);
+    assert.deepStrictEqual(spellers, ["connectionWizardModel.ts"]);
+  });
+
+  test("every builder call passes serviceConfig() and serviceConfigIsSet() through connectionServiceConfig", () => {
+    // Each call's opening text, long enough to hold its first two arguments over any line breaks.
+    const call = /connection(?:Upsert|Remove)Args\(/g;
+    const calls = sources
+      .filter((s) => s.file !== "connectionWizardModel.ts")
+      .flatMap((s) =>
+        [...s.text.matchAll(call)].map((m) => ({ file: s.file, call: s.text.slice(m.index, m.index + 200) })),
+      );
+    // Positive control: the form, the custom editor and the wizard upsert; the form and the custom
+    // editor remove. A scan that matched none would pass the check below vacuously.
+    const callers = new Set(calls.map((c) => c.file));
+    for (const f of ["connectionEditor.ts", "configEditors.ts", "connectionQuickInput.ts"]) {
+      assert.ok(callers.has(f), `${f} no longer calls a connection argv builder`);
+    }
+    const flagged =
+      /^connection(?:Upsert|Remove)Args\([^,]+,\s*connectionServiceConfig\(\s*serviceConfig\(\)\s*,\s*serviceConfigIsSet\(\)\s*\)/;
+    const unflagged = calls.filter((c) => !flagged.test(c.call));
+    assert.deepStrictEqual(unflagged, []);
+  });
+});
+
+suite("connectionWizardModel — remove argv", () => {
+  test("matches `connection remove --config <dir> --service-config <toml> --name <name>` (runJson appends --json)", () => {
+    const args = connectionRemoveArgs("samples/config", "env/prod.toml", "OB_ACME_ADT");
+    assert.deepStrictEqual(args, [
+      "connection",
+      "remove",
+      "--config",
+      "samples/config",
+      "--service-config",
+      "env/prod.toml",
+      "--name",
+      "OB_ACME_ADT",
     ]);
     assert.ok(!args.includes("--json"));
   });

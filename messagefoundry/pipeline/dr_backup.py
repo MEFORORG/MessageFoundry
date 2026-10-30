@@ -43,6 +43,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -79,10 +80,15 @@ from messagefoundry.store.base import (
     resolve_active_key,
     resolve_decrypt_keys,
 )
-from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
+from messagefoundry.store.cipher_cells import (
+    CipherWalkInterrupted,
+    connect_readonly,
+    keyed_store_mismatch,
+    read_cipher_cells,
+    store_tables,
+    with_first_failure,
+)
 from messagefoundry.store.crypto import (
-    MARKER_PREFIX,
-    CipherError,
     StoreKeylessError,
     store_data_key_id,
 )
@@ -1425,8 +1431,9 @@ def _verify_archive_blocking(
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
     re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
     authenticates every cipher-covered cell in it — heavier. That leg returns its own
-    ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells, so an
-    archive that is fine and a key configuration that is not are not both reported as ``FAIL``.
+    ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
+    recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
+    configuration that is not are not both reported as ``FAIL``.
 
     Steps 2 to 4 write the decrypted archive into a ``mefor-verify-*`` staging directory, locked for
     the run (see :func:`_open_staging`), which is discarded on every exit path by
@@ -2452,10 +2459,12 @@ def _full_open_check(
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
 
-    ``KEY_MISMATCH`` is reserved for the one cause the keyring is unambiguously to blame for: the
-    snapshot holds sealed (``mfenc:``) cells and these settings resolve **no** key for them, so nothing
-    could have opened them. An operator reading that fixes their key configuration; reading ``FAIL``
-    they would go looking for a bad archive, and the archive is fine. A cell that will not decrypt under
+    ``KEY_MISMATCH`` is reserved for the one cause the keyring is unambiguously to blame for: these
+    settings resolve **no** key for a snapshot that needs one, because it holds sealed (``mfenc:``)
+    cells or its ``keyed_surface`` rows record it as keyed, so nothing could have read it. An
+    operator reading that fixes their key configuration; reading ``FAIL`` they would go looking for
+    a bad archive. A BLOB found before the decision is named in the reason too, since no key will
+    clear it (:func:`_decrypt_check`). A cell that will not decrypt under
     a keyring that DOES hold keys stays ``FAIL``, because :class:`CipherError` cannot tell a corrupted
     ciphertext from a key that was never supplied (see its own docstring) and corruption is the reading
     that must not be talked down.
@@ -2559,6 +2568,18 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     )
 
 
+def _sqlite_error_reason(exc: sqlite3.Error) -> str:
+    """A SQLite error as a FAIL reason that quotes no row. Its decode error quotes the column's
+    bytes (``... with text '...'``), which are a row's content and which ``safe_exc`` keeps, so
+    that tail is cut, as ``cipher-audit``'s report cuts it."""
+    text = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
+    return safe_text(f"{type(exc).__name__}: {text}")
+
+
+#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
+_SNAPSHOT_BUSY_TIMEOUT = 5.0
+
+
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> tuple[str, str, int]:
@@ -2576,63 +2597,56 @@ def _decrypt_check(
     the composite-key cells alike (BACKLOG #1719). It is declared beside the store rather than here,
     and a parity test pins it to at least every literal ``cell_aad`` call in ``store.py``. A failure
     names the table, the column and the cell's ``locator``, never a key column that can itself be PHI.
+
+    The walk is :func:`~messagefoundry.store.cipher_cells.read_cipher_cells`, which ``cipher-audit``
+    shares, and so is its verdict precedence: a keyed snapshot read with no key
+    (:func:`~messagefoundry.store.cipher_cells.keyed_store_mismatch`), then a sealed text value no
+    key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
+    first value that does not open. With no key it reads on past a BLOB, which fails under any
+    cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
+    decides it, whichever row comes first. That agreement is this pass's: in a full verify the
+    store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
+    this pass reads anything.
     """
     import sqlite3
 
     cipher = build_store_cipher(settings, posture=posture)
-    # Keylessness is a fact about the CIPHER, never about a plaintext: a decrypted value may itself
-    # begin with the marker (a partner reply, a transformed body), and reading that as "no key" would
-    # send the operator to fix a key configuration that is fine.
-    keyless = not cipher.encrypts
     cells = 0
-    conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+    first_blob: str | None = None
+    # The store's own read-only URI builder, not `f"file:{snap}"`: a path can hold `#` or `?`, and
+    # an unquoted `#` cut the path short, so the old open read a different, empty file and passed.
+    conn = connect_readonly(snap, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for spec in SQLITE_CIPHER_CELLS:
-            table, column = spec.table, spec.column
-            if table not in tables:
-                continue  # an older snapshot predating the table — not a verify failure
-            names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}  # constant table
-            needed = {column, *spec.aad_columns, *spec.locator} - {"rowid"}
-            if not names.issuperset(needed):
-                continue
-            # table/column/key names are declared constants; only the marker prefix is a parameter.
-            picked = ", ".join((*spec.locator, *spec.aad_columns, column))
-            rows = conn.execute(
-                f"SELECT {picked} FROM {table} WHERE {column} LIKE ?", (f"{MARKER_PREFIX}%",)
-            )
-            width = len(spec.locator)
-            for *row, stored in rows:
-                where, key = row[:width], row[width:]
-                if keyless:
-                    # LIKE is case-insensitive; the marker is not. A keyless store's plaintext that
-                    # merely resembles it (``MFENC:...``) is not a sealed cell.
-                    if not cipher.is_encrypted(str(stored)):
-                        continue
-                    # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
-                    # resolved no key for them. Nothing could have opened them, so the keyring is
-                    # unambiguously the cause.
-                    return (
-                        "KEY_MISMATCH",
-                        f"{table}.{column} is encrypted at rest but the store settings resolved no key "
-                        "to open it (keyless open of an encrypted snapshot)",
-                        cells,
-                    )
-                try:
-                    cipher.decrypt(str(stored), aad=spec.aad(*key))
-                except CipherError as exc:
-                    # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
-                    # key that was never supplied, and the keyring here is not empty (the keyless case
-                    # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
-                    # the reading that must not be talked down.
-                    return (
-                        "FAIL",
-                        f"{table}.{column} {spec.locate(*where)} did not decrypt: {safe_exc(exc)}",
-                        cells,
-                    )
+        mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
+        if mismatch is not None:
+            return "KEY_MISMATCH", mismatch, cells
+        for reading in read_cipher_cells(conn, cipher):
+            if reading.kind == "keyless":
+                # The #241 F2 keyless-open trap: the snapshot holds sealed text and these settings
+                # resolved no key for it. Nothing could have opened it, so the keyring is
+                # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
+                # decrypted value may itself begin with the marker. A BLOB never comes here.
+                mismatch = with_first_failure(reading.failure(source="snapshot"), first_blob)
+                return "KEY_MISMATCH", mismatch, cells
+            elif reading.kind == "blob":
+                # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
+                if cipher.encrypts:
+                    return "FAIL", reading.failure(source="snapshot"), cells
+                first_blob = first_blob or reading.failure(source="snapshot")
+            elif reading.kind == "failed":
+                # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
+                # CipherError cannot separate a corrupted ciphertext from a key that was never
+                # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
+                # must not be talked down.
+                return "FAIL", reading.failure(source="snapshot"), cells
+            elif reading.kind == "opened":
                 cells += 1
+        if first_blob is not None:
+            return "FAIL", first_blob, cells
     except sqlite3.Error as exc:
-        return "FAIL", safe_exc(exc), cells
+        return "FAIL", _sqlite_error_reason(exc), cells
+    except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
+        return "FAIL", str(exc), cells
     finally:
         conn.close()
     return "PASS", "ok", cells

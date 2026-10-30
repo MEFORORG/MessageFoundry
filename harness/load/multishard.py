@@ -151,9 +151,8 @@ class MultiShardRecord:
     acked: int
     nak: int
     deferred: int
-    no_loss: (
-        NoLoss  # zero_loss: read>=sent, sink_received>=written, aggregate backlog+in_pipeline==0
-    )
+    # zero_loss: read>=sent, written>=read, sink_received>=written, aggregate backlog+in_pipeline==0
+    no_loss: NoLoss
     in_pipeline_peak: int  # aggregate NOT-DONE rows across all engines' stages (headline gauge)
     drain_seconds: float | None
 
