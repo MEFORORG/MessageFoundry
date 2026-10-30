@@ -1843,8 +1843,8 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode and
 > leaves the driver at its own default. Name the mode as well as the files. libpq's default is
 > `sslmode=prefer`, which can fall back to plaintext. psqlODBC's own source sets `disable`, so no TLS
-> would be attempted at all. `Encrypt` is **unproven** on psqlODBC and on MySQL drivers: no test
-> shows either reads it, so on those drivers use `SSLmode` or `SSLMODE`.
+> would be attempted at all. `Encrypt` is **unproven** on MySQL drivers, since no test shows one
+> reads it, so use `SSLMODE` there.
 >
 > **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
 > `Encrypt=yes` would clear this check with no TLS attempted. It also reads `SSLmode` by a
@@ -1855,7 +1855,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 >
 > A passphrase keyword
 > such as `sslpassword` is not a TLS keyword here: it sets no TLS mode, and its value is never read or
-> reported (BACKLOG #1352). It is also reported
+> reported (BACKLOG #1352). A hop that warns is also reported
 > by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
 > line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
@@ -1876,7 +1876,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
 > unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
 > per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by
-> other means. Otherwise set a verifying keyword, or run at `[security].enforcement = warn`.
+> other means. Otherwise set a verifying TLS mode, or run at `[security].enforcement = warn`.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe

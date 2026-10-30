@@ -3024,7 +3024,7 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC database connection(s) may cross in plaintext — {listed}; "
-            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "set a verifying TLS mode in odbc_params (e.g. SSLmode=verify-full). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
             # does not import a crypto module for a string (the crypto-inventory gate).

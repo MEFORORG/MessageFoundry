@@ -346,7 +346,7 @@ fail-closed bind-guard exist. Enabling MLLP-over-TLS keeps **MLLP** feeds off th
 whole-plane property: **TCP/X12 have no `tls` option at all** (`check_tcp_tls_exposure` refuses the
 non-loopback bind and says so — they must be firewall-segmented or proxy-terminated); a
 `dialect='generic'` DATABASE hop's TLS is the ODBC **driver's** own keyword, which the engine never
-enforces or verifies; and a **Direct** destination with `use_tls=false` submits over cleartext SMTP.
+verifies and, once a mode is set, does not enforce; and a **Direct** destination with `use_tls=false` submits over cleartext SMTP.
 Those three are the exceptions, and they are enumerated under
 [No-TLS channels — hazards](#no-tls-channels--hazards) and the outbound matrix below.
 
@@ -570,7 +570,7 @@ self-signed placeholder).
 | **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
 | **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
 | **File source** | local filesystem | n/a (no network) | n/a | — | n/a |
-| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-enforced** — a missing one logs a WARNING, never a refusal | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
+| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-verified** — a missing mode logs a WARNING, and an enforcing instance refuses the hop off-loopback | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
 
 ### Outbound (the engine dials a destination)
 
@@ -614,8 +614,8 @@ REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
   it reports the hop as **non-weakened by construction**, and only what `odbc_params` say can reach the
-  authority. A hop that sets no TLS mode, or pins one to a no-TLS value, goes there and is refused on an
-  enforcing instance (BACKLOG #1178). A hop with **any other mode value never reaches it**: if the
+  authority. A hop that sets no TLS mode, or pins one to a no-TLS value, goes there and is refused
+  off-loopback on an enforcing instance, unless a per-connection declaration relaxes it (BACKLOG #1178). A hop with **any other mode value never reaches it**: if the
   driver ignored or misread that value, plaintext PHI to a Postgres / Oracle / MySQL ODBC target would
   cross with no refusal, on any posture. The risky hops are also reported: a construction WARNING naming
   the connection, plus an entry in
@@ -1101,7 +1101,7 @@ gated set is enumerable (grep the constructions, and also the calls to `revocati
 the Vault guard in `transports/strict_requests.py` calls that function itself and builds no
 `RevocationHopGuard`) and every *other* verifying TLS hop must be named as
 ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
-(`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
+(`tls_allow_expired`, a `dialect='generic'` DATABASE hop with a mode set) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:

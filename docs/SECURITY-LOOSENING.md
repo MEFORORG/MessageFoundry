@@ -247,7 +247,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
-| | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
+| | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` TLS mode (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
@@ -1786,7 +1786,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Why a set mode stays a delegation:** the engine cannot tell whether an arbitrary driver's value
   verifies anything, and a guess-based refusal would break legitimate drivers. The delegation is
   correct; what was wrong, until #333, was that its only control was a log line.
-- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
+- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying TLS mode —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
 - **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
@@ -1799,7 +1799,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
   for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
   is delegated however it is spelled, so a typo clears the check, and on some drivers it would select
-  no TLS. `encrypt` is unproven on psqlODBC and on MySQL drivers.
+  no TLS. `encrypt` is unproven on MySQL drivers and absent from psqlODBC's keyword parser.
   [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
 - **It is never silent:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in

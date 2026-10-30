@@ -10437,7 +10437,7 @@ def security_loosenings(
             (
                 "generic_odbc_tls_unenforced",
                 f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
-                f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
+                f"driver with no TLS mode enforced ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
             )

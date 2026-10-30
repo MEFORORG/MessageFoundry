@@ -507,7 +507,7 @@ _TLS_KEYWORDS_WITH_NO_MODE = sorted(
     for keyword in _ODBC_PARAM_ALLOWLIST - _ODBC_TLS_MODE_KEYWORDS
     if _is_tls_keyword(keyword)
 )
-_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but sslmode has no value"
+_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a value"
 
 
 def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
