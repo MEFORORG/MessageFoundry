@@ -9774,6 +9774,10 @@ class PostgresStore:
     @staticmethod
     async def _delete_user_rows(conn: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
+        # BACKLOG #2738: hold the account row first, as SQL Server's twin does (#2733). A bind, an
+        # unbind and revoke_user_sessions lock this row and then the account's sessions, so a
+        # delete that took the sessions first could deadlock against any of them.
+        await conn.execute("SELECT id FROM users WHERE id=$1 FOR UPDATE", user_id)
         await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
         await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
         await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)

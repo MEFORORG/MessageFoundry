@@ -1105,6 +1105,37 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
 
 
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real SQL Server backend: ``delete_user`` takes the account's ``users``
+    row with ``UPDLOCK, ROWLOCK`` before its sessions (#2733), as the bind does, so the two cannot
+    deadlock.
+
+    The shared body is the one the Postgres suite runs. The probe reads ``sys.dm_exec_requests``: a
+    request whose ``blocking_session_id`` is the bind's session."""
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _session_id(cur: Any) -> object:
+        await cur.execute("SELECT @@SPID")
+        rows = await cur.fetchall()
+        return int(rows[0][0])
+
+    async def _is_blocking(spid: object) -> bool:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute(
+                "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE blocking_session_id = ?", (spid,)
+            )
+            row = await cur.fetchone()
+            await conn.commit()
+        return bool(row[0])
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_session_id, is_blocking=_is_blocking
+    )
+
+
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
     """The layer under the lookup, on the real SQL Server backend.
 
