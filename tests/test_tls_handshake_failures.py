@@ -595,8 +595,11 @@ async def test_the_http_listener_window_shortens_through_the_shared_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Vault BACKLOG #3785 item 4: HTTP had no window seam, because its counter took the window
-    as a default bound at import. Patched in one place, every listener's window is read from it."""
+    as a default bound at import. Patched in one place, every listener's window is read from it.
+    Run on the loop-run path, through the context hook it was written for (BACKLOG #2479 moved the
+    stdlib loop's default onto the listener's own handshake)."""
     monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.3)
+    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, _cert_path = _http_tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events

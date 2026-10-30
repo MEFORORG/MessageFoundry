@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,13 +39,15 @@ class _Intake:
         return f"m{len(self.received)}"
 
 
-async def _https_post(port: int, cert: str) -> int | None:
+async def _https_post(port: int, cert: str, *, client_key: Path | None = None) -> int | None:
     """POST one body over a verified TLS connection and return the response status, or ``None``
-    when the listener closed the connection without answering."""
+    when the listener closed the connection without answering. ``client_key`` presents ``cert``
+    as the client certificate too, for mutual TLS."""
+    ctx = _pinned_client(cert)
+    if client_key is not None:
+        ctx.load_cert_chain(cert, client_key)
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(
-            "127.0.0.1", port, ssl=_pinned_client(cert), server_hostname="127.0.0.1"
-        ),
+        asyncio.open_connection("127.0.0.1", port, ssl=ctx, server_hostname="127.0.0.1"),
         timeout=5.0,
     )
     try:
@@ -238,3 +241,64 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
     finally:
         source._admission.stopping = False
         await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+@pytest.mark.parametrize("runner", ["listener", "loop"])
+@pytest.mark.parametrize(("subject", "status"), [("CN:127.0.0.1", 202), ("CN:other", 403)])
+async def test_mtls_subject_reads_the_certificate_after_either_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str, subject: str, status: int
+) -> None:
+    """``mtls_subject`` reads the verified peer certificate from the writer. Where the listener
+    upgrades the socket itself, that writer's transport was swapped by ``start_tls``, so this pins
+    that the certificate is still there: a listed subject is served, and an unlisted one gets the
+    403. Either way the slot is given back."""
+    if runner == "loop":
+        monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    source, cert = _tls_source(
+        tmp_path,
+        tls_ca_file=str(tmp_path / "c.pem"),
+        intake_auth="mtls_subject",
+        intake_client_subjects=[subject],
+    )
+    intake = _Intake()
+    await source.start(intake)
+    try:
+        assert source._upgrade_tls is (runner == "listener")
+        assert await _https_post(source.sockport, cert, client_key=tmp_path / "k.pem") == status
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+    assert intake.received == ([b"hi"] if status == 202 else [])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
+def test_the_handshake_bound_on_uvloop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real loop, not a stand-in for it. It skips where uvloop is not installed. uvloop keeps
+    the loop-level handshake, so the bound passed to ``start_server`` is what closes a socket that
+    never sends a ClientHello, and a real TLS client still gets a message through."""
+    uvloop = pytest.importorskip("uvloop")
+    monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
+
+    async def scenario() -> None:
+        source, cert = _tls_source(tmp_path)
+        intake = _Intake()
+        await source.start(intake)
+        try:
+            assert source._upgrade_tls is False
+            reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+            try:
+                await _closed_by_listener(reader, within=5.0)
+            finally:
+                await _close_raw(writer)
+        finally:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+        # Restored first, so the real client never races the shortened bound.
+        monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
+        await source.start(intake)
+        try:
+            assert await _https_post(source.sockport, cert) == 202
+        finally:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+        assert intake.received == [b"hi"]
+
+    asyncio.run(scenario(), loop_factory=uvloop.new_event_loop)
