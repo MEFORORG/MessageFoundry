@@ -657,6 +657,35 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
     assert "9991" in outcome.deliveries[0].payload  # the looked-up NPI was stamped
 
 
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        pytest.param(None, "CodeSetError", id="missing"),
+        pytest.param("", "empty CSV", id="malformed"),
+    ],
+)
+def test_dryrun_logs_a_reference_file_it_skips(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str | None, reason: str
+) -> None:
+    """A file that will not load is left out of the preview's view (vault BACKLOG #3340 item 5). It
+    was left out with no log line, so a later read reported the set missing with no word on why."""
+    csv = tmp_path / "npi.csv"
+    if body is not None:
+        _csv(csv, body)
+    reg = _ref_graph(csv)
+    raw = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.dryrun"):
+        outcome = route_message(reg, reg.inbound["IB_REF"], raw)
+
+    assert len(outcome.deliveries) == 1  # the skip is a preview note, not a refusal
+    [record] = [r for r in caplog.records if "skipped" in r.getMessage()]
+    assert record.levelname == "WARNING"
+    assert "'provider_npi'" in record.getMessage()
+    assert reason in record.getMessage()
+    assert "DOE" not in caplog.text  # names the set and the reason, never the message
+
+
 # --- backend capability gate (ADR 0006 "Backend support") --------------------
 #
 # The snapshot store ships on all three backends (SQLite reference impl, Postgres port, SQL Server port

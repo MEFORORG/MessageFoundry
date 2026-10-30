@@ -67,6 +67,7 @@ from messagefoundry.pipeline.ingress_guards import (
     strict_validation_due,
 )
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.metadata import encode_reference_value
 
@@ -602,7 +603,8 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
 
     Each value goes through the same JSON encoding the store applies, so a preview reads what the live
     engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
-    set the store would refuse to encode is omitted, as the live sync would refuse to commit it."""
+    set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
+    a set whose file is missing or will not load (vault BACKLOG #3340); both log a warning naming it."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -614,7 +616,14 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             view[spec.name] = {
                 k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
             }
-        except CodeSetError:
+        except CodeSetError as exc:
+            # A missing or unreadable file. Say so, or a later read of the set reports it missing
+            # with nothing to say why. Names the set and the redacted reason, never a row of it.
+            log.warning(
+                "dry-run: reference set %r skipped, its file did not load: %s",
+                spec.name,
+                safe_exc(exc),
+            )
             continue
         except TypeError:
             # The live sync would refuse to commit this set, so the preview omits it too; say why, or
