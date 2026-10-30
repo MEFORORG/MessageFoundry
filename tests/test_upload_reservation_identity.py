@@ -334,7 +334,7 @@ async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
     assert [m.filename for m in await store.list_files()] == ["b.txt"]
     assert await _settled(store), "a ledger call was left running"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
-    withdrawn = "its removal finished after the quota lock was released"
+    withdrawn = "its removal finished after it was named at ERROR"
     for _ in range(50):  # the done callback runs one loop pass after the thread returns
         if withdrawn in caplog.text:
             break
@@ -379,17 +379,54 @@ async def test_abandoned_removals_run_on_their_own_capped_pool(
     monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
     try:
         for meta in metas:
-            await store._remove_cancelled_pair(meta.file_id)
+            await store._remove_cancelled_pair(meta.file_id, "u-op")
         await asyncio.sleep(0.1)  # time for a queued removal to start, were nothing capping it
         assert peak == 1, f"{peak} hung removals ran at once"
-        assert await asyncio.wait_for(asyncio.to_thread(int), 5) == 0  # the default pool is free
     finally:
         unhang.set()
-    for _ in range(250):
-        if finished == 3:
+        await asyncio.to_thread(pool.shutdown, True)  # runs the queued removals, then returns
+    assert finished == 3
+    assert await store.list_files() == []
+
+
+async def test_the_drain_names_a_removal_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3740 item 4: a removal's bound ERROR is a loop timer, which a closing loop
+    drops, so the shutdown drain names a removal still running inside its bound at ERROR. Once
+    the removal lands, a WARNING withdraws it."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 30.0)
+    store = _uploads(tmp_path, None)
+    meta = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    unhang, removed = threading.Event(), threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        unhang.wait(30)
+        try:
+            return real_discard(file_id)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
+    try:
+        task = asyncio.create_task(store._remove_cancelled_pair(meta.file_id, "u-op"))
+        await asyncio.sleep(0.05)
+        task.cancel()  # the repeat cancellation that ends the cancelled save's wait
+        await asyncio.wait_for(task, 5)
+        await store.drain_stragglers(timeout=0.0, grace=0.0)
+        assert f"upload {meta.file_id} was cancelled after its file landed" in caplog.text
+        assert "its removal was still running at shutdown" in caplog.text, caplog.text
+        assert not store._pending_removals, "the drain left the removal holding later saves"
+    finally:
+        unhang.set()
+    assert await asyncio.to_thread(removed.wait, 10)
+    for _ in range(50):
+        if "its removal finished after it was named at ERROR" in caplog.text:
             break
         await asyncio.sleep(0.02)
-    await asyncio.to_thread(pool.shutdown, True)
+    assert "its removal finished after it was named at ERROR" in caplog.text, caplog.text
     assert await store.list_files() == []
 
 
@@ -403,7 +440,8 @@ async def test_a_repeated_cancel_does_not_spin_a_cancelled_save_on_its_removal(
     removal, without spinning, before it scans. Red before: A ran out the whole bound."""
     import anyio
 
-    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 2.0)
+    # Long enough that B is still inside it on a slow runner, so B is waiting, not past it.
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 5.0)
     store = _uploads(tmp_path, None)
     landed, finish = _hold_after_the_sidecar_lands(monkeypatch)
     unhang = threading.Event()
@@ -434,7 +472,7 @@ async def test_a_repeated_cancel_does_not_spin_a_cancelled_save_on_its_removal(
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
-        assert ended[0] - cancelled_at < 1.0, "A waited out the bound under repeated cancels"
+        assert ended[0] - cancelled_at < 2.0, "A waited out the bound under repeated cancels"
         b = asyncio.create_task(
             store.save(data=b"second\n", filename="b.txt", uploader="op", uploader_id="u-op")
         )

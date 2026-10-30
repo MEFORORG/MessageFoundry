@@ -1031,10 +1031,7 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
-    for _ in range(250):
-        if not list((tmp_path / "uploads").iterdir()):
-            break
-        await asyncio.sleep(0.02)
+    await _removals_settled(store)
     assert list((tmp_path / "uploads").iterdir()) == []
 
 
@@ -1177,6 +1174,7 @@ async def test_an_anyio_scope_cancel_at_either_ledger_call_pays_the_slot_back(
             tg.cancel_scope.cancel()
         finally:
             ledger.gate.set()
+    await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert not root.exists() or list(root.iterdir()) == []
 
@@ -1206,6 +1204,7 @@ async def test_a_deadline_mid_write_still_pays_the_reservation_back(
                 tg.cancel_scope.cancel()
             finally:
                 finish.set()
+    await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert list(root.iterdir()) == []
 
@@ -1255,6 +1254,15 @@ async def _drain_stragglers(store: UploadStore) -> None:
             return
         await asyncio.wait(set(store._stragglers), timeout=10)
     raise AssertionError("ledger calls were still running")
+
+
+async def _removals_settled(store: UploadStore) -> None:
+    """Wait for a cancelled save's removal. Under an anyio scope the save stops waiting for it at
+    the repeat cancellation (vault BACKLOG #3740 item 4), so it can end just after the save does."""
+    if pending := set(store._pending_removals):
+        await asyncio.wait(pending, timeout=10)
+    await asyncio.sleep(0)  # the removal's done callback runs one loop pass after it ends
+    assert not store._pending_removals, "a cancelled save's removal was still running"
 
 
 async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(
