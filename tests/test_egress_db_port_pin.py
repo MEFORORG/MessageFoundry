@@ -249,6 +249,28 @@ def test_generic_with_a_sql_server_driver_reads_no_port(check: Check) -> None:
     check({**kw, "odbc_driver": "PostgreSQL Unicode"}, PINNED)  # a driver that reads PORT
 
 
+@pytest.mark.parametrize(
+    "driver", ["MSSQL18", "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so", "Oracle 21"]
+)
+def test_generic_with_a_driver_not_known_to_read_port_reads_no_port(
+    check: Check, driver: str
+) -> None:
+    # An odbcinst alias or a library path can name a driver that ignores PORT; main refused these
+    # against db:5432 (it read the defaulted port), so admitting them would loosen it. Fail closed.
+    kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
+    with pytest.raises(WiringError, match="use a driver known to read the PORT keyword"):
+        check(kw, PINNED)
+    check(kw, HOST_ONLY)
+
+
+@pytest.mark.parametrize(
+    "driver",
+    ["PostgreSQL ANSI", "psqlodbcw.so", "MySQL ODBC 8.0 Unicode Driver", "MariaDB ODBC 3.1"],
+)
+def test_generic_with_a_driver_known_to_read_port_is_admitted(check: Check, driver: str) -> None:
+    check(_generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"}), PINNED)
+
+
 def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: Check) -> None:
     # The preset's connection string sends int(port), so an env()-shaped " 5432" sends 5432.
     check({"server": HOST, "database": "d", "port": " 5432"}, PINNED)
@@ -308,7 +330,7 @@ def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[st
     # one: the hop guard's 0 is the egress reading's None. A `server` carrying a port is where they
     # part: the hop guard reports that port, and the egress reading refuses the `server`.
     endpoint = database_dial_endpoint(
-        {"server": server, "port": 1433, "odbc_params": params}, dialect="generic"
+        _generic(server=server, port=1433, odbc_params=params), dialect="generic"
     )
     assert endpoint.conflict is None
     assert endpoint.host == server
