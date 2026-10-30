@@ -11,9 +11,9 @@ certificate name compares:
 * the operator API's mTLS client-certificate identity plane (``api/security.py``, ADR 0083), which
   maps the same certificate shape to a MessageFoundry account id.
 
-They share the subject match. They differ in one respect, on purpose for now: the API plane first
-selects the names listed under the certificate's own issuer (BACKLOG #2237), and the intake plane
-still matches a subject from any CA its listener trusts.
+They share the subject match, and both first select the names listed under the certificate's own
+verified issuer, the loaded CA whose key signed it (BACKLOG #2237 for the API plane, #2287 for the
+intake plane's ``intake_client_subjects``), through :func:`client_cert_principal_under_issuer`.
 
 **Neutral and stdlib-only** — no engine, config, FastAPI or Qt imports — so both the transports (which
 must not import the API) and the API (which must not import the transports) can depend on it. Lives at
