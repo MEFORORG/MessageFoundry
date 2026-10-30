@@ -1604,6 +1604,43 @@ async def test_staged_flow_end_to_end_processed(store) -> None:
     ]
 
 
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+    """BACKLOG #3462: the SQL Server twin of the SQLite test of the same name. ``reply_dropped``
+    rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
+    False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
+    ``events_for``, which decrypts ``detail``."""
+    detail = "HTTP 200; reply body over the 64-byte bound"
+
+    async def _to_outbound(now: float) -> tuple[str, Any]:
+        mid, rid = await _ss_seed_routed(store, channel_id="IB", raw=RAW, now=now)
+        assert await store.transform_handoff(
+            routed_id=rid, message_id=mid, channel_id="IB", deliveries=[("OB1", "body")], now=now
+        )
+        ob = await store.claim_next_fifo("OB1", stage=Stage.OUTBOUND.value, now=now)
+        assert ob is not None and ob.stage == Stage.OUTBOUND.value
+        return mid, ob
+
+    def _tail(events: list[dict[str, Any]]) -> list[tuple[str, str | None, str | None]]:
+        return [
+            (e["event"], e["destination"], e["detail"] if e["event"] == "reply_dropped" else None)
+            for e in events
+            if e["event"] in ("delivered", "reply_dropped")
+        ]
+
+    mid, ob = await _to_outbound(100.0)
+    assert await store.mark_done(ob.id, now=110.0, reply_dropped=detail) is True
+    after_drop = await store.events_for(mid)
+    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+    assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
+    assert await store.events_for(mid) == after_drop  # the vanished row wrote nothing
+
+    plain, other = await _to_outbound(120.0)
+    assert await store.mark_done(other.id, now=130.0) is True
+    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+
+
 async def test_all_declined_finalizes_not_deployed(store) -> None:
     """#233 (ADR 0111) parity: a routed message whose only handler declined every Send (each to a
     present-but-not-deployed target) finalizes NOT_DEPLOYED — not FILTERED — carries a ``not_deployed``
