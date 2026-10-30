@@ -382,6 +382,7 @@ async def test_the_windows_sso_entry_point_records_the_kerberos_mechanism(
             require_mfa=False,
             ad_enabled=True,
             kerberos_enabled=True,
+            kerberos_realm="EXAMPLE.COM",
             ad_server="ldaps://x",
             ad_user_search_base="DC=x",
             ad_bind_dn="CN=svc,DC=x",
@@ -429,6 +430,7 @@ async def test_kerberos_under_the_default_require_mfa_builds_its_baseline_at_the
         settings = AuthSettings(
             ad_enabled=True,
             kerberos_enabled=True,
+            kerberos_realm="EXAMPLE.COM",
             ad_server="ldaps://x",
             ad_user_search_base="DC=x",
             ad_bind_dn="CN=svc,DC=x",

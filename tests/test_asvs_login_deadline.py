@@ -485,6 +485,7 @@ def _sso_service(engine: Engine, *, conflicting_local: bool = False) -> AuthServ
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
         ad_bind_dn="CN=svc,DC=x",

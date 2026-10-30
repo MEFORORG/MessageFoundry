@@ -9324,11 +9324,21 @@ ADMIN_TOTP_RESET_ACTION = "auth.admin_totp_reset"
 
 class _ResetTarget(NamedTuple):
     """The account ``admin-reset-totp`` checked before the key was shown, pinned for its write. The
-    write refuses a row whose id or enrolment instant differs (ADR 0171 Amendment B)."""
+    write refuses a row whose id, enrolment instant or seed differs (ADR 0171 Amendment B, BACKLOG
+    #3778). The seed is pinned by its digest, so the old seed is not held across the prompt."""
 
     user_id: str
     username: str
     enrolled_at: float | None
+    secret_digest: str
+
+
+class _SeedPin(NamedTuple):
+    """An account's stored TOTP cell and the digest of the seed it opens to, read from one record
+    (BACKLOG #3778). Named fields, since both are ``str`` and a swap would still type-check."""
+
+    cell: str
+    digest: str
 
 
 def _admin_reset_totp(args: argparse.Namespace) -> int:
@@ -9352,11 +9362,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     **IT NEVER LEAVES THE ACCOUNT WITHOUT A FACTOR.** The new seed is generated in memory, shown on
     the console device and proved with a code BEFORE the store is written. One transaction,
     :meth:`replace_totp_enrolment`, then swaps the seed, the recovery codes and the step high-water
-    mark while TOTP stays on, so no reader ever sees the account with TOTP off. The write is a
-    compare-and-set on the id and the enrolment instant read before the prompt, so a removal or a
-    re-enrolment that lands while the operator types is never overwritten. A wrong code, a lost
-    console or a refusal writes nothing and the old seed still works. The proving code's step is
-    recorded, so that code is spent.
+    mark while TOTP stays on, so no reader ever sees the account with TOTP off. Before the prompt it
+    pins the account's id, enrolment instant and seed; after it, it refuses unless the account
+    still holds them, and the write is a compare-and-set on the instant and the stored cell read
+    then. So a removal or a re-enrolment that lands while the operator types is never overwritten,
+    even one stamped with the same instant (BACKLOG #3778; ADR 0171's correction of 2026-10-29 says
+    how). A wrong code, a lost console or a refusal writes nothing and the old seed still works. The proving code's step is recorded, so that code is
+    spent.
 
     **It replaces the recovery codes too.** A leaked seed or a stolen device usually means the codes
     kept beside it are exposed as well, and a seed rotation that left them valid would revoke nothing
@@ -9382,6 +9394,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from the swap itself is read back first, because on a server backend it can follow the COMMIT;
     the ADR's table gives the three outcomes.
     """
+    import asyncio
     import getpass
     import time as _time
 
@@ -9389,7 +9402,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.auth.notifications import MFA_ENABLED, SecurityEvent
     from messagefoundry.auth.passwords import hash_password
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -9471,7 +9486,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 f"the account {user.username!r} has no authenticator app enrolled, so there is no "
                 "seed to replace; nothing was written. Enrol one from the web console"
             )
-        if await store.get_totp_secret(user.id) is None:
+        # The record's own cell, the one seed_pin opens, not a second read (BACKLOG #3778). An
+        # empty cell is no seed either: the store passes "" through as a blank value.
+        if user.row is None or not user.row.totp_secret:
             return (
                 f"the account {user.username!r} has TOTP turned on but no seed stored, a state no "
                 "supported path leaves; nothing was written. This command replaces a seed and "
@@ -9490,6 +9507,17 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
         return None
 
+    async def seed_pin(store: Store, user: UserRecord) -> _SeedPin | None:
+        """``user``'s :class:`_SeedPin`, from the record that gave the stamp, or ``None`` with no
+        seed. ADR 0171's correction of 2026-10-29 says which half pins what. The decrypt runs off
+        the event loop, as ``judge_totp``'s does: a Transit open is a blocking HTTP call. A cell
+        that does not open raises ``CipherError``, a refusal with nothing written."""
+        cell = None if user.row is None else user.row.totp_secret
+        if not cell:
+            return None
+        held = await asyncio.to_thread(store.open_totp_secret, user.id, cell)
+        return None if held is None else _SeedPin(cell, hash_token(held))
+
     async def check() -> _ResetTarget | str:
         """The account to replace, pinned, or why not. Read before any key is shown."""
         store = await opened()
@@ -9501,7 +9529,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             if refusal is not None:
                 return refusal
             _refuse_an_unauditable_write(store)  # before the key is shown, not after the write
-            return _ResetTarget(user.id, user.username, user.totp_enrolled_at)
+            pin = await seed_pin(store, user)
+            if pin is None:
+                return (
+                    f"the authenticator of {user.username!r} changed while it was read; nothing "
+                    "was written. Run the command again"
+                )
+            return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin.digest)
         finally:
             await store.close()
 
@@ -9589,6 +9623,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             again = await refusal_for(store, user)
             if again is not None:
                 return _sentence(again) + unused_entry
+            pin = await seed_pin(store, user)
+            if pin is None or not constant_time_equal(pin.digest, target.secret_digest):
+                return (
+                    f"the authenticator of {user.username!r} was removed or enrolled again while "
+                    "this command ran, so nothing was replaced; nothing was written. Stop the "
+                    "engine and run the command again." + unused_entry
+                )
             _refuse_an_unauditable_write(store)
             report: dict[str, Any] = {
                 "recovery_codes_issued": len(plain_codes),
@@ -9605,6 +9646,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     recovery_code_hashes=code_hashes,
                     step=step,
                     expected_enrolled_at=target.enrolled_at,
+                    expected_secret_cell=pin.cell,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
             except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
@@ -9637,10 +9679,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     unknown.append(user)
                 raise
             if ended is None:
+                # The stored cell or the instant moved after the re-read just above: a removal, a
+                # re-enrolment, or a store-key rotation re-encrypting the cell (BACKLOG #3778).
                 return (
-                    f"the authenticator of {user.username!r} was removed or enrolled again while "
-                    "this command ran, so nothing was replaced; nothing was written. Stop the "
-                    "engine and run the command again." + unused_entry
+                    f"the authenticator of {user.username!r} changed in the moment before the "
+                    "write (removed, enrolled again, or re-encrypted by a store-key rotation), so "
+                    "nothing was replaced; nothing was written. Stop the engine and run the "
+                    "command again." + unused_entry
                 )
             swapped.append((user, {**report, "sessions_ended": ended}))
             return None

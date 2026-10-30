@@ -136,6 +136,11 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "kerberos_enabled requires ad_enabled",
     ),
+    "kerberos_without_realm": (
+        _auth(kerberos_enabled=True),
+        {},
+        "kerberos_enabled requires kerberos_realm",
+    ),
     "recheck_without_ad": (
         {"ad_session_recheck_seconds": 60, "ad_bind_password": _BIND_PASSWORD, **_CARRIER},
         {},

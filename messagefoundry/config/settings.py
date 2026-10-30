@@ -2498,7 +2498,7 @@ class PipelineSettings(_Section):
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
     # ONE OTHER SETTING CAN CANCEL THIS ONE, and you must be told here rather than in that knob's
-    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is subprocess (it ships off, so
+    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is not off (it ships off, so
     # this bites only a site that turned the sandbox on). Fusion runs Router/Handler/accepts= code
     # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
     # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
@@ -2595,13 +2595,15 @@ class SandboxSettings(_Section):
 
     * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
       process boundary breaks, so they fail closed inside the child. **A Handler needing either must
-      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
-      single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
+      run ``mode="off"``, or ``mode="isolated"``** — the off escape is supported and is not going
+      away. ``mode="isolated"`` (ADR 0147, vault BACKLOG #3131) is the same worker with both lookups
+      brokered through the engine; ``docs/CONFIGURATION.md``, section ``[sandbox]``, says what it
+      does and does not do. ``[sandbox]`` is a single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
       renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
       post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
       to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
@@ -2620,9 +2622,10 @@ class SandboxSettings(_Section):
     **restart to change**, exactly like ``claim_mode``)."""
 
     # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
-    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
-    # connection: one policy is rendered for the whole graph.
-    mode: Literal["off", "subprocess"] = Field(default="off")
+    # live enrichment) | subprocess (persistent per-inbound worker child) | isolated (that worker,
+    # with db_lookup/fhir_lookup brokered through the engine; ADR 0147). Any other value refuses to
+    # load. ENGINE-WIDE, not per connection: one policy is rendered for the whole graph.
+    mode: Literal["off", "subprocess", "isolated"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
@@ -3326,6 +3329,27 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
     return service, hostname
 
 
+def check_kerberos_realm(realm: str) -> str:
+    """Refuse a ``[auth].kerberos_realm`` that is not one bare realm name (BACKLOG #2610).
+
+    The realm is compared with the realm of every ticket's client principal, so it must be the
+    realm alone: printable ASCII, with no whitespace and none of ``@``, ``/`` or ``\\``. ASCII,
+    because a case-insensitive compare folds some non-ASCII letters into ASCII ones (the Kelvin sign
+    lowers to ``k``), and an Active Directory realm is an upper-cased DNS name. The ``ValueError``
+    text never repeats the value.
+    """
+    if not realm or not all(ch.isascii() and ch.isprintable() and not ch.isspace() for ch in realm):
+        raise ValueError(
+            "kerberos_realm must be one realm name in printable ASCII with no whitespace, "
+            "e.g. EXAMPLE.COM"
+        )
+    if any(ch in realm for ch in "@/\\"):
+        raise ValueError(
+            "kerberos_realm must be the realm alone, with no '@', '/' or '\\', e.g. EXAMPLE.COM"
+        )
+    return realm
+
+
 #: The shortest site context term ``[auth].password_extra_context_words`` accepts. The context screen
 #: is a case-insensitive SUBSTRING test, so a one- or two-letter term would refuse a large share of
 #: ordinary passphrases. Three is the length of the shortest shipped term (``hl7``) and admits the
@@ -3695,6 +3719,11 @@ class AuthSettings(_Section):
     # (Windows) asks for the literal principal host/unspecified, so set it there. See
     # split_kerberos_spn.
     kerberos_spn: str | None = None
+    # The one Kerberos realm whose users may sign in, e.g. EXAMPLE.COM (BACKLOG #2610). Required
+    # once kerberos_enabled is on. A ticket from any other realm the KDC trusts is refused, compared
+    # without regard to ASCII case. Never defaulted from ad_domain: that is a UPN suffix, and it
+    # often differs from the realm. See check_kerberos_realm.
+    kerberos_realm: str | None = None
 
     # Federated SSO — OIDC authorization-code + PKCE relying party (ADR 0142, BACKLOG #274). A THIRD
     # login mechanism for an identity that ALREADY exists in on-prem AD: the id_token is verified, then
@@ -4083,6 +4112,15 @@ class AuthSettings(_Section):
             split_kerberos_spn(value)
         return value
 
+    @field_validator("kerberos_realm")
+    @classmethod
+    def _check_kerberos_realm(cls, value: str | None) -> str | None:
+        # Unset or empty reads as unset, as kerberos_spn does; the model validator then refuses
+        # it when kerberos_enabled is on.
+        if value:
+            check_kerberos_realm(value)
+        return value
+
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
     def _check_oidc_skew(cls, value: int) -> int:
@@ -4277,6 +4315,12 @@ class AuthSettings(_Section):
             )
         if self.kerberos_enabled and not self.ad_enabled:
             raise ValueError("kerberos_enabled requires ad_enabled (SSO resolves roles via AD)")
+        if self.kerberos_enabled and not self.kerberos_realm:
+            # BACKLOG #2610; the field's comment says why there is no default.
+            raise ValueError(
+                "kerberos_enabled requires kerberos_realm, the one Kerberos realm whose users may "
+                "sign in, e.g. EXAMPLE.COM"
+            )
         if (
             self.ad_session_recheck_seconds
             and not self.ad_enabled

@@ -1058,6 +1058,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
+            # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
+            # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
+            "hash:via messagefoundry.auth.tokens",
+            "compare:via messagefoundry.credential",
             "kdf:via messagefoundry.pki",
             "key_cert:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.logging_setup",

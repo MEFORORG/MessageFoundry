@@ -167,7 +167,8 @@ order:
    account that does not hold the Administrator role, a disabled account, an account with no TOTP
    enrolled, an account with TOTP on but no seed stored, an Administrator who is not the only
    enabled one, and a store whose audit append would be refused (the `admin-unlock` pre-check). It
-   pins the account's id and its `totp_enrolled_at`.
+   pins the account's id and its `totp_enrolled_at`, and since BACKLOG #3778 a digest of its
+   opened seed (the correction under *Why the account never has zero factors*).
 2. It generates a new seed in memory and shows the key and its URI on the console device, never on
    stdout or stderr. It uses the same terminal enrolment as `provision-admin` (ADR 0197
    Amendment A). The URI labels the entry `<username> (replaced <date>-<time>)`, so the app lists
@@ -182,7 +183,8 @@ order:
    **one transaction**, `replace_totp_enrolment`. That writes the new seed, new recovery-code hashes
    and the proving code's step, ends every session of the account, and appends the audit row. Its
    UPDATE matches only where TOTP is still on, with a seed, and still enrolled at the pinned
-   instant.
+   instant. Since BACKLOG #3778 it also refuses unless the seed still matches the pin, and the
+   UPDATE also requires the stored cell it read then (the same correction).
 4. It shows the new recovery codes on the console device once.
 5. It sends the holder an `mfa_enabled` security notice, best effort, as `provision-admin` sends its
    takeover notice. That comes after the audit row, so a notice never announces an unrecorded swap.
@@ -201,6 +203,19 @@ account whose TOTP was removed and enrolled again while the operator typed, beca
 a seed again. So the UPDATE also requires the pinned `totp_enrolled_at`, which every confirmed
 enrolment rewrites, and the command refuses a row whose id changed. A removal, or a newer enrolment,
 that lands during the prompt is never overwritten: the write matches nothing and the command says so.
+
+> **Correction (2026-10-29, BACKLOG #3778).** `totp_enrolled_at` is a clock reading, so a removal
+> and a re-enrolment inside one reading left a row the compare above could not tell from the one
+> step 1 read. Step 1 now also pins a SHA-256 digest of the opened seed, read from the same record
+> as the stamp. Step 3 reads the account again, refuses unless its seed still opens to that digest,
+> and passes the stored cell it read as `expected_secret_cell`. The UPDATE then requires that
+> cell byte for byte beside the stamp, the compare `enable_totp` makes. On a keyed store every
+> write of the cell draws a fresh nonce; on a keyless one the cell is the seed, drawn at random by
+> at least every enrolment path built today. The pin across the prompt is the opened seed, so a
+> store-key rotation during the prompt refuses nothing. A rotation between step 3's read and its
+> UPDATE makes the write match nothing, which fails closed. A cell that does not open at step 3
+> refuses with nothing written. The decrypt runs before the transaction, never under its lock. No
+> column was added, so the user row and its seal are unchanged.
 
 The other design, clearing the seed and forcing enrol-first at the next sign-in, was rejected. It
 passes through a state with no factor. `admin_reset_mfa` needs a generated credential to make that
@@ -305,7 +320,8 @@ the key is shown: a driver's text can quote a stored value (ASVS 16.5.4).
 ### A named store method, on all three backends
 
 `replace_totp_enrolment` joins the Store protocol, on SQLite, PostgreSQL and SQL Server. It takes
-the pinned `expected_enrolled_at` and an `AuditAppend`, and returns the number of sessions ended, or
+the pinned `expected_enrolled_at`, since BACKLOG #3778 the `expected_secret_cell` step 3 read (the
+correction above), and an `AuditAppend`, and returns the number of sessions ended, or
 `None` when it wrote nothing. No existing method can swap the seed with TOTP on. `enable_totp`
 writes only where TOTP is off, and
 `set_totp_secret` leaves the old recovery codes and step. Every composition of the existing methods

@@ -822,14 +822,22 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   `amr` names a listed value skips the floor, and every other callback keeps it. The exemption proves
   a device or a stored credential answered, not that a person acted, so it is a named loosening
   ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). A value `oidc_mfa_amr_values` also accepts is
-  refused at load while the claim gate is on. Each exempted pass records the matched values as
-  `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
-  the top of the `auth.reauth` row of a step-up. A pass the exemption let through that is then
-  refused carries it too, at the top of its refusal row (BACKLOG #3220), a directory lock refusal
-  included: that row has its own action, `auth.directory_login_locked`, which the audit read
-  routes show only to `users:manage` ([Audit](#audit) names them), so the marker shows a reader
-  without it no lock there (BACKLOG #3726). With the list set, a too-early step-up's code is
-  redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
+  refused at load while the claim gate is on. **This paragraph is the source of record for which
+  audit rows carry the exemption's fields**; other documents link here. Each exempted pass records
+  the matched values as `callback_floor_exempt_amr`, at the top level of its outcome rows: at least
+  the `auth.login_success` or `auth.reauth` row when it is served, and its refusal row when it is
+  refused (BACKLOG #3220, #3728). That includes a directory lock refusal: that row has its own
+  action, `auth.directory_login_locked`, which the audit read routes show only to `users:manage`
+  ([Audit](#audit) names them), so the marker shows a reader without it no lock there (BACKLOG
+  #3726). The other rows the attempt writes, such as a role resync or a session rotation, do not
+  carry it. With the list set, a too-early step-up's code is redeemed before the refusal, because
+  only the exchange yields the `amr`. The outcome rows of such a step-up carry
+  `callback_floor_deferred: true`: at least each refusal and the success row (BACKLOG #3728). It
+  says the floor decision waited for the exchange, not that the exemption applied: a refusal the
+  exchange itself causes comes before any `amr` is known and carries only this field, and so does
+  a `too_early` refusal whose `amr` named no listed value. A review of exempted step-ups reads both
+  fields. The sign-in leg has no such field, because there the floor always waits for the
+  exchange's `auth_time`, whether or not the list is set. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
   the exempt value is refused as `mfa_claim_missing`.
@@ -4408,6 +4416,21 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   (`channel_bindings=None` — EPA is structurally broken behind a TLS-terminating proxy; the
   acceptor-enforcement question is a recorded ADR 0068 spike). Still experimental + off by
   default; mock-seam test coverage only (no AD test infrastructure exists).
+  **Realm (BACKLOG #2610):** the ticket's client principal must read `user@REALM`, split at the
+  last `@`, with `REALM` equal to `[auth].kerberos_realm` up to ASCII case. That key is required
+  once `kerberos_enabled` is on and is never taken from `ad_domain`, a UPN suffix that often
+  differs from the realm. The engine used to drop the realm unread, so on a KDC that trusts another
+  realm, `admin@PARTNER` would have signed in as the local `admin`. Refused with no directory
+  lookup, at least: another realm, a non-ASCII realm, a principal with no realm, and an account
+  part that is empty or holds `@`, `/` or `\`. Each is the `auth.login_failed` row with reason
+  `no_principal` and a `refusal` field naming the case from a closed set (`realm_mismatch`,
+  `no_realm`, `domain_backslash_form`, `not_a_bare_account_name`); neither that row nor the
+  WARNING the engine logs holds any of the principal's text. **The `DOMAIN\user` form is refused
+  too, and what Windows reports is UNVERIFIED.** On a Windows host, pyspnego's SSPI acceptor reads
+  the client's name from `SECPKG_ATTR_NAMES`, which is likely to hold that form, but nobody has run
+  this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
+  closed until a lab run decides how to read it. That is no looser than before, when its directory
+  lookup missed.
 
 ### AD-group → role mapping
 
