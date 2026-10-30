@@ -90,14 +90,15 @@ rejection the standard gives it, and the rest get no rejection.
 
 **After that, each PDU has a deadline too.** The SCP reads a PDU's header and then its body, and
 each read has `timeout_seconds`, however slowly the bytes arrive. A peer that stops part way through
-a PDU is ended there, on an association it was given and on one it was refused. This is a deadline
-per read, not per object, so at the shipped 16 KiB `max_pdu_size` a sender has to keep up about
-0.5 KiB per second. Raising `max_pdu_size` raises that floor. A peer that keeps finishing PDUs is not
-ended by this.
+a PDU is ended there. This is a deadline per read, not per object, so a sender sending PDUs of the
+shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second. Raising `max_pdu_size` raises
+that floor. A peer that keeps finishing PDUs is not ended by this. A send to a peer that stops
+reading has a `timeout_seconds` bound too. `timeout_seconds` has to be above zero; the connection
+is refused when it is built otherwise.
 
 **A peer that stalls before its request is complete does not use up `max_associations`.** It never
 gets an association, so with `max_associations=2` and three stalled peers held, a real sender is
-served. These are the limits of that:
+served. At least these limits apply:
 
 - A stalled peer holds one of the slots above until the deadline. Up to 32 stalled connections from
   one address, or 256 in all, would refuse a sender that shares the address, or any sender, until
@@ -107,8 +108,14 @@ served. These are the limits of that:
 - A connection waiting on `max_associations_per_second` has no association yet, so it holds a slot
   too. A rate low enough to keep many senders waiting can fill the slots, and a connection over them
   is closed.
-- A peer that sends a whole request and then stalls has an association for up to `timeout_seconds`,
-  so it counts against `max_associations` for that long.
+- A peer that sends a whole request and then stalls has an association, so it counts against
+  `max_associations`. The idle timer, the header read and the body read each have `timeout_seconds`,
+  so one peer could hold that slot for about three times `timeout_seconds`, 90 seconds at the default.
+  Only an association the SCP accepted can do this. Over `max_associations` the request is rejected
+  at once, whatever follows it.
+- The SCP does not refuse a PDU longer than the `max_pdu_size` it offered. pynetdicom reads the
+  length the peer announces, into memory, for as long as the deadline allows, on an association the
+  SCP accepted.
 
 **A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
 no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a

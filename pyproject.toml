@@ -230,7 +230,7 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # start the listener on a pynetdicom that left that routing, but a site would only learn that when the
 # listener failed to start. For 3.1 and later, the cap moves that stop to install time, where it is a
 # reviewed step. A 3.0.x patch above 3.0.4 would still be allowed, unread. None exists today. Only the
-# startup guard stands in front of one, and it checks the routing alone.
+# startup guards stand in front of one, and they check the routing and some names, not behaviour.
 # That subclass's request handler also reads the association request ahead of pynetdicom (vault BACKLOG
 # #2712). So it relies on private names too: RequestHandler._create_association, the order of the steps
 # in RequestHandler.handle, Association.dul.socket, DULServiceProvider._is_transport_event testing

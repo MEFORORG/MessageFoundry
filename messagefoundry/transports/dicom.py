@@ -206,10 +206,10 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"
 #: The throttle is the one the socket listeners share (vault BACKLOG #2606), at its defaults.
 _REFUSAL_LOG_WINDOW_SECONDS = REFUSAL_LOG_WINDOW_SECONDS
 
-#: How often a pending inbound TLS handshake, and a read of a first PDU, look at whether the listener
-#: is stopping. It is a poll interval, not a bound. The handshake's bound is
+#: How often a pending inbound TLS handshake, and a read of a PDU, look at whether the listener is
+#: stopping. It is a poll interval, not a bound. The handshake's bound is
 #: ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant, imported so the two listeners cannot drift
-#: apart. The first PDU's is ``timeout_seconds``. pynetdicom polls its own sockets at 0.5 s too.
+#: apart. A PDU's is ``timeout_seconds``. pynetdicom polls its own sockets at 0.5 s too.
 _STOP_POLL_SECONDS = 0.5
 
 #: Connections that may have no association yet, at once: on one SCP, and from one peer address. A
@@ -241,10 +241,9 @@ _PROTOCOL_VERSION = 0x0001
 #: pynetdicom's decoder runs twice on a request that passes, and it logs for each UID it dislikes.
 _MAX_ASSOCIATE_RQ_BYTES = 256 * 1024
 
-#: The A-ASSOCIATE-RJ the DUL answers an unsupported protocol version with (PS3.8 section 9.3.4):
-#: type 3, a 4-byte length of 4, then a reserved byte, result 1 (rejected-permanent), source 2
-#: (service provider, ACSE) and reason 2 (protocol version not supported).
-_RJ_PDU_PROTOCOL_VERSION = bytes((0x03, 0x00, 0, 0, 0, 4, 0x00, 0x01, 0x02, 0x02))
+#: The DUL states (PS3.8 section 9.2) in which an admitted connection is not read; see
+#: ``_AdmittedSocket.ready``: awaiting the request, awaiting the local answer to it, and closing.
+_STATES_THAT_DO_NOT_READ = frozenset({"Sta2", "Sta3", "Sta13"})
 
 #: The most refusal lines one SCP writes per window over every address together. The per-address
 #: bound alone would still let many addresses earn a line each.
@@ -266,7 +265,7 @@ _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 _HUNG_UP = (*HUNG_UP, ssl.SSLEOFError, ConnectionAbortedError)
 
 
-class _NoAssociationRequest(Exception):
+class _RefusedPeer(Exception):
     """A peer did not deliver an association request the SCP will read. The message is the reason
     the refusal line gives, so it never holds a byte the peer sent."""
 
@@ -365,17 +364,16 @@ def _admitting_server_class() -> type[Any]:
       ``AssociationSocket`` itself and ``Association.set_socket`` refuses a second socket, so the
       socket it made is turned into an ``_AdmittedSocket``. A wrapper around the ``socket`` would
       lose the ``ssl.SSLSocket`` check in ``AssociationSocket.ready``, and with it ``pending()``.
-    * The same socket puts a deadline on every later read, so the DUL thread cannot block for good
-      after the association has started either. A peer that sends a whole request and then one
-      stray byte would otherwise block it even on the rejection path, where nothing caps the count
-      and ``Association.kill()`` would never return. The deadline raises in the DUL's read, the DUL
-      takes that as a closed connection, and the connection ends the normal way.
+    * The same socket bounds the DUL thread from there on, so it cannot block for good after the
+      association has started either. A later read has a fixed deadline and a send has a timeout.
+      It also holds off reading while the request is unanswered, so a stray byte behind a whole
+      request cannot delay the ``maximum_associations`` check.
     * ``AE.start_server`` cannot start this class: its non-blocking branch names
       ``ThreadedAssociationServer`` itself. ``AE.make_server`` takes ``server_class`` and passes extra
       keywords to its constructor, and ``start_serving`` here does the rest of what that branch does.
     """
     from pynetdicom import evt
-    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.pdu import A_ASSOCIATE_RJ, A_ASSOCIATE_RQ
     from pynetdicom.transport import AssociationSocket, RequestHandler, ThreadedAssociationServer
     from pynetdicom.utils import make_target
 
@@ -513,7 +511,7 @@ def _admitting_server_class() -> type[Any]:
                 first_pdu = self._read_first_pdu(sock)
                 self._check_association_request(sock, first_pdu)
                 return first_pdu
-            except _NoAssociationRequest as exc:
+            except _RefusedPeer as exc:
                 self._refused(host, "a connection", str(exc))
             except OSError as exc:  # a timeout errno, a reset and an ssl.SSLError are all OSError
                 logger.debug("DICOM peer %s sent no association request: %s", host, safe_exc(exc))
@@ -527,47 +525,53 @@ def _admitting_server_class() -> type[Any]:
             speaking DICOM is closed at once. It asks for no more than the PDU needs, so nothing
             the association will read next is taken here."""
             restore = sock.gettimeout()  # None: accept() returns a blocking socket
-            # The AE's value, not the setting: pynetdicom turns a negative timeout into 30 s.
             seconds = cast(float, self.ae.acse_timeout)
             deadline = time.monotonic() + seconds
-            expired = _NoAssociationRequest(f"no complete association request within {seconds:g}s")
+            expired = _RefusedPeer(f"no complete association request within {seconds:g}s")
 
             pdu = self._read_exactly(sock, 1, deadline, expired)
             if pdu[0] != _PDU_TYPE_ASSOCIATE_RQ:
-                raise _NoAssociationRequest("its first PDU is not an association request")
+                raise _RefusedPeer("its first PDU is not an association request")
             pdu += self._read_exactly(sock, _PDU_HEADER_BYTES - 1, deadline, expired)
             body = int.from_bytes(pdu[2:], "big")
             if _PDU_HEADER_BYTES + body > _MAX_ASSOCIATE_RQ_BYTES:
-                raise _NoAssociationRequest(
+                raise _RefusedPeer(
                     f"its association request is over {_MAX_ASSOCIATE_RQ_BYTES} bytes"
                 )
             pdu += self._read_exactly(sock, body, deadline, expired)
             if self._stopping.is_set():  # finished after the stop began: start no association
                 raise OSError("the listener is stopping")
             sock.settimeout(restore)
-            return pdu
+            return bytes(pdu)
 
-        def read_for_association(self, sock: socket.socket, count: int) -> bytes:
+        def read_for_association(self, sock: socket.socket, count: int, host: str) -> bytearray:
             """One read of a started association, within ``timeout_seconds`` however slowly the
-            peer sends it. Short only where the peer closed, as ``AssociationSocket.recv`` is.
+            peer sends it. Short where the peer closed, as ``AssociationSocket.recv`` is, and empty
+            where the deadline passed, the read failed or the listener is stopping.
 
-            The DUL reads a PDU's header and then its body, so each of those has the deadline, and
-            a peer that stops part way raises ``expired`` into the DUL's own ``except`` for a
-            failed read, which ends the connection the normal way. It is a deadline per read and
-            not per object: a peer that keeps finishing PDUs is what ``max_object_bytes`` and
-            pynetdicom's own timers are for."""
+            The DUL reads a PDU's header and then its body, so each of those has the deadline. It
+            takes a short read as a closed connection, and that ends the connection the normal way.
+            A raise would too, but pynetdicom logs each one at ERROR with a traceback, and a peer
+            could repeat that as often as it could connect, so the refusal goes through the
+            throttled line instead. It is a deadline per read and not per object: a peer that keeps
+            finishing PDUs is for ``max_object_bytes`` and pynetdicom's own timers."""
             seconds = cast(float, self.ae.network_timeout)
-            expired = TimeoutError(f"no complete PDU within {seconds:g}s")
+            expired = _RefusedPeer(f"no complete PDU within {seconds:g}s")
             restore = sock.gettimeout()  # None: pynetdicom reads a blocking socket
             try:
                 return self._read_up_to(sock, count, time.monotonic() + seconds, expired)
+            except _RefusedPeer as exc:
+                self._refused(host, "a connection", str(exc))
+            except OSError as exc:  # a timeout errno, a reset and an ssl.SSLError are all OSError
+                logger.debug("A read from DICOM peer %s ended: %s", host, safe_exc(exc))
             finally:
                 with contextlib.suppress(OSError):  # the association may have closed it
                     sock.settimeout(restore)
+            return bytearray()
 
         def _read_exactly(
             self, sock: socket.socket, count: int, deadline: float, expired: Exception
-        ) -> bytes:
+        ) -> bytearray:
             """Read ``count`` bytes before ``deadline``, or raise."""
             received = self._read_up_to(sock, count, deadline, expired)
             if len(received) < count:
@@ -576,7 +580,7 @@ def _admitting_server_class() -> type[Any]:
 
         def _read_up_to(
             self, sock: socket.socket, count: int, deadline: float, expired: Exception
-        ) -> bytes:
+        ) -> bytearray:
             """Read ``count`` bytes before ``deadline``, or fewer if the peer closes first. Raises
             ``expired`` when the deadline passes. A read asks for 4096 bytes at most, as pynetdicom's
             own does."""
@@ -587,7 +591,7 @@ def _admitting_server_class() -> type[Any]:
                 if not chunk:
                     break
                 received += chunk
-            return bytes(received)
+            return received
 
         def _in_slices(
             self, sock: socket.socket, step: Callable[[], Any], deadline: float, expired: Exception
@@ -624,18 +628,22 @@ def _admitting_server_class() -> type[Any]:
             steps, so a request that passes here is one the association will be given.
 
             A wrong protocol version still gets the A-ASSOCIATE-RJ the DUL answers it with, so
-            that peer is told why. The rest could not be told anything it would read."""
+            that peer can be told why. The rest could not be told anything it would read."""
             pdu = A_ASSOCIATE_RQ()
             try:
                 pdu.decode(first_pdu)
-                pdu.to_primitive()
+                primitive = pdu.to_primitive()
             except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
                 logger.debug("DICOM association request did not decode: %s", safe_exc(exc))
-                raise _NoAssociationRequest("its association request does not decode") from exc
+                raise _RefusedPeer("its association request does not decode") from exc
             if pdu.protocol_version != _PROTOCOL_VERSION:
-                with contextlib.suppress(OSError):
-                    sock.sendall(_RJ_PDU_PROTOCOL_VERSION)
-                raise _NoAssociationRequest("its association request has the wrong protocol")
+                # Rejected-permanent, from the ACSE, protocol version not supported: AE-6's answer.
+                primitive.result, primitive.result_source, primitive.diagnostic = 0x01, 0x02, 0x02
+                try:
+                    sock.sendall(A_ASSOCIATE_RJ(primitive).encode())
+                except OSError as exc:
+                    logger.debug("DICOM association rejection not sent: %s", safe_exc(exc))
+                raise _RefusedPeer("its association request has the wrong protocol")
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -682,23 +690,51 @@ def _admitting_server_class() -> type[Any]:
 
     class _AdmittedSocket(AssociationSocket):
         """An admitted connection's association socket. It first serves the PDU the server has
-        already read, and every later read has a deadline."""
+        already read, and after that a read or a send cannot block the DUL thread for good."""
 
         #: What is left of that PDU. It holds one whole PDU, and the DUL reads a PDU's header and
         #: then its body, so a read never asks for more than is left.
         replay: bytes
         server: _AdmittingAssociationServer
+        host: str
 
         @property
         def ready(self) -> bool:
-            return bool(self.replay) or super().ready
+            """Whether the DUL should read. Not in Sta2, Sta3 or Sta13, whatever has arrived.
+
+            The DUL reads before it takes its next event, so a byte behind the request would have
+            it reading while the request itself waits, unanswered, on its queue. The association
+            then counts for a whole deadline before ``maximum_associations`` is checked, with its
+            slot already given back, so such peers would go round every cap. Sta13 is the same
+            read after a rejection, which only delays closing the connection."""
+            if self.replay:
+                return True
+            if self.assoc.dul.state_machine.current_state in _STATES_THAT_DO_NOT_READ:
+                return False
+            return super().ready
 
         def recv(self, nr_bytes: int) -> bytearray:
             if self.replay:
                 served, self.replay = self.replay[:nr_bytes], self.replay[nr_bytes:]
                 return bytearray(served)
             sock = cast(socket.socket, self.socket)
-            return bytearray(self.server.read_for_association(sock, nr_bytes))
+            return self.server.read_for_association(sock, nr_bytes, self.host)
+
+        def send(self, bytestream: bytes) -> None:
+            """``AssociationSocket.send`` under a timeout. A peer that never reads would otherwise
+            block the DUL thread here for good. The stock ``send`` turns the timeout into a closed
+            connection. Each PDU is small, so an idle bound on the socket is enough."""
+            sock = self.socket
+            if sock is None:
+                super().send(bytestream)  # it reports the closed socket
+                return
+            restore = sock.gettimeout()
+            try:
+                sock.settimeout(self.assoc.network_timeout)
+                super().send(bytestream)
+            finally:
+                with contextlib.suppress(OSError):  # the association may have closed it
+                    sock.settimeout(restore)
 
     class _AdmittingRequestHandler(RequestHandler):
         server: _AdmittingAssociationServer
@@ -714,9 +750,8 @@ def _admitting_server_class() -> type[Any]:
             assoc = self._create_association()
             evt.trigger(assoc, evt.EVT_CONN_OPEN, {"address": self.client_address})
             server = self.server
-            first_pdu = server.read_association_request(
-                self.request, _address_host(self.client_address)
-            )
+            host = _address_host(self.client_address)
+            first_pdu = server.read_association_request(self.request, host)
             if first_pdu is None:
                 server.shutdown_request(self.request)
                 return
@@ -724,6 +759,7 @@ def _admitting_server_class() -> type[Any]:
             sock.__class__ = _AdmittedSocket  # why not a new socket: _admitting_server_class
             sock.replay = first_pdu
             sock.server = server
+            sock.host = host
             assoc.start()
 
     return _AdmittingAssociationServer
@@ -839,6 +875,8 @@ class DicomScpSource(SourceConnector):
         self._timeout = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOM-SCP source"
         )
+        if self._timeout <= 0:  # it is a hard deadline on every read: it would close every peer
+            raise ValueError("DICOM-SCP source: timeout_seconds must be above zero")
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -1185,7 +1223,7 @@ class DicomScpSource(SourceConnector):
         **Why refuse rather than wait.** The SCP could wait on ``EVT_CONN_OPEN``, before the request
         is read, the way :meth:`_pace_association` does. That wait is bounded by a rate deficit. A
         pause has no such bound: it lasts until the backlog drains or disk is freed. Waiting that long
-        would hold a ``max_associations`` slot per sender, and would outlast the sender's own
+        would hold a pending connection slot per sender, and would outlast the sender's own
         association timeout, which then drops the connection with no reason given. The rejection
         says what happened, at once.
 
