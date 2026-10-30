@@ -379,6 +379,12 @@ class ConnScaleRecord:
         """The arm this step asked for; ``off``, the engine default, where nothing was recorded."""
         return "off" if self.sandbox is None else self.sandbox.requested
 
+    @property
+    def step_label(self) -> str:
+        """The step's name in a console note or an SLO observation, with its sandbox arm: without
+        the arm, the two arms of an A/B read as one step."""
+        return f"{self.sweep_mode}@N={self.count} sandbox={self.sandbox_mode}"
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "claim_mode": self.claim_mode,
@@ -1332,15 +1338,15 @@ class ConnScaleReport:
         lines.append(_coverage_note(self.db_backend, self.shim_installed))
         lines.append("")
         header = (
-            f"{'claim':<9}{'mode':<16}{'N':>6}{'rate':>8}{'achv/s':>8}{'sent':>9}{'inpipe':>7}{'exqd':>6}"
+            f"{'claim':<9}{'mode':<16}{'sandbox':<11}{'N':>6}{'rate':>8}{'achv/s':>8}{'sent':>9}{'inpipe':>7}{'exqd':>6}"
             f"{'poolp99':>9}{'idle':>6}{'empty/s':>9}{'wake/s':>8}{'idle/s':>8}{'fd':>7}{'cpu_s':>8}{'reload':>8}{'ackp99':>9}"
         )
         lines.append(header)
         lines.append("-" * len(header))
         for r in self.records:
             lines.append(
-                f"{r.claim_mode:<9}{r.sweep_mode:<16}{r.count:>6}{r.offered_aggregate_rate:>8.0f}"
-                f"{r.achieved_read_per_s:>8.0f}{r.sent:>9}"
+                f"{r.claim_mode:<9}{r.sweep_mode:<16}{r.sandbox_mode:<11}{r.count:>6}"
+                f"{r.offered_aggregate_rate:>8.0f}{r.achieved_read_per_s:>8.0f}{r.sent:>9}"
                 f"{r.in_pipeline_peak:>7}{_na(r.executor_queue_depth_peak):>6}"
                 f"{_na(r.pool_wait_p99_ms):>9}{_na(r.pool_idle_min):>6}"
                 f"{r.empty_claims_per_s:>9.1f}{r.wake_fanout_per_s:>8.1f}{r.idle_poll_per_s:>8.1f}"
@@ -1353,7 +1359,7 @@ class ConnScaleReport:
             if r.fd_probe_degraded_ticks:
                 causes = ", ".join(r.fd_probe_degraded) or "cause not recorded"
                 lines.append(
-                    f"fd probe: {r.sweep_mode}@N={r.count} -- {r.fd_probe_degraded_ticks} of "
+                    f"fd probe: {r.step_label} -- {r.fd_probe_degraded_ticks} of "
                     f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
                 )
         # BACKLOG #1292: the per-message attribution, printed whenever it says anything beyond "clean".
@@ -1364,7 +1370,7 @@ class ConnScaleReport:
             for audit in (r.intake_audit_live, r.intake_audit):
                 if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):
                     continue
-                lines.append(f"{r.sweep_mode}@N={r.count} -- {audit.summary()}")
+                lines.append(f"{r.step_label} -- {audit.summary()}")
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:

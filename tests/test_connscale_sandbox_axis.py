@@ -348,6 +348,31 @@ async def test_an_arm_the_engine_parses_differently_fails(
     assert "parses mode 'off'" in str(check.observed)
 
 
+async def test_the_console_tells_the_two_arms_of_an_ab_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CSV and JSON carry the arm. Without it the console printed two rows, and two notes, with one
+    label for each count."""
+    report = await _sweep(monkeypatch, {"off": 0, "subprocess": 40})
+    lines = report.render_console().splitlines()
+    assert any(line.startswith("claim") and "sandbox" in line for line in lines), lines
+    rows = [line.split() for line in lines if line.startswith("pooled")]
+    assert sorted((row[2], int(row[3])) for row in rows) == [
+        ("off", 10),
+        ("off", 20),
+        ("subprocess", 10),
+        ("subprocess", 20),
+    ]
+    degraded = [
+        dataclasses.replace(r, fd_probe_ticks=2, fd_probe_degraded_ticks=1) for r in report.records
+    ]
+    console = dataclasses.replace(report, records=degraded).render_console()
+    notes = [line for line in console.splitlines() if line.startswith("fd probe:")]
+    assert len(notes) == 4
+    assert len(set(notes)) == 4, notes
+    assert len({r.step_label for r in report.records}) == 4
+
+
 def test_the_sandbox_reading_is_in_the_artifact() -> None:
     record = _record(10, _reading("subprocess", 10, started=20))
     payload = record.to_json_dict()["sandbox"]

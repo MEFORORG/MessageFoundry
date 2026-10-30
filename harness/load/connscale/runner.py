@@ -2530,9 +2530,7 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         # the audit genuinely runs; this line is the operator-facing summary of it.
         audited = sum(1 for r in records if r.intake_audit.conclusive)
         if suspect:
-            observed = "; ".join(
-                f"{r.sweep_mode}@N={r.count} {r.intake_audit.summary()}" for r in suspect
-            )
+            observed = "; ".join(f"{r.step_label} {r.intake_audit.summary()}" for r in suspect)
         elif audited == 0:
             observed = (
                 f"NOT AUDITED -- 0 of {len(records)} step(s) carry an intake audit, so this says "
@@ -2588,7 +2586,7 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     problems: list[str] = []
     for r in records:
         sb = r.sandbox
-        where = f"{r.sweep_mode}@N={r.count} sandbox={r.sandbox_mode}"
+        where = r.step_label
         if sb is None:
             problems.append(f"{where}: no sandbox reading")
             continue
@@ -2622,7 +2620,7 @@ def _warmup_slo(records: list[ConnScaleRecord]) -> SloCheck:
     """Every step's warm-up delivered one message per connection (BACKLOG #3132). Under
     ``subprocess`` a shortfall is the arm's workers failing to come up inside the warm-up."""
     short = [
-        f"{r.sweep_mode}@N={r.count} sandbox={r.sandbox_mode}: "
+        f"{r.step_label}: "
         + (
             "no warm-up ran"
             if r.sandbox is None or not r.sandbox.warmup_ran
