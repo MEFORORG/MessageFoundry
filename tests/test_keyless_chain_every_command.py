@@ -1335,7 +1335,8 @@ _CLI_OPENERS = {
     # would refuse an existing empty store even under the opt-out the CLI gate already accepted
     "_provision_admin.administrator_exists",
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
-    # alert's open instance lands in the store; no create, and the write's verdict and posture
+    # alert's open instance lands in the store, on the write's verdict and posture. It passes no
+    # create; this guard reads only the verdict, so nothing here pins that
     "_provision_admin.alert",
     # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
     "_renew_api_tls_before_spawning._audit",
