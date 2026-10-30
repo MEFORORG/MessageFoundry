@@ -820,8 +820,9 @@ def test_the_tls_sigalgs_leaf_imports_only_the_standard_library() -> None:
 
 
 def test_the_odbc_call_gate_leaf_imports_only_the_standard_library() -> None:
-    # BACKLOG #2394: the store and the DATABASE connector both import the gate, and neither may
-    # import the other, so the gate must reach neither them nor a driver package.
+    # BACKLOG #2394: the SQL Server store imports the gate, and part b moves the DATABASE connector
+    # onto it. Neither may import the other, so the gate must reach neither them nor a driver
+    # package.
     path = _ENGINE_ROOT / "odbc_call_gate.py"
     modules = _imported_modules(path, path.parent)
     assert "threading" in modules, "control: the walk did not read the module's imports"

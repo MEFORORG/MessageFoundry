@@ -13,14 +13,19 @@ without one importing the other.
 
 The SQL Server store installs it on every pooled connection, every claim holder and its open-time
 probe connections. The detach that quarantines a cancelled pooled connection stays in the store,
-because it is the pool's rule, not the gate's.
+because it is the pool's rule, not the gate's. The exits of an unpooled one-shot connection,
+:func:`close_one_shot` and :func:`abandon_one_shot`, live here: they need no pool, so a transport
+can use them without importing the store.
 
 Standard library only: nothing here imports aioodbc or pyodbc. It recognises an aioodbc connection
-by its bound ``_execute`` method.
+by its bound ``_execute`` method, and reaches its raw handles through ``_conn``, ``_executor`` and a
+cursor's ``_impl``, as aioodbc 0.5.0 names them.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
 import logging
 import threading
@@ -28,7 +33,14 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any
 
-__all__ = ["CallGate", "call_gate", "install_call_gate", "raw_closer"]
+__all__ = [
+    "CallGate",
+    "abandon_one_shot",
+    "call_gate",
+    "close_one_shot",
+    "install_call_gate",
+    "raw_closer",
+]
 
 log = logging.getLogger(__name__)
 
@@ -120,9 +132,9 @@ def install_call_gate(conn: Any) -> None:
     still holds directly, on whatever thread runs the collector. So a caller abandoning a connection
     on a cancellation must also drop its ``_conn``, as the SQL Server store's detach does, rather
     than leave the close to the collector. A connection without a bound ``_execute`` (a test
-    double) is left alone and keeps the pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
-    it brings the native crash back; the store's live suite also pins that a pooled connection is
-    gated.
+    double) is left alone and keeps the pre-gate behaviour. A real aioodbc connection that cannot
+    be gated is logged at ERROR, because it brings the native crash back; the store's live suite
+    also pins that a pooled connection is gated.
     """
     if call_gate(conn) is not None:
         return
@@ -151,3 +163,101 @@ def raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
     so the close runs only between pyodbc calls (BACKLOG #2049)."""
     gate = call_gate(conn)
     return raw.close if gate is None else partial(gate.close, raw)
+
+
+def abandon_one_shot(conn: Any, cur: Any) -> bool:
+    """The exit of an unpooled one-shot connection when a cancellation lands during one of its
+    statements (BACKLOG #2394): the pooled quarantine's rule for a connection with no pool.
+    Returns whether it took the connection.
+
+    The cursor goes to the gate, and the connection's handle is dropped at once, so aioodbc's
+    ``__del__`` cannot close it outside the gate. The running call closes both as it returns,
+    cursor first; with no call running, a close is scheduled through the gate. Nothing here awaits,
+    so the cancellation does not wait for a statement that may be an ``ALTER DATABASE`` with no
+    command timeout.
+
+    A connection with no gate (a stand-in, or one :func:`install_call_gate` could not wrap and
+    logged at ERROR) or no handle is not taken. The caller then runs :func:`close_one_shot`, which
+    closes it beside the running statement: the hazard the gate exists to remove. A cursor still
+    being created is not held here, so the collector frees it."""
+    gate = call_gate(conn)
+    raw = getattr(conn, "_conn", None)
+    if gate is None or raw is None:
+        return False
+    _hand_off(conn, raw, getattr(cur, "_impl", None), gate, logging.WARNING)
+    return True
+
+
+async def close_one_shot(conn: Any, cur: Any) -> None:
+    """The normal exit of an unpooled one-shot connection: the cursor, then the connection, in one
+    job on the connection's executor, through its gate (BACKLOG #2394).
+
+    A cursor left for the collector after its connection closed is freed from wherever the
+    interpreter happens to be, the native-abort shape ``tests/_live_scratch.py`` records. A failure
+    is logged, not raised: a peer's ``ROLLBACK IMMEDIATE`` may already have killed the session.
+
+    **A cancellation cannot cut the close short.** The handle is dropped before the job is
+    scheduled, so aioodbc's ``__del__`` never closes it, and the job is awaited through
+    :func:`asyncio.shield`: the cancellation propagates at once, and the job still closes the
+    cursor once, then the connection once, whether it was waiting for a worker or running. An
+    ungated connection gets a gate of its own for the job, whose lock nothing else contends.
+
+    A connection or cursor with no raw handle (a stand-in) is closed through its own ``close``
+    methods instead, best effort."""
+    raw = getattr(conn, "_conn", None)
+    raw_cur = getattr(cur, "_impl", None)
+    if raw is None or (cur is not None and raw_cur is None):
+        await _close_through_methods(conn, cur)
+        return
+    closing = _hand_off(conn, raw, raw_cur, call_gate(conn) or CallGate(), logging.DEBUG)
+    if closing is not None:
+        with contextlib.suppress(Exception):  # the close's own callback logs it
+            await asyncio.shield(closing)
+
+
+def _hand_off(
+    conn: Any, raw: Any, raw_cur: Any, gate: CallGate, level: int
+) -> asyncio.Future[None] | None:
+    """Give ``raw_cur`` and ``raw`` to ``gate`` to close, cursor first, and drop the connection's
+    handle. The close's future, or ``None`` when the running call took it or none was scheduled."""
+    if raw_cur is not None:
+        gate.abandon(raw_cur)
+    conn._conn = None  # first, and await-free: aioodbc's __del__ closes only a handle it holds
+    if gate.close_after_running_call(raw):
+        return None
+    return _schedule_close(conn, partial(gate.close, raw), level)
+
+
+def _schedule_close(
+    conn: Any, close: Callable[[], None], level: int
+) -> asyncio.Future[None] | None:
+    """Run ``close`` on ``conn``'s executor, where aioodbc runs its calls, and log a failure at
+    ``level``. ``None`` when the executor refused the work, at loop teardown: pyodbc then closes
+    the handle when it is collected."""
+    try:
+        closing = asyncio.get_running_loop().run_in_executor(
+            getattr(conn, "_executor", None), close
+        )
+    except RuntimeError:  # the executor is shut down; see the docstring
+        log.warning(
+            "odbc: could not schedule the close of a one-shot connection; it closes when collected",
+            exc_info=True,
+        )
+        return None
+    closing.add_done_callback(partial(_log_close_failure, level))
+    return closing
+
+
+def _log_close_failure(level: int, fut: asyncio.Future[None]) -> None:
+    exc = None if fut.cancelled() else fut.exception()
+    if exc is not None:
+        log.log(level, "odbc: close of a one-shot connection failed: %s", exc)
+
+
+async def _close_through_methods(conn: Any, cur: Any) -> None:
+    for handle in (cur, conn):
+        if handle is not None:
+            try:
+                await handle.close()
+            except Exception:  # noqa: BLE001 - best effort; the caller's own outcome stands
+                log.debug("odbc: one-shot close failed", exc_info=True)

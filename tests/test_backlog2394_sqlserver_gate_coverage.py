@@ -37,7 +37,7 @@ import pytest
 
 import messagefoundry.store.sqlserver as sqlserver
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
-from messagefoundry.odbc_call_gate import call_gate
+from messagefoundry.odbc_call_gate import call_gate, close_one_shot, install_call_gate
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests._odbc_cancel_fakes import (
@@ -51,6 +51,7 @@ from tests._odbc_cancel_fakes import (
     cancel_once_started,
     never,
     wait_for_entry,
+    wait_until,
 )
 
 _STATE_READ = (
@@ -100,17 +101,23 @@ async def rig() -> AsyncIterator[_Rig]:
 
 
 def _aioodbc_serving(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig, raws: list[RawConn], *, keep: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    rig: _Rig,
+    raws: list[RawConn],
+    *,
+    keep: bool = False,
+    gateable: bool = True,
 ) -> list[AioConn]:
     """Stand ``aioodbc`` in: each ``connect`` hands out the next of ``raws``, wrapped as aioodbc
     wraps it. With ``keep`` it returns the connections made. Without, it holds no reference, so the
-    collector can reach them and run their aioodbc-shaped ``__del__``, as it could in a real open."""
+    collector can reach them and run their aioodbc-shaped ``__del__``, as it could in a real open.
+    ``gateable=False`` makes connections the gate cannot wrap."""
     made: list[AioConn] = []
     count = 0
 
     async def _connect(**kwargs: Any) -> AioConn:
         nonlocal count
-        conn = AioConn(raws[count], rig.executor)
+        conn = AioConn(raws[count], rig.executor, gateable=gateable)
         count += 1
         if keep:
             made.append(conn)
@@ -223,6 +230,100 @@ async def test_a_cancel_during_the_cursor_close_still_leaves_through_the_gate(
 
     assert USE_AFTER_FREE not in rig.log, rig.log
     assert rig.log.index("cursor.close") < rig.log.index("conn.close"), rig.log
+    # The defect this pins: the cancel handed the cursor whose close was running to the
+    # gate as well, so the gate closed it a second time.
+    assert rig.log.count("cursor.close") == 1, rig.log
+
+
+async def test_a_cancel_during_the_connection_close_closes_it_once(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A cancel while the connection's close runs. The close goes on, and nothing closes the
+    handle a second time, through the gate or through aioodbc's ``__del__``."""
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        [rig.raw(blocks=never, rows={_STATE_READ: (1, 1)}, block_conn_close=True)],
+    )
+    await _cancel_open_mid_call(rig)
+    assert "conn.close:start" in rig.log, "the arm is vacuous: the cancel missed the close"
+    assert not {"conn.close", DEL_CLOSE} & set(rig.log), rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    gc.collect()
+
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    assert DEL_CLOSE not in rig.log, rig.log
+    assert rig.log.count("conn.close") == 1, rig.log
+    assert rig.log.index("cursor.close") < rig.log.index("conn.close:start"), rig.log
+
+
+class _CountingExecutor(ThreadPoolExecutor):
+    """Counts submissions, so an arm can cancel once a close is queued behind a busy worker."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1, thread_name_prefix="test-2394-one")
+        self.submits = 0
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        future = super().submit(fn, *args, **kwargs)
+        self.submits += 1  # run_in_executor submits from the loop's thread, so no race
+        return future
+
+
+async def test_a_cancel_while_the_connection_close_waits_for_a_worker_still_closes_it() -> None:
+    """A cancel while the close is queued and not yet running. The defect this pins: the
+    cancel also cancelled the queued close, so it never ran, and the handle the exit dropped was
+    left to pyodbc's collector, outside the gate."""
+    executor = _CountingExecutor()
+    busy = threading.Event()
+    log: list[str] = []
+    try:
+        executor.submit(busy.wait, WAIT)  # the one worker is taken, so the close queues
+        conn = AioConn(RawConn(log, threading.Event(), threading.Event()), executor)
+        install_call_gate(conn)
+        task = asyncio.create_task(close_one_shot(conn, None))
+        assert await wait_until(lambda: executor.submits >= 2), "the close was never submitted"
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=1.0)
+        assert done, "the cancellation waited for the queued close"
+        assert task.cancelled(), task
+        assert "conn.close" not in log, "the arm is vacuous: the close had already run"
+
+        busy.set()
+        await wait_for_entry(log, "conn.close")
+        del task, done, conn
+        gc.collect()
+
+        assert log == ["conn.close"], log
+    finally:
+        busy.set()
+        executor.shutdown(wait=True)
+
+
+async def test_a_cancel_during_an_ungated_cursor_close_closes_the_connection_after_it(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A connection the gate could not wrap. The defect this pins: the cancel left the
+    connection to aioodbc's ``__del__``, which closed it on the collector's thread while the
+    cursor's close still ran."""
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        [rig.raw(blocks=never, rows={_STATE_READ: (1, 1)}, block_cursor_close=True)],
+        gateable=False,
+    )
+    await _cancel_open_mid_call(rig)
+    assert "cursor.close:start" in rig.log, "the arm is vacuous: the cancel missed the close"
+    assert not {"cursor.close", "conn.close", DEL_CLOSE} & set(rig.log), rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    assert rig.log.index("cursor.close") < rig.log.index("conn.close"), rig.log
+    assert rig.log.count("conn.close") == 1, rig.log
 
 
 async def test_an_ordinary_open_gates_every_connection_it_makes(

@@ -75,7 +75,9 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
+from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
 from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
 from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
@@ -436,8 +438,7 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 
     The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
     quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
-    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`). The
-    cancellation exit of an unpooled one-shot connection uses it too (:func:`_abandon_one_shot`).
+    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
 
     **The first write is the guarantee, and nothing here awaits.** aioodbc derives
     ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
@@ -2863,61 +2864,6 @@ async def _assert_autocommit(conn: Any) -> None:
         await conn._execute(setattr, raw, "autocommit", True)
     else:
         await asyncio.to_thread(setattr, raw, "autocommit", True)
-
-
-def _abandon_one_shot(conn: Any, cur: Any) -> bool:
-    """The cancellation exit of an unpooled one-shot connection (BACKLOG #2394): the pooled
-    quarantine's rule for a connection with no pool. Returns whether it took the connection.
-
-    The cursor goes to the call gate, then :func:`_detach_connection` drops the connection's handle.
-    The gate closes both once the running call returns, cursor first. Nothing here awaits, so the
-    cancellation propagates at once instead of waiting for a statement that may be an ``ALTER
-    DATABASE`` with no command timeout. Dropping ``_conn`` at once also keeps aioodbc's ``__del__``
-    from closing the handle outside the gate if the collector reaches the connection first.
-
-    With no gate there is nothing to hand the close to, so it does nothing and returns ``False``,
-    and the caller closes as it did before the gate existed. That is a stand-in, or an aioodbc
-    connection :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap, which it
-    logged at ERROR. A cursor still being created is not held here, so the collector frees it."""
-    gate = _call_gate(conn)
-    if gate is None:
-        return False
-    raw_cur = getattr(cur, "_impl", None)
-    if raw_cur is not None:
-        gate.abandon(raw_cur)
-    _detach_connection(conn)
-    return True
-
-
-async def _close_one_shot(conn: Any, cur: Any) -> None:
-    """The normal exit of an unpooled one-shot connection: the cursor first, then the connection.
-
-    A cursor left for the collector after its connection closed is freed from wherever the
-    interpreter happens to be, the native-abort shape ``tests/_live_scratch.py`` records. A failure
-    is logged, not raised: a peer's ``ROLLBACK IMMEDIATE`` may already have killed the session.
-
-    A cancellation during these closes still leaves through the gate. While the cursor is open,
-    both go to :func:`_abandon_one_shot`. Once the connection's own gated close is running, its
-    handle is only dropped, so aioodbc's ``__del__`` cannot close it a second time beside that
-    close."""
-    open_cur = cur
-    try:
-        if cur is not None:
-            try:
-                await cur.close()
-            except Exception:  # noqa: BLE001 - best effort; the caller's own outcome stands
-                log.debug("one-shot cursor close failed", exc_info=True)
-        open_cur = None
-        try:
-            await conn.close()
-        except Exception:  # noqa: BLE001 - best effort; the caller's own outcome stands
-            log.debug("one-shot connection close failed", exc_info=True)
-    except BaseException:  # only a cancellation gets here: both closes swallow every Exception
-        if open_cur is None and _call_gate(conn) is not None:
-            conn._conn = None  # the gated close already running ends the connection
-        else:
-            _abandon_one_shot(conn, open_cur)
-        raise
 
 
 def _options_off(row: Any) -> list[str]:

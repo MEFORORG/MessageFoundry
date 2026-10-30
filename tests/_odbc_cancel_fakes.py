@@ -59,8 +59,7 @@ class RawCursor:
         c = self._conn
         c.note("execute:start")
         if c.blocks(sql):
-            c.started.set()
-            c.release.wait(WAIT)
+            c.hold()
         # pyodbc reads the result's column metadata off this handle as execute returns. That is
         # the read that crashed natively when the handle had already been freed.
         if self.freed:
@@ -86,8 +85,7 @@ class RawCursor:
         if c.block_cursor_close:
             c.block_cursor_close = False  # the first close only
             c.note("cursor.close:start")
-            c.started.set()
-            c.release.wait(WAIT)
+            c.hold()
         if c.closed:
             c.note(USE_AFTER_FREE)
         self.freed = True
@@ -102,7 +100,8 @@ class RawConn:
     that raise once they return, and ``blocks`` picks the statements that wait for ``release``.
     ``block_autocommit`` makes the ``autocommit`` setter wait the same way: it goes through the
     driver, so a close beside it frees the handle under it. ``block_cursor_close`` makes the first
-    cursor close wait too, a place for a cancellation to land during cleanup."""
+    cursor close wait too, a place for a cancellation to land during cleanup, and
+    ``block_conn_close`` does the same for the first connection close."""
 
     def __init__(
         self,
@@ -116,6 +115,7 @@ class RawConn:
         fails: frozenset[str] = frozenset(),
         block_autocommit: bool = False,
         block_cursor_close: bool = False,
+        block_conn_close: bool = False,
     ) -> None:
         self.log = log
         self.release = release
@@ -125,6 +125,7 @@ class RawConn:
         self.fails = fails
         self.block_autocommit = block_autocommit
         self.block_cursor_close = block_cursor_close
+        self.block_conn_close = block_conn_close
         self._prefix = f"{name}:" if name else ""
         self.cursors: list[RawCursor] = []
         self.closed = False
@@ -133,6 +134,11 @@ class RawConn:
 
     def note(self, entry: str) -> None:
         self.log.append(self._prefix + entry)
+
+    def hold(self) -> None:
+        """Say the blocking call has started, then wait for the test to release it."""
+        self.started.set()
+        self.release.wait(WAIT)
 
     def cursor(self) -> RawCursor:
         cur = RawCursor(self)
@@ -153,14 +159,17 @@ class RawConn:
     def autocommit(self, value: bool) -> None:
         self.note("autocommit:start")
         if self.block_autocommit:
-            self.started.set()
-            self.release.wait(WAIT)
+            self.hold()
         if self.closed:
             self.note(USE_AFTER_FREE)
         self._autocommit = value
         self.note("autocommit:end")
 
     def close(self) -> None:
+        if self.block_conn_close:
+            self.block_conn_close = False  # the first close only
+            self.note("conn.close:start")
+            self.hold()
         for cur in self.cursors:
             cur.freed = True
         self.closed = True
@@ -202,12 +211,19 @@ class AioCursor:
 
 class AioConn:
     """aioodbc 0.5.0 ``Connection``: ``_execute`` is ``run_in_executor(self._executor, partial)``,
-    ``closed`` is derived from ``_conn``, and ``close`` runs the raw close through ``_execute``."""
+    ``closed`` is derived from ``_conn``, and ``close`` runs the raw close through ``_execute``.
 
-    def __init__(self, raw: RawConn, executor: ThreadPoolExecutor) -> None:
+    With ``gateable=False``, ``_execute`` is not a bound method, so ``install_call_gate`` leaves
+    the connection ungated: the shape of an aioodbc connection the gate could not wrap."""
+
+    def __init__(
+        self, raw: RawConn, executor: ThreadPoolExecutor, *, gateable: bool = True
+    ) -> None:
         self._conn: RawConn | None = raw
         self._executor = executor
         self._loop = asyncio.get_running_loop()
+        if not gateable:
+            self._execute = partial(AioConn._execute, self)  # type: ignore[method-assign]
 
     def _execute(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return self._loop.run_in_executor(self._executor, partial(func, *args, **kwargs))
@@ -292,10 +308,16 @@ async def cancel_once_started(started: threading.Event, coro: Any) -> asyncio.Ta
     return task
 
 
+async def wait_until(done: Callable[[], bool]) -> bool:
+    """Wait, up to :data:`WAIT`, until ``done()`` is true, and say whether it became true."""
+    for _ in range(int(WAIT / 0.01)):
+        if done():
+            return True
+        await asyncio.sleep(0.01)
+    return done()
+
+
 async def wait_for_entry(log: list[str], entry: str) -> None:
     """Wait, up to :data:`WAIT`, until ``entry`` is in ``log``."""
-    for _ in range(int(WAIT / 0.01)):
-        if entry in log:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"{entry!r} never happened (log={log})")
+    if not await wait_until(lambda: entry in log):
+        raise AssertionError(f"{entry!r} never happened (log={log})")
