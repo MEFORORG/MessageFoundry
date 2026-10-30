@@ -10,13 +10,20 @@ latest-event subquery picks its row by ``MAX(id)``. These tests pin three things
   they still return, measured by running the OLD form and the NEW form on one seeded store;
 * the upgrade -- a store opened before the index existed gains it on its next open.
 
+``connection_metrics``' per-channel last-received read is a loose index scan (limb B): its plan
+seeks ``ix_messages_channel`` once per channel and never scans ``messages``, and the OLD
+``GROUP BY`` form and the new form give identical ``ConnectionMetrics``. The server schemas carry
+the same ``ix_messages_received`` (limb A).
+
 No row is deleted and no figure changes meaning; retention is out of scope here.
 """
 
 from __future__ import annotations
 
 import contextlib
+import math
 import random
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,7 +31,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.store.store import Stage
+from messagefoundry.store import store as sqlite_store
+from messagefoundry.store.store import _LAST_RECEIVED_SQL, Stage
 
 _INDEX = "ix_messages_received"
 
@@ -36,6 +44,11 @@ _OLD_LIST_SQL = (
     "  ORDER BY e.id DESC LIMIT 1) AS last_event"
     " FROM messages{where}"
     " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
+)
+
+# The per-channel last-received read exactly as it shipped before BACKLOG #1726 limb B.
+_OLD_LAST_RECEIVED_SQL = (
+    "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
 )
 
 _CHANNELS = ("IB_A", "IB_B", "IB_C")
@@ -287,24 +300,36 @@ async def test_list_messages_old_and_new_return_the_same_rows(
     assert last_events["m0004"] is None  # no events
 
 
+_WINDOWS = (
+    (0.0, 200.0, 60.0),
+    (140.0, 190.0, 30.0),
+    (1_000.0, 1_000.0, 60.0),  # since after every row: last_at must survive an empty since window
+    (120.0, 500.0, 1_000.0),
+)
+
+
+async def _metrics(store: MessageStore) -> list[Any]:
+    return [
+        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in _WINDOWS
+    ]
+
+
+async def _metrics_under(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, last_received_sql: str
+) -> list[Any]:
+    with monkeypatch.context() as m:
+        m.setattr(sqlite_store, "_LAST_RECEIVED_SQL", last_received_sql)
+        return await _metrics(store)
+
+
 async def test_connection_metrics_returns_every_figure_unchanged(store: MessageStore) -> None:
     """Every inbound and destination figure, with the new index and with it dropped, across since
-    and rate windows. The metrics SQL did not change, and today's planner picks the same plan in both
-    arms, so this guards the day a planner or a later edit starts using ix_messages_received there."""
+    and rate windows. Guards the day a planner or a later edit starts using ix_messages_received in
+    the metrics reads; the old-against-new SQL comparison for limb B is the next test."""
     await _seed(store)
-    windows = (
-        (0.0, 200.0, 60.0),
-        (140.0, 190.0, 30.0),
-        (1_000.0, 1_000.0, 60.0),  # since after every row
-        (120.0, 500.0, 1_000.0),
-    )
-    new = [
-        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in windows
-    ]
+    new = await _metrics(store)
     await _drop_index(store)
-    old = [
-        await store.connection_metrics(since=s, now=now, rate_window=rw) for s, now, rw in windows
-    ]
+    old = await _metrics(store)
     assert old == new
     # The seed reaches every figure, so the comparison is not vacuous.
     first = new[0]
@@ -320,6 +345,301 @@ async def test_connection_metrics_returns_every_figure_unchanged(store: MessageS
     assert any(d.last_done_at is not None for d in dests)
     # The since window moves the windowed counts, so the windows are distinct cases.
     assert new[1] != new[0]
+
+
+async def test_last_received_loose_scan_gives_the_old_connection_metrics(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limb B differential: ConnectionMetrics from the pre-#1726 GROUP BY and from the loose index
+    scan, on one store, across since and rate windows. Equal, and the seed makes last_at matter."""
+    # The empty store first: no channel at all, from either form.
+    empty_old = await _metrics_under(store, monkeypatch, _OLD_LAST_RECEIVED_SQL)
+    assert empty_old == await _metrics_under(store, monkeypatch, _LAST_RECEIVED_SQL)
+    assert all(not m.inbound for m in empty_old)
+    await _seed(store)
+    old = await _metrics_under(store, monkeypatch, _OLD_LAST_RECEIVED_SQL)
+    new = await _metrics_under(store, monkeypatch, _LAST_RECEIVED_SQL)
+    assert old == new
+    # Not vacuous: last_at is each channel's newest row, set even where the since window is empty.
+    late = new[2].inbound
+    assert all(m.read == 0 for m in late.values())
+    assert {c: m.last_at for c, m in late.items()} == {
+        **dict.fromkeys(_CHANNELS, 179.0),  # 240 rows, three per timestamp from 100.0
+        "IB_ONLY_CANCELLED": 50.0,
+    }
+    # Control: a form that reports a wrong last_at is caught by the same comparison.
+    wrong = _OLD_LAST_RECEIVED_SQL.replace("MAX(", "MIN(")
+    assert await _metrics_under(store, monkeypatch, wrong) != new
+
+
+async def test_last_received_read_seeks_the_channel_index_and_scans_no_messages(
+    store: MessageStore,
+) -> None:
+    await _seed(store, n=30)
+    plan = await _plan(store, _LAST_RECEIVED_SQL, ())
+    # "SCAN m" covers both the table name and the subqueries' alias.
+    assert not any(line.startswith("SCAN m") for line in plan), plan
+    assert not any("TEMP B-TREE" in line for line in plan), plan
+    # The hop to the next channel may seek either channel_id-leading index (ix_messages_control
+    # serves a MIN as well, and the planner's tie-break is not the property); the per-channel MAX
+    # needs received_at second, so only ix_messages_channel serves it.
+    assert any(
+        "USING COVERING INDEX ix_messages_" in line and "(channel_id>?)" in line for line in plan
+    ), plan
+    assert any(
+        "USING COVERING INDEX ix_messages_channel (channel_id=?)" in line for line in plan
+    ), plan
+    # Control: the old form reads the whole of messages (by index) rather than seeking it.
+    old_plan = await _plan(store, _OLD_LAST_RECEIVED_SQL, ())
+    assert any(line.startswith("SCAN messages") for line in old_plan), old_plan
+
+
+def _vm_steps(rows_per_channel: int, sql: str) -> int:
+    """SQLite VM instructions ``sql`` costs on a fresh store of 5 channels x ``rows_per_channel``.
+
+    The plan text cannot tell a MIN/MAX that stops at one index entry from one that walks the
+    channel's whole range (``MAX(x * 1)`` prints the same plan), so this counts the work instead."""
+    db = sqlite3.connect(":memory:")
+    try:
+        db.executescript(sqlite_store._SCHEMA)
+        db.executemany(
+            "INSERT INTO messages (id, channel_id, received_at, raw, status)"
+            " VALUES (?,?,?,'r','s')",
+            ((f"{c}-{i}", f"IB_{c}", float(i)) for c in range(5) for i in range(rows_per_channel)),
+        )
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        db.set_progress_handler(tick, 1)
+        db.execute(sql).fetchall()
+        db.set_progress_handler(None, 1)
+        return steps
+    finally:
+        db.close()
+
+
+def test_last_received_cost_follows_channels_not_rows() -> None:
+    """Limb B's claim, measured: 100 times the rows per channel costs the loose scan no more work,
+    while the old GROUP BY's cost grows with the rows (the control that the counter sees rows)."""
+    small, large = _vm_steps(20, _LAST_RECEIVED_SQL), _vm_steps(2_000, _LAST_RECEIVED_SQL)
+    assert large == small, (small, large)
+    old_small = _vm_steps(20, _OLD_LAST_RECEIVED_SQL)
+    old_large = _vm_steps(2_000, _OLD_LAST_RECEIVED_SQL)
+    assert old_large > 50 * old_small, (old_small, old_large)
+    # The mutant the plan test cannot see: an expression defeats the MIN/MAX optimisation.
+    mutant = _LAST_RECEIVED_SQL.replace("MAX(m.received_at)", "MAX(m.received_at * 1)")
+    assert _vm_steps(2_000, mutant) > 50 * _vm_steps(20, mutant)
+
+
+def test_server_schemas_carry_the_received_index() -> None:
+    """Limb A: Postgres and SQL Server build ix_messages_received as SQLite does. Each server
+    schema is content-hashed (ADR 0064), so adding the statement forces one full run on the next
+    open, where an existing server store gains the index. Postgres builds it in
+    _migrate_lease_columns, so _MIGRATION_REV carries it into the hash. Both modules import their
+    drivers lazily, so this runs with or without the server extras installed."""
+    from messagefoundry.store import postgres, sqlserver
+
+    ddl = f"CREATE INDEX IF NOT EXISTS {_INDEX} ON messages(received_at, id)"
+    assert ddl in sqlite_store._SCHEMA
+    assert ddl == postgres._RECEIVED_INDEX_DDL
+    [stmt] = [s for s in sqlserver._SCHEMA if f"'{_INDEX}'" in s]
+    assert f"IF INDEXPROPERTY(OBJECT_ID('messages'),'{_INDEX}','IndexID') IS NULL" in stmt
+    assert f"CREATE INDEX {_INDEX} ON messages(received_at, id)" in stmt
+
+
+class _RecordingPgConn:
+    """Enough of an asyncpg connection for ``_migrate_lease_columns``: every catalog read returns
+    no rows, and every execute is recorded with the timeout it was given."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, object]] = []
+        self.args: list[tuple[object, ...]] = []  # each execute's bind arguments, in step
+
+    async def fetch(self, sql: str, *args: object) -> list[Any]:
+        return []
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        self.executed.append((sql, timeout))
+        self.args.append(args)
+        return ""
+
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        self.executed.append(("BEGIN", None))
+        self.args.append(())
+        yield
+        self.executed.append(("COMMIT", None))
+        self.args.append(())
+
+
+async def test_postgres_received_index_build_is_exempt_from_the_client_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build passes ``timeout=inf`` and stays out of the generic ``_SCHEMA`` loop, which passes
+    none; ``postgres._RECEIVED_INDEX_DDL`` says why."""
+    from messagefoundry.store import postgres
+
+    assert postgres._RECEIVED_INDEX_DDL not in postgres._SCHEMA
+    conn = _RecordingPgConn()
+    # The method reads nothing off self, so an uninitialised instance stands in for an open store.
+    await postgres.PostgresStore.__new__(postgres.PostgresStore)._migrate_lease_columns(conn)
+    timeouts = [t for sql, t in conn.executed if sql == postgres._RECEIVED_INDEX_DDL]
+    assert timeouts == [math.inf]
+    # The _SCHEMA text is unchanged by #1726, so only the revision bump to 7 moves the hash: a store
+    # whose marker records revision 6 must take the full run, or it skips the build above.
+    current = postgres._schema_hash()
+    monkeypatch.setattr(postgres, "_MIGRATION_REV", 6)
+    assert postgres._schema_hash() != current
+    monkeypatch.undo()
+    # Control: the FIFO rebuild this mirrors is seen the same way, so the recorder reads kwargs.
+    fifo = [t for sql, t in conn.executed if "ix_queue_fifo_in_seq" in sql]
+    assert fifo == [math.inf]
+
+
+def _pg_schema_store(
+    conn: _RecordingPgConn,
+    *,
+    schema_lock_timeout: float | None = None,
+    peer_applied: bool = True,
+) -> Any:
+    """A PostgresStore whose _ensure_schema runs against ``conn``: the marker reads stale before
+    the schema lock and, with ``peer_applied``, current once it is held, as if a peer engine shard
+    committed the batch. Without it the open runs the batch itself."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import SchemaManagement, StoreSettings
+    from messagefoundry.store import postgres
+
+    store = postgres.PostgresStore.__new__(postgres.PostgresStore)
+    store._settings = SimpleNamespace(  # type: ignore[assignment]
+        db_schema=None,
+        resolved_schema_management=lambda: SchemaManagement.AUTO,
+        schema_lock_timeout=(
+            StoreSettings().schema_lock_timeout
+            if schema_lock_timeout is None
+            else schema_lock_timeout
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _acquire(*, record: bool = True) -> AsyncIterator[Any]:
+        yield conn
+
+    reads = iter([False, peer_applied])
+
+    async def _marker_current(_conn: Any, _expected: str) -> bool:
+        return next(reads)
+
+    store._timed_acquire = _acquire  # type: ignore[method-assign]
+    store._schema_marker_current = _marker_current  # type: ignore[method-assign,assignment]
+    return store
+
+
+async def test_postgres_schema_lock_wait_takes_the_schema_lock_timeout() -> None:
+    """A peer engine shard waiting on the schema lock waits ``[store].schema_lock_timeout`` (default
+    600 s), not ``command_timeout``; ``PostgresStore._ensure_schema`` says why. Red before the fix:
+    the lock call passed no timeout, so asyncpg applied ``command_timeout`` to the wait (and then
+    ``inf``, unbounded)."""
+    from messagefoundry.config.settings import StoreSettings
+
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn)
+
+    assert await store._ensure_schema() is False  # the peer applied the batch
+    sqls = [sql for sql, _ in conn.executed]
+    [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
+    assert StoreSettings().schema_lock_timeout == 600.0
+    assert conn.executed[lock][1] == 600.0
+    # The server-side statement_timeout is lifted first, in the same transaction.
+    assert sqls.index("BEGIN") < sqls.index("SET LOCAL statement_timeout = 0") < lock
+    assert lock < sqls.index("COMMIT")
+    # Control: a lock with no override keeps the pool's command_timeout (no timeout passed).
+    await store._advisory_lock(conn, 1, "finalize:m1")
+    assert conn.executed[-1] == ("SELECT pg_advisory_xact_lock($1, hashtext($2))", None)
+
+
+async def test_postgres_custom_schema_lock_timeout_reaches_the_lock_wait() -> None:
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=12.5)
+
+    await store._ensure_schema()
+
+    assert [t for sql, t in conn.executed if "pg_advisory_xact_lock" in sql] == [12.5]
+
+
+class _TimingOutLockConn(_RecordingPgConn):
+    """asyncpg raises ``TimeoutError`` when a statement's client timeout elapses."""
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        await super().execute(sql, *args, timeout=timeout)
+        if "pg_advisory_xact_lock" in sql:
+            raise TimeoutError
+        return ""
+
+
+async def test_postgres_schema_lock_expiry_names_the_lock_and_the_setting() -> None:
+    """On expiry the open raises the store's own error naming the lock and
+    ``[store].schema_lock_timeout``, not a bare ``TimeoutError``, and its transaction runs no DDL."""
+    from messagefoundry.store.base import SchemaLockTimeout
+
+    conn = _TimingOutLockConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=45)
+
+    with pytest.raises(SchemaLockTimeout) as info:
+        await store._ensure_schema()
+
+    message = str(info.value)
+    assert "'public:mefor_schema_init'" in message
+    assert "45 s" in message
+    assert "[store].schema_lock_timeout" in message
+    assert "engine shard" in message
+    assert isinstance(info.value.__cause__, TimeoutError)
+    assert not isinstance(info.value, TimeoutError)
+    sqls = [sql for sql, _ in conn.executed]
+    assert "pg_advisory_xact_lock" in sqls[-1]  # nothing ran after the refused lock
+    assert "COMMIT" not in sqls
+
+
+async def test_postgres_network_timeout_during_the_lock_wait_is_not_renamed() -> None:
+    """An OS-level ETIMEDOUT is also a ``TimeoutError``, but it is a network fault: it must not be
+    reported as the schema lock having waited out ``[store].schema_lock_timeout``."""
+    import errno
+
+    class _NetworkTimeoutConn(_RecordingPgConn):
+        async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+            await super().execute(sql, *args, timeout=timeout)
+            if "pg_advisory_xact_lock" in sql:
+                raise TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+            return ""
+
+    store = _pg_schema_store(_NetworkTimeoutConn())
+
+    with pytest.raises(TimeoutError) as info:
+        await store._ensure_schema()
+
+    assert info.value.errno == errno.ETIMEDOUT
+
+
+@pytest.mark.parametrize("value", [0, -1, math.inf, math.nan, 2_147_484.0])
+def test_schema_lock_timeout_refuses_an_unbounded_or_empty_wait(value: float) -> None:
+    """Past the ceiling, SQL Server's @LockTimeout could not carry the value, so the two backends
+    would wait different times for one setting."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.sqlserver import _APPLOCK_MAX_TIMEOUT_MS, _schema_applock_timeout_ms
+
+    with pytest.raises(
+        ValidationError, match="schema_lock_timeout must be > 0 and at most 2147483 s"
+    ):
+        StoreSettings(schema_lock_timeout=value)
+    assert StoreSettings(schema_lock_timeout=30).schema_lock_timeout == 30.0  # control
+    ceiling = StoreSettings(schema_lock_timeout=2_147_483).schema_lock_timeout
+    assert _schema_applock_timeout_ms(ceiling) < _APPLOCK_MAX_TIMEOUT_MS  # carried, not clamped
 
 
 # --- upgrade ---------------------------------------------------------------------------------------
@@ -341,3 +661,122 @@ async def test_an_existing_store_gains_the_index_on_its_next_open(tmp_path: Path
         assert len(rows) == 11
     finally:
         await s.close()
+
+
+async def test_postgres_holder_bounds_its_ddl_lock_waits_after_the_advisory_lock() -> None:
+    """BACKLOG #1726: the open holding the schema lock bounds each DDL statement's own lock wait by
+    ``[store].schema_lock_timeout`` with ``SET LOCAL lock_timeout`` (ms), issued after the advisory
+    lock (whose wait keeps its client-side bound) and before the first DDL statement. Red on
+    00bcb661e6: the builds ran with statement_timeout 0 and no lock_timeout, so a build queued behind
+    an open transaction on its table waited forever while holding the schema lock."""
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=45, peer_applied=False)
+
+    assert await store._ensure_schema() is True
+    sqls = [sql for sql, _ in conn.executed]
+    [lock] = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
+    [bound] = [i for i, sql in enumerate(sqls) if sql == postgres._DDL_LOCK_TIMEOUT_SQL]
+    assert conn.args[bound] == (45_000,)
+    first_ddl = sqls.index(postgres._SCHEMA[0])
+    assert lock < bound < first_ddl < sqls.index("COMMIT")
+    # The builds _migrate_lease_columns runs come after it too.
+    assert bound < sqls.index(postgres._RECEIVED_INDEX_DDL)
+    # Transaction-local, and it keeps a stricter session setting rather than raising it.
+    ddl_bound = postgres._DDL_LOCK_TIMEOUT_SQL
+    assert "set_config('lock_timeout'," in ddl_bound and ddl_bound.count(", true)") == 1
+    assert "s.setting::bigint > 0 AND s.setting::bigint < $1::bigint" in ddl_bound
+
+
+async def test_postgres_fractional_schema_lock_timeout_rounds_the_ddl_bound_up() -> None:
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    store = _pg_schema_store(conn, schema_lock_timeout=0.0001, peer_applied=False)
+
+    await store._ensure_schema()
+
+    sqls = [sql for sql, _ in conn.executed]
+    [bound] = [i for i, sql in enumerate(sqls) if sql == postgres._DDL_LOCK_TIMEOUT_SQL]
+    assert conn.args[bound] == (1,)  # never 0, which would mean no limit
+
+
+async def test_postgres_open_a_peer_already_served_sets_no_ddl_bound() -> None:
+    """The bound is set only once the double-check under the lock finds DDL to run."""
+    from messagefoundry.store import postgres
+
+    conn = _RecordingPgConn()
+    assert await _pg_schema_store(conn)._ensure_schema() is False
+    assert postgres._DDL_LOCK_TIMEOUT_SQL not in [sql for sql, _ in conn.executed]
+
+
+class _PgLockNotAvailable(Exception):
+    """What asyncpg raises when a statement waits out lock_timeout: LockNotAvailableError carries
+    SQLSTATE 55P03 on ``sqlstate``."""
+
+    sqlstate = "55P03"
+
+
+class _DdlFailingConn(_RecordingPgConn):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+        await super().execute(sql, *args, timeout=timeout)
+        if sql.lstrip().upper().startswith("CREATE"):
+            raise self._exc
+        return ""
+
+
+async def test_postgres_ddl_lock_wait_expiry_names_the_setting() -> None:
+    """A DDL statement that waits out the bound (asyncpg LockNotAvailableError, 55P03) becomes the
+    store's own error naming the lock and ``[store].schema_lock_timeout``; the transaction rolls
+    back with nothing committed. Control: any other database error propagates unchanged."""
+    from messagefoundry.store.base import SchemaDdlLockTimeout, SchemaLockTimeout
+
+    failure = _PgLockNotAvailable("canceling statement due to lock timeout")
+    conn = _DdlFailingConn(failure)
+    store = _pg_schema_store(conn, schema_lock_timeout=45, peer_applied=False)
+
+    with pytest.raises(SchemaDdlLockTimeout) as info:
+        await store._ensure_schema()
+
+    assert isinstance(info.value, SchemaLockTimeout)  # a SchemaLockTimeout handler catches it
+    assert info.value.__cause__ is failure
+    message = str(info.value)
+    assert "'public:mefor_schema_init'" in message
+    assert "DDL statement" in message
+    assert "45 s" in message
+    assert "own lock_timeout, if that is stricter" in message  # the kept server bound may fire
+    assert "[store].schema_lock_timeout" in message
+    assert "engine shard" in message
+    assert "COMMIT" not in [sql for sql, _ in conn.executed]
+
+    class _OtherError(Exception):
+        sqlstate = "42P07"
+
+    other = _OtherError("duplicate_table")
+    store = _pg_schema_store(_DdlFailingConn(other), peer_applied=False)
+    with pytest.raises(_OtherError) as raw:
+        await store._ensure_schema()
+    assert raw.value is other
+
+
+async def test_postgres_server_lock_timeout_on_the_advisory_wait_is_not_renamed() -> None:
+    """A role- or database-configured lock_timeout that ends the advisory wait (55P03) propagates
+    as the driver error: SchemaLockTimeout would name schema_lock_timeout, a bound that did not
+    fire and that raising cannot help."""
+    from messagefoundry.store.base import SchemaLockTimeout
+
+    class _LockConn(_RecordingPgConn):
+        async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
+            await super().execute(sql, *args, timeout=timeout)
+            if "pg_advisory_xact_lock" in sql:
+                raise _PgLockNotAvailable("canceling statement due to lock timeout")
+            return ""
+
+    with pytest.raises(_PgLockNotAvailable) as info:
+        await _pg_schema_store(_LockConn(), schema_lock_timeout=45)._ensure_schema()
+    assert not isinstance(info.value, SchemaLockTimeout)

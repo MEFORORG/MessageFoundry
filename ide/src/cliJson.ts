@@ -8,8 +8,10 @@
 // the CLI wrote. Two paths used to quote it:
 //   * stdout that is not JSON. The CLI runs config modules in its own process, so a print() in one
 //     can write to stdout ahead of the JSON. JSON.parse then fails, and V8's message quotes the
-//     start of the text, which is whatever that print wrote. (`dryrun` now sends an author's print
-//     to stderr; `validate` and `graph`, which also import config modules, do not.)
+//     start of the text, which is whatever that print wrote. (Every subcommand but `serve` and
+//     `supervise` now sends an author's print to stderr: `messagefoundry/author_output.py`, vault
+//     BACKLOG #3474. At least an engine older than that change, and author code that writes to
+//     `sys.__stdout__` or file descriptor 1 directly, can still put text there, so this path stays.)
 //   * empty stdout. The message used to be the CLI's stderr, which can carry a traceback or a
 //     warning quoting a value.
 // Either text stays out of the message. It is not logged either: the extension's output channels are

@@ -28,7 +28,9 @@ the readers of those settings go through. The design is ADR 0214.
 reading in :mod:`messagefoundry.serviceenv` still names a non-key secret and does not refuse it);
 create the directory (no installer does yet); wrap a file with DPAPI (a plain file restricted by
 its access list is the control, and whether a Windows file is also wrapped waits on a spike); and
-read a variable a library reads for itself, such as ``VAULT_TOKEN`` or ``PGPASSWORD``.
+read a variable a library reads for itself, such as ``PGPASSWORD``. (The Vault clients read no
+``VAULT_TOKEN`` at all, BACKLOG #2851: their token is ``MEFOR_*_VAULT_TOKEN``, from here or the
+environment.)
 
 Messages here name settings and file names, never a value.
 """

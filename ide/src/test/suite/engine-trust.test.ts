@@ -341,12 +341,21 @@ suite("the registered anchor reaches the TLS layer", () => {
     restoreAnchors();
   });
 
-  test("with no anchor registered the request carries only the floor and the suite pin", () => {
-    // BACKLOG #300 added `ciphers`; the anchor is still absent, which is what this test is about.
+  test("with no anchor registered the request carries only the floors and the suite pin", () => {
+    // BACKLOG #300 added `ciphers` and `minDHSize`; the anchor is still absent, which is what this
+    // test is about.
     assert.deepStrictEqual(tlsOptions(new URL("https://127.0.0.1:8765")), {
       minVersion: "TLSv1.2",
       ciphers: TLS_CIPHERS,
+      minDHSize: 2048,
     });
+  });
+
+  test("a registered anchor keeps the 2048-bit Diffie-Hellman group floor (BACKLOG #300)", () => {
+    setEngineTrustAnchor("https://127.0.0.1:8765", PEM);
+    const opts = tlsOptions(new URL("https://127.0.0.1:8765"));
+    assert.strictEqual(opts.ca, PEM, "the anchor branch was not taken — the test proves nothing");
+    assert.strictEqual(opts.minDHSize, 2048);
   });
 
   test("the suite pin is the approved AEAD list and carries no CBC suite (BACKLOG #300)", () => {

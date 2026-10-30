@@ -930,27 +930,55 @@ def reseal_rotation_fingerprints(
     return updates
 
 
-def _derive_body_digest_key(audit_key: bytes) -> bytes:
-    """The body-digest key derived from one audit-chain key, under its own label."""
+def _derive_from_audit_key(audit_key: bytes, info: bytes) -> bytes:
+    """A 32-byte key HKDF-SHA256 derives from one audit-chain key under the label ``info``. Callers
+    go through a named wrapper, so no call site can pick up another digest's label by omission."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=_BODY_DIGEST_INFO
-    )
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=info)
     return hkdf.derive(audit_key)
 
 
-def _body_mac(key: bytes, body: str) -> HMAC:
-    """An HMAC-SHA256 context over ``body``, ready to finalize or verify. The ``cryptography`` HMAC
+def _derive_body_digest_key(audit_key: bytes) -> bytes:
+    """The body-digest key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _BODY_DIGEST_INFO)
+
+
+def _mac_matches(mac: HMAC, digest: str) -> bool | None:
+    """Whether ``mac`` matches the hex ``digest``, compared in constant time; ``None`` when
+    ``digest`` is not the hex of one HMAC-SHA256 output, so a corrupt or cut record reads as
+    "could not check", never as a mismatch."""
+    try:
+        expected = bytes.fromhex(digest)
+    except ValueError:
+        return None
+    if len(expected) != hashlib.sha256().digest_size:
+        return None
+    from cryptography.exceptions import InvalidSignature
+
+    try:
+        mac.verify(expected)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def _bytes_mac(key: bytes, data: bytes) -> HMAC:
+    """An HMAC-SHA256 context over ``data``, ready to finalize or verify. The ``cryptography`` HMAC
     this module already uses for HKDF, so its ``verify`` gives the constant-time compare."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives import hmac as crypto_hmac
 
     mac = crypto_hmac.HMAC(key, hashes.SHA256())
-    # surrogatepass: a body decoded with surrogateescape still digests, rather than raising here.
-    mac.update(body.encode("utf-8", "surrogatepass"))
+    mac.update(data)
     return mac
+
+
+def _body_mac(key: bytes, body: str) -> HMAC:
+    """:func:`_bytes_mac` over ``body``'s UTF-8."""
+    # surrogatepass: a body decoded with surrogateescape still digests, rather than raising here.
+    return _bytes_mac(key, body.encode("utf-8", "surrogatepass"))
 
 
 def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None] | None:
@@ -1022,17 +1050,69 @@ def verify_audit_body_digest(
     audit_key = cipher.audit_mac_keyring().get(key_id)
     if audit_key is None or not body or not isinstance(digest, str):
         return False
-    try:
-        expected = bytes.fromhex(digest)
-    except ValueError:
-        return False
-    from cryptography.exceptions import InvalidSignature
+    return _mac_matches(_body_mac(_derive_body_digest_key(audit_key), body), digest) is True
 
-    try:
-        _body_mac(_derive_body_digest_key(audit_key), body).verify(expected)
-    except InvalidSignature:
-        return False
-    return True
+
+# HKDF info label for the refused-body digest key (vault BACKLOG #2608). Its own label, not the
+# edit-resend one: this digest is over the received BYTES and that one over the stored TEXT, so a
+# match between the two would claim an equality of bodies it never checked.
+_REFUSED_BODY_DIGEST_INFO = b"mefor/refused-body-digest/v1"
+#: The two HKDF-SHA256 steps a refused-body digest key takes from the DEK, as its record names them.
+REFUSED_BODY_DIGEST_KDF = (
+    AUDIT_SCHEME_IN_HEAP.kdf + ",hkdf-sha256:" + _REFUSED_BODY_DIGEST_INFO.decode("ascii")
+)
+
+
+def _derive_refused_body_digest_key(audit_key: bytes) -> bytes:
+    """The refused-body digest key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _REFUSED_BODY_DIGEST_INFO)
+
+
+def refused_body_digest(cipher: Cipher, wire: bytes) -> dict[str, str] | None:
+    """A keyed digest of a body the listener refused before ingress, exactly as received (vault
+    BACKLOG #2608). When the engine records it, and why it is keyed, is stated once in
+    docs/CONFIGURATION.md under ``[inbound].refused_body_allowance_bytes``.
+
+    Returns ``{"alg", "kdf", "key_id", "digest"}``: HMAC-SHA256 under a key HKDF-SHA256 derives from
+    the in-heap audit-chain key under ``mefor/refused-body-digest/v1``, and :func:`audit_key_id` of
+    that audit key, so :func:`verify_refused_body_digest` still finds it after a rotation while the
+    retired key stays configured. Returns ``None`` when there is no in-heap key: a keyless store, or
+    a Vault Transit cipher whose audit key never enters the engine. An empty body digests like any
+    other, since it is what came in."""
+    audit_key = cipher.audit_mac_key()
+    if audit_key is None:
+        return None
+    return {
+        "alg": BODY_DIGEST_ALG,
+        "kdf": REFUSED_BODY_DIGEST_KDF,
+        "key_id": audit_key_id(audit_key),
+        "digest": _bytes_mac(_derive_refused_body_digest_key(audit_key), wire).finalize().hex(),
+    }
+
+
+def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> bool | None:
+    """Whether ``wire`` is the body a :func:`refused_body_digest` ``record`` was taken of (vault
+    BACKLOG #2608), compared in constant time.
+
+    ``record`` may be the ``body_hmac`` dict or the whole refused-body record that holds it.
+    ``True`` for a match and ``False`` for a mismatch. ``None`` when it cannot be checked, so a
+    caller never reads "unknown" as "not this body": ``record`` is not such a dict (a ``null``
+    ``body_hmac`` included), it names another scheme, its digest is not one HMAC-SHA256 output in
+    hex, or its audit key is not in the cipher's keyring, as after the retired key is dropped from
+    configuration, and always on a keyless cipher."""
+    if isinstance(record, dict) and "body_hmac" in record:
+        record = record["body_hmac"]
+    if not isinstance(record, dict):
+        return None
+    if (record.get("alg"), record.get("kdf")) != (BODY_DIGEST_ALG, REFUSED_BODY_DIGEST_KDF):
+        return None
+    key_id, digest = record.get("key_id"), record.get("digest")
+    if not isinstance(key_id, str) or not isinstance(digest, str):
+        return None
+    audit_key = cipher.audit_mac_keyring().get(key_id)
+    if audit_key is None:
+        return None
+    return _mac_matches(_bytes_mac(_derive_refused_body_digest_key(audit_key), wire), digest)
 
 
 def new_store_salt() -> bytes:

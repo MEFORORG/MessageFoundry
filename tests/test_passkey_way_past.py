@@ -13,8 +13,11 @@ here is real: the in-repo soft authenticator drives py_webauthn's own verify fun
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 import time
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,7 +38,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore  # noqa: E402
+from messagefoundry.store.store import MessageStore, PasskeyRowMalformed  # noqa: E402
 from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -44,12 +47,14 @@ ORIGIN = "http://t"
 _NEW_PASSWORD = "a-brand-new-chosen-passphrase-9"
 
 
-def _service(store: MessageStore, **settings: Any) -> AuthService:
+def _service(
+    store: MessageStore, *, way_past_rp_id: str | None = RP, **settings: Any
+) -> AuthService:
     """``require_mfa`` stays at its shipped default (on) unless an arm says otherwise, so the test
     administrator is covered by the requirement."""
     settings.setdefault("mfa_verify_min_elapsed_seconds", 0)
     settings.setdefault("login_rate_limit_enabled", False)
-    return AuthService(store, AuthSettings(**settings), way_past_rp_id=RP)
+    return AuthService(store, AuthSettings(**settings), way_past_rp_id=way_past_rp_id)
 
 
 async def _register(
@@ -441,6 +446,17 @@ async def _passkey_owner(
     return service, identity, password, auth
 
 
+async def _corrupt_passkey_rows(store: MessageStore, user_id: str, transports: str | bytes) -> None:
+    """Write a ``transports`` value into every passkey row of ``user_id`` that does not parse, as
+    a row written outside the store might hold. ``bytes`` are stored as TEXT that is not UTF-8,
+    which sqlite3 cannot decode while FETCHING the row, before any parse runs."""
+    cell = "CAST(? AS TEXT)" if isinstance(transports, bytes) else "?"
+    await store._db.execute(
+        f"UPDATE webauthn_credentials SET transports={cell} WHERE user_id=?", (transports, user_id)
+    )
+    await store._db.commit()
+
+
 def _proof(service: AuthService, auth: SoftAuthenticator) -> PasskeyProof:
     """Run the begin leg, then the browser's get() against what it staged."""
     begun = service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.10")
@@ -488,6 +504,29 @@ async def test_AC_A7_the_begin_leg_charges_the_sign_in_limiter_first() -> None:
         assert service.begin_passkey_sign_in(rp_id=RP, client="192.0.2.20") is None
         assert len(service._preauth_challenges) == 2
         assert not service.allow_login_attempt("192.0.2.20"), "the begin leg did not charge it"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("first", "other"), [("::ffff:192.0.2.40", "192.0.2.40"), ("192.0.2.40", "::ffff:192.0.2.40")]
+)
+async def test_the_begin_leg_charges_the_bucket_of_the_host_not_of_its_spelling(
+    first: str, other: str
+) -> None:
+    """BACKLOG #3764 item 3: a begin leg from either spelling charges the one bucket of the address,
+    and its staged hit still renews under that key. RED on the unfixed code: the begin leg keyed
+    each spelling apart, so the other spelling got a second budget."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store, login_rate_limit_enabled=True, login_rate_limit_per_ip=1)
+        begun = service.begin_passkey_sign_in(rp_id=RP, client=first)
+        assert begun is not None
+        assert service.begin_passkey_sign_in(rp_id=RP, client=other) is None
+        assert not service.allow_login_attempt(other), "the spellings drew two buckets"
+        taken = service.take_passkey_challenge(begun[0])
+        assert taken is not None and taken.paid, "the folded charge did not renew"
+        assert not service.allow_login_attempt(first), "the renewal freed the bucket"
     finally:
         await store.close()
 
@@ -1235,6 +1274,9 @@ async def test_the_escalation_rule_cannot_be_omitted() -> None:
     try:
         param = inspect.signature(store.increment_login_failure).parameters["totp_usable"]
         assert param.default is inspect.Parameter.empty
+        # BACKLOG #3937 item 8: the passkey rule is required the same way.
+        param = inspect.signature(store.increment_login_failure).parameters["passkey_escalates"]
+        assert param.default is inspect.Parameter.empty
         with pytest.raises(TypeError, match="totp_usable"):
             await store.increment_login_failure(  # type: ignore[call-arg]
                 "nobody",
@@ -1253,6 +1295,7 @@ async def test_the_escalation_rule_cannot_be_omitted() -> None:
                 lockout_seconds=900.0,
                 max_lockout_seconds=86_400.0,
                 totp_usable=none,
+                passkey_escalates=None,
             )
     finally:
         await store.close()
@@ -1772,5 +1815,263 @@ async def test_with_no_configured_rp_id_the_last_discoverable_passkey_still_need
         assert await gate.delete_webauthn_credential(
             identity, by_label["resident"].credential_id_hash
         )
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3937 item 8: the sign-in lock escalates beside a discoverable passkey ---------------
+
+
+async def _two_sign_in_cycles(service: AuthService, user_id: str) -> float:
+    """Lock the sign-in counter twice through the service's failure seam; return the second lock's
+    length."""
+    user = await service._load_user(user_id)
+    assert user is not None
+    start = 1_000_000.0
+    for cycle in range(2):
+        at = start + cycle * 10_000.0
+        for i in range(_LOCK_THRESHOLD):
+            await service._register_failure(user, at + i, counter="sign_in")
+    row = await service._store.get_user(user_id)
+    assert row is not None and row.locked_until is not None and row.lock_cycles == 2
+    return float(row.locked_until - (start + 10_000.0 + _LOCK_THRESHOLD - 1))
+
+
+@pytest.mark.parametrize(
+    ("configured", "escalates"), [(RP, True), (None, False), ("elsewhere.example", False)]
+)
+async def test_the_sign_in_lock_escalates_beside_a_discoverable_passkey(
+    configured: str | None, escalates: bool
+) -> None:
+    """A passkey-only account's sign-in lock doubles per cycle as a TOTP account's does, because
+    the combined passkey sign-in passes it. Only a passkey under the configured relying party
+    counts, the factor-drop gates' rule: one under another relying party, or any passkey where none
+    is configured, may not sign the owner in, so its lock keeps the fixed length."""
+    store = await MessageStore.open(":memory:")
+    try:
+        _, identity, _, _ = await _passkey_owner(store)
+        service = _lock_service(store, way_past_rp_id=configured)
+        length = await _two_sign_in_cycles(service, identity.user_id)
+        assert length == (1800.0 if escalates else 900.0), length
+    finally:
+        await store.close()
+
+
+async def test_a_password_only_account_keeps_the_fixed_sign_in_lock() -> None:
+    """The control: no TOTP and no passkey, so no way past, and the second lock is the base."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _lock_service(store)
+        identity, _token, _ = await login_admin(service)
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+    finally:
+        await store.close()
+
+
+async def test_without_the_webauthn_extra_a_passkey_does_not_escalate_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the extra no passkey can sign in, so none is a way past, and the lock keeps the
+    fixed length beside one."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _, _ = await _passkey_owner(store)
+        monkeypatch.setattr(wa, "available", lambda: False)
+        assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+    finally:
+        await store.close()
+
+
+#: ``transports`` values that do not parse: not JSON, JSON but no list (a scalar, and a string
+#: that would iterate as characters, and ``null``), and JSON nested past the recursion limit.
+_UNPARSEABLE_TRANSPORTS = ["not json", "5", '"usb"', "null", "[" * 100_000]
+
+
+@pytest.mark.parametrize(
+    "transports",
+    [*_UNPARSEABLE_TRANSPORTS, b"\xff"],
+    ids=["text", "5", "str", "null", "deep", "not-utf8"],
+)
+async def test_an_unreadable_passkey_row_counts_the_failure_at_the_fixed_length(
+    transports: str | bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The escalation reads the passkey set inside the count's own transaction. A row that does not
+    parse, or one the driver cannot even fetch (``not-utf8``), must not roll the count back, or the
+    account would never lock. Every failure counts and the lock arms on every cycle, at the fixed
+    length: a passkey that cannot be read signs nobody in, so it is no way past and does not
+    escalate (BACKLOG #3937 item 8). The owner's passkey is discoverable, so a corruption that did
+    not land would escalate and fail this. A warning names the account and carries none of the
+    cell. RED when: the fetch error escapes the increment, or the unreadable set escalates."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _, _ = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, transports)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+            assert await _two_sign_in_cycles(service, identity.user_id) == 900.0
+        warned = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and identity.user_id in r.getMessage()
+            and "could not be read" in r.getMessage()
+        ]
+        assert warned, "the escalation logged no warning naming the account"
+        # The whole message, so any trace of the cell, ASCII or not, fails it.
+        allowed = {
+            f"the passkeys of user {identity.user_id} could not be read ({failure}); its sign-in"
+            " lock keeps its fixed length"
+            for failure in ("PasskeyRowMalformed", "OperationalError")
+        }
+        assert set(warned) <= allowed, warned
+    finally:
+        await store.close()
+
+
+def _real_sqlite_decode_failure() -> sqlite3.OperationalError:
+    """The error sqlite3 itself raises fetching a TEXT cell that is not UTF-8, so the classifier
+    is tested against the stdlib's own message rather than a copy of the prefix it matches."""
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("SELECT CAST(X'FF' AS TEXT)").fetchall()
+    except sqlite3.OperationalError as exc:
+        return exc
+    finally:
+        db.close()
+    raise AssertionError("sqlite3 decoded a cell that is not UTF-8")
+
+
+@pytest.mark.parametrize(
+    ("error", "unreadable"),
+    [
+        (_real_sqlite_decode_failure(), True),
+        (UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate"), True),
+        (PasskeyRowMalformed("JSONDecodeError"), True),
+        (sqlite3.OperationalError("database is locked"), False),
+        (sqlite3.DatabaseError("disk I/O error"), False),
+        (ValueError("a driver value error that is no decode failure"), False),
+        (RuntimeError("anything else"), False),
+    ],
+    ids=[
+        "sqlite-decode",
+        "driver-decode",
+        "parse",
+        "sqlite-locked",
+        "sqlite-io",
+        "value",
+        "other",
+    ],
+)
+async def test_only_a_decode_or_parse_failure_is_survived_rather_than_rolling_back(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, unreadable: bool
+) -> None:
+    """The escalation's passkey read catches only what says the SET cannot be read: a cell the
+    driver cannot decode while fetching, told apart by type or, for sqlite3, by message. Every
+    other driver error still raises and rolls the failure's write back as any write failure does,
+    rather than being swallowed into the fixed length. RED when: the catch widens to every
+    ``OperationalError``, or misses the decode one."""
+    from messagefoundry.store import store as store_mod
+
+    monkeypatch.setattr(store_mod, "sets_a_later_sign_in_lock", lambda *a: True)
+
+    async def read_record() -> Any:
+        return types.SimpleNamespace(row=types.SimpleNamespace(id="u1"))
+
+    async def read_passkeys() -> list[Any]:
+        raise error
+
+    call = store_mod.escalation_passkeys(
+        "sign_in",
+        passkey_escalates=store_mod.passkey_is_way_past,
+        threshold=3,
+        now=1.0,
+        read_record=read_record,
+        read_passkeys=read_passkeys,
+    )
+    if unreadable:
+        # The gates above are forced open, so None here can only be the survived read.
+        assert await call is None
+    else:
+        with pytest.raises(type(error)):
+            await call
+
+
+@pytest.mark.parametrize("malformed", ["not json", "5"])
+async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_the_login_route(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, malformed: str
+) -> None:
+    """The real sign-in route, not the failure seam alone. The failure that sets the lock also
+    writes the lock notice, which asks whether the account holds a discoverable passkey. A passkey
+    row that does not parse must leave that the 401 every wrong password gets, never a 500 that
+    would name the account as one holding a passkey. The failure is still counted: the lock arms,
+    and a warning names the account. ``5`` parses as JSON but is no list,
+    the TypeError arm. RED when: the notice's passkey read lets the parse error out."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    engine = await Engine.create(
+        tmp_path / "pk.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        store = engine.store
+        assert isinstance(store, MessageStore)
+        service, identity, password, _ = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, malformed)
+        transport = httpx.ASGITransport(
+            app=create_app(engine, auth=service), raise_app_exceptions=False
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            for _ in range(_LOCK_THRESHOLD):
+                r = await c.post(
+                    "/auth/login",
+                    json={"username": identity.username, "password": "wrong-" + password},
+                )
+                assert r.status_code == 401, (r.status_code, r.text)
+                assert r.json() == {"detail": "invalid credentials"}
+        row = await engine.store.get_user(identity.user_id)
+        assert row is not None and row.locked_until is not None, "the failure was not counted"
+        assert row.lock_cycles == 1 and row.failed_attempts == _LOCK_THRESHOLD
+        assert any(
+            identity.user_id in rec.getMessage() and rec.levelname == "WARNING"
+            for rec in caplog.records
+        ), "no warning named the account"
+    finally:
+        await engine.stop()
+
+
+async def test_a_passkey_row_that_does_not_parse_refuses_the_combined_passkey_sign_in() -> None:
+    """The combined passkey sign-in reads the account's set before it verifies anything. A row that
+    does not parse leaves no passkey to sign in with, so the request is the password sign-in: the
+    assertion satisfies nothing and the session still owes its second factor, and under a live
+    sign-in lock it is refused like any other. Never raised. RED when: the set read lets the parse
+    error out."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert out.ok and out.mfa_required is True, "the unreadable passkey satisfied a factor"
+        await _set_sign_in_lock(store, identity.user_id)
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok and out.token is None, "the lock was passed"
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census() -> None:
+    """The census reads every account's passkeys. A row that does not parse counts for nothing, so
+    the account is named as having no way past, and the census still runs for every other account.
+    RED when: the parse error escapes and the whole census is lost."""
+    store = await MessageStore.open(":memory:")
+    try:
+        _, identity, _, _ = await _passkey_owner(store)
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.no_way_past == (identity.username,)
+        assert census.passkey_only == ()
     finally:
         await store.close()

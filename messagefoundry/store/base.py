@@ -153,6 +153,8 @@ __all__ = [
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
+    "SchemaDdlLockTimeout",
+    "SchemaLockTimeout",
     "SchemaNotProvisionedError",
     "SchemaProvisionResult",
     "StoreGrantsMissingError",
@@ -2008,6 +2010,7 @@ class AuditStore(Protocol):
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict: ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
@@ -2134,7 +2137,13 @@ class AuthStore(Protocol):
         ...
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
 
@@ -2143,6 +2152,14 @@ class AuthStore(Protocol):
         Returns ``True`` only when that row was updated. ``False`` means nothing was written: the
         row is gone, another caller changed its name first, or another row holds ``username``. The
         caller re-reads to tell those apart.
+
+        **``audits`` are appended only when the write lands, in its transaction (BACKLOG #3018
+        step 7).** So no rename commits without its row, and a write that matched nothing appends
+        none. Before this the caller wrote its row after the commit, and a failed write there left
+        a moved name with no row; the next refresh saw the new name and wrote nothing, so no row
+        ever followed. An append that fails rolls the rename back and raises
+        :class:`~messagefoundry.store.store.UsernameAuditAppendError`, whose ``cause`` is the
+        append's own error, so a caller can tell it from an integrity error the UPDATE raised.
 
         Two refreshes of one row can run at once, a sign-in and a reconciler pass. Both read the old
         name, so without the compare both would write, and both would audit and notify one rename.
@@ -2468,7 +2485,9 @@ class AuthStore(Protocol):
     # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
     # reads ``auth_provider`` for whether the lock escalates (``store.lockout_escalates``); for the
     # SIGN-IN lock the TOTP's usability is judged before the lock, on a cell the locked row must
-    # still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(attempts, just_locked,
+    # still hold (``store.escalation_verdict``, BACKLOG #3422), and a passkey the caller's
+    # ``passkey_escalates`` counts escalates it too, from the set read in the same transaction
+    # (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns ``(attempts, just_locked,
     # cycles)``; ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
     # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
     # policy.
@@ -2484,6 +2503,10 @@ class AuthStore(Protocol):
         # never None, so no caller can omit it and lose the refused-TOTP rule: the sign-in lock
         # keeps its fixed length only where it KNOWS the account's TOTP is refused.
         totp_usable: TotpUsable,
+        # BACKLOG #3937 item 8: which passkey makes the SIGN-IN lock escalate, asked of the set read
+        # in the increment's own transaction (``store.escalation_passkeys``). REQUIRED, as
+        # ``totp_usable`` is, so no caller loses it by omission; an explicit ``None`` counts none.
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement: ...
 
@@ -3357,6 +3380,55 @@ class StoreGrantsMissingError(RuntimeError):
     Raised at open under ``[store].schema_management = external`` so a missing row grant refuses the
     start instead of failing the first pipeline path that touches the object. ``provision-schema``
     cannot fix it: the grant is the DBA's."""
+
+
+class SchemaLockTimeout(RuntimeError):
+    """A server-DB store open did not get the schema lock within ``[store].schema_lock_timeout``
+    (BACKLOG #1726; docs/CONFIGURATION.md says why the wait has its own bound).
+
+    Raised inside the open's schema transaction, which then rolls back with nothing applied; a
+    later open retries the batch. Deliberately NOT a ``TimeoutError``, for the reason
+    :class:`StoreAcquireTimeout` gives."""
+
+    def __init__(self, backend: StoreBackend, lock: str, timeout: float) -> None:
+        self.backend = backend
+        self.lock = lock
+        self.timeout = timeout
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        return (
+            f"{self.backend.value}: the schema lock {self.lock!r} was not acquired within "
+            f"{self.timeout:.15g} s; another engine shard or cluster node may be migrating the store "
+            "schema. Start again once it finishes, or raise [store].schema_lock_timeout"
+        )
+
+
+class SchemaDdlLockTimeout(SchemaLockTimeout):
+    """The open HELD the schema lock, but one of its DDL statements did not get its own table lock
+    within ``[store].schema_lock_timeout`` (BACKLOG #1726).
+
+    The bound covers the lock wait only, never how long a build runs once it has its lock. Without
+    it, a ``CREATE INDEX`` or ``ALTER`` queued behind any open transaction on a store table waits
+    forever while holding the schema lock, and on Postgres its queued lock request also blocks every
+    later write to that table. Raised inside the schema transaction, which then rolls back with
+    nothing applied; a later open retries the batch. A subclass, so a caller that handles
+    :class:`SchemaLockTimeout` handles this too."""
+
+    def _message(self) -> str:
+        # On Postgres a stricter role or database lock_timeout is kept, so it may be what fired.
+        stricter = (
+            " (or the role's or database's own lock_timeout, if that is stricter)"
+            if self.backend is StoreBackend.POSTGRES
+            else ""
+        )
+        return (
+            f"{self.backend.value}: holding the schema lock {self.lock!r}, a DDL statement did not "
+            f"get its table lock within {self.timeout:.15g} s{stricter}; an open transaction on a "
+            "store table, from another engine shard, cluster node or session, may be blocking it. "
+            "Nothing was applied. Start again once that transaction ends, or raise "
+            "[store].schema_lock_timeout"
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -770,6 +770,15 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/file.py::FileSource.__init__": Site(
         2, OPERATOR, "The operator's processed and error subdirectory settings."
     ),
+    "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
+        1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."
+    ),
+    "messagefoundry/transports/file.py::_prune_entries": Site(
+        1,
+        REVIEWED,
+        "A bare name from listing the archive directory the sweep opened through no link, joined "
+        "into that held directory; the Windows delete then opens it as itself, refusing a link.",
+    ),
     "messagefoundry/transports/file.py::_archive": Site(
         1,
         GUARDED,

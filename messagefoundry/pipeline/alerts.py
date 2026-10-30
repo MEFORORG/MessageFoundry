@@ -154,8 +154,8 @@ def crl_reload_refused_detail(
     ]
     if start_refuses:
         # "At least": the time is when one cause of a refusal ends, not a promise that a start
-        # loads the file then. A proven bad signature, or a private copy a start cannot make,
-        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
+        # loads the file then. A private copy a start cannot make, for one, still refuses after
+        # it (vault BACKLOG #3506).
         parts.append(
             "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."
@@ -211,8 +211,42 @@ class AlertSink(Protocol):
     """
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        """An outbound connection's delivery worker halted (``InternalErrorPolicy.STOP`` fired on an
-        internal/code error). The lane is frozen until an operator intervenes (fix + reload/restart)."""
+        """A connection is down until an operator intervenes (fix + reload/restart). At least: an
+        outbound delivery worker halted (``InternalErrorPolicy.STOP`` on an internal/code error, a
+        credential or configuration fault), an inbound's router or transform worker halted under the
+        same policy, a connection failed to build or bind at start (ADR 0031; ``detail`` starts
+        ``failed to start:``), or a log-write halt stopped it (#122). For a connection, ``name`` is
+        the bare connection name, whichever direction stopped. Some raises are not about a
+        connection and carry a prefixed stand-in instead, which no connection name can hold (the
+        name grammar has no colon): at least ``reference:<set>`` for a reference set that failed to
+        sync, ``fhir_lookup:<name>`` for a lookup that failed to build, and
+        ``cluster:transform-state`` for a state-convergence failure. ``detail`` says what stopped."""
+        ...
+
+    def connection_started(self, name: str) -> None:
+        """An operator started an inbound connection and it is up: its listener is bound, with no
+        open cause left on it or on an outbound of the same name (BACKLOG #1741).
+        The **inverse** of :meth:`connection_stopped`, as :meth:`connection_restored` is of
+        :meth:`connection_error`. Emits **no** notification; it exists so durable alert-state (ADR
+        0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
+        inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
+        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
+        bare inbound name, so it never resolves a prefixed stand-in instance. Only one door raises
+        it: an operator's start or restart of the inbound, including a start of an inbound that is
+        already listening. Every other start never does, at least the engine's own ``start()``, a
+        committed reload, a reload's rollback, the scheduler and every alert rule's
+        ``restart_inbound``. A fresh process cannot see an earlier run's causes, so an open stop
+        keeps its durable instance, ack and suspend across a service restart and a reload; the
+        cooldown and the escalation count are per-process memory, so a service restart resets
+        them whatever this event does. A rule-driven loop must keep counting, so a rule's restart
+        also keeps the cooldown and the count. On that door, at least these starts never raise it: an
+        outbound's own start; a start where the runner cannot see every cause (on a clustered node,
+        or on an engine shard that does not own the bare name as an outbound lane, even with no
+        outbound of that name in its own registry); and a start while the
+        outbound namesake is under an operator-style pause, which a log-write halt's pause looks
+        like. A park the engine or the calendar made of the outbound namesake does not hold it back.
+        ``RegistryRunner._emit_inbound_started`` holds the checks. ``name`` is the connection label
+        only (no PHI)."""
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
@@ -229,7 +263,9 @@ class AlertSink(Protocol):
         (auto-resolved on the next clean head via ADR-0044 durable state when wired). Distinct from
         :meth:`connection_stopped` (the ``stop``-policy terminal) so an operator can route a "still
         retrying, look at the dependency" signal apart from a halted lane. ``name`` is the stage-lane
-        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``."""
+        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``.
+        Under ``retry_forever`` it also fires for a serializer HOLDING its lane while the re-pend of
+        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach."""
         ...
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
@@ -899,9 +935,15 @@ class LoggingAlertSink:
     and queue shape are recorded, never a message body."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        log.warning(
-            "ALERT connection_stopped: outbound %r halted on internal error: %s", name, detail
-        )
+        # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
+        # a log-write halt raise this too (#1741). The detail names the cause, and on some paths the
+        # direction; a dual-role name's log-write halt logs two lines that do not say which half.
+        log.warning("ALERT connection_stopped: connection %r stopped: %s", name, detail)
+
+    def connection_started(self, name: str) -> None:
+        # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this
+        # is a no-op, as connection_restored is. ADR 0044, BACKLOG #1741.
+        return
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         log.warning(

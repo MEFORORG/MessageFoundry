@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lift ONLY the custom-role pairing rule, for tests that pin the route-level second line.
 
-Minting refuses a custom role holding ``messages:view_raw`` without ``messages:view_summary``, and
-decoding drops ``view_raw`` from a stored one (vault BACKLOG #1187). Both decisions go through one
+Minting refuses a custom role holding ``messages:view_raw`` without ``messages:view_summary``,
+decoding drops ``view_raw`` from a stored one (vault BACKLOG #1187), and ``Identity.build`` refuses
+a built set of that shape (vault BACKLOG #3474). All three decisions go through one
 predicate, :func:`messagefoundry.auth.permissions.raw_body_without_summary`, so patching it to answer
 ``False`` lifts exactly that rule: at least the validator's other rules (unknown names, an empty
 set, the forbidden escalation permissions) and the decoder's drops still run, and

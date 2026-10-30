@@ -14,6 +14,7 @@ The same single load is where the tee prints a keep that turns off a default scr
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import subprocess
@@ -91,8 +92,20 @@ def _run(db: str, out: Path, *extra: str) -> int:
         (None, "cannot read anon overlay"),
         # Every row would fail on this rule, so it must refuse the run, not the rows (#2997).
         ('[hl7]\ndrop = ["MSH-2"]\n', "sets a rule on MSH-2"),
+        # A retarget the overlay does not list, and a list entry that is no retarget (#3000).
+        ('[hl7.fields]\n"PID-5" = "id"\n', "retargets PID-5 from its default name scrub to id"),
+        ('[hl7]\nretarget_acknowledged = ["PID-31"]\n', "but sets no rule"),
     ],
-    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing", "unwritable-rule"],
+    ids=[
+        "malformed",
+        "not-utf8",
+        "component-path",
+        "unknown-table",
+        "missing",
+        "unwritable-rule",
+        "unlisted-retarget",
+        "stray-acknowledgment",
+    ],
 )
 def test_a_bad_overlay_refuses_the_run_once(
     body: str | bytes | None,
@@ -133,19 +146,14 @@ def test_the_rules_are_loaded_once_for_the_whole_run(
     db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     overlay = _overlay(tmp_path, '[hl7]\ndrop = ["PID-8"]\n')
-    # The run's own load, and the per-row load anonymize_checked falls back to with no rules.
     run_loads = _counting(monkeypatch, "tee.__main__.load_rules", tee.anon.rules.load_rules)
-    row_loads = _counting(monkeypatch, "tee.anon.load_rules", tee.anon.rules.load_rules)
     out = tmp_path / "ds.jsonl"
 
     assert _run(db, out, "--overlay", overlay) == 0
 
     assert len(run_loads) == 1
-    assert row_loads == []
-    # Control: the per-row counter does fire when a caller hands over the path, so the empty
-    # list above means the loop no longer does.
-    tee.anon.anonymize_checked(_raw("C9").decode("latin-1"), salt=_SALT, overlay=Path(overlay))
-    assert len(row_loads) == 1
+    # No row can load it again: the anonymizer takes no overlay path (BACKLOG #3493).
+    assert "overlay" not in inspect.signature(tee.anon.anonymize_checked).parameters
     # And the overlay it loaded is the one each row got: PID-8 is dropped in every record.
     records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(records) == _ROWS
@@ -186,9 +194,12 @@ def test_keeping_a_default_scrubbed_field_is_printed(
 def test_retargeting_a_default_scrubbed_field_is_printed(
     db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PID-5 pointed at the id kind rewrites the family name only (BACKLOG #3000).
+    # PID-5 pointed at the id kind rewrites the family name only (BACKLOG #3000). Listed, so the
+    # run loads it; unlisted, test_a_bad_overlay_refuses_the_run_once refuses it.
     overlay = _overlay(
-        tmp_path, '[hl7]\nkeep = ["EVN-1"]\n[hl7.fields]\n"PID-5" = "id"\n"PID-7" = "date"\n'
+        tmp_path,
+        '[hl7]\nkeep = ["EVN-1"]\nretarget_acknowledged = ["PID-5", "PID-7"]\n'
+        '[hl7.fields]\n"PID-5" = "id"\n"PID-7" = "date"\n',
     )
     out = tmp_path / "ds.jsonl"
 
@@ -198,6 +209,7 @@ def test_retargeting_a_default_scrubbed_field_is_printed(
     (line,) = _warnings(capsys.readouterr().err)
     assert "PID-5 (name to id)" in line
     assert "PID-7 (dob to date)" in line
+    assert "as [hl7].retarget_acknowledged allows" in line
     assert "EVN-1" not in line
     # What the warning is about: the given name really is in the dataset, and the run passed.
     dataset = out.read_text(encoding="utf-8")
@@ -206,10 +218,70 @@ def test_retargeting_a_default_scrubbed_field_is_printed(
     assert "JOHN" not in line
 
 
+_RESIDUE_ROW = "PID|1||999^^^H^MR||DOE^JOHN||19800101|M|||||5550100^PRN^PH^^^^^^(555) 555-0199"
+_SSN_ROW = "PID|1||999^^^H^MR||DOE^JOHN||19800101|M\rZPD|123-45-6789"
+_TOLD = "point each retargeted field back at its default kind, or at drop or freetext"
+_GENERAL = "xtend the rule map or add a keep"
+
+
+@pytest.mark.parametrize(
+    ("rows", "residue", "general"),
+    [
+        ((_RESIDUE_ROW,), True, False),
+        ((_RESIDUE_ROW, _SSN_ROW), True, True),
+        ((_SSN_ROW,), False, True),
+    ],
+    ids=["residue", "mixed", "control"],
+)
+def test_a_residue_refusal_is_not_told_to_add_a_keep(
+    rows: tuple[str, ...],
+    residue: bool,
+    general: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # An acknowledged retarget of PID-13 to id leaves XTN.9, which here holds a punctuated phone
+    # number, so the leak-check refuses the row. A keep would leave the whole field, so the run
+    # line names the right fix (BACKLOG #3493), and gives the old advice only for other refusals.
+    # The control row carries a dashed SSN in an unmapped field, and gets the advice it always had.
+    path = str(tmp_path / "residue.db")
+
+    async def seed() -> None:
+        store = await RelayStore.open(path)
+        try:
+            for n, row in enumerate(rows):
+                raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|R{n}|P|2.5.1\r{row}"
+                await store.record_capture(
+                    direction="corepoint_copy", control_id=f"R{n}", raw=raw.encode("latin-1")
+                )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    overlay = _overlay(
+        tmp_path, '[hl7]\nretarget_acknowledged = ["PID-13"]\n[hl7.fields]\n"PID-13" = "id"\n'
+    )
+
+    assert _run(path, tmp_path / "ds.jsonl", "--overlay", overlay) == 1
+
+    (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
+    assert (_TOLD.capitalize() in error) is residue
+    assert ("A keep would leave the whole field." in error) is residue
+    assert (_GENERAL in error) is general
+    assert ("For the others: Extend" in error) is (residue and general)
+    assert ("Then retry." in error) is (residue and not general)
+    assert "555-0199" not in error
+
+
 def test_a_keep_and_a_retarget_each_get_a_line(
     db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["PID-7"]\n[hl7.fields]\n"PID-5" = "id"\n')
+    overlay = _overlay(
+        tmp_path,
+        '[hl7]\nkeep = ["PID-7"]\nretarget_acknowledged = ["PID-5"]\n[hl7.fields]\n"PID-5" = "id"\n',
+    )
 
     assert _run(db, tmp_path / "ds.jsonl", "--overlay", overlay) == 0
 
@@ -244,7 +316,10 @@ def test_no_default_scrub_lost_means_no_warning(
 
 @pytest.mark.parametrize(
     "body",
-    ['[hl7]\nkeep = ["PID-5"]\n', '[hl7.fields]\n"PID-5" = "id"\n'],
+    [
+        '[hl7]\nkeep = ["PID-5"]\n',
+        '[hl7]\nretarget_acknowledged = ["PID-5"]\n[hl7.fields]\n"PID-5" = "id"\n',
+    ],
     ids=["keep", "retarget"],
 )
 def test_the_overlay_warning_reaches_real_stderr_at_every_log_level(

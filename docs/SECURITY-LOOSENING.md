@@ -39,8 +39,10 @@ section reference.
 
 On the hops in the table below, the engine will not send a credential to a peer whose identity it
 has not checked. The rule does not yet reach every hop or every kind of credential: at least the
-cases in *The rule does not reach every hop yet*, below, still cross. This section is the one
-statement of that rule; other pages link here.
+cases in *The rule does not reach every hop yet*, below, still cross. So does a secret that is not
+credential-shaped under a neutral header name, over plain `http` off this machine. That is an
+[accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine), at the end
+of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
@@ -49,7 +51,9 @@ answers, so that refusal comes at connect, before the password is sent. The AI b
 builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
-`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
+`tls_hop_attested`, `cleartext_accepted` and a loopback host, with one exception: on the plain
+`http` row a loopback host still carries a credential, since that hop never leaves this machine.
+Each refusal names the connection, or
 the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
 also offers removing them. The engine then judges the hop as one with no credential, under its own
@@ -63,6 +67,7 @@ pointed at one of those levers.
 | `Ftp` | it is plain FTP (`tls = false`) | use FTPS (`tls = true`) or `Sftp` |
 | `Ftp` with `tls = true` (FTPS) | `tls_verify` or `tls_check_hostname` is off | turn both checks on; pin a private CA with `tls_ca_file` |
 | `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
+| `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup`, with their OAuth2, SMART and Digest logins | the URL is plain `http` to a host off this machine | use `https` |
 | `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
@@ -71,12 +76,18 @@ pointed at one of those levers.
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
-a static header that settings views would mask, such as `Authorization` or an API key. On a
-`verify_tls = false` hop, the engine also refuses any other static header, unless its name is
+a static header that settings views would mask, such as `Authorization` or an API key, in any
+letter case. On a `verify_tls = false` hop the engine also refuses any other static header,
+unless its name is
 `Accept`, `Content-Type`, `User-Agent` or `X-Request-ID`, in any case. The refusal names such a
 header as outside the allowlist, not as a credential. That allowlist fails closed, so a
 secret under a neutral name, such as `X-Session`, is refused without being recognized. A
-credential-shaped value under an allowlisted name is still refused. The HTTP family reads its
+credential-shaped value under an allowlisted name is still refused. A plain `http` hop off this
+machine refuses the credentials only, not a header for its name. A header a Handler stamps per
+message under `dynamic_headers` meets the same rule as the hop's static headers, when the
+message is sent, after the hop's own send-time check. That refusal dead-letters the one
+message and names neither the header nor its
+value. The HTTP family reads its
 auth-setting credentials from the same reader as the static-credential inventory. That inventory
 does not yet count a static header or a `url` query credential, so for those two kinds this rule is
 the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
@@ -90,27 +101,73 @@ every case.
 **The rule does not reach every hop yet.** At least these still send a credential to a peer the
 engine has not verified, when the lever named beside each is set:
 
-- an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
   like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
-- an HTTP-family static header with a neutral name, such as `X-Session`, over plain `http`, under
-  that hop's own levers. The header allowlist applies on `verify_tls = false` hops only;
-- a secret that is not credential-shaped under an allowlisted header name, such as an opaque token
-  in `X-Request-ID`, on a `verify_tls = false` hop. The allowlist reads names, and the value test
-  knows only auth-scheme prefixes and JWTs;
+- a secret that is not
+  [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
+  an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
+  hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
-  `[security].enforcement = warn`;
-- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
-  false` hop. The refusal reads settings, so it cannot see one.
+  `[security].enforcement = warn`.
+
+**The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
+leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
+#3416). The owner's ruling of 2026-10-05 (vault BACKLOG #3007) refuses it there unless the
+connection declares `cleartext_accepted` with a reason. The engine also lets it cross under
+`tls_hop_attested`, or to a proxy on this machine.
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
+
+### Accepted limit: a neutral header crosses plain `http` off this machine
+
+Over plain `http` to a host off this machine, an HTTP-family header with a neutral name, such as
+`X-Session`, still crosses. That holds for a static header and for one a Handler stamps per
+message. It crosses even when its value is a secret, if that secret is not credential-shaped, as
+defined below. On that hop the no-escape rule refuses only the credentials it
+recognizes, described above (vault BACKLOG #3533 item 4). A credential-shaped value is refused
+under any name. The header allowlist applies on `verify_tls = false` hops only. The hop itself
+crosses only under its own levers, such as `cleartext_accepted` or `tls_hop_attested`.
+
+**Credential-shaped** means the engine's value test recognizes the value, whatever the header is
+called. That test is `_looks_like_a_credential_value` in `messagefoundry/config/wiring.py`. It
+trims surrounding whitespace, then recognizes two shapes only:
+
+- a value that starts, in any letter case, with `Bearer `, `Basic `, `Digest ` or `Negotiate `
+  (each with its trailing space), or with `AWS4-HMAC`, as in `AWS4-HMAC-SHA256`;
+- a JWT: the whole value matches `^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+$`,
+  three base64url segments joined by dots, the first starting `eyJ`.
+
+Any other scheme word is not recognized. A value such as `Token abc123`, `SSWS abc123`,
+`SharedAccessSignature sr=...` or `OAuth abc123` is not credential-shaped. Under a neutral name,
+it crosses.
+
+This limit is accepted, with no fix planned (owner ruling 2026-10-28). The owner was asked whether
+the allowlist should also apply to declared plain-`http` hops. The answer was *"No, keep it as
+decided"*. That confirmed decision `d20261027T133708514-b8b2ed`, made on 2026-10-27 under the
+owner's delegation ([record](https://github.com/MEFORORG/MessageFoundry/pull/2576#issuecomment-6443284239)).
+
+The reason differs by declaration.
+
+- Under `cleartext_accepted`, the declaration says the hop is not secure.
+  [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+  decision 2 accepts that declaration. The hop's body and headers are then readable on the path,
+  by the operator's own choice. Refusing neutral headers would not protect the body, which that
+  declaration already exposes.
+- Under `tls_hop_attested`, the declaration says the hop is secure by means the engine cannot see
+  (the table in ADR 0153 decision 2). The engine trusts that declaration for the body and the
+  headers, except a credential the refusal recognizes. The owner's ruling of 2026-10-26 refuses
+  that credential whatever the hop declares. A secret that is not credential-shaped, under a
+  neutral name, rests on the declaration alone. If the declaration is false, that secret crosses
+  in the clear.
+
+Earlier versions of this guide called this an open owner question. The 2026-10-28 ruling answers it.
 
 ---
 
@@ -488,7 +545,8 @@ false premise.
 
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-at-exposure refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
-  whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
+  whose admin surface is exposed (an off-loopback bind, or a declared reverse proxy: `[api].tls_terminated_upstream`
+  or a set `[api].trusted_proxies`, vault BACKLOG #2251) with `require_mfa` off,
   MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
   Administrators included, would then sign in over the network with a single factor. The one
   exception is an OIDC sign-in that carries an amr/acr claim checked while
@@ -1048,8 +1106,14 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   that provider really uses with no human step.
 - **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`
-  on its audit rows, failed attempts included except a lock refusal; [SECURITY.md](SECURITY.md), *What these floors do not
-  do*, says which rows. Review those rows. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
+  on its audit rows, failed attempts included; [SECURITY.md](SECURITY.md), *What these floors do
+  not do*, says which rows. Review those rows. A directory lock refusal carries the marker too
+  (BACKLOG #3726), but the trail's read routes (at least `GET /audit`, the exports and
+  `/ui/audit`) show that row only to a reader holding `users:manage`, such as an Administrator; the
+  account holder's own `/me/security-events` feed is unfiltered. An Auditor reading the trail does
+  not see it (owner ruling 2026-09-28),
+  so a review that must include exempted attempts against locked accounts needs an Administrator.
+  Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
 
@@ -1216,9 +1280,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `approval.requested` row.
 - **Where it is reported:** `security_loosenings()` names it, so at least the serve-time warning,
   `messagefoundry security show`, `GET /security/posture` and the start's `config_loaded` audit row
-  list it. Nothing refuses it. The
-  serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
-  narrowed or an empty list.
+  list it. Nothing refuses it. On an exposed instance the serve-time dual-control advisory names it
+  too, in the same words, as it names dual control off (vault BACKLOG #3474). That advisory only
+  warns.
 - **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and
   restart. [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
   says what happens to a request that was already held when its operation left the list.
@@ -1320,7 +1384,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What the engine refuses without it:** each of the three Vault hops verifies the Vault server's
   certificate, and its handshake checks no CRL and no OCSP. So the client build refuses a Vault
   that is off the box. On the box means a loopback host reached with no proxy, decided on the
-  address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
+  address the client will really dial, which is the hop's `MEFOR_*_VAULT_ADDR`. A loopback Vault
   behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
   and wherever a client is built without a known posture, which counts as enforcing.
 - **Which callers know the posture:** at least `serve`, `check-privileges` and
@@ -1431,7 +1495,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
 - **What you lose:** the payload — and any credential that connection carries — crosses that hop
   **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
-  partial protection here: it is plaintext PHI on the wire for that connection.
+  partial protection here: it is plaintext PHI on the wire for that connection. The exception is an
+  HTTP-family credential the refusal recognizes, to a host off this machine. It is refused whatever
+  this says (vault BACKLOG #3533 item 4). A secret that is not credential-shaped, under a neutral
+  header name, still crosses: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine). A forward-proxy login is
+  not in that exception: it crosses its cleartext leg under this declaration, as the
+  [credential rule](#no-escape-sends-a-credential-to-an-unverified-peer) says.
 - **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
   transport with no TLS support at all. For `Tcp()` and `X12()` the declaration is **permanent and
   structural**: those connectors have no `tls` parameter, so there is nothing to migrate to
@@ -1485,8 +1555,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
   secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
-  hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
-  and nothing about the hop looks wrong afterwards.
+  hop. If the claim is false, the payload and any credential the connection carries cross in the
+  clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
+  credential the refusal recognizes, other than a forward-proxy login, over cleartext `http` to a
+  host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
+  that is not credential-shaped, under a neutral header name, rests on the attestation alone: an
+  [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
   sidecar in front of the connection is the usual case. An isolated, point-to-point segment with its
   own link-layer encryption is the other.
@@ -1496,9 +1570,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** whatever the reason names. Keep it true: when the proxy or the segment
   changes, the attestation has to change with it.
 - **It is always reported, though not always logged:** at least the inbound bind gates and the
-  raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The OAuth2 and
-  SMART token-endpoint seams and the database weakened-TLS line do not put the reason on it, and a
-  `DatabaseRef` source writes that same line. The complete record is the two reports. `messagefoundry check` prints a
+  raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The database
+  weakened-TLS line does not put the reason on it, and a `DatabaseRef` source writes that same line.
+  The OAuth2 and SMART token-endpoint seams no longer read it for cleartext: their credential is
+  refused over off-box `http` either way (vault BACKLOG #3533 item 4). The complete record is the two reports. `messagefoundry check` prints a
   `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
   `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
   both reports read the attestation from the same place, so a hop cannot be crossed on an attestation
@@ -1594,7 +1669,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
   revocation. On an outbound hop that is the `RevocationHopGuard` refusal (stdlib `ssl` fetches no
   OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
-  `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
+  `tls_ca_file` and no `tls_crl_file`. On an `Ftp(tls=True)` poller, the one inbound that dials out
+  and verifies a server, it is the outbound `RevocationHopGuard` refusal (BACKLOG #2193). With the
+  attestation set, a revoked but unexpired certificate on
   that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
   **On a `FhirLookup`, one declaration lifts two refusals** (BACKLOG #2193): the https read to the
   FHIR server, and the SMART token endpoint the lookup signs in to. Those are often two hosts, so
@@ -1924,20 +2001,24 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     notifier, and no other `messagefoundry` command builds an engine. So a refusal under
     `supervise`, `rotate-key`, `backup`, `restore` or the rest leaves the WARNING line and
     nothing else. That holds even for `rotate-key` and `backup`, which open the store.
-  - **An application that builds its own engine can run with no guard.** It runs the reads too,
-    through `create_managed_app` or `Engine.create`. Only the guard refuses a script and counts
-    it. Where the remote-debugging interface is on and the guard is not in the process, an
-    injected script is not refused at all: it runs. The count then stays at 0, so there is no
-    row and no alert. An application that builds the API reports `remote_debug_unguarded`, as
-    that entry below says. One that builds only an `Engine` reports it nowhere. The guard goes
-    in wherever `messagefoundry.__main__` is imported, or
+  - **An application that builds only an `Engine` can run with no guard.** It runs the reads
+    too, through `Engine.create`. Only the guard refuses a script and counts it. Where the
+    remote-debugging interface is on and the guard is not in the process, an injected script is
+    not refused at all: it runs. The count then stays at 0, so there is no row and no alert. An
+    application that builds the API gets the guard when it builds the app, because `create_app`
+    installs it, and `create_managed_app` calls `create_app` (vault BACKLOG #3673). Where the
+    guard does not answer there, it reports `remote_debug_unguarded`, as that entry below says.
+    One that builds only an `Engine` reports it nowhere. The guard goes in wherever
+    `messagefoundry.__main__` is imported, `create_app` runs, or
     `messagefoundry.remotedebug.install_remote_debug_guard()` is called. An audit hook added
     earlier can still refuse it.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
   other imports. On one Windows development machine that was about 55 ms after the process was
-  created, against about 210 ms when `serve` installed it as its first step. The interpreter's
+  created, against about 210 ms when `serve` installed it as its first step. Cutting the guard's
+  own imports later saved about 20 ms more, by another method; `messagefoundry/remotedebug.py`
+  has that reading (vault BACKLOG #3673). The interpreter's
   own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
   can write the engine's memory can run code in it by other means, and can remove a hook.
 - **The tray has no hook, so how it started decides whether the interface is on.** No entry
@@ -1951,11 +2032,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   tray itself with the interface on.
 - **`remote_debug_unguarded`: the interface is on, and the hook did not answer.** Read it as the
   hook not installed: a process the operating system lets attach could run Python inside the
-  engine, with the store key, the connection secrets and the messages in flight. An application
-  that builds the API without `serve` reports this, until something in it imports the
-  command-line module, which installs the hook. `messagefoundry/api/tls.py` does that when it
-  writes a key. `serve` would report it in at least two cases. Both need an audit hook that
-  something else added to the process first. In one, that hook refused the engine's, so the
+  engine, with the store key, the connection secrets and the messages in flight. Building the
+  API app installs the hook, so an application that builds the API without `serve` has it from
+  then on (vault BACKLOG #3673). Such an application, like `serve`, would report this entry in
+  at least two cases. Both need an audit hook that something else added to the process first. In one, that hook refused the engine's, so the
   engine's hook is missing and an injected script runs. Nothing is refused, so there is no
   WARNING, no row and no alert. In the other, that hook raises on the event the engine uses to
   ask whether its own hook is there. The engine's hook is then usually in place and refuses a
@@ -1967,15 +2047,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   reads it carries the count, which the first case cannot produce. The serve-time warning is
   read once, at start, so it carries a count only for a refusal before then. A count says
   the hook was in at some point, not that it still is, so read the entry as missing either way.
-  In either case a later install call adds the hook again. So a hook the other one refused at
+  In either case a later install call tries the add again. So a hook the other one refused at
   import still goes in if that hook stops refusing by the time `serve` or `supervise` makes its
-  own call. In the first case nothing stacks, because the interpreter dropped the hook. In the
-  second a copy can stack, one per install call, and nothing else bounds them. `serve` and
-  `supervise` make at least two calls, at import and then as each starts. Under `python -m`, the
-  `api/tls.py` import above runs the import-time call again, and an application makes one per
-  call it adds. A stacked copy changes no count: the first copy refuses the script, and the
-  interpreter asks no hook after one that raised. Each copy does run on every other audited
-  event, so the hook's per-event cost is paid once per copy. Without a count,
+  own call. Repeated calls stack no second copy of the hook (vault BACKLOG #3673).
+  `install_remote_debug_guard` in `messagefoundry/remotedebug.py` says how, and what bounds it.
+  Without a count,
   the entry cannot tell the cases apart, so read it as the first, and look for what else in the
   process adds an audit hook.
 - **An audit hook added earlier can refuse a script ahead of the engine's, in any state.** Where

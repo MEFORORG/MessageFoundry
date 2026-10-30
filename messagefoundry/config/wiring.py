@@ -55,6 +55,7 @@ from pathlib import Path
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
+from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
@@ -883,11 +884,19 @@ def FileRef(
     return ReferenceSourceSpec("file", {"path": path, "encoding": encoding})
 
 
+#: Row ceiling for one ``DatabaseRef`` sync when the declaration sets no ``max_rows`` (BACKLOG #2617).
+#: Far above the ``db_lookup`` default, because a reference set is the place a large table belongs:
+#: a provider directory or a code map runs to thousands or tens of thousands of rows. It is a memory
+#: bound on one sync, not a business limit. A sync past it is REFUSED and the last-good snapshot
+#: stays. ``DatabaseRef(max_rows=...)`` moves it; ``0`` removes it.
+DEFAULT_REFERENCE_MAX_ROWS = 100_000
+
+
 def DatabaseRef(
     *,
     server: str | EnvRef,
     database: str | EnvRef,
-    statement: str,
+    statement: str | EnvRef,
     key_column: str,
     value_column: str | None = None,
     auth: str = "sql",
@@ -901,14 +910,25 @@ def DatabaseRef(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
+    max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
 
-    The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
-    the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
+    The engine runs ``statement`` (a read-only ``SELECT``/``WITH`` query) on the set's refresh
+    cadence and builds the snapshot from the rows. The statement passes the same read-only statement
+    test as a ``db_lookup`` (BACKLOG #2617): it must open with ``SELECT`` or ``WITH``, carry no write,
+    ``EXEC`` or DDL keyword outside a literal or comment, and chain no second statement. So a stored
+    procedure is refused. A literal statement is tested here, when the set is declared, so every path
+    that loads the config refuses it. An ``env()`` statement has no value here; the build check
+    (``messagefoundry check``'s build leg, reload) tests it once resolved. Every sync tests the
+    statement again. It is a shape test on text, not read-only authority: give the login only
+    ``SELECT`` (docs/CONNECTIONS.md). The connection also advertises ``ApplicationIntent=ReadOnly``;
+    ``transports.database._build_dsn`` says which servers act on it, at least by sending it to a
+    lagging read-only replica or, on a ``READ_WRITE`` availability-group primary, refusing it.
+    ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
     refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
@@ -921,10 +941,34 @@ def DatabaseRef(
     last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
     the bound is what stops one unresponsive server from stalling every other set's refresh.
 
+    ``max_rows`` (default :data:`DEFAULT_REFERENCE_MAX_ROWS`) bounds one sync's result. The engine
+    reads at most one row past it from the driver, then refuses the sync: the last-good snapshot
+    stays, the AlertSink fires, and a set never synced stays unloaded. The result is never
+    truncated, since a partial set would answer ``get`` wrongly with nothing to say so. ``0``
+    removes the ceiling. Checked when declared, like ``acquire_timeout``; an ``env()`` value is
+    checked by the build check (``messagefoundry check``'s build leg, reload) and at each sync, once
+    resolved.
+
     ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # BACKLOG #2617: a literal statement is tested here, so every load path refuses it, not only the
+    # build check, which `messagefoundry check` runs only with a messagefoundry.toml. Imported here:
+    # messagefoundry.transports imports this module at its top level.
+    from messagefoundry.config.db_lookup import DbLookupError
+    from messagefoundry.transports.database import _require_read_only
+
+    statement_refusal: str | None = None
+    # A statement that is not a literal (an env() ref) waits for the build check and the sync, which
+    # test it once resolved.
+    if isinstance(statement, str):
+        try:
+            _require_read_only(statement, subject="DatabaseRef statement")
+        except DbLookupError as exc:
+            statement_refusal = str(exc)
+    if statement_refusal is not None:
+        raise WiringError(statement_refusal)
     # Refused here, at declaration, because a reference set is first dialled at sync time, after
     # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
     # An env() ref has no value yet; the sync checks it once resolved.
@@ -950,6 +994,20 @@ def DatabaseRef(
             refusal = str(exc)
         if refusal is not None:
             raise WiringError(refusal)
+    # max_rows by the same rule and for the same reason (BACKLOG #2617). An env() ref waits for the
+    # sync and for the build check, which read it once resolved.
+    if not isinstance(max_rows, EnvRef):
+        from messagefoundry.transports.database import max_rows_setting
+
+        rows_refusal: str | None = None
+        try:
+            max_rows_setting(
+                max_rows, label="DATABASE reference source", default=DEFAULT_REFERENCE_MAX_ROWS
+            )
+        except ValueError as exc:
+            rows_refusal = str(exc)
+        if rows_refusal is not None:
+            raise WiringError(rows_refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -969,6 +1027,7 @@ def DatabaseRef(
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            "max_rows": max_rows,
             **attestation,
         },
     )
@@ -1210,7 +1269,9 @@ def FhirLookup(
     :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
     ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
-    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). Neither declaration lifts a refusal of a
+    lookup that sends a credential, over ``verify_tls=False`` or over cleartext ``http`` off this
+    machine (vault BACKLOG #3230, #3533 item 4). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1696,6 +1757,9 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     #3230). Since vault BACKLOG #3533 that refusal also takes any name off its own allowlist. For
     that refusal, narrowing the NAME arm here changes only how a refused header is labelled, and
     narrowing the VALUE arm narrows it for the allowlisted names. Either still narrows the masking.
+    **Over cleartext http off this machine there is no allowlist** (vault BACKLOG #3533 item 4):
+    this function alone decides whether a static or per-message header is a credential the hop
+    refuses, so narrowing EITHER arm lets that header cross there in the clear.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -4379,8 +4443,9 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
-    ``[security].enforcement = warn``. Put secrets (``password``/
+    refused). ``MEFOR_ALLOW_INSECURE_TLS`` at ``[security].enforcement = warn`` accepts an unknown
+    key for a key-only login, and never saves it. A ``password`` login to an unknown key is refused
+    with no escape (vault BACKLOG #3230, #3533 item 8). Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
@@ -5498,6 +5563,17 @@ class Registry:
     # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
     # flag only, not the connections, for the same reason as `all_loopback_inbound`.
     all_pt_inbound: Mapping[str, bool] | None = None
+    # EVERY inbound's DIRECTORY settings in the deployment (NAME -> connector type + only the settings
+    # it reads its watch and `.error` directories from, before env() resolution; None for a connector
+    # that declares directories but not their settings), pinned beside the shard identity by
+    # pipeline.sharding (None on an unfiltered graph / single-shard config, where `inbound` IS the
+    # whole config). Read only by the `.processed` archive sweep's guard (BACKLOG #1188): a sibling
+    # shard's watch directory is a fact about the CONFIG, and an archive directory that overlaps it
+    # would otherwise age out that shard's undelivered drops. Never a whole spec: a credential setting
+    # does not travel with it, and every other reader of `inbound` keeps seeing only this shard's.
+    all_inbound_guard_settings: (
+        Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
+    ) = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -6263,7 +6339,8 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
-    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``check_inbound_revocation`` refusal, or an FTPS poller, the ``RevocationHopGuard`` its
+    constructor runs, BACKLOG #2193), ``outbound`` (the ``RevocationHopGuard``) and
     ``fhir_lookups`` (a lookup's https read and the SMART token hop it signs in to). All three carry
     it as typed fields, like ``cleartext_accepted``, and this reads those fields: a copy in a
     ``FhirLookupSpec``'s
@@ -7155,7 +7232,9 @@ def inbound(
     listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
     ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
     attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
-    Also a ``connections.toml`` key."""
+    On an ``Ftp(tls=True)`` poller, which dials out, the same pair attests the partner SERVER's
+    certificates instead, and crosses the refusal of an off-box poll with no ``[tls].crl_file`` on
+    its context (BACKLOG #2193). Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -8159,7 +8238,10 @@ def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperIm
     imported. A load that raises inside this block gets back, in ``sys.modules``, whatever each of
     its names held before, so a live graph loaded earlier from the same files keeps its modules. (A
     failure after the block -- graph validation, the connections.toml merge -- leaves this load's
-    entries, as it leaves its config modules'.)"""
+    entries, as it leaves its config modules'.)
+
+    Under a CLI command whose stdout carries its result, a ``print()`` the modules run goes to
+    stderr: :func:`~messagefoundry.author_output.author_code_stdout` (vault BACKLOG #3474)."""
     global _active
     helpers = _HelperImporter(snapshot)
     with _load_lock:
@@ -8167,7 +8249,7 @@ def _loading(snapshot: ConfigSnapshot, registry: Registry) -> Iterator[_HelperIm
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
         # already holds them (loaded in load_config/validate_config), and activated() restores cleanly.
         try:
-            with _code_sets_activated(registry.code_sets):
+            with _code_sets_activated(registry.code_sets), author_code_stdout():
                 yield helpers
         except BaseException:
             helpers.discard()

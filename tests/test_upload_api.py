@@ -39,7 +39,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
+from messagefoundry.store.crypto import AesGcmCipher, IdentityCipher, generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
 from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
@@ -1488,15 +1488,24 @@ async def test_a_deadline_during_the_create_row_still_writes_it(
     assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == stored.file_id
 
 
+@pytest.mark.parametrize("removal_refused", [False, True])
 async def test_a_create_row_that_fails_removes_the_stored_file(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removal_refused: bool
 ) -> None:
-    """A row that cannot be written leaves no file behind it, rather than a file with no row."""
+    """A row that cannot be written leaves no file behind it, rather than a file with no row.
+
+    The removal's ``upload.delete`` row says the file is gone (vault BACKLOG #3740 item 2), so a
+    removal the filesystem refused writes none, and the file is still stored. The stub stands in
+    for the refusal's answer only; its ERROR line is tests/test_uploads.py's subject."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    us = app.state.upload_store
+    if removal_refused:
+        # As _discard_cancelled_sync answers when an unlink raises OSError.
+        monkeypatch.setattr(us, "_discard_cancelled_sync", lambda _file_id: False)
     real = engine.store.record_audit
 
     async def _failing(name: str, **kwargs: Any) -> Any:
@@ -1512,8 +1521,14 @@ async def test_a_create_row_that_fails_removes_the_stored_file(
         monkeypatch.setattr(engine.store, "record_audit", _failing)
         r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
     assert r.status_code == 500
-    assert await app.state.upload_store.list_files() == []
-    assert not list((tmp_path / "uploads").iterdir())
+    deleted = await engine.store.list_audit(action="upload.delete")
+    if removal_refused:
+        assert len(await us.list_files()) == 1
+        assert deleted == []
+    else:
+        assert await us.list_files() == []
+        assert not list((tmp_path / "uploads").iterdir())
+        assert [row["actor"] for row in deleted] == ["system"]
 
 
 async def test_a_deadline_during_the_delete_row_still_writes_it(
@@ -1542,6 +1557,289 @@ async def test_a_deadline_during_the_delete_row_still_writes_it(
     assert await app.state.upload_store.list_files() == []
     [row] = await engine.store.list_audit(action="upload.delete")
     assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == fid
+
+
+# --- vault BACKLOG #3740 items 1 and 2: the shutdown drain, and a create row that raised ----------
+
+
+async def _drain_while_parked(
+    app: Any, request: Any, parked: asyncio.Event, *, label: str, grace: float
+) -> None:
+    """Send ``request`` and let a shutdown drain cancel its outliving operation, ``label``, once
+    ``parked`` is set. The route then ends in the drain's cancellation, so its outcome is not read."""
+    outliving = app.state.outliving_operations
+    sent = asyncio.ensure_future(request)
+    try:
+        await asyncio.wait_for(parked.wait(), 5.0)
+        assert await outliving.drain(timeout=0.0, grace=grace) == [label]
+    finally:
+        await asyncio.gather(sent, return_exceptions=True)
+
+
+async def _settle_unlanded_rows() -> None:
+    """Let the row writes a drain left running end, so none outlives the test. Only this loop's:
+    a write an earlier test's closed loop left in the set never ends."""
+    from messagefoundry.api.app import _UNLANDED_ROW_WRITES
+
+    loop = asyncio.get_running_loop()
+    mine = {task for task in _UNLANDED_ROW_WRITES if task.get_loop() is loop}
+    if mine:
+        await asyncio.wait(mine, timeout=2.0)
+
+
+@pytest.mark.parametrize("cut", ["after_unlink", "in_row"])
+async def test_a_shutdown_drain_does_not_cut_a_delete_row_short(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cut: str
+) -> None:
+    """Red before vault BACKLOG #3740 item 1: the drain's cancellation landed between the unlink
+    and its row, or inside the row's write, and the removed file had no ``upload.delete`` row.
+    The row now lands within the drain's grace."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    us = app.state.upload_store
+    parked = asyncio.Event()
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]
+        if cut == "after_unlink":
+            real_delete = us.delete
+
+            async def _slow_delete(*args: Any, **kwargs: Any) -> Any:
+                removed = await real_delete(*args, **kwargs)
+                parked.set()
+                await asyncio.sleep(0.05)  # the drain's cancel lands here, with the file removed
+                return removed
+
+            monkeypatch.setattr(us, "delete", _slow_delete)
+        else:
+            real_audit = engine.store.record_audit
+
+            async def _slow_audit(name: str, **kwargs: Any) -> Any:
+                if name == "upload.delete":
+                    parked.set()
+                    await asyncio.sleep(0.05)  # the drain's cancel lands here, inside the write
+                return await real_audit(name, **kwargs)
+
+            monkeypatch.setattr(engine.store, "record_audit", _slow_audit)
+        await _drain_while_parked(
+            app, c.delete(f"/uploads/{fid}", headers=h), parked, label="upload delete", grace=5.0
+        )
+    assert await us.list_files() == []
+    [row] = await engine.store.list_audit(action="upload.delete")
+    assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == fid
+
+
+async def test_a_delete_row_the_drain_leaves_unlanded_logs_its_file_id(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red before vault BACKLOG #3740 item 1: a row still being written when the drain's grace ran
+    out was lost with no log line. It is now logged at ERROR, naming the removed file's id, when
+    the write ends without landing, as on the store engine.stop() closes."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    parked, release = asyncio.Event(), asyncio.Event()
+    real_audit = engine.store.record_audit
+
+    async def _held_audit(name: str, **kwargs: Any) -> Any:
+        if name == "upload.delete":
+            parked.set()
+            await release.wait()
+            raise RuntimeError("PROBE: the store is closed")
+        return await real_audit(name, **kwargs)
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]
+        monkeypatch.setattr(engine.store, "record_audit", _held_audit)
+        try:
+            await _drain_while_parked(
+                app,
+                c.delete(f"/uploads/{fid}", headers=h),
+                parked,
+                label="upload delete",
+                grace=0.3,
+            )
+        finally:
+            release.set()  # the write left running now meets the closed store
+            await _settle_unlanded_rows()
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    assert "action=upload.delete actor=op" in lost.getMessage()
+    assert fid in lost.getMessage()
+    assert "a.hl7" not in lost.getMessage()  # the file name is not logged (vault BACKLOG #2619)
+
+
+async def test_a_drained_delete_the_store_refused_logs_no_lost_row(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3740 item 1: a delete refused as missing removed nothing, so a drain cancel
+    that lands while it runs owes no row and must not log one as lost."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.uploads import UploadNotFoundError
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    us = app.state.upload_store
+    parked = asyncio.Event()
+
+    async def _refused(file_id: str, **_kwargs: Any) -> Any:
+        parked.set()
+        await asyncio.sleep(0.05)  # the drain's cancel lands here
+        raise UploadNotFoundError(file_id)
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]
+        monkeypatch.setattr(us, "delete", _refused)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            await _drain_while_parked(
+                app,
+                c.delete(f"/uploads/{fid}", headers=h),
+                parked,
+                label="upload delete",
+                grace=5.0,
+            )
+            await asyncio.sleep(0.1)  # time for a done callback to have logged, had it
+    assert not [rec for rec in caplog.records if "Lost row" in rec.getMessage()]
+    assert await engine.store.list_audit(action="upload.delete") == []
+
+
+@pytest.mark.parametrize("ending", ["raised", "drained"])
+async def test_a_create_row_that_committed_then_raised_has_a_delete_row(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """Red before vault BACKLOG #3740 item 2: the ``upload.create`` row committed and then its
+    call raised, by an error or the shutdown drain's cancellation, so the file its row names was
+    removed with no row saying so. The removal now writes an ``upload.delete`` row, attributed to
+    the system since no operator asked for it, with the owner and the reason as data."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    parked = asyncio.Event()
+    real_audit = engine.store.record_audit
+
+    async def _committed_then_raised(name: str, **kwargs: Any) -> None:
+        await real_audit(name, **kwargs)
+        if name == "upload.create":
+            if ending == "raised":
+                raise RuntimeError("PROBE: raised after the row committed")
+            parked.set()
+            await asyncio.sleep(0.05)  # the drain's cancel lands here, with the row committed
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "record_audit", _committed_then_raised)
+        upload = c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        if ending == "raised":
+            assert (await upload).status_code == 500
+        else:
+            await _drain_while_parked(app, upload, parked, label="upload.create audit", grace=5.0)
+    assert await app.state.upload_store.list_files() == []
+    [created] = await engine.store.list_audit(action="upload.create")
+    fid = json.loads(str(created["detail"]))["file_id"]
+    [row] = await engine.store.list_audit(action="upload.delete")
+    assert row["actor"] == "system" and row["client"] is None
+    detail = json.loads(str(row["detail"]))
+    assert detail["file_id"] == fid and detail["uploader"] == "op"
+    assert detail["reason"] == "upload.create row failed"
+    assert "a.hl7" not in str(row["detail"])
+
+
+async def test_a_removal_row_that_fails_is_logged_by_file_id(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3740 item 2: when the removal's own ``upload.delete`` row fails too, the
+    loss is an ERROR line naming the file id and the lost row, and the create row's failure is
+    still what the request answers."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    real_audit = engine.store.record_audit
+
+    async def _both_fail(name: str, **kwargs: Any) -> None:
+        if name in {"upload.create", "upload.delete"}:
+            raise RuntimeError(f"PROBE: the audit log refused {name}")
+        await real_audit(name, **kwargs)
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "record_audit", _both_fail)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+    assert r.status_code == 500
+    assert await app.state.upload_store.list_files() == []
+    [lost] = [rec for rec in caplog.records if "upload.delete row for its removal" in rec.message]
+    assert "Lost row: action=upload.delete actor=system" in lost.message
+    assert "may still be stored" not in lost.message  # the removal answered
+    assert "a.hl7" not in lost.message
+    assert lost.exc_info is not None and "upload.delete" in str(lost.exc_info[1])
+
+
+async def test_a_removal_cancelled_while_its_thread_runs_still_reports_the_pair_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 2: the removal waits out its thread when it is cancelled, as by a
+    straggler drain. Its answer was dropped there, so a pair that was gone read as kept, and the
+    caller wrote no ``upload.delete`` row for it."""
+    import threading
+
+    store = UploadStore(tmp_path / "uploads", IdentityCipher(), max_bytes=4096)
+    meta = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    started, go = threading.Event(), threading.Event()
+    real = store._discard_cancelled_sync
+
+    def _slow(file_id: str) -> bool:
+        started.set()
+        go.wait(5.0)
+        return real(file_id)
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _slow)
+    removal = asyncio.ensure_future(store._discard_under_lock(meta.file_id))
+    await asyncio.to_thread(started.wait, 5.0)
+    removal.cancel()
+    await asyncio.sleep(0)
+    go.set()
+    assert await asyncio.wait_for(removal, 5.0) is True
+    assert await store.list_files() == []
+    # A pair something else already removed, such as an operator's delete, owes no second row.
+    assert real(meta.file_id) is False
 
 
 @_BREAKS

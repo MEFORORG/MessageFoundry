@@ -13,7 +13,7 @@ import asyncio
 import base64
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -902,7 +902,30 @@ async def test_lockout_store_contract(store) -> None:
     backend needs does not exist."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    def corrupt(statement: str, param: object) -> Callable[[str], Awaitable[None]]:
+        async def write(user_id: str) -> None:
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(statement, (param, user_id))
+                await cur.close()
+                await conn.commit()
+
+        return write
+
+    await _assert_lockout_contract(
+        store,
+        corrupt_passkeys={
+            # A lone UTF-16 surrogate: the driver's decode of the NVARCHAR cell raises
+            # UnicodeDecodeError while fetching, before any parse runs. A driver that decodes it
+            # anyway hands the parse a value that is not JSON, which keeps the fixed length too.
+            "fetch": corrupt(
+                "UPDATE webauthn_credentials SET transports=NCHAR(?) WHERE user_id=?", 55296
+            ),
+            "parse": corrupt(
+                "UPDATE webauthn_credentials SET transports=? WHERE user_id=?", "not json"
+            ),
+        },
+    )
 
 
 async def test_login_address_store_contract(store) -> None:
@@ -5965,12 +5988,14 @@ async def test_concurrent_mark_done_strands_rounds_without_the_finalize_applock(
     real_applock = store._applock
     skipped = 0
 
-    async def _applock_without_finalize(cur: Any, resource: str) -> None:
+    async def _applock_without_finalize(
+        cur: Any, resource: str, *, timeout_ms: int | None = None
+    ) -> None:
         nonlocal skipped
         if resource.startswith("mefor:finalize:"):
             skipped += 1
             return
-        await real_applock(cur, resource)
+        await real_applock(cur, resource, timeout_ms=timeout_ms)
 
     monkeypatch.setattr(store, "_applock", _applock_without_finalize)
 

@@ -44,14 +44,14 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args
-from urllib.parse import urlsplit
+from typing import Any, Final, Literal, get_args
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -663,6 +663,11 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
         raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
 
 
+#: Ceiling for ``[store].schema_lock_timeout`` (s): the largest whole-second ``sp_getapplock``
+#: ``@LockTimeout``, a T-SQL ``int`` of milliseconds (BACKLOG #1726).
+_SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -996,6 +1001,10 @@ class StoreSettings(_Section):
     # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
     # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
+    # Upper bound (seconds) on a server-DB store open's wait for the schema lock (BACKLOG #1726).
+    # Must be > 0 and at most _SCHEMA_LOCK_TIMEOUT_MAX. Why it exists and what it does not bound:
+    # docs/CONFIGURATION.md.
+    schema_lock_timeout: float = 600.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
     db_schema: str | None = None
@@ -1097,6 +1106,19 @@ class StoreSettings(_Section):
         # this setting exists to remove, so there is deliberately no way to configure it back.
         if value <= 0:
             raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
+        return value
+
+    @field_validator("schema_lock_timeout")
+    @classmethod
+    def _positive_schema_lock_timeout(cls, value: float) -> float:
+        # No "0 disables" value, as with acquire_timeout: on SQL Server an unbounded wait could hang
+        # a store open, and a service stop behind it, forever (BACKLOG #1726). The ceiling is the
+        # largest sp_getapplock @LockTimeout (a T-SQL int of ms), so both backends wait what is set.
+        if not 0 < value <= _SCHEMA_LOCK_TIMEOUT_MAX:
+            raise ValueError(
+                "schema_lock_timeout must be > 0 and at most "
+                f"{_SCHEMA_LOCK_TIMEOUT_MAX:.0f} s (the wait is always bounded)"
+            )
         return value
 
     @field_validator("warm_pool_target")
@@ -1528,6 +1550,127 @@ def _split_address_list(v: object) -> object:
     return v
 
 
+_WS_ORIGIN_FORM = (
+    "list each origin exactly as a browser sends it in Origin, scheme://host[:port] with no "
+    "path, query, fragment or wildcard, as separate TOML list items "
+    '(ws_allowed_origins = ["https://a.example", "https://b.example"]) or, in '
+    "MEFOR_API_WS_ALLOWED_ORIGINS, comma-separated; docs/CONFIGURATION.md has the rules "
+    "(BACKLOG #3764)"
+)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# A registered name as a browser serializes it into Origin: ASCII, lower case, and no character the
+# WHATWG host parser forbids, decodes or rewrites (at least '%', '\', '<', '>', '^', '|').
+_WS_ORIGIN_HOST = re.compile(r"[a-z0-9._-]+")
+_WS_ORIGIN_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _whatwg_ipv6(address: ipaddress.IPv6Address) -> str:
+    """Serialize an IPv6 address as a browser writes it into ``Origin`` (the WHATWG URL standard).
+    ``IPv6Address.compressed`` already does, except on an IPv4-mapped address, which it writes
+    dotted where the standard writes two hex pieces."""
+    mapped = address.ipv4_mapped
+    if mapped is None:
+        return address.compressed
+    n = int(mapped)
+    return f"::ffff:{n >> 16:x}:{n & 0xFFFF:x}"
+
+
+def _split_origin(entry: str) -> tuple[SplitResult, int | None] | None:
+    """``urlsplit`` and ``.port``, or ``None`` where either refuses (a bad bracketed host, an
+    NFKC-unsafe netloc, a bad or out-of-range port). The caller raises once this has returned, so
+    the parser's error, which quotes the entry, is never on its refusal's chain."""
+    try:
+        parts = urlsplit(entry)
+        return parts, parts.port
+    except ValueError:
+        return None
+
+
+def _ipv6_or_none(host: str) -> ipaddress.IPv6Address | None:
+    """The IPv6 address ``host`` spells, or ``None``; returned rather than raised, as above."""
+    try:
+        return ipaddress.IPv6Address(host)
+    except ValueError:
+        return None
+
+
+def _check_ws_allowed_origin(entry: str, position: int) -> None:
+    """Raise ``ValueError`` unless one ``[api].ws_allowed_origins`` entry, the ``position``-th
+    (from 1), is an origin spelled as an ``Origin`` header carries it.
+
+    The handshake check is an exact string match against the ``Origin`` header, and a browser
+    always sends its own serialization, so an entry in another form loads and matches nothing: a
+    ``;``-joined list loads as one origin, and so does any text at all. An entry must therefore be
+    that serialization already. One that names a real origin in another spelling (case, a trailing
+    ``/``, a default port, an IPv6 literal's spelling) is refused with the spelling to list, rather
+    than rewritten, so what the file says is what matches. What is refused is listed in
+    docs/CONFIGURATION.md. A refusal names the entry by position and never quotes it whole: a
+    pasted URL can carry a credential in its userinfo, query or path, and the message reaches the
+    log. Only the other-spelling refusal quotes anything, the scheme, host and port to list. For
+    the same reason no refusal is raised inside a handler: the caught parser error quotes the
+    entry, and ``from exc`` or ``from None`` would keep it on the chain (BACKLOG #1796)."""
+    field = f"[api].ws_allowed_origins entry {position} (the env form skips empty fields)"
+    if "@" in entry:
+        raise ValueError(f"{field} has an '@'; userinfo is refused: {_WS_ORIGIN_FORM}")
+    if any(ch in ";," or ch.isspace() or not ch.isprintable() for ch in entry):
+        raise ValueError(
+            f"{field} holds a ';', a ',', whitespace or a control character: {_WS_ORIGIN_FORM}"
+        )
+    # Before the split: a fullwidth ':' or '@' fails urlsplit's NFKC check, and would otherwise
+    # read as a bad host or port.
+    if not entry.isascii():
+        raise ValueError(
+            f"{field} has a non-ASCII character; a non-ASCII host takes its xn-- form: "
+            f"{_WS_ORIGIN_FORM}"
+        )
+    split = _split_origin(entry)
+    if split is None:
+        raise ValueError(f"{field} has a bad host or port: {_WS_ORIGIN_FORM}")
+    parts, port = split
+    scheme = parts.scheme  # urlsplit lowercases the scheme, and .hostname the host
+    host = parts.hostname
+    if (
+        scheme not in _DEFAULT_PORTS
+        or not host
+        or parts.path not in ("", "/")
+        # urlsplit drops an empty "?" or "#", so read the raw text for them.
+        or "?" in entry
+        or "#" in entry
+    ):
+        raise ValueError(f"{field} is not a bare origin: {_WS_ORIGIN_FORM}")
+    if port == 0:
+        raise ValueError(f"{field} has port 0, which a browser blocks: {_WS_ORIGIN_FORM}")
+    if parts.netloc.startswith("["):
+        literal = _ipv6_or_none(host)
+        if literal is None:  # urlsplit passes an IPvFuture literal such as [v1.x]
+            raise ValueError(f"{field} has a bad IPv6 literal: {_WS_ORIGIN_FORM}")
+        if literal.scope_id is not None:
+            raise ValueError(f"{field} has an IPv6 zone, which no browser sends: {_WS_ORIGIN_FORM}")
+        host = f"[{_whatwg_ipv6(literal)}]"
+    elif not _WS_ORIGIN_HOST.fullmatch(host):
+        raise ValueError(
+            f"{field} has a host character no browser Origin carries: {_WS_ORIGIN_FORM}"
+        )
+    else:
+        # A browser reads a host whose last label is numeric as IPv4 and rewrites it to four
+        # decimal parts (127.1, 0x7f.0.0.1, 010.0.0.1 and 127.0.0.1. all become another string).
+        labels = host.split(".")
+        last = labels[-2] if len(labels) > 1 and not labels[-1] else labels[-1]
+        if _WS_ORIGIN_NUMERIC_LABEL.fullmatch(last) and not is_canonical_ipv4(host):
+            raise ValueError(
+                f"{field} is not an IPv4 address a browser sends as written; write it as four "
+                f"decimal parts from 0 to 255 with no leading zeros: {_WS_ORIGIN_FORM}"
+            )
+    suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
+    canonical = f"{scheme}://{host}{suffix}"
+    if canonical != entry:
+        # Quoting the canonical form is safe: it is built from the scheme, host and port alone.
+        raise ValueError(
+            f"{field} is not spelled as a browser sends it in Origin; list {canonical!r}: "
+            f"{_WS_ORIGIN_FORM}"
+        )
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1804,6 +1947,15 @@ class ApiSettings(_Section):
             _parse_trusted_proxy(entry)
         return v
 
+    @field_validator("ws_allowed_origins", mode="after")
+    @classmethod
+    def _check_ws_allowed_origins(cls, v: list[str]) -> list[str]:
+        # An entry not spelled as an Origin header loads and matches no handshake, so a client the
+        # operator meant to allow is refused with nothing naming why (BACKLOG #3764).
+        for position, entry in enumerate(v, 1):
+            _check_ws_allowed_origin(entry, position)
+        return v
+
     @field_validator("tls_client_cert_identities", mode="before")
     @classmethod
     def _cert_identities_name_an_issuer(cls, v: Any) -> Any:
@@ -2037,6 +2189,15 @@ class TlsSettings(_Section):
         )
 
 
+#: Vault BACKLOG #2608: the refused-body allowance defaults, here so the settings and
+#: pipeline/refused_body.py share one copy. Per inbound, per window: two whole bodies at the 16 MiB
+#: engine frame ceiling; refilled evenly over an hour; a head long enough for the MSH and the first
+#: segments of an HL7 message.
+REFUSED_BODY_ALLOWANCE_BYTES = 32 * 1024 * 1024
+REFUSED_BODY_WINDOW_SECONDS = 3600.0
+REFUSED_BODY_HEAD_BYTES = 8192
+
+
 class InboundSettings(_Section):
     """Inbound-connection defaults that are an operational, per-environment decision rather than
     something authored in the message graph."""
@@ -2092,6 +2253,24 @@ class InboundSettings(_Section):
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
     max_staged_depth: int = 0
+
+    # Vault BACKLOG #2608: the per-inbound refused-body allowance. A body a listener refuses before
+    # ingress (at least decode, NUL, size, declared type, parse, strict validation, streaming detach) is
+    # recorded as an ERROR row, and its length always is (with a keyed digest, never a plain hash;
+    # docs/CONFIGURATION.md says when). The WHOLE body is stored only
+    # while its inbound's rolling byte allowance covers it; past that, the first
+    # refused_body_head_bytes of it are. A body whose head is the whole of it is stored whole. This
+    # bounds the bytes a reject flood stores, never the count of refusals, and never pauses intake, so
+    # it ships on and has no off value: 0 stores only heads. A poll source's refusals are always whole. The allowance refills evenly over the
+    # window. Held per engine process; an inbound lives on one engine shard. docs/CONFIGURATION.md
+    # carries the catalog rows.
+    refused_body_allowance_bytes: int = Field(default=REFUSED_BODY_ALLOWANCE_BYTES, ge=0)
+    # The window's floor and the head's ceiling keep a typo from switching the bound off in effect:
+    # a near-zero window refills at once, and a head as large as a frame stores every body whole.
+    refused_body_window_seconds: float = Field(
+        default=REFUSED_BODY_WINDOW_SECONDS, ge=1.0, allow_inf_nan=False
+    )
+    refused_body_head_bytes: int = Field(default=REFUSED_BODY_HEAD_BYTES, ge=256, le=1024 * 1024)
 
     @field_validator("max_staged_depth")
     @classmethod
@@ -2259,8 +2438,11 @@ class PipelineSettings(_Section):
     # InternalErrorPolicy.STOP muscle (STOPPED phase + connection_stopped alert + reload/notify_work
     # re-arm), never dead-lettering the good message. "retry_forever" never STOPs — it retries the head
     # at capped backoff forever and emits a throttled lane_stuck alert once the horizon is crossed (for
-    # a deliberately-unattended flaky-infra site). Reliability-core + read ONCE at construction (a
-    # /config/reload does NOT re-read it — restart to change, exactly like claim_mode).
+    # a deliberately-unattended flaky-infra site). A pooled lane whose T17 re-pend itself fails HOLDS
+    # and retries it (BACKLOG #1611). Under "stop" the hold ends at infra_fault_stop_after failed
+    # re-pends and the lane STOPs as above; under "retry_forever" it holds on and raises one
+    # lane_stuck there. Reliability-core + read ONCE at construction (a /config/reload does NOT
+    # re-read it — restart to change, like claim_mode).
     infra_fault_policy: Literal["stop", "retry_forever"] = Field(default="stop")
     # Consecutive zero-progress T17 faults before a "stop"-policy lane transitions to STOPPED. Also the
     # "retry_forever" stuck horizon at which the throttled lane_stuck alert first fires. Under the
@@ -2909,6 +3091,16 @@ class RetentionSettings(_Section):
     # closed cell; do not let a classification table describe this window as covering `reference.value`
     # generally, which would machine-bless a false claim.
     reference_snapshot_days: int = 0
+    # Past N days, DELETE the archived copies a File inbound left in its `.processed` directory
+    # (`processed_subdir`), keyed on ARCHIVE time: the File source sets each file's mtime to the moment
+    # it archives it, so a partner's preserved old mtime cannot age a fresh copy out early. Each copy
+    # is the full clear-text inbound payload, a second PL-1 copy beside the stored body, so it is
+    # auto-bounded at the body window (owner ruling A2 of 2026-10-08, BACKLOG #1188). One level, regular
+    # files only, never through a link; `.error` is NOT swept. Only a running File inbound's directory is
+    # swept, and one that overlaps a directory it must not reach is refused (the list is
+    # docs/CONFIGURATION.md, `processed_archive_days`). 0 = keep forever, which an enforcing PHI
+    # instance refuses unless `allow_unbounded_phi` is set.
+    processed_archive_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
@@ -3005,9 +3197,10 @@ class RetentionSettings(_Section):
     vacuum_at: str = ""
     # Secure-by-default opt-out (#186a, ASVS 14.2.4): `serve` refuses to start under
     # [security].enforcement=enforce (warns under enforcement = warn) when an auto-bounded PHI window
-    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`
-    # (`auto_bounded_windows()` is the list; the first two keep FULL raw message bodies until
-    # purged, the third covers orphaned reference snapshots only) — so PHI does not
+    # is unbounded — `messages_days`, `dead_letter_days`, `reference_snapshot_days` and
+    # `processed_archive_days` (`auto_bounded_windows()` is the list; the first two keep FULL raw
+    # message bodies until purged, the third covers orphaned reference snapshots only, the fourth the
+    # File source's `.processed` copies) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
     # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
     # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
@@ -3029,6 +3222,7 @@ class RetentionSettings(_Section):
         "app_log_compress_days",
         "search_preset_days",
         "reference_snapshot_days",
+        "processed_archive_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
@@ -3221,11 +3415,14 @@ class AuthSettings(_Section):
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
     # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
-    # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
-    # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
-    # it **refuses to start** on a production instance and **warns** on a non-production one, mirroring
-    # the keyless-store / open-egress startup gates (see __main__._serve), so MFA can't be silently
-    # skipped at exposure. Scope: since ASVS 6.3.3 it gates **every authorized route** for an in-scope
+    # An exposed instance MUST keep this on; ``serve`` makes that posture explicit (sec-mfa-on). Exposed
+    # is ``_serve``'s ``instance_exposed``: an off-loopback bind, a declared TLS-terminating proxy, or a
+    # set ``[api].trusted_proxies`` (vault BACKLOG #2251), on a loopback bind too. With this
+    # **explicitly opted out** there, ``serve`` **refuses to start** under ``[security].enforcement =
+    # "enforce"`` unless ``[security].allow_single_factor_admin_when_exposed`` lowers that to an
+    # audited warning, and **warns** under ``warn``, whatever the environment (see __main__._serve),
+    # so MFA can't be silently skipped at exposure.
+    # Scope: since ASVS 6.3.3 it gates **every authorized route** for an in-scope
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
     require_mfa: bool = True
@@ -3331,9 +3528,9 @@ class AuthSettings(_Section):
     lockout_minutes: int = 15
     # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
     # doubles per cycle only where the owner has a way past it (the second-step lock on a local
-    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
-    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
-    # `lockout_minutes`.
+    # account, and the sign-in lock on a local account with TOTP enrolled or a discoverable passkey
+    # under the configured relying party, BACKLOG #3937); every other lock keeps `lockout_minutes`.
+    # 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least `lockout_minutes`.
     lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
@@ -3374,6 +3571,14 @@ class AuthSettings(_Section):
     # independent of [security].enforcement (a substituted AD anchor permits an LDAPS MITM). Dormant
     # when None. Block-scoped (direct-read by the preflight, not desugared).
     ad_tls_ca_cert_pin: str | None = None
+    # BACKLOG #2193: optional PEM file of CRLs checked against the domain controller's certificate on
+    # every LDAPS bind. The LDAPS context resolves no [tls] trust anchor, so [tls].crl_file never
+    # reaches it: this is the hop's own knob, as oidc_tls_crl_file is the IdP's. Each bind builds a
+    # fresh context and loads this file again, so a replaced CRL reaches the next bind. Same
+    # fail-closed refusals as every other CRL: absent or blank at load, unloadable or past
+    # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
+    # instance is refused when serve builds the auth service.
+    ad_tls_crl_file: str | None = None
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -3854,10 +4059,10 @@ class AuthSettings(_Section):
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
-    @field_validator("oidc_tls_crl_file")
+    @field_validator("ad_tls_crl_file", "oidc_tls_crl_file")
     @classmethod
-    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
-        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
+    def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
 
     @field_validator("kerberos_spn")
     @classmethod
@@ -5149,7 +5354,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "gcm_invocations",
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
-        "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
+        # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever), or is
+        # held retrying a failed re-pend of its claimed rows under it (BACKLOG #1611).
+        "lane_stuck",
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
@@ -10099,7 +10306,9 @@ def security_loosenings(
                 "cleartext_accepted",
                 f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
                 f"({named}) — the payload, and any credential the connection carries, ride those hops "
-                "unencrypted and readable by anything on the path",
+                "unencrypted and readable by anything on the path, except an HTTP-family credential "
+                "other than a forward-proxy login, which is still refused to a host off this machine "
+                "(vault BACKLOG #3533 item 4)",
             )
         )
     if expiry_relaxed_hops:
@@ -10166,7 +10375,9 @@ def security_loosenings(
                 f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
-                "and any credential cross in the clear",
+                "and any credential cross in the clear, except an HTTP-family credential other than "
+                "a forward-proxy login, which is still refused over cleartext http off this machine "
+                "or with verification off",
             )
         )
     if revocation_attested_hops:
@@ -10455,3 +10666,77 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
     ):
         return KEYLESS_REFUSED_BY_NO_STRICT_ACK
     return None
+
+
+#: Directory settings whose WHOLE tree the engine owns (BACKLOG #1188): an archive inside one is
+#: refused as well as one that is or holds it. ``base_dir`` is the config-repo root, which commonly
+#: holds watch directories, so it is guarded as a directory only.
+_OWNED_TREE_NAMES: frozenset[str] = frozenset({"destination"})
+_NOT_A_TREE: frozenset[str] = frozenset({"base_dir"})
+
+
+def engine_owned_dirs(
+    models: Iterable[object],
+    *,
+    dirs: Iterable[str | Path | None] = (),
+    trees: Iterable[str | Path | None] = (),
+    files: Iterable[str | Path | None] = (),
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The engine's own directories, which no ``.processed`` archive sweep may reach (BACKLOG #1188),
+    as ``(dirs, trees)``: an archive directory that is, or holds, any of either is refused, and one
+    inside a tree is refused too.
+
+    Read from every settings model given, recursively, by field name, so a setting added later is
+    covered without a list to keep: at least a ``*_file``, ``*_files`` or ``*_path`` setting (and the
+    store's ``path`` and ``[logging].file``) contributes its parent directory, and a ``*_dir`` setting or the backup
+    ``destination`` contributes a tree (``base_dir``, the config-repo root, only a directory). A value
+    that names a URL is skipped. ``dirs``, ``trees`` and ``files`` add paths the settings models do
+    not hold, the config directory or the served TLS certificate say. Relative paths are taken
+    against the working directory, as the engine opens them."""
+    out_dirs: list[Path] = []
+    out_trees: list[Path] = []
+
+    def usable(value: object) -> str | None:
+        if isinstance(value, Path):
+            value = str(value)
+        if not isinstance(value, str) or not value.strip() or "://" in value:
+            return None
+        return value
+
+    def add_file(value: object) -> None:
+        if (v := usable(value)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)).parent)
+
+    def walk(model: object, seen: set[int]) -> None:
+        if not isinstance(model, BaseModel) or id(model) in seen:
+            return
+        seen.add(id(model))
+        for name in type(model).model_fields:
+            value = getattr(model, name, None)
+            if isinstance(value, BaseModel):
+                walk(value, seen)
+            elif name.endswith("_url") or "redirect" in name:
+                continue
+            elif name.endswith("_files") and isinstance(value, list | tuple):
+                for item in value:
+                    add_file(item)
+            elif name.endswith(("_file", "_path")) or name in ("path", "file"):
+                add_file(value)
+            elif (name.endswith("_dir") or name in _OWNED_TREE_NAMES) and (
+                v := usable(value)
+            ) is not None:
+                target = out_dirs if name in _NOT_A_TREE else out_trees
+                target.append(Path(os.path.abspath(v)))
+
+    seen: set[int] = set()
+    for model in models:
+        walk(model, seen)
+    for d in dirs:
+        if (v := usable(d)) is not None:
+            out_dirs.append(Path(os.path.abspath(v)))
+    for d in trees:
+        if (v := usable(d)) is not None:
+            out_trees.append(Path(os.path.abspath(v)))
+    for f in files:
+        add_file(f)
+    return tuple(dict.fromkeys(out_dirs)), tuple(dict.fromkeys(out_trees))

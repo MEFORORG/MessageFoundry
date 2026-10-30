@@ -1314,6 +1314,7 @@ class _RecordingAlertSink:
         self.errors.append((name, kind))
 
     def connection_restored(self, name: str) -> None: ...
+    def connection_started(self, name: str) -> None: ...
 
 
 def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:

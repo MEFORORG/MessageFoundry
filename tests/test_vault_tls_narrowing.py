@@ -812,6 +812,9 @@ def test_a_send_time_refusal_keeps_its_text_through_the_transit_cipher(
     client = _transit_client("http://127.0.0.1:9")
     cipher = crypto_transit.TransitCipher(client, "mefor-store-dek")
     monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token, **_: client)
+    # The address the client holds, and a token: both required since BACKLOG #2851.
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", "http://127.0.0.1:9")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-store-dek")
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
     calls: dict[str, Any] = {
@@ -837,6 +840,9 @@ def test_a_send_time_refusal_keeps_its_text_through_the_key_provider(
 
     client = _transit_client("http://127.0.0.1:9")
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token, **_: client)
+    # The address the client holds, and a token: both required since BACKLOG #2851.
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", "http://127.0.0.1:9")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "mefor-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
     monkeypatch.setenv("HTTP_PROXY", proxy.url)

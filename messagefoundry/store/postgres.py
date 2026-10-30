@@ -52,6 +52,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import ssl
@@ -98,11 +99,14 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
+    SchemaDdlLockTimeout,
+    SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
     acquire_pooled,
+    driver_sqlstate,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -189,6 +193,7 @@ from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _LAST_RECEIVED_SQL,
     _SESSION_CAP_ORDER_SQL,
     AD_MAPS,
     AD_ROLE_MAP,
@@ -255,6 +260,7 @@ from messagefoundry.store.store import (
     TotpUsable,
     UserAuthzRecord,
     UserChange,
+    UsernameAuditAppendError,
     UserRecord,
     UserRow,
     WebAuthnCredential,
@@ -266,6 +272,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    append_rename_audits,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -276,6 +283,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -430,6 +438,19 @@ _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
 _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
 
+#: SQLSTATE lock_not_available: a statement waited out lock_timeout (BACKLOG #1726).
+_LOCK_NOT_AVAILABLE: Final = "55P03"
+
+#: Sets the schema transaction's lock_timeout to $1 ms, unless the session already has a stricter
+#: one (BACKLOG #1726). 0 means no limit, so it never counts as stricter. pg_settings reports
+#: lock_timeout in ms.
+_DDL_LOCK_TIMEOUT_SQL: Final = (
+    "SELECT pg_catalog.set_config('lock_timeout',"
+    " CASE WHEN s.setting::bigint > 0 AND s.setting::bigint < $1::bigint"
+    " THEN s.setting ELSE $1::bigint::text END, true)"
+    " FROM pg_catalog.pg_settings s WHERE s.name = 'lock_timeout'"
+)
+
 # H1 epoch-fence guard templates (ADR 0157 C1/C2). Templates rather than literals because the guard
 # lands at a different `$N` at every site; `{h}` is bound once and referenced twice, already the house
 # idiom (see the twice-referenced `$5` at claim_next_fifo). `leader_lease.leader_epoch` is BIGINT, so
@@ -523,6 +544,7 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
+    # ix_messages_received (BACKLOG #1726) is built in _migrate_lease_columns; _RECEIVED_INDEX_DDL says why.
     """CREATE TABLE IF NOT EXISTS queue (
         id               TEXT PRIMARY KEY,
         message_id       TEXT NOT NULL REFERENCES messages(id),
@@ -1194,7 +1216,15 @@ _SCHEMA.append(
 # columns) are ADDed in the same function. Same contract, same caveat.
 # 6 (ADR 0197 Amendment A, BACKLOG #1131): the users.password_generated ADD lands in the same
 # function. Same contract, same caveat.
-_MIGRATION_REV = 6
+# 7 (BACKLOG #1726): the same function builds ix_messages_received. Same contract. This bump is the
+# only thing that moves the hash for it, since _SCHEMA is unchanged.
+_MIGRATION_REV = 7
+
+# BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
+# is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
+# timeout=inf, for the reason its FIFO covering-index comment gives: an existing store's first build
+# scans the whole table.
+_RECEIVED_INDEX_DDL = "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)"
 
 
 def _schema_hash() -> str:
@@ -1957,25 +1987,62 @@ class PostgresStore:
                 # first-upgrade FIFO index rebuild (in _migrate_lease_columns) isn't killed by a
                 # role/database-configured statement_timeout → txn abort → startup crash-loop. This covers
                 # only the server side; asyncpg ALSO imposes a client-side command_timeout, exempted
-                # per-statement with timeout=inf on the FIFO rebuild itself. SET LOCAL scopes to this txn
-                # and auto-reverts at commit.
+                # per-statement with timeout=inf on the long builds in _migrate_lease_columns. SET LOCAL
+                # scopes to this txn and auto-reverts at commit.
                 await conn.execute("SET LOCAL statement_timeout = 0")
-                await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK)
-                # Double-check under the lock: the peer this open queued behind may have just applied
-                # this exact batch and committed its marker — then there is nothing to do.
+                # The wait is bounded by [store].schema_lock_timeout, not command_timeout (BACKLOG
+                # #1726), on both server backends. A peer engine shard or cluster node holding this
+                # lock runs the same batch with its builds exempt from command_timeout, so bounding
+                # the wait by command_timeout would fail this open at startup while the peer's
+                # upgrade is still healthy. It stays bounded (ADR 0060 prefers a bounded wait that
+                # fails transiently and recoverably): on expiry asyncpg cancels the wait, the
+                # transaction rolls back with nothing applied, and the next open retries the
+                # idempotent batch. The lock is transaction-scoped: it is released when the holder
+                # commits or rolls back, or once the server sees the holder's session end, which
+                # for a crashed host can take as long as TCP keepalive allows. A role- or
+                # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
+                log.info("postgres: waiting for the schema lock to apply the DDL batch")
+                wait = self._settings.schema_lock_timeout
+                lock = self._lock_key(_SCHEMA_LOCK)
+                try:
+                    await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK, timeout=wait)
+                except TimeoutError as exc:
+                    # asyncpg's client timeout carries no errno; an OS-level ETIMEDOUT (also a
+                    # TimeoutError) is a network fault, not a lock wait, so it propagates as is.
+                    if exc.errno is not None:
+                        raise
+                    raise SchemaLockTimeout(self.backend, lock, wait) from exc
+                # Double-check under the lock: the peer this open queued behind may have just
+                # applied this exact batch and committed its marker — then there is nothing to do.
                 if await self._schema_marker_current(conn, expected):
                     log.debug("postgres: schema applied by a peer (%s…) — skipped", expected[:12])
                     return False
-                for statement in _SCHEMA:
-                    await conn.execute(statement)
-                await self._migrate_lease_columns(conn)
-                await conn.execute(
-                    "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, $2)"
-                    " ON CONFLICT (id) DO UPDATE"
-                    " SET schema_hash = EXCLUDED.schema_hash, applied_at = EXCLUDED.applied_at",
-                    expected,
-                    time.time(),
-                )
+                # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The builds run with
+                # statement_timeout 0, so without this a CREATE INDEX or ALTER queued behind any open
+                # transaction on its table waits forever while holding the schema lock, and its
+                # queued SHARE-lock request also blocks every later write to that table. lock_timeout
+                # bounds only each lock wait, never how long a build runs once it has its lock. Set
+                # AFTER the advisory lock so that wait keeps its own client-side bound. It only
+                # tightens: a stricter role- or database-configured lock_timeout is kept. Local to
+                # this transaction, so it reverts at commit or rollback.
+                await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(wait * 1000))
+                try:
+                    for statement in _SCHEMA:
+                        await conn.execute(statement)
+                    await self._migrate_lease_columns(conn)
+                    await conn.execute(
+                        "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, $2)"
+                        " ON CONFLICT (id) DO UPDATE"
+                        " SET schema_hash = EXCLUDED.schema_hash, applied_at = EXCLUDED.applied_at",
+                        expected,
+                        time.time(),
+                    )
+                except Exception as exc:
+                    # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
+                    # error rather than by importing the lazy driver.
+                    if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
+                        raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
+                    raise
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
 
@@ -2090,7 +2157,9 @@ class PostgresStore:
         open. Gating on ``information_schema`` keeps re-opens of an already-migrated DB lock-free
         (this runs under the schema advisory lock alongside the CREATEs). Also creates the lease
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
-        would reference a not-yet-added column if it lived in the _SCHEMA loop."""
+        would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
+        builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
+        ix_messages_received), which the _SCHEMA loop cannot give per statement."""
         present = {
             r["column_name"]
             for r in await conn.fetch(
@@ -2138,6 +2207,7 @@ class PostgresStore:
         )
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
+        await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
@@ -2535,13 +2605,19 @@ class PostgresStore:
         database-scoped, not schema-scoped)."""
         return f"{self._settings.db_schema or 'public'}:{key}"
 
-    async def _advisory_lock(self, conn: Any, classid: int, key: str) -> None:
+    async def _advisory_lock(
+        self, conn: Any, classid: int, key: str, *, timeout: float | None = None
+    ) -> None:
         """Take a transaction-scoped advisory lock in the ``classid`` family (auto-released at commit).
         Uses the two-key form so each family has its own 32-bit hashtext namespace (no cross-family
-        collisions)."""
-        await conn.execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))", classid, self._lock_key(key)
-        )
+        collisions). ``timeout`` overrides asyncpg's client-side ``command_timeout`` for the wait;
+        ``None`` keeps the pool default."""
+        sql = "SELECT pg_advisory_xact_lock($1, hashtext($2))"
+        # Only an override passes the keyword, so every other lock's call is unchanged.
+        if timeout is None:
+            await conn.execute(sql, classid, self._lock_key(key))
+        else:
+            await conn.execute(sql, classid, self._lock_key(key), timeout=timeout)
 
     async def _lock_outbound_lanes(self, conn: Any, destinations: Iterable[str]) -> None:
         """ADR 0090 strict-FIFO writer-funnel: take the per-lane advisory lock for each distinct
@@ -8763,6 +8839,7 @@ class PostgresStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
@@ -8781,6 +8858,7 @@ class PostgresStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------
@@ -8980,7 +9058,13 @@ class PostgresStore:
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
@@ -9023,23 +9107,55 @@ class PostgresStore:
         # BACKLOG #2592: the guard is now a read in the same transaction, then the sealed write
         # under the account's row lock. It still only narrows the window, as above, and the
         # unique index is still what refuses the loser.
+        #
+        # BACKLOG #3018 step 7: ``audits`` are appended only when the write landed, inside its
+        # transaction, so a failed append rolls the rename back (AuthStore says why). The append
+        # takes the audit advisory lock while the write holds the account's row lock, the order
+        # ``_execute_with_audits`` uses.
         now = time.time() if now is None else now
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            taken = await conn.fetchrow(
-                "SELECT 1 FROM users WHERE username=$1 AND id<>$2", username, user_id
+        lost: UsernameAuditAppendError | None = None
+        try:
+            async with self._timed_acquire(record=False) as conn, conn.transaction():
+                taken = await conn.fetchrow(
+                    "SELECT 1 FROM users WHERE username=$1 AND id<>$2", username, user_id
+                )
+                if taken is not None:
+                    return False
+                written = await self._write_user(
+                    conn,
+                    user_id,
+                    lambda r: (
+                        r.changed(username=username, updated_at=float(now))
+                        if r.row.username == expected_username
+                        else None
+                    ),
+                )
+                if written is None:
+                    return False
+                try:
+                    appended = await append_rename_audits(
+                        lambda: self._append_audits(conn, audits, now=now)
+                    )
+                except UsernameAuditAppendError as exc:
+                    lost = exc
+                    raise
+        except Exception as exc:
+            # After a failed append, a failure in the rollback or the release after it replaces the
+            # append's error. No COMMIT was sent, so the rename did not commit, and the caller is
+            # owed the append's error: read as a plain store fault, it would end a reconciler pass.
+            # Recorded at the append, never read off the exception chain, so it holds however many
+            # errors follow it.
+            if lost is None or exc is lost:
+                raise
+            log.warning(
+                "postgres: after a failed rename audit append, the rollback or the release failed "
+                "too (%s)",
+                type(exc).__name__,
             )
-            if taken is not None:
-                return False
-            written = await self._write_user(
-                conn,
-                user_id,
-                lambda r: (
-                    r.changed(username=username, updated_at=float(now))
-                    if r.row.username == expected_username
-                    else None
-                ),
-            )
-        return written is not None
+        if lost is not None:
+            raise lost
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
@@ -9593,6 +9709,7 @@ class PostgresStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -9605,28 +9722,43 @@ class PostgresStore:
         ``auth_provider`` that decides the escalation (ADR 0197), and for the SIGN-IN lock the
         TOTP's refusal is judged by ``totp_usable`` before the lock, only for a failure that would
         set a later-cycle lock, on a cell the locked row must still hold
-        (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an
+        (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the escalation is
+        ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns ``(0, False, 0)`` for an
         unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
         async with self._timed_acquire() as conn, conn.transaction():
+            # The passkey set the escalation reads is read in the write's own transaction, after
+            # the account row is locked, so a concurrent passkey write waits (BACKLOG #3937 item 8).
+            passkeys = await escalation_passkeys(
+                counter,
+                passkey_escalates=passkey_escalates,
+                threshold=threshold,
+                now=now,
+                read_record=lambda: self._read_user_record(conn, user_id),
+                read_passkeys=lambda: self._account_passkeys(conn, user_id),
+            )
+            change = lockout_increment(
+                counter,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                now=now,
+                out=out,
+                totp_counts=totp_counts,
+                passkeys=passkeys,
+                sealed=self._row_sealer is not None,
+                passkey_escalates=passkey_escalates,
+            )
             written = await self._write_user(conn, user_id, change)
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
@@ -10630,9 +10762,9 @@ class PostgresStore:
             since,
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in count_rows}
-        last_rows = await self._fetchall(
-            "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
-        )
+        # BACKLOG #1726: the SQLite store's loose index scan, as one string. Its result is pinned
+        # against the old GROUP BY on the gated Postgres leg; its plan here is not measured.
+        last_rows = await self._fetchall(_LAST_RECEIVED_SQL)
         inbound: dict[str, InboundMetrics] = {}
         for r in last_rows:
             read, errored = counts.pop(r["channel_id"], (0, 0))

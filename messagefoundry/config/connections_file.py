@@ -183,7 +183,8 @@ _INBOUND_KEYS = frozenset(
         # the factory's schema would accept. Under [settings] it is refused.
         "tls_hop_attested",
         "tls_hop_attested_reason",
-        # ADR 0173: the per-connection revocation attestation for an mTLS listener. TOP-LEVEL for the
+        # ADR 0173: the per-connection revocation attestation for an mTLS listener, or for an FTPS
+        # poller, which dials out (BACKLOG #2193). TOP-LEVEL for the
         # same reason as the outbound cleartext pair below: a hop-policy declaration, not a transport
         # setting the factory's schema would accept.
         "tls_revocation_attested",

@@ -67,8 +67,9 @@ __all__ = [
     "worker_environment",
 ]
 
-#: The engine's own settings and secrets are named with this prefix. The libraries it uses read
-#: other names as well; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
+#: The engine's own settings and secrets are named with this prefix. Secrets under other names are
+#: kept from children too; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the ones known here,
+#: and its comment says why each is there.
 ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
 #: The interpreter options every Python child is started with. Each child starts a script,
@@ -204,11 +205,13 @@ _WINDOWS_SHELL_NAMES: Final = frozenset(
     }
 )
 
-#: Secrets the engine may rely on that are not named ``MEFOR_*``, because a library it uses reads
-#: them when the engine's own setting is unset. At least these two: hvac falls back to
-#: ``VAULT_TOKEN`` when ``MEFOR_STORE_VAULT_TOKEN`` or ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, and
-#: asyncpg falls back to ``PGPASSWORD`` when ``[store].password`` is unset. A list of names, so it
-#: can be incomplete; the module docstring says what that leaves.
+#: Secrets outside the ``MEFOR_*`` prefix that are kept from every child process and refused in
+#: ``pass_environment``. At least these two. asyncpg falls back to ``PGPASSWORD`` when
+#: ``[store].password`` is unset. ``VAULT_TOKEN`` is no longer read by the engine, whose Vault
+#: clients refuse an unset ``MEFOR_*_VAULT_TOKEN`` rather than let hvac fall back (BACKLOG
+#: #2851); it stays because an operator's own Vault token, inherited from the shell that started
+#: the engine, is still a secret a Router, a Handler or a hook has no business holding. A list of
+#: names, so it can be incomplete; the module docstring says what that leaves.
 ENGINE_SECRETS_OUTSIDE_THE_PREFIX: Final = frozenset({"VAULT_TOKEN", "PGPASSWORD"})
 
 
@@ -228,8 +231,8 @@ def _allowed_for_a_worker(name: str, extra_names: Collection[str]) -> bool:
 
 
 def outside_engine_namespace(name: str) -> bool:
-    """Whether ``name`` is neither one of the engine's own ``MEFOR_*`` variables nor a secret a
-    library reads on its behalf. Upper-cased on every platform: Windows reads ``mefor_x`` and
+    """Whether ``name`` is neither one of the engine's own ``MEFOR_*`` variables nor one of the
+    secrets in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`. Upper-cased on every platform: Windows reads ``mefor_x`` and
     ``MEFOR_X`` as one variable, and on POSIX refusing the lower-case spelling costs nothing."""
     upper = name.upper()
     return (

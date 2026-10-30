@@ -21,6 +21,15 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.crypto import PREFIX, make_cipher
 from messagefoundry.store.keyprovider import KeyProviderError, resolve_key_provider
+from tests._vault_hop_env import STORE, supply_vault_hop
+
+
+@pytest.fixture(autouse=True)
+def _store_vault_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key provider refuses an unset address or token before any client is built (BACKLOG
+    #2851), so every test here names both."""
+    supply_vault_hop(monkeypatch, STORE)
+
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 

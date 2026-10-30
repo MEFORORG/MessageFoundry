@@ -113,6 +113,69 @@ async def test_a_repeat_returns_the_open_request_and_files_nothing(store: Messag
     assert json.loads(str(repeated[0]["detail"])) == {"approval_id": first, "operation": _OP}
 
 
+async def test_a_cancelled_rejoin_still_writes_its_repeat_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3740 item 9: a rejoin's ``approval.request_repeated`` write outlives a cancelled
+    caller, as the guard's write does (vault BACKLOG #3193), and ``drain`` waits for it. The purge
+    core now rejoins a renamed requester's repeat after its proof, where a request deadline or a
+    shutdown can cancel it."""
+    gate = _gate(store)
+    held = await _guard(gate)
+    started, release = asyncio.Event(), asyncio.Event()
+    write = store.record_audit
+
+    async def _slow_write(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return await write(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", _slow_write)
+    call = asyncio.ensure_future(
+        gate.rejoin(_OP, {"channel_id": "IB_A"}, requester="maker", requester_user_id=_REQUESTER_ID)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+    finally:
+        # Released and drained whatever failed above, so no write is left pending at teardown.
+        release.set()
+        stuck = await gate.drain()
+    assert stuck == []
+    repeated = await store.list_audit(action="approval.request_repeated")
+    # Before the fix: [], because the cancel reached the write itself.
+    assert [json.loads(str(r["detail"]))["approval_id"] for r in repeated] == [held]
+
+
+async def test_rejoin_requester_name_modes(store: MessageStore) -> None:
+    """BACKLOG #3740 item 9: what each ``requester_name`` joins, keyed on the requester's id."""
+    gate = _gate(store)
+    filed = {"channel_id": "IB_A", "requester": "maker"}
+    held = await _guard(gate, filed)
+    renamed = {**filed, "requester": "maker2"}
+
+    async def _rejoin(params: Mapping[str, Any], mode: Any, user_id: str = _REQUESTER_ID) -> Any:
+        return await gate.rejoin(
+            _OP, params, requester="maker", requester_user_id=user_id, requester_name=mode
+        )
+
+    assert await _rejoin(filed, "same") == held
+    assert await _rejoin(renamed, "same") is None
+    assert await _rejoin(filed, "any") == held
+    assert await _rejoin(renamed, "any") == held
+    # "renamed" leaves an exact repeat to guard's serialized step.
+    assert await _rejoin(filed, "renamed") is None
+    assert await _rejoin(renamed, "renamed") == held
+    # Another person never joins, whatever the name.
+    assert await _rejoin(filed, "any", "maker-2-id") is None
+    assert await _rejoin({"channel_id": "IB_B", "requester": "maker2"}, "any") is None
+    # An unknown mode fails closed rather than widening the match.
+    with pytest.raises(ValueError, match="requester_name"):
+        await _rejoin(renamed, "exact")
+
+
 async def test_concurrent_repeats_file_one_request(store: MessageStore) -> None:
     """The race the IDE and the console could both reach: several identical calls in flight."""
     gate = _gate(store)

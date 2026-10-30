@@ -700,8 +700,17 @@ def test_the_store_open_check_reads_the_pin_once(
             opened.append(pin)
         return real_open(file, *args, **kwargs)  # type: ignore[call-overload]
 
+    real_os_open = os.open
+
+    def counting_os_open(file: object, *args: object, **kwargs: object) -> int:
+        # The anchor read opens by descriptor since vault BACKLOG #3090, so a pipe never waits.
+        if isinstance(file, (str, os.PathLike)) and os.fspath(file) == pin:
+            opened.append(pin)
+        return real_os_open(file, *args, **kwargs)  # type: ignore[arg-type]
+
     monkeypatch.setattr(builtins, "open", counting_open)
     monkeypatch.setattr(io, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_os_open)
     check_pinned_certificate(settings, posture=HopPosture(enforcing=True))
     assert opened == [pin]
 

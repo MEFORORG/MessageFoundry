@@ -22,23 +22,31 @@ Three layers, because pinning the five fixed pages cannot catch a SIXTH bare pag
 from __future__ import annotations
 
 import ast
-import json
+import logging
+import time
 from pathlib import Path
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 import messagefoundry_webconsole
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import _LOGOUT_LINEAGE_SECONDS, AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole import pages
+from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
 LOGOUT_FORM = 'action="/ui/logout"'
+
+#: The logger :meth:`AuthService.logout` writes its fail-soft ERROR lines to.
+_SERVICE_LOGGER = "messagefoundry.auth.service"
 
 #: The pages/*.py builders allowed to suppress the nav entirely: both are reached WITHOUT a session.
 UNAUTHENTICATED_BARE_BUILDERS = frozenset({"login", "sso_challenge"})
@@ -184,14 +192,6 @@ async def _service(engine: Engine) -> AuthService:
     return service
 
 
-async def _logout_rows(engine: Engine) -> list[tuple[object, object, object]]:
-    """Each ``auth.logout`` row as its actor, client address and ``outcome``."""
-    return [
-        (r["actor"], r["client"], json.loads(str(r["detail"] or "{}")).get("outcome"))
-        for r in await engine.store.list_audit(action="auth.logout")
-    ]
-
-
 async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> None:
     """A must_change_password account is confined to /ui/account/password. The page now renders the
     Sign-out form, and POST /ui/logout — which has no Depends gate precisely so this works — really
@@ -231,7 +231,7 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
     # BACKLOG #3029: the route passes no actor, so the auth.logout row names the owner of the
     # session it ended rather than carrying a NULL actor. BACKLOG #3339: it also records the
     # address the sign-out came from.
-    assert await _logout_rows(engine) == [("rotate", PEER_ADDRESS, "revoked")]
+    assert await logout_rows(engine.store) == [("rotate", PEER_ADDRESS, "revoked")]
 
 
 async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_address(
@@ -241,15 +241,336 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
     owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
     the test above, it shows the actor there comes from the session, not from the request.
 
-    It pins the CURRENT behaviour, which is still open: an unauthenticated sign-out can append a
-    row for a cookie naming no session (engine PR 2384, open finding 6, held by vault BACKLOG
-    #3749). A fix that writes no row here, or bounds the rows, is expected to change this test."""
+    No budget drops such a row (BACKLOG #3749 item 6): ``tests/test_session_supersession.py``
+    drives many of them from one address, and docs/SECURITY.md names the unbounded growth as an
+    open gap."""
     service = await _service(engine)
+    out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
+    assert out.status_code == 303
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+
+
+async def _signed_in_operator(engine: Engine) -> tuple[AuthService, str]:
+    """A service with one operator, and a console session cookie for it, minted by a direct
+    ``login`` call that names no client address."""
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    user_id = await create_local_user_chosen(
+        service,
+        username="op",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await engine.store.set_password(
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
+    )
+    outcome = await service.login("op", PW)
+    assert outcome.ok and outcome.token is not None
+    return service, outcome.token
+
+
+async def _sign_out_with(engine: Engine, service: AuthService, cookie: str) -> httpx.Response:
     transport = httpx.ASGITransport(
         app=create_app(engine, auth=service, serve_ui=True), client=(PEER_ADDRESS, 51234)
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        c.cookies.set("mf_session", "a-token-that-names-no-session")
-        out = await c.post("/ui/logout")
-        assert out.status_code == 303
-    assert await _logout_rows(engine) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+        c.cookies.set("mf_session", cookie)
+        return await c.post("/ui/logout")
+
+
+async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_successor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3715, #3749 item 3. An elevation in another tab re-keys the session while this
+    tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
+    the elevation the sign-out follows the link, ends the session under its new token, and the
+    row names the owner, where it used to keep a NULL actor and leave the session live. The clock
+    is FROZEN 2 seconds inside the bound, read after the rotation, so runner speed cannot move it."""
+    service, old = await _signed_in_operator(engine)
+    successor = await service._rotate_session_token(old)
+    assert successor is not None, "the rotation failed closed, so the race was not driven"
+    rotated_at = time.time()
+    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS - 2.0)
+    out = await _sign_out_with(engine, service, old)
+    assert out.status_code == 303
+    assert await service.identity_for_token(successor, activity=False) is None
+    assert await logout_rows(engine.store) == [("op", PEER_ADDRESS, "revoked")]
+    assert await logout_details(engine.store) == [
+        {
+            "outcome": "revoked",
+            "session": hash_token(successor)[:12],
+            "presented": hash_token(old)[:12],
+        }
+    ]
+
+
+async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above, one second past the 5-second window. This route carries no
+    credential, so a retired cookie leads nowhere after that: nothing is revoked, the row says
+    ``nothing_to_revoke`` and has no owner to name."""
+    service, old = await _signed_in_operator(engine)
+    successor = await service._rotate_session_token(old)
+    assert successor is not None
+    rotated_at = time.time()
+    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    out = await _sign_out_with(engine, service, old)
+    assert out.status_code == 303
+    assert await service.identity_for_token(successor, activity=False) is not None
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "nothing_to_revoke")]
+
+
+async def test_ui_logout_clears_the_cookie_when_the_row_fails_after_the_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3884 item 1. Once the session ended, a refused ``auth.logout`` row used to raise
+    through the route, which answered 500 and never cleared the cookie or sent Clear-Site-Data.
+    The sign-out has happened, so the route must still finish it."""
+    service, token = await _signed_in_operator(engine)
+    real_record = engine.store.record_audit
+
+    async def _refuse_logout_row(action: str, **kwargs: object) -> None:
+        if action == "auth.logout":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await service.identity_for_token(token, activity=False) is None
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {hash_token(token)[:12]}, but its auth.logout row failed"
+    ]
+
+
+def _assert_signed_out(out: httpx.Response) -> None:
+    """The route finished the sign-out: it redirected, sent Clear-Site-Data and expired the cookie."""
+    assert out.status_code == 303
+    assert "clear-site-data" in out.headers
+    assert any(
+        "mf_session=" in header and "max-age=0" in header.lower()
+        for header in out.headers.get_list("set-cookie")
+    ), out.headers.get_list("set-cookie")
+
+
+def _error_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER and r.levelno == logging.ERROR
+    ]
+
+
+async def test_ui_logout_clears_the_cookie_when_the_owner_lookup_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3884 item 1, the owner-lookup branch. The session ended, then reading its owner
+    failed: the route still finishes the sign-out, the row is written with no actor, and the ERROR
+    line names the session."""
+    service, token = await _signed_in_operator(engine)
+
+    async def _refuse_owner(user_id: str) -> object:
+        raise OSError("the user store refused the read")
+
+    # Scoped to the sign-out, so a session left live fails the check below on its own terms
+    # rather than on this planted fault.
+    caplog.clear()  # only the sign-out's own lines are asserted below
+    with monkeypatch.context() as patch, caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        patch.setattr(engine.store, "get_user", _refuse_owner)
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await service.identity_for_token(token, activity=False) is None
+    assert await logout_rows(engine.store) == [(None, PEER_ADDRESS, "revoked")]
+    session = hash_token(token)[:12]
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {session}, but its owner could not be read; its auth.logout "
+        "row names no actor and any temporary credential it holds is not checked for a lapse"
+    ]
+
+
+async def test_ui_logout_clears_the_cookie_when_a_row_for_nothing_ended_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3884 item 1, the ``nothing_to_revoke`` branch. The cookie names no session, and
+    the row recording that is refused: the route still finishes the sign-out and logs an ERROR
+    line. No session ended, so the line has none to name."""
+    service = await _service(engine)
+    real_record = engine.store.record_audit
+
+    async def _refuse_logout_row(action: str, **kwargs: object) -> None:
+        if action == "auth.logout":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_logout_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == []
+    assert _error_lines(caplog) == [
+        "a sign-out that ended nothing could not write its auth.logout row"
+    ]
+
+
+#: The temporary-credential lifetime the tests below configure, in hours.
+_EXPIRY_HOURS = 72
+
+
+async def _temporary_credential_session(engine: Engine) -> tuple[AuthService, str, str]:
+    """A service whose temporary credentials last ``_EXPIRY_HOURS``, an operator holding one,
+    and a session that operator opened before the deadline. Returns the service, the account id
+    and the session token; the deadline is still 30 seconds ahead."""
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=_EXPIRY_HOURS)
+    )
+    await service.initialize()
+    user_id = await create_local_user_chosen(
+        service,
+        username="temp",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    await _move_deadline_to(engine, user_id, time.time() + 30)
+    outcome = await service.login("temp", PW)
+    assert outcome.ok and outcome.token is not None
+    return service, user_id, outcome.token
+
+
+async def _move_deadline_to(engine: Engine, user_id: str, deadline: float) -> None:
+    """Move the stored ``password_changed_at`` so the temporary credential's deadline lands on
+    ``deadline``: the gate reads the wall clock, so the stamp is what a test can move."""
+    store = engine.store
+    assert isinstance(store, MessageStore)  # a SQLite-specific reach-in
+    await store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (deadline - _EXPIRY_HOURS * 3600, user_id),
+    )
+    await store._db.commit()
+
+
+async def test_ui_logout_after_the_temporary_credential_lapsed_records_lapsed(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3749. The session was opened with an admin-issued temporary credential before its
+    deadline, and the deadline has since passed. Every gate ends such a session as lapsed and
+    audits ``auth.temp_password_expired`` (BACKLOG #2298). ``/ui/logout`` has no gate, so the
+    sign-out applies the same rule itself: its row says ``lapsed``, not ``revoked``, and it writes
+    exactly one ``auth.temp_password_expired`` row, with the fields the gate's row carries and an
+    ``at`` naming this leg."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    session = await engine.store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is not None
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == [
+        ("temp", PEER_ADDRESS, {"provider": "local", "expiry_hours": _EXPIRY_HOURS, "at": "logout"})
+    ]
+
+
+async def test_ui_logout_before_the_temporary_credential_lapsed_records_revoked(
+    engine: Engine,
+) -> None:
+    """The control for the test above: the deadline is still ahead, so the same sign-out ends a
+    live session, says ``revoked``, and writes no ``auth.temp_password_expired`` row."""
+    service, _, token = await _temporary_credential_session(engine)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "revoked")]
+    assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_of_an_idle_session_with_a_lapsed_credential_writes_no_lapse_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the sign-out judges the temporary credential of a session that was already over.
+    The gate asks the session's own clock checks first and ends an idle session without the lapse
+    row, so the sign-out does too: ``lapsed``, and no ``auth.temp_password_expired`` row."""
+    service, _, token = await _temporary_credential_session(engine)
+    later = time.time() + service.session_idle_seconds + 60
+    monkeypatch.setattr(time, "time", lambda: later)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_of_a_disabled_account_writes_no_lapse_row(engine: Engine) -> None:
+    """RED when: the sign-out audits a disabled account's session as a lapsed temporary credential.
+    The gate refuses a disabled account for that reason and writes no lapse row, so the sign-out
+    writes none either."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    await engine.store.set_user_disabled(user_id, disabled=True)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "revoked")]
+    assert await temp_password_expired_rows(engine.store) == []
+
+
+async def test_ui_logout_counts_a_deadline_that_passes_while_the_revoke_waits(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the sign-out judges the temporary credential at the clock read taken before the
+    revoke. The deadline passes while the revoke runs, as it can while the revoke waits on the
+    store, and the gate would judge it at its own later read, so the sign-out records ``lapsed``
+    and writes the lapse row."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    start = time.time()
+    clock = [start]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    real_supersede = engine.store.supersede_session
+
+    async def _slow_supersede(*args: object, **kwargs: object) -> object:
+        ended = await real_supersede(*args, **kwargs)  # type: ignore[arg-type]
+        clock[0] = start + 31  # the deadline was 30 seconds ahead
+        return ended
+
+    monkeypatch.setattr(engine.store, "supersede_session", _slow_supersede)
+    out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert len(await temp_password_expired_rows(engine.store)) == 1
+
+
+async def test_ui_logout_clears_the_cookie_when_the_lapse_row_fails(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3749, #3884 item 1. A refused ``auth.temp_password_expired`` row is logged, not
+    raised: the route still finishes the sign-out, and the ``auth.logout`` row still says
+    ``lapsed``."""
+    service, user_id, token = await _temporary_credential_session(engine)
+    await _move_deadline_to(engine, user_id, time.time() - 1)
+    real_record = engine.store.record_audit
+
+    async def _refuse_lapse_row(action: str, **kwargs: object) -> None:
+        if action == "auth.temp_password_expired":
+            raise OSError("the audit store refused the row")
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine.store, "record_audit", _refuse_lapse_row)
+    caplog.clear()  # only the sign-out's own lines are asserted below
+    with caplog.at_level(logging.ERROR, logger=_SERVICE_LOGGER):
+        out = await _sign_out_with(engine, service, token)
+    _assert_signed_out(out)
+    assert await logout_rows(engine.store) == [("temp", PEER_ADDRESS, "lapsed")]
+    assert _error_lines(caplog) == [
+        f"a sign-out ended session {hash_token(token)[:12]}, whose temporary credential had "
+        "lapsed, but its auth.temp_password_expired row failed"
+    ]

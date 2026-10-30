@@ -21,9 +21,10 @@ attestation and the command's posture (vault BACKLOG #2983):
 address, an unreachable server, a 403 on the lookup -- comes back as a problem string, which the
 read-out reports as ``unobservable``. **Nothing secret is kept:** never the token, its accessor or
 its id, and never a bind password. A problem names the exception type, or the engine's own fixed
-refusal text, or the first 200 characters of a plain ``ValueError`` (the probe's own shape checks
-and the TLS-suite assertion raise those). It never carries a server's error body: a subclass of
-``ValueError``, such as a JSON decode error, keeps its type name alone.
+refusal text, or the first 200 characters of a plain ``ValueError`` raised from engine code (the
+probe's own shape checks and the TLS-suite assertion raise those). It never carries a server's
+error body: a subclass of ``ValueError``, such as a JSON decode error, keeps its type name alone,
+and so does a plain ``ValueError`` a library raised, such as a URL parser's (vault BACKLOG #3454).
 """
 
 from __future__ import annotations
@@ -110,12 +111,30 @@ def _why(exc: BaseException) -> str:
     # hvac maps a 403 to Forbidden; say what it means without importing hvac here.
     if name == "Forbidden":
         return f"permission denied ({name})"
-    if type(exc) is ValueError:
-        # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
-        # assertion raise it with engine-written text. A subclass, such as a JSON decode error,
-        # can quote what the server sent, so it keeps the type name alone.
+    # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
+    # assertion raise it with engine-written text. A subclass, such as a JSON decode error, can
+    # quote what the server sent, so it keeps the type name alone. So does a ValueError a library
+    # raised (vault BACKLOG #3454): urllib.parse's quotes a whole proxy URL. The rule reads the
+    # innermost frame, not who wrote the text, so it does not catch a ValueError a C builtin such
+    # as int() raises inside engine code, nor engine code that copies a library's text. An
+    # exception never raised has no frame, and keeps its type name alone.
+    if type(exc) is ValueError and _raised_by_the_engine(exc):
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
+
+
+def _raised_by_the_engine(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback is in a ``messagefoundry`` module (vault
+    BACKLOG #3454), the rule ``config.wiring`` and ``__main__._is_engine_refusal`` apply too. A
+    copy, not an import of ``config.wiring``'s, so the probe neither loads that module nor imports
+    anything inside its exception handlers, where a failed import would raise."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    module = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -339,6 +358,7 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
             settings.auth,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+            hop_posture=posture,  # BACKLOG #2193: the LDAPS revocation guard, as AuthService passes
         )
     except Exception as exc:  # no extra, no CA file, an unset token: reported, never raised
         return BindAccountReading(
