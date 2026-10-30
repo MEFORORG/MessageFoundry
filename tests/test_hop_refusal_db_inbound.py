@@ -594,8 +594,7 @@ _GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _g
 def test_generic_lone_tls_keyword_refused_when_enforcing(
     keyword: str, connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
-    # BACKLOG #2483: a key or certificate path sets no mode, and a driver's own default need not
-    # require TLS.
+    # BACKLOG #2483: a key or certificate path does not count as a mode.
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
@@ -620,7 +619,7 @@ def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
     [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}, {"sslmode": ["disable"]}],
 )
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
-def test_generic_blank_or_non_scalar_mode_refused_when_enforcing(
+def test_generic_blank_or_non_string_mode_refused_when_enforcing(
     params: dict[str, object], connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
     # The DSN would carry the keyword with no usable mode in it, which is no evidence of one.

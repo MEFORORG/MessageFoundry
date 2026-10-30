@@ -6383,9 +6383,9 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This remains the INVENTORY of delegated hops — a hop can appear here and still be
-    crossed legitimately, on-box or under a declared attestation or acceptance — so read it as "who
-    owns TLS on this hop", never as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one with a TLS mode set
+    is absent. A hop can appear here and still be crossed legitimately, on-box or under a declared
+    attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so

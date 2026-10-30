@@ -292,8 +292,10 @@ def test_generic_dsn_warns_when_no_tls_keyword(caplog: pytest.LogCaptureFixture)
     assert any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
 
 
-def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureFixture) -> None:
-    # An operator who set a TLS keyword AT A VERIFYING VALUE has taken ownership → no WARNING (DEBUG).
+def test_generic_dsn_no_warn_when_a_mode_is_outside_the_deny_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A mode keyword at a value the deny-list does not name is delegated → no WARNING (DEBUG).
     # The other half of the pair is below: a TLS keyword at a NO-TLS value must still WARN. Before #333
     # the detector matched the regex against KEYS ONLY, so this test passed for `disable` too — which is
     # why the pair, not this test alone, is the control.
@@ -533,8 +535,8 @@ def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> 
 
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str) -> None:
-    """BACKLOG #2483. A key or certificate path with no mode beside it leaves the driver at its own
-    default, which need not require TLS. A real mode beside it is the control."""
+    """BACKLOG #2483. A key or certificate path with no mode beside it does not count as a mode. A
+    real mode beside it is the control."""
     for spelling in (keyword, keyword.upper()):
         assert generic_odbc_tls_unenforced({spelling: "fixture"}) == _NO_MODE_REASON
     assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "require"}) is None
@@ -562,16 +564,13 @@ def test_a_lone_sslrootcert_is_not_ownership() -> None:
         {"sslmode": ["disable"]},
         {"Encrypt": ["yes"]},
         {"sslmode": {"mode": "require"}},
+        {"Encrypt": True},
+        {"sslmode": 1},
     ],
 )
-def test_a_blank_or_non_scalar_mode_keyword_sets_no_mode(params: dict[str, object]) -> None:
+def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, object]) -> None:
+    # connections.toml refuses a non-string value, so only a code-first table can hand one in.
     assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
-
-
-@pytest.mark.parametrize("params", [{"Encrypt": True}, {"sslmode": 1}])
-def test_a_scalar_mode_value_that_is_not_a_string_still_counts(params: dict[str, object]) -> None:
-    # The control for the non-scalar cases above: TOML can spell a mode as a bool or an integer.
-    assert generic_odbc_tls_unenforced(params) is None
 
 
 def test_one_blank_mode_keyword_does_not_void_the_other() -> None:

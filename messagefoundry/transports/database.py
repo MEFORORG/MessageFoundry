@@ -330,14 +330,13 @@ _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
 # The ONLY keywords whose value can set a generic hop's TLS mode, in the form
 # :func:`_odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
-# as the operator owning TLS. A key, certificate or CA file, or a cipher list, sets no mode: on its
-# own it leaves the driver at its own default, and the defaults docs/CONNECTIONS.md records do not
-# require TLS.
+# as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
+# docs/CONNECTIONS.md records what the drivers read so far do with one.
 #
-# `encrypt` IS UNPROVEN. It is here for a driver that reads it. No test shows a MySQL driver does,
-# and docs/CONNECTIONS.md records that psqlODBC's keyword parser has none. On a driver that ignores
-# it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so treat that
-# spelling as the operator's claim, not a tested control.
+# `encrypt` IS UNPROVEN. It is here for a driver that reads it. docs/CONNECTIONS.md records that
+# neither psqlODBC's keyword parser nor MySQL Connector/ODBC's parameter page has it. On a driver
+# that ignores it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so
+# treat that spelling as the operator's claim, not a tested control.
 _ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
 
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
@@ -405,12 +404,12 @@ def _is_tls_keyword(name: str) -> bool:
 
 
 def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a value. A blank, ``None`` or
-    non-scalar one sets nothing: the engine has no evidence of how a driver reads it, and
+    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value. Anything
+    else sets nothing: the engine has no evidence of how a driver reads it, and
     :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good one is
     :func:`generic_odbc_no_tls_params`'s question, not this one."""
     modes = (_odbc_param(params, keyword) for keyword in _ODBC_TLS_MODE_KEYWORDS)
-    return any(isinstance(mode, str | int) and str(mode).strip() for mode in modes)
+    return any(isinstance(mode, str) and mode.strip() for mode in modes)
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:

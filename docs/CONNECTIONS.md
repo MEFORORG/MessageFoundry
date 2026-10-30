@@ -1834,17 +1834,21 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > `Encrypt`/`TrustServerCertificate` to *refuse* a weakened DB hop, but it cannot introspect an arbitrary
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
-> `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. So the
-> delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
+> `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. A generic
+> connection logs a **WARNING** at construction, naming itself,
 > when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`optional`/`0`/`false`/`off`) —
-> dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **Those two
-> are the only keywords that can set a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`,
-> `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode and
-> leaves the driver at its own default. Name the mode as well as the files. libpq's default is
-> `sslmode=prefer`, which can fall back to plaintext. psqlODBC's own source sets `disable`, so no TLS
-> would be attempted at all. `Encrypt` is **unproven** on MySQL drivers, since no test shows one
-> reads it, so use `SSLMODE` there.
+> dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **The engine
+> counts only those two as a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and
+> `SSLCIPHER` do not count, so one of them alone, or a blank mode, reads as no mode. Name the mode as
+> well as the files. libpq's default is `sslmode=prefer`, which can fall back to plaintext.
+> psqlODBC's own source sets `disable`, so no TLS would be attempted at all.
+>
+> **On MySQL Connector/ODBC, set `SSLMODE`.** Its
+> [parameter page](https://dev.mysql.com/doc/connector-odbc/en/connector-odbc-configuration-connection-parameters.html)
+> (read 2026-10-30) says that with `SSLMODE` unset, `SSLCA` or its CA path option implies
+> `SSLMODE=VERIFY_CA`. The engine does not read that, so the gate stays fail-closed: such a hop reads
+> as no mode until `SSLMODE=...` is set beside it. That page lists no `Encrypt` keyword.
 >
 > **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
 > `Encrypt=yes` would clear this check with no TLS attempted. It also reads `SSLmode` by a
@@ -1860,7 +1864,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
-> **A generic hop that says TLS is not required is REFUSED, not merely warned about** (BACKLOG #1178).
+> **A generic hop that says TLS is not required, or sets no TLS mode, is REFUSED, not merely warned about** (BACKLOG #1178).
 > The warning above used to be the whole control, so a generic connection with no TLS keyword would
 > cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
 > authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box

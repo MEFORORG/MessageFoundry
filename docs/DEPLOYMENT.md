@@ -623,7 +623,7 @@ REST obey the authority does not settle these:
   `security_loosenings()` / `GET /security/posture` and a `generic-db-tls` line from
   `messagefoundry check`. The reporting covers **inbound `DatabasePoll` as well as outbound**, and reads
   the keyword's **value**, so `SSLmode=disable` is reported rather than mistaken for TLS ownership. A
-  key or certificate keyword alone sets no mode, so it is not TLS ownership either. TLS
+  key or certificate keyword alone is not TLS ownership either. TLS
   here is operator-owned: set the driver's keyword in `odbc_params` (`SSLmode=verify-full`,
   `SSLMODE=VERIFY_IDENTITY`, …) and treat it as a deployment requirement.
 - **Direct (S/MIME) cleartext SMTP** — `use_tls=false` reads the clamped `MEFOR_ALLOW_INSECURE_TLS`

@@ -2984,19 +2984,18 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
     in the same DSN.
 
-    **This is the INVENTORY, and the refusal is elsewhere** (BACKLOG #1178). A generic hop whose
+    **This reports what the classifier flags, and the refusal is elsewhere** (BACKLOG #1178). A generic hop whose
     ``odbc_params`` say TLS is not required, or set no TLS mode, is gated at construction through the shared
     cleartext-hop authority (``transports.database.generic_cleartext_hop_guard``), so on an enforcing
     instance it fails the REQUIRED ``build-check`` — which stamps the derived posture and constructs
     every connector — rather than being reported here and crossed anyway.
 
-    So this stays ``required=False`` on purpose, and not because the arm is ungated. Two reasons, each
-    sufficient. It has no posture to key on, so a refusal here would have to re-derive the gradient's
-    loopback / attested / accepted arms from the graph — a second, silently different definition of a
-    decision that already has one. And the residual it reports is genuinely unjudgeable: the engine
-    cannot prove a driver keyword that IS set verifies anything, so refusing on that would be
-    guess-based and would break legitimate drivers, exactly what ADR 0092 declined. SKIPs when the graph
-    will not load, same convention as its siblings."""
+    So this stays ``required=False`` on purpose, and not because the arm is ungated. It has no posture
+    to key on, so a refusal here would have to re-derive the gradient's loopback / attested / accepted
+    arms from the graph — a second, silently different definition of a decision that already has one.
+    A hop with a mode set is not reported here at all: the engine cannot prove that value verifies
+    anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
+    what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
 
     try:
@@ -3015,7 +3014,10 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             "generic-db-tls",
             ok=True,
             required=False,
-            detail="no generic-ODBC database connection leaves TLS unenforced",
+            detail=(
+                "no generic-ODBC database connection omits a TLS mode or pins one to a no-TLS "
+                "value; the engine does not verify a set mode"
+            ),
         )
     listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
     return CheckResult(
