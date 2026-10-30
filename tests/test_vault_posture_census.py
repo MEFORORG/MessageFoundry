@@ -98,6 +98,10 @@ _LINKS: dict[str, int | None] = {
     "Engine": None,
     # the offline commands' security notifier, which resolves an SMTP secret
     "_offline_security_notifier": 1,
+    # provision-admin's [alerts] notifier and the step that raises its administrator_granted
+    # alert, which resolve the alert transports' secrets (vault BACKLOG #3849 B5)
+    "_offline_alert_notifier": 1,
+    "_raise_offline_administrator_granted": 1,
 }
 _KEYWORDS = ("posture", "hop_posture")
 
@@ -272,6 +276,20 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "-"),
         ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
+        ("__main__.py", "_offline_alert_notifier.build", "resolve_secret_provider", "posture"),
+        (
+            "__main__.py",
+            "_raise_offline_administrator_granted",
+            "_offline_alert_notifier",
+            "posture",
+        ),
+        (
+            "__main__.py",
+            "_provision_admin.alert",
+            "_raise_offline_administrator_granted",
+            "posture",
+        ),
+        ("__main__.py", "_provision_admin.alert", "open_store", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
