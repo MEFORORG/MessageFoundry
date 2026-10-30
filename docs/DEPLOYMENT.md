@@ -659,7 +659,7 @@ plus a `tls-allow-expired` line from `messagefoundry check` naming each connecti
 alongside the WARNING each construction logs. Like every connection-scoped declaration it is **not** in
 the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
 gated — nothing refuses the setting, and nothing takes it away again. It does take one lever away: on a hop
-that sets it, a `[tls].crl_file` no longer crosses the revocation gate, so off the box on an enforcing
+that sets it, a `[tls].crl_file` does not cross the revocation gate, so off the box on an enforcing
 instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13).
 
 Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in

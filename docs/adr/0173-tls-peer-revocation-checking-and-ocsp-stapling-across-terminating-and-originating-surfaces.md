@@ -1475,9 +1475,9 @@ on first deployment, with no attestation.
 - The attested crossing still logs its audit line, which §4.3 names as the only record of the
   attestation on this shape: with no CRL credit, the attestation is what crosses the hop.
 - On an instance that does not enforce, these hops used to cross silently on the CRL. They now log
-  the revocation WARNING at each build, as any hop without a check does. The exception is
-  `MEFOR_TLS_REVOCATION_ATTESTED`: where it is set, a non-enforcing instance still lets the hop cross
-  with no line, as on every hop the guard decides (BACKLOG #299).
+  the revocation WARNING at each build, as any hop without a check does. At least three cases still
+  cross there with no line, as on every hop the guard decides: `MEFOR_TLS_REVOCATION_ATTESTED` set
+  (BACKLOG #299), the connection's own `tls_revocation_attested`, and a loopback hop.
 - Without `tls_allow_expired` both hops are unchanged: a CRL that reaches the context admits them.
 - **Two older passages read as before this amendment.** Where the §7.1 rows for the MLLP destination
   and the DICOM SCU say a CRL that reaches the context relaxes the refusal, that now holds only for
