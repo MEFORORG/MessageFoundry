@@ -7999,6 +7999,7 @@ def _offline_security_notifier(
     ``email_username`` and the password and send unauthenticated.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 
     alerts = settings.alerts
@@ -8009,8 +8010,6 @@ def _offline_security_notifier(
     try:
         # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
         # drops the notice, as any other failure here does; the recovery itself goes on.
-        from messagefoundry.config.settings import hop_posture_from_ai
-
         if not _offline_smtp_relay_ca_accepted(settings, what="security notice"):
             return None
         return security_notifier_from_settings(
@@ -8126,13 +8125,29 @@ def _offline_alert_notifier(
     construction the relay. A failure with nothing left to drop yields ``None``, and the caller's
     alert reaches the log instead: the grant it reports has already been written, and a recovery
     command must not die on its page.
+
+    ``posture`` keys the transports' revocation guards (BACKLOG #2193). Where it is ``None`` the
+    guards get the instance's own, derived from ``settings``, as :func:`_offline_security_notifier`
+    gives its guard, so a ``warn`` instance warns rather than taking the guards' enforcing default
+    for no posture. A guard's refusal is printed in its own words, once: it names the hop, its host
+    and the setting that clears it, and reads no secret, as ``_build_provision_auth_service`` shows
+    one.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.controlchars import scrub_control_chars
     from messagefoundry.pipeline.alert_sinks import (
         alerts_without_email,
         alerts_without_webhook,
         configured_alert_transport_names,
         notifier_from_settings,
+    )
+
+    guard_posture = (
+        posture
+        if posture is not None
+        else hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     )
 
     def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
@@ -8146,8 +8161,22 @@ def _offline_alert_notifier(
                 else None
             ),
             trust_anchor_policy=settings.tls.policy(),
-            posture=posture,
+            posture=guard_posture,
         )
+
+    # The class only, as `_build_provision_auth_service` names a secret failure: the text of a
+    # provider's error can carry its address or a reference. A revocation guard's refusal is the
+    # one exception, printed once in its own words.
+    failures: list[str] = []
+    shown: set[str] = set()
+
+    def failed(exc: Exception) -> None:
+        failures.append(type(exc).__name__)
+        if isinstance(exc, InsecureHopRefused):
+            refusal = scrub_control_chars(_sentence(exc))
+            if refusal not in shown:
+                shown.add(refusal)
+                print(f"WARNING: {refusal}", file=sys.stderr)
 
     alerts = settings.alerts
     names = configured_alert_transport_names(alerts)
@@ -8169,13 +8198,10 @@ def _offline_alert_notifier(
             hop_accepted = False
         if not hop_accepted:
             alerts, emails = alerts_without_email(alerts), False
-    # The class only, here and below, as `_build_provision_auth_service` names a secret failure:
-    # the text of a provider's error can carry its address or a reference.
-    failures: list[str] = []
     try:
         return build(alerts)
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
-        failures.append(type(exc).__name__)
+        failed(exc)
     if emails and len(names) > 1:
         print(
             f"WARNING: the [alerts] notifier could not be built ({failures[0]}); this command "
@@ -8189,7 +8215,7 @@ def _offline_alert_notifier(
             try:
                 built = build(alone)
             except Exception as retry:  # noqa: BLE001 - as above
-                failures.append(type(retry).__name__)
+                failed(retry)
                 continue
             print(
                 f"WARNING: the [alerts] notifier was built without the {dropped} transport, so "
