@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
-import traceback
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
@@ -25,6 +25,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
+from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
@@ -39,6 +40,7 @@ from messagefoundry.transports.database import (
     _classify_db_error,
     _driver_code,
     _is_transient,
+    _lookup_connect_failure,
     _parse_named_params,
     _safe_db_error,
     _sqlstate,
@@ -1020,6 +1022,50 @@ async def test_source_mark_failure_log_carries_no_driver_value(
     assert "duplicate key" not in caplog.text.lower()
 
 
+async def test_source_handler_failure_log_carries_no_driver_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1661: on a SQL Server store the handler's write is itself a pyodbc call, and a 2628
+    truncation quotes the value it refused, which ``safe_exc`` keeps.
+
+    Red mutation: render the handler-failure log with ``safe_exc`` again. Reds here.
+    """
+    truncated = (
+        "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would "
+        "be truncated in table 'mf.dbo.messages', column 'control_id'. Truncated value: "
+        f"'MRN{_SYNTHETIC_ID}'. (2628) (SQLExecDirectW)"
+    )
+    src = _src(body_column="payload")
+    h = _RecordingHandler(exc=_driver_exc("22001", truncated))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+    assert "handler failed" in caplog.text  # the instrument fired
+    assert "[22001] driver error 2628" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
+class _FailingCloseCursor:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def close(self) -> None:
+        raise self._exc
+
+
+async def test_cursor_close_failure_log_carries_no_driver_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cursor-close debug line took the bare exception, so a DEBUG log printed the driver text.
+
+    Red mutation: pass the bare ``exc`` to ``_close_cursor``'s debug line again. Reds here.
+    """
+    exc = _driver_exc("23000", _SQLSERVER_DUP)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.database"):
+        await database_module._close_cursor(_FailingCloseCursor(exc))
+    assert "cursor close failed" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
 async def test_source_handler_failure_log_is_scrubbed_and_bounded(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1053,7 +1099,8 @@ _SQLSERVER_CONVERT = (
 
 
 async def _run_one_failed_poll(src: DatabaseSource, poll_exc: Exception) -> None:
-    """Run the real ``_run`` loop for one tick whose poll_statement raises ``poll_exc``."""
+    """Run the real ``_run`` loop for one tick whose poll_statement raises ``poll_exc``. Bounded, so
+    a loop that never reaches the poll fails the test rather than spinning on a zero interval."""
     _install_cursor(src, ["id", "payload"], [], _RecordingHandler(), poll_exc=poll_exc)
     src._poll_seconds = 0.0
     poll_once = src._poll_once
@@ -1063,7 +1110,7 @@ async def _run_one_failed_poll(src: DatabaseSource, poll_exc: Exception) -> None
         await poll_once()
 
     src._poll_once = once  # type: ignore[method-assign]
-    await src._run()
+    await asyncio.wait_for(src._run(), timeout=10)
 
 
 @pytest.mark.parametrize(
@@ -1076,8 +1123,9 @@ async def test_source_poll_failure_log_carries_no_driver_value(
     """BACKLOG #1661, the poll-failure limb: the ``_run`` loop logged a poll error with
     ``logger.exception``, whose traceback ends in the driver's own text and the value it quotes.
 
-    ``caplog.text`` renders a record's ``exc_info`` as the log handler would, so a traceback carrying
-    the driver message shows up here. The frames must survive: they are the diagnostic.
+    ``caplog.text`` renders a record's ``exc_info`` with the stdlib formatter and no engine filter,
+    so a traceback carrying the driver message shows up here. The frames must survive: they are the
+    diagnostic. The sink test below runs the engine's own filter chain.
 
     Red mutation: restore ``logger.exception`` in the ``_run`` loop's poll-error arm. Both arms red.
     """
@@ -1088,18 +1136,17 @@ async def test_source_poll_failure_log_carries_no_driver_value(
     assert _SYNTHETIC_ID not in caplog.text
     assert "duplicate key" not in caplog.text.lower()
     assert "Conversion failed" not in caplog.text
-    assert f"Exception [{state}] driver error {code}" in caplog.text
+    assert f"RedactedDbError: Exception [{state}] driver error {code}" in caplog.text
     assert "in _select" in caplog.text  # the frames are kept
-    assert all(r.exc_info is None for r in caplog.records)
 
 
 async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safely(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A driver error wrapped by another, as ``raise X from driver_error`` or inside an ``except``,
-    prints both links; neither link may print the driver's text.
+    """A driver error wrapped by another, as ``raise X from driver_error``, prints both links with
+    the stdlib's banner between them; neither link may print the driver's text.
 
-    Red mutation: render a chained link with ``str()`` in ``_safe_db_frames``. Reds here.
+    Red mutation: copy only the outermost link in ``_redacted_copy``. The banner assertion reds.
     """
     try:
         try:
@@ -1117,25 +1164,73 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
     assert _SYNTHETIC_ID not in caplog.text
 
 
-async def test_source_poll_failure_log_survives_a_failed_traceback_render(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The render runs in the poll loop's error arm, so a render that raises must not kill the
-    poller: it falls back to the ``_safe_db_error`` line alone.
+@pytest.mark.parametrize("fmt", ["text", "json"])
+async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(fmt: str) -> None:
+    """Through the engine's own handler chain, the traceback lands in ``exc_text``, so the text
+    sink keeps one physical line per traceback line and the JSON sink has an ``exception`` key.
 
-    Red mutation: drop the ``try`` in ``_safe_db_traceback``. ``_run`` raises here.
+    A traceback built into the message instead is collapsed onto one line by the control-character
+    scrub, which escapes the message's line breaks.
+
+    Red mutation: log the rendered traceback as a ``%s`` argument with no ``exc_info``. Both red.
     """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_make_formatter(fmt))
+    _install_phi_filters(handler)
+    log = logging.getLogger("messagefoundry.transports.database")
+    log.addHandler(handler)
+    try:
+        await _run_one_failed_poll(
+            _src(body_column="payload"), _driver_exc("22018", _SQLSERVER_CONVERT)
+        )
+    finally:
+        log.removeHandler(handler)
+    out = stream.getvalue()
+    assert "poll failed" in out
+    assert _SYNTHETIC_ID not in out
+    if fmt == "json":
+        exception = json.loads(out.splitlines()[-1])["exception"]
+        assert "Exception [22018] driver error 245" in exception
+    else:
+        assert len(out.splitlines()) > 3  # the frames kept their line breaks
+        assert "Exception [22018] driver error 245" in out
 
-    def broken(tb: object) -> list[str]:
-        raise RuntimeError("render failed")
 
-    monkeypatch.setattr(traceback, "format_tb", broken)
+class _UnprintableDriverError(Exception):
+    """A driver-shaped error whose ``__str__`` raises."""
+
+    def __str__(self) -> str:
+        raise AttributeError("no message")
+
+
+async def test_source_poll_failure_log_survives_an_unprintable_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The render runs in the poll loop's error arm, so an error that cannot be printed must not
+    kill the poller: its line becomes a fixed note and its frames are kept.
+
+    Red mutation: drop the ``try`` in ``_safe_db_error``. ``_run`` raises here.
+    """
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
-        await _run_one_failed_poll(src, _driver_exc("22018", _SQLSERVER_CONVERT))
+        await _run_one_failed_poll(src, _UnprintableDriverError("22018", _SQLSERVER_CONVERT))
     assert "poll failed" in caplog.text
-    assert "Exception [22018] driver error 245" in caplog.text
+    assert "message withheld: AttributeError while rendering it" in caplog.text
+    assert "in _select" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+def test_lookup_connect_failure_names_a_unicode_error_by_type_alone() -> None:
+    """``_lookup_connect_failure`` promises a type alone for an error with no SQLSTATE. A codec name
+    such as ``ascii`` passes ``_sqlstate``'s shape, so a Unicode error must still get its type alone.
+
+    Red mutation: drop the ``UnicodeError`` test in ``_lookup_connect_failure``. Reds here.
+    """
+    exc = UnicodeEncodeError("ascii", "MRN\xe9", 3, 4, "ordinal not in range(128)")
+    assert _lookup_connect_failure("DB_X", exc) == (
+        "db_lookup on 'DB_X': could not open a connection (UnicodeEncodeError)"
+    )
 
 
 @pytest.mark.parametrize(

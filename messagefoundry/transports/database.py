@@ -46,17 +46,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import itertools
 import json
 import logging
 import os
 import re
-import traceback
 import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
+from types import TracebackType
 from typing import Any, NamedTuple
 
 from messagefoundry.auth.trust_anchors import (
@@ -1413,54 +1412,66 @@ def _safe_db_error(exc: BaseException) -> str:
     A ``UnicodeError`` goes to ``safe_exc`` first, whatever its arguments: ``UnicodeEncodeError``'s
     first argument is the codec name, and ``ascii`` is five alphanumerics, so it would otherwise read
     as a SQLSTATE. That keeps this function exactly as codec-safe as ``safe_exc``, which is why
-    ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers."""
-    state = None if isinstance(exc, UnicodeError) else _sqlstate(exc)
-    if state is None:
-        return safe_exc(exc)
-    code = _driver_code(str(exc))
+    ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers.
+
+    It never raises. Its callers are error arms and helpers documented never to raise, and an
+    exception whose ``__str__`` raises renders as its type and a fixed note instead."""
+    try:
+        state = None if isinstance(exc, UnicodeError) else _sqlstate(exc)
+        if state is None:
+            return safe_exc(exc)
+        code = _driver_code(str(exc))
+    except Exception as failure:  # noqa: BLE001 - see docstring
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
 
 
-def _safe_db_traceback(exc: BaseException) -> str:
-    """``exc``'s traceback with each exception's own line rendered by :func:`_safe_db_error`, for a
-    log line that must keep the frames but never a driver message (BACKLOG #1661).
+class RedactedDbError(Exception):
+    """Stands in for one exception of a logged chain: the original's frames, and
+    :func:`_safe_db_error`'s line as its message (BACKLOG #1661). Never raised."""
 
-    ``logger.exception`` ends each exception with its ``str()``, and a driver error's ``str()`` is
-    the text that embeds the offending value. The frames are code: file, line, function and source
-    line, never a local or an argument, so they are kept. The chain is walked as the stdlib walks it,
-    explicit cause first and an unsuppressed context otherwise, oldest printed first. ``__notes__``
-    and an exception group's members are not printed, since either can carry free text. It never
-    raises: it runs in the poll loop's error arm, which must not kill the poller, so a render that
-    fails gives the :func:`_safe_db_error` line alone, as ``redaction.prepare_log_record`` falls
-    back for its own render."""
+
+def _safe_db_exc_info(
+    exc: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """An ``exc_info`` for ``exc`` that keeps every frame and cause but no driver message.
+
+    ``logger.exception`` ends each exception of the chain with its ``str()``, and a driver error's
+    ``str()`` is the text that embeds the offending value: a 2627 duplicate key, a 245 conversion.
+    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_safe_db_error`'s
+    line, with the original's traceback and its cause, context and suppression wired the same way.
+    The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
+    ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
+    An exception group's members and any ``__notes__`` are not copied, since either can carry free
+    text.
+
+    It never raises, because it runs in the poll loop's error arm, which must not kill the poller.
+    A copy that fails gives one :class:`RedactedDbError` with no frames, whose message names the
+    failure, as ``prepare_log_record`` names its own."""
     try:
-        chain: list[BaseException] = []
-        seen: set[int] = set()
-        link: BaseException | None = exc
-        while link is not None and id(link) not in seen:
-            seen.add(id(link))
-            chain.append(link)
-            link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
-        parts = _safe_db_frames(chain[-1])
-        for older, newer in itertools.pairwise(reversed(chain)):
-            parts.append(
-                "\nThe above exception was the direct cause of the following exception:\n\n"
-                if newer.__cause__ is older
-                else "\nDuring handling of the above exception, another exception occurred:\n\n"
-            )
-            parts += _safe_db_frames(newer)
-        return "".join(parts).removesuffix("\n")
-    except Exception:  # noqa: BLE001 - see docstring: the poller outlives a failed render
-        return _safe_db_error(exc)
+        copy = _redacted_copy(exc, {})
+    except Exception as failure:  # noqa: BLE001 - see docstring: the poller outlives a failed render
+        copy = RedactedDbError(
+            f"[traceback withheld: {type(failure).__name__} while rendering {type(exc).__name__}]"
+        )
+    return RedactedDbError, copy, copy.__traceback__
 
 
-def _safe_db_frames(exc: BaseException) -> list[str]:
-    """One exception's frames and its :func:`_safe_db_error` line, as a traceback prints them."""
-    return [
-        "Traceback (most recent call last):\n",
-        *traceback.format_tb(exc.__traceback__),
-        f"{_safe_db_error(exc)}\n",
-    ]
+def _redacted_copy(exc: BaseException, made: dict[int, RedactedDbError]) -> RedactedDbError:
+    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle."""
+    found = made.get(id(exc))
+    if found is not None:
+        return found
+    copy = RedactedDbError(_safe_db_error(exc)).with_traceback(exc.__traceback__)
+    made[id(exc)] = copy
+    if exc.__cause__ is not None:
+        copy.__cause__ = _redacted_copy(exc.__cause__, made)
+    if exc.__context__ is not None:
+        copy.__context__ = _redacted_copy(exc.__context__, made)
+    copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
+    return copy
 
 
 class _DriverMissingError(RuntimeError):
@@ -2497,8 +2508,8 @@ class DatabaseSource(SourceConnector):
                 # offending value, such as a 245 conversion error naming the column value it could not
                 # convert. The frames are kept and each exception line is _safe_db_error's (#1661).
                 logger.error(
-                    "DATABASE source poll failed; retrying next interval\n%s",
-                    _safe_db_traceback(exc),
+                    "DATABASE source poll failed; retrying next interval",
+                    exc_info=_safe_db_exc_info(exc),
                 )
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
@@ -2801,7 +2812,9 @@ def _lookup_connect_failure(connection: str, exc: Exception) -> str:
     prefix = f"db_lookup on {connection!r}: could not open a connection"
     if isinstance(exc, _DriverMissingError):
         return f"{prefix}; the 'sqlserver' extra is not installed"
-    detail = _safe_db_error(exc) if _sqlstate(exc) else type(exc).__name__
+    # A UnicodeError's codec name can pass for a SQLSTATE, and _safe_db_error quotes it (safe_exc).
+    driver = _sqlstate(exc) and not isinstance(exc, UnicodeError)
+    detail = _safe_db_error(exc) if driver else type(exc).__name__
     return f"{prefix} ({detail})"
 
 
