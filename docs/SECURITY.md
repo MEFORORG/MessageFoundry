@@ -830,11 +830,13 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   ([Audit](#audit) names them), so the marker shows a reader without it no lock there (BACKLOG
   #3726). The other rows the attempt writes, such as a role resync or a session rotation, do not
   carry it. With the list set, a too-early step-up's code is redeemed before the refusal, because
-  only the exchange yields the `amr`. Each outcome row of such a step-up carries
-  `callback_floor_deferred: true` (BACKLOG #3728). It says the floor decision waited for the
-  exchange, not that the exemption applied: a refusal the exchange itself causes comes before any
-  `amr` is known and carries only this field, and so does a `too_early` refusal whose `amr` named
-  no listed value. A review of exempted attempts reads both fields. The exemption lifts
+  only the exchange yields the `amr`. The outcome rows of such a step-up carry
+  `callback_floor_deferred: true`: at least each refusal and the success row (BACKLOG #3728). It
+  says the floor decision waited for the exchange, not that the exemption applied: a refusal the
+  exchange itself causes comes before any `amr` is known and carries only this field, and so does
+  a `too_early` refusal whose `amr` named no listed value. A review of exempted step-ups reads both
+  fields. The sign-in leg has no such field, because there the floor always waits for the
+  exchange's `auth_time`, whether or not the list is set. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
   the exempt value is refused as `mfa_claim_missing`.

@@ -719,8 +719,10 @@ async def test_a_failed_exchange_on_a_deferred_step_up_is_tied_to_the_exemption(
 #
 # WHAT IT DOES NOT CATCH, at least: a helper under the region writing a NEW outcome action (only the
 # actions listed below are known as outcomes there); a marker named in the expression but dropped
-# before the row is written (`extra=floor_marker and {}`); a writer outside the three methods. The
-# behavioural tests above hold today's arms; this holds the next arm written in the same shape.
+# before the row is written (`extra=floor_marker and {}`); a local dict whose marked assignment sits
+# in another branch above the write (the read is by line, not by branch); a writer outside the
+# three methods. The behavioural tests above hold today's arms; this holds the next arm written in
+# the same shape.
 
 #: Audit actions that record a sign-in or step-up attempt's OUTCOME. Each must carry the marker.
 _OUTCOME_ACTIONS = frozenset(
@@ -795,16 +797,27 @@ def _action(call: ast.Call) -> str | None:
     return None
 
 
-def _built_from(fn: ast.AST, variable: str) -> set[str]:
-    """Every name a local dict ``variable`` is built or updated from inside ``fn``."""
-    names: set[str] = set()
+def _built_from(fn: ast.AST, variable: str, line: int) -> set[str]:
+    """The names a local dict ``variable`` holds at ``line``: its last assignment above that line,
+    and each ``variable.update(...)`` between the two. Not branch-aware."""
+    assigned = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.Assign, ast.AnnAssign))
+        and n.lineno < line
+        and any(
+            isinstance(t, ast.Name) and t.id == variable
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+        )
+    ]
+    if not assigned:
+        return set()
+    last = max(assigned, key=lambda n: n.lineno)
+    names = _names(last.value)
     for node in ast.walk(fn):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(t, ast.Name) and t.id == variable for t in targets):
-                names |= _names(node.value)
-        elif (
+        if (
             isinstance(node, ast.Call)
+            and last.lineno < node.lineno < line
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "update"
             and isinstance(node.func.value, ast.Name)
@@ -814,24 +827,35 @@ def _built_from(fn: ast.AST, variable: str) -> set[str]:
     return names
 
 
-def _carries(fn: ast.AST, expr: ast.expr | None, markers: set[str]) -> bool:
+def _carries(fn: ast.AST, call: ast.Call, expr: ast.expr | None, markers: set[str]) -> bool:
     if not markers:
         return False
     names = _names(expr)
-    return bool(names & markers) or any(_built_from(fn, n) & markers for n in names)
+    return bool(names & markers) or any(_built_from(fn, n, call.lineno) & markers for n in names)
 
 
 def _not_branches(fn: ast.AST, decision: str | None) -> list[tuple[int, int]]:
-    """The line spans of each ``if`` body whose test reads ``not <decision>``: the branch where the
-    exemption did not apply, so a row written there has no marker to carry."""
+    """The line spans of each ``if`` body whose test is ``not <decision>``, or a conjunction with
+    it as one operand: the branch where the exemption cannot have applied, so a row written there
+    has no marker to carry. A disjunction does not count, since its body may run either way."""
+
+    def negated(test: ast.expr) -> bool:
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Name)
+            and test.operand.id == decision
+        )
+
     spans: list[tuple[int, int]] = []
     for node in ast.walk(fn) if decision else ():
-        if isinstance(node, ast.If) and any(
-            isinstance(n, ast.UnaryOp)
-            and isinstance(n.op, ast.Not)
-            and isinstance(n.operand, ast.Name)
-            and n.operand.id == decision
-            for n in ast.walk(node.test)
+        if isinstance(node, ast.If) and (
+            negated(node.test)
+            or (
+                isinstance(node.test, ast.BoolOp)
+                and isinstance(node.test.op, ast.And)
+                and any(negated(v) for v in node.test.values)
+            )
         ):
             spans.append((node.body[0].lineno, node.body[-1].end_lineno or node.body[-1].lineno))
     return spans
@@ -857,8 +881,10 @@ def _unmarked(
         if any(lo <= call.lineno <= hi for lo, hi in unmarked_spans):
             continue
         callee = _callee(call)
-        if markers and isinstance(call.func, ast.Attribute) and call.func.attr == "record_audit":
-            problems.append(f"{where}:{call.lineno} writes the audit store directly")
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "record_audit":
+            # In a region any such write fails; in a method the region calls, an outcome one does.
+            if markers or _action(call) in _OUTCOME_ACTIONS | {None}:
+                problems.append(f"{where}:{call.lineno} writes the audit store directly")
         elif callee == "_audit":
             action = _action(call)
             if action is None:
@@ -869,11 +895,11 @@ def _unmarked(
                     problems.append(f"{where}:{call.lineno} writes {action!r}, not sorted")
                 continue
             checked += 1
-            if not _carries(fn, _keyword(call, "detail"), markers):
+            if not _carries(fn, call, _keyword(call, "detail"), markers):
                 problems.append(f"{where}:{call.lineno} writes {action!r} without the marker")
         elif callee in _KEYWORD_WRITERS:
             checked += 1
-            if not _carries(fn, _keyword(call, _KEYWORD_WRITERS[callee]), markers):
+            if not _carries(fn, call, _keyword(call, _KEYWORD_WRITERS[callee]), markers):
                 problems.append(f"{where}:{call.lineno} calls {callee} without the marker")
         elif callee == "_step_up_refused":
             problems.append(f"{where}:{call.lineno} calls _step_up_refused past the bound refuse")
@@ -999,16 +1025,13 @@ def test_each_writer_puts_the_marker_keyword_into_its_row(
         writes = [c for c in _calls(fn) if _callee(c) == "_audit"]
         assert writes, sink
         for call in writes:
-            assert _carries(fn, _keyword(call, "detail"), {keyword}), (sink, call.lineno)
+            assert _carries(fn, call, _keyword(call, "detail"), {keyword}), (sink, call.lineno)
 
 
 def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
-    """The negative control, on synthetic code shaped like the real legs: a refusal between the
-    decision and the marker, a new refusal written without the marker, a refuse that replaces the
-    bound fields, an action the guard cannot read, an unsorted action, a write straight to the
-    store, and a helper that writes an outcome row the marker cannot reach. Each is reported. The
-    marked writer, the side-effect row, and the row in the branch where the exemption did not apply
-    are not."""
+    """The negative control, on synthetic code shaped like the real legs. Each shape the guard
+    claims to catch is reported; the marked writers, the side-effect rows, and the rows in a branch
+    where the exemption cannot have applied are not."""
     source = textwrap.dedent(
         """
         class AuthService:
@@ -1016,8 +1039,16 @@ def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
                 floor_exempt_amr = ()
                 if not floor_exempt_amr:
                     await self._audit("auth.login_failed", detail=_json({"reason": "too_early"}))
+                if client and not floor_exempt_amr:
+                    await self._audit("auth.login_failed", detail=_json({"reason": "too_early"}))
+                if client or not floor_exempt_amr:
+                    await self._audit("auth.login_failed", detail=_json({"reason": "either"}))
                 await self._audit("auth.login_failed", detail=_json({"reason": "above"}))
                 floor_marker = {}
+                detail = {"reason": "fresh"}
+                await self._audit("auth.login_failed", detail=_json(detail))
+                detail = {**floor_marker, "reason": "marked"}
+                await self._audit("auth.login_failed", detail=_json(detail))
                 await self._directory_reject_audit("u", "oidc", "x", client=client, extra=floor_marker)
                 await self._audit("auth.ad_roles_resynced", detail=_json({}))
                 await self._directory_reject_audit("u", "oidc", "new_arm", client=client)
@@ -1029,6 +1060,8 @@ def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
 
             async def _helper(self):
                 await self._audit("auth.login_failed", detail=_json({"reason": "w"}))
+                await self._store.record_audit("auth.login_failed", detail="{}")
+                await self._store.record_audit("auth.session_rotated", detail="{}")
         """
     )
     [cls] = ast.parse(source).body
@@ -1043,9 +1076,13 @@ def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
         seen=set(),
         decision="floor_exempt_amr",
     )
-    assert len(problems) == 7, problems
-    assert sum("without the marker" in p for p in problems) == 3, problems
-    for expected in ("cannot read", "not sorted", "store directly", "floor="):
+    # Without the marker: the disjunction's row, the row above the marker, the fresh dict, the new
+    # arm, and the helper's row. Straight to the store: the region's write and the helper's outcome
+    # one, not the helper's side-effect one.
+    assert len(problems) == 10, problems
+    assert sum("without the marker" in p for p in problems) == 5, problems
+    assert sum("store directly" in p for p in problems) == 2, problems
+    for expected in ("cannot read", "not sorted", "floor="):
         assert any(expected in p for p in problems), (expected, problems)
 
 
