@@ -63,6 +63,11 @@ from tests.test_first_run_default_account import _directory_signed_in
 # does not look like a secret rather than an allowlist entry that teaches the scanner to skip one.
 _PASSWORD = "a-long-enough-operator-passphrase"
 
+# BACKLOG #2193: the alert webhook's revocation guard refuses an enforcing posture, which a test
+# passing no posture gets, unless the [alerts] webhook attestation pair is set. The tests about
+# which transport survives a failed build set it, so the guard is not what they measure.
+_WEBHOOK_REVOCATION_REASON = "the synthetic webhook certificate lives 24 hours"
+
 
 async def test_a_provisioned_administrator_is_usable_and_a_start_adds_no_account() -> None:
     """AC-1, reworded at Wave 2: provision, then start, and the store holds exactly that account.
@@ -2477,6 +2482,8 @@ def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
         email_from="mefor@example.invalid",
         email_to=["ops@example.invalid"],
         webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
     )
     built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
     assert built is not None
@@ -2501,11 +2508,162 @@ def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webh
         email_to=["ops@example.invalid"],
         email_use_tls=False,
         webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
     )
     built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
     assert built is not None
     assert [t.name for t in built._transports] == ["webhook"]
     assert "no alert email is sent" in capsys.readouterr().err
+
+
+@pytest.fixture
+def _no_blanket_revocation_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The blanket attestation must not stand in for the [alerts] pair these tests measure."""
+    from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
+
+    monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
+
+
+@pytest.mark.usefixtures("_no_blanket_revocation_attestation")
+@pytest.mark.parametrize("enforcing", [None, True], ids=["no-posture", "enforcing"])
+def test_the_offline_alert_notifier_keeps_the_webhook_revocation_guard(
+    enforcing: bool | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2193 on the offline alert path of vault BACKLOG #3849 B5: an unattested webhook
+    under an enforcing posture, or none on an enforcing instance, is refused here as ``serve``
+    refuses it, and the refusal is printed in its own words, naming the setting that clears it.
+    A single-transport build: the retry case is the next test."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import HopPosture
+
+    posture = None if enforcing is None else HopPosture(enforcing=enforcing)
+    alerts = AlertsSettings(webhook_url="https://hooks.example.invalid/x")
+    assert _offline_alert_notifier(ServiceSettings(alerts=alerts), posture) is None
+    err = capsys.readouterr().err
+    assert "InsecureHopRefused" in err and "webhook_tls_revocation_attested" in err
+    attested = alerts.model_copy(
+        update={
+            "webhook_tls_revocation_attested": True,
+            "webhook_tls_revocation_attested_reason": _WEBHOOK_REVOCATION_REASON,
+        }
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=attested), posture)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+
+
+@pytest.mark.usefixtures("_no_blanket_revocation_attestation")
+def test_a_refused_webhook_costs_the_webhook_only_across_the_retry(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #2193 across the #3849 retry: with a plain relay beside an unattested webhook under
+    enforcement, the webhook's refusal costs the webhook only, the email is kept, and the
+    refusal's own words are printed once although the retry meets it twice."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import HopPosture
+
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), HopPosture(enforcing=True))
+    assert built is not None
+    assert [t.name for t in built._transports] == ["email"]
+    err = capsys.readouterr().err
+    assert "webhook_tls_revocation_attested" in err
+    assert err.count("WARNING: [alerts] webhook POST") == 1
+    assert "built without the webhook transport" in err
+
+
+@pytest.mark.usefixtures("_no_blanket_revocation_attestation")
+def test_a_refused_smtp_login_costs_the_email_only_across_the_retry(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #2193 slice (c) across the #3849 retry: an unattested off-box relay login under
+    enforcement costs the email only, and the attested webhook still carries the alert. With no
+    webhook beside it, nothing is left, and the alert goes to the log."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import HopPosture
+
+    enforcing = HopPosture(enforcing=True)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_username="alerts-relay",
+        email_password="synthetic-not-a-secret",
+        webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), enforcing)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    assert "email_tls_revocation_attested" in capsys.readouterr().err
+    email_only = alerts.model_copy(update={"webhook_url": None})
+    assert _offline_alert_notifier(ServiceSettings(alerts=email_only), enforcing) is None
+
+
+def test_a_vault_hop_refusal_behind_a_secret_error_is_shown_but_not_the_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Vault provider raises its revocation refusal as the cause of a ``SecretProviderError``
+    (#2317). The alert step shows that refusal, which names the setting that clears it, and still
+    names the provider error by its class only. The email is lost and the webhook kept."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config import secretprovider
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    def refused(*_a: object, **_k: object) -> None:
+        cause = InsecureHopRefused("synthetic Vault hop: set [secrets].vault_revocation_attested")
+        raise SecretProviderError("synthetic provider text at vault.example.invalid") from cause
+
+    monkeypatch.setattr(secretprovider, "resolve_secret_provider", refused)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        email_password_secret="alerts/smtp",
+        webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert err.count("[secrets].vault_revocation_attested") == 1
+    assert "vault.example.invalid" not in err and "SecretProviderError" in err
+
+
+@pytest.mark.usefixtures("_no_blanket_revocation_attestation")
+@pytest.mark.parametrize("explicit", [False, True], ids=["derived-warn", "not-enforcing"])
+def test_a_warn_instance_builds_the_unattested_webhook_offline(explicit: bool) -> None:
+    """BACKLOG #2193: on a ``warn`` instance the offline alert path warns rather than refusing,
+    whether the caller passes a non-enforcing posture or none, which is derived from the settings
+    as the security notifier derives it."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import (
+        SecurityEnforcement,
+        SecuritySettings,
+        ServiceSettings,
+    )
+    from messagefoundry.config.tls_policy import HopPosture
+
+    settings = ServiceSettings(
+        alerts=AlertsSettings(webhook_url="https://hooks.example.invalid/x"),
+        security=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+    )
+    built = _offline_alert_notifier(settings, HopPosture(enforcing=False) if explicit else None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
 
 
 def test_a_webhook_that_cannot_build_keeps_the_email(
@@ -2709,6 +2867,8 @@ def test_a_secret_provider_this_shell_cannot_reach_costs_the_email_only(
         email_to=["ops@example.invalid"],
         email_password_secret="alerts/smtp",
         webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
     )
     built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
     assert built is not None
@@ -2734,6 +2894,8 @@ def test_a_hop_check_that_raises_costs_the_email_only(
         email_from="mefor@example.invalid",
         email_to=["ops@example.invalid"],
         webhook_url="https://hooks.example.invalid/x",
+        webhook_tls_revocation_attested=True,
+        webhook_tls_revocation_attested_reason=_WEBHOOK_REVOCATION_REASON,
     )
     built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
     assert built is not None
