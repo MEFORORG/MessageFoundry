@@ -1698,9 +1698,12 @@ async def test_the_enrol_first_notice_offers_both_factors_with_a_way_past(
 ) -> None:
     """RED when: the enroll_first notice stops offering a passkey to a local account
     ``require_mfa`` covers that has no TOTP. From ADR 0197 Amendment A wave 2 a passkey the browser
-    stores as discoverable is a way past the sign-in lock, so it may be the first factor. With the
-    requirement off the general notice offers both, as before."""
+    stores as discoverable is a way past the sign-in lock, so it may be the first factor, where the
+    configuration names the relying party (BACKLOG #3937); with none named the notice offers TOTP
+    alone, since no passkey would discharge the requirement. With the requirement off the general
+    notice offers both, as before."""
     service = await _service(engine)
+    service._way_past_rp_id = "t"  # as [api].public_origin = "http://t" sets it
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _login(c)
@@ -1710,6 +1713,14 @@ async def test_the_enrol_first_notice_offers_both_factors_with_a_way_past(
         page = await c.get(_ENROL_FIRST)
     assert page.status_code == 200
     assert "enroll an authenticator app (TOTP) or a passkey to continue" in page.text
+
+    unnamed = await _service(engine)
+    async with _client(engine, unnamed) as c:
+        await _login(c)
+        page = await c.get(_ENROL_FIRST)
+    assert page.status_code == 200
+    assert "enroll an authenticator app (TOTP) to continue" in page.text
+    assert "or a passkey to continue" not in page.text
 
     off = await _service(engine, require_mfa=False)
     async with _client(engine, off) as c:

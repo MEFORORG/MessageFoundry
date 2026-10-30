@@ -1,0 +1,458 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""A Handler's per-message headers meet the hop's static header rule at send (vault BACKLOG #3533 item 6).
+
+The owner's 2026-10-26 ruling on item 7 holds a ``verify_tls = false`` hop's static headers to
+``VERIFY_OFF_STATIC_HEADER_ALLOWLIST``. The ruling on item 4 refuses a credential over plain http
+off this machine, with no allowlist. Before item 6 both rules read settings only, so a header a
+Handler stamped under ``dynamic_headers`` crossed either hop whatever it held. These tests drive the
+REST and FHIR ``send`` with a fake wire call, so a refusal is seen before any byte would cross, and a
+control reaches the wire.
+
+Every value here is synthetic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.wiring import FHIR, Registry, Rest
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.fhir import FhirDestination
+from messagefoundry.transports.rest import (
+    DYNAMIC_HEADER_REFUSED_CODE,
+    INSECURE_HOP_REFUSED_CODE,
+    VERIFY_OFF_STATIC_HEADER_ALLOWLIST,
+    InsecureHopGuard,
+    RestDestination,
+)
+
+_ENFORCING = HopPosture(enforcing=True)
+_PATIENT = '{"resourceType": "Patient", "id": "p1"}'
+
+#: Each per-message header set a verify-off hop must refuse: a name off the allowlist, a
+#: credential under an allowed name, and both together.
+_REFUSED: dict[str, dict[str, str]] = {
+    "neutral name": {"X-Session": "s1"},
+    "credential value under an allowed name": {"X-Request-ID": "Bearer abc.def.ghi"},
+    "two headers": {"X-Session": "s1", "If-Match": 'W/"3"'},
+}
+
+#: Each per-message header set an off-box cleartext hop must refuse: a credential, by name or by
+#: value. The ruling on item 4 refuses credentials only, so a neutral name is not among them.
+_CLEARTEXT_REFUSED: dict[str, dict[str, str]] = {
+    "credential name": {"X-Api-Key": "k1"},
+    "credential value under a neutral name": {"X-Session": "Bearer abc.def.ghi"},
+    "credential value under an allowed name": {"X-Request-ID": "Bearer abc.def.ghi"},
+    "a credential beside a neutral header": {
+        "X-Auth-Token": "t9",
+        "Prefer": "return=minimal",
+    },
+}
+
+
+def _meta(headers: dict[str, str]) -> dict[str, str]:
+    return {f"http.header.{name}": value for name, value in headers.items()}
+
+
+def _build(ctype: ConnectorType, settings: dict[str, Any], **declared: Any) -> Any:
+    with active_hop_posture(_ENFORCING):
+        return build_destination(
+            Destination(name="OB_DYN", type=ctype, settings=settings, **declared),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+def _rest(url: str, *, verify_tls: bool = True, **declared: Any) -> RestDestination:
+    settings = Rest(url=url, verify_tls=verify_tls, dynamic_headers=True).settings
+    dest = _build(ConnectorType.REST, settings, **declared)
+    assert isinstance(dest, RestDestination)
+    return dest
+
+
+def _fhir(url: str, *, verify_tls: bool = True, **declared: Any) -> FhirDestination:
+    settings = FHIR(url=url, verify_tls=verify_tls, dynamic_headers=True).settings
+    dest = _build(ConnectorType.FHIR, settings, **declared)
+    assert isinstance(dest, FhirDestination)
+    return dest
+
+
+_Dest = RestDestination | FhirDestination
+
+_ACCEPTED: dict[str, Any] = {
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner has no TLS listener",
+}
+
+#: Each hop the static rule holds to the allowlist, so the dynamic rule must too.
+_HELD: dict[str, Callable[[], _Dest]] = {
+    "rest verify-off loopback": lambda: _rest("https://127.0.0.1:8443/x", verify_tls=False),
+    "fhir verify-off loopback": lambda: _fhir("https://127.0.0.1:8443/fhir", verify_tls=False),
+}
+
+#: Each hop whose static credentials the item 4 rule refuses, so the dynamic rule must too.
+_CLEARTEXT: dict[str, Callable[[], _Dest]] = {
+    "rest cleartext off-box": lambda: _rest("http://partner.example.test/x", **_ACCEPTED),
+    "fhir cleartext off-box": lambda: _fhir("http://partner.example.test/fhir", **_ACCEPTED),
+}
+
+#: Each hop the rule does not hold: a verified https hop, and plain http that stays on the box.
+_FREE: dict[str, Callable[[], _Dest]] = {
+    "rest verified": lambda: _rest("https://127.0.0.1:8443/x"),
+    "rest cleartext loopback": lambda: _rest("http://127.0.0.1:8080/x"),
+    "fhir verified": lambda: _fhir("https://127.0.0.1:8443/fhir"),
+    "fhir cleartext loopback": lambda: _fhir("http://127.0.0.1:8080/fhir"),
+}
+
+
+def _wire(dest: RestDestination | FhirDestination, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Replace the blocking wire call with a recorder that answers 200 with no body."""
+    sent: list[Any] = []
+    if isinstance(dest, RestDestination):
+
+        def post(payload: str, dynamic: dict[str, str] | None = None) -> tuple[str, int, dict]:
+            sent.append(dynamic)
+            return "", 200, {}
+
+        monkeypatch.setattr(dest, "_post", post)
+    else:
+
+        def exchange(payload: str, request: Any, extra: dict[str, str]) -> tuple:
+            sent.append(extra)
+            return "", 200, {}, None
+
+        monkeypatch.setattr(dest, "_exchange", exchange)
+    return sent
+
+
+def _assert_refused(dest: _Dest, headers: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> str:
+    """Send ``headers`` on ``dest``, assert the refusal's shape, and return its text."""
+    sent = _wire(dest, monkeypatch)
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(headers)))
+    assert sent == []
+    assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
+    assert exc.value.permanent is True
+    assert exc.value.config_fault is False  # dead-letter this message; the lane goes on
+    text = str(exc.value)
+    assert "connection 'OB_DYN'" in text
+    # Neither a name nor a value: at send both are message-derived. The verify-off text lists the
+    # allowlist itself, so an allowed name is checked only by its value.
+    for name, value in headers.items():
+        assert value not in text
+        if name.lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+            assert name not in text
+    return text
+
+
+@pytest.mark.parametrize("hop", list(_HELD))
+@pytest.mark.parametrize("case", list(_REFUSED))
+def test_a_held_hop_refuses_the_header_at_send(
+    hop: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _assert_refused(_HELD[hop](), _REFUSED[case], monkeypatch)
+    assert f"stamped {len(_REFUSED[case])} per-message header" in text
+    assert "verify_tls=false" in text
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+@pytest.mark.parametrize("case", list(_CLEARTEXT_REFUSED))
+def test_a_cleartext_hop_refuses_a_credential_header_at_send(
+    hop: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _assert_refused(_CLEARTEXT[hop](), _CLEARTEXT_REFUSED[case], monkeypatch)
+    # Only the credential is counted, not a neutral header beside it.
+    assert "stamped 1 per-message header " in text
+    assert "cleartext http off this machine" in text
+    assert "allowlist" not in text
+
+
+@pytest.mark.parametrize("hop", list(_HELD) + list(_CLEARTEXT))
+def test_control_a_held_hop_sends_an_allowlisted_header(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arms above refuse for the header, not for the hop: an allowlisted name with a plain
+    value reaches the wire."""
+    dest = {**_HELD, **_CLEARTEXT}[hop]()
+    sent = _wire(dest, monkeypatch)
+    asyncio.run(dest.send(_PATIENT, metadata=_meta({"X-Request-ID": "r1", "Accept": "a/b"})))
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_cleartext_hop_sends_a_neutral_header(hop: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verify-off allowlist does not apply to an off-box cleartext hop (the ruling on item 4
+    names credentials only), so a neutral name off the list, with a plain value, still crosses."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    asyncio.run(dest.send(_PATIENT, metadata=_meta(_REFUSED["two headers"])))
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("hop", list(_FREE))
+def test_control_a_free_hop_sends_any_header(hop: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verified hop, and plain http on the box, keep sending what the Handler stamps."""
+    dest = _FREE[hop]()
+    sent = _wire(dest, monkeypatch)
+    asyncio.run(dest.send(_PATIENT, metadata=_meta(_REFUSED["two headers"])))
+    assert len(sent) == 1
+
+
+async def _seed_delivery(store: Any, *, channel: str, dest: str, control_id: str) -> str:
+    """Drive one message ingress to routed to outbound for ``dest``; return its message id."""
+    raw = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|{control_id}|P|2.5.1\r"
+    mid = await store.enqueue_ingress(channel_id=channel, raw=raw, now=0.0)
+    ing = await store.claim_next_fifo(channel, stage=Stage.INGRESS.value, now=0.0)
+    assert ing is not None
+    await store.route_handoff(
+        ingress_id=ing.id,
+        message_id=mid,
+        channel_id=channel,
+        handlers=[("h1", raw)],
+        disposition=MessageStatus.ROUTED,
+        now=0.0,
+    )
+    routed = await store.claim_next_fifo(channel, stage=Stage.ROUTED.value, now=0.0)
+    assert routed is not None
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id=channel,
+        deliveries=[(dest, _PATIENT)],
+        now=0.0,
+    )
+    return str(mid)
+
+
+class _StopSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+
+async def test_one_bad_message_dead_letters_and_the_lane_delivers_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 review finding 1 (vault BACKLOG #3533 item 6): the refusal is per message. A Handler
+    that stamps an off-allowlist header on one message dead-letters that message only. The lane is
+    not stopped, and the next message, with an allowed header, reaches the wire."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        bad = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        good = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M2")
+        headers = {bad: {"X-Session": "s1"}, good: {"X-Request-ID": "r1"}}
+        sink = _StopSink()
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            poll_interval=0.02,
+            alert_sink=sink,
+            egress=EgressSettings(deny_by_default=False),
+        )
+        dest = _rest("https://127.0.0.1:8443/x", verify_tls=False)
+        sent = _wire(dest, monkeypatch)
+        runner._destinations["OB_DYN"] = dest
+
+        async def metadata_for(message_id: str) -> dict[str, str]:
+            return _meta(headers[message_id])
+
+        monkeypatch.setattr(runner, "_user_metadata_for", metadata_for)
+
+        async def status_of(mid: str) -> str:
+            cur = await store._db.execute(
+                "SELECT status FROM queue WHERE message_id=? AND stage=?",
+                (mid, Stage.OUTBOUND.value),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return str(row[0])
+
+        first = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert first is not None and first.message_id == bad
+        outcome = await runner._process_delivery_item("OB_DYN", first)
+        assert outcome[0] is _ItemOutcome.PROCESSED  # the lane goes on
+        assert await status_of(bad) == OutboxStatus.DEAD.value
+        assert sent == []
+
+        second = await store.claim_next_fifo("OB_DYN", now=2.0)
+        assert second is not None and second.message_id == good
+        outcome = await runner._process_delivery_item("OB_DYN", second)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert sent == [{"X-Request-ID": "r1"}]
+        assert await status_of(good) == OutboxStatus.DONE.value
+        assert sink.stopped == []
+    finally:
+        await store.close()
+
+
+# --- Lander finding 6 on engine PR 2576: the hop is judged before the headers -------------------
+#
+# A hop that is no longer permitted is the connection's fault, and on main it stopped the lane and
+# kept the row. The per-message header refusal dead-letters one message. Judged first, it turned
+# that lane stop into a dead-letter for any message holding a held header. The guard below is the
+# one the hop would capture with its declaration gone, built as
+# test_digest_refusal_classification builds it.
+
+#: A Handler header each rule holds: a credential by value, so the cleartext rule and the
+#: verify-off rule both refuse it.
+_HELD_HEADER = {"X-Session": "Bearer abc.def.ghi"}
+
+
+def _refusing_guard() -> InsecureHopGuard:
+    return InsecureHopGuard(
+        posture=HopPosture(enforcing=True),
+        attested=False,
+        cell="HTTP cleartext egress",
+        connection="OB_DYN",
+    )
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_refused_hop_wins_over_a_held_header(hop: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    dest = _CLEARTEXT[hop]()
+    assert dest._hop_guard is not None  # built permitted, with a guard to re-assert at send
+    sent = _wire(dest, monkeypatch)
+    dest._hop_guard = _refusing_guard()
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(_HELD_HEADER)))
+    assert exc.value.code == INSECURE_HOP_REFUSED_CODE
+    assert (exc.value.permanent, exc.value.config_fault) == (True, True)  # stop the lane
+    assert sent == []
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_a_refused_hop_wins_over_an_unsendable_header(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 1: every other per-message refusal comes after the hop too. A value
+    http.client cannot encode is a per-message dead-letter, so it must not win either."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    dest._hop_guard = _refusing_guard()
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta({"X-Note": "cafā"})))
+    assert exc.value.code == INSECURE_HOP_REFUSED_CODE
+    assert sent == []
+
+
+@pytest.mark.parametrize("hop", list(_CLEARTEXT))
+def test_control_a_permitted_hop_still_refuses_the_held_header(
+    hop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other order: with the guard the hop was built with, the send passes the hop check and
+    the header is what refuses, dead-lettering this message only."""
+    dest = _CLEARTEXT[hop]()
+    sent = _wire(dest, monkeypatch)
+    with pytest.raises(NegativeAckError) as exc:
+        asyncio.run(dest.send(_PATIENT, metadata=_meta(_HELD_HEADER)))
+    assert exc.value.code == DYNAMIC_HEADER_REFUSED_CODE
+    assert exc.value.config_fault is False
+    assert sent == []
+
+
+async def _runner_with(
+    store: Any, dest: _Dest, monkeypatch: pytest.MonkeyPatch, headers: dict[str, dict[str, str]]
+) -> tuple[RegistryRunner, _StopSink]:
+    sink = _StopSink()
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    runner._destinations["OB_DYN"] = dest
+
+    async def metadata_for(message_id: str) -> dict[str, str]:
+        return _meta(headers[message_id])
+
+    monkeypatch.setattr(runner, "_user_metadata_for", metadata_for)
+    return runner, sink
+
+
+async def _outbound_status(store: Any, mid: str) -> str:
+    cur = await store._db.execute(
+        "SELECT status FROM queue WHERE message_id=? AND stage=?", (mid, Stage.OUTBOUND.value)
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+async def test_a_refused_hop_stops_the_lane_and_keeps_a_held_header_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As on main: a hop refused at send stops the lane and keeps the row, though the message
+    holds a header the per-message rule would dead-letter it for."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        mid = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        dest = _CLEARTEXT["rest cleartext off-box"]()
+        sent = _wire(dest, monkeypatch)
+        dest._hop_guard = _refusing_guard()
+        runner, sink = await _runner_with(store, dest, monkeypatch, {mid: _HELD_HEADER})
+        item = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert item is not None and item.message_id == mid
+        outcome = await runner._process_delivery_item("OB_DYN", item)
+        assert outcome[0] is _ItemOutcome.STOPPED
+        assert sink.stopped == ["OB_DYN"]
+        assert await _outbound_status(store, mid) == OutboxStatus.PENDING.value
+        assert sent == []
+    finally:
+        await store.close()
+
+
+#: Per-message headers that only look like a credential (finding 1, shipped fail-closed). Each
+#: must cost its own message and never the lane.
+_FALSE_POSITIVES: dict[str, dict[str, str]] = {
+    "clinical value with a scheme word": {"X-Order-Name": "Basic metabolic panel"},
+    "neutral name holding a credential word": {"X-Token-Count": "3"},
+}
+
+
+@pytest.mark.parametrize("case", list(_FALSE_POSITIVES))
+@pytest.mark.parametrize("hop", ["rest cleartext off-box", "fhir cleartext off-box"])
+async def test_a_false_positive_header_dead_letters_only_its_message(
+    case: str, hop: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Lander's condition on finding 1: a header the name or value heuristic refuses wrongly
+    dead-letters that message, the lane goes on, and the next message is delivered."""
+    store = await MessageStore.open(tmp_path / "dyn.db")
+    try:
+        bad = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M1")
+        good = await _seed_delivery(store, channel="IB_DYN", dest="OB_DYN", control_id="M2")
+        dest = _CLEARTEXT[hop]()
+        sent = _wire(dest, monkeypatch)
+        headers = {bad: _FALSE_POSITIVES[case], good: {"X-Request-ID": "r1"}}
+        runner, sink = await _runner_with(store, dest, monkeypatch, headers)
+
+        first = await store.claim_next_fifo("OB_DYN", now=1.0)
+        assert first is not None and first.message_id == bad
+        outcome = await runner._process_delivery_item("OB_DYN", first)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert await _outbound_status(store, bad) == OutboxStatus.DEAD.value
+        assert sent == []
+
+        second = await store.claim_next_fifo("OB_DYN", now=2.0)
+        assert second is not None and second.message_id == good
+        outcome = await runner._process_delivery_item("OB_DYN", second)
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert await _outbound_status(store, good) == OutboxStatus.DONE.value
+        assert len(sent) == 1
+        assert sink.stopped == []
+    finally:
+        await store.close()

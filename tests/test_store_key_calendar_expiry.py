@@ -356,13 +356,16 @@ def test_the_reconcile_handler_is_still_the_blanket_one_this_test_guards_against
     tree = ast.parse(_ENGINE_PY.read_text(encoding="utf-8"))
     guarded = _guarded_reconcile_try(tree)
     assert guarded.handlers, "the reconcile await is no longer guarded at all"
-    for handler in guarded.handlers:
-        assert isinstance(handler.type, ast.Name) and handler.type.id == "Exception", (
-            "the reconcile handler narrowed — re-read the siting decision"
-        )
-        assert not any(isinstance(n, ast.Raise) for n in ast.walk(handler)), (
-            "the reconcile handler now re-raises; the swallow this test guards against is gone"
-        )
+    names = [h.type.id if isinstance(h.type, ast.Name) else None for h in guarded.handlers]
+    # Vault BACKLOG #2595: one narrow arm ahead of the blanket one re-raises a secrets-directory
+    # refusal, so it refuses as itself. It is the only arm allowed beside the blanket swallow.
+    assert names[-1] == "Exception" and set(names[:-1]) <= {"SecretsDirectoryError"}, (
+        f"the reconcile handlers changed ({names}) — re-read the siting decision"
+    )
+    blanket = guarded.handlers[-1]
+    assert not any(isinstance(n, ast.Raise) for n in ast.walk(blanket)), (
+        "the reconcile handler now re-raises; the swallow this test guards against is gone"
+    )
 
 
 def test_the_refusal_is_sited_OUTSIDE_the_blanket_reconcile_handler() -> None:

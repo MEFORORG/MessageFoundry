@@ -39,7 +39,7 @@ from messagefoundry.remotedebug import (
 #
 # `_serve` and `_supervise` still make the same call first. Their comments describe the window
 # as it was before this call existed; with this one in place theirs normally adds nothing.
-# `install_remote_debug_guard` says when a later call adds a copy, including this one run again.
+# `install_remote_debug_guard` says why a later call adds no second copy, this one run again too.
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
@@ -49,7 +49,6 @@ __lazy_modules__ = ["sqlite3", "tomllib"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402
-import contextlib  # noqa: E402
 import functools  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -86,6 +85,7 @@ from messagefoundry.logging_setup import (  # noqa: E402
     LogFile,
     SyslogForward,
     configure_logging,
+    install_filtered_last_resort,
     level_refused_on_production,
     query_sntp_offset,
 )
@@ -161,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         args,
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
+        author_prints_keep_stdout=_AUTHOR_PRINTS_KEEP_STDOUT,
         floor_code=_floor_error_code,
     )
 
@@ -1013,6 +1014,26 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "'messagefoundry audit-anchor' (on PowerShell 5.1 pipe to 'Set-Content -Encoding utf8' — "
         "its '>' writes UTF-16, which is refused)",
     )
+    # vault BACKLOG #2612. Not in the anchor's group: an anchor and a set of rows are different
+    # witnesses, and both may be checked in the one walk.
+    audit_verify.add_argument(
+        "--expected-row",
+        action="append",
+        default=None,
+        metavar="SEQ:ROW_HASH",
+        help="also check that the row at sequence number SEQ is still in the chain with this full "
+        "row_hash, as the off-box audit record carries them ('seq' and 'row_hash'; never the row "
+        "id). Repeatable. A row that is gone, or whose hash differs, is a broken chain (exit 1). "
+        "Every pair given here and in --expected-rows-file is checked in one walk of the chain",
+    )
+    audit_verify.add_argument(
+        "--expected-rows-file",
+        default=None,
+        metavar="PATH",
+        help="read SEQ:ROW_HASH pairs, one per line, from a UTF-8 text file of at most "
+        f"{_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB, such as pairs exported from the off-box audit "
+        "copy. Blank lines are skipped. Checked as --expected-row is",
+    )
 
     audit_anchor = sub.add_parser(
         "audit-anchor",
@@ -1462,10 +1483,7 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        # This load imports the author's config modules ahead of the subcommand's own load, so a
-        # print() in one would reach stdout before any command redirects it (vault BACKLOG #2727).
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir)
+        reg = load_config(config_dir)
     except (WiringError, FileNotFoundError, OSError):
         # A config that doesn't load is reported by the subcommand's own validate/load path with a
         # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
@@ -2005,8 +2023,8 @@ def _forwarder_posture_refused(
     # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
     # staging instance is held to it exactly as a production one is.
     if not deny_written:
-        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
-        # like the sibling posture gates rather than logging.info.
+        # In `serve` configure_logging has not run yet (its filtered lastResort drops < WARNING), so
+        # announce on stderr like the sibling posture gates rather than logging.info.
         print(
             f"info: [security].block_unlisted_outbound defaulted ON for a "
             f"{'production ' if production else ''}PHI instance "
@@ -2018,7 +2036,7 @@ def _forwarder_posture_refused(
     elif not settings.egress.deny_by_default:
         # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
         # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-        # line is WARNING-level so the root lastResort handler still surfaces it before
+        # line is WARNING-level so `serve`'s filtered lastResort still surfaces it before
         # configure_logging.
         logging.getLogger(__name__).warning(
             "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
@@ -2254,8 +2272,8 @@ def _start_logging(
             )
             return 2
         if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
-            # lastResort handler even though configure_logging has not run yet.
+            # Crossed, but never silent — the point of the fix. In `serve` the WARNING surfaces via
+            # the filtered lastResort even though configure_logging has not run yet.
             logging.getLogger(__name__).warning(
                 "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
@@ -2276,10 +2294,10 @@ def _start_logging(
     # opens no spool and contacts no collector.
     #
     # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
-    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
-    # stderr only in `serve`, where configure_logging has not run, and in `supervise` it would
-    # reach stdout but never the forwarder. So the gate hands the notes back as text and each is
-    # written TWICE, as the #1989 static-credential lines are: to stderr now, and to the
+    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach the
+    # filtered lastResort only in `serve`, where configure_logging has not run, and in `supervise`
+    # it would reach stdout but never the forwarder. So the gate hands the notes back as text and
+    # each is written TWICE, as the #1989 static-credential lines are: to stderr now, and to the
     # configured handlers once `configure` below has returned.
     _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
     for _gate_note in _gate_notes:
@@ -2336,8 +2354,8 @@ def _start_logging(
 
     _forward_ca = log_forward_anchor_spec(settings.logging)
     # Under `warn` the check warns rather than refuses. Its text quotes a configured path, so it is
-    # taken here and printed scrubbed, as the #2375 gate notes above are: no handler is installed
-    # yet, so a logged warning would reach bare stderr with any newline in the path intact.
+    # taken here and printed with its control characters scrubbed, as the #2375 gate notes above
+    # are, so a newline in the path cannot forge a line.
     _ca_notes: list[str] = []
     _ca_refusal = (
         anchor_refusal(_forward_ca, enforcing=enforcing, warn=_ca_notes.append)
@@ -2493,7 +2511,6 @@ def _read_environment_values(
     )
     from messagefoundry.config.snapshot import NotInSnapshot
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
-    from messagefoundry.redaction import safe_exc
 
     # Guarded HERE because this is the one site that knows the value file's PATH, and because this
     # function is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
@@ -2520,6 +2537,9 @@ def _read_environment_values(
     # reads it again on every reload. So each read vets it again first, and a file edited or
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+    from messagefoundry.redaction import safe_exc
+
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
@@ -2542,6 +2562,12 @@ def _read_environment_values(
             environment=environment,
             environ=os.environ,
         )
+    except SecretsDirectoryError as exc:
+        # Vault BACKLOG #2595: the secrets directory, not the value file, refused. Its message names
+        # the file and its remedy and never a value, so it is passed whole rather than blamed on
+        # env_file and cut to safe_exc's length.
+        refusal = str(exc)
+        failed_on = "could not read environment values from the secrets directory"
     except (ValueError, RecursionError, OSError) as exc:
         # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
         # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
@@ -2551,11 +2577,12 @@ def _read_environment_values(
         # an embedder's arbitrary callable, while this one wraps our own call into a function that
         # returns a dict or raises.
         refusal = safe_exc(exc)
+        failed_on = f"could not read environment values from {env_file}"
     # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
     # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
     # bytes on .object, so chaining either would carry every credential the file holds. `from None`
     # would not do: it leaves __context__ set.
-    raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+    raise WiringError(f"{failed_on}: {refusal}")
 
 
 def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
@@ -2653,6 +2680,10 @@ def _serve(args: argparse.Namespace) -> int:
     # A no-op where the interpreter was started with remote debugging disabled, which is every
     # engine shard under `supervise`.
     install_remote_debug_guard()
+    # BACKLOG #3768: configure_logging runs only after the gates below, so until then a record no
+    # handler takes goes to `logging.lastResort`. This gives it the filter chain; the function
+    # says what else it keeps. The comments below that name the filtered lastResort rely on it.
+    install_filtered_last_resort()
 
     import uvicorn
 
@@ -2669,6 +2700,7 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
+        _approvals_loosenings,
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
@@ -2693,9 +2725,10 @@ def _serve(args: argparse.Namespace) -> int:
     # deleted 4.0.3 V8.3.6 and kept 11.7.1); this is worth doing on its own merits only.
     #
     # APPLIED here, REPORTED after configure_logging (below). The call must run before PHI can be
-    # resident; the report must not, because at this point the root logger still has no handlers and
-    # every record is serviced by logging.lastResort — which drops < WARNING at ANY --log-level and
-    # reaches none of the handlers/filters/off-box forwarder the operator configured. A hardened
+    # resident; the report must not, because in a real process the root logger still has no
+    # handlers here and every record is serviced by the filtered logging.lastResort above — which
+    # drops < WARNING at ANY --log-level and reaches none of the handlers or the off-box forwarder
+    # the operator configured. A hardened
     # container (RLIMIT_MEMLOCK=0) would otherwise print a WARNING to stderr on every start that no
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
@@ -2864,8 +2897,8 @@ def _serve(args: argparse.Namespace) -> int:
     # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
     # on every /config/reload, because the graph is not loaded in this function (load_config executes
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
-    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the root
-    # lastResort handler on stderr, never the log file or the off-box forwarder, because
+    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the
+    # filtered lastResort on stderr, never the log file or the off-box forwarder, because
     # configure_logging has not run. So each line is written TWICE (BACKLOG #1989): to stderr now,
     # which every exit before configure_logging still sees and no log level can filter, and to the
     # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
@@ -2946,10 +2979,11 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
         # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
         # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
-        # never silent. (Logging isn't configured yet here, so this goes through the root logger,
-        # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
-        # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
-        # was verified above, so the AUDIT line names it too; the warn posture names the opt-out alone.
+        # never silent. (Logging isn't configured yet here, so this goes to the filtered
+        # lastResort, which emits >=WARNING to stderr through the filter chain — a durable startup
+        # audit line.) Under strict enforcement the second ack
+        # ([security].allow_unencrypted_phi_under_strict_enforcement=true) was verified above, so
+        # the AUDIT line names it too; the warn posture names the opt-out alone.
         # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
         logging.getLogger(__name__).warning(
             "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
@@ -3058,8 +3092,8 @@ def _serve(args: argparse.Namespace) -> int:
     ) is not None:
         logging.getLogger(__name__).warning("%s", _rd_audit)
     # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
-    # configured, so to bare stderr only. Logged again here, under the settings logger they came
-    # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
+    # configured, so to the filtered lastResort only. Logged again here, under the settings logger
+    # they came from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
     from messagefoundry.config.settings import unread_env_warnings
 
     for _env_line in unread_env_warnings(settings):
@@ -3986,13 +4020,40 @@ def _serve(args: argparse.Namespace) -> int:
     # the sec-mfa-on / retention / notifications prod-refuse ladder above, returning 2) instead of
     # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
     # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
-    if admin_exposed and not settings.approvals.enabled:
+    #
+    # Dual control on with a narrowed or empty [approvals].operations leaves the same actions on one
+    # caller's authority, so it gets the advisory too (vault BACKLOG #3474). The narrowing and its
+    # wording are `_approvals_loosenings`', the one reader of that list against its default, so this
+    # arm does not compare the list itself. The off case's text still names the shipped pair. Still WARN-only: the arm's body holds no return.
+    # The serve-time loosenings warning above prints the same risk text; this is the exposure
+    # reminder beside it, as the MFA arm's is.
+    held_gap = (
+        next(
+            (
+                risk
+                for switch, risk in _approvals_loosenings(settings.approvals)
+                if switch == "approvals.operations"
+            ),
+            None,
+        )
+        if admin_exposed
+        else None
+    )
+    if admin_exposed and (not settings.approvals.enabled or held_gap is not None):
+        if not settings.approvals.enabled:
+            gap = (
+                "[approvals].enabled off — high-value actions (dead_letter_replay, "
+                "connection_purge) each complete on a single caller's authority with no second "
+                "sign-off (ASVS 2.3.5). Enable dual-control with [approvals].enabled=true"
+            )
+        else:
+            gap = (
+                f"[approvals].operations narrowed: {held_gap} (ASVS 2.3.5). Hold the default "
+                "operations in [approvals].operations"
+            )
         print(
-            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
-            "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) each "
-            "complete on a single caller's authority with no second sign-off (ASVS 2.3.5). Enable "
-            "dual-control with [approvals].enabled=true so a distinct approver (approvals:approve) must "
-            "release them before exposure.",
+            f"warning: {exposure_desc} in a PHI-carrying environment ({env_name!r}) with {gap} so "
+            "a distinct approver (approvals:approve) must release them before exposure.",
             file=sys.stderr,
         )
 
@@ -4359,6 +4420,9 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
     # and the #188 gate above already owns the "no channel at all" case.
+    #
+    # A login never reaches this gate: it cannot load beside either shape
+    # (AlertsSettings._refuse_a_login_over_an_unauthenticated_hop, vault BACKLOG #3533).
     if settings.alerts.email_smtp_host and settings.alerts.email_from:
         if not settings.alerts.email_use_tls:
             hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"
@@ -4370,12 +4434,12 @@ def _serve(args: argparse.Namespace) -> int:
             if enforcing and not settings.security.allow_unverified_alert_smtp_tls:
                 print(
                     f"error: {hop_desc} on a {'production ' if production else ''}PHI instance "
-                    f"({env_name!r}); refusing to start — operator alert bodies, every per-user "
-                    "security-event email, and the SMTP AUTH password would cross a hop that does not "
-                    "authenticate the relay, so an on-path attacker can read them. Remove the override "
-                    "(the default verifies), or point [alerts].email_tls_ca_file / [tls].internal_ca_file "
-                    "at the relay's CA; or set [security].allow_unverified_alert_smtp_tls=true to "
-                    "deliberately accept an unauthenticated alert hop (audited).",
+                    f"({env_name!r}); refusing to start — operator alert bodies and every per-user "
+                    "security-event email would cross a hop that does not authenticate the relay, so "
+                    "an on-path attacker can read them. Remove the override (the default verifies), "
+                    "or point [alerts].email_tls_ca_file / [tls].internal_ca_file at the relay's CA; "
+                    "or set [security].allow_unverified_alert_smtp_tls=true to deliberately accept an "
+                    "unauthenticated alert hop with no login (audited).",
                     file=sys.stderr,
                 )
                 return 2
@@ -4384,17 +4448,17 @@ def _serve(args: argparse.Namespace) -> int:
                 # (captured by NSSM stdout/SIEM), then the shared warn posture below. Never silent.
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
-                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
+                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies and security-event "
+                    "email cross an UNAUTHENTICATED hop with no login "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
                     hop_desc,
                 )
             print(
-                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies, "
-                "per-user security-event email and the SMTP AUTH password cross a hop that does not "
-                "authenticate the relay (MITM-able). Remove the override, or trust the relay's CA via "
+                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies and "
+                "per-user security-event email cross a hop that does not authenticate the relay "
+                "(MITM-able). Remove the override, or trust the relay's CA via "
                 "[alerts].email_tls_ca_file / [tls].internal_ca_file.",
                 file=sys.stderr,
             )
@@ -4743,6 +4807,7 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #3402: the key files a graph's connections name are graph data, judged by an awaited
     # preflight at each load the engine runs, with that load's env() values, off the event loop.
     from messagefoundry.config.key_file_access import make_connection_key_file_preflight
+    from messagefoundry.pipeline.refused_body import RefusedBodyPolicy
 
     app = create_managed_app(
         store_settings=settings.store,
@@ -4764,6 +4829,11 @@ def _serve(args: argparse.Namespace) -> int:
         ack_after_default=settings.inbound.ack_after,
         stream_inflight_budget_bytes=settings.inbound.stream_inflight_budget_bytes,
         max_staged_depth=settings.inbound.max_staged_depth,
+        refused_body=RefusedBodyPolicy(
+            allowance_bytes=settings.inbound.refused_body_allowance_bytes,
+            window_seconds=settings.inbound.refused_body_window_seconds,
+            head_bytes=settings.inbound.refused_body_head_bytes,
+        ),
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         per_lane_wake=settings.pipeline.per_lane_wake,
@@ -4806,8 +4876,8 @@ def _serve(args: argparse.Namespace) -> int:
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
         # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
-        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the driver does not check
-        # under Encrypt=strict.
+        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
+        # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
         settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
@@ -5427,8 +5497,7 @@ def _validate(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, _ = resolved
-    with _author_prints_to_stderr():
-        diags = validate_config(config_dir)
+    diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -5455,8 +5524,7 @@ def _graph(args: argparse.Namespace) -> int:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir, allow_empty=True)
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -5576,20 +5644,6 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
         return PipelineSettings().snapshot_on_send
 
 
-def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
-    """Send a print() in the author's own code to stderr for the duration of one call.
-
-    ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
-    one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
-    the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
-    ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
-
-    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
-    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
-    still lets a print reach stdout."""
-    return contextlib.redirect_stdout(sys.stderr)
-
-
 def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
     """The text ``dryrun`` reports for an error that stopped its per-message loop.
 
@@ -5622,8 +5676,7 @@ def _dryrun(args: argparse.Namespace) -> int:
         return resolved
     config_dir, service_config = resolved
     try:
-        with _author_prints_to_stderr():
-            reg = load_config(config_dir)
+        reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -5651,14 +5704,13 @@ def _dryrun(args: argparse.Namespace) -> int:
         traced: list[dict[str, Any]] = []
         try:
             for source, path, raw in messages:
-                with _author_prints_to_stderr():
-                    entry = trace_dry_run(
-                        reg,
-                        raw,
-                        inbound=args.inbound,
-                        show_phi=show_phi,
-                        snapshot_on_send=snapshot_on_send,
-                    )
+                entry = trace_dry_run(
+                    reg,
+                    raw,
+                    inbound=args.inbound,
+                    show_phi=show_phi,
+                    snapshot_on_send=snapshot_on_send,
+                )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
             return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
@@ -5668,8 +5720,7 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            with _author_prints_to_stderr():
-                result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
             out.append(
                 {
                     "source": source,
@@ -6664,6 +6715,10 @@ def _protect_key(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The PowerShell 5.1 encoding hint both audit-verify file flags print on a read refusal.
+_UTF16_HINT = "PowerShell 5.1's '>' writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there."
+
+
 def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None | int:
     """The anchor for ``audit-verify``, or the exit code 2 if the flags are unusable.
 
@@ -6675,7 +6730,12 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
     from messagefoundry.redaction import codec_safe_str
-    from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
+    from messagefoundry.store.store import (
+        AUDIT_ANCHOR_FORM,
+        AuditAnchorError,
+        parse_audit_anchor,
+        read_audit_anchor_file,
+    )
 
     raw: str | None
     if args.expected_anchor_file is not None:
@@ -6690,8 +6750,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
             print(
                 f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: "
                 f"{codec_safe_str(exc)}. "
-                "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
-                "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
+                f"It must be a UTF-8 text file holding the COUNT:HEAD line; {_UTF16_HINT}",
                 file=sys.stderr,
             )
             return 2
@@ -6699,11 +6758,133 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         raw = args.expected_anchor
     if raw is None:
         return None
+    if args.expected_anchor_file is not None and not raw.strip():
+        # An empty file and a blank first line alike: the anchor is read from line 1 only.
+        print(
+            f"error: --expected-anchor-file {args.expected_anchor_file!r}: line 1 is empty; the "
+            "COUNT:HEAD line must be the file's first line",
+            file=sys.stderr,
+        )
+        return 2
     try:
         return parse_audit_anchor(raw)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except AuditAnchorError as exc:
+        if args.expected_anchor_file is None:
+            print(f"error: {exc}", file=sys.stderr)  # the operator typed it, so it is quoted
+        else:
+            # Never the file's text (vault BACKLOG #2612): a path typo'd onto a key file, a config
+            # or a captured message would put its first line on the job's output. The line number
+            # and a reason that quotes nothing are enough to find the fault in an editor.
+            print(
+                f"error: malformed --expected-anchor-file line 1: {exc.reason} — "
+                f"{AUDIT_ANCHOR_FORM}",
+                file=sys.stderr,
+            )
         return 2
+
+
+#: How much of an ``--expected-rows-file`` is read before it is refused: a bound against a path typo'd
+#: onto something that is not a pair file, not a size any deployment was measured against. A pair line
+#: is about 72 bytes, so this holds over three million pairs; the walk itself already loads every
+#: audit row into memory, which a log that size dwarfs.
+_AUDIT_ROWS_FILE_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | int:
+    """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
+    (vault BACKLOG #2612). An empty list when neither flag was given.
+
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
+    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
+    operator typed it; one for a file line names the line number and a reason that quotes nothing,
+    so a path typo'd onto another file does not put that file's content on the job's output.
+    """
+    from messagefoundry.redaction import codec_safe_str
+    from messagefoundry.store.store import (
+        AUDIT_ROW_PAIR_FORM,
+        AuditRowPairError,
+        parse_audit_row_pair,
+        read_bounded_utf8_lines,
+    )
+
+    #: Each pair with where it came from, by position and never by content, for the refusal below:
+    #: ``-n`` is the n-th ``--expected-row``, ``n`` is line n of the file. An int, not a label, so a
+    #: file of millions of pairs carries no string per pair.
+    pairs: list[tuple[int, str, int]] = []
+    for number, text in enumerate(args.expected_row or (), start=1):
+        try:
+            pairs.append((*parse_audit_row_pair(text), -number))
+        except AuditRowPairError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    path = args.expected_rows_file
+    if path is None:
+        return _refuse_contradictory_pairs(pairs)
+    try:
+        lines = read_bounded_utf8_lines(
+            path,
+            _AUDIT_ROWS_FILE_MAX_BYTES,
+            too_large=f"the file is larger than {_AUDIT_ROWS_FILE_MAX_BYTES // 2**20} MiB",
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` is a `ValueError`: uncaught it would exit 1, a broken chain's code.
+        # The encoding hint goes only on the error it explains.
+        hint = (
+            f" It must be a UTF-8 text file of SEQ:ROW_HASH lines; {_UTF16_HINT}"
+            if isinstance(exc, UnicodeDecodeError)
+            else ""
+        )
+        print(
+            f"error: cannot read --expected-rows-file {path!r}: {codec_safe_str(exc)}.{hint}",
+            file=sys.stderr,
+        )
+        return 2
+    before = len(pairs)
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            pairs.append((*parse_audit_row_pair(line), number))
+        except AuditRowPairError as exc:
+            print(
+                f"error: malformed --expected-rows-file line {number}: {exc.reason} — "
+                f"{AUDIT_ROW_PAIR_FORM}",
+                file=sys.stderr,
+            )
+            return 2
+    if len(pairs) == before:
+        # Refused, not read as "nothing to compare": a job pointed at an empty export would
+        # otherwise report a clean walk with no witness checked, which is what the flag is for.
+        print(f"error: --expected-rows-file {path!r} holds no SEQ:ROW_HASH line", file=sys.stderr)
+        return 2
+    return _refuse_contradictory_pairs(pairs)
+
+
+def _refuse_contradictory_pairs(pairs: list[tuple[int, str, int]]) -> list[tuple[int, str]] | int:
+    """``pairs``, or the exit code 2 if one seq is given two different row_hashes. No chain matches
+    both, so such a set is a bad input, such as an export mixing two engines' tees, never evidence
+    of tampering.
+
+    The refusal names the two places by position (each pair's third item) and never the seq: a
+    seq read from a file is that file's content, and a refusal quotes none (vault BACKLOG #2612).
+    """
+
+    def where(origin: int) -> str:
+        return f"--expected-row {-origin}" if origin < 0 else f"--expected-rows-file line {origin}"
+
+    first: dict[int, tuple[str, int]] = {}
+    for seq, head, origin in pairs:
+        earlier_head, earlier_origin = first.setdefault(seq, (head, origin))
+        if earlier_head != head:
+            print(
+                f"error: {where(earlier_origin)} and {where(origin)} give one seq two different "
+                "row_hash "
+                "values; no chain matches both, so the set is refused rather than reported as "
+                "tampering",
+                file=sys.stderr,
+            )
+            return 2
+    return [(seq, head) for seq, head, _ in pairs]
 
 
 def _host_gated_store_settings(
@@ -7751,13 +7932,23 @@ def _offline_security_notifier(
     **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
     instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that
     posture is derived from more than this command reads. Refusing everywhere is the stricter of the
-    two, and it costs one notice rather than putting the SMTP password on an unauthenticated hop.
+    two, and it costs one notice rather than putting the notice on an unauthenticated hop. A login
+    never reaches this point on such a hop: settings refuse ``[alerts].email_username`` beside it
+    at load (vault BACKLOG #3533 item 3).
 
-    **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
-    serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
-    build error escaping here would also land after the store was created, leaving no administrator.
-    The audit row then records that no channel was wired. That covers a relay CA the trust-anchor
-    checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
+    **A failure to build the channel here is WARNED and yields ``None`` rather than refusing.**
+    This serves a recovery command, and losing the notice is the smaller harm than losing the
+    recovery. A build error escaping here would also land after the store was created, leaving no
+    administrator. The audit row then records that no channel was wired. That covers a relay CA the
+    trust-anchor checks refuse (BACKLOG #3470): the CA is never loaded, and the notice is dropped.
+
+    **One shape is refused earlier, and the command does not run.** An ``[alerts]`` SMTP login
+    (``email_username`` set) beside ``email_use_tls = false`` or ``email_tls_verify = false`` is
+    refused when settings load (vault BACKLOG #3533 item 3). That is before any store is opened or
+    created, so at least ``provision-admin``, ``serve`` and ``supervise`` stop there and leave
+    nothing half-written; ``check`` fails its required ``posture`` leg on it and runs the rest.
+    The remedy is to verify the relay's TLS, or to remove
+    ``email_username`` and the password and send unauthenticated.
     """
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -7778,8 +7969,9 @@ def _offline_security_notifier(
         # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
         print(
             "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
-            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice and the SMTP "
-            "password can be read on that hop.",
+            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice can be read "
+            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
+            "when settings load.",
             file=sys.stderr,
         )
     try:
@@ -7897,7 +8089,7 @@ def _build_provision_auth_service(
 
     BACKLOG #2081, and the one place that says why the command builds it this way. Building the
     service checks the OIDC and AD trust anchors (#2034), resolves the directory secrets and applies
-    the OIDC revocation guard, so the command builds it ONCE, before the password prompt and before
+    the OIDC and LDAPS revocation guards (#1887, #2193), so the command builds it ONCE, before the password prompt and before
     any store is opened or created (ADR 0183 AC-15). Before this, a fresh install built it only for
     the write, after the prompt and after ``open_store(create=True)``, so a refused anchor left an
     empty store behind; an existing store built it twice, which at ``warn`` printed each anchor
@@ -7914,12 +8106,14 @@ def _build_provision_auth_service(
     ``SecretProviderError`` loading the provider, a ``SecretProviderError`` resolving a reference,
     an ``LdapError``, a ``FileNotFoundError`` and a ``SigningError`` (the OIDC private_key_jwt key or
     certificate, BACKLOG #296) each get a fixed text. ``InsecureHopRefused``, a
-    refusal ``serve`` also gives (an off-box OIDC IdP with no revocation check, at ``enforce``),
+    refusal ``serve`` also gives (an off-box OIDC IdP, or since BACKLOG #2193 an off-box LDAPS
+    domain controller, with no revocation check, at ``enforce``),
     keeps its own text, which names the hop, its host and the setting that clears it, and reads no
     secret. Any other exception is not this function's to name and reaches the caller as it is.
     """
     from messagefoundry.auth.ldap import LdapError
     from messagefoundry.auth.service import AuthService
+    from messagefoundry.auth.webauthn import configured_rp_id
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.tls_policy import InsecureHopRefused
@@ -7940,6 +8134,8 @@ def _build_provision_auth_service(
             secret_provider=secret_provider,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
             hop_posture=posture,
+            # BACKLOG #3937: as the serving engine passes it, so a gate here counts the same passkeys.
+            way_past_rp_id=configured_rp_id(settings.api.public_origin),
         )
     except SecretProviderError as exc:
         # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
@@ -9184,6 +9380,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     expected_anchor = resolved
+    # vault BACKLOG #2612. An argv/file error, like the anchor's, so it is refused before the open too.
+    expected_rows = _resolve_expected_rows(args)
+    if isinstance(expected_rows, int):
+        return expected_rows
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -9260,7 +9460,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         try:
             # The verdict carries the walk's own row count, which decides the empty-log exit
             # below: no second query, which could fail after a clean walk or see other rows.
-            return await store.verify_audit_chain(expected_anchor=expected_anchor)
+            # Every expected row rides this ONE walk (vault BACKLOG #2612), never a walk per row.
+            return await store.verify_audit_chain(
+                expected_anchor=expected_anchor, expected_rows=expected_rows
+            )
         except walk_errors as exc:
             if is_store_shape_error(exc):
                 # A table, column or grant gone since the open: still not a row's evidence.
@@ -9344,10 +9547,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # chain as plain SHA-256 changes every row hash, the head included. `audit-anchor` verifies
         # nothing, so an anchor taken after a rewrite matches it, and the cause stays named, scoped
         # to before the anchor (vault BACKLOG #3110, item 2).
+        # Matched expected rows rule a rewrite out the same way, for the rows they witness: the tee
+        # captured each pair as the row was written (vault BACKLOG #2612).
         rewrite = (
             "Or the chain was rewritten as keyless before the expected anchor was taken: it "
             "matched, which rules out a rewrite since then and no earlier one."
             if expected_anchor is not None
+            else "Or the chain was rewritten as keyless before the expected rows were captured: "
+            "they matched, which rules out a rewrite since the earliest was captured and no "
+            "earlier one."
+            if expected_rows
             else "Or the chain was rewritten as keyless, which a keyless check cannot see."
         )
         print(
@@ -10310,16 +10519,29 @@ def _connection(args: argparse.Namespace) -> int:
     env_name = settings.ai.environment
     # Anchor environments/<env>.toml the same way serve does (honor [environments].base_dir), so a
     # GUI/CLI edit validates against the same env() values the running instance will resolve.
-    env_values = (
-        load_environment_values(
-            base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
+    from messagefoundry.engine_secrets import SecretsDirectoryError
+
+    try:
+        env_values = (
+            load_environment_values(
+                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+            if env_name is not None
+            else {}
         )
-        if env_name is not None
-        else {}
-    )
+    except (ValueError, RecursionError, OSError) as exc:
+        # Vault BACKLOG #2595: a MEFOR_VALUE_* file the secrets directory cannot supply names the
+        # file and never a value, so it is printed as the refusal it is. Anything else from the read
+        # is a malformed or unreadable value file, reported the way serve's reader reports it,
+        # through safe_exc, rather than as a traceback the IDE bridge sees as no output.
+        if isinstance(exc, SecretsDirectoryError):
+            return _emit_error(str(exc), as_json=args.json)
+        from messagefoundry.redaction import safe_exc
+
+        return _emit_error(f"could not read environment values: {safe_exc(exc)}", as_json=args.json)
 
     def validate(config_dir: Path) -> None:
         # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate
@@ -10820,7 +11042,8 @@ def _security(args: argparse.Namespace) -> int:
     # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
     # degradation marker.
     _api = ApiSettings()
-    # BACKLOG #2489: [approvals] carries the dual-control dwell and expiry. Same read, same marker.
+    # BACKLOG #2489, vault #3123: [approvals] carries the dual-control dwell, expiry and held list.
+    # Same read, same marker.
     _approvals = ApprovalsSettings()
     # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
     _cert_monitor = CertMonitorSettings()
@@ -11209,12 +11432,22 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
-#: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
-#: and egress gates run, and its WARNINGs in that window still go through the unfiltered
-#: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
-#: on its first line, so it has no such window. Whether `serve` should take run_cli()'s sink for
-#: that window is an open question, deliberately not decided by the change that added this set.
+#: `serve` calls `configure_logging` only after its settings, key and egress gates run. For that
+#: window `_serve` calls `install_filtered_last_resort` near its start (BACKLOG #3768), whose
+#: docstring says what it covers. `supervise` calls
+#: `configure_logging` on its first line, so it has no such window.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
+
+#: The subcommands `run_cli` does NOT mark as carrying a result on stdout, so a print() in a config
+#: module, Router or Handler they run stays on stdout (`messagefoundry.author_output`, vault BACKLOG
+#: #3474). Every other entry in `_DISPATCH` sends such a print to stderr by default, so a new
+#: subcommand, or a new config load in an old one, is covered without anyone wrapping it.
+#: `tests/test_cli_author_prints.py` pins this set.
+#:
+#: Both run for as long as the service does, print no result, and log to the stdout NSSM captures.
+#: The redirect swaps the process's `sys.stdout`, and a `/config/reload` loads the graph in a worker
+#: thread while the engine runs, so under `serve` it would move other threads' output too.
+_AUTHOR_PRINTS_KEEP_STDOUT = frozenset({"serve", "supervise"})
 
 _DISPATCH = {
     "serve": _serve,

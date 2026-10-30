@@ -13,6 +13,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import sys
 import threading
@@ -118,6 +119,64 @@ def test_idempotent_does_not_stack_handlers() -> None:
 def test_unknown_level_raises() -> None:
     with pytest.raises(ValueError):
         configure_logging("LOUD")
+
+
+def test_the_filtered_last_resort_redacts_what_no_handler_takes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3768: ``serve``'s ``lastResort`` for the window before its handlers. It redacts at
+    WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
+    and a record a handler takes never reaches it, so nothing is written twice."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
+    root = logging.getLogger()
+    root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
+    resort = logging_setup.install_filtered_last_resort()
+    assert resort is not None and logging.lastResort is resort
+    assert resort.level == logging.WARNING and root.handlers == []
+    assert logging_setup.install_filtered_last_resort() is resort  # a second call builds nothing
+
+    log = logging.getLogger("messagefoundry.test_filtered_last_resort")
+    log.setLevel(logging.INFO)  # so the INFO record reaches lastResort's own level gate
+    try:
+        log.warning("early %s", SYNTHETIC_PHI)
+        log.info("below the level")
+    finally:
+        log.setLevel(logging.NOTSET)
+    quiet = logging.getLogger("messagefoundry.test_filtered_last_resort_nonprop")
+    monkeypatch.setattr(quiet, "propagate", False)
+    quiet.warning("quiet %s", SYNTHETIC_PHI)
+    early = capsys.readouterr()
+    assert early.err.count("early") == 1 and early.err.count("quiet") == 1, early.err
+    assert "[redacted]" in early.err and "DOE^JANE" not in early.err, early.err
+    assert "below the level" not in early.err and early.out == ""
+
+    # sys.stderr swapped AFTER the build is followed, as the stdlib's own lastResort follows it.
+    swapped = io.StringIO()
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stderr", swapped)
+        log.warning("swapped %s", SYNTHETIC_PHI)
+    assert "swapped" in swapped.getvalue() and "DOE^JANE" not in swapped.getvalue()
+    assert capsys.readouterr().err == ""
+
+    configure_logging("INFO")
+    log.warning("late %s", SYNTHETIC_PHI)
+    late = capsys.readouterr()
+    assert late.err == "", "a record the root handler took also reached lastResort"
+    assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
+
+
+def test_the_filtered_last_resort_leaves_a_configured_root_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that configured logging first keeps the stdlib's ``lastResort``, as it keeps its
+    handlers under ``run_cli``'s sink: the choice is process-wide, so it is the host's."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
+    before = logging.lastResort
+    root = logging.getLogger()
+    hosts = logging.NullHandler()
+    root.handlers[:] = [hosts]
+    assert logging_setup.install_filtered_last_resort() is None
+    assert logging.lastResort is before and root.handlers == [hosts]
 
 
 def test_routes_uvicorn_loggers_to_root() -> None:
@@ -281,8 +340,10 @@ def test_redaction_filter_scrubs_stack_info() -> None:
 
 def test_redaction_filter_residual_bare_name_not_caught() -> None:
     # DOCUMENTED RESIDUAL (redaction.py / PHI.md §7): a bare free-text name with <2 HL7 delimiters and
-    # no segment header is not HL7-shaped, so the filter does NOT catch it — the "never put PHI in an
-    # exception message" convention is the control. Pin the boundary so a future change is deliberate.
+    # no segment header is not HL7-shaped, so the filter does NOT catch it. The "never put PHI in an
+    # exception message" convention binds only the engine's own authors, Router and Handler authors
+    # included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md section 7, "Who the
+    # exception-message convention binds"). Pin the boundary so a change is deliberate.
     rec = logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "invalid patient %s", ("DOE^JANE",), None
     )
@@ -1334,6 +1395,197 @@ def test_the_hand_off_queue_is_bounded_and_reports_what_it_drops(
     assert "8 dropped since this process started" in later[1].getMessage()
 
 
+def test_a_general_log_flood_does_not_cost_an_audit_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2612, closing step 2: audit tee lines have their own lane, so a flood of
+    general log traffic against a stalled collector cannot drop them.
+
+    The collector is gated, so nothing drains while the flood runs, and the general lane is cut to
+    five so the flood overflows it. The control is that it did: ``dropped`` counts the general
+    records that did not fit. On the single shared queue this test was written against, the audit
+    lines logged after the queue filled were dropped with them, and the test failed."""
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    gate = threading.Event()
+    target = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(target, fmt="text")
+    expected: list[str] = []
+    try:
+        for i in range(200):
+            fwd.handle(
+                logging.LogRecord(
+                    "mefor.test.flood", logging.WARNING, __file__, 1, "flood %d", (i,), None
+                )
+            )
+            if i % 20 == 0:
+                line = f'{{"event": "audit", "n": {i}}}'
+                expected.append(line)
+                fwd.handle(
+                    logging.LogRecord(
+                        audit_tee.audit_logger.name, logging.INFO, __file__, 1, line, None, None
+                    )
+                )
+    finally:
+        gate.set()
+        fwd.close()
+
+    assert fwd.dropped > 0, "the flood never overflowed the general lane, so it tested nothing"
+    delivered = [r.getMessage() for r in target.seen]
+    # Walk what was DELIVERED, so a lane that re-ordered its own lines goes red here.
+    audit = [line for m in delivered for line in expected if m.endswith(line)]
+    assert audit == expected  # every audit line, once each, in the order it was logged
+
+
+def _drop_reports(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, logger_name: str
+) -> list[str]:
+    """Fill one lane of a forwarder that is not draining with five records past its bound, and
+    return the drop reports it logged. The lanes' bounds differ, so a report that printed the
+    dropping lane's own bound would read differently per lane."""
+    general_bound, audit_bound = 3, 2
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", general_bound)
+    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", audit_bound)
+    bound = audit_bound if logger_name == logging_setup.AUDIT_LOGGER_NAME else general_bound
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
+    caplog.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for i in range(bound + 5):
+                fwd.handle(
+                    logging.LogRecord(logger_name, logging.INFO, __file__, 1, f"r{i}", None, None)
+                )
+    finally:
+        fwd.close()
+    assert fwd.dropped == 5  # the lane's bound fits, then five drops, whichever lane
+    return [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
+
+
+def test_the_drop_report_reads_the_same_whichever_lane_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The drop report reaches ``GET /logs/tail``, so it must not say which lane dropped: naming the
+    audit lane would tell that reader an audit row was written in the window (BACKLOG #1131,
+    #2612). An audit-only drop and a general-only drop of the same size log the same text, with
+    the combined counts and the one depth figure the single queue printed."""
+    from messagefoundry.store import audit_tee
+
+    audit = _drop_reports(monkeypatch, caplog, audit_tee.audit_logger.name)
+    general = _drop_reports(monkeypatch, caplog, "mefor.test")
+    assert len(audit) == 1, audit
+    assert audit == general  # the control is the general lane: same text, so no lane signal
+    assert "lane" not in audit[0].lower() and "audit" not in audit[0].lower(), audit[0]
+    assert re.findall(r"\d+", audit[0]) == ["1", "2", "1"], audit[0]  # the smaller lane bound
+
+
+def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal handler or a finalizer can log on a thread that is inside ``_count_drop`` and so
+    holds the counter lock. When that record is dropped too, the drop is counted under the same
+    lock on the same thread (BACKLOG #2612). A plain lock deadlocks the thread on itself; the
+    control is that the lock is held at all, so the nested count really re-enters it."""
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 1)
+    fwd = _build_queued_forwarder(_CapturingHandler(), fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane stays full
+    record = logging.LogRecord("mefor.test", logging.INFO, __file__, 1, "x", None, None)
+    fwd.handle(record)  # fills the lane
+    held: list[bool] = []
+
+    def reenter() -> None:
+        with fwd._counter_lock:
+            held.append(True)
+            fwd.handle(record)  # dropped, so counted under the lock this thread holds
+
+    worker = threading.Thread(target=reenter, daemon=True)
+    worker.start()
+    worker.join(5.0)
+    if worker.is_alive():
+        # The stuck worker holds the counter lock and the handler's own lock for good, and close()
+        # and the interpreter's logging shutdown would block on them. Fresh locks let the run
+        # fail rather than hang.
+        fwd._counter_lock = threading.RLock()
+        fwd.lock = threading.RLock()
+        fwd.close()
+        pytest.fail("the nested drop count deadlocked on the counter lock")
+    fwd.close()
+    assert held == [True] and fwd.dropped == 1
+
+
+def _lane_record(name: str, msg: str) -> logging.LogRecord:
+    return logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None)
+
+
+def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
+    """Failed sign-ins write audit rows, so an unauthenticated client drives the audit rate. The
+    lanes serve at most ``_FORWARD_AUDIT_BURST`` audit lines in a row while a general record waits,
+    and serve the stop sentinel only once the audit lane is empty (BACKLOG #2612)."""
+    from messagefoundry.store import audit_tee
+
+    burst = logging_setup._FORWARD_AUDIT_BURST
+    lanes = logging_setup._ForwardLanes(100, 100)
+    for i in range(burst * 3):
+        lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, f"a{i}"))
+    lanes.put_nowait(_lane_record("mefor.test", "g0"))
+    lanes.put_nowait(_lane_record("mefor.test", "g1"))
+    lanes.put_nowait(None)
+    order = []
+    while lanes.qsize():
+        item = lanes.get_nowait()
+        order.append(None if item is None else item.getMessage())
+    audit_order = [m for m in order if m is not None and m.startswith("a")]
+    assert audit_order == [f"a{i}" for i in range(burst * 3)]  # each lane stays FIFO
+    assert order.index("g0") == burst and order.index("g1") == 2 * burst + 1
+    assert order[-1] is None  # every audit line went out ahead of the stop sentinel
+
+
+@pytest.mark.parametrize("burst", [None, 10**9], ids=["shipped-cap", "uncapped-control"])
+def test_general_lines_drain_while_the_audit_lane_stays_full(
+    monkeypatch: pytest.MonkeyPatch, burst: int | None
+) -> None:
+    """Finding 10 of PR 2601's review, measured as a bound: an unauthenticated client can keep the
+    audit lane full, by failing sign-ins faster than the collector takes lines. The lane is topped
+    back up to its bound after every line served, so it is never empty, and the general lines must
+    still all go out, one in every ``_FORWARD_AUDIT_BURST + 1`` lines served (BACKLOG #2612).
+
+    The control lifts the cap. Audit-first serving with no cap then sends no general line at all
+    under the same load, so the test can see starvation when it is there."""
+    from messagefoundry.store import audit_tee
+
+    cap = logging_setup._FORWARD_AUDIT_BURST  # the shipped cap sets the bound in both arms
+    if burst is not None:
+        monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_BURST", burst)
+    audit_bound, general = 50, 20
+    lanes = logging_setup._ForwardLanes(100, audit_bound)
+
+    def top_up() -> None:
+        while True:
+            try:
+                lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, "{}"))
+            except queue.Full:
+                return
+
+    for i in range(general):
+        lanes.put_nowait(_lane_record("mefor.test", f"g{i}"))
+    top_up()
+    served = (cap + 1) * general
+    general_seen: list[str] = []
+    for _ in range(served):
+        item = lanes.get_nowait()
+        if item.name != audit_tee.audit_logger.name:
+            general_seen.append(item.getMessage())
+        top_up()
+        assert len(lanes.audit) == audit_bound  # saturated the whole time
+    if burst is None:
+        assert general_seen == [f"g{i}" for i in range(general)]
+    else:
+        assert general_seen == []  # the control: uncapped, the general lane starves
+
+
 def test_the_drop_report_does_not_recurse_on_the_root_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1470,6 +1722,113 @@ def test_a_full_queue_still_accepts_the_stop_sentinel(
     finally:
         gate.set()
     assert fwd._stopped
+
+
+def _shutdown_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    *,
+    audit_rows: int,
+    spooled: bool,
+) -> list[str]:
+    """Stall the collector on its first record, fill the general lane past its bound of five, write
+    ``audit_rows`` audit rows, then close; return the shutdown lines close() logged. Every queued
+    record is still there at the drain deadline, so they are all spooled or all undelivered."""
+    from messagefoundry.log_spool import LogSpool
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    monkeypatch.setattr(logging_setup, "_FORWARD_DRAIN_TIMEOUT", 0.2)
+    spool = None
+    if spooled:
+        spool = LogSpool(tmp_path / f"spool-{audit_rows}", max_bytes=10_000_000)
+        spool.open()
+    gate = threading.Event()
+    fwd = _build_queued_forwarder(_CapturingHandler(gate=gate, wait=1.0), fmt="text", spool=spool)
+    try:
+        fwd.handle(_lane_record("mefor.test", "first"))
+        deadline = time.monotonic() + 5.0
+        while fwd._records.qsize() and time.monotonic() < deadline:
+            time.sleep(0.01)  # until the listener holds the first record inside the stalled send
+        assert fwd._records.qsize() == 0, "the listener never took the first record"
+        for i in range(8):
+            fwd.handle(_lane_record("mefor.test", f"g{i}"))
+        for i in range(audit_rows):
+            fwd.handle(_lane_record(audit_tee.audit_logger.name, f'{{"seq": {i}}}'))
+        assert fwd._records.qsize() == 5 + audit_rows  # the control: the raw depth DOES move
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+            fwd.close()
+    finally:
+        gate.set()
+        fwd.close()  # idempotent; frees the thread and the spool lock if an assert fired first
+    where = str(spool.directory) if spool is not None else "<no spool>"
+    return [
+        r.getMessage().replace(where, "<spool>")  # each run has its own directory
+        for r in caplog.records
+        if "drain deadline" in r.getMessage() or "undelivered" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("spooled", [False, True], ids=["no-spool", "spool"])
+def test_the_shutdown_counts_do_not_move_with_audit_rows_while_the_general_lane_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    spooled: bool,
+) -> None:
+    """The engine log is served by ``GET /logs/tail``, so a reader with ``logs:view`` and without
+    ``users:manage`` must not count audit rows off it (BACKLOG #1131, #2612). With the general lane
+    full, the shutdown line that counts what was undelivered, and the one that counts what moved to
+    the spool, read the same for 0 and 40 audit rows: both are capped at the smaller lane bound,
+    as the single queue was. Uncapped, they read 5 and 45."""
+    quiet = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=0, spooled=spooled)
+    busy = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=40, spooled=spooled)
+    assert len(quiet) == 1, quiet
+    expected = "moved at least 5 record(s)" if spooled else "at least 5 record(s) undelivered"
+    assert expected in quiet[0], quiet
+    assert busy == quiet
+
+
+def test_published_counts_share_one_budget_and_the_loss_takes_it_first() -> None:
+    """Capped together, so two counts that sum past the cap cannot tell how far past it the lanes
+    were; and the loss first, so a record that did not reach the collector is always reported."""
+    lanes = logging_setup._ForwardLanes(5, 100)
+    assert logging_setup._published_counts(lanes, 3, 7) == (3, 2)
+    assert logging_setup._published_counts(lanes, 9, 7) == (5, 0)
+    assert logging_setup._published_counts(lanes, 2, 1) == (2, 1)  # below the cap, untouched
+    unbounded: queue.Queue[Any] = queue.Queue()
+    assert logging_setup._published_counts(unbounded, 9, 7) == (9, 7)
+    # A lane bound of 0 is a cap of 0, never "no cap".
+    assert logging_setup._published_counts(logging_setup._ForwardLanes(0, 100), 9, 7) == (0, 0)
+
+
+def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:
+    """``enqueue_sentinel``'s discard loop, on the plain bounded queue it is kept for. The shipped
+    :class:`_ForwardLanes` always takes the sentinel (BACKLOG #2612), so the test above no longer
+    reaches the loop; this one goes red if the stdlib ``enqueue_sentinel`` is restored, because
+    ``put_nowait`` on a full queue raises ``queue.Full``."""
+    records: queue.Queue[Any] = queue.Queue(maxsize=2)
+    records.put_nowait("a")
+    records.put_nowait("b")
+    listener = logging_setup._ForwardQueueListener(records, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert listener._sentinel_queued
+    assert [records.get_nowait(), records.get_nowait()] == ["b", None]  # oldest made room
+
+
+def test_the_lanes_always_take_the_stop_sentinel() -> None:
+    """The shipped queue exempts the sentinel from both bounds, so a full lane neither refuses it
+    nor discards a record for it (BACKLOG #2612)."""
+    lanes = logging_setup._ForwardLanes(1, 1)
+    lanes.put_nowait("general")
+    with pytest.raises(queue.Full):
+        lanes.put_nowait("one too many")
+    listener = logging_setup._ForwardQueueListener(lanes, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert lanes.qsize() == 2
+    assert [lanes.get_nowait(), lanes.get_nowait()] == ["general", None]
 
 
 def test_a_broken_stream_forwarder_reconnects_on_the_next_record(

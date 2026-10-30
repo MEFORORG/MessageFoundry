@@ -172,14 +172,22 @@ def test_email_cleartext_refusal() -> None:
     assert "[security].enforcement = warn" in message
 
 
+def _assert_offers_no_lever_that_cannot_lift_it(message: str) -> None:
+    """A credential over off-box cleartext http is refused with no escape (vault BACKLOG #3533
+    item 4, owner ruling 2026-10-26), so its refusal offers https and says neither declaration
+    lifts it, rather than offering the attestation or the acceptance as a lever (SDS-3.7)."""
+    assert "use https" in message
+    assert HOP_ATTESTATION_LEVER not in message
+    assert "with a cleartext_reason" not in message
+    assert "neither tls_hop_attested nor cleartext_accepted" in message
+
+
 def test_oauth2_cleartext_token_endpoint_refusal() -> None:
     with active_hop_posture(ENFORCING), pytest.raises(HttpAuthError) as exc:
         OAuth2ClientCredentialsProvider(
             token_url="http://auth.example.invalid/token", client_id="cid", client_secret="s3cr3t"
         )
-    message = str(exc.value)
-    _assert_offers_the_supported_lever(message)
-    assert "cleartext_accepted" in message
+    _assert_offers_no_lever_that_cannot_lift_it(str(exc.value))
 
 
 def test_digest_cleartext_refusal() -> None:
@@ -188,9 +196,7 @@ def test_digest_cleartext_refusal() -> None:
             {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"},
             url="http://api.example.invalid/x",
         )
-    message = str(exc.value)
-    _assert_offers_the_supported_lever(message)
-    assert "cleartext_accepted" in message
+    _assert_offers_no_lever_that_cannot_lift_it(str(exc.value))
 
 
 def test_smart_cleartext_token_endpoint_refusal() -> None:
@@ -204,9 +210,7 @@ def test_smart_cleartext_token_endpoint_refusal() -> None:
         SmartBackendTokenProvider(
             token_url="http://auth.example.invalid/token", client_id="c", private_key=pem
         )
-    message = str(exc.value)
-    _assert_offers_the_supported_lever(message)
-    assert "cleartext_accepted" in message
+    _assert_offers_no_lever_that_cannot_lift_it(str(exc.value))
 
 
 # --- `messagefoundry check` ------------------------------------------------------------------------

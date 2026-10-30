@@ -46,7 +46,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.queue_tag import queue_row_aad
-from messagefoundry.store.store import load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -808,8 +808,35 @@ async def test_stats_and_metrics(store) -> None:
     # a default run still cannot tell the literal from a 0. Naming the limit rather than implying
     # this guards every run.
     assert db.disk_free_bytes is None
+    assert db.disk_free_status is DiskFreeStatus.NOT_APPLICABLE  # stated, not inferred
     ok, _ = await store.integrity_check()
     assert ok is True
+
+
+async def test_last_received_loose_scan_matches_the_group_by(store) -> None:
+    """BACKLOG #1726 limb B on Postgres: the shared loose-index-scan string returns what the old
+    GROUP BY did, over several channels whose ids differ in case, length and non-ASCII characters,
+    and connection_metrics carries each channel's newest received_at. The SQLite differential does
+    not reach here: postgres.py binds the string by name at import."""
+    from messagefoundry.store.store import _LAST_RECEIVED_SQL
+
+    assert await store._fetchall(_LAST_RECEIVED_SQL) == []  # an empty table ends the walk at once
+    channels = ("IB_B", "IB_a", "IB_A", "IB_é", "", "IB_AA")
+    expected: dict[str, float] = {}
+    for n, channel in enumerate(channels):
+        for k in range(3):
+            at = 100.0 + 10 * n + k
+            await store.enqueue_message(channel_id=channel, raw=RAW, deliveries=[], now=at)
+            expected[channel] = at
+    old = await store._fetchall(
+        "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
+    )
+    new = await store._fetchall(_LAST_RECEIVED_SQL)
+    assert len(new) == len(channels)
+    assert {r["channel_id"]: r["last_at"] for r in new} == expected
+    assert {r["channel_id"]: r["last_at"] for r in old} == expected
+    metrics = await store.connection_metrics(since=10_000.0, now=10_000.0)
+    assert {c: m.last_at for c, m in metrics.inbound.items()} == expected
 
 
 async def test_cancel_queued(store) -> None:
@@ -1082,6 +1109,14 @@ async def test_webauthn_store_contract(store) -> None:
     await _assert_webauthn_store_contract(store)
 
 
+async def test_webauthn_conditional_bind_contract(store) -> None:
+    """BACKLOG #3014, #3690 item 1 on the real Postgres backend: the conditional passkey insert,
+    checked with the account row held under FOR UPDATE."""
+    from tests._webauthn_store_contract import _assert_webauthn_conditional_bind_contract
+
+    await _assert_webauthn_conditional_bind_contract(store)
+
+
 async def test_totp_store_contract(store) -> None:
     """WP-14 TOTP store contract on the real Postgres backend — the backfill that finally executes
     the FOR UPDATE row-lock paths (consume_totp_step / consume_recovery_code_hash) under test."""
@@ -1100,7 +1135,15 @@ async def test_lockout_store_contract(store) -> None:
     contract above states."""
     from tests._lockout_store_contract import _assert_lockout_contract
 
-    await _assert_lockout_contract(store)
+    async def corrupt(user_id: str) -> None:
+        # A UTF8 database refuses a cell it cannot decode at write time, so only the parse arm can
+        # be planted here; the fetch-time arm runs on SQLite and SQL Server.
+        async with store._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE webauthn_credentials SET transports='not json' WHERE user_id=$1", user_id
+            )
+
+    await _assert_lockout_contract(store, corrupt_passkeys={"parse": corrupt})
 
 
 async def test_login_address_store_contract(store) -> None:

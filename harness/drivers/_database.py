@@ -28,6 +28,7 @@ from typing import Any
 
 from harness.endpoints import ENV_PREFIX, Endpoints
 from harness.endpoints.database import ENVIRONMENT_ONLY
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 #: The ODBC driver the engine's SQL Server preset names, and so the one the harness dials with.
@@ -139,31 +140,21 @@ def target(endpoints: Endpoints, environ: Mapping[str, str] | None = None) -> Ta
     )
 
 
-def _brace(value: str) -> str:
-    """ODBC-quote a value, doubling any ``}``, so a value cannot add a connection keyword."""
-    return "{" + value.replace("}", "}}") + "}"
-
-
 def build_dsn(t: Target) -> str:
     """The ODBC connection string for ``t``. TLS is always on and always verified: the harness
-    never weakens a hop the engine itself would refuse to weaken."""
+    never weakens a hop the engine itself would refuse to weaken. The quoting and the TLS tail are
+    the engine's own (:mod:`messagefoundry.odbc_dsn`, BACKLOG #3714)."""
     if any(ch in _ODBC_METACHARACTERS for ch in t.server):
         raise ValueError("database_server must not contain ';', '{', '}', '=' or a newline")
-    return (
-        ";".join(
-            [
-                f"DRIVER={_brace(ODBC_DRIVER)}",
-                f"SERVER={t.server},{t.port}",
-                f"DATABASE={_brace(t.database)}",
-                "APP={messagefoundry-harness}",
-                f"UID={_brace(t.username)}",
-                f"PWD={_brace(t.password)}",
-                "Encrypt=yes",
-                "TrustServerCertificate=no",
-            ]
-        )
-        + ";"
-    )
+    head = [
+        f"DRIVER={odbc_brace(ODBC_DRIVER)}",
+        f"SERVER={t.server},{t.port}",
+        f"DATABASE={odbc_brace(t.database)}",
+        "APP={messagefoundry-harness}",
+        f"UID={odbc_brace(t.username)}",
+        f"PWD={odbc_brace(t.password)}",
+    ]
+    return odbc_connection_string(head, encrypt=True, trust_server_certificate=False)
 
 
 def unavailable(endpoints: Endpoints, environ: Mapping[str, str] | None = None) -> str:

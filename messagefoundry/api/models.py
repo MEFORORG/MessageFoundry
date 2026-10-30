@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
@@ -1024,6 +1024,10 @@ class DbInfo(BaseModel):
     # like `synchronous` below: that default exists for wire compatibility, and this field has never
     # been optional on the wire, so a caller must say which of the two it means.
     disk_free_bytes: int | None
+    # Which reading disk_free_bytes is, as the backend states it: the values of the store's
+    # DiskFreeStatus, spelled out here so the API models import nothing from the store (BACKLOG
+    # #1563). Required for the reason disk_free_bytes is: a caller must say which case it means.
+    disk_free_status: Literal["observed", "not_applicable", "unobservable"]
     journal_mode: str
     messages: int
     events: int
@@ -1034,6 +1038,17 @@ class DbInfo(BaseModel):
     # server backends (a SQLite-only knob). Read-only observability (B7) so a status reader / load run
     # records which durability mode it measured. Defaulted so older clients deserialize unchanged.
     synchronous: str | None = None
+
+    @model_validator(mode="after")
+    def _figure_exactly_when_observed(self) -> DbInfo:
+        # The pair DbStatus.__post_init__ enforces, refused here too, so a reader of the wire
+        # model never has to decide which half of a contradiction to trust (BACKLOG #1563).
+        if (self.disk_free_status == "observed") != (self.disk_free_bytes is not None):
+            raise ValueError(
+                f"disk_free_status={self.disk_free_status!r} contradicts"
+                f" disk_free_bytes={self.disk_free_bytes!r}"
+            )
+        return self
 
 
 class LogInfo(BaseModel):
@@ -1100,8 +1115,8 @@ class LogForwarderInfo(BaseModel):
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
-    queued: int = 0  # on the hand-off queue now: a level, not a loss, and not the spool
-    queue_dropped: int = 0  # dropped because the hand-off queue was full
+    queued: int = 0  # on the hand-off queue now, both lanes, capped at the smaller lane bound
+    queue_dropped: int = 0  # dropped because their lane of the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
     undeliverable: int = 0  # dropped for a send error that was not a network error
     spool_dropped: int = 0  # the on-disk spool was full or refused the write

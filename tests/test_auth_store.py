@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -167,8 +168,27 @@ async def test_lockout_counter_contract() -> None:
     The same body runs against live PostgreSQL and SQL Server, so the one security policy the three
     SQL bodies implement is asserted once rather than worded three times."""
     store = await _store()
+
+    def corrupt(cell: str | bytes) -> Callable[[str], Awaitable[None]]:
+        async def write(user_id: str) -> None:
+            await store._db.execute(
+                "UPDATE webauthn_credentials SET transports=CAST(? AS TEXT) WHERE user_id=?",
+                (cell, user_id),
+            )
+            await store._db.commit()
+
+        return write
+
     try:
-        await _assert_lockout_contract(store)
+        await _assert_lockout_contract(
+            store,
+            corrupt_passkeys={
+                # Not UTF-8: sqlite3 raises OperationalError while FETCHING the row, before any
+                # parse runs.
+                "fetch": corrupt(bytes([0xFF])),
+                "parse": corrupt("not json"),
+            },
+        )
     finally:
         await store.close()
 
@@ -419,6 +439,73 @@ async def test_the_username_refresh_contract_on_sqlite() -> None:
         await _assert_username_refresh_contract(store)
     finally:
         await store.close()
+
+
+class _RollbackFailed(Exception):
+    """Stands in for a driver error raised by the rollback after a failed append."""
+
+
+class _ReleaseFailed(Exception):
+    """Stands in for a driver error raised by the pool release after that rollback."""
+
+
+@pytest.mark.parametrize(
+    "release_fails", [False, True], ids=["rollback-fails", "rollback-and-release-fail"]
+)
+async def test_a_failed_rollback_on_postgres_still_reports_the_rename_audit_append(
+    release_fails: bool,
+) -> None:
+    """BACKLOG #3018 step 7. On PostgreSQL, after a failed append, a failure in the rollback or
+    the release after it replaces the append's error. With ``release_fails`` both fail, so the
+    append's error sits two levels down the chain. The store raises the append's
+    ``UsernameAuditAppendError`` either way, so the reconciler reads a refused row and goes on,
+    rather than a store fault that ends its pass. Driven against the real method with its I/O
+    seams replaced, because the live leg cannot make a rollback or a release fail on cue."""
+    from contextlib import asynccontextmanager
+
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import UsernameAuditAppendError
+
+    append_error = ConnectionResetError("synthetic: the audit append failed")
+
+    class _Transaction:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            if exc is not None:
+                raise _RollbackFailed("synthetic: the rollback failed")
+
+    class _Conn:
+        async def fetchrow(self, *_a: object) -> None:
+            return None  # nobody holds the name
+
+        def transaction(self) -> _Transaction:
+            return _Transaction()
+
+    @asynccontextmanager
+    async def _acquire(*, record: bool = True) -> Any:
+        try:
+            yield _Conn()
+        finally:
+            if release_fails:
+                raise _ReleaseFailed("synthetic: the release failed")
+
+    async def _write_user(*_a: object) -> object:
+        return object()  # the write landed
+
+    async def _append_audits(*_a: object, **_kw: object) -> list[object]:
+        raise append_error
+
+    store: Any = PostgresStore.__new__(PostgresStore)
+    store._timed_acquire = _acquire
+    store._write_user = _write_user
+    store._append_audits = _append_audits
+    with pytest.raises(UsernameAuditAppendError) as refused:
+        await store.set_user_username(
+            "u1", "jdoe-new", expected_username="jdoe", audits=(AuditAppend("x", actor="a"),)
+        )
+    assert refused.value.cause is append_error
 
 
 async def test_the_username_comparison_is_byte_exact_on_sqlite() -> None:

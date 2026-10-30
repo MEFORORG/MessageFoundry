@@ -2555,19 +2555,6 @@ def _ad_off(ca: str) -> dict[str, Any]:
     return {"ad_tls_ca_cert_file": ca}
 
 
-def _ad_on_plain_ldap(ca: str) -> dict[str, Any]:
-    return {
-        "ad_enabled": True,
-        "ad_server": "ldap://dc1.example.com",
-        "ad_allow_insecure_ldap": True,
-        "ad_domain": "example.com",
-        "ad_user_search_base": "DC=example,DC=com",
-        "ad_bind_dn": "CN=svc,DC=example,DC=com",
-        "ad_bind_password": "not-a-real-password",
-        "ad_tls_ca_cert_file": ca,
-    }
-
-
 def _oidc_off(ca: str) -> dict[str, Any]:
     return {"oidc_tls_ca_cert_file": ca}
 
@@ -2576,7 +2563,8 @@ def _oidc_off(ca: str) -> dict[str, Any]:
     "unused",
     [
         pytest.param(_ad_off, id="AD off"),
-        pytest.param(_ad_on_plain_ldap, id="AD on plain ldap"),
+        # An "AD on, plain ldap://" case sat here. That bind is refused at load now (vault BACKLOG
+        # #3533 item 1), so it can no longer carry an anchor nothing loads.
         pytest.param(_oidc_off, id="OIDC off"),
     ],
 )
@@ -2833,9 +2821,9 @@ _AUDIT_FAULTS = pytest.mark.parametrize("fail", ["list_audit", "record_audit"])
 
 def _no_anchor_refusal_in(exc: BaseException) -> None:
     """Nothing on the explicit cause chain is an anchor refusal, and the store's OSError is its root."""
-    from messagefoundry.api.app import _caused_by_trust_anchor
+    from messagefoundry.auth.trust_anchors import trust_anchor_cause
 
-    assert not _caused_by_trust_anchor(exc)
+    assert trust_anchor_cause(exc) is None
     root = exc
     while root.__cause__ is not None:
         root = root.__cause__

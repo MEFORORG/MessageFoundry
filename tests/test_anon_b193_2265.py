@@ -24,6 +24,7 @@ from messagefoundry.anon import anonymize as engine_anonymize
 from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
 from messagefoundry.anon import hl7 as engine_hl7
 from messagefoundry.anon import leak as engine_leak
+from messagefoundry.anon import load_rules as engine_load_rules
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import AnonError as TeeAnonError
 from tee.anon import FieldRule as TeeFieldRule
@@ -31,6 +32,7 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import hl7 as tee_hl7
 from tee.anon import leak as tee_leak
+from tee.anon import load_rules as tee_load_rules
 
 _LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
 _NO_SCANNER = pytest.mark.skipif(
@@ -333,9 +335,9 @@ def test_an_overlay_drop_reaches_a_second_msh_line_through_the_tee(tmp_path: Pat
     """The operator's route: an ``anon.toml`` drop naming an MSH field. The tee now honours it."""
     overlay = tmp_path / "anon.toml"
     overlay.write_text('[hl7]\ndrop = ["MSH-8"]\n', encoding="utf-8")
-    out = tee_anonymize_checked(_MSG, salt=_SALT, overlay=overlay)
+    out = tee_anonymize_checked(_MSG, salt=_SALT, rules=tee_load_rules(overlay))
     assert _SSN not in out
-    assert out == engine_anonymize_checked(_MSG, salt=_SALT, overlay=overlay)
+    assert out == engine_anonymize_checked(_MSG, salt=_SALT, rules=engine_load_rules(overlay))
 
 
 @_NO_SCANNER

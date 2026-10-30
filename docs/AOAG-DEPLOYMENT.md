@@ -413,7 +413,8 @@ cross-subnet listener:
 > cross-subnet failover can leave the driver dialing the stale subnet's IP until the TCP/login
 > timeout. `[store].connect_timeout` (default 15 s) bounds each attempt, and ODBC 18's default TNIR
 > softens but does not eliminate the penalty. `ApplicationIntent=ReadOnly` exists only on the
-> separate `db_lookup` connector ([`../messagefoundry/transports/database.py`](../messagefoundry/transports/database.py));
+> separate `db_lookup` connector and the `DatabaseRef` reference sync (BACKLOG #2617;
+> [`../messagefoundry/transports/database.py`](../messagefoundry/transports/database.py));
 > the store connection takes exactly one AG-aware keyword, and **it has shipped**:
 > **`[store].multi_subnet_failover`** emits ODBC `MultiSubnetFailover=Yes` so the driver races the
 > subnets instead of serially waiting out each one
@@ -622,11 +623,11 @@ or an NLB with:
 - **One VIP per inbound MLLP port, with the health check a TCP connect to that port.** Only the
   leader binds it, so the check passes only on the active engine and the VIP follows engine
   failover passively, including a failover to the DR-DC standby.
-- **L7 alternative.** Probe `GET /cluster/status` and require `role == "primary"`. This needs a
-  least-privilege `monitoring:read` bearer token injected by the LB, because unauthenticated probes
-  get 401/403 on *every* node and black-hole traffic. Mint one by creating a dedicated local
-  service account with a `monitoring:read`-bearing role and using its bearer token
-  ([`SECURITY.md`](SECURITY.md), "Roles & permissions" / "Sessions"). The tokenless `/health`
+- **L7 alternative.** Probe `GET /cluster/status` and require `role == "primary"`. This needs the
+  probe to carry a bearer token, because unauthenticated probes get 401/403 on *every* node and
+  black-hole traffic. The engine mints no static API token: the only bearer is a sign-in session
+  token of an account holding `monitoring:read`, which expires, so something beside the LB must
+  refresh it ([`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) section 3.1 describes the constraint). The tokenless `/health`
   returns 200 on every node and **cannot** select the primary; there is no tokenless primary-only
   endpoint.
 - **Set the probe interval comfortably above the ~1 s graph-reconcile interval** (e.g. 10 s) so

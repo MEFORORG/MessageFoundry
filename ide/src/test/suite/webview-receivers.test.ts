@@ -52,6 +52,7 @@ interface JsdomWindow {
   document: DomNode;
   origin: string;
   MessageEvent: new (type: string, init?: Record<string, unknown>) => unknown;
+  Event: new (type: string) => unknown;
   dispatchEvent(event: unknown): boolean;
   close(): void;
   [key: string]: unknown;
@@ -75,7 +76,7 @@ interface Page {
   readonly window: JsdomWindow;
   /** Every exception the page raised, loading or handling a message. */
   readonly errors: unknown[];
-  /** Every console.warn the page wrote. A discard names itself there. */
+  /** Every console.warn the page wrote. A discard reports itself there, in one fixed phrase. */
   readonly warnings: string[];
   /** Every message the page posted to the host. */
   readonly posted: Payload[];
@@ -568,10 +569,20 @@ const ONE_PER_TYPE: [string, string][] = [
   ["tristate", "production_instance"],
 ];
 
+function formControls(p: Page): DomNode[] {
+  return [...p.window.document.querySelectorAll("#form input, #form select")];
+}
+
 /** The live value of every control in the form, which is what Save would send. */
 function formValues(p: Page): string {
-  const controls = [...p.window.document.querySelectorAll("#form input, #form select")];
-  return JSON.stringify(controls.map((c: DomNode) => [c.id, c.value]));
+  return JSON.stringify(formControls(p).map((c) => [c.id, c.value]));
+}
+
+/** Every control in the form that is not unset: a select with an option chosen, or an input with text. */
+function setControls(p: Page): string[] {
+  return formControls(p)
+    .filter((c) => (c.tagName === "SELECT" ? c.selectedIndex !== -1 : c.value !== ""))
+    .map((c) => `${c.id}=${JSON.stringify(c.value)}`);
 }
 
 /** The text the panel is SHOWING in its error element, or "" while that element is hidden. Read
@@ -775,6 +786,22 @@ const wiringMap: Receiver = {
 
 const RECEIVERS: Receiver[] = [alertRules, codeSet, connection, home, security, sourceControl, wiringMap];
 
+// Discriminants no receiver handles. Each is message text, so a discard warning reports it with a
+// fixed phrase and never echoes it (BACKLOG #1123). The hostile one would show quoting or markup if
+// it got through; the number and the list are not strings, and the list String()s to its text.
+const UNKNOWN_KINDS: unknown[] = [
+  "notAType",
+  `"'><img src=x onerror=1> PID|1||A123`,
+  "hasOwnProperty",
+  12345,
+  ["PID|1||A123"],
+];
+// The whole warning any discard writes: the page's own panel name in one fixed phrase. Nothing in it
+// is chosen by the message, not even its kind (owner decision 2026-10-29, BACKLOG #1123).
+const discardWarning = (panel: string): string => `MessageFoundry ${panel}: discarded a malformed message`;
+const STATE_WARNING = discardWarning(security.panel);
+const RULES_WARNING = discardWarning(alertRules.panel);
+
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
 
@@ -808,6 +835,24 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     for (const [mode, check, want] of modes) {
       assert.deepStrictEqual(["s", undefined, null, 7].map(check), want, mode);
     }
+  });
+
+  test("mfShapeOk refuses an entry that is not a function, and a check that is truthy but not true", () => {
+    // SHAPE_HELPERS is the source every receiver embeds, so this runs the shipped helper. Every
+    // panel's entries are functions returning booleans, so only this pins the two guards.
+    // The helpers get their own `console` as a parameter, never the global one: in the VS Code
+    // Extension Host console.warn is an accessor whose setter does not install an assigned stub, so
+    // a stub on the global console saw nothing there (measured at VS Code 1.143.1).
+    const warned: string[] = [];
+    const pageConsole = { warn: (...args: unknown[]) => void warned.push(args.map(String).join(" ")) };
+    const h = new Function("console", `${SHAPE_HELPERS}; return { mfShapeOk };`)(pageConsole) as {
+      mfShapeOk(d: Payload, key: string, shapes: Record<string, unknown>, panel: string): boolean;
+    };
+    const shapes = { notCallable: 1, truthy: () => 1, ok: () => true };
+    assert.strictEqual(h.mfShapeOk({ command: "notCallable" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "truthy" }, "command", shapes, "P"), false);
+    assert.strictEqual(h.mfShapeOk({ command: "ok" }, "command", shapes, "P"), true, "control");
+    assert.deepStrictEqual(warned, [discardWarning("P"), discardWarning("P")]);
   });
 
   test("the fixtures the host builds are the shape the malformed cases assume", () => {
@@ -889,20 +934,23 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   });
 
   test("Security Settings: Save stays off until a state renders, and a discarded state turns it off again", () => {
-    // Before a state renders, the form holds placeholders, and saving them would write them as
+    // Before a state renders, every control is unset, and saving that would write most switches as
     // explicit values. A discard must not leave the form looking loaded AND saveable.
     const p = security.load();
     const doc = p.window.document;
     const save = doc.getElementById("save");
     assert.strictEqual(save.disabled, true, "Save was on before any state arrived");
+    // Unset, not each select's first option: no Yes/No may say "Yes" before a state has said so.
+    assert.deepStrictEqual(setControls(p), [], "a control showed a value before any state arrived");
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults));
     assert.strictEqual(save.disabled, true, "a discarded state turned Save on");
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false, "a well-formed state did not turn Save on");
-    // A state discarded AFTER one rendered: the form now holds values nobody can vouch for.
+    // A state discarded AFTER one rendered: the last good state is no longer one anybody can vouch
+    // for, so the form is cleared (the clearing tests below) and goes down with Save.
     p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
-    assert.strictEqual(save.disabled, true, "Save stayed on over a stale form");
-    assert.strictEqual(doc.getElementById("form").style.display, "none", "the stale form stayed up");
+    assert.strictEqual(save.disabled, true, "Save stayed on after a discard");
+    assert.strictEqual(doc.getElementById("form").style.display, "none", "the form stayed up after a discard");
     // And the next well-formed state brings all of it back.
     p.deliver(STATE_OK);
     assert.strictEqual(save.disabled, false);
@@ -940,7 +988,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
-      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "state"')), `${why}: console.warn was dropped`);
+      // Exactly the one fixed warning, so no field value from the message reaches the console either.
+      assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: console.warn was dropped or carried more`);
       // The message's own values are never echoed: the refusal names a kind, not what was sent.
       assert.ok(!shown.includes(SENT), `${why}: the refusal echoed a value from the message`);
     }
@@ -988,26 +1037,29 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     assert.strictEqual(JSON.stringify(q.posted), JSON.stringify([{ command: "remove", index: 1 }]));
   });
 
-  test("Alert Rules: a discarded list names the rule, the field and what was wrong", () => {
+  test("Alert Rules: a discarded list names the position, the field and what was wrong", () => {
     const SENT = '<img src=x onerror="window.pwned=1"><b id="planted">';
-    // The last two columns: the problem is a value in the file, which the operator can fix; and
-    // it is a string where a number belongs, the one case the quoting hint fits.
-    const cases: [string, (c: Payload) => void, string, boolean, boolean][] = [
-      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string", true, true],
-      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean", true, false],
-      // TOML has no null, so a null did not come from the file.
-      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null", false, false],
-      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string", true, true],
-      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list", true, false],
-      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string", true, false],
-      ["transports holds a number", (c) => (c.rules[0].transports = [1, 2]), "rule 0, transports: expected a list of text, got a list with an entry that is not text", true, false],
-      ["transports holds a null", (c) => (c.rules[0].transports = ["webhook", null]), "rule 0, transports: expected a list of text, got a list with an entry that is not text", false, false],
-      // Positions count from 0, as the ordinals in the table's first column do.
-      ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list has no whole-number index", false, false],
-      ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list is not a rule", false, false],
-      ["no list", (c) => delete c.rules, "the list is missing or is not a list", false, false],
+    // Positions count from 0, as the ordinals in the table's first column do. In ALERT_RULES each
+    // entry's index equals its position; the test below this one pulls the two apart.
+    const cases: [string, (c: Payload) => void, string][] = [
+      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "the entry at position 2 of the list (counted from 0), min_depth: expected a number, got string"],
+      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "the entry at position 0 of the list (counted from 0), min_oldest_seconds: expected a number, got boolean"],
+      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "the entry at position 1 of the list (counted from 0), cooldown_seconds: expected a number, got null"],
+      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "the entry at position 1 of the list (counted from 0), min_depth: expected a number, got string"],
+      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "the entry at position 0 of the list (counted from 0), connection: expected text, got list"],
+      ["transports is text", (c) => (c.rules[0].transports = SENT), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got string"],
+      ["transports holds a number", (c) => (c.rules[0].transports = [1, 2]), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got a list with an entry that is not text"],
+      ["transports holds a null", (c) => (c.rules[0].transports = ["webhook", null]), "the entry at position 0 of the list (counted from 0), transports: expected a list of text, got a list with an entry that is not text"],
+      ["a rule with no index", (c) => delete c.rules[1].index, "the entry at position 1 of the list (counted from 0) has no whole-number index"],
+      ["an entry that is text", (c) => (c.rules[2] = SENT), "the entry at position 2 of the list (counted from 0) is not a rule"],
+      ["no list", (c) => delete c.rules, "the list is missing or is not a list"],
     ];
-    for (const [why, change, problem, inFile, quoted] of cases) {
+    // Every case gets the same text around the problem, whatever the bad value is, so no branch on
+    // the message picks the advice (BACKLOG #1123). The whole refusal is compared with the problem
+    // cut out, so wording that varied before the problem would be caught too. Both the file and the
+    // command are named in the advice.
+    let advice: string | undefined;
+    for (const [why, change, problem] of cases) {
       const p = alertRules.load();
       const doc = p.window.document;
       p.deliver(variant(ALERT_OK, change));
@@ -1015,17 +1067,41 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const shown = refusalShown(p);
       assert.ok(shown.startsWith(ALERT_REFUSAL), `${why}: no refusal, got "${shown}"`);
       assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
-      // Only a value in the file is the operator's to fix. The rest is not, and must not say so.
-      assert.strictEqual(shown.includes("Fix that value in [[alerts.rules]]"), inFile, `${why}: wrong advice: "${shown}"`);
-      assert.strictEqual(shown.includes("a number must not be quoted"), quoted, `${why}: wrong hint: "${shown}"`);
-      assert.strictEqual(shown.includes("No edit to the file fixes this"), !inFile, `${why}: wrong advice: "${shown}"`);
-      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
+      const rest = shown.replace(problem, "<problem>");
+      advice ??= rest;
+      assert.strictEqual(rest, advice, `${why}: the text around the problem differs from the other cases: "${shown}"`);
+      assert.deepStrictEqual(p.warnings, [RULES_WARNING], `${why}: console.warn was dropped or carried more`);
       // Nothing the message carried is echoed, and nothing in it became an element.
       assert.ok(!shown.includes("onerror"), `${why}: the refusal echoed a value from the message`);
       assert.strictEqual(doc.getElementById("error").children.length, 0, `${why}: markup was parsed`);
       assert.strictEqual(doc.getElementById("planted"), null);
       assert.strictEqual(p.window.pwned, undefined);
     }
+    assert.ok(advice?.includes("[[alerts.rules]] of the service-settings file"), `the file is not named: "${advice}"`);
+    assert.ok(advice?.includes("the command that lists the rules"), `the command is not named: "${advice}"`);
+  });
+
+  test("Alert Rules: a refusal names an entry by its position, never by the index the message gave", () => {
+    // The index is a value from the message, so the refusal must not show it (BACKLOG #1123).
+    // Index 7 sits at position 0 here. The problem text is pinned whole, up to the full stop that
+    // ends it, so "rule 7" or a 7 anywhere in it fails, and the fixed advice after it may say what
+    // it likes.
+    const p = alertRules.load();
+    p.deliver({ command: "rules", rules: [{ event_type: "queue_buildup", min_depth: "500", index: 7 }] });
+    assert.deepStrictEqual(p.errors.map(String), [], "the page threw");
+    const shown = refusalShown(p);
+    const want =
+      `${ALERT_REFUSAL} The list sent to this panel is malformed: ` +
+      "the entry at position 0 of the list (counted from 0), min_depth: expected a number, got string. ";
+    assert.ok(shown.startsWith(want), `the refusal does not name position 0 alone: "${shown}"`);
+    assert.deepStrictEqual(p.warnings, [RULES_WARNING], "console.warn was dropped or carried more");
+    // Past the first entry too: index 5 at position 1, behind a well-formed entry.
+    const q = alertRules.load();
+    q.deliver({ command: "rules", rules: [{ index: 0 }, { connection: 3, index: 5 }] });
+    assert.ok(
+      refusalShown(q).includes("malformed: the entry at position 1 of the list (counted from 0), connection: expected text, got number. "),
+      `the refusal does not name position 1 alone: "${refusalShown(q)}"`,
+    );
   });
 
   test("Alert Rules: a well-formed list after a refusal brings back the table, Remove and Add", () => {
@@ -1177,7 +1253,97 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     // A discard after that: Save is off again, and a click sends nothing more.
     p.deliver(variant(STATE_OK, (c) => delete c.state.defaults.max_session_hours));
     save.click();
-    assert.strictEqual(p.posted.length, 1, "Save posted from a stale form");
+    assert.strictEqual(p.posted.length, 1, "Save posted after a discard");
+  });
+
+  // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
+  // 2026-10-29, BACKLOG #1123). Every malformed state the suite already discards is a trigger, so a
+  // case added there is covered here too. Each first renders a state with insecure values, so
+  // 'loosened' is set and defaults are held, and edits two controls without saving, one of them
+  // into a loosening.
+
+  /** The page's own `defaults` binding, read in the page's realm: the object collectUpdates() reads. */
+  function heldDefaults(p: Page): string[] {
+    return JSON.parse((p.window.eval as (s: string) => string)("JSON.stringify(Object.keys(defaults))")) as string[];
+  }
+
+  function loosenedFields(p: Page): string[] {
+    return [...p.window.document.querySelectorAll(".loosened")].map((e: DomNode) => String(e.id)).sort();
+  }
+
+  for (const [why, malformed] of security.malformed.state) {
+    test(`Security Settings: a discarded state clears the form, defaults and every loosened mark when ${why}`, () => {
+      const p = security.load();
+      const doc = p.window.document;
+      const save = doc.getElementById("save");
+      p.deliver(variant(STATE_OK, (c) => (c.state.values.allow_unencrypted_phi = true)));
+      // Unsaved edits: a number, and a Yes/No turned into a loosening, as the operator would.
+      const hours = doc.getElementById("in-max_session_hours");
+      hours.value = "99";
+      hours.dispatchEvent(new p.window.Event("input"));
+      const local = doc.getElementById("in-local_access_only");
+      local.value = "false";
+      local.dispatchEvent(new p.window.Event("change"));
+      // THE CONTROL: the state rendered, and every piece of state this test expects cleared is held.
+      assert.deepStrictEqual(p.warnings, [], `${why}: the good state was discarded`);
+      assert.strictEqual(save.disabled, false, `${why}: the good state did not render`);
+      assert.deepStrictEqual(
+        loosenedFields(p),
+        ["field-allow_unencrypted_phi", "field-local_access_only", "field-require_mfa"],
+        `${why}: the good state and the edit did not mark their loosenings`,
+      );
+      const held = heldDefaults(p);
+      assert.ok(FIELDS.every((f) => held.includes(f.key)), `${why}: the defaults are not held`);
+      assert.ok(setControls(p).includes('in-max_session_hours="99"'), `${why}: the edit did not take`);
+
+      p.deliver(malformed);
+
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
+      assert.deepStrictEqual(p.warnings, [STATE_WARNING], `${why}: the state was not discarded`);
+      const shown = refusalShown(p);
+      assert.ok(shown.startsWith(REFUSAL), `${why}: no refusal, got "${shown}"`);
+      assert.ok(shown.includes("with any change on it that was not saved"), `${why}: the refusal hides that edits went`);
+      assert.deepStrictEqual(setControls(p), [], `${why}: a control still holds a value from before the refusal`);
+      assert.deepStrictEqual(heldDefaults(p), [], `${why}: collectUpdates() would still compare against old defaults`);
+      assert.deepStrictEqual(loosenedFields(p), [], `${why}: a loosened mark outlived the refusal`);
+      // A control the refusal replaced still fires, as a number field committed on blur would. It
+      // must not mark the cleared form through its replacement.
+      local.dispatchEvent(new p.window.Event("change"));
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: an event from a replaced control threw`);
+      assert.deepStrictEqual(loosenedFields(p), [], `${why}: a replaced control marked the cleared form`);
+      assert.strictEqual(save.disabled, true, `${why}: Save is on after a refusal`);
+      // The handler holds on its own, not only the attribute.
+      save.disabled = false;
+      save.click();
+      assert.strictEqual(p.posted.length, 0, `${why}: Save posted after a refusal: ${JSON.stringify(p.posted)}`);
+    });
+  }
+
+  test("Security Settings: the state after a refusal renders from itself alone", () => {
+    // A page that was refused, then sent a well-formed state, must match a page sent that state on
+    // its own: same controls, same loosened marks, same Save. A REGRESSION GUARD on render(), not on
+    // refuse(): it passes on the code before the refusal cleared anything, because render() sets
+    // every control, mark and default. The cases above are what pin the clearing.
+    // production_instance stays null: an unset select and its "Derived" option both read '' as a
+    // value, so setControls() below is what tells them apart.
+    const next = variant(STATE_OK, (c) => (c.state.values.delete_message_bodies_after_days = 0));
+    const p = security.load();
+    const pdoc = p.window.document;
+    p.deliver(variant(STATE_OK, (c) => (c.state.values.allow_unencrypted_phi = true)));
+    pdoc.getElementById("in-listen_address").value = "0.0.0.0";
+    p.deliver(variant(STATE_OK, (c) => delete c.state.values.require_mfa));
+    p.deliver(next);
+    const q = security.load();
+    q.deliver(next);
+    assert.strictEqual(formValues(p), formValues(q), "the controls differ from a page that saw only this state");
+    assert.deepStrictEqual(setControls(p), setControls(q), "a control is set on one page and unset on the other");
+    assert.ok(setControls(p).includes('in-production_instance=""'), "a null tristate was left unset, not derived");
+    assert.deepStrictEqual(loosenedFields(p), loosenedFields(q), "the loosened marks differ");
+    assert.deepStrictEqual(loosenedFields(q), ["field-delete_message_bodies_after_days", "field-require_mfa"]);
+    pdoc.getElementById("save").click();
+    q.window.document.getElementById("save").click();
+    assert.strictEqual(p.posted.length, 1, "Save did not post after the well-formed state");
+    assert.strictEqual(JSON.stringify(p.posted), JSON.stringify(q.posted), "Save sends something else");
   });
 
   test("Security Settings: a key this form has no switch for, and a tristate that is set, still render", () => {
@@ -1254,24 +1420,31 @@ suite("webview receivers discard a malformed payload and render a well-formed on
           } else {
             assert.strictEqual(p.snapshot(), before, `${r.panel} "${type}", ${why}: the page changed`);
           }
-          assert.ok(
-            p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "${type}"`)),
-            `${r.panel} "${type}", ${why}: the discard was not named in the console`,
+          // Exactly the one fixed warning. The kind is well-formed and the page's own, and this exact
+          // match is what proves it is not named: it is the message's own discriminant.
+          assert.deepStrictEqual(
+            p.warnings,
+            [discardWarning(r.panel)],
+            `${r.panel} "${type}", ${why}: the discard was not named in the console, carried more, or named the kind`,
           );
         });
       }
     }
 
-    test(`${r.panel}: discards a message type it does not handle`, () => {
-      const p = r.load();
-      const before = p.snapshot();
-      p.deliver({ [r.key]: "notAType", message: "x", text: "x" });
-      assert.deepStrictEqual(p.errors.map(String), []);
-      assert.strictEqual(p.snapshot(), before);
-      assert.ok(
-        p.warnings.some((w) => w.includes(`MessageFoundry ${r.panel}: discarded a malformed "notAType"`)),
-        `${r.panel}: an unhandled type was not named in the console`,
-      );
-    });
+    for (const kind of UNKNOWN_KINDS) {
+      test(`${r.panel}: discards a message type it does not handle, without echoing it: ${JSON.stringify(kind)}`, () => {
+        const p = r.load();
+        const before = p.snapshot();
+        p.deliver({ [r.key]: kind, message: "x", text: "x" });
+        assert.deepStrictEqual(p.errors.map(String), []);
+        assert.strictEqual(p.snapshot(), before);
+        assert.deepStrictEqual(
+          p.warnings,
+          [discardWarning(r.panel)],
+          `${r.panel}: an unhandled type was not reported with the fixed phrase`,
+        );
+        assert.ok(!p.warnings.some((w) => w.includes(String(kind))), `${r.panel}: the unhandled type was echoed`);
+      });
+    }
   }
 });

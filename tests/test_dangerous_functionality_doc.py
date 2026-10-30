@@ -75,7 +75,9 @@ from messagefoundry.redaction import json_loads_or_refusal
 from tests.test_threat_model_doc_drift import (
     _ALLOWED_SUBPROCESS_SITES,
     _TOOLKIT_PREFIX,
+    _code_only,
     _scanned_py_files,
+    _subprocess_sites,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -2002,6 +2004,36 @@ def _harness_drift(text: str, sources: Mapping[str, str]) -> list[str]:
 
 def test_the_harness_section_matches_the_code() -> None:
     _assert_no_drift(11, _harness_drift(_doc_text(), _harness_sources()))
+
+
+def _harness_start_gap(text: str, sources: Mapping[str, str]) -> set[str]:
+    """Harness modules on one side only: the threat-model test's spawn forms, run over the
+    harness, against section 11's process-start rows."""
+    live = _subprocess_sites({rel: _code_only(source) for rel, source in sources.items()})
+    assert live, "no harness process start found by the threat-model forms: the scan is dead"
+    return live ^ set(_start_rows_in(_harness_region(text, _HARNESS_STARTS_LEAD)))
+
+
+def test_the_harness_starts_agree_with_the_threat_model_detector() -> None:
+    """Section 11's process starts are held to this page's own detector above. The threat-model
+    test keeps its own spawn forms and its own register, ``_ALLOWED_SUBPROCESS_SITES``, which
+    covers the engine and the toolkit only. Two registers of one class, read by two detectors,
+    drift apart unless something compares them (vault BACKLOG #3474, item 10), as
+    :func:`test_the_two_process_start_inventories_agree` does for section 4. The harness is not
+    added to that register: it is the 15.1.5 section's, matched there by basename."""
+    gap = _harness_start_gap(_doc_text(), _harness_sources())
+    assert not gap, f"the two harness process-start inventories disagree on {sorted(gap)}"
+
+
+def test_the_harness_start_comparison_fires() -> None:
+    """A start section 11 does not list, and a row the code does not back, each show as a gap."""
+    text, sources = _doc_text(), _harness_sources()
+    planted = {**sources, "load/planted.py": "import os\nos.startfile(path)\n"}
+    assert _harness_start_gap(text, planted) == {"load/planted.py"}
+    anchor = "| `__main__.py` | `git rev-parse HEAD` |"
+    assert text.count(anchor) == 1, "re-anchor the planted row on a row section 11 still has"
+    widened = text.replace(anchor, "| `load/ghost.py` | x | x | argument list |\n" + anchor)
+    assert _harness_start_gap(widened, sources) == {"load/ghost.py"}
 
 
 _SWAP_CONTROLS: list[tuple[str, tuple[str, ...]]] = [

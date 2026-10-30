@@ -14,7 +14,8 @@ Public surface (same shape as the engine's):
   no parseable MSH, or with a line no rule can reach (a malformed segment id).
 * :func:`anonymize_checked` — :func:`anonymize` + a fail-closed :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only) on any surviving token or a
-  structural PHI shape in a field no rule mapped. A name, an undashed number or a date in an
+  structural PHI shape in a field no rule mapped, or a dashed SSN or punctuated phone in what a
+  retarget of a default field left (BACKLOG #3493). A name, an undashed number or a date in an
   unmapped field passes; only the coverage report records it.
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (vendored twin of the engine's; BACKLOG #331).
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
@@ -79,18 +79,21 @@ def anonymize(
     raw: str,
     *,
     salt: str,
-    overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     blanked: list[str] | None = None,
 ) -> str:
     """De-identify one HL7 v2 message with the secret ``salt`` and the effective rule set.
+
+    ``rules`` is the rule set, :data:`DEFAULT_RULES` when left out. For an ``anon.toml`` overlay,
+    call :func:`load_rules` once and pass what it returns to every message: this function takes no
+    overlay path, so a run reads, checks and warns about its overlay once (BACKLOG #3493).
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
     because its value was not a timestamp it could keep.
     """
     keyer = Keyer(salt)
     if rules is None:
-        rules = load_rules(overlay)
+        rules = DEFAULT_RULES
     # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
     rewrites = tuple(r for r in rules if r.kind != SurrogateKind.KEEP)
     return anonymize_message(raw, keyer, rewrites, blanked)
@@ -100,7 +103,6 @@ def anonymize_checked(
     raw: str,
     *,
     salt: str,
-    overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     require_live_denylist: bool = False,
     require_full_coverage: bool = False,
@@ -109,7 +111,8 @@ def anonymize_checked(
     """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
 
     Two-layered like the engine's (BACKLOG #331): the known-token denylist plus high-precision
-    structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
+    structural PHI-shape detectors over the fields no rule matched and over what a retarget of a
+    default field left past its first component. ``require_live_denylist`` (default
     off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
     refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
     PV1-2, and a kept field is still scanned; a line that is a bare segment id and passed is in
@@ -121,7 +124,7 @@ def anonymize_checked(
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
     value was not a timestamp it could keep; it is a record, not a refusal cause (BACKLOG #2330).
     """
-    effective = rules if rules is not None else load_rules(overlay)
+    effective = rules if rules is not None else DEFAULT_RULES
     blanked: list[str] = []
     output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
     # The version of the INPUT: a rule on MSH-12 has put a surrogate in the output, and a

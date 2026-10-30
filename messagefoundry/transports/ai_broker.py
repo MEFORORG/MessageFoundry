@@ -57,6 +57,8 @@ from messagefoundry.transports.rest import (
     _redact_url,
     find_outbound_length_violation,
     refuse_url_credentials,
+    url_host_label,
+    url_scheme,
 )
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
@@ -128,7 +130,10 @@ class AiBroker:
             raise AiBrokerError(
                 "engine-brokered AI requires an '[ai].endpoint' (the customer-managed LLM's URL)"
             )
-        scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
+        # Read through url_scheme, never a bare urlsplit: a URL it cannot parse raises urlsplit's own
+        # ValueError, which quotes the netloc. The full credential screen stays after the http
+        # refusal below, so that order is unchanged (BACKLOG #2686).
+        scheme = url_scheme(endpoint, "[ai].endpoint", use="[ai].api_key", error=AiBrokerError)
         # The api_key is a credential, and every call sends it (an empty key is refused below), so a
         # cleartext http endpoint is refused with no escape and in every posture: vault BACKLOG #3533
         # item 5, which applies docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
@@ -150,7 +155,7 @@ class AiBroker:
         # than — and independent of — the permissive-when-empty [egress].allowed_http, so the engine can
         # never be pointed at an un-allowlisted LLM host. An EMPTY allowlist permits NOTHING.
         if not endpoint_host_allowed(endpoint, allowed_endpoints):
-            host = urllib.parse.urlsplit(endpoint).hostname or ""
+            host = url_host_label(endpoint)
             raise AiBrokerError(
                 f"[ai].endpoint host {host!r} is not in the [ai].allowed_endpoints allowlist; "
                 "list it explicitly to permit engine-brokered AI egress (SSRF fail-closed)"

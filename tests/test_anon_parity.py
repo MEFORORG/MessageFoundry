@@ -171,6 +171,10 @@ _LEAK_PARITY_INPUTS = [
     # BACKLOG #2265: a second MSH line with a dashed number in MSH-8, which no default rule maps.
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
     "\rMSH|^~\\&|A2|B2|C|D|20260102|123-45-6789|ADT^A01|M2|P|2.5.1",
+    # BACKLOG #3465: shapes the field separator cut across fields, one malformed line among them.
+    "MSH-^~\\&-A-B-C-D-20260101--ADT^A01-M1-P-2.5.1\rPID-1--1^^^H^MR--X^Y"
+    "\rZZZ-1-123-45-6789\rZZZ-1-555-555-0100\rOBX-1-NM-8480^S^LN--000-12-3456\rzz-123-45-6789",
+    "MSH ^~\\& A B C D 20260101  ADT^A01 M1 P 2.5.1\rPID 1  1^^^H^MR  X^Y\rZZZ 1 (555) 555-0100",
 ]
 
 

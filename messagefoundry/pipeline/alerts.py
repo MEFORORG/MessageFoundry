@@ -154,8 +154,8 @@ def crl_reload_refused_detail(
     ]
     if start_refuses:
         # "At least": the time is when one cause of a refusal ends, not a promise that a start
-        # loads the file then. A proven bad signature, or a private copy a start cannot make,
-        # still refuses after it (vault BACKLOG #3506); the remedy that follows says when.
+        # loads the file then. A private copy a start cannot make, for one, still refuses after
+        # it (vault BACKLOG #3506).
         parts.append(
             "A start refuses this file too at least until its CRL takes effect, so do not restart "
             "before then."
@@ -211,8 +211,42 @@ class AlertSink(Protocol):
     """
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        """An outbound connection's delivery worker halted (``InternalErrorPolicy.STOP`` fired on an
-        internal/code error). The lane is frozen until an operator intervenes (fix + reload/restart)."""
+        """A connection is down until an operator intervenes (fix + reload/restart). At least: an
+        outbound delivery worker halted (``InternalErrorPolicy.STOP`` on an internal/code error, a
+        credential or configuration fault), an inbound's router or transform worker halted under the
+        same policy, a connection failed to build or bind at start (ADR 0031; ``detail`` starts
+        ``failed to start:``), or a log-write halt stopped it (#122). For a connection, ``name`` is
+        the bare connection name, whichever direction stopped. Some raises are not about a
+        connection and carry a prefixed stand-in instead, which no connection name can hold (the
+        name grammar has no colon): at least ``reference:<set>`` for a reference set that failed to
+        sync, ``fhir_lookup:<name>`` for a lookup that failed to build, and
+        ``cluster:transform-state`` for a state-convergence failure. ``detail`` says what stopped."""
+        ...
+
+    def connection_started(self, name: str) -> None:
+        """An operator started an inbound connection and it is up: its listener is bound, with no
+        open cause left on it or on an outbound of the same name (BACKLOG #1741).
+        The **inverse** of :meth:`connection_stopped`, as :meth:`connection_restored` is of
+        :meth:`connection_error`. Emits **no** notification; it exists so durable alert-state (ADR
+        0044) can **auto-resolve** the open ``connection_stopped`` instance for ``name``, such as an
+        inbound's bind failure. Auto-resolve-only, never a rule-targetable alert type. The default
+        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is always a
+        bare inbound name, so it never resolves a prefixed stand-in instance. Only one door raises
+        it: an operator's start or restart of the inbound, including a start of an inbound that is
+        already listening. Every other start never does, at least the engine's own ``start()``, a
+        committed reload, a reload's rollback, the scheduler and every alert rule's
+        ``restart_inbound``. A fresh process cannot see an earlier run's causes, so an open stop
+        keeps its durable instance, ack and suspend across a service restart and a reload; the
+        cooldown and the escalation count are per-process memory, so a service restart resets
+        them whatever this event does. A rule-driven loop must keep counting, so a rule's restart
+        also keeps the cooldown and the count. On that door, at least these starts never raise it: an
+        outbound's own start; a start where the runner cannot see every cause (on a clustered node,
+        or on an engine shard that does not own the bare name as an outbound lane, even with no
+        outbound of that name in its own registry); and a start while the
+        outbound namesake is under an operator-style pause, which a log-write halt's pause looks
+        like. A park the engine or the calendar made of the outbound namesake does not hold it back.
+        ``RegistryRunner._emit_inbound_started`` holds the checks. ``name`` is the connection label
+        only (no PHI)."""
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
@@ -229,7 +263,9 @@ class AlertSink(Protocol):
         (auto-resolved on the next clean head via ADR-0044 durable state when wired). Distinct from
         :meth:`connection_stopped` (the ``stop``-policy terminal) so an operator can route a "still
         retrying, look at the dependency" signal apart from a halted lane. ``name`` is the stage-lane
-        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``."""
+        label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``.
+        Under ``retry_forever`` it also fires for a serializer HOLDING its lane while the re-pend of
+        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach."""
         ...
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
@@ -606,24 +642,29 @@ class AlertSink(Protocol):
         #3010, the ``auth.ad_reconcile_misconfigured`` row), which leaves those accounts unjudged the
         same way; or one account's group search was refused for the engine's own bound
         (``group_search_deadline`` or ``group_search_cap``, vault BACKLOG #3696), raised once as
-        the account enters that state, which leaves it unjudged too. The type's name predates every
-        case but the first. Read ``reason`` before naming the cause.
+        the account enters that state, which leaves it unjudged too; or the directory has stayed
+        unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
+        (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
+        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
+        ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        and ``"directory-reconciler-paging:<username>"`` for a paging refusal, so each is its own
-        instance and throttle. ``reason`` is one of those six closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal, and
+        ``"directory-reconciler-outage"`` for a lasting outage, so each is its own instance and
+        throttle. ``reason`` is one of those seven closed-set slugs. ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
-        a referral, a configuration refusal and a probe fault it is how many probes the pass sent to
-        the directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the
-        operator-facing explanation the auth service latches, or for a paging refusal a fixed
-        sentence naming its cause. No PHI. Emitted by the API-lifespan reconciler task, never from
-        ``auth/``. A whole-directory outage is NOT this event: it is audited as
-        ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine. A pass where
-        every probe fails and none is referred, refused or faults is such an outage."""
+        a referral, a configuration refusal, a probe fault and a lasting outage it is how many
+        probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
+        ``detail`` is the operator-facing explanation the auth service latches, or for a paging
+        refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
+        reconciler task, never from ``auth/``. A single whole-directory outage pass is NOT this
+        event: it is audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the
+        accounts are fine. A pass where every probe fails and none is referred, refused or faults
+        is such an outage."""
         ...
 
     def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
@@ -645,7 +686,9 @@ class AlertSink(Protocol):
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
         for the same ``name``: ``"directory-reconciler"`` for the breaker's instance, and
-        ``"directory-reconciler-referral"`` for the referral's. Raised on every such pass, except where
+        ``"directory-reconciler-referral"`` for the referral's, and ``"directory-reconciler-outage"``
+        for a lasting outage's, on a pass that reached the directory after a run that paged
+        (``AuthService._note_directory_outage``, BACKLOG #3709). Raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
         (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
@@ -892,9 +935,15 @@ class LoggingAlertSink:
     and queue shape are recorded, never a message body."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
-        log.warning(
-            "ALERT connection_stopped: outbound %r halted on internal error: %s", name, detail
-        )
+        # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
+        # a log-write halt raise this too (#1741). The detail names the cause, and on some paths the
+        # direction; a dual-role name's log-write halt logs two lines that do not say which half.
+        log.warning("ALERT connection_stopped: connection %r stopped: %s", name, detail)
+
+    def connection_started(self, name: str) -> None:
+        # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this
+        # is a no-op, as connection_restored is. ADR 0044, BACKLOG #1741.
+        return
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         log.warning(
@@ -1189,8 +1238,8 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal and a probe fault
-            # (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
+            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",
@@ -1211,7 +1260,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
-        # The referral's source label raises it too, once no referral stands (BACKLOG #2538).
+        # The referral's source label raises it too, once no referral stands (BACKLOG #2538), and
+        # the outage's, on a reach after a run that paged (BACKLOG #3709).
         log.debug("ALERT ad_reconcile_breaker_cleared: %r found its condition clear", name)
 
     def ad_reconcile_hold_released(self, name: str) -> None:

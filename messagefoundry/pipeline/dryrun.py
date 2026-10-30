@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 
+from messagefoundry.author_output import runs_author_code
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.run_context import RunContext, run_contexts
@@ -894,6 +895,7 @@ def _dry_run_raw(
     )
 
 
+@runs_author_code
 def dry_run(
     registry: Registry,
     raw: str | bytes,
@@ -936,6 +938,9 @@ def dry_run(
 
     The live ``db_lookup``/``fhir_lookup`` bridges are not part of that gap. They have no runner here,
     so a Handler that reaches either and does not catch the error returns ``ERROR``.
+
+    Under a CLI command whose stdout carries its result, a ``print()`` the Router or a Handler runs
+    goes to stderr: :func:`~messagefoundry.author_output.runs_author_code` (vault BACKLOG #3474).
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
