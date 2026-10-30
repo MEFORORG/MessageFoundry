@@ -338,20 +338,31 @@ def parse_doc_ref(value: str) -> tuple[str, str]:
 def _obx_5_5_holds_escape(message: Message, occurrence: int) -> bool:
     """Whether the RAW (still escaped) ``OBX-5.5`` text of that OBX holds the message's escape
     character. ``Message.field`` decodes escapes on a component read, so the raw field is scanned by
-    position instead, on the first repetition as that read takes it, without copying the value."""
+    position instead, on the first repetition as that read takes it. Nothing is copied, and clean
+    base64 costs one scan for the escape character from the start of component 5."""
     _field_sep, comp_sep, rep_sep, esc, _sub_sep = message._encoding_chars()
     raw = message.field("OBX-5", occurrence=occurrence) or ""
-    rep_end = raw.find(rep_sep)
-    if rep_end == -1:
-        rep_end = len(raw)
     start = 0
     for _ in range(4):  # past the separators ahead of component 5
-        start = raw.find(comp_sep, start, rep_end)
+        start = raw.find(comp_sep, start)
         if start == -1:
             return False
         start += 1
-    end = raw.find(comp_sep, start, rep_end)
-    return raw.find(esc, start, rep_end if end == -1 else end) != -1
+    if raw.find(rep_sep, 0, start) != -1:
+        return False  # the first repetition ends before component 5
+    hit = raw.find(esc, start)
+    # The escape counts only if no separator closes component 5 before it.
+    return (
+        hit != -1 and raw.find(comp_sep, start, hit) == -1 and raw.find(rep_sep, start, hit) == -1
+    )
+
+
+def _is_base64_ed(message: Message, occurrence: int) -> bool:
+    """Whether that OBX carries an ED value encoded ``Base64`` (``OBX-2`` and ``OBX-5.4``)."""
+    if (message.field("OBX-2", occurrence=occurrence) or "").upper() != "ED":
+        return False
+    encoding = message.field("OBX-5.4", occurrence=occurrence) or ""
+    return encoding.strip().lower() == _ED_ENCODING.lower()
 
 
 def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tuple[int, str, str]]:
@@ -364,25 +375,25 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
     Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``.
 
-    Raises :class:`EscapedDocumentError` for a qualifying document whose raw ``OBX-5.5`` holds the
-    escape character: the value this would yield is decoded, not verbatim (vault BACKLOG #2809)."""
+    Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
+    whose value would be decoded rather than verbatim (vault BACKLOG #2809). Every document is checked
+    before the first is yielded, so a caller that stores each one as it goes has stored none of them
+    when the refusal comes."""
     count = message.count_segments("OBX")
-    for occ in range(1, count + 1):
-        if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
-            continue
-        if (message.field("OBX-5.4", occurrence=occ) or "").strip().lower() != _ED_ENCODING.lower():
-            continue  # not Base64-encoded ED — leave it
-        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
-        if not data_b64 or is_document_tombstone(data_b64) or is_doc_ref(data_b64):
-            continue  # empty / already-stripped / already-detached — idempotent
-        if len(data_b64) < min_b64_len:
-            continue
+    occurrences = [occ for occ in range(1, count + 1) if _is_base64_ed(message, occ)]
+    for occ in occurrences:
         if _obx_5_5_holds_escape(message, occ):
             raise EscapedDocumentError(
                 f"OBX occurrence {occ}: the Base64 document in OBX-5.5 holds an HL7 escape "
                 "sequence, which base64 never needs; refusing to detach a value that is not the "
                 "sender's verbatim bytes"
             )
+    for occ in occurrences:
+        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
+        if not data_b64 or is_document_tombstone(data_b64) or is_doc_ref(data_b64):
+            continue  # empty / already-stripped / already-detached — idempotent
+        if len(data_b64) < min_b64_len:
+            continue
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
         yield occ, data_b64, ed_type
 

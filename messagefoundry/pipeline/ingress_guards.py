@@ -24,12 +24,11 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
 **The two callers still differ in at least these places.** The declared-type sniff, which the
-dry-run does not run: ``messagefoundry
-check`` sends each fixture to every inbound, so adding the sniff there would fail an HL7 fixture on
-every X12 or FHIR inbound of a mixed config, and that choice is not this module's to make. The HL7
-parse step, which each caller runs itself: the stored ``parse error`` text differs, and the dry-run
-catches only ``HL7PeekError`` where the listener catches every peek-read fault. And the two live
-guards below.
+dry-run does not run: ``messagefoundry check`` sends each fixture to every inbound, so adding the
+sniff there would fail an HL7 fixture on every X12 or FHIR inbound of a mixed config, and that
+choice is not this module's to make. The HL7 parse step, which each caller runs itself: the stored
+``parse error`` text differs, and the dry-run catches only ``HL7PeekError`` where the listener
+catches every peek-read fault. And the two live guards below.
 
 **Two live guards are deliberately NOT mirrored for the dry-run, and both omissions are by design:**
 

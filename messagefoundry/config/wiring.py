@@ -9512,6 +9512,19 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
             cause = _textless_import_error(exc)
+    except SystemExit:
+        # A module that calls sys.exit() at import is a bad config, not a request to end the process
+        # (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module
+        # leave SystemExit alone because it is not their kind of failure; this runs the author's module:
+        # on a serving engine (a reload, a connection-flag write) the SystemExit would leave the
+        # event loop and stop every connection, and at `check` it would end the run as if it had
+        # passed. So it is refused like any failing module. KeyboardInterrupt still propagates. The
+        # exit code is not quoted, since it may be the author's text.
+        helpers.unregister(mod_name, module)
+        withheld = WiringError(
+            f"error loading config module {path.name}: it called sys.exit() at import, which a "
+            "config module may not do"
+        )
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.

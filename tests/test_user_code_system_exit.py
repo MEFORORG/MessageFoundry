@@ -12,8 +12,8 @@ with the ``SystemExit`` itself.
 
 The sites, at least: the router hop and the inline transform (``_process_ingress_item``), the split
 transform (``_process_routed_item``), both fused bodies (``_run_fused_route``,
-``_run_fused_transform``) and the reload's ``load_config``. ``mode=subprocess`` is not covered
-here: the Handler runs in a worker process there.
+``_run_fused_transform``) and the config loader's ``_exec_module``, which a reload runs.
+``mode=subprocess`` is not covered here: the Handler runs in a worker process there.
 """
 
 from __future__ import annotations
@@ -183,6 +183,24 @@ def _write_config(cfg: Path, *, inbox: Path, outdir: Path, top_level: str = "") 
     )
 
 
+def test_a_config_module_calling_sys_exit_is_a_wiring_error_at_load(tmp_path: Path) -> None:
+    """The refusal sits in the loader, so every load path takes it: a reload, a connection-flag
+    write's validation, ``serve`` and ``check``. The module is unregistered as for any failure."""
+    bad = tmp_path / "bad"
+    _write_config(bad, inbox=tmp_path / "in", outdir=tmp_path / "out", top_level="sys.exit(7)\n")
+    before = set(sys.modules)
+
+    with pytest.raises(WiringError, match=r"sys\.exit\(\)") as ei:
+        load_config(bad)
+
+    assert "7" not in str(ei.value)  # the code is not quoted
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    # Nothing left registered for the module itself (the loader may import engine modules lazily).
+    cfg = str(bad / "cfg.py")
+    added = [sys.modules[name] for name in set(sys.modules) - before]
+    assert [m for m in added if getattr(m, "__file__", None) == cfg] == []
+
+
 async def test_a_config_module_calling_sys_exit_refuses_the_reload_and_keeps_the_graph(
     tmp_path: Path,
 ) -> None:
@@ -198,7 +216,7 @@ async def test_a_config_module_calling_sys_exit_refuses_the_reload_and_keeps_the
         bad = tmp_path / "bad"
         _write_config(bad, inbox=inbox, outdir=outdir, top_level="sys.exit(0)\n")
 
-        with pytest.raises(WiringError, match="sys.exit"):
+        with pytest.raises(WiringError, match=r"sys\.exit\(\)"):
             await eng.reload_detail(bad)
 
         assert eng.registry_runner is not None

@@ -621,8 +621,8 @@ async def test_binding_a_streaming_listener_emits_the_warning(store: MessageStor
 # detach refuses the message before the ACK instead.
 
 
-def _escaped_b64(nbytes: int, escape: str = "\\X0D\\") -> str:
-    b64 = _big_b64(nbytes)
+def _escaped_b64(escape: str = "\\X0D\\") -> str:
+    b64 = _big_b64(2000)
     return b64[:100] + escape + b64[100:]
 
 
@@ -630,7 +630,7 @@ def _escaped_b64(nbytes: int, escape: str = "\\X0D\\") -> str:
 async def test_an_escape_in_obx_5_5_is_refused_at_detach_with_an_error_row_and_ar(
     store: MessageStore, escape: str
 ) -> None:
-    raw = _hl7_with_doc(_escaped_b64(2000, escape))
+    raw = _hl7_with_doc(_escaped_b64(escape))
     ic = _streaming_ic(threshold=500)
     runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
 
@@ -646,7 +646,7 @@ async def test_an_escape_in_obx_5_5_is_refused_at_detach_with_an_error_row_and_a
 
 
 async def test_the_http_listener_refuses_an_escape_in_obx_5_5_too(store: MessageStore) -> None:
-    raw = _hl7_with_doc(_escaped_b64(2000))
+    raw = _hl7_with_doc(_escaped_b64())
     ic = _streaming_ic(threshold=500)
     runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
 
@@ -656,6 +656,24 @@ async def test_the_http_listener_refuses_an_escape_in_obx_5_5_too(store: Message
     assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
     assert "escape sequence" in msgs[0]["error"]
     assert await _attachments(store) == []
+
+
+async def test_an_escape_in_a_later_document_stores_none_of_the_earlier_ones(
+    store: MessageStore,
+) -> None:
+    """Every document is checked before the first is stored, so a refusal leaves no orphaned
+    attachment behind for a clean document that came ahead of the escaped one."""
+    clean = f"OBX|1|ED|PDF^Report||^Application^PDF^Base64^{_big_b64(2000)}||||||F\r"
+    raw = _hl7_with_doc(_escaped_b64()).replace("OBX|1|", clean + "OBX|2|")
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+
+    assert _ack_code(await runner._handle_inbound(ic, raw.encode("utf-8"))) == "AR"
+
+    assert await _attachments(store) == []
+    cur = await store._db.execute("SELECT COUNT(*) FROM attachment_chunk")
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 0
 
 
 async def test_clean_base64_still_detaches_and_rehydrates_verbatim(store: MessageStore) -> None:

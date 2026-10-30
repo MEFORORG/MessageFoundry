@@ -886,6 +886,16 @@ class _StreamBudgetExceeded(Exception):
     ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
 
 
+#: What ``_detach_documents`` raises for a body it will not detach. Both listeners catch exactly this
+#: and record ``ERROR`` before the ACK, so a type added here is refused by both, never by one alone.
+_DETACH_REFUSALS: tuple[type[Exception], ...] = (
+    _StreamBudgetExceeded,
+    StreamingAttachmentsUnsupported,
+    DocRefError,
+    EscapedDocumentError,
+)
+
+
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
 # inbound. EADDRINUSE: another process/instance holds it; EADDRNOTAVAIL: the bind_address isn't a local
@@ -7903,12 +7913,7 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (
-                _StreamBudgetExceeded,
-                StreamingAttachmentsUnsupported,
-                DocRefError,
-                EscapedDocumentError,
-            ) as exc:
+            except _DETACH_REFUSALS as exc:
                 await self._record_refused(
                     ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
                 )
@@ -8260,12 +8265,7 @@ class RegistryRunner:
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (
-                _StreamBudgetExceeded,
-                StreamingAttachmentsUnsupported,
-                DocRefError,
-                EscapedDocumentError,
-            ) as exc:
+            except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
                 # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
@@ -11292,7 +11292,7 @@ class _RedactedFault(Exception):
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
 
 
-class _UserCodeExit(Exception):
+class _UserCodeExit(_RedactedFault):
     """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
     #3134). Converted at each place that code runs, so the message takes the internal-error policy
     as for any other raise.
@@ -11305,8 +11305,8 @@ class _UserCodeExit(Exception):
     re-raises it out of the event loop and every connection stops. ``KeyboardInterrupt`` and
     ``CancelledError`` keep propagating: those are signals to the engine, not faults in a message.
 
-    The text names an integer exit code and nothing else: ``sys.exit("...")`` carries the author's
-    text, which could quote a field."""
+    Redacted by construction: the text names an integer exit code and nothing else, since
+    ``sys.exit("...")`` carries the author's text, which could quote a field."""
 
     @classmethod
     def from_exit(cls, exc: SystemExit) -> _UserCodeExit:
