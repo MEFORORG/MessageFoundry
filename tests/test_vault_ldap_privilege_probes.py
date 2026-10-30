@@ -47,7 +47,6 @@ from messagefoundry.privilege_check import (
     VAULT_ADMIN_PATHS,
     HopState,
     VaultConsumer,
-    _vault_hops,
     administrative_group,
     exit_code_for,
     ldap_hop,
@@ -55,6 +54,7 @@ from messagefoundry.privilege_check import (
     vault_admin_paths,
     vault_consumers,
     vault_hop,
+    vault_hops,
 )
 from messagefoundry.privilege_probes import (
     VaultTokenReading,
@@ -343,7 +343,7 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
     )
     assert store.same_token_as(secrets)
     kv = VaultConsumer("vault.secrets", "kv", "kv", "read the KV path")
-    hops = _vault_hops([_STORE, kv], [store, secrets])
+    hops = vault_hops([_STORE, kv], [store, secrets])
     assert [h.state for h in hops] == [HopState.OVER_GRANTED, HopState.OVER_GRANTED]
     assert f"the same token serves vault.secrets, so it also holds read on {kv_path}" in (
         hops[0].detail
@@ -361,7 +361,7 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
         lambda a, t: _FakeVault(caps=caps),
         lambda: {kv_path: frozenset({"read"})},
     )
-    assert [h.state for h in _vault_hops([_STORE, kv], [store, other])] == [
+    assert [h.state for h in vault_hops([_STORE, kv], [store, other])] == [
         HopState.CLEAN,
         HopState.CLEAN,
     ]
@@ -377,7 +377,7 @@ def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFi
     error = ConnectionError(f"https://vault.invalid/ token={_TOKEN}")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
         _reading(_FakeVault(lookup_error=error))
-    assert "check-privileges: token lookup-self failed: ConnectionError" in caplog.text
+    assert "privilege probe: token lookup-self failed: ConnectionError" in caplog.text
     assert _TOKEN not in caplog.text
 
 
@@ -1030,7 +1030,7 @@ def _cli(
     return ["check-privileges", "--service-config", str(_vault_toml(tmp_path)), "--json"]
 
 
-def test_cli_exits_3_on_a_root_token_and_says_it_does_not_gate_a_start(
+def test_cli_exits_3_on_a_root_token_and_says_serve_would_refuse(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     argv = _cli(monkeypatch, tmp_path, lambda a, t: _FakeVault(policies=("root",)))
@@ -1040,7 +1040,8 @@ def test_cli_exits_3_on_a_root_token_and_says_it_does_not_gate_a_start(
     payload = json.loads(out)
     vault = next(h for h in payload["hops"] if h["hop"] == "vault.store")
     assert vault["state"] == "over_granted"
-    assert "vault.store is reported only; it does not gate a start" in payload["serve"]
+    # BACKLOG #2903 (ADR 0216): the root policy is in the refusing class, so serve would refuse.
+    assert payload["serve"].startswith("would REFUSE to start: a Vault token on vault.store")
 
 
 def test_cli_exits_4_when_vault_is_unreachable_and_sends_one_request(
@@ -1182,7 +1183,10 @@ def test_cli_exits_0_on_a_least_privilege_token(
 ) -> None:
     argv = _cli(monkeypatch, tmp_path, lambda a, t: _FakeVault(caps=_least_caps()))
     assert main(argv) == 0
-    assert "does not gate a start" not in json.loads(capsys.readouterr().out)["serve"]
+    # The whole line: a clean Vault hop adds no note, so a hop wrongly judged as one that warns or
+    # refuses changes it (BACKLOG #2903).
+    serve = json.loads(capsys.readouterr().out)["serve"]
+    assert serve == "would start: the store probe found nothing to refuse"
 
 
 def test_cli_probes_the_ldap_bind_when_ad_is_on(

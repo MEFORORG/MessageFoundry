@@ -169,6 +169,7 @@ from messagefoundry.store.row_seal import (
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AdMap,
@@ -504,15 +505,6 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
-# The one row an administrator's password or MFA reset leaves in the account's known-address record
-# (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
-# so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
-# never a match: it is stamped at the epoch, outside every lookback, ``_mark_login_address_known``
-# never writes a client whose text equals it, and the next real write's prune usually removes it.
-_LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
-# Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
-# because SQL Server's FLOAT cannot hold an infinity.
-_LOGIN_ADDRESS_FOREVER = 1e18
 
 
 class _LoginAddress(Enum):
@@ -2315,6 +2307,11 @@ class ProvisionedAdministrator:
     #: enrolled no TOTP (``--no-totp``, which only a site with ``require_mfa`` off may pass). Never
     #: in ``--json`` output, never logged, never audited.
     recovery_codes: tuple[str, ...] = ()
+    #: Every enabled Administrator when the run checked, as the audit row's
+    #: ``administrators_at_check`` records them (vault BACKLOG #2711 step 1). Non-empty means this
+    #: one was added beside them, so the CLI warns when its ``administrator_granted`` alert reached
+    #: only the log (vault BACKLOG #3849 B5).
+    administrators_at_check: tuple[str, ...] = ()
 
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
@@ -4095,7 +4092,9 @@ class AuthService:
         always covers an administrator.
 
         **THE REPAIR BRANCH CLEARS EVERYTHING THE EARLIER HOLDER COULD STILL USE**, first: TOTP, its
-        recovery codes, every passkey, and every session on the row. Before this, the branch revoked
+        recovery codes, every passkey, every session on the row, and since vault BACKLOG #3849 B2 the
+        account's known sign-in addresses, as a reset clears them, once the role is granted. Before
+        this, the branch revoked
         no session, and ``_build_identity`` re-reads roles on every request, so a live session the
         earlier holder kept became an Administrator session when the role was written -- an ADR 0183
         defect this amendment fixes because it edits this branch.
@@ -4424,9 +4423,27 @@ class AuthService:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
+            # below, so the row is read again first. Only a read of this very row without the role
+            # shows the store wrote none and took nothing over, and leaves the record, as
+            # SECURITY.md says. Anything else, a read that raises or finds no verified row of this
+            # id, leaves it unknown, and the record is cleared, the side that challenges: a re-run
+            # refuses a row that holds the role, so nothing else would clear it.
+            row: VerifiedUser | None = None
+            may_hold_role = True
+            try:
+                row = (await self._lookup_by_username(username)).user
+                may_hold_role = not (
+                    row is not None
+                    and row.id == user_id
+                    and Role.ADMINISTRATOR.value not in row.role_ids
+                )
+            finally:
+                if repaired and may_hold_role:
+                    await self._clear_login_addresses(user_id, username=username)
             raise FirstAdministratorRefused(
                 await self._unexpected_grant_refusal(
-                    username, user_id, enrolled=totp_secret is not None
+                    username, user_id, row, enrolled=totp_secret is not None
                 )
             )
         if repaired:
@@ -4435,6 +4452,15 @@ class AuthService:
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator.
             await self._store.revoke_user_sessions(user_id)
+            # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
+            # not the new Administrator's, so they go too, as after an administrator's reset
+            # (#2946). Otherwise a sign-in from one of them would read as known and skip the
+            # first-seen challenge. HERE, after the grant, and not with the first clear: a sign-in
+            # the earlier holder finished before ``set_password`` can still record its address.
+            # A run the grant refuses (ADMIN_EXISTS, ACCOUNT_CHANGED) has already replaced the
+            # password, the TOTP and the notification address, but it wrote no role, so the
+            # addresses are left as they were. Best effort, as at a reset.
+            await self._clear_login_addresses(user_id, username=username)
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
@@ -4464,17 +4490,19 @@ class AuthService:
             repaired=repaired,
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
+            administrators_at_check=standing_admins,
         )
 
     async def _unexpected_grant_refusal(
-        self, username: str, user_id: str, *, enrolled: bool
+        self, username: str, user_id: str, row: VerifiedUser | None, *, enrolled: bool
     ) -> str:
         """The operator-facing text for a first-admin grant that answered out of contract (#3078).
 
-        Such a store MAY still have written a role, so the row is read again, through the same
-        seal-checked loader a re-run uses, and the advice matches what it holds. The read runs
-        after the grant's transaction, so it can also see another run's work; the text says
-        "may" for that reason. "Keep the entry and re-run" is wrong in at least two states: a re-run
+        Such a store MAY still have written a role, so the caller reads the row again, through the
+        same seal-checked loader a re-run uses, and passes it as ``row``; the advice matches what
+        it holds. The caller's read runs after the grant's transaction, so it can also see another
+        run's work; the text says "may" for that reason. "Keep the entry and re-run" is wrong in at
+        least two states: a re-run
         refuses a row that holds the Administrator role, and on a roleless row it clears the
         authenticator this run enrolled.
         """
@@ -4486,8 +4514,6 @@ class AuthService:
             "If the command is refused the same way again, the store has a fault this command "
             "cannot repair"
         )
-        lookup = await self._lookup_by_username(username)
-        row = lookup.user
         if row is None or row.id != user_id:
             return f"{prefix}, and could not read what that account holds now. {again}"
         if Role.ADMINISTRATOR.value in row.role_ids:
@@ -12769,7 +12795,7 @@ class AuthService:
             # A client text equal to the reset marker (a forged forwarded header can carry any
             # text) is not written, or the upsert would move the marker into the lookback.
             if (
-                key == _LOGIN_ADDRESS_RESET_MARKER
+                key == LOGIN_ADDRESS_RESET_MARKER
                 or len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX
             ):
                 return
@@ -12804,34 +12830,37 @@ class AuthService:
         """Empty the account's known-address record after an administrator's password or MFA reset
         (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
         the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
-        session does not call this, because revoking is routine.
+        session does not call this, because revoking is routine. A ``provision-admin`` takeover
+        calls it too (vault BACKLOG #3849 B2): the addresses are the earlier holder's.
 
-        It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
+        It leaves one row, the store's ``LOGIN_ADDRESS_RESET_MARKER`` (vault BACKLOG #2946,
+        #3849), stamped at the epoch so the lookback
         read never returns it. An account that never stamped ``last_login_at`` would otherwise read
         as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
-        rather than be judged NEW. In the usual case the prune after the next real write removes
-        it, and that write has just added a real row; ``delete_user`` and a later reset also remove
-        it. Every reset leaves it, an account that never signed in included, as the ruling asks.
+        rather than be judged NEW. The store's prune never removes it, so it stays until
+        ``delete_user`` or a later reset (vault BACKLOG #3849 B4); it is never a match. Every reset
+        leaves it, an account that never signed in included, as the ruling asks.
+
+        **The delete and the marker are one store transaction** (``reset_login_addresses``, vault
+        BACKLOG #3849 B4). Before that they were two calls, so a failure between them, or a
+        sign-in's prune racing the marker, could leave the record empty, which reads as no
+        baseline. A sign-in's prune can no longer remove the marker either.
 
         Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
         reset's credential write has committed, and its reply carries the one-time credential. A
-        failure is logged at ERROR with the username, and the reset stands with the record as the
-        failure left it: unchanged, or emptied with no marker. The two calls are separate
-        transactions, so any record write still in flight for the account, from a sign-in, a
-        step-up, a factor proof or an enrolment, can land after the delete."""
+        failure is logged at ERROR with the username, and the reset stands with the record
+        unchanged. Any record write still in flight for the account, from a sign-in, a step-up, a
+        factor proof or an enrolment, can still land after the reset's transaction."""
         # The notice debounce goes too, so the first NEW sign-in after the reset is also mailed.
         for key in [k for k in self._login_new_ip_noticed if k[0] == user_id]:
             del self._login_new_ip_noticed[key]
         try:
-            await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
-            # Stamped at the epoch, so the lookback read never returns it and only the any-age
-            # baseline read sees it.
-            await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+            await self._store.reset_login_addresses(user_id)
         except Exception:
             _log.exception(
-                "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
-                "and the next sign-in may read an address seen before it as known, or find no "
-                "baseline",
+                "could not clear the known sign-in addresses of %s after a reset or takeover; it "
+                "stands, the record is unchanged, and the next sign-in may read an address seen "
+                "before it as known",
                 username,
             )
 

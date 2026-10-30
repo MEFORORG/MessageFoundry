@@ -7381,6 +7381,19 @@ class SecuritySettings(_Section):
     # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
     allow_over_granted_store_principal: bool = False
 
+    # ── Vault token privileges (ASVS 13.2.2, ADR 0216) ───────────────
+    # The audited opt-out from the refusal the gravest Vault grants earn under enforcement = enforce:
+    # the startup preflight (messagefoundry/vault_preflight.py) found a Vault token the engine uses
+    # holding the root policy, a grant on an administrative path, or a Transit key's config, rotate,
+    # export or backup, and the operator accepts that in writing. It lifts that one refusal and
+    # nothing else: every other Vault over-grant only warns, and so does a probe stopped by a network
+    # failure, a timeout or a 403; a probe that failed otherwise refuses under enforce whatever this
+    # says (privilege_probes.excused_failure). Default FALSE.
+    # Setting it TRUE is a LOOSENING: an AUDIT: line at every start that uses it,
+    # over_grant_accepted=true on the vault_privilege_preflight audit row, and a
+    # security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
+    allow_over_granted_vault_token: bool = False
+
     # ── Interpreter remote debugging (PEP 768, vault BACKLOG #2700) ──
     # The named acceptance that lifts the refusal `serve` and `supervise` make under enforcement =
     # enforce when the interpreter's remote debugging is enabled in their process (owner ruling
@@ -10480,6 +10493,15 @@ def security_loosenings(
                 "a store login holding more than the documented least-privilege grant is permitted "
                 "to start an enforcing instance (ADR 0199) — the refusal the startup privilege "
                 "preflight would otherwise raise is acknowledged away",
+            )
+        )
+    if sec.allow_over_granted_vault_token:
+        out.append(
+            (
+                "allow_over_granted_vault_token",
+                "a Vault token holding the root policy or a grant on an administrative path is "
+                "permitted to start an enforcing instance (ADR 0216) — the refusal the startup "
+                "Vault privilege preflight would otherwise raise is acknowledged away",
             )
         )
     if sec.allow_remote_debugging:

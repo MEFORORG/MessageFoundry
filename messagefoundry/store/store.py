@@ -1813,13 +1813,21 @@ async def admin_guard_counts(
     sealer: RowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
     counts: AdminHolderTest | None = None,
+    *,
+    role_id: str,
 ) -> tuple[int, int]:
     """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
     rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
     ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
     counting it would let the last usable administrator be removed. With ``counts``, it must also
     pass that test (the first-administrator grant's); the removal guard passes none, so it counts
-    every sealed holder."""
+    every sealed holder.
+
+    **The record it counts is the record it judged** (vault BACKLOG #3849 C4). The holder list
+    comes from a join that reads ``users.disabled`` and ``user_roles`` once, and the record is read
+    after it, so the record must itself be enabled and hold ``role_id``, the role the join selected
+    on. The seal vouches for the record, not for the join: before this, a holder the join listed
+    counted whatever the sealed record then said about either."""
     target = others = 0
     for holder_id, is_target in holders:
         if is_target:
@@ -1827,6 +1835,8 @@ async def admin_guard_counts(
             continue
         record = await read_record(holder_id)
         if record is None or not user_seal_ok(sealer, record):
+            continue
+        if record.row.disabled or role_id not in record.role_ids:
             continue
         if counts is None or counts(record.row):
             others += 1
@@ -3586,6 +3596,14 @@ def existing_roles_only(
 #: The ``roles`` columns a role seal leaves out, each with its reason (BACKLOG #2592).
 #: ``tests/test_role_seal.py`` pins this list.
 ROLE_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
+
+#: The one row an administrator's reset, or a provision-admin takeover, leaves in an account's
+#: known sign-in address record (vault BACKLOG #2946, #3849). It holds no host, is stamped at the
+#: epoch, and is never a match; it is the baseline for an account that never stamped
+#: ``last_login_at``. Defined in the store because the store keeps it: ``forget_login_addresses``
+#: never prunes it, and ``reset_login_addresses`` writes it in the transaction that empties the
+#: record (vault BACKLOG #3849 B4).
+LOGIN_ADDRESS_RESET_MARKER: Final = "cleared by reset"
 
 #: The AD group-to-role map: its table, and the name its seal is stored under in
 #: ``authority_set_seal``. The name is inside the sealed bytes too, so a seal made for one map
@@ -16463,8 +16481,19 @@ class MessageStore:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-                (user_id, before),
+                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<? AND address<>?",
+                (user_id, before, LOGIN_ADDRESS_RESET_MARKER),
+            )
+            await self._commit()
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+            await self._db.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES (?, ?, 0, 0) ON CONFLICT(user_id, address) DO NOTHING",
+                (user_id, LOGIN_ADDRESS_RESET_MARKER),
             )
             await self._commit()
 
@@ -16492,7 +16521,7 @@ class MessageStore:
                 cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                 holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                 target, others = await admin_guard_counts(
-                    holders, self._row_sealer, self._read_user_record
+                    holders, self._row_sealer, self._read_user_record, role_id=admin_role_id
                 )
                 if target and not others:
                     await self._db.rollback()
@@ -16541,7 +16570,11 @@ class MessageStore:
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
-                        holders, self._row_sealer, self._read_user_record, counts_as_admin
+                        holders,
+                        self._row_sealer,
+                        self._read_user_record,
+                        counts_as_admin,
+                        role_id=admin_role_id,
                     )
                     if others:
                         await self._db.rollback()

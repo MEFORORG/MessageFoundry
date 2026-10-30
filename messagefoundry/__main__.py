@@ -94,14 +94,17 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    import asyncio
+
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
-    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.settings import AlertsSettings, ServiceSettings, StoreSettings
     from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.store import UserRecord
@@ -7678,8 +7681,11 @@ def _check_privileges(args: argparse.Namespace) -> int:
     probe could not observe its principal. 3 wins when both apply.
 
     A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
-    store observation under these settings (ADR 0199). Only the store finding gates a start; the
-    line says so when another hop is over-granted. The exit code does not follow it."""
+    store and Vault observations under these settings (ADR 0199, ADR 0216). The store finding and a
+    Vault grant in the refusing class gate a start; the line names a Vault finding that only warns
+    and an LDAP over-grant, which do not, and a Vault probe failure that is not a network failure,
+    a timeout or a 403, which gates serve's start only where serve's own probe meets it. The exit
+    code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
@@ -7998,40 +8004,14 @@ def _offline_security_notifier(
     alerts = settings.alerts
     if not (settings.auth.notify_security_events and alerts.email_smtp_host and alerts.email_from):
         return None
-    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
-    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
-        print(
-            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
-            "email_tls_verify is false), so no security notice is sent from this command. Set "
-            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
-            file=sys.stderr,
-        )
+    if not _offline_smtp_hop_unauthenticated_permitted(settings, what="security notice"):
         return None
-    if unauthenticated:
-        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
-        print(
-            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
-            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice can be read "
-            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
-            "when settings load.",
-            file=sys.stderr,
-        )
     try:
         # BACKLOG #3470: the relay's CA takes the trust-anchor checks `serve` gives it. A refusal
         # drops the notice, as any other failure here does; the recovery itself goes on.
-        from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
-        from messagefoundry.config.settings import SecurityEnforcement, hop_posture_from_ai
-        from messagefoundry.controlchars import scrub_control_chars
+        from messagefoundry.config.settings import hop_posture_from_ai
 
-        relay_ca = smtp_hop_anchor_spec(alerts, settings.auth, settings.tls)
-        enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
-        if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
-            # The refusal's text is written for a start. This command does not stop on it.
-            print(
-                f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
-                "sends no security notice over that relay.",
-                file=sys.stderr,
-            )
+        if not _offline_smtp_relay_ca_accepted(settings, what="security notice"):
             return None
         return security_notifier_from_settings(
             alerts,
@@ -8056,6 +8036,446 @@ def _offline_security_notifier(
             file=sys.stderr,
         )
         return None
+
+
+def _offline_smtp_hop_unauthenticated_permitted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether an offline command may send a ``what`` over the ``[alerts]`` SMTP hop as configured.
+
+    False, with a WARNING, for a hop that does not authenticate the relay (``email_use_tls`` or
+    ``email_tls_verify`` false) unless ``[security].allow_unverified_alert_smtp_tls`` acknowledges
+    it. :func:`_offline_security_notifier` says why an offline command refuses that hop at every
+    posture. An acknowledged one is sent over, and said so, never silently."""
+    alerts = settings.alerts
+    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
+    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
+        print(
+            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
+            f"email_tls_verify is false), so no {what} is sent from this command. Set "
+            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
+            file=sys.stderr,
+        )
+        return False
+    if unauthenticated:
+        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
+        print(
+            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
+            f"permitted by [security].allow_unverified_alert_smtp_tls=true. The {what} can be read "
+            "on that hop. No login crosses it: [alerts].email_username beside that hop is refused "
+            "when settings load.",
+            file=sys.stderr,
+        )
+    return True
+
+
+def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> bool:
+    """Whether the ``[alerts]`` relay's CA passes the trust-anchor checks ``serve`` gives it
+    (BACKLOG #3470). False, with a WARNING, when they refuse it: the command goes on and sends no
+    ``what`` over that relay. May raise what the checks raise; the callers treat that as a channel
+    that could not be built."""
+    from messagefoundry.auth.trust_anchors import anchor_refusal, smtp_hop_anchor_spec
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.controlchars import scrub_control_chars
+
+    relay_ca = smtp_hop_anchor_spec(settings.alerts, settings.auth, settings.tls)
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    if relay_ca is not None and (refusal := anchor_refusal(relay_ca, enforcing=enforcing)):
+        # The refusal's text is written for a start. This command does not stop on it.
+        print(
+            f"WARNING: {scrub_control_chars(str(refusal))}\nThis command goes on, but it "
+            f"sends no {what} over that relay.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+#: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
+_PROVISION_ADMIN_GRANT_VIA = "provision_admin"
+#: How long ``provision-admin``'s alert step waits, in all, for the alert's sends and its
+#: open-instance write before it closes the store. The recovery codes are shown before the step
+#: starts, so this bound protects the command's result and not the codes; the step as a whole is
+#: bounded by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
+_OFFLINE_ALERT_WAIT_SECONDS = 15.0
+#: How long the alert step waits for each of the store reopen its open-instance record needs and
+#: that store's close. A store that does not open in time costs that record, not the page. It
+#: bounds an await only: a synchronous hop inside the open, such as the key provider's, is bounded
+#: by its own client's timeout and by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
+_OFFLINE_ALERT_REOPEN_SECONDS = 5.0
+#: How long ``provision-admin`` waits for its whole alert step, the notifier build, the store
+#: reopen, the sends, the open-instance write and the close, before it prints its result without
+#: the step's answer. The build has no bound of its own, so a slow build can run a step past this
+#: that would have answered True; the command then reports no confirmed delivery and logs the
+#: fallback, the safe direction.
+_OFFLINE_ALERT_STEP_SECONDS = 30.0
+
+
+def _offline_alert_notifier(
+    settings: ServiceSettings, posture: HopPosture | None
+) -> NotifierAlertSink | None:
+    """The ``[alerts]`` notifier ``serve`` would wire, built for an offline command (vault BACKLOG
+    #3849 B5), or ``None`` when no transport is configured, as ``serve`` then falls back to its
+    logging sink. Synchronous, and it may read anchor files and reach a secret provider, so an
+    async caller runs it off the loop.
+
+    The email transport is dropped, and any webhook kept, when the SMTP hop is one an offline command
+    refuses (:func:`_offline_smtp_hop_unauthenticated_permitted`) or its relay CA is refused
+    (:func:`_offline_smtp_relay_ca_accepted`), as the ``serve`` lifespan drops it for a refused CA.
+    The checks run only when the email transport would be built at all. A build failure with both
+    transports configured is WARNED and retried with each one alone, the webhook first, so a secret
+    this shell cannot resolve for the relay does not also cost the webhook, nor a webhook refused at
+    construction the relay. A failure with nothing left to drop yields ``None``, and the caller's
+    alert reaches the log instead: the grant it reports has already been written, and a recovery
+    command must not die on its page.
+    """
+    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.pipeline.alert_sinks import (
+        alerts_without_email,
+        alerts_without_webhook,
+        configured_alert_transport_names,
+        notifier_from_settings,
+    )
+
+    def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
+        # The provider is resolved only for a build that names a secret reference, which only the
+        # email transport does: a provider this shell cannot reach must not cost the webhook.
+        return notifier_from_settings(
+            alerts,
+            secret_provider=(
+                resolve_secret_provider(settings.secrets, posture=posture)
+                if alerts.email_password_secret
+                else None
+            ),
+            trust_anchor_policy=settings.tls.policy(),
+            posture=posture,
+        )
+
+    alerts = settings.alerts
+    names = configured_alert_transport_names(alerts)
+    if not names:
+        # As `serve` with no transport: the logging sink. Nothing is resolved for it.
+        return None
+    emails = "email" in names
+    if emails:
+        try:
+            hop_accepted = _offline_smtp_hop_unauthenticated_permitted(
+                settings, what="alert email"
+            ) and _offline_smtp_relay_ca_accepted(settings, what="alert email")
+        except Exception as exc:  # noqa: BLE001 - a check that cannot decide costs the email only
+            print(
+                f"WARNING: the [alerts] SMTP hop could not be checked ({type(exc).__name__}), so "
+                "no alert email is sent from this command.",
+                file=sys.stderr,
+            )
+            hop_accepted = False
+        if not hop_accepted:
+            alerts, emails = alerts_without_email(alerts), False
+    # The class only, here and below, as `_build_provision_auth_service` names a secret failure:
+    # the text of a provider's error can carry its address or a reference.
+    failures: list[str] = []
+    try:
+        return build(alerts)
+    except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
+        failures.append(type(exc).__name__)
+    if emails and len(names) > 1:
+        print(
+            f"WARNING: the [alerts] notifier could not be built ({failures[0]}); this command "
+            "tries again with the webhook alone, then with the email transport alone.",
+            file=sys.stderr,
+        )
+        for alone, dropped in (
+            (alerts_without_email(alerts), "email"),
+            (alerts_without_webhook(alerts), "webhook"),
+        ):
+            try:
+                built = build(alone)
+            except Exception as retry:  # noqa: BLE001 - as above
+                failures.append(type(retry).__name__)
+                continue
+            print(
+                f"WARNING: the [alerts] notifier was built without the {dropped} transport, so "
+                f"this command's alert is not sent by {dropped}.",
+                file=sys.stderr,
+            )
+            return built
+    print(
+        f"WARNING: the [alerts] notifier could not be built ({', '.join(failures)}), so this "
+        "command's alert goes to the log only.",
+        file=sys.stderr,
+    )
+    return None
+
+
+#: Tasks :func:`_within` stopped waiting for, held so the loop's weak task references cannot drop
+#: one before it settles.
+_LATE_TASKS: set[Any] = set()
+
+
+async def _within[T](
+    awaitable: Awaitable[T], timeout: float, on_late: Callable[[asyncio.Future[T]], None]
+) -> T:
+    """``awaitable``'s result, waited on for at most ``timeout`` seconds, else
+    :class:`TimeoutError`; ``on_late`` gets the task once it settles, when this stopped waiting first.
+
+    Not ``asyncio.timeout`` around the await (vault BACKLOG #3849, repair 3): a cancel that lands
+    after the awaited call finished but before the awaiting coroutine resumed throws into it, and
+    the result, an opened store, is discarded with nothing to close it. Nor is the task cancelled
+    at the bound: a driver cancelled mid-open can drop a handle it already holds, and a close
+    cancelled mid-way leaves one half closed. The work runs as its own task, left to finish while
+    the loop runs, so a result that lands in that time is never thrown away. It does not outlive
+    the loop: ``provision-admin``'s step loop ends once the step answers, and a task still running
+    then is cancelled by that shutdown, its own cancel handling then owning the cleanup."""
+    import asyncio
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        _hold_late(task, on_late)
+        raise
+    if not task.done():
+        _hold_late(task, on_late)
+        raise TimeoutError
+    return task.result()
+
+
+def _hold_late[T](task: asyncio.Future[T], on_done: Callable[[asyncio.Future[T]], None]) -> None:
+    """Hold ``task`` in :data:`_LATE_TASKS` until it settles, then hand it to ``on_done``."""
+    _LATE_TASKS.add(task)
+    task.add_done_callback(_LATE_TASKS.discard)
+    task.add_done_callback(on_done)
+
+
+def _close_late_store(opened: asyncio.Future[Store]) -> None:
+    """``on_late`` for the alert's store open: close a store that opened after its bound, and name
+    the class of an open that failed after it, which the caller logged only as a timeout."""
+    import asyncio
+
+    if opened.cancelled():
+        return
+    if (exc := opened.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store reopen failed after its bound (%s)", type(exc).__name__
+        )
+        return
+    _hold_late(asyncio.ensure_future(opened.result().close()), _log_late_close)
+
+
+def _log_late_close(closing: asyncio.Future[None]) -> None:
+    """``on_late`` for the alert's store close, and for a late store's: name a failure's class."""
+    if not closing.cancelled() and (exc := closing.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store did not close cleanly (%s)", type(exc).__name__
+        )
+
+
+async def _raise_offline_administrator_granted(
+    settings: ServiceSettings,
+    posture: HopPosture | None,
+    open_alert_store: Callable[[], Awaitable[Store]],
+    *,
+    username: str,
+    granted_by: str,
+) -> bool:
+    """Raise ``administrator_granted`` for an Administrator ``provision-admin`` just granted (vault
+    BACKLOG #3849 B5), and return whether an ``[alerts]`` transport confirmed delivering it.
+
+    Every role grant the web console makes raises this alert. Since vault BACKLOG #2711 step 1 this
+    command can add an Administrator beside directory ones that still sign in, and before this
+    nobody was paged. It is raised on every successful run, a first install included, because the
+    console pages every grant too and a "beside others" condition would be one more read that can
+    race.
+
+    The notifier is the one ``serve`` wires. When one is built, ``open_alert_store`` is called so
+    the alert also lands as an open alert instance the web console lists once the engine runs (ADR
+    0044), best effort: a store that does not open within :data:`_OFFLINE_ALERT_REOPEN_SECONDS`
+    costs that record, not the page. With no notifier nothing would record one, so the store is
+    not opened. The notifier is started, fed and drained here, because the loop ends with the
+    step, within :data:`_OFFLINE_ALERT_WAIT_SECONDS`. No suspend window is primed: a muted key
+    would page anyway, the safe direction for one alert.
+
+    True only when a transport confirmed delivery in time (:func:`_feed_offline_alert`). False
+    when no notifier was built, it raised, no transport confirmed, or nothing answered in time: the
+    CALLER then writes the logging sink's line,
+    so the line is written once whether or not this step answers at all. It never raises. Its own
+    failure lines name the exception's class only, because a provider's or driver's text can carry
+    an address. The notifier's lines are not this step's: a failed send or open-instance write is
+    logged inside :class:`NotifierAlertSink` as ``serve`` logs it, through the command's redacting
+    handler."""
+    import asyncio
+
+    log = logging.getLogger(__name__)
+    try:
+        notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
+    except Exception as exc:  # noqa: BLE001 - the grant is written; the log carries the alert
+        log.warning(
+            "the [alerts] notifier could not be built (%s), so the administrator_granted alert "
+            "goes to the log only",
+            type(exc).__name__,
+        )
+        return False
+    if notifier is None:
+        return False
+    store: Store | None = None
+    try:
+        store = await _within(open_alert_store(), _OFFLINE_ALERT_REOPEN_SECONDS, _close_late_store)
+    except Exception as exc:  # noqa: BLE001 - the page goes on without the open-instance record
+        log.warning(
+            "could not reopen the store for the administrator_granted open alert (%s); the alert "
+            "is sent without it",
+            type(exc).__name__,
+        )
+    try:
+        return await _feed_offline_alert(notifier, store, username=username, granted_by=granted_by)
+    finally:
+        if store is not None:
+            try:
+                # Bounded: the answer is read only once this returns, and a close that waits on a
+                # write still running would otherwise hold a True answer past the step's bound. A
+                # close still running at the bound is not cancelled here; see `_within` for what
+                # the loop's shutdown then does to it.
+                await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
+            except Exception as exc:  # noqa: BLE001 - the alert's answer stands
+                log.warning("the alert's store did not close cleanly (%s)", type(exc).__name__)
+
+
+async def _feed_offline_alert(
+    notifier: NotifierAlertSink, store: Store | None, *, username: str, granted_by: str
+) -> bool:
+    """Start ``notifier``, raise the one alert on it, and drain it within
+    :data:`_OFFLINE_ALERT_WAIT_SECONDS`. Whether a transport confirmed delivery in that time.
+
+    The open-instance write is scheduled at the emit, so it is drained BESIDE the close, on every
+    path, each against the same deadline: a hung send cannot take the write's time, nor a slow
+    write the sends'. A write still running at the deadline is left to fail as
+    :meth:`NotifierAlertSink.drain_state` says. A send still running in a worker thread at the
+    deadline cannot be recalled: it may yet page, after the caller has logged the fallback line.
+    Both, never neither.
+
+    The answer is whether at least one transport CONFIRMED delivery before the deadline: its send
+    returned without raising, so the relay accepted every recipient or the webhook answered 2xx
+    (vault BACKLOG #3849, repair 3). A notifier that only accepted the alert is not enough: a send
+    the relay refuses, a rule that routes the alert to no transport, and a send still running at
+    the deadline each answer False, and the caller then logs the fallback and warns."""
+    import asyncio
+
+    log = logging.getLogger(__name__)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _OFFLINE_ALERT_WAIT_SECONDS
+    key = f"user:{username}"
+    confirmed = False
+
+    def observe(_transport: str, event: dict[str, Any]) -> None:
+        nonlocal confirmed
+        if event.get("type") == "administrator_granted" and event.get("connection") == key:
+            confirmed = True
+
+    try:
+        notifier.set_store(store)
+        notifier.set_delivery_observer(observe)
+        notifier.start()
+        notifier.administrator_granted(key, via=_PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by)
+    except Exception as exc:  # noqa: BLE001 - never raise past the caller's own output
+        log.warning(
+            "the [alerts] notifier failed on the administrator_granted alert (%s)",
+            type(exc).__name__,
+        )
+    drained = asyncio.ensure_future(notifier.drain_state(timeout=max(0.0, deadline - loop.time())))
+    try:
+        async with asyncio.timeout_at(deadline):
+            await notifier.aclose()
+    except TimeoutError:
+        log.warning(
+            "the [alerts] notifier did not finish within %.0f s, so a send still running when it "
+            "stopped waiting is not counted as delivered",
+            _OFFLINE_ALERT_WAIT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - as above
+        log.warning("the [alerts] notifier failed while closing (%s)", type(exc).__name__)
+    await drained  # never raises, and ends by the deadline
+    # A send the deadline cut off is not counted, even one the relay accepted just before it: the
+    # cancel can land before the drain resumes to tell the observer. The safe direction.
+    return confirmed
+
+
+def _log_administrator_granted(username: str, granted_by: str) -> None:
+    """The logging sink's ``administrator_granted`` line, ``serve``'s fallback when no notifier
+    takes the alert. Builds the key and swallows a sink fault, as the reconciler's raise does."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
+
+    administrator_granted_alert(LoggingAlertSink(), granted_by=granted_by)(
+        username, _PROVISION_ADMIN_GRANT_VIA
+    )
+
+
+def _run_offline_alert_step(step: Callable[[], Awaitable[bool]]) -> bool:
+    """Run ``provision-admin``'s alert step on its own event loop in a daemon thread, and wait for
+    its answer for at most :data:`_OFFLINE_ALERT_STEP_SECONDS`. The step's answer, or False, with
+    a WARNING naming why, when it did not answer in time, raised, or the wait was interrupted
+    (Ctrl-C).
+
+    In a thread because nothing inside a loop can bound the command: a send left running in a
+    worker thread at the step's own deadline held ``asyncio.run`` at its executor shutdown, for up
+    to 300 s, and a hung notifier build or store reopen held it with no bound at all. The answer is
+    read when the step's coroutine finishes, not when its loop has shut down, so the command prints
+    its result then. The process can still wait at EXIT for a call already in a worker thread, a
+    send, the notifier build or a store driver's, until that call's own timeouts end it; the result
+    is printed before that. Bounding exit too would need the process killed or the transports
+    rewritten, which this step does not do.
+
+    The wait polls, so a Ctrl-C is taken between polls on every platform. It ends the wait, not
+    the command: the account is written and its codes shown, so the caller still prints its
+    result. A thread that cannot be started is the same: no answer, and False."""
+    import threading
+    import time
+
+    from messagefoundry.last_resort import run_guarded
+
+    log = logging.getLogger(__name__)
+    answered = threading.Event()
+    answer: list[bool] = []
+
+    async def answering() -> None:
+        try:
+            answer.append(await step())
+        except Exception as exc:  # noqa: BLE001 - named now, before the loop's teardown can wait
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # Here, so the answer is read before the loop's executor shutdown.
+            answered.set()
+
+    def run() -> None:
+        try:
+            run_guarded(answering())
+        except Exception as exc:  # noqa: BLE001 - the caller logs the fallback on False
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # And here, for a failure before the coroutine ran at all.
+            answered.set()
+
+    deadline = time.monotonic() + _OFFLINE_ALERT_STEP_SECONDS
+    try:
+        try:
+            threading.Thread(target=run, name="provision-admin-alert", daemon=True).start()
+        except RuntimeError as exc:  # "can't start new thread": the account is written regardless
+            log.warning(
+                "the administrator_granted alert step did not start (%s)", type(exc).__name__
+            )
+            return False
+        while not answered.wait(min(0.25, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "the administrator_granted alert step did not finish within %.0f s, so the "
+                    "alert may not have been sent",
+                    _OFFLINE_ALERT_STEP_SECONDS,
+                )
+                return False
+    except KeyboardInterrupt:
+        log.warning(
+            "the administrator_granted alert step was interrupted, so the alert may not have "
+            "been sent"
+        )
+        return False
+    return bool(answer) and answer[0]
 
 
 class _ProvisionStore:
@@ -8478,6 +8898,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
+    actor = f"cli:{getpass.getuser()}"
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
@@ -8505,8 +8927,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
             # notice, so this command wires the same notifier `serve` does, from the same settings.
             # Started and drained here, because the loop ends when this command does. Built only when
-            # a row with the name exists, so a fresh install resolves no SMTP secret and prints
-            # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
+            # a row with the name exists, so a fresh install prints nothing about a notice it does
+            # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
+            # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
             security_notifier = (
                 _offline_security_notifier(settings, posture) if existing is not None else None
@@ -8520,7 +8943,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     password=password,
                     display_name=args.display_name,
                     notify_email=email,
-                    actor=f"cli:{getpass.getuser()}",
+                    actor=actor,
                     totp_secret=totp_secret,
                     totp_code=totp_code,
                     totp_code_read_at=totp_read_at,
@@ -8594,6 +9017,31 @@ def _provision_admin(args: argparse.Namespace) -> int:
         "a lost authenticator is replaced by another Administrator, or at the host by "
         "`admin-reset-totp`, so create a second Administrator soon.",
     )
+
+    async def reopen() -> Store:
+        # The store opened again, as `serve` opens it, only so the alert's open instance lands in
+        # it. Called only when a notifier was built.
+        return await open_store(
+            settings.store,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
+
+    # The name alone: the step's thread can outlive this function, and `outcome` holds the codes.
+    granted = outcome.username
+
+    async def alert() -> bool:
+        # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every console
+        # grant does. AFTER the codes are shown, and bounded with an interrupt taken, so a slow
+        # relay or a Ctrl-C here costs neither the codes nor the result printed below.
+        return await _raise_offline_administrator_granted(
+            settings, posture, reopen, username=granted, granted_by=actor
+        )
+
+    alerted = _run_offline_alert_step(alert)
+    if not alerted:
+        # Here, not in the step, so the line is written once, whether or not the step answered.
+        _log_administrator_granted(granted, actor)
     if args.json:
         _print_json(
             {
@@ -8611,6 +9059,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # True only when recovery codes were issued AND reached the console; false with
                 # --no-totp (none issued) and when the console failed before showing them.
                 "recovery_codes_shown": codes_shown,
+                # Vault BACKLOG #3849 B5: true when an [alerts] transport confirmed delivery of the
+                # administrator_granted alert, as `_feed_offline_alert` defines it; false when the
+                # fallback went to the log.
+                "administrator_granted_alerted": alerted,
             },
             compact=True,
         )
@@ -8643,6 +9095,25 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
+    # Vault BACKLOG #3849 B5.
+    if alerted:
+        _safe_print(
+            "An [alerts] transport accepted the administrator_granted alert for this grant. A "
+            "transport that failed shows as a WARNING above."
+        )
+    elif outcome.administrators_at_check:
+        _safe_print(
+            "WARNING: no [alerts] transport confirmed delivery of the administrator_granted alert "
+            "for this grant (none is configured, a rule routes it to none, or a WARNING or ERROR "
+            "above says why), so it went to the log and nobody may have been paged. Tell the "
+            "site's other Administrators yourself: "
+            + ", ".join(repr(name) for name in outcome.administrators_at_check)
+        )
+    else:
+        _safe_print(
+            "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
+            "grant, so it went to the log."
+        )
     return 0
 
 

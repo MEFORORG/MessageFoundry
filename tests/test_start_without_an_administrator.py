@@ -363,7 +363,9 @@ def test_the_ide_start_dialog_does_not_say_nobody_can_sign_in() -> None:
     in, and offered a start "only if sign-in is off". A Windows sign-in still creates a directory
     account with no role, and ``serve`` cannot run with sign-in off (vault BACKLOG #2719)."""
     texts = {rel: _ide_prose((_REPO / rel).read_text(encoding="utf-8")) for rel in _IDE_START_FILES}
-    assert "no enabled administrator" in texts["ide/src/statusBar.ts"], (
+    # Vault BACKLOG #3849 B3 reworded the dialog to say "local": the probe also offers provisioning
+    # on a store whose only Administrators sign in through a directory.
+    assert "no enabled local administrator" in texts["ide/src/statusBar.ts"], (
         "control: this is the dialog"
     )
     for rel, text in texts.items():

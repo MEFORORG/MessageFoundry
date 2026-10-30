@@ -167,14 +167,41 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         password_generated=False,
     )
     await store.set_user_roles("hashless", [ADMIN], assigned_by="test")
+    # Vault BACKLOG #3849 C1: an admin-issued temporary credential past its deadline signs nobody
+    # in, so it does not refuse the grant. Stamped at 1.0, far past the shipped 72-hour expiry.
+    await _temporary_credential_admin(store, "lapsed", issued_at=1.0)
     await provisioned_row(store, "a", totp=False)
     await provisioned_row(store, "b", totp=False)
 
     assert await grant(store, "a", None) is AdminGrant.GRANTED
-    assert await enabled_admins(store) == {"dir", "dir-hashed", "hashless", "a"}
+    assert await enabled_admins(store) == {"dir", "dir-hashed", "hashless", "lapsed", "a"}
     # Paired control: a local Administrator with a usable password now exists, so it refuses.
     assert await grant(store, "b", None) is AdminGrant.ADMIN_EXISTS
     assert await store.get_user_role_ids("b") == []
+
+    # C1: a temporary credential still inside its window does sign in, so it refuses the grant on
+    # its own once the usable Administrator above is disabled. Its control: disabled too, the grant
+    # goes through.
+    await store.set_user_disabled("a", disabled=True)
+    await _temporary_credential_admin(store, "in-window", issued_at=time.time())
+    assert await grant(store, "b", None) is AdminGrant.ADMIN_EXISTS
+    assert await store.get_user_role_ids("b") == []
+    await store.set_user_disabled("in-window", disabled=True)
+    assert await grant(store, "b", None) is AdminGrant.GRANTED
+
+
+async def _temporary_credential_admin(store: Any, user_id: str, *, issued_at: float) -> None:
+    """A local Administrator holding an admin-issued must-change credential stamped ``issued_at``."""
+    await store.create_user(
+        user_id=user_id,
+        username=f"name-{user_id}",
+        auth_provider="local",
+        now=issued_at,
+        password_hash=f"synthetic-hash-{user_id}",
+        must_change_password=True,
+        password_generated=True,
+    )
+    await store.set_user_roles(user_id, [ADMIN], assigned_by="test")
 
 
 async def assert_concurrent_grants_leave_one(store: Any) -> None:

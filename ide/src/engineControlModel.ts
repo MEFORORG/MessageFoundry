@@ -143,8 +143,8 @@ export function buildBootstrapPlan(opts: {
 // It creates no store and no account either way. The first answer is go-ahead; the second means provision
 // first. Since vault BACKLOG #2711 step 1 the first answer means an enabled LOCAL Administrator with a
 // usable password, so a store whose Administrators all sign in through the directory gets the second
-// answer. The modal in `statusBar.ts` still words that case as "no enabled administrator"; rewording it
-// is not done here.
+// answer. The modal in `statusBar.ts` words both cases: no Administrator at all, or only ones that need
+// an outside service (vault BACKLOG #3849 B3).
 //
 // The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db` or
 // `--service-config`. In the default layout that is the store `serve` opens. It is NOT when the service
@@ -308,7 +308,8 @@ export type StartOutcome =
 export interface StartPlanEffects {
   /** Run the probe with no terminal and capture what it printed. */
   probeAdmin(): Promise<AdminProbeResult>;
-  /** The store has no enabled Administrator: provision one (the default), start without one, or stop. */
+  /** The store has no enabled local Administrator with a usable password: provision one (the default),
+   *  start without one, or stop. */
   chooseToProvision(): Promise<"provision" | "skip" | undefined>;
   /** The probe could not answer: show why, then provision anyway, start anyway, or stop. */
   chooseAfterRefusal(detail: string): Promise<"provision" | "startAnyway" | undefined>;
