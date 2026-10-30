@@ -636,6 +636,14 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and re-run `rotate-key`. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
    UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
    key will ever open it. Restore that upload, or remove its two files from the uploads directory.
+   The log names each skipped file, and says whether the key its marker names is configured. A file
+   larger than an upload can be is skipped too, unread. **A symlink, a FIFO or anything else that is
+   not a regular file at an upload's path is neither opened nor followed, and it is not a skip**, so
+   a planted one cannot fail every run. The command counts them in a note, and you remove them by
+   hand. A link's target was not rotated, so if it belongs in the uploads directory, put it back and
+   re-run before you retire the prior key. **A body that is missing is treated as lost, not as
+   waiting.** The run completes, and if that body later returns under a key you have since retired,
+   no key reads it. So keep the prior key for as long as a missing body may come back.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it

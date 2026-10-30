@@ -10578,7 +10578,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"note: {uploads.body_lost} uploaded file(s) have a body that is missing or is not text. "
             "No key can read it, and nothing of them is left under the prior key. Delete them, or "
             "the retention prune removes them once they expire. If a missing body may come back, "
-            "from a restore or a quarantine, keep the prior key until it does and re-run."
+            "from a restore or a quarantine, keep the prior key until it does and re-run: a body "
+            "that returns under a key you have retired can never be read."
+        )
+    if uploads.not_regular:
+        # BACKLOG #3737: the engine writes no such file, and a planted one must not fail every run.
+        # The link is the case that could hide a value, so the last sentence stands guard over it.
+        print(
+            f"note: {uploads.not_regular} uploaded file(s) have a body or sidecar that is a symlink, "
+            "a FIFO or something else that is not a regular file. rotate-key neither opened nor "
+            "followed it, so remove it by hand. If a link points at a file that belongs in the "
+            "uploads directory, that file was not rotated: put it back and re-run before retiring "
+            "the prior key."
         )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file may STILL be under the old key, so retiring

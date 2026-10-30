@@ -9,8 +9,8 @@ reconcile honours. And a run that skipped an upload used to roll the audit chain
 be undone and took away the back-out to the prior key. Each test here fails on the code before
 #3737: the stamp is written, or the back-out refuses.
 
-The skipped upload is sealed under a key nobody supplies, which is a cause an operator can fix by
-removing it, and it fails the run the way any skip does."""
+The skipped upload is sealed under a key nobody supplies, a cause an operator can fix by removing
+it, and it fails the run the way any skip does."""
 
 from __future__ import annotations
 

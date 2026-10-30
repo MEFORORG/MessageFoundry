@@ -1494,6 +1494,21 @@ class AesGcmCipher(_UnmarkedPolicy):
             return False
         return key_id in self._keyring
 
+    def named_key_id(self, stored: str) -> str | None:
+        """The key id the marker of ``stored`` names, or ``None`` when it is unmarked, malformed, or
+        names anything but an id of the shape this cipher writes (BACKLOG #3737). Safe to log: a
+        malformed marker's id is cut from the stored text, so only an exact id passes. Reads only
+        the marker, never the ciphertext."""
+        if not stored.startswith(MARKER_PREFIX):
+            return None
+        try:
+            key_id, _salt, _blob = self._parse(stored)
+        except CipherError:
+            return None
+        return (
+            key_id if len(key_id) == _KEY_ID_LEN and not key_id.strip("0123456789abcdef") else None
+        )
+
     def audit_mac_key(self) -> bytes:
         """The HKDF-derived HMAC key for the tamper-evident audit chain (#190-B). Keys the
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it

@@ -628,9 +628,10 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     """BACKLOG #3181: a skipped file may STILL be under the prior key. The command used to print OK,
     exit 0 and stamp the rotation for ASVS 13.3.4, so a wrapper or an operator would drop a key that
     is still load-bearing. It now fails, prints no OK line, and writes no stamp. Once the cause is
-    fixed, a re-run completes and stamps. A directory in the body's place stands in for a cause an
-    operator can fix. The store starts with a stamp naming the OLD key, as it would after any start,
-    so the re-run's changed-fingerprint test is the one exercised."""
+    fixed, a re-run completes and stamps. A body sealed under a key nobody supplied stands in for a
+    cause an operator can fix, by putting the real one back. The store starts with a stamp naming
+    the OLD key, as it would after any start, so the re-run's changed-fingerprint test is the one
+    exercised."""
     import asyncio
 
     from messagefoundry.store.crypto import generate_key, make_cipher
@@ -657,8 +658,7 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     asyncio.run(stamp_the_old_key())
     blob = uploads / f"{file_id}.blob"
     body = blob.read_bytes()
-    blob.unlink()
-    blob.mkdir()
+    blob.write_text(make_cipher(generate_key()).encrypt("gone"), encoding="utf-8")
 
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
@@ -671,7 +671,6 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     assert stamped == old_key_id  # this run left the old key's stamp as it was
 
     # Fixed and re-run: the rotation completes, and only now is it stamped.
-    blob.rmdir()
     blob.write_bytes(body)
     assert main(["rotate-key", "--db", str(db)]) == 0
     assert "OK:" in capsys.readouterr().out
@@ -730,6 +729,8 @@ def test_rotate_key_completes_over_an_upload_whose_body_is_gone(
     assert main(["rotate-key", "--db", str(db)]) == 0
     captured = capsys.readouterr()
     assert "note: 1 uploaded file(s) have a body that is missing or is not text" in captured.out
+    # BACKLOG #3737: a missing body is judged as it is now, so this is what covers one that returns.
+    assert "keep the prior key until it does" in captured.out
     assert "NOT fully re-sealed" not in captured.err
     new_key_id, stamped = _key_id_and_stamp(db, key_b)
     assert stamped == dek_fingerprint(new_key_id)
