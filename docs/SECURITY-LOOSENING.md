@@ -1744,11 +1744,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   URL. The rule that decides which URL settings are withheld, and what a withheld one shows, is
   stated once, in `config/wiring.py` `_url_may_carry_a_credential`; it withholds more than this
   entry's URLs, and it does not reach a secret that is a bare path segment.
-- **Why it is reported and not refused:** a credential in the URL's user part, `user:password@`, is
-  refused at construction, because that shape never authenticated anything and its error text carried
-  the password. A query credential does authenticate, and some partner APIs take it nowhere else, such
-  as a shared-access `sig` or an API `key`. The detection is also a guess from the parameter name, and
-  a wrong refusal would have no override.
+- **Where it is refused, and why it is only reported elsewhere:** on a `verify_tls = false` hop, and
+  over plain `http` to a host off this machine, it is refused with no escape:
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  On those hops a name that only looks like a credential is refused too. On any other hop it is
+  reported. A credential in the URL's user part, `user:password@`, is refused at construction,
+  because that shape never authenticated anything and its error text carried the password. A query
+  credential does authenticate, and some partner APIs take it nowhere else, such as a shared-access
+  `sig` or an API `key`. The detection is also a guess from the parameter name, and a wrong refusal
+  would have no override.
 - **When acceptable:** the partner accepts the credential only in the query. If it takes a header, use
   `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
@@ -1757,10 +1761,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   parameter names, never a value. It is logged at least whenever a build check builds the connection
   (at least `messagefoundry check` when its `build-check` leg runs, and a reload, `dry_run`
   included) and whenever a connection is built without one (at least a start, an operator start and
-  a connection test). A reload that replaces a running graph skips it on its rebuilds, because that
-  reload's build check has already logged it. It can still appear more than once for one connection,
-  at least on a reload into an engine started without a graph, because that reload runs a start
-  after its build check, and on a start where one `FhirLookup` fails to build. There is also a
+  a connection test). A reload skips it on the builds that follow its build check, which has
+  already logged it, so a reload logs it once for each connection that check builds. That holds for
+  a reload into an engine started without a graph as well as for one that replaces a running graph.
+  A `FhirLookup` that fails to build at a start logs no WARNING, because no read can go through it;
+  its failure is recorded and alerted, and each lookup that did build logs it once. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
@@ -1771,7 +1776,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
   URL on such a lane appears nowhere meanwhile.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
-  know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
+  know, and it will name a parameter that only looks like one, such as `csrf_token`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced

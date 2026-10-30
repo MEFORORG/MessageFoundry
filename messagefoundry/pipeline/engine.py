@@ -3591,7 +3591,8 @@ class Engine:
             try:
                 runner = self.add_registry(registry)
                 runner.build_check(registry)  # bad connector → WiringError (422), before any start
-                await runner.start()
+                # That check warned for this graph, so this start does not (vault BACKLOG #2910).
+                await runner.start(warn_query_credentials=False)
             except Exception:
                 # Don't leave a half-started runner: a later reload would take the "runner exists"
                 # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.

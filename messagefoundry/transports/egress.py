@@ -331,22 +331,26 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
     the parameter NAMES, never a value or the URL.
 
-    WARN, not refuse, and the reason is the difference from the userinfo precedent.
-    ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
-    authenticated anything: urllib reads it as part of the host, and the error text carried the
-    password into ``queue.last_error``. A query credential does authenticate, and some partner APIs
-    take it nowhere else (a shared-access ``sig``, an API ``key``), so a refusal would remove the
-    hop with no header to move it to. The detection is also a heuristic over names, and a false
-    refusal has no override. What the warning records is the cost: the request line, query and all,
-    lands in the partner's and every proxy's access log. The engine's own log lines already drop the
-    query (``_peer_label``, ``rest._redact_url``).
+    This warns and does not refuse. Other code refuses the same names on two kinds of hop, with no
+    escape: ``transports.rest.refuse_verify_off`` on a ``verify_tls = false`` hop (vault BACKLOG
+    #3230) and ``transports.rest.refuse_cleartext_credentials`` over plain http off this machine
+    (vault BACKLOG #3533). On any other hop the warning is all there is, and the reason is the
+    difference from the userinfo precedent. ``transports.rest.refuse_url_credentials`` REFUSES
+    ``user:password@`` because that shape never authenticated anything: urllib reads it as part of
+    the host, and the error text carried the password into ``queue.last_error``. A query credential
+    does authenticate, and some partner APIs take it nowhere else (a shared-access ``sig``, an API
+    ``key``), so a refusal would remove the hop with no header to move it to. The detection is also
+    a heuristic over names, and a false refusal has no override. What the warning records is the
+    cost: the request line, query and all, lands in the partner's and every proxy's access log. The
+    engine's own log lines already drop the query (``_peer_label``, ``rest._redact_url``).
 
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
-    least check, start, operator start and test), and from :func:`check_fhir_lookup_allowed`, its
-    FhirLookup twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
-    A reload that replaces a running graph skips it on its rebuilds, because that reload's build
-    check already warned; :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the
-    source of record for where it fires.
+    least check, start, operator start and test), from :func:`check_fhir_lookup_allowed`, its
+    FhirLookup twin, and from the runner's ``_build_fhir_lookup_executor``, which holds the warning
+    back until it knows which lookups built. All run on env-resolved settings, so this sees a URL
+    that ``env()`` supplied. A reload skips it on the builds that follow its build check, which has
+    already warned; :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the source
+    of record for where it fires.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")
@@ -380,7 +384,7 @@ def check_egress_allowed(
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. A reload passes it for the rebuild that follows its build check, which has already
+    refusal. A reload passes it for the builds that follow its build check, which has already
     logged the warning for this reload (vault BACKLOG #2910)."""
     # ADR 0126 forward proxy: an http-family destination may dial through an operator-chosen proxy that
     # receives a Proxy-Authorization credential. Gated by its OWN [egress].allowed_proxy list, BEFORE

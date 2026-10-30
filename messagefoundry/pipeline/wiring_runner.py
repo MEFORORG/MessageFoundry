@@ -244,6 +244,7 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.egress import warn_url_query_credentials
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
@@ -2486,14 +2487,18 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` is passed to :class:`FhirLookupExecutor`; a reload passes False
+        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup that built,
+        after the build that kept it. A caller whose build check has already warned passes False
         (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
 
         def build(
-            names: Iterable[str], failed: Mapping[str, str] | None = None
+            names: Iterable[str],
+            failed: Mapping[str, str] | None = None,
+            *,
+            warn: bool = warn_query_credentials,
         ) -> FhirLookupExecutor:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             resolved = {
@@ -2510,13 +2515,18 @@ class RegistryRunner:
                 # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
                 # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
                 # against an internal FHIR server could otherwise never name an internal CA.
-                return FhirLookupExecutor(
+                executor = FhirLookupExecutor(
                     resolved,
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    warn_query_credentials=warn_query_credentials,
+                    # The executor would warn lookup by lookup, before a later one fails.
+                    warn_query_credentials=False,
                 )
+            if warn:
+                for name, lookup_settings in resolved.items():
+                    warn_url_query_credentials(f"FhirLookup {name!r}", lookup_settings)
+            return executor
 
         try:
             return build(specs)  # a healthy graph builds once, as it always did
@@ -2525,13 +2535,15 @@ class RegistryRunner:
                 raise
         # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
         # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
-        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
-        # and attestation lines, so on this path each surviving lookup logs them again per build.
-        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its TLS
+        # warning and attestation lines, so on this path each surviving lookup logs those again per
+        # build, and they are kept at every construction (ADR 0153). That cost falls only on a start
+        # that already failed, and keeps the healthy start to one build. The query-credential WARNING
+        # is not among them: only the last build below logs it, for the lookups that survive.
         errors: dict[str, Exception] = {}
         for name in specs:
             try:
-                build([name])
+                build([name], warn=False)
             except Exception as exc:
                 errors[name] = exc
         failed = {name: safe_exc(err) for name, err in errors.items()}
@@ -5237,7 +5249,9 @@ class RegistryRunner:
                 self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
-    async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+    async def _start_outbound(
+        self, name: str, oc: OutboundConnection, *, warn_query_credentials: bool
+    ) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
         ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
         (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
@@ -5245,7 +5259,7 @@ class RegistryRunner:
         preserving the count-and-log + at-least-once invariants) and a later reload/restart that builds
         the connector self-heals the lane. retry/ordering/etc. are set regardless of build outcome
         because the worker reads them live per item (a reload can swap a working connector under the
-        already-spawned worker)."""
+        already-spawned worker). ``warn_query_credentials`` is :meth:`start`'s."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
         # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
@@ -5325,7 +5339,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
-                connector = build_destination(dest, egress=self._egress)
+                connector = build_destination(
+                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -5357,7 +5373,12 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
-    async def start(self) -> None:
+    async def start(self, *, warn_query_credentials: bool = True) -> None:
+        """Bring the graph up. ``warn_query_credentials=False`` is for a caller that has just run
+        :meth:`build_check` on this graph, which logged the URL query-credential WARNING, at least
+        ``Engine.reload_detail`` with no runner yet (vault BACKLOG #2910). It reaches only the
+        builds this call makes. A later window open or operator start builds a lane this start left
+        unbuilt, and that build logs the WARNING."""
         async with self._reload_lock:
             if self._running:
                 return
@@ -5469,7 +5490,9 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
-                    await self._start_outbound(name, oc)
+                    await self._start_outbound(
+                        name, oc, warn_query_credentials=warn_query_credentials
+                    )
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
@@ -5480,7 +5503,7 @@ class RegistryRunner:
                 # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
                 # A restart and a clustered node's start on promotion both come through here.
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor(
-                    isolated=fhir_lookup_isolated
+                    isolated=fhir_lookup_isolated, warn_query_credentials=warn_query_credentials
                 )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.

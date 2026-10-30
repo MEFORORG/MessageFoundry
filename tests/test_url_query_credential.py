@@ -3,21 +3,29 @@
 """A credential in an outbound ``url``'s query string is a RECORDED loosening (ASVS 14.2.1).
 
 The vault re-read of 2026-10-01 found it accepted with no line anywhere: ``refuse_url_credentials``
-covers the userinfo and never the query. It is WARNED and reported rather than refused; the reason is
-on ``transports.egress.warn_url_query_credentials``. Every positive arm has a benign-parameter
-control, so a test is not green because the detector names every parameter.
+covers the userinfo and never the query. On a hop the no-escape credential rule does not refuse, it
+is WARNED and reported; the reason is on ``transports.egress.warn_url_query_credentials``. Every
+positive arm has a benign-parameter control, so a test is not green because the detector names every
+parameter.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination, Priority
+from messagefoundry.config.models import (
+    ActiveWindow,
+    ConnectorType,
+    Destination,
+    Priority,
+    Schedule,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -26,8 +34,10 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     build_outbound_connection,
+    load_config,
     query_credential_hops,
 )
+from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.store import MessageStore
@@ -51,6 +61,8 @@ _MARK = "carries a credential in its query string"
             "https://p.example.invalid/x?api_key=A&client_secret=B&password=C",
             ["api_key", "client_secret", "password"],
         ),
+        # The example docs/SECURITY-LOOSENING.md gives of a name that only looks like a credential.
+        ("https://p.example.invalid/x?csrf_token=AAA", ["csrf_token"]),
     ],
 )
 def test_detector_names_credential_parameters(url: str, expected: list[str]) -> None:
@@ -63,6 +75,7 @@ def test_detector_names_credential_parameters(url: str, expected: list[str]) -> 
         # Benign controls: substrings of a credential word that are not the word.
         "https://p.example.invalid/x?format=json&keyword=lab&monkey=1&bypass=2&passage=3",
         "https://p.example.invalid/x?code=404&state=RUNNING",  # OIDC words, ordinary here
+        "https://p.example.invalid/x?page_token=AAA",  # a pagination cursor, exempt by name
         "https://p.example.invalid/x",
         "not a url at all",
     ],
@@ -522,15 +535,24 @@ def _warned(caplog: pytest.LogCaptureFixture, label: str) -> int:
 
 
 def _reload_graph(
-    *, v: int = 1, added: bool = False, fhir: bool = False, priority: Priority | None = None
+    *,
+    v: int = 1,
+    added: bool = False,
+    fhir: bool = False,
+    priority: Priority | None = None,
+    url: str | EnvRef | None = None,
+    schedule: Schedule | None = None,
 ) -> Registry:
     reg = Registry()
     for name in ["OB_KEYED", "OB_ADDED"] if added else ["OB_KEYED"]:
-        spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=v)})
-        reg.add_outbound(build_outbound_connection(name, spec, priority=priority))
+        settings = {"url": _KEYED.format(v=v) if url is None else url}
+        spec = ConnectionSpec(type=ConnectorType.REST, settings=settings)
+        reg.add_outbound(
+            build_outbound_connection(name, spec, priority=priority, schedule=schedule)
+        )
     if fhir:
-        url = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
-        reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": url}))
+        lookup_url = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
+        reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": lookup_url}))
     return reg
 
 
@@ -553,8 +575,8 @@ async def test_a_reload_warns_once_for_a_changed_and_an_added_outbound(
     """``OB_KEYED`` changes, so it takes the in-place rebuild; ``OB_ADDED`` is new, so it takes the
     added-lane build. Both used to log twice per reload: once in build_check, once in the rebuild."""
     runner = _reload_runner(reload_store, _reload_graph(v=1))
-    await runner.start()
     try:
+        await runner.start()
         before = runner._destinations["OB_KEYED"]
         caplog.clear()
         with caplog.at_level(logging.WARNING):
@@ -573,8 +595,8 @@ async def test_a_reload_warns_once_for_an_unchanged_outbound(
     """The control: an unchanged lane is not rebuilt, so the one line is build_check's. It still
     fires on every reload, so the change did not drop the warning from a reload altogether."""
     runner = _reload_runner(reload_store, _reload_graph(v=1))
-    await runner.start()
     try:
+        await runner.start()
         before = runner._destinations["OB_KEYED"]
         for _ in range(2):
             caplog.clear()
@@ -590,8 +612,8 @@ async def test_a_reload_warns_once_for_a_fhir_lookup(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     runner = _reload_runner(reload_store, _reload_graph(fhir=True))
-    await runner.start()
     try:
+        await runner.start()
         before = runner._fhir_lookup_executor
         caplog.clear()
         with caplog.at_level(logging.WARNING):
@@ -612,8 +634,8 @@ async def test_an_activation_reload_warns_once_for_a_lane_leaving_the_passive_pa
     runner = _reload_runner(
         reload_store, _reload_graph(priority=Priority.CRITICAL), dr_standby=Priority.CRITICAL
     )
-    await runner.start()
     try:
+        await runner.start()
         assert "OB_KEYED" not in runner._destinations  # parked unbuilt on the passive box
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         caplog.clear()
@@ -657,9 +679,9 @@ async def test_a_start_and_an_operator_start_still_warn_once(
     spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1)})
     reg.add_outbound(build_outbound_connection("OB_OFF", spec, auto_start=False))
     runner = _reload_runner(reload_store, reg)
-    with caplog.at_level(logging.WARNING):
-        await runner.start()
     try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
         assert _warned(caplog, "outbound 'OB_KEYED'") == 1
         assert _warned(caplog, "FhirLookup 'LK'") == 1
         assert "OB_OFF" not in runner._destinations
@@ -670,3 +692,215 @@ async def test_a_start_and_an_operator_start_still_warn_once(
         assert _warned(caplog, "outbound 'OB_OFF'") == 1
     finally:
         await runner.stop()
+
+
+async def test_a_failed_fhir_lookup_leaves_each_survivor_one_warning_at_start(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first whole-graph build reaches ``LK_A`` and fails at ``LK_BAD``, then each lookup builds
+    alone, then the survivors build again: ``LK_A`` logged three times and ``LK_Z`` twice. A lookup
+    that did not build logs nothing, since nothing reads through it; its failure is the record."""
+    reg = Registry()
+    urls = {
+        "LK_A": "https://fhir.example.invalid/R4?api_key=PLACEHOLDER",
+        "LK_BAD": "ftp://fhir.example.invalid/R4?api_key=PLACEHOLDER",  # not http or https
+        "LK_Z": "https://fhir.example.invalid/R4?api_key=PLACEHOLDER",
+    }
+    for name, url in urls.items():
+        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": url}))
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
+        assert list(runner.degraded_fhir_lookups()) == ["LK_BAD"]
+        assert _warned(caplog, "FhirLookup 'LK_A'") == 1
+        assert _warned(caplog, "FhirLookup 'LK_Z'") == 1
+        assert _warned(caplog, "FhirLookup 'LK_BAD'") == 0
+    finally:
+        await runner.stop()
+
+
+# --- a schedule dropped from a calendar-parked lane (vault BACKLOG #3766 item 2) ----------------
+
+
+_WINDOW = Schedule(
+    windows=[ActiveWindow(days=frozenset({0}), start=time(8), end=time(17), timezone="UTC")]
+)
+_OUTSIDE = datetime(2026, 7, 13, 20, tzinfo=UTC)  # a Monday, past the window
+_INSIDE = datetime(2026, 7, 13, 9, tzinfo=UTC)  # the same Monday, in it
+
+
+async def _park(runner: RegistryRunner) -> None:
+    """Close the window on ``OB_KEYED`` deterministically, as the scheduler's tick would."""
+    await runner._reconcile_schedule("OB_KEYED", "outbound", _WINDOW)
+    assert "OB_KEYED" in runner._schedule_parked
+
+
+@pytest.mark.parametrize("claim_mode", ["pooled", "per_lane"])
+async def test_a_reload_that_drops_the_schedule_warns_once_for_a_lane_with_no_connector(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture, claim_mode: str
+) -> None:
+    """The row's concern. The resume builds through the warning default of
+    ``_ensure_destination_built``, and ``_reconcile_outbounds`` has built the lane by then, so the
+    resume finds a connector and builds nothing. The lane has none here because its first build
+    failed, and the reload's new URL is what cures it."""
+    runner = _reload_runner(
+        reload_store,
+        _reload_graph(url=EnvRef("MEFOR_UNSET_URL"), schedule=_WINDOW),
+        schedule_clock=lambda: _OUTSIDE,
+        schedule_tick=3600.0,
+        claim_mode=claim_mode,
+    )
+    try:
+        await runner.start()
+        assert "OB_KEYED" not in runner._destinations  # the first build failed
+        await _park(runner)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.reload(_reload_graph(v=1))
+        assert "OB_KEYED" in runner._destinations
+        assert "OB_KEYED" not in runner._schedule_parked  # the resume ran
+        assert runner.outbound_running("OB_KEYED")
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_that_drops_the_schedule_warns_once_for_a_lane_with_its_connector(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: the park kept the connector, so the one line is the build check's."""
+    runner = _reload_runner(
+        reload_store,
+        _reload_graph(schedule=_WINDOW),
+        schedule_clock=lambda: _OUTSIDE,
+        schedule_tick=3600.0,
+    )
+    try:
+        await runner.start()
+        before = runner._destinations["OB_KEYED"]
+        await _park(runner)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.reload(_reload_graph())
+        assert runner._destinations["OB_KEYED"] is before
+        assert "OB_KEYED" not in runner._schedule_parked
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+    finally:
+        await runner.stop()
+
+
+async def test_a_window_open_that_builds_the_lane_warns(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default ``_start_outbound_unsafe`` keeps: no build check runs before a window open, so
+    this build is the only one to warn. It is why the resume path above passes no flag."""
+    now = [_OUTSIDE]
+    runner = _reload_runner(
+        reload_store,
+        _reload_graph(url=EnvRef("MEFOR_LATE_URL"), schedule=_WINDOW),
+        schedule_clock=lambda: now[0],
+        schedule_tick=3600.0,
+    )
+    try:
+        await runner.start()
+        await _park(runner)
+        runner._env_values = {"MEFOR_LATE_URL": _KEYED.format(v=1)}  # the cause, since cured
+        now[0] = _INSIDE
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner._reconcile_schedule("OB_KEYED", "outbound", _WINDOW)
+        assert "OB_KEYED" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+    finally:
+        await runner.stop()
+
+
+# --- through the engine: a reload with no runner yet, and a plain start (vault BACKLOG #2910) ---
+
+
+_ENGINE_CONFIG = """
+from messagefoundry import FhirLookup, File, Rest, Send, handler, inbound, outbound, router
+
+inbound("IB", File(directory={inbox!r}, pattern="*.hl7", poll_seconds=0.02), router="r")
+outbound("OB_KEYED", Rest(url="https://p.example.invalid/x?key=PLACEHOLDER"))
+outbound("OB_OFF", Rest(url="https://p.example.invalid/x?key=PLACEHOLDER"), auto_start=False)
+FhirLookup("LK", url="https://fhir.example.invalid/R4?api_key=PLACEHOLDER")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB_KEYED", msg)
+"""
+
+
+async def _engine(tmp_path: Path) -> Engine:
+    return await Engine.create(
+        tmp_path / "engine.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+
+
+def _engine_config(tmp_path: Path) -> Path:
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    return _write(tmp_path, _ENGINE_CONFIG.format(inbox=str(inbox)))
+
+
+async def test_a_reload_with_no_runner_yet_warns_once_and_the_start_keeps_no_silence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``Engine.reload_detail`` runs the build check, then a start: both warned. The flag is on the
+    START side, for this path only: ``OB_OFF`` is built in the check alone, so a quiet check would
+    lose its line. And it lasts one call: the operator start that first builds ``OB_OFF`` warns."""
+    cfg = _engine_config(tmp_path)
+    eng = await _engine(tmp_path)
+    try:
+        await eng.start()
+        assert eng.registry_runner is None
+        with caplog.at_level(logging.WARNING):
+            outcome = await eng.reload_detail(cfg)
+        assert outcome.applied
+        runner = eng.registry_runner
+        assert runner is not None and "OB_KEYED" in runner._destinations
+        assert "OB_OFF" not in runner._destinations
+        assert runner._fhir_lookup_executor is not None
+        for label in ("outbound 'OB_KEYED'", "outbound 'OB_OFF'", "FhirLookup 'LK'"):
+            assert _warned(caplog, label) == 1, label
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner.start_outbound("OB_OFF")
+        assert "OB_OFF" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_OFF'") == 1
+    finally:
+        await eng.stop()
+
+
+async def test_a_plain_engine_start_warns_then_a_reload_warns_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: no build check runs before an ``Engine.start``, so it keeps the warning. Its
+    ``auto_start=False`` lane is not built, so that lane logs nothing until a reload's check."""
+    cfg = _engine_config(tmp_path)
+    eng = await _engine(tmp_path)
+    eng.add_registry(load_config(cfg))
+    try:
+        with caplog.at_level(logging.WARNING):
+            await eng.start()
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
+        assert _warned(caplog, "outbound 'OB_OFF'") == 0
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            outcome = await eng.reload_detail(cfg)
+        assert outcome.applied
+        for label in ("outbound 'OB_KEYED'", "outbound 'OB_OFF'", "FhirLookup 'LK'"):
+            assert _warned(caplog, label) == 1, label
+    finally:
+        await eng.stop()
