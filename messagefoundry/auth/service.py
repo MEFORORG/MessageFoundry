@@ -2684,13 +2684,22 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     """The audit fields for an OIDC callback the floor exemption let through, empty when it did not
     apply (BACKLOG #2388).
 
-    BACKLOG #3220: the success row carries it, and so does each refusal row written after the
-    exemption applied, a directory lock refusal included since BACKLOG #3726 gave that row its own
-    whole-hidden action (see :meth:`AuthService._refuse_directory_row`). So the review
-    ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed. At least the
-    role-resync and session-rotation rows the attempt writes do not carry it. The values are the
+    They sit at the top level of every OUTCOME row the attempt writes after the exemption applied:
+    the success row and each refusal row (BACKLOG #3220, #3728), a directory lock refusal included
+    (BACKLOG #3726). At least the role-resync and session-rotation rows the attempt writes do not
+    carry them. ``docs/SECURITY.md``, *What these floors do not do*, is the source of record for
+    which rows those are; ``tests/test_oidc_callback_floor_exempt_amr.py`` derives the outcome
+    writers from this module's code and fails on one that drops the fields. The values are the
     CONFIGURED ones the token matched, never the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
+
+
+#: BACKLOG #3728: the field on every step-up outcome row written after an opted-in site deferred a
+#: too-early callback's floor decision past the code exchange, so a refusal that comes before any
+#: ``amr`` is known, such as a failed exchange, is still tied to the exemption.
+_FLOOR_DEFERRED_MARKER: Final[Mapping[str, object]] = MappingProxyType(
+    {"callback_floor_deferred": True}
+)
 
 
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
@@ -5971,8 +5980,8 @@ class AuthService:
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
-        # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
-        # each refusal after this point (BACKLOG #3220), a lock refusal included (BACKLOG #3726).
+        # in oidc_callback_floor_exempt_amr) is exempt. Every outcome row from here on carries the
+        # marker (see _floor_exempt_marker).
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(
                 self._oidc_callback_floor_exempt_values(), principal_claims.amr
@@ -5980,7 +5989,6 @@ class AuthService:
             if signed_in_during_flow and arrived_too_early
             else ()
         )
-        floor_marker = _floor_exempt_marker(floor_exempt_amr)
         if signed_in_during_flow and arrived_too_early and not floor_exempt_amr:
             # With the client address, as the token_refused arm records it: a run of these is
             # automation, and the operator needs to see where it comes from.
@@ -5991,6 +5999,7 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=TOO_EARLY)
+        floor_marker = _floor_exempt_marker(floor_exempt_amr)
 
         # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
         username = principal_claims.username
@@ -6176,8 +6185,6 @@ class AuthService:
             "sub": principal_claims.subject,
             "mfa_verified": mfa_verified,
         }
-        # BACKLOG #2388: present only when the exemption let a too-early callback through.
-        evidence.update(floor_marker)
         return await self._complete_ad_login(
             principal,
             client,
@@ -6192,7 +6199,7 @@ class AuthService:
             idp_auth_time=principal_claims.auth_time,
             # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
-            refusal_extra=floor_marker,
+            outcome_extra=floor_marker,
         )
 
     # --- the federated step-up leg (BACKLOG #296, ADR 0142 Amendment B) ---------------------------
@@ -6377,7 +6384,8 @@ class AuthService:
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
         #2301), a check that moves after the exchange when ``oidc_callback_floor_exempt_amr`` is set,
         because only the exchange yields the ``amr`` it exempts by (BACKLOG #2388), so a too-early
-        callback whose exchange fails is then refused with that failure's reason, not ``too_early``;
+        callback whose exchange fails is then refused with that failure's reason, not ``too_early``,
+        on a row that carries ``callback_floor_deferred`` (BACKLOG #3728);
         the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
         ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA claim when that gate
         is on); the session is still live by every test :meth:`identity_for_token` applies, and
@@ -6430,6 +6438,12 @@ class AuthService:
         )
         if arrived_too_early and not exempt_values:
             return await refuse(TOO_EARLY)
+        # BACKLOG #3728: past this line a too-early callback is one whose floor decision the
+        # exemption deferred, so every outcome row says so, a failed exchange's included: that row
+        # comes before any amr is known, and would otherwise record nothing tying it to the exemption.
+        # Bound as `floor`, which no arm's `extra` can replace.
+        floor_fields: Mapping[str, object] = _FLOOR_DEFERRED_MARKER if arrived_too_early else {}
+        refuse = partial(refuse, floor=floor_fields)
         try:
             principal_claims = await asyncio.to_thread(
                 self._exchange_and_validate, code, flow, self._oidc_redirect_uri(public_origin)
@@ -6454,11 +6468,11 @@ class AuthService:
             if arrived_too_early
             else ()
         )
-        # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
-        # so a failed exempted step-up is as visible to the loosening's review as a served one.
-        floor_marker = _floor_exempt_marker(floor_exempt_amr)
-        # Bound once, as the address fields are above, so a new arm cannot leave the marker out.
-        refuse = partial(refuse, extra=floor_marker)
+        # BACKLOG #3220: every outcome row past the floor carries the marker when the exemption
+        # applied, so a failed exempted step-up is as visible to the loosening's review as a served
+        # one. Bound once, as the address fields are above, so a new arm cannot leave it out.
+        floor_fields = {**floor_fields, **_floor_exempt_marker(floor_exempt_amr)}
+        refuse = partial(refuse, floor=floor_fields)
         if arrived_too_early and not floor_exempt_amr:
             # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
             return await refuse(TOO_EARLY)
@@ -6593,7 +6607,7 @@ class AuthService:
         }
         # BACKLOG #2388: present only when the exemption let a too-early callback through, and
         # holding only configured values, never the token's own.
-        detail.update(floor_marker)
+        detail.update(floor_fields)
         await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
@@ -6634,20 +6648,26 @@ class AuthService:
         extra: Mapping[str, object] | None = None,
         flow_consumed: bool = True,
         flow: PendingFlow | None = None,
+        floor: Mapping[str, object] | None = None,
     ) -> OidcStepUp:
         """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
 
         ``extra`` adds fields to the audit row only, such as a received status or an exception
         type (BACKLOG #1948). It never carries IdP text.
 
+        ``floor`` adds the callback-floor fields (``_floor_exempt_marker`` and
+        ``_FLOOR_DEFERRED_MARKER``). It is a keyword of its own so :meth:`complete_oidc_step_up` can
+        bind it once while an arm still passes ``extra``, which would replace a bound ``extra``.
+
         ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
         BACKLOG #3145). Only a refusal made after a STEP-UP flow was redeemed passes it: before
         ``state`` matched, the callback is not shown to belong to the flow; a sign-in flow refused
         as ``flow_purpose_mismatch`` started another ceremony, so its address is not a step-up's;
         and some refusals have no flow at all. Those rows carry neither field."""
-        # `extra` first, so it can never overwrite a closed-set field.
+        # `extra` and `floor` first, so neither can overwrite a closed-set field.
         detail: dict[str, object] = {
             **(extra or {}),
+            **(floor or {}),
             "ok": False,
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
@@ -6747,11 +6767,11 @@ class AuthService:
         # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
         # federated caller passes it; a Kerberos session has no IdP clock to compare.
         idp_auth_time: float | None = None,
-        # BACKLOG #3220: extra fields for the refusal rows this login writes, a lock refusal
-        # included since BACKLOG #3726 (see _refuse_directory_row). The federated caller passes the
-        # callback_floor_exempt_amr marker when the floor exemption let it through, so a refused
-        # exempted attempt carries it as the success row does. Kerberos passes nothing.
-        refusal_extra: Mapping[str, object] | None = None,
+        # BACKLOG #3220, #3728: extra fields for every OUTCOME row this login writes, each refusal
+        # and the success row, at their top level. The federated caller passes the
+        # callback_floor_exempt_amr marker (see _floor_exempt_marker). Kerberos passes nothing, so
+        # its rows are unchanged.
+        outcome_extra: Mapping[str, object] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
@@ -6777,7 +6797,7 @@ class AuthService:
             # BACKLOG #2592: the name's row fails its integrity seal. It is refused, and never
             # adopted or re-created over: the store will not re-seal it.
             return await self._refuse_directory_row(
-                principal.username, ACCOUNT_REFUSED, client=client, extra=refusal_extra
+                principal.username, ACCOUNT_REFUSED, client=client, extra=outcome_extra
             )
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -6785,7 +6805,7 @@ class AuthService:
                 "auth.login_failed",
                 actor=principal.username,
                 detail=_json(
-                    {**(refusal_extra or {}), "provider": "ad", "reason": "local_account_conflict"}
+                    {**(outcome_extra or {}), "provider": "ad", "reason": "local_account_conflict"}
                 ),
                 client=client,
             )
@@ -6818,13 +6838,13 @@ class AuthService:
                     "oidc",
                     DIRECTORY_OBJECT_ID_MISSING,
                     client=client,
-                    extra=refusal_extra,
+                    extra=outcome_extra,
                 )
                 return LoginOutcome(
                     ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
                 )
             return await self._refuse_directory_row(
-                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client, extra=refusal_extra
+                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client, extra=outcome_extra
             )
         if existing is not None and existing.directory_object_id != principal.directory_object_id:
             # BACKLOG #1471. THE ROW HOLDING THIS NAME MUST AGREE WITH THE PRESENTED IDENTITY.
@@ -6862,7 +6882,7 @@ class AuthService:
                 actor=principal.username,
                 detail=_json(
                     {
-                        **(refusal_extra or {}),
+                        **(outcome_extra or {}),
                         "provider": "ad",
                         "reason": DIRECTORY_IDENTITY_CONFLICT,
                     }
@@ -6899,7 +6919,7 @@ class AuthService:
             refusal = _directory_login_refusal(existing, time.time(), federated=federated)
             if refusal is not None:
                 return await self._refuse_directory_row(
-                    principal.username, refusal, client=client, extra=refusal_extra
+                    principal.username, refusal, client=client, extra=outcome_extra
                 )
         try:
             user = await self._upsert_ad_user(
@@ -6913,7 +6933,7 @@ class AuthService:
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({**(refusal_extra or {}), "provider": "ad", "reason": exc.reason}),
+                detail=_json({**(outcome_extra or {}), "provider": "ad", "reason": exc.reason}),
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict", reason=exc.reason)
@@ -6922,7 +6942,7 @@ class AuthService:
             # audit row carries the caller's ``client`` and every directory refusal in this method
             # has one shape.
             return await self._refuse_directory_row(
-                principal.username, exc.reason, client=client, extra=refusal_extra
+                principal.username, exc.reason, client=client, extra=outcome_extra
             )
         if (
             federated_subject is not None
@@ -6954,7 +6974,7 @@ class AuthService:
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
             await self._directory_reject_audit(
-                principal.username, "oidc", reason, client=client, extra=refusal_extra
+                principal.username, "oidc", reason, client=client, extra=outcome_extra
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
@@ -7068,7 +7088,7 @@ class AuthService:
                     principal.username,
                     FEDERATED_SIGN_IN_REQUIRED,
                     client=client,
-                    extra=refusal_extra,
+                    extra=outcome_extra,
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
@@ -7076,7 +7096,7 @@ class AuthService:
                 "oidc",
                 "federated_subject_unbound",
                 client=client,
-                extra=refusal_extra,
+                extra=outcome_extra,
             )
             return LoginOutcome(
                 ok=False,
@@ -7086,8 +7106,9 @@ class AuthService:
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
-        # Only the federated path passes mech/evidence, so it alone grows the row.
-        detail: dict[str, object] = {"provider": "ad", "roles": role_ids}
+        # Only the federated path passes mech/evidence/outcome_extra, so it alone grows the row.
+        # `outcome_extra` first, so it can never overwrite a field this row sets.
+        detail: dict[str, object] = {**(outcome_extra or {}), "provider": "ad", "roles": role_ids}
         if mech is not None:
             detail["mech"] = mech
         if evidence:
