@@ -31,25 +31,36 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
     that skip on CI). All callers are INGRESS (channel_id lane)."""
     conn = await ss_store._pool.acquire()
     cur = await conn.cursor()
-    # Resolve the row's fifo-index coordinates first (a plain read via ix_queue_message); seq is
-    # globally unique (IDENTITY), so (stage, channel_id, status, seq) pins exactly one row. Fully
-    # drained before BEGIN TRAN (no-MARS).
-    await cur.execute(
-        "SELECT channel_id, status, seq FROM queue WHERE message_id=? AND stage=?",
-        (message_id, stage),
-    )
-    coords = await cur.fetchall()
-    assert len(coords) == 1  # the target row must exist, or the test proves nothing
-    channel_id, status, seq = coords[0]
-    await cur.execute("BEGIN TRAN")
-    await cur.execute(
-        # INDEX hint pins the seek to ix_queue_fifo_in_seq so the U-lock lands on that NC key
-        # (the scan site the store's STEP-3 READPAST probe skips), not the clustered key.
-        "SELECT id FROM queue WITH (INDEX(ix_queue_fifo_in_seq), UPDLOCK, ROWLOCK)"
-        " WHERE stage=? AND channel_id=? AND status=? AND seq=?",
-        (stage, channel_id, status, seq),
-    )
-    assert len(await cur.fetchall()) == 1  # the U-lock MUST land on the intended row
+    try:
+        # Resolve the row's fifo-index coordinates first (a plain read via ix_queue_message); seq is
+        # globally unique (IDENTITY), so (stage, channel_id, status, seq) pins exactly one row. Fully
+        # drained before BEGIN TRAN (no-MARS).
+        await cur.execute(
+            "SELECT channel_id, status, seq FROM queue WHERE message_id=? AND stage=?",
+            (message_id, stage),
+        )
+        coords = await cur.fetchall()
+        assert len(coords) == 1  # the target row must exist, or the test proves nothing
+        channel_id, status, seq = coords[0]
+        await cur.execute("BEGIN TRAN")
+        await cur.execute(
+            # INDEX hint pins the seek to ix_queue_fifo_in_seq so the U-lock lands on that NC key
+            # (the scan site the store's STEP-3 READPAST probe skips), not the clustered key.
+            "SELECT id FROM queue WITH (INDEX(ix_queue_fifo_in_seq), UPDLOCK, ROWLOCK)"
+            " WHERE stage=? AND channel_id=? AND status=? AND seq=?",
+            (stage, channel_id, status, seq),
+        )
+        assert len(await cur.fetchall()) == 1  # the U-lock MUST land on the intended row
+    except Exception:
+        # The callers' try/finally starts only once this returns, so a failure here must release
+        # what it took itself: a leaked open transaction would hold its lock against the next
+        # test's cleanup DELETE, which waits at the default LOCK_TIMEOUT -1.
+        try:
+            await conn.rollback()
+        finally:
+            await cur.close()
+            await ss_store._pool.release(conn)
+        raise
     return conn, cur
 
 

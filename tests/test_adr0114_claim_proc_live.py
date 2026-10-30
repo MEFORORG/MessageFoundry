@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import warnings
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -300,6 +301,13 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
         )
         assert res.by_lane == {} and res.rearm == frozenset()
         assert_skip_named(res, lane, abort_ok=True)
+        if res.lock_timeout is not None:
+            # Legal, and it still names a route, but it did not exercise the _v2 marker: say so in
+            # the warnings summary rather than let a green run read as proof of the marker path.
+            warnings.warn(
+                "the _v2 head-skip test passed on the 1222 abort route; the marker was not read",
+                stacklevel=1,
+            )
         rows = await ss_lane_pending(proc_store, lane)
         assert len(rows) == 3
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)

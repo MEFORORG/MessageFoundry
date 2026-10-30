@@ -3000,6 +3000,7 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
             f" with: {counters!r}"
         )
         assert "ESTABLISHED" in text and "NOT ESTABLISHED" not in text
+        assert "claim_head_skips=0" in counters.split()  # an abort is not a skip (arm 3's mirror)
     finally:
         await d.stop()
 
@@ -3021,14 +3022,19 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
         assert d2.claim_lock_timeouts == 0
         text2 = await _expiry_report(lane=lane2)
         assert "claim_lock_timeouts=0" in _counters_line(text2)
-        assert "NOT ESTABLISHED" in text2, (
+        # Read the ROUTE sentence itself: the verdict prose above it says READPAST on every T12
+        # report, so a search of the whole dump could not fail.
+        assert " ROUTE: " in text2 and " HEAD SKIP: " in text2, f"a route sentence is gone: {text2}"
+        route2 = text2.split(" ROUTE: ", 1)[1].split(" HEAD SKIP: ", 1)[0]
+        assert "NOT ESTABLISHED" in route2, (
             f"the zero is reported without its reading, which is how it becomes 'no contention':"
-            f" {text2}"
+            f" {route2!r}"
         )
-        assert "READPAST" in text2, (
+        assert "READPAST" in route2, (
             "the route the zero says nothing about must be named beside it, or the dump points the"
-            f" next reader at the one route it can see: {text2}"
+            f" next reader at the one route it can see: {route2!r}"
         )
+        assert "HEAD SKIP: claim_head_skips=0," in text2  # and that route reports its own zero
     finally:
         await d2.stop()
 
@@ -3043,10 +3049,13 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
     try:
         d3.mark_ready(lane3)
         assert await _wait_until(lambda: d3.claim_head_skips >= 1)
-        counters3 = _counters_line(await _expiry_report(lane=lane3))
+        text3 = await _expiry_report(lane=lane3)
+        counters3 = _counters_line(text3).split()  # whole tokens, so =1 cannot match =10
         assert "claim_head_skips=1" in counters3, (
             f"the head-skip counter is not on the counters line beside its sibling: {counters3!r}"
         )
         assert "claim_lock_timeouts=0" in counters3  # a skip is not an abort; the routes stay apart
+        head3 = text3.split(" HEAD SKIP: ", 1)[-1]
+        assert head3.startswith("claim_head_skips=1,") and "has evidence" in head3, text3
     finally:
         await d3.stop()
