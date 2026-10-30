@@ -987,7 +987,21 @@ class LoggingAlertSink:
         )
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
-        log.warning("ALERT connection_error: outbound %r %s: %s", name, kind, detail or "")
+        """Log the connection and the exception class only, never the rest of ``detail``.
+
+        ``detail`` is a ``safe_exc`` rendering, and that keeps the transport's own text, which can
+        echo payload content: a partner's reply, or an OS error naming a file built from message
+        fields (BACKLOG #3210). The full reason is stored, masked, on the connection event and the
+        alert instance. ``safe_exc`` puts the class first; a head that is not a plain ASCII name is
+        not trusted to be one, so the line then names no class."""
+        head = (detail or "").partition(":")[0]
+        error_class = head if head.isascii() and head.isidentifier() else "unnamed error"
+        log.warning(
+            "ALERT connection_error: outbound %r %s (%s); the reason is stored on its event",
+            name,
+            kind,
+            error_class,
+        )
 
     def log_write_failed(
         self, name: str, *, stage: str, reason: str, stopped: int | None = None
