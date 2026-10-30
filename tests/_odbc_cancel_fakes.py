@@ -21,10 +21,11 @@ import types
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from messagefoundry.store.pool_metrics import AcquireWaitHistogram
-from messagefoundry.store.sqlserver import SqlServerStore
+if TYPE_CHECKING:
+    from messagefoundry.store.sqlserver import SqlServerStore
+
 
 # Bound on every wait for a worker thread. Generous, since these steps take milliseconds, but finite
 # so a wedged case fails as a timeout instead of hanging the suite.
@@ -81,8 +82,16 @@ class RawCursor:
         return self._row
 
     def close(self) -> None:
+        c = self._conn
+        if c.block_cursor_close:
+            c.block_cursor_close = False  # the first close only
+            c.note("cursor.close:start")
+            c.started.set()
+            c.release.wait(WAIT)
+        if c.closed:
+            c.note(USE_AFTER_FREE)
         self.freed = True
-        self._conn.note("cursor.close")
+        c.note("cursor.close")
 
 
 class RawConn:
@@ -92,7 +101,8 @@ class RawConn:
     ``rows`` maps a statement to the row ``fetchone`` returns after it, ``fails`` names statements
     that raise once they return, and ``blocks`` picks the statements that wait for ``release``.
     ``block_autocommit`` makes the ``autocommit`` setter wait the same way: it goes through the
-    driver, so a close beside it frees the handle under it."""
+    driver, so a close beside it frees the handle under it. ``block_cursor_close`` makes the first
+    cursor close wait too, a place for a cancellation to land during cleanup."""
 
     def __init__(
         self,
@@ -105,6 +115,7 @@ class RawConn:
         rows: Mapping[str, tuple[Any, ...]] | None = None,
         fails: frozenset[str] = frozenset(),
         block_autocommit: bool = False,
+        block_cursor_close: bool = False,
     ) -> None:
         self.log = log
         self.release = release
@@ -113,6 +124,7 @@ class RawConn:
         self.rows = dict(rows or {})
         self.fails = fails
         self.block_autocommit = block_autocommit
+        self.block_cursor_close = block_cursor_close
         self._prefix = f"{name}:" if name else ""
         self.cursors: list[RawCursor] = []
         self.closed = False
@@ -254,7 +266,13 @@ class Pool:
 
 
 def bare_store(pool: Pool) -> SqlServerStore:
-    """A ``SqlServerStore`` with only what ``_acquire`` and ``_cursor`` read, over ``pool``."""
+    """A ``SqlServerStore`` with only what ``_acquire`` and ``_cursor`` read, over ``pool``.
+
+    The store is imported here, not at the top, so a driver-level arm that never builds one does
+    not load the SQL Server store with these fakes."""
+    from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+    from messagefoundry.store.sqlserver import SqlServerStore
+
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = pool
     store._settings = types.SimpleNamespace(  # type: ignore[assignment]

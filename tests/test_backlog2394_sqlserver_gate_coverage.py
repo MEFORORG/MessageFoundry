@@ -130,8 +130,13 @@ async def _cancel_open_mid_call(rig: _Rig) -> None:
     task = await cancel_once_started(
         rig.started, SqlServerStore._ensure_database_options(_settings())
     )
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 1.0)
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running driver call"
+    assert task.cancelled(), task
+    # Drop the task, and with it the frames its cancellation keeps, so the abandoned connection is
+    # garbage. A ``pytest.raises`` here would hold the traceback, and the collector would reach
+    # nothing.
+    del task, done
     gc.collect()
 
 
@@ -197,6 +202,27 @@ async def test_a_cancelled_reread_on_a_probe_frees_nothing_until_it_returns(
     assert USE_AFTER_FREE not in rig.log, rig.log
     end = rig.log.index("probe:execute:end")
     assert end < rig.log.index("probe:cursor.close") < rig.log.index("probe:conn.close"), rig.log
+
+
+async def test_a_cancel_during_the_cursor_close_still_leaves_through_the_gate(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The cleanup itself can be cancelled: shutdown cancels the open once its check is done and
+    its cursor close is running. The connection must still go to the gate, not to the collector."""
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        [rig.raw(blocks=never, rows={_STATE_READ: (1, 1)}, block_cursor_close=True)],
+    )
+    await _cancel_open_mid_call(rig)
+    assert "cursor.close:start" in rig.log, "the arm is vacuous: the cancel missed the close"
+    assert not {"cursor.close", "conn.close", DEL_CLOSE} & set(rig.log), rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    assert rig.log.index("cursor.close") < rig.log.index("conn.close"), rig.log
 
 
 async def test_an_ordinary_open_gates_every_connection_it_makes(

@@ -115,9 +115,12 @@ def install_call_gate(conn: Any) -> None:
 
     aioodbc 0.5.0 sends every call through ``Connection._execute(func, *args, **kwargs)``: cursor
     operations reach it through ``Cursor._run_operation``, and the connection's own ``cursor``,
-    ``commit``, ``rollback`` and ``close`` call it directly. Wrapping that one method covers them
-    all. A connection without a bound ``_execute`` (a test double) is left alone and keeps the
-    pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
+    ``commit``, ``rollback`` and ``close`` call it directly. Wrapping that one method covers those
+    calls. It does NOT cover aioodbc's ``Connection.__del__``, which closes a handle the connection
+    still holds directly, on whatever thread runs the collector. So a caller abandoning a connection
+    on a cancellation must also drop its ``_conn``, as the SQL Server store's detach does, rather
+    than leave the close to the collector. A connection without a bound ``_execute`` (a test
+    double) is left alone and keeps the pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
     it brings the native crash back; the store's live suite also pins that a pooled connection is
     gated.
     """
