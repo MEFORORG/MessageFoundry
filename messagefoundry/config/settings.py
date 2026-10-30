@@ -4803,33 +4803,30 @@ def vault_revocation_attestations(
     ]
 
 
-#: What each ``[alerts]`` hop's own handshake can check, for its loosening entry (BACKLOG #2193):
-#: a CRL reaches the SMTP hop's context, and none can reach the webhook's import-time opener.
-_ALERT_HOP_CRL_NOTE: Final[dict[str, str]] = {
-    "alerts.email_tls_revocation_attested": "and no CRL unless [tls].crl_file is set",
-    "alerts.webhook_tls_revocation_attested": "and no CRL, which cannot reach this hop",
-}
-
-
-def alert_revocation_attestations(alerts: AlertsSettings) -> list[tuple[str, str, str | None]]:
-    """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers and
-    its reason (BACKLOG #2193). The ``[alerts]`` sibling of :func:`vault_revocation_attestations`,
-    read by :func:`security_loosenings`."""
+def alert_revocation_attestations(
+    alerts: AlertsSettings,
+) -> list[tuple[str, str, str, str | None]]:
+    """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
+    what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
+    sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
+    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
             "the [alerts] SMTP relay, for a login (email_username) over verified STARTTLS",
+            "and no CRL unless [tls].crl_file is set",
             alerts.email_tls_revocation_attested,
             alerts.email_tls_revocation_attested_reason,
         ),
         (
             "alerts.webhook_tls_revocation_attested",
             "the [alerts] webhook host, over verified https",
+            "and no CRL, which cannot reach this hop",
             alerts.webhook_tls_revocation_attested,
             alerts.webhook_tls_revocation_attested_reason,
         ),
     )
-    return [(switch, hop, reason) for switch, hop, flag, reason in pairs if flag]
+    return [(switch, hop, crl, reason) for switch, hop, crl, flag, reason in pairs if flag]
 
 
 def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> HopPosture:
@@ -10342,12 +10339,12 @@ def security_loosenings(
             switch,
             f"revocation of the certificate of {hop} is attested as covered outside the engine "
             f"(reason: {reason}) -- the engine verifies that certificate but its own handshake "
-            f"checks no OCSP, {_ALERT_HOP_CRL_NOTE[switch]}; the attestation adds no check. "
+            f"checks no OCSP, {crl}; the attestation adds no check. "
             "Wherever the revocation refusal would apply to that hop it is lifted, so a revoked "
             "certificate is caught only if what the reason names really covers it. It never lifts "
             "a cleartext or verify-off refusal",
         )
-        for switch, hop, reason in alert_revocation_attestations(alerts)
+        for switch, hop, crl, reason in alert_revocation_attestations(alerts)
     )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
     # acknowledgment of it are different facts and an operator can hold either without the other. A hop

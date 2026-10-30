@@ -1034,7 +1034,7 @@ this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 - **The webhook follows section 12's lever, not its posture rule.** Its one lever is a typed `[alerts]` pair with a mandatory reason, named by `security_loosenings()`, as on the Vault hops. But it decides through `RevocationHopGuard`, as the LDAPS bind and the OIDC legs do and the Vault guard does not, so a build with no posture, stamped or passed, is the unstamped no-op rather than judged as enforcing. At least the API lifespan, the alerts test send and the offline notifier (which derives the instance's own posture when its caller passes none) hand it a posture. `tests/test_alert_revocation_guard.py` pins that the engine builds it names pass a posture keyword; a name that is always `None` would still pass that pin.
 - **`messagefoundry check` builds neither hop**, so it reports neither refusal. The loosening report names a set pair.
 
-The counts paragraph above names the alert SMTP hop and the alert webhook among its seven; both are now guarded. Of the seven, at least the AI broker stays open on #2193. This note does not re-check the paragraph's other counts.
+The counts paragraph above names the alert SMTP hop and the alert webhook among its seven. The webhook is now guarded; the SMTP hop is guarded only when it carries a login, and the hop with no login is declined, not guarded. Of the seven, at least the AI broker stays open on #2193. This note does not re-check the paragraph's other counts.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents

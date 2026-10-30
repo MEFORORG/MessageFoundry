@@ -1471,8 +1471,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
   carries its path token. **Setting the flag adds no check on the wire.**
-- **What the attestation can truthfully rest on:** for the SMTP relay, prefer `[tls].crl_file`,
-  which reaches that hop and adds a real check. For the webhook no CRL can reach the hop, so the
+- **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
+  that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
+  every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
+  its handshake fails. For the webhook no CRL can reach the hop, so the
   flag is the only way across, and the honest basis is the same as for the Vault hops: a
   short-lived certificate, with its lifetime in the reason. A public SaaS webhook host's
   certificate is issued by a public CA you do not run; say what you relied on.

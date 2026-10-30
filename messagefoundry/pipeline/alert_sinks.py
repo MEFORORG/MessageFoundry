@@ -364,8 +364,9 @@ _WEBHOOK_WAYS_ACROSS = (
 #: is offered beside the ``[alerts]`` pair; a connection's attestation is not, as this is no
 #: connection.
 _ALERT_SMTP_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
-    "[alerts].email_tls_revocation_attested = true with an "
+    "Configure [tls].crl_file so the engine checks a CRL on this hop (it is instance-wide: every "
+    "non-loopback hop it reaches then needs its issuer's CRL in that file, or its handshake "
+    "fails), or set [alerts].email_tls_revocation_attested = true with an "
     "[alerts].email_tls_revocation_attested_reason. Or remove [alerts].email_username and the "
     "password to send unauthenticated, which takes no revocation guard."
 )
@@ -409,9 +410,29 @@ def _refuse_webhook_revocation(
     ).enforce_construction()
 
 
+def _alerts_smtp_context(
+    *,
+    host: str,
+    verify: bool,
+    ca_file: str | None,
+    trust_anchor_policy: TrustAnchorPolicy | None,
+) -> Any:  # an ssl.SSLContext; this module never imports ssl (the crypto inventory gate)
+    """The ``[alerts]`` SMTP hop's TLS context: the one recipe :func:`send_plain_email` sends on
+    and :func:`_refuse_alert_smtp_revocation` judges (BACKLOG #2193), so the two cannot drift."""
+    return build_smtp_tls_context(
+        host=host,
+        cell=ALERTS_SMTP_CELL,
+        verify=verify,
+        ca_file=ca_file,
+        trust_anchor_policy=trust_anchor_policy,
+        ca_setting="[alerts].email_tls_ca_file",
+    )
+
+
 def _refuse_alert_smtp_revocation(
     *,
     host: str,
+    allowed_hosts: tuple[str, ...],
     use_tls: bool,
     username: str | None,
     tls_verify: bool,
@@ -434,14 +455,20 @@ def _refuse_alert_smtp_revocation(
     builds no verifying context, and a login over one is refused at load and again at each send,
     so there is nothing for this guard to judge.
 
-    The context is built by the recipe :func:`send_plain_email` runs for every send, from the same
-    arguments, so a ``[tls].crl_file`` that really loads there relaxes the refusal, and the guard
+    A host outside ``allowed_hosts`` is left to :func:`send_plain_email`, which refuses it before
+    any other work at every send; judging its revocation first would send the operator to fix a
+    hop the egress policy forbids.
+
+    The context is built by :func:`_alerts_smtp_context`, the recipe :func:`send_plain_email` runs
+    for every send, from the same arguments, so a ``[tls].crl_file`` that really loads there relaxes the refusal, and the guard
     never reads the setting. A CRL that cannot be loaded refuses here, and so at the build.
 
     ``posture`` is PASSED, because both callers are built outside every ``active_hop_posture``
     scope. ``None`` reads the ambient posture; where none is stamped the guard is the shipped no-op
     and no context is built, so a build with no posture is unchanged."""
     if username is None or not use_tls or not tls_verify:
+        return
+    if allowed_hosts and host.lower() not in (h.lower() for h in allowed_hosts):
         return
     if posture is None and current_hop_posture() is None:
         return
@@ -453,13 +480,11 @@ def _refuse_alert_smtp_revocation(
             "certificate revocation checking"
         ),
         attested=attested,
-        context=build_smtp_tls_context(
+        context=_alerts_smtp_context(
             host=host,
-            cell=ALERTS_SMTP_CELL,
             verify=True,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
-            ca_setting="[alerts].email_tls_ca_file",
         ),
         posture=posture,
         ways_across=_ALERT_SMTP_WAYS_ACROSS,
@@ -685,13 +710,11 @@ def send_plain_email(
     # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
     # function and depends on a disallowed host raising before ANY other work happens.
     tls_context = (
-        build_smtp_tls_context(
+        _alerts_smtp_context(
             host=host,
-            cell=ALERTS_SMTP_CELL,
             verify=tls_verify,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
-            ca_setting="[alerts].email_tls_ca_file",
         )
         if use_tls
         else None
@@ -786,6 +809,7 @@ class EmailTransport:
         # so an enforcing instance refuses the start, not the first alert.
         _refuse_alert_smtp_revocation(
             host=host,
+            allowed_hosts=allowed_hosts,
             use_tls=use_tls,
             username=username,
             tls_verify=tls_verify,

@@ -594,6 +594,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         # revocation guard, with the same [alerts] pair. First, so a refused build starts nothing.
         _refuse_alert_smtp_revocation(
             host=host,
+            allowed_hosts=allowed_hosts,
             use_tls=use_tls,
             username=username,
             tls_verify=tls_verify,

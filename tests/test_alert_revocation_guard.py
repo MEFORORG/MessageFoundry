@@ -209,6 +209,14 @@ def test_an_smtp_hop_with_no_login_takes_no_guard() -> None:
     assert not log.has(_SMTP_CELL), log.state()
 
 
+def test_a_relay_outside_the_allowlist_is_left_to_the_send_refusal() -> None:
+    """The egress allowlist refuses the host at every send, before any other work, so the guard
+    does not send the operator to fix revocation on a hop the policy forbids."""
+    transport = _email(ENFORCING, allowed_hosts=("other.example.test",))
+    with pytest.raises(ValueError, match="allowlist"):
+        asyncio.run(transport.send({"type": "connection_stopped", "connection": "OB_X"}))
+
+
 def test_an_smtp_login_on_loopback_still_crosses() -> None:
     _email(ENFORCING, host="127.0.0.1")
     _notifier(ENFORCING, host="localhost")

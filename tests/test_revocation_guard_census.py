@@ -80,6 +80,9 @@ _BUILDERS = frozenset(
         # two stay the sites and the wrapper hands its opener on, as build_idp_opener does.
         "build_idp_opener_from_settings",
         "NarrowedTls",
+        # pipeline/alert_sinks.py: the [alerts] SMTP recipe the send and its guard share
+        # (BACKLOG #2193), so both stay the sites, as for the IdP wrapper above.
+        "_alerts_smtp_context",
     }
 )
 
