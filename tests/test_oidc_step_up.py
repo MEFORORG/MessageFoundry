@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import urllib.parse
 from collections.abc import Callable, Coroutine
@@ -1438,6 +1439,7 @@ async def test_state_mismatch_rows_on_step_up_returns_stop_at_a_global_ceiling(
     user, so K users' forged returns write about K x ``login_rate_limit_per_ip`` rows a window. They
     now draw a budget of their own, per user AND across users. Past it each return is refused
     exactly as before, consumes nothing, and is logged instead of audited."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)

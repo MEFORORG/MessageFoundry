@@ -13,6 +13,7 @@ the step-up able to fail if the engine looked for the session anywhere but the s
 
 from __future__ import annotations
 
+import logging
 import time
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
@@ -524,9 +525,13 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
     """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row has no global
     ceiling. Within the budget the row is written. With the ceiling spent by other users it is
     not, and the refusal is otherwise the same: a 303 that consumes nothing and keeps the cookie."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole")
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
-        await _federated_sign_in(service, c, monkeypatch)
+        identity = await service.identity_for_token(
+            await _federated_sign_in(service, c, monkeypatch), activity=False
+        )
+        assert identity is not None
         start = await _start_step_up(c)
         assert start.status_code == 303
         flow_id = _flow_id(c)
@@ -542,6 +547,10 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         # Past the budget the refusal still leaves a trace: the line, in place of the row.
         logged = "refused (non_navigation_fetch)" in caplog.text
         assert logged is spent, caplog.text
+        # The row was charged under the staged user, the key the service's state_mismatch draws.
+        limiter = service._step_up_return_audit_limiter
+        assert limiter is not None
+        assert (identity.user_id in limiter._hits) is not spent
         assert service.oidc_step_up_flow(flow_id) is not None and _flow_id(c) == flow_id
 
 

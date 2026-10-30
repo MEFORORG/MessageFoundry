@@ -6389,10 +6389,9 @@ class AuthService:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
         if not consumed:
             # Repeatable while the flow lives, so its row draws the step-up return's audit budget
-            # (BACKLOG #3965). A flow naming no user is a sign-in flow, which the callback sends to
-            # the sign-in window and its global ceiling instead, so its row is not charged here.
-            user_id = flow.step_up_user_id
-            audit = user_id is None or self.allow_step_up_return_audit(user_id)
+            # (BACKLOG #3965). A sign-in flow names no user; the callback never sends one here, and
+            # one that arrives anyway still draws the budget, under a key no user id can take.
+            audit = self.allow_step_up_return_audit(flow.step_up_user_id or "<oidc>")
             if not audit:
                 _log.warning(
                     "federated step-up return refused (state_mismatch) for %s; its audit budget "
