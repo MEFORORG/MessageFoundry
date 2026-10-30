@@ -596,8 +596,9 @@ sessions and no user is left half deleted.
 record for both.
 
 **CORRECTED 2026-10-30 (BACKLOG #2738).** The paragraph above is kept as written and no longer
-describes the code. Its claim that a missed session lasts until it expires is false: the session
-epoch (BACKLOG #2592) refuses it on its next presentation, with at least one exception. The deadlock with
+describes the code. Its claim that a missed session lasts until it expires no longer holds in
+general: the session epoch (BACKLOG #2592) refuses it on its next presentation, with at least one
+exception. The deadlock with
 a user delete has since been closed on both server stores (BACKLOG #2733, #2738). Its "being
 retried" did not say who retries a failed request. It also did not say that both limits were read
 from the code and not run. SECURITY.md, linked above, is the source of record for what remains,

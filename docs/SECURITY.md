@@ -4599,7 +4599,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   in the instant the sweep runs can be missed by it. The same holds on that store for an
   unbind and for every other whole-account revoke, which run the same sweep: at least an
   administrator's revoke of a user's sessions, a role change and a password reset. **A missed
-  session is refused the next time it is presented** (BACKLOG #2738), with at least the
+  session is refused the next time it is presented** (BACKLOG #2592), with at least the
   exception below. Each of these raises the account's session epoch in the same transaction,
   and a rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
   session, and the user's own session list hides it and ends it the same way. **The exception:**
@@ -4615,8 +4615,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   bind's and the unbind's are read from the driver's row count, so where a session-wide
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
   until the session is presented or listed, the store still holds it as live. A follow-up row,
-  not yet filed, is to carry the fix for all of this: a sweep that follows a rotated session, so
-  nothing is missed. The Postgres store follows a
+  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
+  session, so nothing is missed. That would not change the -1 count. The Postgres store follows a
   rotated row and the SQLite store runs one writer at a time, so neither has this limit. All
   of this was read from the code; the skip has not been reproduced against a server. A bind
   ends sessions only: an engine factor already enrolled on the account stays.
