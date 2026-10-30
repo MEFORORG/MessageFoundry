@@ -565,10 +565,10 @@ def _host_key(address: str) -> str:
 
 
 def _client_limiter_key(client: str | None) -> str:
-    """The key the sign-in limiter, the passkey begin leg, the repeated-credential audit budget and
-    the step-up return audit budget's address keys charge for ``client``: :func:`_host_key`, so an address's IPv4-mapped and plain spellings share
-    one bucket, as every loopback address does (BACKLOG #3764 item 3), or ``"unknown"`` when there
-    is no address.
+    """The key at least the sign-in limiter, the passkey begin leg, the repeated-credential audit
+    budget and the step-up return audit budget's address keys charge for ``client``:
+    :func:`_host_key`, so an address's IPv4-mapped and plain spellings share one bucket, as every
+    loopback address does (BACKLOG #3764 item 3), or ``"unknown"`` when there is no address.
 
     It only folds the text uvicorn hands over; which forwarded address is the client stays
     uvicorn's call (ADR 0151 D-1). A zone id is kept on an address that is neither loopback nor
@@ -597,8 +597,7 @@ def _bounded_address_text(address: str) -> str:
 
 #: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`
 #: (BACKLOG #3965), each mapped to the audit action of the row it writes, which the backstop's page
-#: names.
-StepUpReturnAuditReason = Literal["state_mismatch", "non_navigation_fetch"]
+#: names. The method's ``reason`` Literal spells the same keys.
 _STEP_UP_RETURN_AUDIT_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {"state_mismatch": "auth.reauth", "non_navigation_fetch": "auth.login_failed"}
 )
@@ -3356,22 +3355,30 @@ class AuthService:
             else None
         )
         # The safety ceiling across every source, so a spread of sources still cannot grow
-        # audit_log unbounded. Past it an ACCOUNT that has written no row this window still writes
-        # one (_step_up_return_audit_first_row, charged on every row an account writes), so the
-        # ceiling never silences a named user outright; a source with no account gets no such row,
-        # because client addresses are the caller's to multiply and accounts are not. A row it
-        # stops pages (_page_step_up_return_audit_backstop).
+        # audit_log unbounded. Past it each ACCOUNT still writes one row a window
+        # (_step_up_return_audit_floor, charged only past the backstop), so the ceiling never
+        # silences a named user outright; a source with no account gets no such row, because
+        # client addresses are the caller's to multiply and accounts are not. A row it stops pages
+        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0 or less, which
+        # removes the whole budget (a negative global would otherwise refuse every row there).
+        backstop_on = (
+            settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
+        )
         self._step_up_return_audit_backstop: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=0,
                 glob=settings.login_rate_limit_global,
                 window_seconds=settings.login_rate_limit_window_seconds,
             )
-            if settings.login_rate_limit_enabled
+            if backstop_on
             else None
         )
-        self._step_up_return_audit_first_row = SlidingWindowRateLimiter(
-            per_key=1, glob=0, window_seconds=settings.login_rate_limit_window_seconds
+        self._step_up_return_audit_floor: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=1, glob=0, window_seconds=settings.login_rate_limit_window_seconds
+            )
+            if backstop_on
+            else None
         )
         # Called with the audit action of the row the backstop stopped; injected by the API
         # lifespan, as integrity_alert is. None logs only. Paged at most once a window per action,
@@ -3617,7 +3624,13 @@ class AuthService:
         return self._reauth_limiter.allow(actor)
 
     def allow_step_up_return_audit(
-        self, user_id: str | None, *, client: str | None, reason: StepUpReturnAuditReason
+        self,
+        user_id: str | None,
+        *,
+        client: str | None,
+        # The keys of _STEP_UP_RETURN_AUDIT_ACTIONS, spelled out in the signature so the web
+        # console seam's digest records the closed set and moves when it does.
+        reason: Literal["state_mismatch", "non_navigation_fetch"],
     ) -> bool:
         """Whether a refusal on an IdP step-up's return that consumed nothing may write its audit
         row (BACKLOG #3965): a ``state_mismatch``, on the completion or the abandon leg, or the
@@ -3626,8 +3639,8 @@ class AuthService:
         Keyed per source by :func:`_step_up_return_audit_key`: the user the staged flow names, or,
         for a flow that names none, the callback's ``client`` address. One source spending its
         budget costs no other source a row. A backstop across every source sits behind it; past
-        that, an account that has written no row this window still writes one and a source with no
-        account writes none, and a row it stops pages
+        that, each account still writes one row a window and a source with no account writes none,
+        and a row it stops pages
         (:meth:`_page_step_up_return_audit_backstop`). It gates the row only, never the return,
         and draws neither the sign-in window nor the ceremony budget. True = write; always True
         when the limiter is disabled."""
@@ -3647,31 +3660,28 @@ class AuthService:
 
     def _step_up_return_audit_backstop_admits(self, key: str, *, named: bool, action: str) -> bool:
         """Whether the all-sources backstop of :meth:`allow_step_up_return_audit` admits a row for
-        ``key``, charging it when it does. Every row a ``named`` account writes marks it in
-        ``_step_up_return_audit_first_row``; past the backstop only an account with no such mark
-        this window is admitted. A row refused here pages."""
-        first_row = self._step_up_return_audit_first_row
+        ``key``, charging it when it does. Past it a ``named`` account still gets one row a window
+        from ``_step_up_return_audit_floor``; a row refused here pages."""
         backstop = self._step_up_return_audit_backstop
-        if backstop is None or backstop.allow(_STEP_UP_RETURN_AUDIT_BACKSTOP_KEY):
-            if named:
-                first_row.allow(key)  # the mark; refused once the account already holds one
+        floor = self._step_up_return_audit_floor
+        if backstop is None or floor is None or backstop.allow(_STEP_UP_RETURN_AUDIT_BACKSTOP_KEY):
             return True
-        if named and first_row.allow(key):
+        if named and floor.allow(key):
             return True
         self._page_step_up_return_audit_backstop(action)
         return False
 
     def _page_step_up_return_audit_backstop(self, action: str) -> None:
         """Raise the backstop's page for a stopped ``action`` row, at most once a window per
-        action: the injected alert and a WARNING line. Never raises."""
+        action: the injected alert and an ERROR line. Never raises."""
         now = time.monotonic()
         paged = self._step_up_return_audit_paged_at.get(action)
         if paged is not None and now - paged < self._settings.login_rate_limit_window_seconds:
             return
         self._step_up_return_audit_paged_at[action] = now
-        _log.warning(
+        _log.error(
             "the federated step-up return audit backstop is spent across all callers, so a %s row "
-            "was not written; past it only an account with no row this window writes one",
+            "was not written; past it each account writes one row a window",
             action,
         )
         if self._step_up_return_audit_alert is None:

@@ -730,14 +730,16 @@ from typing import Any
 #: BACKLOG #3965 review repair: ``allow_step_up_return_audit`` now takes the callback's ``client``
 #: and the refusal's ``reason``, so the budget is kept per source with a paging backstop. The
 #: console's call passes both, and an older engine would raise TypeError there, so it forces a
-#: bump. Re-derived with ``--write`` on the merged tree (from 449ea6021c083aa8).
+#: bump. Re-derived with ``--write`` on the merged tree (from 449ea6021c083aa8). Its review then spelled
+#: ``reason``'s closed set out in the signature, so the digest records it; re-derived again (from
+#: 17b6da621787ad8b).
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "17b6da621787ad8b"
+ENGINE_UI_SEAM: str = "dd768841fe24ec45"
 
 
 @dataclass(frozen=True, slots=True)

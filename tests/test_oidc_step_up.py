@@ -1489,8 +1489,8 @@ async def test_many_accounts_spending_the_backstop_still_leave_each_account_its_
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
     """BACKLOG #3965. RED when: the step-up return audit budget's all-callers ceiling, once spent
-    by some accounts, silences every other account's ``state_mismatch`` row. Past the backstop an
-    account that has written none this window still writes its first, and only that."""
+    by some accounts, silences every other account's ``state_mismatch`` row. Past the backstop each
+    account still writes one row a window, whatever it wrote before, and only that one."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
@@ -1514,10 +1514,12 @@ async def test_many_accounts_spending_the_backstop_still_leave_each_account_its_
         assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 1, (
             "past the backstop, a fresh account must write exactly its first row"
         )
-        # The floor is the FIRST row of a window: an account that already wrote one gets none.
-        await _forged_return(service, early, 1)
-        assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 1, (
-            "past the backstop, an account that already wrote a row this window wrote another"
+        # An account that wrote a row before the backstop filled gets its one row past it too,
+        # and no second.
+        for n in range(1, 4):
+            await _forged_return(service, early, n)
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 2, (
+            "past the backstop, an account must write exactly one row a window"
         )
     finally:
         await store.close()
@@ -1597,6 +1599,30 @@ async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
         await store.close()
 
 
+@pytest.mark.parametrize("window", [0.0, -1.0])
+async def test_a_window_of_zero_or_less_removes_the_whole_step_up_return_audit_budget(
+    window: float,
+) -> None:
+    """BACKLOG #3965. RED when: with a window of 0 or less a negative global still refuses rows
+    with no account behind them, and pages on every one, though the docs say that window removes
+    the whole budget."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(login_rate_limit_window_seconds=window, login_rate_limit_global=-1),
+        )
+        pages: list[str] = []
+        service._step_up_return_audit_alert = pages.append
+        assert all(
+            service.allow_step_up_return_audit(None, client="198.51.100.1", reason="state_mismatch")
+            for _ in range(100)
+        )
+        assert pages == []
+    finally:
+        await store.close()
+
+
 async def test_a_step_up_return_audit_reason_outside_the_closed_set_fails_on_every_call(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
@@ -1628,7 +1654,8 @@ def test_the_backstop_page_is_the_audit_write_failed_alert_the_lifespan_injects(
             raised.append((name, action))
 
     step_up_return_audit_alert(_Sink())("auth.login_failed")  # type: ignore[arg-type]
-    assert raised == [(STEP_UP_RETURN_AUDIT_KEY, "auth.login_failed")]
+    # The action is in the key, so the sink throttles each action apart.
+    assert raised == [(f"{STEP_UP_RETURN_AUDIT_KEY}:auth.login_failed", "auth.login_failed")]
 
     class _Broken:
         def audit_write_failed(self, name: str, *, action: str) -> None:
