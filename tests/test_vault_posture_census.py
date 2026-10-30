@@ -508,8 +508,9 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
-        # The offline security notifier's SMTP login guard, for a caller with no posture
-        # (BACKLOG #2193).
+        # The offline alert notifier's revocation guards and the offline security notifier's SMTP
+        # login guard, each for a caller with no posture (BACKLOG #2193).
+        ("__main__.py", "_offline_alert_notifier", "settings.security.enforcement"),
         ("__main__.py", "_offline_security_notifier", "settings.security.enforcement"),
         ("__main__.py", "_provision_admin", "settings.security.enforcement"),
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
