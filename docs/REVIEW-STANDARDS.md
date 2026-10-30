@@ -99,9 +99,13 @@ shard"; they are different axes. Source: [CLAUDE.md](../CLAUDE.md) section 12.
 ## Security, UI and hygiene
 
 **R18. API and `/ui` gates match action sensitivity and channel scope.** Flag `@public_route` on a
-non-public endpoint, a mutating route gated only by a read `Permission` or missing step-up auth, a
-channel-bearing route marked `not_channel_bearing` or unfiltered on mutations, or a `/ui` route in
-`messagefoundry_webconsole/` missing per-channel filtering. Source: [CLAUDE.md](../CLAUDE.md) section 2, and [SECURITY.md](SECURITY.md).
+non-public endpoint, a mutating route gated below the tier its action needs (the gate families under
+*Anti-automation* in [SECURITY.md](SECURITY.md); for example, a sensitive write without step-up), a
+read `Permission` on a mutation not confined to the caller's own objects, a channel-bearing route
+marked `not_channel_bearing` or unfiltered on mutations, or a channel-bearing `/ui` route in
+`messagefoundry_webconsole/` missing per-channel filtering. `require_paced` is itself an intended
+tier: a write that warrants pacing but no step-up, such as `delete_search_preset`, is not a finding.
+Source: [CLAUDE.md](../CLAUDE.md) section 2, and [SECURITY.md](SECURITY.md).
 
 **R19. TLS-always, attested plaintext hops, and `cap_setting` for numeric caps.** Flag `verify=False`,
 unattested non-loopback plaintext, disabling engine TLS without `tls_terminated_upstream`,
