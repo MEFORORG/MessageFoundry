@@ -14,8 +14,8 @@ replaces it with a recorder. So the whole opener runs as shipped, request proces
 handler included, and the test reads the host the request would have gone to.
 
 Each rule is paired with a control on the same opener: a host the guard does not accept still goes
-to the proxy. The alert webhook, the OIDC legs and the AI broker have no proxy setting of their own, so the
-environment proxy is their only route out on a network that requires one.
+to the proxy. The alert webhook, the OIDC legs and the AI broker have no proxy setting of their
+own, so the environment proxy is their only route out on a network that requires one.
 
 Synthetic data only: every host name is reserved or made up.
 """

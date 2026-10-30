@@ -2042,9 +2042,9 @@ def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
 # it carry PHI? is it production?) so every cell decides identically, and a legitimately-secure hop is
 # opted in per-connection (an AUDITED attestation) rather than via the blunt global escape.
 
-#: Host tokens that name the local box (loopback) with no DNS resolution — hoisted verbatim from
-#: ``transports.rest._LOOPBACK_HOST_NAMES`` so the HTTP-egress cell and this authority share ONE
-#: literal set. ``""`` (empty host) is treated as loopback (an on-box bind with no host component).
+#: Host tokens that name the local box (loopback) with no DNS resolution, hoisted here from the REST
+#: transport by ADR 0092, so the HTTP-egress cell and this authority share ONE literal set.
+#: ``""`` (empty host) is treated as loopback (an on-box bind with no host component).
 _LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost", ""})
 
 
@@ -2123,8 +2123,8 @@ def is_loopback_hop_host(host: str) -> bool:
 
     ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
     ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.
-    The two disagree only toward "remote": that match takes the connection's own proxy off the hop,
-    a proxy from the environment still takes it, and it opens no on-box carve-out. A plain
+    The two disagree only toward "remote": that match opens no on-box carve-out, and
+    ``transports.rest.ProxyConfig.for_host`` says what it does to the route. A plain
     ``rstrip(".")`` is not the fix, because the host of ``http://./x`` is ``.``, and stripping it
     leaves the empty host, which reads as loopback."""
     h = host.lower()
