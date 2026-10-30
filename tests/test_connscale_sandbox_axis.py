@@ -153,6 +153,10 @@ def test_the_stamp_is_what_the_engine_parser_reads() -> None:
 # --- the warm-up ----------------------------------------------------------------------------------
 
 
+#: The stand-in driver never reads the corpus.
+_NO_CORPUS: Any = object()
+
+
 class _Driver:
     """Queues one send per connection and delivers ``deliver`` of them after a short delay."""
 
@@ -180,11 +184,12 @@ async def test_the_warm_up_waits_for_every_first_delivery_and_keeps_it_out_of_th
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: next(walks))
     hold_ack, hold_e2e = Histogram(), Histogram()
     metrics = LiveMetrics(Counters(), hold_ack, hold_e2e)
-    driver = _Driver(metrics, count=10, deliver=10)
+    # A stand-in for ConnScaleDriver: only send_one_each is called.
+    driver: Any = _Driver(metrics, count=10, deliver=10)
     start = SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=30.0)
 
     reading = await _warm_up(
-        start, driver=driver, corpus=object(), metrics=metrics, pid=4242, timeout=5.0
+        start, driver=driver, corpus=_NO_CORPUS, metrics=metrics, pid=4242, timeout=5.0
     )
 
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 10)
@@ -200,11 +205,12 @@ async def test_a_warm_up_that_runs_out_is_recorded_not_raised(
 ) -> None:
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: None)  # the walk did not read
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
-    driver = _Driver(metrics, count=10, deliver=4)
+    # A stand-in for ConnScaleDriver: only send_one_each is called.
+    driver: Any = _Driver(metrics, count=10, deliver=4)
     start = SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=30.0)
 
     reading = await _warm_up(
-        start, driver=driver, corpus=object(), metrics=metrics, pid=4242, timeout=0.3
+        start, driver=driver, corpus=_NO_CORPUS, metrics=metrics, pid=4242, timeout=0.3
     )
 
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 4)
@@ -337,4 +343,6 @@ def test_the_sandbox_reading_is_in_the_artifact() -> None:
     assert isinstance(payload, dict)
     assert payload["requested"] == "subprocess"
     assert payload["processes_started"] == 20
-    assert payload["warmup"]["delivered"] == 10  # type: ignore[index]
+    warmup = payload["warmup"]
+    assert isinstance(warmup, dict)
+    assert warmup["delivered"] == 10
