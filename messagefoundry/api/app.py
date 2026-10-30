@@ -231,6 +231,7 @@ from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
+    ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
     alert_sink_for,
@@ -5436,9 +5437,10 @@ def create_app(
         except ConfigWriteAuditFailed as exc:
             # The audit log did not record the row, so the engine refused the toggle and undid it,
             # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
-            # fault, so 503 as for any refused audit write. The route's only 503, which the console
-            # relies on to name this fix.
-            raise HTTPException(503, str(exc)) from exc
+            # fault, so 503 as for any refused audit write. Not the route's only 503 (at least
+            # _get_engine's and RequestTimeoutMiddleware's answer one too), so the console names
+            # this fix by the type it raises, never by the status (BACKLOG #3811).
+            raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
             # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
             # which writes no config file (vault BACKLOG #2933): the edit never landed.

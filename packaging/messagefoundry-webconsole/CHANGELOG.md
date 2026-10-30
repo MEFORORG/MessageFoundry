@@ -248,6 +248,11 @@ digest moved.
 
 ### Fixed
 
+- **The flag toggle's "audit log did not record the change" page shows only for that refusal.**
+  The console gave that page for any 503 from the toggle, on the claim that the engine's flag
+  handler had no other. It now keys the page on the engine's `ConfigWriteNotRecorded`, and any
+  other 503 reaches the operator as itself. Needs the engine seam that carries
+  `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 - **A throttled `/ui` write now says how long to wait.** The admin-write `429` carried a literal
   `Retry-After: 10`, whatever the engine's window was. It now carries the time until that account's
   next write would be admitted, in whole seconds, the same value the JSON API sends. Seam change:

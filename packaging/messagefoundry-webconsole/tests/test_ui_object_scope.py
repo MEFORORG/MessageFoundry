@@ -107,3 +107,28 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
     assert "The audit log did not record the change, so the engine undid it" in r.text
     assert "was not recorded within 10 s" in r.text
     assert "code-first connection" not in r.text and "cluster node" not in r.text
+
+
+async def test_ui_flag_gives_another_503_no_audit_page(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3811: the console named the audit fix for ANY 503, on the claim that the handler
+    had no other. A 503 that is not the audit refusal must reach the operator as itself, not as
+    "the audit log did not record the change"."""
+    from fastapi import HTTPException
+
+    async def _other_503(*_args: object, **_kwargs: object) -> None:
+        raise HTTPException(503, "some other unavailable")
+
+    monkeypatch.setattr(engine, "set_connection_flag", _other_503)
+    service = await auth_service(engine)
+    await provision(service, "dep", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "inbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 503, r.text[:300]
+    assert "The audit log did not record the change" not in r.text

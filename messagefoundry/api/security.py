@@ -420,6 +420,21 @@ class RepeatedCredentialError(HTTPException):
         self.credential = credential
 
 
+class ConfigWriteNotRecorded(HTTPException):
+    """A 503 for a config write the engine refused because its audit row was not recorded (vault
+    BACKLOG #2945).
+
+    The connection flag handler raises it in place of a plain 503, so the console's flag route can
+    name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). A status cannot
+    name it: the JSON route has other 503s, at least ``_get_engine``'s "engine not started" and
+    ``RequestTimeoutMiddleware``'s deadline, and a later handler change could add one the console
+    calls through. The HTTP answer is the ordinary 503 with ``detail``. Defined here because this
+    is the leaf module the console imports, and the seam snapshot records what it imports from it."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+
+
 #: How much of the request path the repeated-credential line and row keep.
 _REPEATED_PATH_MAX = 256
 
