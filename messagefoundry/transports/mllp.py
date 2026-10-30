@@ -46,6 +46,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
@@ -66,6 +67,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
     relax_verify_expiry,
     resolve_trust_anchor,
+    skips_validity_period,
     warn_hostname_check_off,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
@@ -904,6 +906,11 @@ class MLLPDestination(DestinationConnector):
         # cleartext _hop_guard above — so the two gates never double-refuse one hop. A production-PHI hop
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
+        #
+        # A context that skips validity-period checks (tls_allow_expired) is handed to the guard as
+        # no context, so a CRL on it cannot admit the hop and only the attestation crosses it, as on
+        # REST, SOAP, FHIR and FTPS (owner ruling 2026-10-05; vault BACKLOG #2978, ADR 0173 §13).
+        expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
                 host=self.host,
@@ -916,7 +923,8 @@ class MLLPDestination(DestinationConnector):
                 # reached it (via [tls].crl_file through the resolved anchor) sets
                 # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting -- so a
                 # sibling hop the same CRL never reached keeps its refusal.
-                context=self._ssl,
+                context=None if expiry_relaxed else self._ssl,
+                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None

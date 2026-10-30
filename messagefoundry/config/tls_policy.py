@@ -134,6 +134,8 @@ __all__ = [
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
     "relax_verify_expiry",
+    "skips_validity_period",
+    "EXPIRY_RELAXED_WAYS_ACROSS",
     "verifies_peer_fully",
     "warn_hostname_check_off",
     "requests_verify_from_anchor",
@@ -872,7 +874,7 @@ def verifies_peer_fully(ctx: object) -> bool:
         isinstance(ctx, ssl.SSLContext)
         and ctx.verify_mode == ssl.CERT_REQUIRED
         and ctx.check_hostname
-        and not ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME
+        and not skips_validity_period(ctx)
     )
 
 
@@ -922,6 +924,33 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
         host or "(unspecified host)",
         still_verified,
     )
+
+
+def skips_validity_period(ctx: ssl.SSLContext) -> bool:
+    """Whether :func:`relax_verify_expiry` has set ``X509_V_FLAG_NO_CHECK_TIME`` on ``ctx``.
+
+    OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
+    ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
+    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal: a hop
+    whose context answers True hands the guard no context, and names
+    :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2188 for the HTTP family, #2978 for MLLP and
+    the DICOM SCU). Read off the context, as :func:`context_checks_revocation` reads the CRL flag."""
+    return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
+
+
+#: The remedy a revocation refusal names on a hop whose context skips validity-period checks
+#: (``tls_allow_expired``, :func:`skips_validity_period`). No CRL can relax that refusal, so the
+#: connection-shaped default, which offers ``[tls].crl_file``, would name a lever that cannot work
+#: there (SDS-3.7).
+EXPIRY_RELAXED_WAYS_ACROSS = (
+    "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
+    "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
+    "skips the CRL's validity window at the handshake, and a CA may drop an expired "
+    "certificate from its CRL, which is the certificate this setting accepts. Set "
+    "tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
+    "[tls].crl_file on this hop can admit it."
+)
 
 
 def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
