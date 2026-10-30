@@ -238,6 +238,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
+| | `[alerts].security_signals`, and its five detector counts | `true`, and each count above `0` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off and is named as `alerts.<count>`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
@@ -268,7 +269,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals` and its counts,
+`[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
 `[alerts].email_tls_revocation_attested`, `[alerts].webhook_tls_revocation_attested` and
@@ -818,6 +820,19 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
   is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
   `escalate` tier with `transports = []` overrides the base rule once it is reached.
+
+### `[alerts].security_signals = false`, or a detector count at `0` — a security signal raises no alert
+Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_signin_failures`,
+`alerts.security_denials`, `alerts.security_body_views`, `alerts.security_export_messages` or
+`alerts.security_peer_refusals` (vault BACKLOG #2613).
+- **What you lose:** the alert. A burst of refused sign-ins, refused requests, stored-body reads,
+  exported messages or refused peers, and with the layer off a DEBUG log level too, is left in the
+  audit log or the service log for someone to read. The `[alerts]` table of
+  [CONFIGURATION.md](CONFIGURATION.md) says what each detector counts.
+- **What stays:** the posture detector. With the layer off it still runs, so the start that loads
+  this setting raises `posture_loosened` naming it.
+- **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns.
+- **Reversible:** yes. Remove the line, or set a count above `0`, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a

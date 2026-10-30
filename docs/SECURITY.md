@@ -6370,10 +6370,11 @@ export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `with
 `audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
 hidden row falls in the range read, so it cannot tell the reader that a lock happened.
 
-**Six audit signals also raise an operator alert (vault BACKLOG #2613).** A small rule layer
-(`messagefoundry/pipeline/security_signals.py`) watches the audit stream and raises one alert type
-per detector through the `[alerts]` notifier, or the log when no transport is set. It is on by
-default. What each one counts is stated once, in the `[alerts]` table of `docs/CONFIGURATION.md`.
+**Seven security signals also raise an operator alert (vault BACKLOG #2613).** A small rule
+layer (`messagefoundry/pipeline/security_signals.py`) watches the audit stream, and the listeners'
+peer refusals, and raises one alert type per detector through the `[alerts]` notifier, or the log
+when no transport is set. It is on by default. What each one counts is stated once, in the
+`[alerts]` table of `docs/CONFIGURATION.md`.
 
 | Alert | Setting | Subject |
 |---|---|---|
@@ -6381,8 +6382,9 @@ default. What each one counts is stated once, in the `[alerts]` table of `docs/C
 | `access_denied_burst` | `security_denials` | `account:<username>` |
 | `body_view_burst` | `security_body_views` | `account:<username>` |
 | `bulk_export` | `security_export_messages` | `account:<username>` |
+| `peer_refused_burst` | `security_peer_refusals` | `listener:<inbound>` |
 | `log_level_debug` | none | `logging:debug` |
-| `posture_loosened` | none | `posture:start` |
+| `posture_loosened` | none | `posture:start`, plus `@node:<id>` or `@shard:<id>` where several engine processes share the store |
 
 The layer is an observer on the off-box audit tee, which at least `record_audit` and every
 in-transaction audit append call after their commit. So it adds no commit and no store read to the
@@ -6397,10 +6399,21 @@ sign-in detector counts `auth.login_failed`, which is written once per refused l
 lock state, and leaves out the withheld directory lock refusal, so its count does not reveal a lock.
 **An account lock raises no alert**, by the 2026-09-28 ruling above: the alert list is readable
 under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
-withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
-`[alerts].security_signals = false`, or a threshold of `0`, is absent from
-`GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
-records its loosenings as unknown, such as one whose config snapshot could not be taken.
+withholds it from.
+
+A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and a
+`connection_event` row only while capture is on. So the MLLP, raw-TCP, X12 and HTTP listeners and
+the DICOM server tell the layer directly, with the inbound's name and never the peer's address.
+
+**Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
+a detector count of `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
+With the layer off, every detector stops but the posture one, so that start still raises
+`posture_loosened` naming the switch. A later start that records no loosening raises the
+`posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
+process and pages nobody. An unpinned cluster node's identity changes on every start, so its alert
+stays open for an operator. `posture_loosened` does not fire, and nothing resolves, on a start whose
+`config_loaded` row records its loosenings as unknown, such as one whose config snapshot could not
+be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC
