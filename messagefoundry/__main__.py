@@ -7020,13 +7020,15 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
+    posture = _instance_hop_posture(settings)
 
     async def run() -> tuple[str, dict[str, Any]]:
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
         # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
-        store = await _open_store_or_refuse_the_key(
+        store = await _open_store_or_refuse(
             open_store(
                 settings.store,
+                posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
@@ -7058,12 +7060,13 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     try:
         outcome, report = run_guarded(run())
-    # #1916; #1780: a server database with no store (auto mode); #3054: no key. Could not start.
+    # #1916; #1780: a server database with no store (auto mode); #3054: no key; #2532: a store hop
+    # the posture refuses. Could not start.
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        _StoreKeyUnresolved,
+        _StoreOpenRefused,
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -7353,6 +7356,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     import math
 
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -7397,6 +7401,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
     actor = f"cli:{getpass.getuser()}"
+    posture = _instance_hop_posture(settings)
     # What a failure left in place, for the refusal lines below.
     unchanged = (
         "nothing was recorded"
@@ -7440,6 +7445,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         try:
             store = await open_store(
                 settings.store,
+                posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         except open_refusals:
@@ -7472,7 +7478,12 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
 
     try:
         outcome, row, path = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError, _UnauditableWrite) as exc:
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        InsecureHopRefused,
+    ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except key_errors as exc:
@@ -9157,6 +9168,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
+    posture = _instance_hop_posture(settings)
     # Validated before the store opens, so a refusal touches nothing. The web console's length
     # bound comes first. Then comes the one-mailbox check the console and POST /me/notify-email
     # apply (BACKLOG #1139). Since vault BACKLOG #2870 that check includes the rule the alert sender
@@ -9192,9 +9204,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # BACKLOG #1916: this command appends an audit row, so on a fresh store with no key it
             # would start a keyless chain. The shared verdict decides; a refusal exits 2 below, as
             # does a key that does not resolve (vault BACKLOG #3054, item 11).
-            store = await _open_store_or_refuse_the_key(
+            store = await _open_store_or_refuse(
                 open_store(
                     settings.store,
+                    posture=posture,
                     keyless_chain_refusal=keyless_opt_out_refusal(
                         settings.store, settings.security
                     ),
@@ -9259,13 +9272,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    # #1916, #1780, #3054 (no key): could not start. And #2124: the chain's key check refused the
-    # audit row, which `admin-unlock` exits 2 on with the same text (a seat decision under owner
-    # delegation 2026-10-08, not an owner ruling).
+    # #1916, #1780, #3054 (no key), #2532 (a store hop the posture refuses): could not start. And
+    # #2124: the chain's key check refused the audit row, which `admin-unlock` exits 2 on with the
+    # same text (a seat decision under owner delegation 2026-10-08, not an owner ruling).
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-        _StoreKeyUnresolved,
+        _StoreOpenRefused,
         _UnauditableWrite,
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
@@ -9407,6 +9420,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.auth.permissions import Role
     from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -9422,13 +9436,15 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
+    posture = _instance_hop_posture(settings)
     wanted = args.username.strip()
-    # Could not start, so exit 2: as admin-unlock exits on the first three, and provision-admin on
+    # Could not start, so exit 2: as admin-unlock exits on the first four, and provision-admin on
     # a store key that cannot be resolved (BACKLOG #2081). Each is raised before anything is written.
     could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
+        InsecureHopRefused,
         *_key_unresolved(),
     )
     open_refusals: tuple[type[Exception], ...] = (
@@ -9469,6 +9485,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     async def opened() -> Store:
         return await open_store(
             settings.store,
+            posture=posture,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
 
@@ -9758,7 +9775,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         address = (user.notify_email or "").strip()
         if not address:
             return "no_address"
-        notifier = _offline_security_notifier(settings)
+        notifier = _offline_security_notifier(settings, posture)
         if notifier is None:
             return "no_channel"
         notifier.start()
@@ -9962,6 +9979,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
+    posture = _instance_hop_posture(settings)
     # Decides exit 4 against exit 1, and exit 5 against exit 0 for a keyless walk (#3054), below.
     # The open computes the same verdict inline, because the #1916 source guard reads that call's
     # argument, so the two cannot be one expression.
@@ -9987,10 +10005,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
         try:
-            store = await _open_store_or_refuse_the_key(
+            store = await _open_store_or_refuse(
                 open_store(
                     settings.store,
                     read_only=True,
+                    posture=posture,
                     keyless_chain_refusal=keyless_opt_out_refusal(
                         settings.store, settings.security
                     ),
@@ -10026,11 +10045,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     try:
         verdict = run_guarded(run())
+    # #1916; #1780: a server database with no store; #2725: no key; #2532: a store hop the posture
+    # refuses. Could not start.
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-        _StoreKeyUnresolved,
-    ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
+        _StoreOpenRefused,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except _AuditWalkStopped as exc:
@@ -10188,13 +10209,15 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
+    posture = _instance_hop_posture(settings)
 
     async def run() -> tuple[int, str]:
         # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
-        store = await _open_store_or_refuse_the_key(
+        store = await _open_store_or_refuse(
             open_store(
                 settings.store,
                 read_only=True,
+                posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
@@ -10208,8 +10231,8 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-        _StoreKeyUnresolved,
-    ) as exc:  # #1916, #1780, #2725, as audit-verify
+        _StoreOpenRefused,
+    ) as exc:  # #1916, #1780, #2725, #2532, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except audit_chain_read_errors() as exc:  # #1670: not a database; #3054: no server
@@ -10340,8 +10363,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
+    posture = _instance_hop_posture(settings)
     try:
-        active_key = resolve_active_key(settings.store)
+        active_key = resolve_active_key(settings.store, posture=posture)
     except _key_unresolved() + (ValueError,) as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
@@ -10412,7 +10436,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
         # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
         # at resolve_active_key above, so its refusal needs the same clean exit 2.
-        store = await _open_store_or_refuse_the_key(open_store(settings.store))
+        store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
@@ -10490,7 +10514,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     # #1780: no store there. #3054: a key error, a key that is not base64 of 32 bytes among them,
     # which `resolve_active_key` above does not decode. One the OPEN raises arrives wrapped as
-    # `_StoreKeyUnresolved` (#2109, below). Nothing after the open is known to raise these classes;
+    # `_StoreOpenRefused` (#2109, below). Nothing after the open is known to raise these classes;
     # they stay here so one that does still exits 2 rather than reaching the dispatch floor.
     could_not_start: tuple[type[Exception], ...] = (
         NotImplementedError,
@@ -10516,7 +10540,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except could_not_start as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except _StoreKeyUnresolved as exc:  # #2109: the open refused the key; nothing was changed
+    except _StoreOpenRefused as exc:  # #2109, #2532: the open refused; nothing was changed
         print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -10598,6 +10622,7 @@ def _backup(args: argparse.Namespace) -> int:
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
     from messagefoundry import __version__
     from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
@@ -10628,12 +10653,14 @@ def _backup(args: argparse.Namespace) -> int:
             "full_restore_verify": args.full_verify or settings.backup.full_restore_verify,
         }
     )
+    posture = _instance_hop_posture(settings)
 
     async def run() -> BackupResult | None:
         # #1916: a backup writes a `dr_backup` audit row, even on failure, so on a fresh store it
         # would start the chain.
         store = await open_store(
             settings.store,
+            posture=posture,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -10645,6 +10672,7 @@ def _backup(args: argparse.Namespace) -> int:
                 config_dir=args.config,
                 engine_version=__version__,
                 instance=settings.ai.environment or "",
+                hop_posture=posture,
             )
             return await runner.run_once(force_config_only=args.config_only)
         finally:
@@ -10654,8 +10682,13 @@ def _backup(args: argparse.Namespace) -> int:
         result = run_guarded(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
-    except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
-        # #1780, #1916: could not start, so exit 2 like #1670 below
+    except (
+        StoreNotFoundError,
+        KeylessAuditChainRefused,
+        _UnauditableWrite,
+        InsecureHopRefused,
+    ) as exc:
+        # #1780, #1916, #2532: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
         return 2
     except SchemaMismatchError as exc:
@@ -12010,25 +12043,40 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
     return (KeyProviderError, DpapiError, DpapiUnavailable, StoreCipherConfigError)
 
 
-class _StoreKeyUnresolved(RuntimeError):
-    """The store key the settings name could not be resolved while the store opened (vault BACKLOG
-    #2725). Its text is the resolution error's, which names settings, variables and files."""
+class _StoreOpenRefused(RuntimeError):
+    """The settings stopped the store opening, before it read a row: the key they name could not be
+    resolved (vault BACKLOG #2725), or the posture refused the store hop (BACKLOG #2532). Its text
+    is the refusal's, which names settings, variables, files, and the hop's host."""
 
 
-async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
-    """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
+def _instance_hop_posture(settings: ServiceSettings) -> HopPosture:
+    """The instance's hop posture, derived as ``serve`` derives it, for a command that opens the
+    store (BACKLOG #2532). Passing no posture is not the strict answer on every hop: the PostgreSQL
+    store's revocation guard does nothing with none, so that command would cross a hop ``serve``
+    refuses. Imported here, not at module level, so the CLI's import cost stays where it is."""
+    from messagefoundry.config.settings import hop_posture_from_ai
+
+    return hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+
+
+async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
+    """Await a store open, turning a key that cannot be resolved, or a store hop the posture
+    refuses (BACKLOG #2532), into :class:`_StoreOpenRefused`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
     code, for ``admin-unlock`` and ``admin-set-notify-email`` (vault BACKLOG #3054, item 11), and
     for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the OPEN is wrapped:
-    ``open_store`` resolves the key before the backend reads a row, so nothing a database holds can
-    turn a finding into "could not start". A malformed key is caught as ``StoreCipherConfigError``,
-    never as the bare ``ValueError`` the open raises for other reasons too.
+    ``open_store`` resolves the key and judges the hop before the backend reads a row, so nothing a
+    database holds can turn a finding into "could not start". A malformed key is caught as
+    ``StoreCipherConfigError`` and a hop as ``InsecureHopRefused``, never as the bare ``ValueError``
+    the open raises for other reasons too.
     """
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
     try:
         return await opening
-    except _key_unresolved() as exc:
-        raise _StoreKeyUnresolved(str(exc)) from exc
+    except _key_unresolved() + (InsecureHopRefused,) as exc:
+        raise _StoreOpenRefused(str(exc)) from exc
 
 
 async def _close_store_quietly(store: Store) -> None:

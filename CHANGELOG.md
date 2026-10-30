@@ -14,6 +14,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   proxy or a credential of its own needs that name listed. The `pass_environment` row of the
   `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
   setting refuses. (`BACKLOG #2587`)
+- **`admin-unlock`, `admin-set-notify-email`, `admin-reset-totp`, `store attest-transit-bound`,
+  `store withdraw-transit-bound`, `audit-verify`, `audit-anchor`, `rotate-key` and `backup` now
+  open the store with the instance's hop posture, as `serve` does.** They passed none. On a first
+  deployment at `[security].enforcement = enforce`, each would have crossed an off-box PostgreSQL
+  store hop with no revocation check, which `serve` refuses. Each now refuses it and exits 2. At
+  `warn` they now follow the dial as `serve` does: `MEFOR_ALLOW_INSECURE_TLS` is honoured on a
+  weakened store, and an unattested off-box Vault or an unrevoked store hop crosses with a WARNING.
+  ([SECURITY.md](docs/SECURITY.md), `BACKLOG #2532`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
