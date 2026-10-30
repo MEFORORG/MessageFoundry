@@ -26,6 +26,15 @@ directory (Kerberos or OIDC) lock refusal writes ``auth.directory_login_locked``
 lock rows themselves are not read, and so an account lock raises no alert: that would show lock
 state to a reader the 2026-09-28 owner ruling withholds it from.
 
+**Refused peers are the one input that is not an audit row.** A listener refusing a peer at its
+source allowlist or a connection cap writes a ``connection_event`` row only while the operator's
+capture is on, and no audit row, so :func:`~messagefoundry.transports.admission.notify_refusal`
+tells this layer directly. It passes the inbound's name and never the peer's address.
+
+**Switched off, the layer still reports its own posture.** ``[alerts].security_signals = false`` is
+a loosening :func:`~messagefoundry.config.settings.security_loosenings` names, so the posture
+detector keeps running to raise it: every other detector stops.
+
 **Bounded where the caller chooses the key.** A windowed detector tracks at most
 :data:`MAX_SUBJECTS` subjects. Past :data:`MAX_SUBJECT_ALERTS` alerts in one window it raises under
 one shared ``<prefix>:*`` subject instead, so a spread of addresses cannot open an alert instance,
@@ -45,7 +54,9 @@ from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.intake_bound import process_alert_subject
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
+from messagefoundry.transports.admission import add_refusal_observer, remove_refusal_observer
 
 __all__ = [
     "MAX_SUBJECTS",
@@ -64,9 +75,11 @@ BODY_VIEW_BURST: Final = "body_view_burst"
 BULK_EXPORT: Final = "bulk_export"
 LOG_LEVEL_DEBUG: Final = "log_level_debug"
 POSTURE_LOOSENED: Final = "posture_loosened"
+PEER_REFUSED_BURST: Final = "peer_refused_burst"
 
 #: Every event type this layer raises. ``config/settings.py`` ``_ALERT_EVENT_TYPES`` lists the same
-#: six by hand, because ``config/`` may not import ``pipeline/``; a test pins that each is there.
+#: seven by hand, because ``config/`` may not import ``pipeline/``; a test pins that each is there.
+#: The ``posture_restored`` inverse is not one: it pages nobody, so no rule can route it.
 SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
     {
         SIGNIN_FAILURE_BURST,
@@ -75,6 +88,7 @@ SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
         BULK_EXPORT,
         LOG_LEVEL_DEBUG,
         POSTURE_LOOSENED,
+        PEER_REFUSED_BURST,
     }
 )
 
@@ -100,7 +114,8 @@ _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locke
 
 @dataclass(frozen=True, slots=True)
 class SecuritySignalThresholds:
-    """The ``[alerts]`` security-signal settings. A count of 0 switches that detector off.
+    """The ``[alerts]`` security-signal settings. A count of 0 switches that detector off, and
+    ``enabled`` False switches off every detector but the posture one.
     ``AlertsSettings`` owns the defaults; build one with :meth:`from_settings`."""
 
     window_seconds: float
@@ -108,6 +123,8 @@ class SecuritySignalThresholds:
     denials: int
     body_views: int
     export_messages: int
+    peer_refusals: int
+    enabled: bool = True
 
     @classmethod
     def from_settings(cls, alerts: AlertsSettings) -> SecuritySignalThresholds:
@@ -117,6 +134,8 @@ class SecuritySignalThresholds:
             denials=alerts.security_denials,
             body_views=alerts.security_body_views,
             export_messages=alerts.security_export_messages,
+            peer_refusals=alerts.security_peer_refusals,
+            enabled=alerts.security_signals,
         )
 
 
@@ -197,6 +216,11 @@ _BODIES = _Burst(
 _EXPORT = _Burst(
     BULK_EXPORT, "account", "{total} messages exported by this account within {window}"
 )
+_REFUSED = _Burst(
+    PEER_REFUSED_BURST,
+    "listener",
+    "{total} peers refused by this inbound's source allowlist or connection caps within {window}",
+)
 
 
 def _detail_of(detail: str | None) -> dict[str, Any]:
@@ -250,6 +274,11 @@ class SecuritySignalDetector:
     """The fixed detectors. :meth:`observe` is an :data:`~messagefoundry.store.audit_tee.AuditObserver`.
 
     It runs inline on the audit writer's path, so it does only in-memory work and never raises.
+    :meth:`observe_refusal` runs inline on a listener's accept path the same way.
+
+    ``identity`` returns which engine process this is (``Engine.instance_identity``), or ``None``
+    for a lone engine. It is read when a start's row arrives, and suffixes the posture subject, so
+    a clean start resolves only its own process's ``posture_loosened``.
     """
 
     def __init__(
@@ -258,11 +287,13 @@ class SecuritySignalDetector:
         thresholds: SecuritySignalThresholds,
         *,
         clock: Callable[[], float] = time.monotonic,
+        identity: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._sink = sink
         t = thresholds
         self._window_label = f"{t.window_seconds:g} s"
         self._clock = clock
+        self._identity = identity
         windows = {
             _SIGNIN: _Window(t.signin_failures, t.window_seconds),
             _DENIED: _Window(t.denials, t.window_seconds),
@@ -276,9 +307,23 @@ class SecuritySignalDetector:
             "messages_export": (_EXPORT, windows[_EXPORT], _export_size),
         }
         self._signin = windows[_SIGNIN]  # read by a test of the subject bound
-        #: The audit actions some detector reads.
-        self.actions: frozenset[str] = frozenset(
-            {*self._bursts, "logging_level_change", "logging_level_change_denied", "config_loaded"}
+        # The layer switched off is decided here, once per input: the audit actions narrow to the
+        # posture row, and the refusal window gets a zero threshold, which counts nothing.
+        self._refused = _Window(t.peer_refusals if t.enabled else 0, t.window_seconds)
+        #: Whether :meth:`observe_refusal` can ever raise, so the installer can skip the observer.
+        self.counts_refusals = self._refused.threshold > 0
+        #: The audit actions some running detector reads; :meth:`observe` ignores every other.
+        self.actions: frozenset[str] = (
+            frozenset(
+                {
+                    *self._bursts,
+                    "logging_level_change",
+                    "logging_level_change_denied",
+                    "config_loaded",
+                }
+            )
+            if t.enabled
+            else frozenset({"config_loaded"})
         )
 
     def observe(
@@ -289,10 +334,14 @@ class SecuritySignalDetector:
         client: str | None,
         detail: str | None,
     ) -> None:
+        if action not in self.actions:
+            return
         try:
             burst = self._bursts.get(action)
             if burst is not None:
-                self._on_burst(*burst, actor=actor, client=client, detail=detail)
+                kind, window, weight_of = burst
+                key = client if kind.by_address else actor
+                self._on_burst(kind, window, key, weight_of(detail))
             elif action == "logging_level_change":
                 self._on_level(actor, detail, "to", "the live log level was raised to DEBUG by")
             elif action == "logging_level_change_denied":
@@ -307,19 +356,18 @@ class SecuritySignalDetector:
         except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the audit writer
             log.warning("security-signal detector failed: %s", type(exc).__name__)
 
-    def _on_burst(
-        self,
-        burst: _Burst,
-        window: _Window,
-        weight_of: Callable[[str | None], int],
-        *,
-        actor: str | None,
-        client: str | None,
-        detail: str | None,
-    ) -> None:
-        key = (client if burst.by_address else actor) or "unknown"
+    def observe_refusal(self, connection: str) -> None:
+        """A :data:`~messagefoundry.transports.admission.RefusalObserver`: the inbound
+        ``connection`` refused a peer at its source allowlist or a connection cap."""
+        try:
+            self._on_burst(_REFUSED, self._refused, connection, 1)
+        except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the listener
+            log.warning("security-signal detector failed: %s", type(exc).__name__)
+
+    def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> None:
+        key = key or "unknown"
         now = self._clock()
-        total = window.hit(key, now, weight_of(detail))
+        total = window.hit(key, now, weight)
         if total is None:
             return
         subject = _bounded(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
@@ -336,22 +384,33 @@ class SecuritySignalDetector:
     def _on_config_loaded(self, detail: str | None) -> None:
         switches = _detail_of(detail).get("loosenings")
         # None means the start could not read its list; that is no finding either way.
-        if not isinstance(switches, list) or not switches:
+        if not isinstance(switches, list):
+            return
+        subject = process_alert_subject("posture:start", self._identity())
+        if not switches:
+            self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
             return
         names = _bounded(", ".join(str(s) for s in switches), _SWITCH_LIST_LIMIT)
         self._raise(
             POSTURE_LOOSENED,
-            "posture:start",
+            subject,
             len(switches),
             f"the engine started with {len(switches)} security loosening(s): {names}",
         )
 
     def _raise(self, signal: str, subject: str, count: int, detail: str) -> None:
+        self._notify(
+            signal,
+            lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
+        )
+
+    @staticmethod
+    def _notify(event: str, call: Callable[[], None]) -> None:
         try:
-            self._sink.security_signal(subject, signal=signal, count=count, detail=detail)
+            call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
             log.warning(
-                "security-signal alert %s could not be raised: %s", signal, type(exc).__name__
+                "security-signal alert %s could not be raised: %s", event, type(exc).__name__
             )
 
 
@@ -359,13 +418,25 @@ def install_security_signals(
     sink: AlertSink,
     thresholds: SecuritySignalThresholds,
     loop: asyncio.AbstractEventLoop,
+    *,
+    identity: Callable[[], str | None] = lambda: None,
 ) -> Callable[[], None]:
-    """Register a :class:`SecuritySignalDetector` on the audit tee; returns the function that
-    removes it.
+    """Register a :class:`SecuritySignalDetector` on the audit tee, and on the listeners' refusal
+    observers while it counts refusals; returns the function that removes it.
 
-    A row committed on ``loop``'s own thread is judged at once. One committed on another thread is
-    hopped onto ``loop``, so the detector's state and the sink are only touched from one thread."""
-    detector = SecuritySignalDetector(sink, thresholds)
+    A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
+    onto ``loop``, so the detector's state and the sink are only touched from one thread."""
+    detector = SecuritySignalDetector(sink, thresholds, identity=identity)
+
+    def _on_loop(judge: Callable[..., None], *args: str | None) -> None:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            judge(*args)
+        elif not loop.is_closed():
+            loop.call_soon_threadsafe(judge, *args)
 
     def _observe(
         action: str,
@@ -376,14 +447,17 @@ def install_security_signals(
     ) -> None:
         if action not in detector.actions:
             return  # the common case: one set lookup per row, and no thread hop
-        try:
-            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            detector.observe(action, actor, channel_id, client, detail)
-        elif not loop.is_closed():
-            loop.call_soon_threadsafe(detector.observe, action, actor, channel_id, client, detail)
+        _on_loop(detector.observe, action, actor, channel_id, client, detail)
+
+    def _refused(connection: str) -> None:
+        _on_loop(detector.observe_refusal, connection)
 
     add_audit_observer(_observe)
-    return lambda: remove_audit_observer(_observe)
+    if detector.counts_refusals:
+        add_refusal_observer(_refused)
+
+    def _remove() -> None:
+        remove_audit_observer(_observe)
+        remove_refusal_observer(_refused)
+
+    return _remove

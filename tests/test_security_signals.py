@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -20,11 +21,14 @@ from pydantic import ValidationError
 
 from messagefoundry.auth.audit_visibility import DIRECTORY_LOCKED_REFUSAL_DETAIL
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
+    _SECURITY_SIGNAL_COUNTS,
     AlertsSettings,
     AuthSettings,
+    _security_signal_loosenings,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -39,6 +43,13 @@ from messagefoundry.pipeline.security_signals import (
 )
 from messagefoundry.store import audit_tee
 from messagefoundry.store.store import MessageStore
+from messagefoundry.transports import admission
+from messagefoundry.transports.admission import (
+    ListenerAdmission,
+    add_refusal_observer,
+    remove_refusal_observer,
+)
+from messagefoundry.transports.dicom import DicomScpSource
 
 
 class _Sink(LoggingAlertSink):
@@ -321,25 +332,30 @@ def test_a_failing_sink_never_reaches_the_audit_writer() -> None:
 # --- settings and sinks ---------------------------------------------------------------------------
 
 
-def test_the_signal_types_are_routable_and_never_control_or_resolve_types() -> None:
+def test_the_signal_types_are_routable_and_only_the_posture_one_resolves() -> None:
     assert SECURITY_SIGNAL_TYPES <= _ALERT_EVENT_TYPES
     assert not SECURITY_SIGNAL_TYPES & _ALERT_CONTROL_EVENT_TYPES
-    assert not SECURITY_SIGNAL_TYPES & set(_AUTO_RESOLVE) and not SECURITY_SIGNAL_TYPES & set(
-        _AUTO_RESOLVE.values()
-    )
+    assert not SECURITY_SIGNAL_TYPES & set(_AUTO_RESOLVE)
+    assert SECURITY_SIGNAL_TYPES & set(_AUTO_RESOLVE.values()) == {"posture_loosened"}
+    assert _AUTO_RESOLVE["posture_restored"] == "posture_loosened"
+    assert "posture_restored" not in _ALERT_EVENT_TYPES  # an inverse pages nobody
 
 
 def test_settings_defaults_and_bounds() -> None:
     s = AlertsSettings()
     assert s.security_signals is True
     t = SecuritySignalThresholds.from_settings(s)
-    assert (t.window_seconds, t.signin_failures, t.denials, t.body_views, t.export_messages) == (
-        300.0,
-        20,
-        20,
-        100,
-        5000,
-    )
+    assert (
+        t.window_seconds,
+        t.signin_failures,
+        t.denials,
+        t.body_views,
+        t.export_messages,
+        t.peer_refusals,
+        t.enabled,
+    ) == (300.0, 20, 20, 100, 5000, 100, True)
+    off = SecuritySignalThresholds.from_settings(AlertsSettings(security_signals=False))
+    assert off.enabled is False
     with pytest.raises(ValidationError):
         AlertsSettings(security_window_seconds=0)
     with pytest.raises(ValidationError):
@@ -503,3 +519,245 @@ def test_an_observer_fault_does_not_stop_the_next_observer(
         audit_tee.remove_audit_observer(broken)
         audit_tee.remove_audit_observer(good)
     assert seen == ["anything"]
+
+
+# --- refused peers: the one input that is not an audit row ----------------------------------------
+
+
+class _Writer:
+    """The one thing admission reads off a writer: the peer's address."""
+
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+    def get_extra_info(self, key: str) -> object:
+        return (self.host, 50000) if key == "peername" else None
+
+
+def _admission(**caps: Any) -> ListenerAdmission:
+    settings: dict[str, Any] = {
+        "max_connections": None,
+        "max_connections_per_host": None,
+        "source_ip_allowlist": None,
+    }
+    settings.update(caps)
+    return ListenerAdmission(transport="MLLP", name="IB_ACME_ADT", **settings)
+
+
+def _refuse(gate: ListenerAdmission, n: int, host: str = "203.0.113.9") -> None:
+    for _ in range(n):
+        assert gate.check(cast(Any, _Writer(host)), host) is not None
+
+
+def test_peer_refused_burst_fires_per_listener_and_never_names_the_address() -> None:
+    det, sink, _ = _detector(peer_refusals=4)
+    for i in range(4):  # four addresses, one listener: a scan still trips it
+        det.observe_refusal("IB_ACME_ADT")
+        det.observe_refusal(f"IB_OTHER_{i}")
+    ((signal, subject, count, detail),) = sink.signals
+    assert (signal, subject, count) == ("peer_refused_burst", "listener:IB_ACME_ADT", 4)
+    assert "allowlist" in detail
+
+
+def test_refusals_below_the_threshold_or_past_the_window_do_not_fire() -> None:
+    det, sink, clock = _detector(peer_refusals=4, window_seconds=60)
+    for _ in range(3):
+        det.observe_refusal("IB_ACME_ADT")
+    clock.now += 61
+    for _ in range(3):
+        det.observe_refusal("IB_ACME_ADT")
+    assert sink.signals == []
+
+
+def test_a_zero_peer_refusal_count_switches_that_detector_off() -> None:
+    det, sink, _ = _detector(peer_refusals=0)
+    for _ in range(500):
+        det.observe_refusal("IB_ACME_ADT")
+    assert sink.signals == []
+
+
+async def test_allowlist_and_cap_refusals_reach_the_detector_and_a_stopping_one_does_not() -> None:
+    sink = _Sink()
+    remove = install_security_signals(
+        sink, _thresholds(peer_refusals=3), asyncio.get_running_loop()
+    )
+    try:
+        _refuse(_admission(source_ip_allowlist=["10.0.0.0/8"]), 2)
+        full = _admission(max_connections=1)
+        full.admit("192.0.2.1")
+        _refuse(full, 1)
+        assert [(s, n, c) for s, n, c, _d in sink.signals] == [
+            ("peer_refused_burst", "listener:IB_ACME_ADT", 3)
+        ]
+        # The controls: a stopping listener's refusal and an admitted peer are not counted.
+        stopping = _admission(source_ip_allowlist=["10.0.0.0/8"])
+        stopping.stopping = True
+        _refuse(stopping, 5)
+        assert _admission().check(cast(Any, _Writer("10.1.1.1")), "10.1.1.1") is None
+        remove()
+        _refuse(_admission(source_ip_allowlist=["10.0.0.0/8"]), 5)  # removed: nothing counts
+        assert len(sink.signals) == 1
+    finally:
+        remove()  # idempotent
+
+
+def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
+    seen: list[str] = []
+    scp = DicomScpSource(
+        Source(
+            type=ConnectorType.DIMSE,
+            name="IB_PACS",
+            settings={"ae_title": "MEFOR_SCP", "host": "127.0.0.1", "port": 0},
+        )
+    )
+    add_refusal_observer(seen.append)
+    try:
+        scp._log_refused_peer("203.0.113.9", "a connection", "peer IP not in source_ip_allowlist")
+    finally:
+        remove_refusal_observer(seen.append)
+    assert seen == ["IB_PACS"]
+
+
+def test_a_failing_refusal_observer_never_reaches_the_listener() -> None:
+    def broken(_connection: str) -> None:
+        raise RuntimeError("observer down")
+
+    add_refusal_observer(broken)
+    try:
+        refusal = _admission(source_ip_allowlist=["10.0.0.0/8"]).check(
+            cast(Any, _Writer("203.0.113.9")), "203.0.113.9"
+        )
+    finally:
+        remove_refusal_observer(broken)
+    assert refusal is not None and refusal.kind == "peer_not_allowlisted"
+
+
+# --- the layer switched off is a loosening, and the posture detector still reports it -------------
+
+
+def _loosenings(alerts: AlertsSettings) -> list[str]:
+    return [name for name, _risk in _security_signal_loosenings(alerts)]
+
+
+def test_the_layer_off_or_a_detector_at_zero_is_a_named_loosening() -> None:
+    assert _loosenings(AlertsSettings()) == []  # the control: shipped defaults loosen nothing
+    assert _loosenings(AlertsSettings(security_signals=False)) == ["alerts.security_signals"]
+    assert _loosenings(
+        AlertsSettings(security_signals=False, security_denials=0, security_peer_refusals=0)
+    ) == ["alerts.security_signals"]
+    assert _loosenings(AlertsSettings(security_denials=0, security_peer_refusals=0)) == [
+        "alerts.security_denials",
+        "alerts.security_peer_refusals",
+    ]
+    for count in _SECURITY_SIGNAL_COUNTS:
+        assert count[0] in AlertsSettings.model_fields
+
+
+def test_the_layer_off_still_raises_its_posture_and_nothing_else() -> None:
+    det, sink, _ = _detector(enabled=False, signin_failures=1, denials=1, peer_refusals=1)
+    _rows(det, "auth.login_failed", 5)
+    _rows(det, "auth.permission_denied", 5)
+    det.observe("logging_level_change", "op", None, None, json.dumps({"to": "DEBUG"}))
+    det.observe_refusal("IB_ACME_ADT")
+    assert sink.signals == []
+    det.observe(
+        "config_loaded",
+        "system",
+        None,
+        None,
+        json.dumps({"loosenings": ["alerts.security_signals"]}),
+    )
+    assert [(s, n) for s, n, _c, _d in sink.signals] == [("posture_loosened", "posture:start")]
+    assert "alerts.security_signals" in sink.signals[0][3]
+
+
+@pytest.mark.parametrize("off", [{"enabled": False}, {"peer_refusals": 0}])
+async def test_a_detector_that_counts_no_refusal_registers_no_refusal_observer(
+    off: dict[str, Any],
+) -> None:
+    before = admission._REFUSAL_OBSERVERS
+    remove = install_security_signals(_Sink(), _thresholds(**off), asyncio.get_running_loop())
+    try:
+        assert before == admission._REFUSAL_OBSERVERS
+    finally:
+        remove()
+    remove = install_security_signals(_Sink(), _thresholds(), asyncio.get_running_loop())
+    try:
+        assert len(admission._REFUSAL_OBSERVERS) == len(before) + 1  # the control: on, it does
+    finally:
+        remove()
+    assert before == admission._REFUSAL_OBSERVERS
+
+
+# --- posture_restored: the inverse that resolves posture_loosened ---------------------------------
+
+
+class _PostureSink(_Sink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.restored: list[str] = []
+
+    def posture_restored(self, name: str) -> None:
+        self.restored.append(name)
+
+
+def _start(det: SecuritySignalDetector, loosenings: Any) -> None:
+    det.observe("config_loaded", "system", None, None, json.dumps({"loosenings": loosenings}))
+
+
+def test_a_clean_start_raises_posture_restored_and_a_loosened_or_unread_one_does_not() -> None:
+    sink = _PostureSink()
+    det = SecuritySignalDetector(sink, _thresholds())
+    _start(det, ["security.allow_x"])
+    _start(det, None)  # an unread list says nothing either way
+    assert sink.restored == []
+    _start(det, [])
+    assert sink.restored == ["posture:start"]
+    assert [s for s, _n, _c, _d in sink.signals] == ["posture_loosened"]
+
+
+def test_the_posture_subject_names_the_process_where_several_share_the_store() -> None:
+    sink = _PostureSink()
+    det = SecuritySignalDetector(sink, _thresholds(), identity=lambda: "node:a")
+    _start(det, ["security.allow_x"])
+    _start(det, [])
+    assert [n for _s, n, _c, _d in sink.signals] == ["posture:start@node:a"]
+    assert sink.restored == ["posture:start@node:a"]
+
+
+def test_a_failing_posture_restored_never_reaches_the_audit_writer() -> None:
+    class _Broken(LoggingAlertSink):
+        def posture_restored(self, name: str) -> None:
+            raise RuntimeError("sink down")
+
+    _start(SecuritySignalDetector(_Broken(), _thresholds()), [])  # must not raise
+
+
+async def test_the_notifier_resolves_posture_loosened_without_a_page() -> None:
+    upserts: list[str] = []
+    resolves: list[tuple[str, str]] = []
+
+    class _Store:
+        async def upsert_alert_instance(self, *, event_type: str, **_kw: Any) -> None:
+            upserts.append(event_type)
+
+        async def resolve_alert_instances_for(
+            self, *, event_type: str, connection: str, **_kw: Any
+        ) -> None:
+            resolves.append((event_type, connection))
+
+    sink = NotifierAlertSink([], store=cast(Any, _Store()))
+    sink.posture_restored("posture:start")
+    for _ in range(50):
+        if resolves:
+            break
+        await asyncio.sleep(0.01)
+    assert resolves == [("posture_loosened", "posture:start")]
+    assert upserts == []
+
+
+def test_the_logging_sink_logs_posture_restored_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.alerts"):
+        LoggingAlertSink().posture_restored("posture:start")
+    (record,) = caplog.records
+    assert record.levelno == logging.DEBUG and "posture_restored" in record.getMessage()

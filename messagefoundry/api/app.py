@@ -11982,15 +11982,13 @@ def create_managed_app(
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
-        signal_settings = alerts_settings or AlertsSettings()
-        remove_security_signals = (
-            install_security_signals(
-                notifier or LoggingAlertSink(),
-                SecuritySignalThresholds.from_settings(signal_settings),
-                asyncio.get_running_loop(),
-            )
-            if signal_settings.security_signals
-            else None
+        # Installed even with [alerts].security_signals = false: that switch is itself a loosening,
+        # and the posture detector, the one it leaves running, is what reports it.
+        remove_security_signals = install_security_signals(
+            notifier or LoggingAlertSink(),
+            SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
+            asyncio.get_running_loop(),
+            identity=lambda: engine.instance_identity,
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
