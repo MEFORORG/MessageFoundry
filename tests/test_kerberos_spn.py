@@ -135,14 +135,17 @@ def server_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 def test_login_step_passes_hostname_and_service_separately(
     server_calls: list[dict[str, Any]],
 ) -> None:
-    assert kerberos_principal(b"token", AuthSettings(kerberos_spn=_SPN)) == "alice"
+    assert (
+        kerberos_principal(b"token", AuthSettings(kerberos_spn=_SPN, kerberos_realm="EXAMPLE.COM"))
+        == "alice"
+    )
     assert server_calls == [{"hostname": "host.example.com", "service": "HTTP"}]
 
 
 def test_preflight_passes_hostname_and_service_separately(
     server_calls: list[dict[str, Any]],
 ) -> None:
-    kerberos_acceptor_preflight(AuthSettings(kerberos_spn=_SPN))
+    kerberos_acceptor_preflight(AuthSettings(kerberos_spn=_SPN, kerberos_realm="EXAMPLE.COM"))
     assert server_calls == [{"hostname": "host.example.com", "service": "HTTP"}]
 
 
@@ -150,7 +153,7 @@ def test_preflight_passes_hostname_and_service_separately(
 def test_unset_spn_keeps_the_library_default(
     server_calls: list[dict[str, Any]], value: str | None
 ) -> None:
-    kerberos_acceptor_preflight(AuthSettings(kerberos_spn=value))
+    kerberos_acceptor_preflight(AuthSettings(kerberos_spn=value, kerberos_realm="EXAMPLE.COM"))
     assert server_calls == [{}]
 
 
@@ -158,7 +161,7 @@ def test_a_value_that_bypassed_the_validator_is_refused_at_first_use(
     server_calls: list[dict[str, Any]],
 ) -> None:
     # model_construct skips validation, standing in for any path that builds settings unchecked.
-    bad = AuthSettings.model_construct(kerberos_spn="HTTP")
+    bad = AuthSettings.model_construct(kerberos_spn="HTTP", kerberos_realm="EXAMPLE.COM")
     with pytest.raises(LdapError, match="kerberos_spn"):
         kerberos_acceptor_preflight(bad)
     with pytest.raises(LdapError, match="kerberos_spn"):

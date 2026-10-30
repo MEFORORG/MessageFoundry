@@ -147,7 +147,8 @@ def _assert_one_budget(b_outcome: object, a_outcome: object, sidecars: list[Path
 async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
     """The read the fix depends on: raw in-flight totals, (0, 0) for an unknown uploader. A release
     pays back its own reservation only, and a repeat of it, or of an unknown id, changes nothing
-    (vault BACKLOG #3180)."""
+    (vault BACKLOG #3180). A release naming another uploader leaves the row alone (vault BACKLOG
+    #3740 item 10)."""
     small, large = f"{uploader_id}-s", f"{uploader_id}-l"
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
     assert await store.reserve_upload_quota(
@@ -157,13 +158,56 @@ async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
         uploader_id, large, size_bytes=20, max_files=5, max_total_bytes=100
     )
     assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
-    await store.release_upload_quota(small)
+    await store.release_upload_quota(uploader_id=f"{uploader_id}-other", reservation_id=small)
+    assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=small)
     assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
-    await store.release_upload_quota(small)
-    await store.release_upload_quota(f"{uploader_id}-never-reserved")
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=small)
+    await store.release_upload_quota(
+        uploader_id=uploader_id, reservation_id=f"{uploader_id}-never-reserved"
+    )
     assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
-    await store.release_upload_quota(large)
+    await store.release_upload_quota(uploader_id=uploader_id, reservation_id=large)
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
+
+
+async def _assert_budget_edges(store: Any, uploader_id: str) -> None:
+    """Vault BACKLOG #3740 item 12: the reserve reads the count and the byte total as one aggregate.
+    Each limb admits an exact fit and refuses one past it, on its own, and a refusal writes nothing.
+    The first reserve runs over no rows, where the aggregate still yields its one row."""
+    other = f"{uploader_id}-other"
+
+    async def _reserve(name: str, size: int, *, files: int = 2, total: int = 30) -> bool:
+        return bool(
+            await store.reserve_upload_quota(
+                uploader_id,
+                f"{uploader_id}-{name}",
+                size_bytes=size,
+                max_files=files,
+                max_total_bytes=total,
+            )
+        )
+
+    try:
+        # Another uploader's rows count toward nothing here.
+        assert await store.reserve_upload_quota(
+            other, f"{other}-x", size_bytes=25, max_files=1, max_total_bytes=25
+        )
+        assert await _reserve("a", 10)  # over no rows of this uploader
+        assert not await _reserve("over_bytes", 21)  # 10 + 21 > 30, with a file slot to spare
+        assert await store.upload_quota_in_flight(uploader_id) == (1, 10)
+        assert await _reserve("b", 20)  # 10 + 20 == 30 and 1 + 1 == 2: exact on both limbs
+        assert not await _reserve("over_files", 0, total=1000)  # 2 + 1 > 2, bytes to spare
+        assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
+    finally:
+        # Released on a failure too, so a server-backend run leaves nothing in flight behind it.
+        for name in ("a", "b", "over_bytes", "over_files"):
+            await store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+            )
+        await store.release_upload_quota(uploader_id=other, reservation_id=f"{other}-x")
+    assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
+    assert await store.upload_quota_in_flight(other) == (0, 0)
 
 
 # --- one pair of store connections per backend -------------------------------------------------
@@ -244,14 +288,22 @@ async def test_upload_quota_in_flight_reads_what_reserve_and_release_left(
 
 
 @pytest.mark.parametrize("pair", _BACKENDS)
+async def test_the_reserve_budget_admits_an_exact_fit_and_refuses_one_past_it(
+    tmp_path: Path, pair: _Pair
+) -> None:
+    async with pair(tmp_path) as (store, _):
+        await _assert_budget_edges(store, f"u-3740-{uuid.uuid4().hex}")
+
+
+@pytest.mark.parametrize("pair", _BACKENDS)
 async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
     tmp_path: Path, pair: _Pair
 ) -> None:
-    """Vault BACKLOG #3180, with BACKLOG #2648. Shard A's slot leaked, then shard B reserved and is
-    mid-write. Shard C's reserve arrives once A's slot is past the window but B's is not. It must
-    reclaim A's slot and still count B's. Each reservation has its own clock, so B's activity no
-    longer keeps A's leak alive. Red before #3180: one row held one clock for every slot, so B's
-    reserve kept A's leaked slot counted, and C read ``(3, 30)``."""
+    """Vault BACKLOG #3180, with BACKLOG #2648. Engine shard A's slot leaked, then engine shard B
+    reserved and is mid-write. Engine shard C's reserve arrives once A's slot is past the window but
+    B's is not. It must reclaim A's slot and still count B's. Each reservation has its own clock,
+    so B's activity no longer keeps A's leak alive. Red before #3180: one row held one clock for
+    every slot, so B's reserve kept A's leaked slot counted, and C read ``(3, 30)``."""
     uploader_id = f"u-3180-{uuid.uuid4().hex}"
     async with pair(tmp_path) as (shard_ab, shard_c):
 
@@ -267,16 +319,18 @@ async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
                 )
             )
 
-        assert await _reserve(shard_ab, "a")  # shard A, never released
+        assert await _reserve(shard_ab, "a")  # engine shard A, never released
         await asyncio.sleep(2.0)
-        assert await _reserve(shard_ab, "b")  # shard B, mid-write
-        # Shard C: A's slot is twice the window old, B's is well inside it.
+        assert await _reserve(shard_ab, "b")  # engine shard B, mid-write
+        # Engine shard C: A's slot is twice the window old, B's is well inside it.
         assert await _reserve(shard_c, "c", stale_after=1.0)
         # A's leaked slot is gone; B's live slot and C's own are counted.
         assert await shard_c.upload_quota_in_flight(uploader_id) == (2, 20)
         # Release what is left, so a server-backend run leaves nothing in flight behind it.
         for name in ("b", "c"):
-            await shard_c.release_upload_quota(f"{uploader_id}-{name}")
+            await shard_c.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=f"{uploader_id}-{name}"
+            )
         assert await shard_c.upload_quota_in_flight(uploader_id) == (0, 0)
 
 
@@ -343,5 +397,7 @@ async def test_the_server_backends_stamp_since_with_the_database_clock(
         await asyncio.sleep(0.05)  # past A's stamp on the server's own clock
         assert await _reserve(shard_b, "b", stale_after=0.0)
         assert await shard_b.upload_quota_in_flight(uploader_id) == (1, 10)
-        await shard_b.release_upload_quota(f"{uploader_id}-b")
+        await shard_b.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=f"{uploader_id}-b"
+        )
         assert await shard_b.upload_quota_in_flight(uploader_id) == (0, 0)

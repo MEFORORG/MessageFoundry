@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
+from _bash_resolver import probe_env, require_bash
 
 from scripts.ci.step_margin import (
     DEFAULT_MIN_MARGIN,
@@ -782,6 +785,11 @@ def _job(name: str) -> dict:
     return jobs[name]  # type: ignore[no-any-return]
 
 
+def _margin_check(job_name: str) -> dict:
+    steps = _job(job_name)["steps"]
+    return next(s for s in steps if "--since" in str(s.get("run", "")))  # type: ignore[no-any-return]
+
+
 def _matrix_legs() -> list[dict]:
     """The `test` job's per-leg matrix entries, parsed out of the shell that BUILDS them in `changes`.
 
@@ -887,7 +895,7 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         assert ids.get(gated), (
             f"{gated!r} in {job_name} carries no `id:`, so its own outcome cannot be referenced"
         )
-        check = next(s for s in steps if "--since" in str(s.get("run", "")))
+        check = _margin_check(job_name)
         env = check.get("env") or {}
         referenced = {str(v) for v in env.values()}
         expected = "${{ steps." + str(ids[gated]) + ".outcome }}"
@@ -896,6 +904,71 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
         )
         joined = " ".join(referenced) + str(check.get("run", ""))
         assert "job.status" not in joined and "job.conclusion" not in joined
+
+
+@pytest.fixture(scope="module")
+def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return Path(require_bash(tmp_path_factory.mktemp("resolve-bash")))
+
+
+@pytest.mark.parametrize(
+    ("event", "script_rc", "step_rc", "warns"),
+    [
+        ("pull_request", 1, 1, False),  # a LOW margin still blocks before enqueue
+        ("merge_group", 1, 0, True),  # ... and is a warning in the queue
+        ("merge_group", 2, 2, False),  # a gate that could not measure still fails, queue or not
+        ("merge_group", 0, 0, False),
+        ("push", 1, 1, False),
+    ],
+)
+def test_the_engine_margin_check_is_advisory_only_for_a_low_margin_in_merge_group(
+    bash: Path, tmp_path: Path, event: str, script_rc: int, step_rc: int, warns: bool
+) -> None:
+    """The owner ruling of 2026-10-29 (quoted beside the step in ci.yml), pinned until #3515's
+    re-measure reverts it. Runs the step's REAL run body under the runner's own `bash -eo
+    pipefail`, with `python` stubbed to the script's exit code, so the pin is on behaviour rather
+    than on a spelling.
+
+    Falsified by widening the branch to `"$rc" -ne 0`, and separately by deleting the `::warning`
+    line: RED both times. Restored.
+    """
+    check = _margin_check("test")
+    assert "continue-on-error" not in check, "continue-on-error would also pass exit 2 in the queue"
+    assert (check.get("env") or {}).get("EVENT_NAME") == "${{ github.event_name }}"
+    summary = tmp_path / "summary.md"
+    summary.write_text("", encoding="utf-8")
+    env = probe_env(
+        bash,
+        dict(
+            os.environ,
+            EVENT_NAME=event,
+            LEG="ubuntu-latest",
+            STEP_CAP="46",
+            TESTS_OUTCOME="success",
+            GITHUB_STEP_SUMMARY=summary.as_posix(),
+        ),
+    )
+    stub = f"python() {{ return {script_rc}; }}\n"
+    done = subprocess.run(
+        [str(bash), "-eo", "pipefail", "-c", stub + str(check["run"])],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    print(f"[step-margin] {event} rc {script_rc}: step {done.returncode}; {done.stdout.strip()!r}")
+    assert done.returncode == step_rc, done.stdout + done.stderr
+    assert ("::warning" in done.stdout) is warns, done.stdout
+    assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
+
+
+def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
+    """The ruling names the engine suite's check only. Falsified by adding a merge_group branch or
+    a `continue-on-error` to this step: RED. Restored."""
+    check = _margin_check("webconsole")
+    assert "continue-on-error" not in check, check.get("continue-on-error")
+    assert "merge_group" not in str(check.get("run", ""))
 
 
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:
@@ -1026,7 +1099,7 @@ def _cap_knob(job_name: str) -> str:
     what the workflow actually feeds the gate. `${{ }}` cannot appear in a `run:` body here (zizmor),
     so the value always arrives as an env var and the hop is always there to follow.
     """
-    check = next(s for s in _job(job_name)["steps"] if "--since" in str(s.get("run", "")))
+    check = _margin_check(job_name)
     run = str(check.get("run", ""))
     var = re.search(r'--cap-minutes\s+"?\$\{?(\w+)\}?"?', run)
     assert var, f"{job_name}'s margin check does not pass --cap-minutes at all: {run!r}"

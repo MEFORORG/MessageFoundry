@@ -11,6 +11,10 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
   can read it or change it.
 
+Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
+the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
+here so the `cert` commands, which write through this module, need not import the API TLS module.
+
 ``store._secure_file`` is the other mechanism, and it is for files that hold no key: it tightens a
 file that already exists and only logs when it cannot. A file that holds a key must never have that
 as its only protection.
@@ -33,7 +37,8 @@ from __future__ import annotations
 import os
 import stat
 import sys
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,7 +53,15 @@ from messagefoundry.auth.anchor_path import (
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
-__all__ = ["RestrictedFileError", "broad_access_problem", "write_restricted_file"]
+__all__ = [
+    "WINERROR_ACCESS_DENIED",
+    "WINERROR_SHARING_VIOLATION",
+    "RestrictedFileError",
+    "broad_access_problem",
+    "ride_out_a_held_file",
+    "unlink_generated",
+    "write_restricted_file",
+]
 
 
 class RestrictedFileError(OSError):
@@ -120,6 +133,11 @@ _REACH_MASK = (
     | 0x80000000  # GENERIC_READ
 )
 
+#: The same, for a DIRECTORY that holds key or secret files: also FILE_DELETE_CHILD, which lets its
+#: holder delete any file in the directory whatever that file's own access list says. Deleting a
+#: secret file can send its setting back to a less protected source (vault BACKLOG #2595).
+_DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
+
 #: Groups and logon classes that many accounts hold, beyond the ones the trust-anchor check already
 #: names (``auth.trust_anchors._is_broad_sid``: Everyone, Authenticated Users, Users, Guests, the
 #: INTERACTIVE, NETWORK, BATCH and SERVICE logon classes, Domain Users and Domain Guests). **At
@@ -165,7 +183,7 @@ def _is_broad_group(sid: str) -> bool:
     return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
 
 
-def _windows_access_problem(security: _WinPathSecurity) -> str | None:
+def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
     """Why a broad group can read or change the file this access list belongs to, or ``None``.
 
     A list that could not be read is a problem too, and so is an entry of a kind this check cannot
@@ -178,14 +196,14 @@ def _windows_access_problem(security: _WinPathSecurity) -> str | None:
         return "it has no access list at all, so every account on the host can read or change it"
     if security.aces is None:
         return "its access list could not be read in full"
-    for ace_type, mask, sid in security.aces:
+    for ace_type, ace_mask, sid in security.aces:
         if ace_type not in _GRANTING_ACE_TYPES:
             continue  # a deny or audit entry grants nothing
         if ace_type != ACCESS_ALLOWED_ACE_TYPE:
             # A conditional or object allow entry. The reader records neither its rights nor its
             # account, so who it lets in is unknown.
             return "its access list holds a conditional entry this check cannot interpret"
-        if mask & _REACH_MASK and _is_broad_group(sid):
+        if ace_mask & mask and _is_broad_group(sid):
             return f"{describe_sid(sid)} can read or change it"
     return None
 
@@ -200,8 +218,12 @@ def _posix_access_problem(mode: int) -> str | None:
     return None
 
 
-def broad_access_problem(path: Path) -> str | None:
+def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
+
+    With ``directory``, ``path`` is a directory that holds such files, and on Windows a broad
+    group's right to delete a file inside it (FILE_DELETE_CHILD) is a problem too. On POSIX the
+    group and other write bits, which the check already refuses, are that right.
 
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
     over. The groups are at least Everyone, Authenticated Users and the local Users group; the
@@ -221,8 +243,48 @@ def broad_access_problem(path: Path) -> str | None:
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        return _windows_access_problem(_win32_config_source_probes().read_path(path))
+        return _windows_access_problem(
+            _win32_config_source_probes().read_path(path),
+            _DIRECTORY_REACH_MASK if directory else _REACH_MASK,
+        )
     return _posix_access_problem(status.st_mode)
+
+
+# --- removing a file the engine wrote -------------------------------------------------------------
+
+#: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
+WINERROR_SHARING_VIOLATION = 32
+#: Windows ERROR_ACCESS_DENIED: what a REPLACE onto a file held open elsewhere returns, measured on
+#: Windows 11 with a reader holding the destination (a delete returns the sharing violation).
+WINERROR_ACCESS_DENIED = 5
+_HELD_RETRY_S = 2.0
+_HELD_POLL_S = 0.05
+
+
+def ride_out_a_held_file(action: Callable[[], None], held: frozenset[int]) -> None:
+    """Run ``action``, retrying for :data:`_HELD_RETRY_S` while Windows refuses it with one of the
+    ``held`` codes.
+
+    On Windows a file another process holds open cannot be deleted or replaced, and a certificate or
+    key is exactly the file other processes open: the tray pins it, and backup or antivirus may scan
+    it. That hold is momentary, so the refusal is retried before it propagates. Any other error, and
+    every error off Windows, propagates at once.
+    """
+    deadline = time.monotonic() + _HELD_RETRY_S
+    while True:
+        try:
+            action()
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in held or time.monotonic() >= deadline:
+                raise
+        time.sleep(_HELD_POLL_S)
+
+
+def unlink_generated(path: Path) -> None:
+    """Delete one file the engine wrote, riding out a brief Windows sharing violation. Shared by
+    the API's minted pair and the `cert` commands' cleanup, so neither imports the other."""
+    ride_out_a_held_file(path.unlink, frozenset({WINERROR_SHARING_VIOLATION}))
 
 
 # --- creating the file ----------------------------------------------------------------------------

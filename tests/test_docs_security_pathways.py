@@ -57,7 +57,7 @@ from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 from tests._ast_sites import call_sites
-from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
+from tests._sign_in_claim import SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -519,10 +519,19 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     )
 
 
+def _provider_reads(tree: ast.AST) -> int:
+    """How many provider branches ``tree`` holds: each ``.auth_provider`` read and each call of
+    ``_is_directory_account``, the service's shared reading (BACKLOG #3117, #3780). Docstrings are
+    constants, so they never match."""
+    attrs = sum(
+        1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+    )
+    return attrs + len(call_sites(tree, "_is_directory_account", bare_only=True))
+
+
 def _reads_auth_provider(func: Callable[..., Any]) -> bool:
-    """True when ``func``'s body reads ``.auth_provider``. Docstrings are constants, so they never match."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    return any(isinstance(n, ast.Attribute) and n.attr == "auth_provider" for n in ast.walk(tree))
+    """True when ``func``'s body holds a provider branch (:func:`_provider_reads`)."""
+    return _provider_reads(ast.parse(textwrap.dedent(inspect.getsource(func)))) > 0
 
 
 def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> None:
@@ -552,20 +561,22 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     """
 
     # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once.
-    def _attrs(func: object) -> list[str]:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
+    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    def _tree(func: object) -> ast.AST:
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+
+    def _attrs(tree: ast.AST) -> list[str]:
         return [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
 
-    verify_attrs = _attrs(AuthService.verify_mfa)
-    helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
-    reread_attrs = _attrs(AuthService._factor_holder_current)
+    verify_tree = _tree(AuthService.verify_mfa)
+    helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        verify_attrs.count("auth_provider") == 0
-        and reread_attrs.count("auth_provider") == 0
-        and "_directory_vouches_for_factor" in verify_attrs
-        and helper_attrs.count("auth_provider") == 1
-        and "_directory_step_up_refusal" in helper_attrs
+        _provider_reads(verify_tree) == 0
+        and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
+        and "_directory_vouches_for_factor" in _attrs(verify_tree)
+        and _provider_reads(helper_tree) == 1
+        and "_directory_step_up_refusal" in _attrs(helper_tree)
     ), (
         "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
         "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
@@ -580,10 +591,9 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         AuthService.finish_webauthn_registration,
     ):
         assert not _reads_auth_provider(func), (
-            f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
+            f"{func.__qualname__} now branches on the provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
         )
-    verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
     assert any(
         isinstance(n, ast.Attribute) and n.attr == "_register_failure"
         for n in ast.walk(verify_tree)
@@ -2094,13 +2104,16 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     assert set(counters) == {"sign_in", "second_step"}
     for counter in counters:
         for provider in ("local", "ad"):
-            for totp in (False, True):
-                want = provider == "local" and (counter == "second_step" or totp)
-                got = lockout_escalates(counter, auth_provider=provider, totp_enabled=totp)
+            for totp, passkey in itertools.product((False, True), repeat=2):
+                want = provider == "local" and (counter == "second_step" or totp or passkey)
+                got = lockout_escalates(
+                    counter, auth_provider=provider, totp_enabled=totp, passkey_way_past=passkey
+                )
                 assert got is want, (
-                    f"lockout_escalates({counter!r}, {provider!r}, totp={totp}) is now {got}; the "
-                    "Local row, control 1 and Table A say only the second-step lock on a local "
-                    "account and the sign-in lock on a local account with TOTP double."
+                    f"lockout_escalates({counter!r}, {provider!r}, totp={totp}, passkey={passkey}) "
+                    f"is now {got}; the Local row, control 1 and Table A say only the second-step "
+                    "lock on a local account and the sign-in lock on a local account with TOTP or "
+                    "a discoverable passkey double (BACKLOG #3937)."
                 )
 
     security = " ".join(_doc_text().split())
@@ -2153,8 +2166,11 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
         "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
         "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
-        "or whose value will not compute, still escalates. Every other lock keeps "
-        "`lockout_minutes`. A local account whose enrolment is known to be refused keeps it for "
+        "or whose value will not compute, still escalates. It does so too on a local account "
+        "holding a discoverable passkey under the configured relying party (BACKLOG #3937). "
+        "Every other lock keeps "
+        "`lockout_minutes`. A local account whose enrolment is known to be refused, and that holds "
+        "no such passkey, keeps it for "
         "serial failures only: a race listed under [WebAuthn passkeys]"
     )
     assert doubling in " ".join(local_row[2].split()), (
@@ -2263,7 +2279,11 @@ _RETRACTED_CRL_SIGNATURE_CLAIMS = (
 #: Sentences the guide must keep, each for a fact a reader acts on.
 _REQUIRED_CRL_SIGNATURE_SENTENCES = (
     "an earlier version is logged again when it returns after another version that was logged",
-    "the engine does not check its signature, at a start or at a reload",
+    # Finding (f): the older wording read as if nothing checked it, the expiry scan included.
+    "neither a start nor a reload checks its signature",
+    # Finding (b) and the Manager's item 4: a staging retry is not a file to fix, and a start
+    # can refuse it too.
+    "The private copy is about the temporary directory, not the CRL.",
 )
 
 
@@ -3251,8 +3271,8 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         == settings_module.KEYLESS_REFUSED_BY_NO_STRICT_ACK
     ), "the opt-out alone lifts the keyless refusal under `enforce` now; restate docs/PHI.md §3."
     assert settings_module.keyless_opt_out_refusal(opted_out, acknowledged) is None, (
-        "the audited opt-out no longer lifts the keyless refusal; restate the guide's and "
-        "docs/CONTAINER-EXPOSURE-EVALUATION.md's `require_encryption` sentences."
+        "the audited opt-out no longer lifts the keyless refusal; restate the `require_encryption` "
+        "sentences in every doc test_no_doc_credits_require_encryption_with_the_keyless_refusal reads."
     )
     assert (
         settings_module.keyless_opt_out_refusal(
@@ -3397,6 +3417,22 @@ _SIGN_IN_OFF = re.compile(
     re.IGNORECASE,
 )
 
+#: Sign-in REQUIRED only by default, in either word order: "requires authentication by default",
+#: "authentication is required by default", "by default the API requires sign-in". Calling it a
+#: default says a setting can change it, which no setting can (vault BACKLOG #3477). A denial makes
+#: it worse, not true ("does not require auth by default"), so no denial clears this pattern.
+_SIGN_IN_DEFAULT = re.compile(
+    rf"\b(?:an? )?{_SIGN_IN}\b(?: (?:is|are|be))? required,? by default\b"
+    rf"|\brequire[sd]? (?:an? )?{_SIGN_IN}\b,? by default\b"
+    # One subject between: "binds 127.0.0.1 by default and requires auth" ties the default to the bind.
+    rf"|\bby default,? (?:the |an? )?(?!(?:and|or|but)\b)\w+ requires? (?:an? )?{_SIGN_IN}\b",
+    re.IGNORECASE,
+)
+
+#: A leg's or another system's name, anywhere in the stretch that holds a default match: "the SMTP
+#: relay requires authentication by default" is about the relay, not the engine's sign-in.
+_ONE_LEG = re.compile(r"\b(?:" + "|".join(_SIGN_IN_LEGS) + r")\b", re.IGNORECASE)
+
 #: A denial just ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
 _DENIED_BEFORE = re.compile(r"\b(?:no|not|never|cannot|nothing)\b|n't\b", re.IGNORECASE)
 
@@ -3413,14 +3449,22 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     comma, colon, dash or bracket. So a return of the claim behind a "no" or "not" in that stretch
     still passes, and so does one joined on by "and". A true sentence can trip it, at least "that
     account's sign-in is disabled" and "a request without authentication is answered 401": that is
-    loud, and rewording clears it."""
+    loud, and rewording clears it.
+
+    ``_SIGN_IN_DEFAULT`` is read apart: no denial clears it, and a leg or system named in its
+    stretch does. So a true sentence about the engine that also names one ("the local API requires
+    sign-in by default") passes, and so would the claim written that way."""
+
+    def stretch(c: str, m: re.Match[str]) -> str:
+        return re.split(r"[,:(—–]", c[: m.start()])[-1]
+
     return [
         c
         for c in clauses
         if _AUTH_DISABLED.search(c)
+        or any(not _DENIED_BEFORE.search(stretch(c, m)) for m in _SIGN_IN_OFF.finditer(c))
         or any(
-            not _DENIED_BEFORE.search(re.split(r"[,:(—–]", c[: m.start()])[-1])
-            for m in _SIGN_IN_OFF.finditer(c)
+            not _ONE_LEG.search(stretch(c, m) + m.group(0)) for m in _SIGN_IN_DEFAULT.finditer(c)
         )
     ]
 
@@ -3472,6 +3516,17 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Authentication is opt-in.",
         "Auth is enabled by default, and the engine creates no account on its own.",
         "The console prompts for sign-in (authentication is on by default).",
+        # docs/USER-GUIDE.md's network paragraph, as engine PR 2303 left it (vault BACKLOG #3477).
+        "The API binds 127.0.0.1:8765, serves HTTPS, and requires authentication by default.",
+        # Its rewordings, in either word order, and with a denial, which only makes it worse.
+        "Authentication is required by default.",
+        "sign-in is required by default",
+        "By default the API requires authentication.",
+        "The API requires auth, by default.",
+        "The engine requires a sign-in by default.",
+        "The API does not require authentication by default.",
+        "The engine no longer requires sign-in by default.",
+        "The API doesn't require auth by default.",
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
@@ -3493,6 +3548,13 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "`intake_auth` defaults to `none`, so the listener checks no credential.",
         "Off-box log forwarding needs a collector on another host.",
         "Two-factor authentication is on by default.",
+        "The API serves HTTPS, and always requires sign-in: no setting turns it off.",
+        "The API binds 127.0.0.1:8765 by default and requires auth.",
+        "The SMTP relay requires authentication by default.",
+        # Each matches ``_SIGN_IN_DEFAULT``, and the named system exempts it.
+        "The LDAP server requires authentication by default.",
+        "By default LDAP requires authentication.",
+        "Two-factor authentication is required by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3537,13 +3599,22 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
 
 @pytest.mark.parametrize(
     ("name", "floor"),
-    [("docs/EARLY-ADOPTER-GUIDE.md", 300), ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150)],
+    [
+        ("docs/EARLY-ADOPTER-GUIDE.md", 300),
+        ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150),
+        ("docs/CLOUD-DEPLOYMENT.md", 250),
+        ("docs/CLOUD-PHI-HIPAA.md", 110),
+        ("docs/CONFIGURATION.md", 5000),
+    ],
 )
 def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, floor: int) -> None:
     """The early-adopter guide told the reader to set `[store].require_encryption` to get the
     keyless refusal, and engine PR 2015 retired that. docs/CONTAINER-EXPOSURE-EVALUATION.md said
     the same in three places, and no guard read that file for it (vault BACKLOG #2993, items 5 and
-    6). A keyless start is refused by default. The key keeps the refusal past the audited opt-out."""
+    6). docs/CLOUD-DEPLOYMENT.md, docs/CLOUD-PHI-HIPAA.md and docs/CONFIGURATION.md said it too, and
+    no guard read them either (vault BACKLOG #3477). A keyless start is refused by default. The key
+    keeps the refusal past the audited opt-out. Each floor sits below the file's count on
+    2026-10-26."""
     units = _clauses_and_rows(_doc(name))
     assert len(units) >= floor, (
         f"{name} cut into {len(units)} clause(s) and row(s), floor {floor}: the require_encryption "
@@ -3555,6 +3626,98 @@ def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, f
     assert not credited, (
         f"{name} says require_encryption creates the keyless refusal again: {credited}. A keyless "
         "start is refused by default; the key keeps that refusal past the audited opt-out."
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "floor"),
+    [
+        ("docs/USER-GUIDE.md", 600),
+        ("docs/CLOUD-DEPLOYMENT.md", 250),
+        ("docs/CLOUD-PHI-HIPAA.md", 110),
+    ],
+)
+def test_these_docs_do_not_say_sign_in_can_be_off(name: str, floor: int) -> None:
+    """docs/USER-GUIDE.md said the API requires authentication "by default" and that it is "on by
+    default", and no guard read that file for it (vault BACKLOG #3477). `serve` always requires
+    sign-in: the load refuses both keys that once turned it off (the second-round probe above).
+
+    docs/CLOUD-PHI-HIPAA.md section 6 states the posture; docs/CLOUD-DEPLOYMENT.md states none, so
+    for it this is a floor against a claim arriving. A table row is read whole, but the patterns
+    need their words side by side, so a claim split across cells ("| Sign-in | optional |") still
+    passes. docs/CONFIGURATION.md is left out: it holds at least one true sentence the scan
+    reds, and a stale "required by default" in its `[auth]` section, both outside what vault BACKLOG
+    #3477 was briefed to edit. Each floor sits below the file's count on 2026-10-26."""
+    clauses = _clauses_and_rows(_doc(name))
+    assert len(clauses) >= floor, (
+        f"{name} cut into {len(clauses)} clause(s) and row(s), floor {floor}: the sign-in scan reads "
+        "too little to clear it."
+    )
+    disabled = _says_sign_in_can_be_off(clauses)
+    assert not disabled, (
+        f"{name} says sign-in can be off, or is only a default, again: {disabled}. `serve` always "
+        "requires sign-in."
+    )
+
+
+def test_phi_egress_and_the_feature_map_forwarding_row_state_what_the_code_does() -> None:
+    """docs/PHI.md section 4 called the `[egress]` allowlist opt-in, empty meaning unrestricted, and
+    docs/FEATURE-MAP.md section 8 marked JSON logs and off-box forwarding deferred (vault BACKLOG
+    #3477). Egress is deny-by-default, and both log features are built; only structlog is not."""
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.logging_setup import SyslogForward
+
+    assert settings_module.EgressSettings.model_fields["deny_by_default"].default is True, (
+        "egress is not deny-by-default any more; restate docs/PHI.md section 4."
+    )
+    # The paragraph, not the section: the section's MLLP row says "opt-in mTLS", which is true.
+    egress = [
+        p
+        for p in re.split(r"\n\s*\n", _doc_section("docs/PHI.md", "## 4. Data in transit"))
+        if "Outbound destination allowlist" in p
+    ]
+    assert len(egress) == 1, f"docs/PHI.md section 4 must hold one egress paragraph: {egress}"
+    clauses = _clauses(egress[0])
+    assert len(clauses) >= 4, f"docs/PHI.md's egress paragraph cut into {len(clauses)}, floor 4"
+    assert "(CONFIGURATION.md#egress)" in egress[0], (
+        "docs/PHI.md's egress paragraph must link to CONFIGURATION.md#egress, which states the rule"
+    )
+    assert any(re.search(r"\bdeny-by-default\b", c, re.IGNORECASE) for c in clauses), (
+        "docs/PHI.md's egress paragraph no longer says the allowlist is deny-by-default"
+    )
+    # At least the words the retired claim used, and its plainest rewordings. Others pass.
+    open_words = re.compile(
+        r"\bopt-in\b|\bunrestricted\b|\boptional\b|\ballow(?:s|ed)? (?:any|all|every)\b"
+        r"|\ballow-(?:any|all)\b",
+        re.IGNORECASE,
+    )
+    opt_in = [c for c in clauses if open_words.search(c)]
+    assert not opt_in, f"docs/PHI.md section 4 calls the egress allowlist opt-in again: {opt_in}"
+
+    # The row names `[logging].format` and `[logging].forward_host`, and says serve forwards.
+    assert settings_module.LogFormat("json") is settings_module.LogFormat.JSON
+    assert {"format", "forward_host"} <= set(settings_module.LoggingSettings.model_fields)
+    assert "allowed_syslog" in settings_module.EgressSettings.model_fields
+    main_tree = ast.parse((_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8"))
+    assert inspect.isclass(SyslogForward) and _called(main_tree, "SyslogForward"), (
+        "serve no longer builds the SyslogForward handler; docs/FEATURE-MAP.md section 8 says "
+        "off-box forwarding is built."
+    )
+    section = _doc_section("docs/FEATURE-MAP.md", "## 8. PHI / Compliance")
+    rows = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in section.splitlines()
+        if line.lstrip().startswith("|") and re.search(r"off-box|JSON log", line, re.IGNORECASE)
+    ]
+    assert rows, "docs/FEATURE-MAP.md section 8 no longer has its off-box forwarding row"
+    # The legend's shipped mark, or its word. The word keeps the new-glyph hook level, since the hook
+    # counts a swap of one glyph for another as an added codepoint. Read the cell's first word, so a
+    # trailing "(PR #N)", as section 9 writes it, still reads as shipped.
+    shipped = {"\u2705", "Shipped"}
+    stale = [row for row in rows if (row[1].split() or [""])[0] not in shipped]
+    assert not stale, (
+        f"docs/FEATURE-MAP.md section 8 marks JSON logs or off-box forwarding other than shipped: "
+        f"{stale}. Both are built (`[logging].format`, `SyslogForward`)."
     )
 
 
@@ -3937,6 +4100,7 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
             settings = AuthSettings(
                 ad_enabled=True,
                 kerberos_enabled=True,
+                kerberos_realm="EXAMPLE.COM",
                 ad_server="ldaps://x",
                 ad_user_search_base="DC=x",
                 ad_bind_dn="CN=svc,DC=x",
@@ -4069,22 +4233,27 @@ def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str
         ), "the caveat must say the allow-list is not consulted once intake_auth names a mode"
 
 
-def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
-    """docs/SECURITY-LOOSENING.md said the password of every user who signs in crosses a plain
-    `ldap://` hop. Simple-bind sign-in is retired; the step-up re-bind is the only user bind left
-    (the probe above)."""
+def test_the_loosening_guide_lists_a_plain_ldap_bind_as_refused_not_as_a_loosening() -> None:
+    """Vault BACKLOG #3533 item 1 removed ``[auth].ad_allow_insecure_ldap``. Its loosening entry,
+    which this test once read for a sign-in claim, went with it. The guide must not describe the
+    plain bind as a lever any more, and its credential-refusal table must name it."""
     doc = _doc("docs/SECURITY-LOOSENING.md")
-    start = doc.index("### `[auth].ad_allow_insecure_ldap = true`")
-    section = doc[start : doc.index("\n### ", start + 1)]
-    clauses = [c for c in _clauses(section) if "password" in c]
-    assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
-    # The shared pattern in every tense, so "sign-in", "login", "signed in" and "logged on" are read.
-    at_sign_in = [c for c in clauses if SIGN_IN_ANY_TENSE.search(c)]
-    assert not at_sign_in, (
-        f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
+    assert "### `[auth].ad_allow_insecure_ldap" not in doc, (
+        "docs/SECURITY-LOOSENING.md still has a loosening entry for the removed opt-in"
     )
-    assert any(re.search(r"\bstep(?:s|-)? ?up\b", c) for c in clauses), (
-        "the cleartext-LDAP section must say the step-up re-bind carries the user's password"
+    start = doc.index("## No escape sends a credential to an unverified peer")
+    section = doc[start : doc.index("\n## ", start + 1)]
+    table, _, rest = section.partition("**The rule does not reach every hop yet.**")
+    assert re.search(r"^\| `\[auth\]` AD binds \| `ad_server` is a plain `ldap://`", table, re.M), (
+        "the refusal table does not name the plain ldap:// AD bind"
+    )
+    end = rest.find("\nAn SFTP login")
+    bullets = [
+        line for line in rest[: end if end != -1 else None].splitlines() if line.startswith("- ")
+    ]
+    assert bullets, "found no bullets under the not-reached heading, so this check reads nothing"
+    assert not [b for b in bullets if "ldap://" in b], (
+        "the not-reached list still names the plain ldap:// bind"
     )
 
 
@@ -4538,13 +4707,10 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     )
     # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
-        1
-        for fn in (assertion, helper, _service_func("_factor_holder_current"))
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+        _provider_reads(fn) for fn in (assertion, helper, _service_func("_factor_holder_current"))
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "
+        f"finish_webauthn_assertion and its two helpers branch on the provider {provider_reads} "
         "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
         "directory check."
     )

@@ -37,7 +37,7 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 
 | Section | What it does |
 |---|---|
-| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; the host cipher policy those ODBC hops take (`host.ciphers`: AEAD-only suites, TLS 1.0/1.1 off; reports only; when it reads the policy, and its statuses, are in [DEPLOY-SERVER-DB.md section 5.4](../DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition)); listener ports bindable (+ firewall = MANUAL); store/working dir **already exists and is** writable (+ service-account ACLs = MANUAL); every `sc.exe` spawn passes `CREATE_NO_WINDOW` (no-flash; Windows-only, SKIP elsewhere). |
+| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; the host cipher policy those ODBC hops take (`host.ciphers`: AEAD-only suites, TLS 1.0/1.1 off; on Linux without `OPENSSL_CONF`, it reads the floor from both the file `openssl` names and `/etc/ssl/openssl.cnf`, and the worse reading stands, as section 5.4 says; changes no setting, but its FAIL or ERROR makes `verify` exit 1, as any row's does; when it reads the policy, and its statuses, are in [DEPLOY-SERVER-DB.md section 5.4](../DEPLOY-SERVER-DB.md#54-host-cipher-policy-for-the-odbc-hops-operator-precondition)); listener ports bindable (+ firewall = MANUAL); store/working dir **already exists and is** writable (+ service-account ACLs = MANUAL); every `sc.exe` spawn passes `CREATE_NO_WINDOW` (no-flash; Windows-only, SKIP elsewhere). |
 | **store** | Opens the **already-existing** configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes**. A SQLite store the engine has never created is a FAIL, not a PASS. Run once per backend the box is pointed at. |
 | **smoke** | `self` (default) routes a synthetic HL7 through your config via dry-run — **no store, no network, no side effects**; `live` MLLP-sends one synthetic message to the running engine and confirms an **AA ACK**; `none` skips. Add **`--check-disposition`** (+ `--service-config`) to also poll the store and **FAIL unless the message reached `PROCESSED`** (a new `smoke.disposition` row). |
 | **manual** | Echoes the human-only steps (AD/Kerberos login, TOTP MFA, API bind+TLS, NSSM service, end-to-end disposition in the console) as MANUAL with instructions. |
@@ -54,7 +54,9 @@ So a mistyped `[store].path` is now a FAIL where it used to be a PASS — the ch
 because it made whatever it was pointed at. Run `python -P -X disable-remote-debug -m messagefoundry serve` once before
 `--section store`. And running `verify` elevated no longer leaves an administrator-owned store and
 directory tree at the configured path, which is the service-identity gap the `store.connect` row's
-own text tells you to go and confirm.
+own text tells you to go and confirm. It can still leave a SQLite store's `-wal` and `-shm` files,
+as the table below says, so run `verify` against a stopped engine's store as the service account,
+or while the engine runs.
 
 **That is narrower than "verify only reads", and the difference matters on a live box.** At least
 these things still write:
@@ -63,18 +65,42 @@ these things still write:
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
 | `host.ciphers` | a host run where `pyodbc` is installed, on Windows or Linux (DEPLOY-SERVER-DB.md section 5.4 says what it reads) | nothing of its own. Its hop census loads the `--config` graph, which can leave Python's `__pycache__` files in that folder, as the self smoke can. On Windows, the PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
-| `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
+| `store.connect` | `--section store`, store **already exists** | no schema DDL. On SQLite, the `-wal`/`-shm` sidecars of a WAL store, as any reader creates them, as the calling user. A read-only close does not remove them, so with the engine stopped they stay after `verify` exits, owned by the calling user. On PostgreSQL or SQL Server under `schema_management = external` (the server default), the at-open writes any non-read-only open makes, as the `[store]` database login. At least: the store salt bind, the invocation reserve, the at-rest sweep, which seals any legacy plaintext under the key this shell holds, and on a keyed store with an empty log the audit genesis row |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 
-Two limits of the SQLite gate to know before pointing `verify` at something you care about:
+`tests/test_verify.py` pins which `open_store` calls in `verify` are read-only (BACKLOG #1708). At
+least the `auth.lockable_accounts` census and both `--check-disposition` reads always are, and so is
+`store.connect` everywhere but one case. What that means per backend:
 
-- **It is scoped to SQLite.** On PostgreSQL and SQL Server, `open_store` builds the full schema in
-  whatever database it is pointed at. A wrong-but-*existing* database name — `postgres`, or a
-  sibling application's — connects and gets populated, and reports PASS. Only a wrong database
-  *name* fails at connect. Check `[store].database` before running `--section store` against a
-  server backend.
-- **It stops creation, not writing.** Against a store that does exist, `store.connect` still runs
-  the schema-ensure as *you*. If you are elevated, that is still the identity gap above.
+- **SQLite.** The file is opened `mode=ro`, so SQLite itself refuses every write. On a file that is
+  not a MessageFoundry store, such as a sibling application's database, `store.connect` FAILs and
+  nothing is built into it.
+- **PostgreSQL and SQL Server under `schema_management = external`**, which is what an unset
+  setting resolves to on a server. `store.connect` makes a writable open, as before BACKLOG #1708.
+  It runs no DDL there. It refuses a `schema_meta` marker that is missing or not current. On
+  PostgreSQL it also refuses missing runtime grants. On SQL Server it refuses
+  `READ_COMMITTED_SNAPSHOT` off, and only logs `ALLOW_SNAPSHOT_ISOLATION` off. It is not
+  `serve`'s own open: it passes no keyless-chain verdict and no hop posture. So `serve` can still
+  refuse a store this PASSes. Its at-open writes are in the table above. The census and the
+  disposition reads stay read-only.
+- **Run that open only with the service's own store key settings.** That means the same key, key
+  file, environment variables and `cipher_provider` the service uses. Its genesis row and at-rest
+  sweep write under the key this shell holds. A service on other key settings then cannot verify
+  that genesis row or read those sealed cells. So never run it between changing those settings and
+  restarting `serve`.
+- **PostgreSQL and SQL Server under `schema_management = auto`.** A writable open would run DDL, so
+  every open is read-only. It runs no DDL and no `ALTER DATABASE`. A wrong database *name* fails at
+  connect. A database that exists but has no `schema_meta` table this login can see, such as
+  `postgres` or a sibling application's, is a FAIL, and nothing is built into it. What stops a write
+  after the open is the login's grants, not the handle.
+- **A stale schema is not reported as such on a read-only open.** A store whose schema differs from
+  this build's is opened as it is, neither migrated nor refused, and the store logs a WARNING. `store.connect` reads
+  PASS for it unless the open itself needs an object the store lacks, so a PASS does not prove the
+  schema is current. A later read that needs a missing object fails on its own row.
+- **A read-only PASS proves read access, not write access or readiness to serve.** A read-only
+  open writes nothing to the store, so a store file the calling user can read but not write can be
+  a PASS. Where a WAL store has no `-wal` and `-shm` files yet, SQLite must create them, so a user
+  who cannot write the directory FAILs even with read access.
 
 ### Handling a captured `id_token`
 

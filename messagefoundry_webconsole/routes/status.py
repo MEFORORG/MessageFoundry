@@ -38,52 +38,6 @@ _log = logging.getLogger(__name__)
 _DISK_WARN_BYTES = 5 * 1024**3  # < 5 GiB free → warn (orange)
 _DISK_CRIT_BYTES = 1 * 1024**3  # < 1 GiB free → critical (blinking red)
 
-# ``DbStatus.journal_mode`` already carries the backend on the wire — Postgres reports the literal
-# "postgres", SQL Server its recovery model, SQLite the PRAGMA journal mode — which is what lets this
-# rollup tell "not applicable" from "the probe broke" with no second field. Only the SERVER modes are
-# listed: anything unrecognised counts as a local disk, so a null from an unknown backend ALARMS
-# rather than going quiet. That direction is deliberate — silence is the failure this rule exists to
-# prevent, and a new backend added here is louder than it should be (visible, and fixed on sight)
-# rather than quieter (never noticed). SQLite's modes (delete/truncate/persist/memory/wal/off) share
-# no spelling with these, so the two vocabularies cannot collide.
-#
-# ONE case lands on the loud side by judgement rather than by evidence: the EMPTY string. Both
-# stores fall back to "" when their own mode read comes back empty, so it names no backend. SQLite
-# reaches it only if `PRAGMA journal_mode` returns no row, which a live connection does not do;
-# SQL Server reaches it if the `sys.databases` recovery read returns nothing. So "" is in practice
-# a SQL Server tell, and treating it as local means a server whose recovery probe failed warns
-# about a disk that was never ours to see. That is accepted here: both paths are near-unreachable,
-# and of the two wrong answers a visible one beats a silent one. Resolving it properly needs the
-# backend stated outright rather than inferred, which is the deferred `disk_free_status` field.
-#
-# `PoolInfo.backend` was considered and declined, though naming the backend is literally its job:
-# `pool` is None on SQLite (no pool) and DEFAULTED None on the wire, so it cannot separate "SQLite"
-# from "a server backend that reported no pool" -- the same conflation this rule exists to end, and
-# `DbInfo.synchronous` is defaulted the same way. `journal_mode` is the only backend-bearing field
-# on `DbInfo` that is REQUIRED and never defaulted, which is why an imperfect discriminator on a
-# required field beats a cleaner one that may be absent.
-_SERVER_DB_JOURNAL_MODES = frozenset({"postgres", "full", "bulk_logged", "simple"})
-
-
-def _db_disk_free_is_self_measured(journal_mode: str) -> bool:
-    """Whether the engine measures the DB's free space ITSELF, read from the backend discriminator
-    already on the wire (:attr:`DbInfo.journal_mode`). That is the question the caller has: it
-    decides whether a null ``disk_free_bytes`` is a failed probe or a reading never taken.
-
-    True on the default SQLite backend, where ``disk_free_bytes`` comes from a ``shutil.disk_usage``
-    the engine ran, and is ``None`` for exactly one reason: that call raised. There is no
-    not-applicable reading, so a null is a FAILED probe on a path that should have been readable.
-
-    False on the server backends, whose disk the engine never looks at — a null is "not applicable"
-    and claims nothing. An unrecognised mode answers True on purpose; see
-    :data:`_SERVER_DB_JOURNAL_MODES`. Compared case-folded, because SQLite reports its mode
-    lowercase and SQL Server reports its recovery model uppercase.
-
-    Named for the measurement and NOT for the disk being local: a SQLite store on an SMB or NFS
-    share sits on a remote disk and must still answer True, because the engine still stats it.
-    """
-    return journal_mode.strip().lower() not in _SERVER_DB_JOURNAL_MODES
-
 
 def _derive_health(
     sysinfo: SystemStatus | None,
@@ -104,9 +58,9 @@ def _derive_health(
       **warn**, naming it. That is a configured log directory, and the DB drive on the default
       SQLite backend — for both, a null ``disk_free_bytes`` has one cause, a probe that failed on a
       path that should have been readable. On a server backend the DB null means "not applicable"
-      instead and stays silent; ``journal_mode`` tells the two apart. Not comparing is not the same
-      as saying nothing, and collapsing them let a SQLite DB drive that stopped being stattable
-      read green.
+      instead and stays silent; the backend says which through ``DbInfo.disk_free_status``. Not
+      comparing is not the same as saying nothing, and collapsing them let a SQLite DB drive that
+      stopped being stattable read green. A status this build does not recognise warns.
 
       Scoped to the free-space half on purpose, because that is all this rollup reads. ``LogInfo``
       meters size and free space INDEPENDENTLY, so a log directory that is unlistable but sits on a
@@ -158,15 +112,17 @@ def _derive_health(
         # (label, free bytes, the reason to raise if a null HERE means a failed probe rather than a
         # disk the engine was never meant to see). The third element carries the rule with the entry
         # that owns it, so the loop never has to infer health policy from a display label.
-        frees: list[tuple[str, int | None, str | None]] = [
-            (
-                "db",
-                sysinfo.db.disk_free_bytes,
-                "db directory missing or unreadable"
-                if _db_disk_free_is_self_measured(sysinfo.db.journal_mode)
-                else None,
-            )
-        ]
+        frees: list[tuple[str, int | None, str | None]] = []
+        # BACKLOG #1563: the backend STATES whether its DB disk is measured. A server backend says
+        # not_applicable and is skipped whatever its journal_mode reads; observed and unobservable
+        # are the engine's own probe, so a null there is a failed probe and warns. DbInfo refuses
+        # an unknown status at validation; one that arrives around it warns, naming the value,
+        # rather than going quiet.
+        disk_status = sysinfo.db.disk_free_status
+        if disk_status in ("observed", "unobservable"):
+            frees.append(("db", sysinfo.db.disk_free_bytes, "db directory missing or unreadable"))
+        elif disk_status != "not_applicable":
+            issues.append((1, f"db disk status not recognised: {disk_status!r}"))
         if sysinfo.logs is not None:
             frees.append(
                 ("logs", sysinfo.logs.disk_free_bytes, "log directory missing or unreadable")
@@ -174,7 +130,7 @@ def _derive_health(
         for label, free, unmeasurable_reason in frees:
             if free is None:
                 # BACKLOG #1563. WHETHER a null here means "the probe failed" or "not applicable"
-                # is decided at the `frees` entry above (`_db_disk_free_is_self_measured`); this
+                # is decided at the `frees` entries above, from the backend's stated status; this
                 # branch only acts on it. Staying quiet on a FAILED probe would trade #1563's wrong
                 # answer for a silent one, and the SQLite shape is reachable: the store holds its
                 # file handle open, so queries keep succeeding while the parent directory's ACL or

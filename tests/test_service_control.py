@@ -172,9 +172,10 @@ def test_installer_keeps_restart_and_throttle_guardrails() -> None:
 #
 # service.py's own elevated-dispatch guards (the service-name / environment metacharacter rejections)
 # and the exact ShellExecuteW argument construction had no coverage: test_service_cli mocks
-# control_service / install_service wholesale so the real ShellExecuteW line is never reached, and
-# test_service_status covers a *different* module's is_safe_service_name. These fill that gap without a
-# real elevation (ShellExecuteW is monkeypatched) or a real installed service.
+# control_service / install_service wholesale so the real ShellExecuteW line is never reached.
+# test_service_status covers the guard itself, service_status.is_safe_service_name, which service.py
+# imports (BACKLOG #1680). These fill that gap without a real elevation (ShellExecuteW is
+# monkeypatched) or a real installed service.
 
 
 def _recorded_dispatch(monkeypatch: pytest.MonkeyPatch) -> _ShellExecRecorder:
@@ -296,7 +297,9 @@ def test_install_params_rejects_unsafe_paths(bad: str, field: str) -> None:
         _install_params("script.ps1", "dev", config=config, service_config=service_config)
 
 
-@pytest.mark.parametrize("bad", [";", "&", '"', "a b", "$x", "`", "a/b", "a\\b", "a&b", ""])
+@pytest.mark.parametrize(
+    "bad", [";", "&", '"', "a b", "$x", "`", "a/b", "a\\b", "a&b", "", "dev\n", "dev\r\n", "\ndev"]
+)
 def test_install_params_rejects_unsafe_environment(bad: str) -> None:
     """The env name is interpolated into an elevated PowerShell line — reject shell metacharacters."""
     with pytest.raises(ValueError, match="unsafe environment name"):
@@ -318,6 +321,90 @@ def test_control_service_rejects_unsafe_name_before_platform_check(
 def test_control_service_rejects_unsafe_names(bad: str) -> None:
     with pytest.raises(ValueError, match="unsafe service name"):
         control_service("start", bad)
+
+
+# BACKLOG #1680: names the one guard refuses by their first character or by a trailing line feed,
+# which `$` with `.match` used to admit. control_service_ex's are in test_service_control_outcome.
+_EDGE_NAMES = [
+    " MyEngine",
+    ".MyEngine",
+    "-MyEngine",
+    "_MyEngine",
+    "MyEngine\n",
+    "My Engine\n",
+    "MyEngine\r\n",
+]
+
+
+def test_installer_checks_the_environment_with_the_python_text() -> None:
+    """install-service.ps1's -Environment check is service.py's pattern, case-sensitive.
+
+    Case-sensitive because a case-insensitive [A-Za-z] in .NET also matches the Kelvin sign, and
+    the same text because a `$` there would admit a trailing line feed the Python guard refuses.
+
+    Matched as a whole live line, not a substring, so a commented-out check fails, and it must come
+    before the first line that writes ``--env $Environment`` into the service's parameters."""
+    lines = [ln.strip() for ln in _install_script_text().splitlines()]
+    # The whole installer was read, not a stub or a truncated copy: it is well over a thousand lines
+    # and still opens with its param block.
+    assert len(lines) >= 1000, f"CONTROL FAILED: install-service.ps1 read as {len(lines)} lines"
+    assert "param(" in lines, "CONTROL FAILED: install-service.ps1 has no param( line"
+    expected = f"if ($Environment -cnotmatch '{service_control._SAFE_ENV_NAME.pattern}') {{"
+    checks = [i for i, ln in enumerate(lines) if ln == expected]
+    assert len(checks) == 1, f"expected exactly one live line {expected!r}, found {len(checks)}"
+    # Any other live -Environment pattern test would be a second, unpinned copy.
+    others = [
+        ln
+        for ln in lines
+        if ln.startswith("if ($Environment -") and "match" in ln and ln != expected
+    ]
+    assert others == [], others
+    uses = [
+        i for i, ln in enumerate(lines) if "--env $Environment" in ln and not ln.startswith("#")
+    ]
+    assert uses, "CONTROL FAILED: no line writes --env $Environment; re-aim this guard"
+    assert checks[0] < uses[0], "the -Environment check must run before --env is written"
+
+
+def test_environment_guard_matches_the_engine_charset() -> None:
+    """service.py's environment pattern and settings' allowed set are one character set.
+
+    config/settings.py does not import service.py, whose elevated-launch imports
+    tests/test_dependency_boundaries.py tracks, so the two are pinned here instead. Every BMP code
+    point is asked, so a case-folding look-alike such as the Kelvin sign, or a character added to
+    one side only, fails (BACKLOG #1680)."""
+    from messagefoundry.config.settings import _ENV_NAME_ALLOWED
+
+    # Exactly the 26 + 26 ASCII letters, 10 digits, and `.`, `_`, `-`.
+    assert len(_ENV_NAME_ALLOWED) == 65, sorted(_ENV_NAME_ALLOWED)
+    assert {"a", "Z", "0", "9", ".", "_", "-"} <= _ENV_NAME_ALLOWED
+    # The single characters service.py accepts, in code-point order, must be settings' set exactly.
+    accepted = [chr(cp) for cp in range(0x10000) if is_safe_environment(chr(cp))]
+    assert accepted == sorted(_ENV_NAME_ALLOWED)
+
+
+def test_service_uses_the_one_guard_from_service_status() -> None:
+    """No second copy to drift: service.py imports the sibling's guard."""
+    assert service_control.is_safe_service_name is service_status.is_safe_service_name
+    assert not hasattr(service_control, "_is_safe_service_name")
+    assert not hasattr(service_control, "_SAFE_SERVICE_NAME")
+
+
+@pytest.mark.parametrize("bad", _EDGE_NAMES)
+def test_control_service_refuses_edge_names(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    # Off Windows, so a guard regression returns False and fails here instead of elevating for real.
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
+    with pytest.raises(ValueError, match="unsafe service name"):
+        control_service("restart", bad)
+
+
+@pytest.mark.parametrize("bad", _EDGE_NAMES)
+def test_service_state_refuses_edge_names_without_running_sc(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    run = _fake_sc_query(monkeypatch)
+    assert service_state(bad) == "unavailable"
+    assert run.args == []
 
 
 def test_control_service_off_windows_returns_false_without_dispatch(
@@ -394,10 +481,21 @@ def test_is_safe_environment_accepts_valid(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b"]
+    "name",
+    ["", "a b", "a;b", "a&b", 'a"b', "a/b", "a\\b", "a$b", "a`b", "a|b", "dev\n", "dev\r\n", None],
 )
 def test_is_safe_environment_rejects_invalid(name: str) -> None:
     assert is_safe_environment(name) is False
+
+
+def test_install_service_refuses_a_non_str_environment_with_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An untyped caller gets the documented ValueError, which the CLI turns into exit 2."""
+    # Off Windows, so a guard regression returns UNSUPPORTED and fails here instead of elevating.
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
+    with pytest.raises(ValueError, match="unsafe environment name"):
+        install_service("script.ps1", None, config=_CFG)  # type: ignore[arg-type]
 
 
 def test_cli_start_unsafe_name_exits_2(

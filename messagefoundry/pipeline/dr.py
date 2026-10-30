@@ -54,22 +54,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
 from messagefoundry import proctree
-from messagefoundry.auth.trust_anchors import TrustAnchorError
+from messagefoundry.auth.trust_anchors import trust_anchor_cause
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
 
@@ -102,28 +103,24 @@ def _vip_note(cause: str) -> str:
 #: What a step-4 abort says in place of a trust-anchor refusal's own text (vault BACKLOG #3224).
 #: That text names the CA's path, the folders above it and its SHA-256. The server log comes
 #: first because it always has the refusal: a refused setting, such as a blank ``tls_ca_pin``,
-#: writes no audit row. The connection's name is lost with the text, which is where it lives.
+#: writes no audit row. :func:`_anchor_refused` puts the refused setting in, when known.
 _ANCHOR_REFUSED = (
     "a trust anchor was refused; the server log says which one and why, and a refused file has "
     "auth.trust_anchor audit rows too"
 )
 
 
-def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` is a :class:`TrustAnchorError` or wraps one through its explicit
-    ``__cause__`` chain, the way the settings, registry and lane checks raise a refusal.
-
-    An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
-    being handled would then lose its own text. The API's connection-test route walks the chain
-    the same way; ``pipeline/`` cannot import it from there."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, TrustAnchorError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__
-    return False
+def _anchor_refused(setting: str | None) -> str:
+    """:data:`_ANCHOR_REFUSED`, naming the refused setting and its connection when the refusal
+    carries them (:attr:`TrustAnchorError.setting`, vault BACKLOG #3498). That names no path, so
+    an operator reading the 503 or the audit row knows which connection to fix. The limit takes
+    the longest connection name, 256 characters, with its kind and setting key."""
+    if not setting:
+        return _ANCHOR_REFUSED
+    return (
+        f"a trust anchor was refused ({safe_text(setting, limit=320)}); the server log says why, "
+        "and a refused file has auth.trust_anchor audit rows too"
+    )
 
 
 #: The one answer for every refused request archive, whichever check refused it. It names the
@@ -471,7 +468,11 @@ class DrCoordinator:
             await self._activate_profile()
         except Exception as exc:
             self._active = False
-            anchored = _caused_by_trust_anchor(exc)
+            refusal = trust_anchor_cause(exc)
+            anchored, named = refusal is not None, refusal.setting if refusal else None
+            # Only the setting is kept. A local holding the refusal would stay on the abort's
+            # traceback frame, and with it the text this arm keeps off the abort.
+            refusal = None
             if anchored:
                 # The refusal's own text goes to the server log only. The reason below reaches
                 # the API caller and the dr_activation_aborted row, which is teed off the box
@@ -486,7 +487,7 @@ class DrCoordinator:
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"
-            ) + f": {_ANCHOR_REFUSED if anchored else safe_exc(exc)}"
+            ) + f": {_anchor_refused(named) if anchored else safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
@@ -1279,7 +1280,12 @@ class DrCoordinator:
             # left taking the address. A release hook is left to finish late, as before, since
             # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command, stop_kills=phase == "takeover", on_start=mark_started),
+                _run_command(
+                    command,
+                    stop_kills=phase == "takeover",
+                    on_start=mark_started,
+                    pass_environment=self._settings.pass_environment,
+                ),
                 timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
@@ -1291,7 +1297,7 @@ class DrCoordinator:
             ok = False
             reason = f"VIP {phase} hook errored: {safe_exc(exc)}"
         else:
-            reason = "" if ok else f"VIP {phase} hook exited non-zero"
+            reason = "" if ok else f"VIP {phase} hook exited non-zero{_HOOK_ENVIRONMENT_HINT}"
         if not ok:
             if phase == "takeover":
                 # A hook that ran and then failed or was killed may have moved the address before
@@ -1366,17 +1372,39 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
+#: Appended to a failed hook's reason: its output is discarded, and a variable it read that nobody
+#: listed in `[dr].pass_environment` is the cause the allowlist adds (vault BACKLOG #2587).
+_HOOK_ENVIRONMENT_HINT = (
+    " (a hook gets only the variables childenv.hook_environment allows; add one it reads to "
+    "[dr].pass_environment and restart)"
+)
+
+
+def warn_unset_pass_environment(names: Collection[str]) -> None:
+    """Log, by name only, each ``[dr].pass_environment`` name the engine's environment lacks."""
+    unset = [name for name in names if name not in os.environ]
+    if unset:
+        log.warning("DR: [dr].pass_environment names a variable that is not set: %s", unset)
+
+
 async def _run_command(
-    command: str, *, stop_kills: bool = True, on_start: Callable[[], None] | None = None
+    command: str,
+    *,
+    stop_kills: bool = True,
+    on_start: Callable[[], None] | None = None,
+    pass_environment: Collection[str],
 ) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
-    Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587). ``on_start`` is called once the
-    hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
+    Its environment is the allowlist :func:`messagefoundry.childenv.hook_environment` builds, with
+    ``pass_environment`` (``[dr].pass_environment``) as its extras (vault BACKLOG #2587). It is
+    required, so a caller cannot run a hook without the operator's names by forgetting it. A listed
+    name the engine's environment does not hold is logged, by name only, since the hook's output
+    is discarded and an aborted activation would otherwise not point at it. ``on_start`` is called
+    once the hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
 
     **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
     bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
@@ -1389,12 +1417,13 @@ async def _run_command(
     processes, such as a service wrapper's tree kill or a signal to the engine's process group,
     can still end it. A hook that finishes on its own is left alone either way, including
     anything it left running."""
+    warn_unset_pass_environment(pass_environment)
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=hook_environment(),
+            env=hook_environment(extra_names=pass_environment),
             creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
             start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
         )

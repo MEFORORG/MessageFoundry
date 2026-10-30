@@ -114,7 +114,8 @@ _CONN_SERVER = "Per-connection TLS server key"
 _MTLS_CLIENT = "Outbound mTLS client key"
 _LOG_FORWARD = "Off-box log-forward client key"
 _API_CLIENT = "Native API client key"
-_NONPROD = "Non-production self-signed key"
+#: Not "non-production": a site may serve the `cert self-signed` placeholder (vault BACKLOG #3514).
+_SELF_SIGNED = "CLI placeholder and load-test harness key"
 _TOTP = "TOTP shared secret"
 _ANON_SALT = "Anonymizer re-identification salt"
 _SEALED = "Sealed-cache key"
@@ -144,8 +145,11 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/gcm_invocations.py": frozenset({_DEK}),
     "messagefoundry/pipeline/dr_backup.py": frozenset({_DEK}),
     "messagefoundry/pipeline/secret_rotation.py": frozenset({_DEK}),
+    # Vault BACKLOG #2608: keys the refused-body digest with an HMAC key HKDF-derived from the
+    # audit-chain key, itself derived from the DEK. Key material in the usage-scope guard too.
+    "messagefoundry/pipeline/refused_body.py": frozenset({_DEK}),
     "messagefoundry/uploads.py": frozenset({_DEK}),
-    "messagefoundry/__main__.py": frozenset({_DEK, _NONPROD}),
+    "messagefoundry/__main__.py": frozenset({_DEK, _SELF_SIGNED}),
     # Private keys the engine loads or mints.
     "messagefoundry/transports/signing.py": frozenset({_JWS, _SMART, _OIDC_ASSERTION}),
     # BACKLOG #296: builds the private_key_jwt signer from the operator's key.
@@ -169,8 +173,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/keywrap.py": frozenset(
         {_API_TLS, _CONN_SERVER, _MTLS_CLIENT, _LOG_FORWARD, _API_CLIENT}
     ),
-    "messagefoundry/pki.py": frozenset({_NONPROD}),
-    "harness/load/tlsmat.py": frozenset({_NONPROD}),
+    "messagefoundry/pki.py": frozenset({_SELF_SIGNED}),
+    "harness/load/tlsmat.py": frozenset({_SELF_SIGNED}),
     # Secret keys the engine holds or feeds.
     "messagefoundry/auth/totp.py": frozenset({_TOTP}),
     "messagefoundry/auth/service.py": frozenset({_TOTP}),
@@ -270,8 +274,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,
     "messagefoundry/api/security.py": _POSTURE_ONLY,
-    "messagefoundry/store/cipher_cells.py": "a read-only declaration of cipher-covered cells; it "
-    "builds a cell's AAD, which is byte framing, and never loads or holds a key",
+    "messagefoundry/store/cipher_cells.py": "declares the cipher-covered cells and walks them "
+    "read-only, decrypting each sealed value through a store cipher its caller built; it builds "
+    "a cell's AAD, which is byte framing, and never loads, resolves or holds a key itself",
     "messagefoundry/transports/base.py": "names the ssl types for a connect helper that receives a "
     "context built elsewhere and reports handshake failures; it builds no context and loads no key",
     "messagefoundry/transports/ai_broker.py": _POSTURE_ONLY,
@@ -293,6 +298,10 @@ _NO_KEY: dict[str, str] = {
     "scripts/asvs/scorecard.py": _KEYLESS,
     "scripts/asvs/prove_report.py": _KEYLESS,
     "scripts/asvs/anchor_report.py": _KEYLESS,
+    # Vault BACKLOG #3411 wave 3.1: a CI spike on a throwaway runner, never shipped.
+    "scripts/ci/appcontainer_spike_worker.py": _EPHEMERAL
+    + " (a P-256 signing key the spike makes for one run, signs a synthetic constant with, and"
+    " deletes; it protects nothing)",
     "scripts/security/dast_target.py": _EPHEMERAL + " (a throwaway scan password)",
     "scripts/webconsole_seam_snapshot.py": _KEYLESS,
     "scripts/security/build_password_corpus.py": _KEYLESS,
@@ -655,7 +664,7 @@ _DEK_CITED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "derive_store_data_key",
         "_SubkeyDeriver",
         "_derive_audit_mac_key",
-        "rotation_fingerprint_key",
+        "seal_rotation_fingerprint",
         "_derive_body_digest_key",
         "_WriteKey",
         "generate_key",

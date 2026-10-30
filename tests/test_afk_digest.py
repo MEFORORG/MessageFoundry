@@ -21,18 +21,19 @@ import pytest
 from tests._fake_gh import (
     COORD,
     GUARDED_TIMEOUT_S,
-    VAULT,
     Sandbox,
     id_day,
     make_sandbox,
+    no_host_usage,
+    seed_vault,
     utc_day_now,
     utc_day_with_room,
     with_default,
+    write_fake_usage,
 )
 
 DIGEST = COORD / "digest.ps1"
 DECISION = COORD / "decision.ps1"
-MARKER = "<!-- mefor-decision v1 -->"
 # A fixed day, which digest() passes as -Day unless a test names its own, so the seeded records
 # and the digested day never read the wall clock: a run that crosses UTC midnight would otherwise
 # seed one day and have digest.ps1 default to the next. A record decision.ps1 mints itself, a
@@ -53,6 +54,8 @@ pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not o
 def sb(tmp_path: Path) -> Sandbox:
     s = make_sandbox(tmp_path)
     s.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    # The cost rung reads this, never the host account's own usage files.
+    write_fake_usage(tmp_path / "usage.ps1", {"state": "UNKNOWN", "reason": "test"}, code=20)
     return s
 
 
@@ -87,27 +90,8 @@ def rec(kind: str = "decision", day: str = TODAY, **fields: Any) -> dict[str, An
     return base
 
 
-def seed(sb: Sandbox, records: list[dict[str, Any]]) -> None:
-    state = sb.state
-    store = state.setdefault("repos", {}).setdefault(VAULT, {"issues": [], "labels": []})
-    for r in records:
-        title = f"decision-log {id_day(r['id'])}"
-        issue = next((i for i in store["issues"] if i["title"] == title), None)
-        if issue is None:
-            issue = {
-                "number": len(store["issues"]) + 1,
-                "title": title,
-                "labels": ["decision-log"],
-                "comments": [],
-            }
-            store["issues"].append(issue)
-        body = f"{MARKER}\nheader\n\n```json\n{json.dumps(r, indent=2)}\n```"
-        issue["comments"].append({"id": len(issue["comments"]) + 1, "body": body})
-    sb.state_path.write_text(json.dumps(state), encoding="utf-8")
-
-
 def digest(sb: Sandbox, *args: str, code: int = 0) -> str:
-    proc = sb.run(DIGEST, *with_default(args, "-Day", TODAY))
+    proc = sb.run(DIGEST, *no_host_usage(sb, with_default(args, "-Day", TODAY)))
     assert proc.returncode == code, (proc.stdout, proc.stderr)
     return proc.stdout
 
@@ -133,7 +117,7 @@ def ratings(sb: Sandbox) -> list[dict[str, Any]]:
 
 
 def test_the_digest_has_every_section_and_is_written_privately(sb: Sandbox) -> None:
-    seed(
+    seed_vault(
         sb,
         [
             rec(item="1", **{"class": "A"}),
@@ -174,7 +158,7 @@ def test_the_blind_sample_hides_the_recommendation(sb: Sandbox) -> None:
         undo="split them again",
         predicates=[{"name": "live", "evidence": "read the ledger"}],
     )
-    seed(sb, [sampled])
+    seed_vault(sb, [sampled])
     out = digest(sb, "-Sample", "1")
     section = out[out.index("## Your blind sample") : out.index("## Reversals")]
     shown = [ln.split(". ", 1)[1] for ln in section.splitlines() if ln[:2] in {"1.", "2.", "3."}]
@@ -195,7 +179,7 @@ def _drawn(sb: Sandbox) -> list[str]:
 
 
 def test_a_saved_draw_is_kept_and_topped_up_never_redrawn(sb: Sandbox) -> None:
-    seed(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(8)])
+    seed_vault(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(8)])
     first = digest(sb, "-Sample", "3")
     picked = _drawn(sb)
     assert len(picked) == 3 and first.count("### `d") == 3
@@ -209,12 +193,12 @@ def test_an_early_empty_draw_does_not_freeze_the_days_sample(sb: Sandbox) -> Non
     """A digest run before any Class B decision is logged must not leave the day unsampled."""
     digest(sb)
     assert _drawn(sb) == []
-    seed(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(4)])
+    seed_vault(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(4)])
     assert digest(sb).count("### `d") == 4
 
 
 def test_the_default_draw_is_five_or_ten_percent(sb: Sandbox) -> None:
-    seed(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(60)])
+    seed_vault(sb, [rec(item=str(i), recommendation=f"r{i}") for i in range(60)])
     assert digest(sb).count("### `d") == 6
 
 
@@ -223,7 +207,7 @@ def test_rate_by_option_number_compares_with_the_hidden_recommendation(
     sb: Sandbox, pick_recommended: bool
 ) -> None:
     r = rec(item="5", recommendation="yes", alternatives=["no", "later"])
-    seed(sb, [r])
+    seed_vault(sb, [r])
     order = blind_order(r)
     n = order.index("yes") + 1 if pick_recommended else order.index("no") + 1
     digest(sb)
@@ -243,7 +227,7 @@ def test_rate_takes_agree_or_disagree_and_drops_a_rated_decision_from_the_pool(
     # so this test's day is the real one, with room left in it for every run below.
     day = utc_day_with_room()
     r = rec(day=day, item="5", recommendation="yes", alternatives=["no"])
-    seed(sb, [r])
+    seed_vault(sb, [r])
     digest(sb, "-Day", day)
     assert sb.run(DIGEST, "-Rate", r["id"], "disagree").returncode == 0
     assert [x["rating"] for x in ratings(sb)] == ["disagree"]
@@ -262,7 +246,7 @@ def test_rate_refuses_what_it_cannot_record(
     sb: Sandbox, make: Any, verdict: str, code: int
 ) -> None:
     r = make()
-    seed(sb, [r])
+    seed_vault(sb, [r])
     digest(sb)
     proc = sb.run(DIGEST, "-Rate", r["id"], verdict)
     assert proc.returncode == code, (proc.stdout, proc.stderr)
@@ -272,9 +256,9 @@ def test_rate_refuses_what_it_cannot_record(
 def test_rate_refuses_a_decision_that_was_not_drawn_blind(sb: Sandbox) -> None:
     """Its recommendation was in the day's list, so a rating of it is not blind."""
     drawn, seen = rec(recommendation="a"), rec(recommendation="b")
-    seed(sb, [drawn])
+    seed_vault(sb, [drawn])
     digest(sb, "-Sample", "1")
-    seed(sb, [seen])
+    seed_vault(sb, [seen])
     digest(sb, "-Sample", "1")
     proc = sb.run(DIGEST, "-Rate", seen["id"], "agree")
     assert proc.returncode == 2 and "was not in the" in proc.stderr
@@ -316,7 +300,7 @@ def _rated(count: int, disagree_first: int) -> list[dict[str, Any]]:
 def test_sixty_rated_samples_calibrate_at_three_disagreements_or_fewer(
     sb: Sandbox, disagree: int, status: str
 ) -> None:
-    seed(sb, _rated(60, disagree))
+    seed_vault(sb, _rated(60, disagree))
     cells = _calibration_row(digest(sb, "-Sample", "0"), "manager", "B")
     assert cells[2:5] == ["60", str(disagree), status]
 
@@ -327,14 +311,16 @@ def test_sixty_rated_samples_calibrate_at_three_disagreements_or_fewer(
 )
 def test_after_a_breach_sixty_fresh_samples_must_pass(sb: Sandbox, count: int, status: str) -> None:
     """One agreement that pushes the fourth disagreement out of the window is not 60 fresh."""
-    seed(sb, _rated(count, 4))
+    seed_vault(sb, _rated(count, 4))
     cells = _calibration_row(digest(sb, "-Sample", "0", "-Window", "60"), "manager", "B")
     assert cells[4] == status
 
 
 def test_under_sixty_samples_stay_on_the_review_path(sb: Sandbox) -> None:
     decided = [rec(recommendation="r") for _ in range(10)]
-    seed(sb, decided + [rec("rating", seat="owner", ref=d["id"], rating="agree") for d in decided])
+    seed_vault(
+        sb, decided + [rec("rating", seat="owner", ref=d["id"], rating="agree") for d in decided]
+    )
     cells = _calibration_row(digest(sb, "-Sample", "0"), "manager", "B")
     assert cells[4] == "review path, 10/60 samples"
 
@@ -347,7 +333,7 @@ def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox)
         rec("outcome", seat="lander", ref=d["id"], outcome="reversed", note="reverted in PR 9")
         for d in (recent[0], stale[0], stale[1])
     ]
-    seed(sb, recent + stale + reversed_)
+    seed_vault(sb, recent + stale + reversed_)
     out = digest(sb, "-Sample", "0")
     cells = _calibration_row(out, "lander", "B")
     assert cells[5:8] == ["10", "1", "10.0% BREACH"]
@@ -355,7 +341,7 @@ def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox)
 
 
 def test_two_sessions_on_one_item_is_a_collision(sb: Sandbox) -> None:
-    seed(
+    seed_vault(
         sb,
         [
             rec(item="42", session="s1", recommendation="a"),
@@ -370,7 +356,7 @@ def test_two_sessions_on_one_item_is_a_collision(sb: Sandbox) -> None:
 
 def test_a_decision_with_one_option_is_never_drawn(sb: Sandbox) -> None:
     """Its only option would be the recommendation, so a rating of it could not be blind."""
-    seed(
+    seed_vault(
         sb, [rec(recommendation="go", alternatives=[]), rec(recommendation="x", alternatives=["x"])]
     )
     assert "No unrated Class B decision today." in digest(sb)
@@ -379,9 +365,11 @@ def test_a_decision_with_one_option_is_never_drawn(sb: Sandbox) -> None:
 def test_a_reversal_of_an_earlier_days_unrated_sample_stays_hidden(sb: Sandbox) -> None:
     yesterday = days_before(1)
     drawn = rec(day=yesterday, recommendation="a")
-    seed(sb, [drawn])
+    seed_vault(sb, [drawn])
     digest(sb, "-Day", yesterday)
-    seed(sb, [rec("outcome", seat="lander", ref=drawn["id"], outcome="reversed", note="PR 9")])
+    seed_vault(
+        sb, [rec("outcome", seat="lander", ref=drawn["id"], outcome="reversed", note="PR 9")]
+    )
     out = digest(sb)
     assert "shown once you rate it" in out and drawn["id"] not in out
 
@@ -389,7 +377,7 @@ def test_a_reversal_of_an_earlier_days_unrated_sample_stays_hidden(sb: Sandbox) 
 def test_with_no_day_the_digest_is_for_the_utc_day_it_runs(sb: Sandbox) -> None:
     """Read either side of the run, so a run that crosses UTC midnight still passes."""
     before = utc_day_now()
-    proc = sb.run(DIGEST, "-Sample", "0")
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
     after = utc_day_now()
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     (day,) = [d for d in {before, after} if f"# AFK-autonomy digest, {d} (UTC)" in proc.stdout]
@@ -402,7 +390,7 @@ def test_an_impossible_day_is_refused(sb: Sandbox) -> None:
 
 
 def test_an_unread_vault_marks_the_digest_incomplete(sb: Sandbox) -> None:
-    seed(sb, [rec(recommendation="r")])
+    seed_vault(sb, [rec(recommendation="r")])
     sb.set_state(fail=True)
     out = digest(sb, code=4)
     assert "INCOMPLETE" in out and "Kill switch: **ON**" in out
@@ -413,11 +401,12 @@ def test_end_to_end_a_logged_decision_is_sampled_and_rated(sb: Sandbox) -> None:
     """The owner's flow: log now, run the digest with no -Day, rate what it drew."""
     day = utc_day_with_room()
     args = ("-Log", "-Item", "7", "-Class", "B", "-Seat", "manager", "-Recommendation", "go")
-    logged = sb.run(DECISION, *args, "-Alternative", "stop")
-    assert logged.returncode == 0, logged.stderr
+    logged = sb.run(DECISION, *no_host_usage(sb, (*args, "-Alternative", "stop")))
+    # Unreviewed and uncalibrated: the gate answers REVIEW (11), and the record is still logged.
+    assert logged.returncode == 11, logged.stderr
     did = logged.stdout.split()[1]
     assert id_day(did) == day, "the id is not dated on the UTC day it was logged"
-    proc = sb.run(DIGEST, "-Sample", "1")
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "1")))
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert f"### `{did}`" in proc.stdout
     assert sb.run(DIGEST, "-Rate", did, "agree").returncode == 0

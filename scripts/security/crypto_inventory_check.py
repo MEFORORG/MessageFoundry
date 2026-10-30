@@ -309,6 +309,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # settled. It measures the operator's proxy and carries NO application data; the contexts are built,
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
+    # Vault BACKLOG #3533: tls_policy left with the posture keyword; the context is ldap_tls.py's.
+    # BACKLOG #2193: tls_policy is back, for the LDAPS revocation-hop guard (RevocationHopGuard).
+    # It reads the check flag off a context ldap_tls.py builds; it builds none.
     "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
     # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
@@ -340,8 +343,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
     # ADR 0197 Amendment A (AC-A9): store.crypto for CipherError alone, so the lockable-account census
     # can tell a TOTP cell the store key does not open apart from any other store error.
+    # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
+    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret.
     "messagefoundry/auth/service.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
+        {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
@@ -350,8 +355,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # anchor-changed audit fingerprint. Integrity/tamper-evidence over a public CA cert, not a secret.
     # BACKLOG #2025: anchor_cadata trial-loads the checked text into a throwaway client
     # SSLContext, so the reload preflight refuses what a consumer's cadata= load refuses. That
-    # context verifies no peer and is discarded.
-    "messagefoundry/auth/trust_anchors.py": frozenset({"hashlib", "ssl"}),
+    # context verifies no peer and is discarded. tls_policy since BACKLOG #3470, for
+    # is_loopback_hop_host alone: smtp_hop_anchor_spec skips the internal CA for a loopback relay,
+    # as resolve_trust_anchor does. It builds no context.
+    "messagefoundry/auth/trust_anchors.py": frozenset(
+        {"hashlib", "ssl", "messagefoundry.config.tls_policy"}
+    ),
     # ADR 0068 (WP-14b): first-party 64-byte WebAuthn ceremony challenges (secrets.token_bytes) —
     # single-use, TTL'd, staged server-side (ASVS 6.7.2 evidence). The `webauthn` library (an optional
     # [webauthn] extra, lazy-imported inside this module's functions) performs the COSE signature
@@ -438,7 +447,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # it as a start judges a CRL setting (tls_policy.judge_crl_bytes, which reads the CRL fields). It
     # loads those bytes into a scratch context (tls_policy.crl_scratch_context) to read the CA
     # certificates OpenSSL takes from them, and checks each CRL's signature against those through
-    # pki.crl_signature_refusal (a public-key verify). The scratch context is discarded: it serves no
+    # pki.judge_crl_signatures (a public-key verify), which tells a signature proven bad from one
+    # it could not confirm (BACKLOG #3512). The scratch context is discarded: it serves no
     # handshake and changes no hop's trust.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"messagefoundry.config.tls_policy", "ssl"}
@@ -448,23 +458,29 @@ INVENTORY: dict[str, frozenset[str]] = {
     # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
     # adds them to the live context with load_verify_locations(cafile=). It judges the bytes with
     # tls_policy.judge_crl_bytes, which reads the CRL fields, and checks each CRL's signature against
-    # the hop's own CA certificates through pki.crl_signature_refusal (a public-key verify). No key
+    # the hop's own CA certificates through pki.crl_signature_finding (a public-key verify). No key
     # material, no new trust: a certificate the hop does not already trust refuses the reload.
     "messagefoundry/pipeline/crl_reload.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ASVS 11.3.4 (#301): the periodic AES-GCM invocation-reserve refill runner reads the live
     # cipher's key_id + per-key bound through the store.crypto seam — no direct stdlib crypto import.
     "messagefoundry/pipeline/gcm_invocations.py": frozenset({"messagefoundry.store.crypto"}),
     # ASVS 13.3.4 (BACKLOG #282): the secret-rotation watcher fingerprints each tracked secret with a
-    # KEYED MAC — hmac.new(key, value, sha256), keyed by a DEK-derived subkey (rotation_fingerprint_key
-    # in store/crypto.py, HKDF), never a salted hash — to auto-detect rotation without persisting or
-    # logging any value. hashlib supplies the SHA-256 digestmod for that HMAC. The DEK-derived key is
-    # obtained through the store cipher (store.crypto seam), delegated, so this module keeps only the
-    # keyed-MAC primitive. BACKLOG #3421: it imports the store.crypto seam for the stored
-    # fingerprints' scheme tags only (KEY_ID_SCHEME, scheme_tagged, read_scheme_tag): string
-    # tagging and parsing, no primitive.
+    # KEYED MAC — hmac.new(key, value, sha256), never a salted hash — to auto-detect rotation without
+    # persisting or logging any value. hashlib supplies the SHA-256 digestmod for that HMAC. BACKLOG
+    # #3472 (ADR 0213): the key is a per-row random 32 bytes from secrets.token_bytes, and the key,
+    # the MAC and the row's class id are sealed together as a store-cipher cell through the
+    # store.crypto seam (seal_rotation_fingerprint / open_rotation_fingerprint), so the key is never
+    # derived from the DEK and a DEK rotation re-seals the cell instead of moving it. BACKLOG #3421:
+    # the same seam supplies the stored fingerprints' scheme tags (KEY_ID_SCHEME, scheme_tagged,
+    # read_scheme_tag): string tagging and parsing, no primitive.
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"hashlib", "hmac", "messagefoundry.store.crypto", "secrets"}
     ),
+    # Vault BACKLOG #2608: the refused-body allowance records, through store.crypto's
+    # refused_body_digest, a KEYED digest of each body refused before ingress: HMAC-SHA256 under a key
+    # HKDF-SHA256 derives from the in-heap audit-chain key under its own label. The section 4 row
+    # "Refused inbound body digest" is the crypto record; docs/CONFIGURATION.md says when it is kept.
+    "messagefoundry/pipeline/refused_body.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
@@ -476,8 +492,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # snapshot's cipher-covered cells through the store's own cipher, under the same cell-bound AAD the
     # store writes (cell_aad, ASVS 11.3.3), to prove the PHI is readable and not merely that a SQLite
     # file opened. No primitive is implemented here — the cipher is built by build_store_cipher and the
-    # AEAD runs inside it; this module holds only the marker prefix and the fail-closed
-    # CipherError/StoreKeylessError verdicts. The AAD comes from store/cipher_cells.py (BACKLOG #1719).
+    # AEAD runs inside it; the walk that calls it, and the cell AAD, are store/cipher_cells.py's
+    # (BACKLOG #1719), and this module holds only the fail-closed StoreKeylessError verdict.
     # Vault BACKLOG #2983 adds the tls_policy import, for one name: HopPosture, a value type. The
     # backup runner holds the instance posture and hands it to the key resolve and the full verify,
     # so the Vault hop they can dial is judged as `serve` judges it. Builds no context.
@@ -515,9 +531,10 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"hashlib", "cryptography", "messagefoundry.store.crypto"}
     ),
     # BACKLOG #1719: a read-only declaration of the store's composite-key cipher cells, each with the
-    # columns its writer binds into the cell AAD. It builds that AAD with cell_aad through the
-    # store.crypto seam and performs no encrypt or decrypt itself; the full restore-verify does that
-    # through the store cipher in pipeline/dr_backup.py.
+    # columns its writer binds into the cell AAD, built with cell_aad through the store.crypto seam.
+    # Its read_cipher_cells walk decrypts each sealed value through the store cipher it is handed
+    # (built by build_store_cipher), for the full restore-verify and `cipher-audit`. It never
+    # encrypts, and implements no primitive: the AEAD runs inside the cipher.
     "messagefoundry/store/cipher_cells.py": frozenset({"messagefoundry.store.crypto"}),
     # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
     # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
@@ -658,10 +675,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
     # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
     # is a posture decision on the scheme, and it calls no cipher or context.
-    # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the once-per-
-    # hop-and-proxy disclosure. A dedupe key, not a security control and not key material; what it
-    # keeps out of memory, and what it does not, is the section 4 row "Vault hop ambient-proxy
-    # disclosure dedupe".
+    # Vault BACKLOG #4028 adds hashlib: SHA-256 of the raw ambient proxy value keys the
+    # disclosure, logged once per hop and distinct proxy value. A dedupe key, not a security
+    # control and not key material; what it keeps out of memory, and what it does not, is the
+    # section 4 row "Vault hop ambient-proxy disclosure dedupe".
     "messagefoundry/transports/strict_requests.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "ssl"}
     ),
@@ -819,6 +836,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # commit the reader cannot resolve from this one. No secret, no key, no message authentication,
     # nothing user- or PHI-derived: it is an identifier in a log line.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
+    # Vault BACKLOG #3411 wave 3.1, a CI spike that ships nothing: SHA-256 over a synthetic constant,
+    # signed with a P-256 CNG key the run makes and deletes, to ask whether an AppContainer can use
+    # the service account's key store; and SHA-256 over a DPAPI blob, to show the container was
+    # handed the service's exact bytes. No secret, no product key, nothing user- or PHI-derived.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
     # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
     # arm of the subject-exists screen's own control. Unpredictability is not the property being
@@ -878,11 +900,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # alert_sinks also imports smtplib: the alert SMTP hop's STARTTLS posture. This is the file
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
-    # BACKLOG #2242: also imports rotation_fingerprint_keys from store.crypto, the retired-DEK
-    # fingerprint keys the secret-rotation reconcile needs to tell a re-key from a rotation.
-    "messagefoundry/pipeline/engine.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
-    ),
+    "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
     # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -973,12 +991,9 @@ IMPORT_ONLY: dict[str, str] = {
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it; and names "
         "store.crypto's CipherError only to classify a decrypt failure, calling no cipher"
     ),
-    "messagefoundry/store/cipher_cells.py": (
-        "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
-        "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
-    ),
     "messagefoundry/transports/ai_broker.py": (
-        "carries a HopPosture value to the refusal check; builds no context"
+        "names HopPosture only to annotate the factory's unread posture parameter; builds no "
+        "context"
     ),
     "messagefoundry/transports/base.py": (
         "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
@@ -1030,11 +1045,23 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #3470: anchor_refusal checks the forwarder's and the SMTP relay's CA before
+            # those hops are built, through evaluate_anchor: its SHA-256 fingerprint, and its pin
+            # compare, which these specs never reach since they carry no pin.
+            "compare:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.auth.trust_anchors",
             # BACKLOG #1352: cert import opens a PKCS#12 bundle's encrypted parts through pki.
             "cipher:via messagefoundry.pki",
+            # BACKLOG #1719: cipher-audit decrypts the live store's sealed cells through the store
+            # cipher, by cipher_cells' walk. It never encrypts.
+            "cipher:via messagefoundry.store.cipher_cells",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
+            # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
+            # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
+            "hash:via messagefoundry.auth.tokens",
+            "compare:via messagefoundry.credential",
             "kdf:via messagefoundry.pki",
             "key_cert:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.logging_setup",
@@ -1109,9 +1136,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # BACKLOG #2494: the LDAPS context is built by tls_policy.assert_ldap3_tls_suites, and the socket
-    # is wrapped with it here, in place of ldap3's own wrap_socket.
+    # is wrapped with it here, in place of ldap3's own wrap_socket. BACKLOG #2193: that builder now
+    # loads [auth].ad_tls_crl_file through harden_crl_check, the CRL read and signature check the
+    # key_cert and sign_verify entries name, as on the OIDC opener.
     "messagefoundry/auth/ldap_tls.py": frozenset(
-        {"tls_context:.wrap_socket()", "tls_context:via messagefoundry.config.tls_policy"}
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "sign_verify:via messagefoundry.config.tls_policy",
+            "tls_context:.wrap_socket()",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
     ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
@@ -1162,6 +1196,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.oidc.flow",
             "hash:via messagefoundry.auth.oidc_http",
             "hash:via messagefoundry.auth.tokens",
+            # BACKLOG #3772: _bounded_address_text, a SHA-256 dedupe key over over-long client text.
+            "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).
             "hash:via messagefoundry.store.store",
@@ -1305,8 +1341,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
-    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.crl_signature_refusal itself, when
-    # a pass finds a hop holding an older copy of a CA file; the INVENTORY row above says the rest.
+    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.judge_crl_signatures itself
+    # (BACKLOG #3512), when a pass finds a hop holding a copy of a CA file that differs from the
+    # file; the INVENTORY row above says the rest.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {
             "sign_verify:via messagefoundry.pki",
@@ -1330,7 +1367,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # store_data_key_id derives (HKDF) and fingerprints (SHA-256) through the store.crypto seam.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {
-            "cipher:.decrypt()",
+            # BACKLOG #1719: the full restore-verify's decrypt pass is cipher_cells' shared walk.
+            "cipher:via messagefoundry.store.cipher_cells",
             "cipher:via messagefoundry.store.backup_codec",
             "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.backup_codec",  # BACKLOG #1167: the key_id match
@@ -1352,15 +1390,33 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail
             # directly (fingerprint_bundle runs it in asyncio.to_thread), so this scanner sees the fold.
             "hash:via messagefoundry.config.fingerprint",
-            # BACKLOG #2242: derives the secret-rotation fingerprint keys of the active and retired
-            # DEKs (rotation_fingerprint_keys) for the reconcile, so a DEK rotation is a re-key.
-            "kdf:via messagefoundry.store.crypto",
+            # BACKLOG #3472: the secret-rotation reconcile seals and opens each fingerprint cell
+            # (cipher) and draws its per-row random MAC key (csprng), through secret_rotation.
+            "cipher:via messagefoundry.pipeline.secret_rotation",
+            "csprng:via messagefoundry.pipeline.secret_rotation",
             "mac:via messagefoundry.pipeline.secret_rotation",
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
+    # Vault BACKLOG #2608: the keyed digest of a refused inbound body (refused_body_digest: HKDF off
+    # the audit-chain key, then HMAC-SHA256; the hash is audit_key_id); the INVENTORY row says why.
+    "messagefoundry/pipeline/refused_body.py": frozenset(
+        {
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
+        }
+    ),
     "messagefoundry/pipeline/secret_rotation.py": frozenset(
-        {"compare:hmac.compare_digest", "mac:hmac.new[sha256]"}
+        {
+            # BACKLOG #3472: each non-DEK fingerprint is sealed and opened as a store-cipher cell
+            # (store.crypto seal_rotation_fingerprint / open_rotation_fingerprint), and its per-row
+            # HMAC key is drawn from the CSPRNG.
+            "cipher:via messagefoundry.store.crypto",
+            "compare:hmac.compare_digest",
+            "csprng:secrets.token_bytes",
+            "mac:hmac.new[sha256]",
+        }
     ),
     "messagefoundry/pipeline/sharding.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/pki.py": frozenset(
@@ -1391,6 +1447,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
             # Server pin file, so a bundle is refused at load. Public certificates only.
             "key_cert:cryptography.x509.load_pem_x509_certificates",
+            # Vault BACKLOG #3506: _crl_extensions parses a copy of a CRL whose authority key
+            # identifier carries a serial that is not positive, to read its extensions without
+            # cryptography's warning. Public material; no signature is checked on the copy.
+            "key_cert:cryptography.x509.load_der_x509_crl",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
@@ -1463,6 +1523,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
     # tag its row's routing fields build.
     "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed.
+    "messagefoundry/store/cipher_cells.py": frozenset({"cipher:.decrypt()"}),
     # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
     # cipher) under the tag its row's id and channel or owner build.
     "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),
@@ -1499,7 +1561,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
-            "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
             # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
@@ -1522,12 +1583,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
-            "kdf:via messagefoundry.store.crypto",
-            # Vault BACKLOG #2223: connection_string parses the [store].ssl_root_cert pin (public
-            # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
-            # validity period, since Encrypt=strict leaves that check to the engine.
+            # Vault BACKLOG #2223: check_pinned_certificate parses the [store].ssl_root_cert pin
+            # (public certificate only) through pki.pinned_server_certificate to refuse one outside
+            # its validity period. Why the engine makes that check: the ssl_root_cert row of
+            # docs/CONFIGURATION.md.
             "key_cert:via messagefoundry.pki",
-            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforce_anchor), which
+            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforced_anchor), which
             # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
             "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.trust_anchors",
@@ -1548,7 +1609,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
-            "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
             # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
             "sign_verify:.verify()",
@@ -1556,9 +1616,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)
     # before the DSN reaches the driver. Before this it was IMPORT_ONLY; that entry's point still
-    # stands and is kept here: it appends Encrypt= and TrustServerCertificate= to a DSN string and
-    # refuses an insecure hop, a first-party TLS posture decision with no crypto-shaped expression
-    # for any pattern instrument to match (an INSTRUMENT LIMIT, named in BACKLOG #1164).
+    # stands and is kept here: it refuses an insecure hop and has messagefoundry/odbc_dsn.py append
+    # Encrypt= and TrustServerCertificate= to a DSN string (BACKLOG #3714), a first-party TLS posture
+    # decision with no crypto-shaped expression for any pattern instrument to match (an INSTRUMENT
+    # LIMIT, named in BACKLOG #1164).
     "messagefoundry/transports/database.py": frozenset({"key_cert:via messagefoundry.keywrap"}),
     "messagefoundry/transports/dicom.py": frozenset(
         {
@@ -1731,6 +1792,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/strict_requests.py": frozenset(
         {
             "hash:hashlib.sha256",  # Vault BACKLOG #4028: the ambient proxy disclosure's dedupe key
+            # BACKLOG #3458: connect() checks the client key hvac took from VAULT_CLIENT_CERT with
+            # keywrap.refuse_weak_cert_chain_key before urllib3 loads it. A check, not a load.
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.load_verify_locations()",
         }
     ),
@@ -1772,6 +1836,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
     "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
+    # The INVENTORY row above says why: NCryptSignHash and NCryptVerifySignature over a synthetic
+    # digest, with a key the spike makes for the run, called through ctypes.
+    "scripts/ci/appcontainer_spike_worker.py": frozenset(
+        {"hash:hashlib.sha256", "sign_verify:.sign()", "sign_verify:.verify()"}
+    ),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}
     ),
@@ -2271,6 +2340,11 @@ _LIT = r"""(?:\s*['"`](?P<alg>[\w.-]+)['"`])?"""
 #: An identifier is captured as a reference (``ciphers[=TLS_CIPHERS]``), so swapping the constant a
 #: pin names changes the token even when no literal moved.
 _CIPHER_LIT = r"""(?:\s*(?:['"`](?P<alg>[^'"`\n]+)['"`]|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
+#: A numeric option value (BACKLOG #300, ``minDHSize``): a number literal is captured as the value,
+#: so a changed literal changes the token; a name is captured as a reference, as ``_CIPHER_LIT``
+#: does. The number must end the value, so an expression such as ``2048 / 2`` captures nothing and
+#: reads as a bare, undocumented token. An assignment after the object is built is not seen at all.
+_NUMBER_LIT = r"""(?:\s*(?:(?P<alg>[0-9][0-9_]*)(?=\s*(?:[,}]|$))|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
 #: One cipher SUITE NAME in a string literal, OpenSSL style (``ECDHE-RSA-AES256-GCM-SHA384``) or IANA
 #: style (``TLS_AES_256_GCM_SHA384``, ``TLS_DH_anon_WITH_AES_128_CBC_SHA``). BACKLOG #2020. It must
 #: sit between quotes, colons, commas or whitespace, so each suite of a joined list is its own
@@ -2366,6 +2440,8 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     # A floor and a cap are different decisions, so they are different tokens.
     "minVersion": (re.compile(_B + r"minVersion\s*:" + _LIT), "tls_context"),
     "maxVersion": (re.compile(_B + r"maxVersion\s*:" + _LIT), "tls_context"),
+    # The smallest DHE group a client accepts. A floor on the key exchange, not on the protocol.
+    "minDHSize": (re.compile(_B + r"minDHSize\s*:" + _NUMBER_LIT), "tls_context"),
     "rejectUnauthorized": (re.compile(_B + r"rejectUnauthorized\s*:"), "tls_context"),
     "checkServerIdentity": (re.compile(_B + r"checkServerIdentity\s*:"), "tls_context"),
     "secureProtocol": (
@@ -2396,11 +2472,12 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
-    # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
-    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
-    # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
-    # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
-    # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
+    # The TLS floors and suite pin the extension applies to every https request it makes to the
+    # engine; `tlsOptions` in that file says what it returns. Certificate verification is never
+    # switched off. The protocol floor is a named constant, not a literal, so the token does not
+    # carry it. The DHE group floor is a literal, so `minDHSize[2048]` does. At least a changed
+    # literal, an expression in its place, or a dropped key reds the gate (BACKLOG #300).
+    # `ciphers` is the BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
     # The `ciphers` token names the constant the pin uses, `TLS_CIPHERS`. The seven `suite` tokens
     # are the literals of `TLS_12_SUITES` and `TLS_13_SUITES`, so this row pins WHICH suites the file
     # names (BACKLOG #2020): drop one, add a full suite name such as a CBC one, or add an expanding
@@ -2413,6 +2490,7 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "ide/src/engineClient.ts": frozenset(
         {
             "tls_context:minVersion",
+            "tls_context:minDHSize[2048]",
             "tls_context:ciphers[=TLS_CIPHERS]",
             "tls_context:suite[ECDHE-ECDSA-AES256-GCM-SHA384]",
             "tls_context:suite[ECDHE-RSA-AES256-GCM-SHA384]",
@@ -2427,7 +2505,32 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
     # directories from the walk would be a scope cut the randomness arm does not make either.
     "ide/src/test/suite/engine-trust.test.ts": frozenset(
-        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers[=TLS_CIPHERS]"}
+        {
+            "tls_context:minVersion[TLSv1.2]",
+            "tls_context:minDHSize[2048]",
+            "tls_context:ciphers[=TLS_CIPHERS]",
+        }
+    ),
+    # Not a TLS use the product makes: the extension test that measures the DHE group floor above
+    # with real handshakes (BACKLOG #300). It mints a throwaway RSA key and self-signed certificate
+    # in memory. Its server offers the one DHE suite over a 1536-bit or 2048-bit group, at level 0
+    # so it will serve the small group. Two client handshakes lower the client's level to 1, so the
+    # refusal asserted is the floor's and not OpenSSL's. `minDHSize[1024]` is the control arm, Node's
+    # own default. `DH` is the PEM label of the parameter block. It also signs with `crypto.sign`
+    # and builds groups with `getDiffieHellman`, which no pattern here names.
+    "ide/src/test/suite/engine-client-dh.test.ts": frozenset(
+        {
+            "key_cert:createKey",
+            "tls_context:cipher_string[@SECLEVEL=0]",
+            "tls_context:cipher_string[@SECLEVEL=1]",
+            "tls_context:cipher_string[DH]",
+            "tls_context:ciphers[${DHE_SUITE}:@SECLEVEL=0]",
+            "tls_context:ciphers[=lowered]",
+            "tls_context:maxVersion[TLSv1.2]",
+            "tls_context:minDHSize[1024]",
+            "tls_context:minVersion[TLSv1.2]",
+            "tls_context:suite[DHE-RSA-AES256-GCM-SHA384]",
+        }
     ),
     # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
     # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.

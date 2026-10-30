@@ -31,11 +31,13 @@ start applies (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`): every
 Then it must carry no certificate the hop does not already trust (BACKLOG #1890). A load cannot be
 undone, so that is proved on a scratch context BEFORE the live one sees the bytes. Each CRL's
 signature must also verify against a CA certificate the hop lists for its issuer
-(:func:`~messagefoundry.pki.crl_signature_refusal`). OpenSSL checks that signature only at the
+(:func:`~messagefoundry.pki.crl_signature_finding`). OpenSSL checks that signature only at the
 handshake, so OpenSSL would load a badly signed CRL and then fail every handshake it judges. A start
 checks the signature too, and refuses only the proven case, which is
 :class:`~messagefoundry.pki.CrlSignature` state ``bad`` (vault BACKLOG #2905). Anything short of
-that a start loads with a warning, so this reload holds back some files a start would load.
+that a start loads with a warning, so this reload holds back some files a start would load. The
+remedy says which (vault BACKLOG #3506): a proven bad signature is a file to fix, and one the engine
+could not confirm asks for a check, then a restart, since such a file can be right.
 The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
 not in it, so a CRL that intermediate issued is refused with :data:`NO_ISSUER`. That refusal is
 retried every pass, because a CA directory adds a CA to the store only when a handshake first needs
@@ -134,7 +136,14 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
-from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
+from messagefoundry.pki import (
+    CrlBlock,
+    CrlFacts,
+    CrlIssuerKey,
+    CrlSignatureFinding,
+    crl_signature_finding,
+    quoted_issuer,
+)
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
@@ -148,6 +157,8 @@ __all__ = [
     "RESTART",
     "RETRY",
     "STOP_TIMEOUT_SECONDS",
+    "UNCHECKABLE_SIGNATURE",
+    "UNPROVEN_SIGNATURE",
     "WAIT",
     "CrlReloadRunner",
     "ReloadOutcome",
@@ -182,21 +193,45 @@ LAPSES_FIRST = (
     "Fix the file now with a CRL that is in effect: the hop's copy lapses before the file's CRL "
     "takes effect, and every peer is refused in between, restart or not"
 )
-#: True of both things a start does with such a file (vault BACKLOG #2905). A start refuses only a
-#: CRL it proves badly signed, :class:`~messagefoundry.pki.CrlSignature` state ``bad``. It loads
-#: any other with a warning, and the handshake then decides. The reload gives this one remedy for
-#: all of those cases, because :func:`~messagefoundry.pki.crl_signature_refusal` folds them into
-#: one flag. So it cannot tell a renewed CA key, where a restart is enough, from a forged CRL.
-#: That was filed as an open finding on vault BACKLOG #3506 (2026-10-13). The text gives no
-#: definition of proof, on purpose: ``CrlSignature`` holds it, and a short form here went wrong.
+#: The signature remedies, one per :class:`~messagefoundry.pki.CrlSignature` state the reload
+#: holds a file back for (vault BACKLOG #2905, #3506). A start refuses only the proven case,
+#: state ``bad``, and loads the others with a warning; the handshake then decides. Before #3506
+#: one remedy, class ``bad_signature``, covered all three, because the reload's check folded them
+#: into one flag. Its words hedged across every state, so they could not say which one held.
+#:
+#: ``bad``: a file to fix. It names no restart, so it takes no not-in-effect caveat
+#: (:data:`_LEADS_TO_A_START`): a start whose check finds the same refuses the file whatever the
+#: time. While some issuer in such a file has no CRL in effect yet, it is still judged again each
+#: pass (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`). The text gives no definition of proof, on purpose:
+#: ``CrlSignature`` holds it, and a short form here went wrong.
 BAD_SIGNATURE = (
-    "If the file is wrong, fix it: give a CRL the hop's CA signed. On the signature, a start "
-    "refuses the file too only where it proves the signature bad. Short of that proof the "
-    "signature does not stop a start: unless another rule refuses the file, a start loads it "
-    "with a warning, and each handshake then decides. That covers at least a CRL that names no "
-    "key and a signature the engine cannot check. The handshake passes where the peer's chain "
-    "carries the CA that signed the CRL, as after a CA renews its key, and fails where it does "
-    "not"
+    "Fix the file: give a CRL the hop's CA signed. On the signature, a start refuses the file too "
+    "wherever its own check proves the same, at any time, not only while a CRL in the file is not "
+    "yet in effect. If a good CRL from that issuer is already in the file, remove this one instead"
+)
+#: What follows a check in the two remedies for a signature the engine could not confirm. One
+#: sentence names a restart, so :data:`_LEADS_TO_A_START` holds both. The reload judges no CRL
+#: after the one it reports (:func:`~messagefoundry.pki.crl_signature_finding`), and a start
+#: judges them all, so the check must cover every CRL in the file.
+_SHORT_OF_PROOF = (
+    "Check the other CRLs in the file too: the reload judged none after this one, and a start "
+    "refuses the file where it proves any CRL in it badly signed. Restart the engine to apply the "
+    "file once they all check out. Short of such a proof the signature does not stop a start: "
+    "unless another rule refuses the file, a start loads it with a warning, and each handshake "
+    "then decides. If the file is wrong, fix it"
+)
+#: ``unproven``: the CA was checked, its key does not verify the CRL, and the CRL names no key.
+UNPROVEN_SIGNATURE = (
+    "Check that the CRL is one the hop's CA signed: the CRL does not name the key of the CA "
+    "certificate this hop lists for its issuer, so the engine cannot prove it badly signed. After "
+    "a CA renews its key the file can be right: a handshake passes where the peer's chain carries "
+    f"the CA that signed the CRL, and fails where it does not. {_SHORT_OF_PROOF}"
+)
+#: ``uncheckable``: some CA judged could not be checked, and none verifies the CRL.
+UNCHECKABLE_SIGNATURE = (
+    "Check that the CRL is one the hop's CA signed: the engine cannot check its signature with "
+    "the key the CRL names, or, where it names no listed CA's key, with the key of some listed CA "
+    f"that fits it. {_SHORT_OF_PROOF}"
 )
 NO_ISSUER = (
     "Restart the engine to apply the file. The reload checks a CRL's signature against the hop's "
@@ -217,10 +252,47 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: Which remedy a refusal names when the contexts of one file disagree: the earliest here. A file
 #: to fix, then a restart, outrank a wait, because waiting would not apply the file.
 #: :data:`LAPSES_FIRST` is a fix too, and the most urgent one: every peer is refused, restart or not.
-_PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, LAPSES_FIRST, RESTART, NO_ISSUER, RETRY, WAIT)
+#: The two signature remedies short of proof (vault BACKLOG #3506) ask for a check, then a restart,
+#: so they rank with the restarts, under every fix: a file whose held copy lapses first needs a
+#: CRL in effect whatever its signature check says. ``docs/CONFIGURATION.md`` lists the classes
+#: in this order.
+_PRECEDENCE = (
+    FIX,
+    BAD_SIGNATURE,
+    _NOT_PROVABLE,
+    LAPSES_FIRST,
+    UNPROVEN_SIGNATURE,
+    UNCHECKABLE_SIGNATURE,
+    RESTART,
+    NO_ISSUER,
+    RETRY,
+    WAIT,
+)
 _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
-#: The remedies that send the operator to a restart, which fails while the file is not in effect.
-_SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE})
+#: The remedies that can send the operator to a restart, which fails while the file is not in
+#: effect, so they take the not-in-effect caveat. :data:`BAD_SIGNATURE` is not one since vault
+#: BACKLOG #3506: it names no restart, and says a start refuses the file at any time.
+_LEADS_TO_A_START = frozenset(
+    {RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE, UNPROVEN_SIGNATURE, UNCHECKABLE_SIGNATURE}
+)
+#: The remedies whose refusal the reload judges again each pass while some issuer in the file has
+#: no CRL in effect yet (:func:`~messagefoundry.config.tls_policy.crl_not_in_effect`,
+#: :meth:`_Refusals.reopen`). Each one in :data:`_LEADS_TO_A_START` is, because its caveat names a
+#: time that passes. So is :data:`BAD_SIGNATURE`, as it was before item 8 of vault
+#: BACKLOG #3506 took it out of that set: otherwise it is final until the bytes change, and a
+#: refusal a later pass would find for the same bytes is never reported. One such is
+#: :data:`LAPSES_FIRST`, which it outranks, once the hop's CA list gains a CA that the CRL names and
+#: that verifies it. A CA with no Subject Key Identifier counts for nothing beside a named one
+#: (vault BACKLOG #4159, :class:`~messagefoundry.pki.CrlSignature`), so adding one lifts nothing.
+_REOPENED_WHILE_NOT_IN_EFFECT = _LEADS_TO_A_START | {BAD_SIGNATURE}
+#: The remedy for each :class:`~messagefoundry.pki.CrlSignature` state that holds a file back.
+#: ``unlisted`` is no signature finding: the reload's list may lack the issuer, so a restart.
+_SIGNATURE_REMEDY = {
+    "bad": BAD_SIGNATURE,
+    "unproven": UNPROVEN_SIGNATURE,
+    "uncheckable": UNCHECKABLE_SIGNATURE,
+    "unlisted": NO_ISSUER,
+}
 #: A short token per remedy, for the ``crl_reload_refused`` alert (vault BACKLOG #2904). The alert
 #: carries this and the remedy sentence, never the refusal's reason, which quotes CRL issuer
 #: names and dates. ``docs/CONFIGURATION.md`` lists the tokens under ``[cert_monitor]``.
@@ -230,6 +302,8 @@ _REMEDY_CLASS = {
     WAIT: "wait",
     LAPSES_FIRST: "lapses_first",
     BAD_SIGNATURE: "bad_signature",
+    UNPROVEN_SIGNATURE: "unproven_signature",
+    UNCHECKABLE_SIGNATURE: "uncheckable_signature",
     NO_ISSUER: "no_issuer",
     RETRY: "retry",
     _NOT_PROVABLE: "not_provable",
@@ -282,8 +356,9 @@ class ReloadOutcome:
     refusal: ReloadRefusal | None
     #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
     stale: int = 0
-    #: True when the remedy names a restart and a start would refuse the file too, until one of
-    #: its CRLs takes effect. The reason says so with the time; an alert carries only this flag.
+    #: True when the remedy can send the operator to a restart (:data:`_LEADS_TO_A_START`) and a
+    #: start would refuse the file too, at least until one of its CRLs takes effect. The reason
+    #: says so with the time; an alert carries only this flag.
     start_refuses: bool = False
 
     @property
@@ -299,10 +374,13 @@ def _first_lapse(held: Sequence[CrlBlock]) -> CrlBlock | None:
     OpenSSL scores CRLs per issuer and per ``selection`` (scope and signing key), and among equals
     uses the latest ``thisUpdate``. So each such group lapses with its latest CRL. An older CRL in
     the group that lapses sooner changes nothing, and one that lapses later would only stand in
-    without the newer revocations. The soonest of those latest CRLs decides."""
-    latest: dict[tuple[str, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock] = {}
+    without the newer revocations. The soonest of those latest CRLs decides. An issuer is its
+    ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`, vault BACKLOG #3755)."""
+    latest: dict[
+        tuple[CrlIssuerKey, tuple[bytes | None, bytes | None, frozenset[str]]], CrlBlock
+    ] = {}
     for block in held:
-        group = (block.issuer, block.selection)
+        group = (block.issuer_key, block.selection)
         if group not in latest or block.this_update > latest[group].this_update:
             latest[group] = block
     return min(latest.values(), key=lambda block: block.next_update, default=None)
@@ -358,11 +436,12 @@ def supersede_refusal(
 
 
 def _successors(old: CrlBlock, new: Sequence[CrlBlock]) -> list[CrlBlock]:
-    """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect."""
+    """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect. The issuers
+    match by ``issuer_key`` (:class:`~messagefoundry.pki.CrlBlock`)."""
     return [
         block
         for block in new
-        if block.issuer == old.issuer
+        if block.issuer_key == old.issuer_key
         and block.selection == old.selection
         and block.this_update > old.this_update
         and block.next_update >= old.next_update
@@ -422,12 +501,14 @@ class _Refusals:
         self.strongest: tuple[str, str] | None = None
         #: True once the next pass must judge these bytes again. Either a refusal that can lift
         #: (:data:`_RETRIED`) is what stopped a context or the whole pass, so that context may
-        #: still take them, or the reason reported carries a warning that ends with time.
+        #: still take them, or the refusal reported is one :data:`_REOPENED_WHILE_NOT_IN_EFFECT`
+        #: holds and some issuer in the file has no CRL in effect yet.
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
-        #: True when the refusal reported names a restart and a start would refuse the file too,
-        #: until one of its CRLs takes effect (:attr:`ReloadOutcome.start_refuses`).
+        #: True when the refusal reported can send the operator to a restart and a start would
+        #: refuse the file too, at least until one of its CRLs takes effect
+        #: (:attr:`ReloadOutcome.start_refuses`).
         self.start_refuses = False
 
     def add(self, reason: str, remedy: str, *, stops: bool = True) -> None:
@@ -460,7 +541,8 @@ class _Refusals:
 
         "Final" is the reload's rule, not a proof. A file check reads the hop's CA list, which a
         CA directory can still add to. A file to fix was already final on its own, and a wait
-        beside it no longer keeps the pass open."""
+        beside it no longer keeps the pass open. :data:`BAD_SIGNATURE` is final only once every
+        issuer in the file has a CRL in effect (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`)."""
         return not self.pending and (self.strongest is None or self.strongest[1] not in _RETRIED)
 
 
@@ -647,7 +729,11 @@ def _label(
     kept = _LABELS.get(key)
     if refused and kept is not None and kept[0] == fingerprint:
         return kept[1]
-    shown = next((h.configured_path for _, h in stale if h.configured_path), path)
+    # One spelling whatever the order: two holders may spell one file differently, and the first
+    # one depended on the order the registry met them in (vault BACKLOG #3498). An absolute
+    # spelling comes first, since a relative one does not say what it is relative to.
+    spellings = [h.configured_path for _, h in stale if h.configured_path]
+    shown = min(spellings, key=lambda p: (not os.path.isabs(p), p), default=path)
     # The setting, only when every stale holder recorded the same one. Several listeners can share
     # one CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
     # whichever the pass met first sent the operator to one hop of several. The path alone is
@@ -687,7 +773,9 @@ def _reload_path(
     try:
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
         # CRL nothing supersedes, or a file to fix each outranks a wait, and must be reported.
-        facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
+        facts, blocks = judge_crl_bytes(
+            pem, label=label, now=now, require_in_effect=False, refuse_unread_extensions=True
+        )
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         # Every stale context, with the verdict that holds it back, if any. Each still gets the
@@ -738,20 +826,27 @@ def _reload_path(
         refusals.error = exc
     if (
         refusals.strongest is not None
-        and refusals.strongest[1] in _SAYS_RESTART
+        and refusals.strongest[1] in _REOPENED_WHILE_NOT_IN_EFFECT
         and (unmet := crl_not_in_effect(blocks, now=now)) is not None
     ):
-        # For the alert, which carries no reason. The reopen below is what lets this flag live
-        # on the outcome and not on the recorded refusal: such a refusal is never final, so
-        # ``_pending`` never replays it without the flag.
-        refusals.start_refuses = True
         why, remedy = refusals.strongest
-        refusals.strongest = (
-            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
-            f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect",
-            remedy,
-        )
-        # Judged again each pass, so the warning goes once its time has passed.
+        if remedy in _LEADS_TO_A_START:
+            # For the alert, which carries no reason. The reopen below is what lets this flag
+            # live on the outcome and not on the recorded refusal: such a refusal is never final,
+            # so ``_pending`` never replays it without the flag.
+            refusals.start_refuses = True
+            # "At least": the time ends one cause of a refusal, and a start can refuse after it
+            # for another, such as a private copy it cannot make. A proven bad signature takes no
+            # caveat: its remedy names no restart and says a start refuses it at any time (vault
+            # BACKLOG #3506).
+            refusals.strongest = (
+                f"{why}. Not before {log_timestamp(unmet.this_update)}: a start refuses this file "
+                f"too at least until then, since its CRL from issuer "
+                f"{quoted_issuer(unmet.issuer)} is not in effect",
+                remedy,
+            )
+        # Judged again each pass, so a warning goes once its time has passed, and a refusal a
+        # later pass finds for these bytes is reported (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`).
         refusals.reopen()
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
@@ -778,7 +873,7 @@ def _load(
     (:attr:`_Refusals.sticky`). A context that fails a file check is stopped by it, wait or no
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
     reloaded = 0
-    signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
+    signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
     for ctx, held, held_back in ready:
         if held_back is not None:
             # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
@@ -797,10 +892,9 @@ def _load(
                 )
                 continue
             if anchors not in signatures:
-                signatures[anchors] = crl_signature_refusal(pem, anchors)
+                signatures[anchors] = crl_signature_finding(pem, anchors)
             if (unsigned := signatures[anchors]) is not None:
-                why, found = unsigned
-                refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
+                refusals.add(f"{label}: {unsigned.why}", _SIGNATURE_REMEDY[unsigned.state])
                 continue
             if held_back is not None:
                 # Every file check passed, so this verdict alone holds the context back.

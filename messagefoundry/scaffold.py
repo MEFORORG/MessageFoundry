@@ -171,17 +171,31 @@ on:
   push:
     branches: [main]
 
+# No permission by default; each job names the least it needs, so a job you add starts with none.
+# Each action is pinned to a commit, since a tag can be moved to other code; the tag is the comment.
+# Nothing here bumps them: move the commit and its tag together, by hand or with Dependabot's
+# github-actions ecosystem.
+permissions: {}
+
 jobs:
   # Supply-chain gate (MessageFoundry WP-BL3-07): verify the pinned engine wheel's SLSA build provenance
   # BEFORE installing it, so a registry/mirror substitution of the engine fails the build instead of
   # shipping silently. Fail-closed by default. If your package index strips attestations (some private
   # mirrors do), set the repository variable MEFOR_VERIFY_ENGINE=off to skip this job (see README).
+  # Its token reads this repository. `attestations: read` is the permission GitHub's attestations
+  # API documents for reading attestations; whether a token reading another, public repository's
+  # attestations needs it was not measured. The checkout keeps no credential.
   verify-engine:
     runs-on: ubuntu-latest
     if: ${{ vars.MEFOR_VERIFY_ENGINE != 'off' }}
+    permissions:
+      contents: read
+      attestations: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Download the pinned engine wheel (no install)
@@ -237,10 +251,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Install the pinned MessageFoundry engine
@@ -262,53 +276,97 @@ jobs:
   #
   # WINDOWS, the engine's only supported deployment platform: pip-audit silently skips a dependency
   # whose environment marker does not match the runner. With a hashed requirements.lock the job
-  # installs the lock under --require-hashes and runs the engine's own auditor, which audits every
-  # pin in it whatever its marker. The engine's docs/ADOPTER-CI.md, "Job 3", says more.
+  # runs the engine's own auditor, which audits every pin in it whatever its marker. The engine's
+  # docs/ADOPTER-CI.md, "Job 3", says what each step does and what it leaves open.
   #
   # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a novel
-  # malicious substitute from a compromised/confused index. Without a lock, `pip install -r
+  # malicious substitute from a compromised/confused index. Without a lock, `pip-audit -r
   # requirements.txt` resolves the whole transitive closure (fastapi, cryptography, pydantic, …) LIVE
-  # and UNHASHED, so the step WARNS and recommends an index pin (--index-url / PIP_CONSTRAINT) against
-  # dependency-confusion. Generate the lock over YOUR closure (see the README "Transitive
-  # supply-chain" section).
+  # and UNHASHED, so the job WARNS and recommends an index pin (--index-url / PIP_CONSTRAINT) against
+  # dependency-confusion. With a lock, requirements.txt is audited as written, with no resolve and no
+  # install, and the lock's hashed pins are audited. Generate the lock over YOUR closure (see the
+  # README "Transitive supply-chain" section).
   #
-  # One step per command, and each after the first runs even when an earlier one failed
-  # (`!cancelled()`), so a failed install or one audit's finding never hides the requirements.txt
-  # audit's result, and a requirements.txt finding never hides the lock audit's. The lock audit
-  # needs the auditor the install brings, so a failed install skips it.
-  # It runs engine code from the lock, so the token reads only, and the checkout keeps no credential.
+  # One step per check, and each after the first runs even when an earlier one failed
+  # (`!cancelled()`), so one failure or finding never hides another's result. The lock audit needs
+  # the auditor the engine install brings, so a failed install skips it.
+  # It runs engine code, so the token reads only, and the checkout keeps no credential.
+  # Wheels only for every pip in the job, pip-audit's included: building an sdist runs its build code
+  # here, so a dependency that ships no wheel for Windows fails the job instead. Drop it only once
+  # you have decided that package's build code may run in CI.
   audit-pin:
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      PIP_ONLY_BINARY: ":all:"
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
-      # dependencies win any version they share.
-      - name: Install the locked engine for its auditor
+      # Only the engine's own pin goes into the interpreter that runs the auditor, pip and pip-audit,
+      # so no other locked package's code runs inside them. The auditor checks the rest of the lock
+      # with a dry run that installs nothing. This reads the lock as pip does: by its byte-order
+      # mark, and joining a line that ends in a backslash to the next unless it is a comment.
+      # pip's --require-hashes then refuses the pin if it carries no hash.
+      - name: Install the engine alone, from its locked hashes, for its auditor
         id: engine
         if: ${{ hashFiles('requirements.lock') != '' }}
-        run: python -m pip install --no-deps --require-hashes -r requirements.lock
+        run: |
+          python -I - <<'PY'
+          import codecs, os, re, sys
+          from pathlib import Path
+
+          raw = Path("requirements.lock").read_bytes()
+          boms = [(codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32")]
+          boms += [(codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")]
+          encoding = next((name for bom, name in boms if raw.startswith(bom)), "utf-8-sig")
+          pins, group = [], []
+          for line in raw.decode(encoding).splitlines():
+              group.append(line)
+              if line.endswith(chr(92)) and not line.lstrip().startswith("#"):
+                  continue
+              name = re.match("[A-Za-z0-9][A-Za-z0-9._-]*", group[0].lstrip())
+              if name and re.sub("[-_.]+", "-", name[0]).lower() == "messagefoundry":
+                  pins.append(group)
+              group = []
+          if len(pins) != 1:
+              print(f"::error::requirements.lock must pin messagefoundry once; it pins it {len(pins)} times")
+              sys.exit(1)
+          pin = Path(os.environ["RUNNER_TEMP"], "engine-pin.txt")
+          pin.write_text(chr(10).join(pins[0]) + chr(10), encoding="utf-8")
+          PY
+          python -m pip install --no-deps --require-hashes -r "$RUNNER_TEMP/engine-pin.txt"
       - name: Warn when the transitive resolve is not hash-pinned
         if: ${{ hashFiles('requirements.lock') == '' }}
         run: |
           echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
           echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
+      # One exact version. Its own dependencies still resolve live and unhashed, into the
+      # interpreter the auditor runs in.
       - name: Install pip-audit
         if: ${{ !cancelled() }}
-        run: python -m pip install pip-audit
+        run: python -m pip install pip-audit==2.10.1
       - name: Audit requirements.txt as Windows resolves it
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('requirements.lock') == '' }}
         run: pip-audit -r requirements.txt --desc
+      # Each pin as written, with no resolve and no install, so each must be pinned with ==. This
+      # form of pip-audit skips an included file without a word, so an include is refused.
+      - name: Audit the pins of requirements.txt as written
+        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        run: |
+          if grep -Eq '^[[:space:]]*(-r|--requirement)' requirements.txt; then
+            echo "::error::requirements.txt includes another file, which this audit would skip; list its pins in requirements.txt"
+            exit 1
+          fi
+          pip-audit -r requirements.txt --desc --disable-pip --no-deps
       # Needs the auditor the install step brings, so it waits on that step alone: after a failed
       # install it would only fail again, for a reason that is not an advisory.
       - name: Audit every pin of requirements.lock, whatever its marker
@@ -407,9 +465,13 @@ bumping the engine pin in `requirements.txt` to a release that fixed it (accept 
 appending `--ignore-vuln <ID>` to each audit line that reports it, recorded per your own change control).
 It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
-Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
+Windows-only dependencies. With a `requirements.lock` it audits `requirements.txt` as written, with
+no resolve, so pin each requirement there with `==`, and runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses.
+in the lock whatever its marker. The engine's `docs/ADOPTER-CI.md`, "Job 3", says what each step
+requires and refuses. The job
+takes wheels only (`PIP_ONLY_BINARY`), so a dependency with no wheel for Windows fails it rather
+than having its build code run in CI.
 
 ## Transitive supply-chain (your deps, not the engine)
 `gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`
@@ -434,8 +496,8 @@ hardening steps (recommended for any PHI-handling adopter):
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```
-   When you commit a `requirements.lock`, the `audit-pin` CI job verifies it installs reproducibly
-   under `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
+   When you commit a `requirements.lock`, the `audit-pin` CI job dry-run installs it under
+   `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
    closure resolves live and unhashed. `uv pip compile --universal` writes every platform's pins;
    `pip-compile` locks only the platform it runs on, so run it on Windows.
 

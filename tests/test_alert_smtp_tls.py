@@ -632,6 +632,121 @@ def test_cram_md5_is_never_selected_even_when_the_server_offers_it(
     assert "CRAM-MD5" in _RecordingSMTP.esmtp_features["auth"]
 
 
+# --------------------------------------------------------------------------------------------------
+# Vault BACKLOG #3533 item 3: a LOGIN never crosses a hop that does not authenticate the relay.
+# [security].allow_unverified_alert_smtp_tls still permits such a hop with no login; it no longer
+# covers the SMTP AUTH password. Settings refuse the shape at load, at every posture.
+# --------------------------------------------------------------------------------------------------
+
+_LOGIN = "svc-alerts-3533"  # a sentinel, so the tests can check the refusal never echoes it
+
+_UNAUTHENTICATED = [
+    pytest.param({"email_tls_verify": False}, "email_tls_verify = false", id="verify-off"),
+    pytest.param({"email_use_tls": False}, "email_use_tls = false", id="cleartext"),
+]
+
+
+@pytest.mark.parametrize(("hop", "named"), _UNAUTHENTICATED)
+@pytest.mark.parametrize("login", [_LOGIN, ""], ids=["login", "empty-login"])
+def test_a_login_over_an_unauthenticated_hop_is_refused_at_load(
+    hop: dict[str, Any], named: str, login: str
+) -> None:
+    """The sender runs SMTP AUTH whenever a username is set, an empty one included, so both refuse.
+    On the unchanged code both load, and the verify-off arm sends the password to any peer."""
+    with pytest.raises(ValueError, match="email_username is set") as refused:
+        AlertsSettings(email_smtp_host="smtp.example", email_username=login, **hop)
+    message = str(refused.value)
+    assert named in message
+    assert "allow_unverified_alert_smtp_tls covers only a hop with no login" in message
+    assert _LOGIN not in message
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({"email_tls_verify": False}, id="verify-off-no-login"),
+        pytest.param({"email_use_tls": False}, id="cleartext-no-login"),
+        pytest.param({"email_username": _LOGIN}, id="login-verified-hop"),
+        # A password with no username starts no AUTH, so nothing crosses.
+        pytest.param({"email_tls_verify": False, "email_password": "pw"}, id="password-no-login"),
+    ],
+)
+def test_the_refusal_needs_both_a_login_and_an_unauthenticated_hop(fields: dict[str, Any]) -> None:
+    """The controls: either half alone still loads, so the refusal above keys on the pair."""
+    AlertsSettings(email_smtp_host="smtp.example", **fields)
+
+
+@pytest.mark.parametrize(
+    "security_lines",
+    [
+        pytest.param("security.allow_unverified_alert_smtp_tls = true\n", id="acknowledged"),
+        pytest.param('security.enforcement = "warn"\n', id="warn-dial"),
+    ],
+)
+@pytest.mark.parametrize(("hop", "named"), _UNAUTHENTICATED)
+def test_neither_way_past_the_serve_gate_lets_a_login_cross(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    security_lines: str,
+    hop: dict[str, bool],
+    named: str,
+) -> None:
+    """The acknowledgment and the warn dial each start a hop with no login (the tests above). With
+    a login they refuse, and the message names the login. On the unchanged code both return 0."""
+    ((key, value),) = hop.items()
+    alerts_lines = f'{key} = {str(value).lower()}\nemail_username = "{_LOGIN}"\n'
+    rc = _serve(
+        tmp_path,
+        monkeypatch,
+        _prod_phi_toml(alerts_lines=alerts_lines, security_lines=security_lines),
+        env="dev",
+    )
+    err = capsys.readouterr().err
+    assert rc != 0, err
+    assert "email_username is set" in err and named in err, err
+    assert _LOGIN not in err
+
+
+def test_a_login_with_no_relay_configured_loads() -> None:
+    """With no SMTP host there is no hop, so a username left behind crosses nothing."""
+    AlertsSettings(email_username=_LOGIN, email_use_tls=False)
+    AlertsSettings(email_username=_LOGIN, email_tls_verify=False)
+
+
+def test_the_send_step_refuses_a_login_over_verify_off(smtp: type[_RecordingSMTP]) -> None:
+    """The second line, for a caller that never built an AlertsSettings. On the unchanged code it
+    sends, and the fake records the login on a hop that accepted any certificate."""
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        tls_verify=False,
+        username="svc",
+        password="pw",
+    )
+    with pytest.raises(ValueError, match="certificate is not verified"):
+        asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert "login" not in smtp.captured, "the credential reached the transport before the refusal"
+
+
+def test_the_acknowledgment_still_starts_a_hop_with_no_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: the same config with the login removed starts."""
+    rc = _serve(
+        tmp_path,
+        monkeypatch,
+        _prod_phi_toml(
+            alerts_lines="email_tls_verify = false\n",
+            security_lines="security.allow_unverified_alert_smtp_tls = true\n",
+        ),
+        env="dev",
+    )
+    assert rc == 0
+
+
 # BACKLOG #1966: the serve fixtures here test the alert gates, so they carry verified off-box
 # forwarding (tests/conftest.py, verified_log_forwarding).
 pytestmark = pytest.mark.usefixtures("verified_log_forwarding")

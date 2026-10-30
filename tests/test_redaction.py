@@ -28,6 +28,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
+from tests._cpu_clock import cpu_seconds as _cpu_seconds
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
 ADT = (
@@ -217,13 +218,6 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
     return best
 
 
-#: The least CPU time one ``_cpu_seconds`` sample spends. **A floor, because the clock is coarse:**
-#: ``time.process_time`` reports a resolution of 100 ns on Windows but moves in 15.625 ms ticks,
-#: measured 2026-10-13. One call of a 5 ms arm reads 0 or 15.6 ms, so a sample repeats the call
-#: until this much CPU time has passed and divides by the count. That caps the tick's error at
-#: about 8% of the sample.
-_CPU_SAMPLE_FLOOR_SECONDS = 0.2
-
 #: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
 #: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
 #: of 24, each with room. **The number is borrowed, the clock is not:**
@@ -235,33 +229,6 @@ _CPU_GROWTH_LINE = 24.0
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
 #: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
 _CPU_CEILING_SECONDS = 0.5
-
-
-def _cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
-    """Best-of-``reps`` CPU seconds per call of ``work``, each sample at least
-    ``_CPU_SAMPLE_FLOOR_SECONDS`` long.
-
-    **CPU time rather than wall time, for the arms whose margin a loaded runner can eat (BACKLOG
-    #2958).** A busy host delays a process without charging it the delay, so the clock this reads
-    stops while the runner is away. **It counts every thread in the process, not only this one**, so
-    a thread an earlier test left running is charged here too. It does not stop everything: a shared
-    core still slows each instruction through the cache, which is why the arms read a RATIO between
-    two sizes timed back to back, under one load, rather than a fixed number of seconds. A wall-clock ratio was built and
-    withdrawn in PR 2000, red 12 times in 25 on a shared Linux core; this is not that instrument.
-
-    The minimum over samples, for the reason ``_best_of`` gives."""
-    best = float("inf")
-    for _ in range(reps):
-        calls = 0
-        start = time.process_time()
-        while True:
-            work()
-            calls += 1
-            spent = time.process_time() - start
-            if spent >= _CPU_SAMPLE_FLOOR_SECONDS:
-                break
-        best = min(best, spent / calls)
-    return best
 
 
 def _redact_seconds(reps: int) -> float:
@@ -577,8 +544,9 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
 
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
-    completeness: the "never put PHI in an exception message" convention remains the control for a
-    headerless fragment, exactly as it does for a bare single-token identifier.
+    completeness. The "never put PHI in an exception message" convention binds only the engine's own
+    authors, Router and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime
+    (docs/PHI.md section 7, *Who the exception-message convention binds*).
 
     The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
     scrubs the value after that ``mrn`` label. That is a different pass reaching it, not the sniff, so
@@ -586,6 +554,49 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     beside it."""
     assert redact("id MRN123$$$H$MR here") == "id MRN123$$$H$MR here"
     assert redact("mrn MRN123$$$H$MR here") == "mrn [redacted]$$$H$MR here"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x Ann Jo Lee Smith y", "x [redacted] y"),  # control: four tokens go whole
+        ("x Mary Ann Jo Lee Smith y", "x [redacted] Smith y"),  # 4j+1: the last survives
+        ("x MARY ANN JO LEE SMITH y", "x [redacted] SMITH y"),
+        ("x Mary Ann Jo Lee Smith Doe y", "x [redacted] [redacted] y"),  # six: four, then two
+        ("x Aa Bb Cc Dd Ee Ff Gg Hh y", "x [redacted] [redacted] y"),  # eight: none survives
+        ("x Aa Bb Cc Dd Ee Ff Gg Hh Ii y", "x [redacted] [redacted] Ii y"),  # nine: the last
+        ("x Aaron Bobby Carl Dave Eve, Jane y", "x Aaron [redacted] y"),  # comma: the FIRST
+        ("x Doe, Aaron Bobby Carl Dave Eve y", "x [redacted] Eve y"),  # comma: the last
+        ("x Aa Bb Cc Dd Ee, Ff Gg Hh Ii Jj y", "x Aa [redacted] Jj y"),  # comma: one each side
+    ],
+)
+def test_a_long_name_run_keeps_a_token_on_each_4j_plus_1_remainder(
+    text: str, expected: str
+) -> None:
+    """DOCUMENTED RESIDUAL, OPEN (found under BACKLOG #2079), pinned so a change to it is deliberate.
+
+    Each ``_NAME_RUN`` arm takes two to four tokens and the scan resumes after a match, so a run of
+    4j+1 tokens keeps its last token and every other length loses all. ``_COMMA_NAME_RUN`` runs first
+    and takes at most four a side, and what is left either side is read as a run by the same rule.
+    The comment above ``_NAME_RUN`` states it."""
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x Jane Doe y", "x [redacted] y"),  # control: one case throughout is caught
+        ("x Jane DOE y", "x Jane DOE y"),
+        ("x JANE Doe y", "x JANE Doe y"),
+        ("x Mary JO Smith y", "x Mary JO Smith y"),
+        ("x Mary Ann DOE y", "x [redacted] DOE y"),  # the same-case pair is still taken
+        ("x DOE, Jane y", "x DOE, Jane y"),  # the comma arm has the same rule
+    ],
+)
+def test_a_name_token_with_no_same_case_neighbour_passes(text: str, expected: str) -> None:
+    """DOCUMENTED RESIDUAL, OPEN (found under BACKLOG #2079): each name arm needs one case throughout
+    a run, so a token whose neighbours are all in the other case is read alone and passes."""
+    assert redact(text) == expected
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------

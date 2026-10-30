@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.security.audit_all_platforms import PUBLISHED_DISTRIBUTIONS
 from tests._force_include import wheel_force_include
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -41,27 +42,36 @@ _ROOT = Path(__file__).resolve().parent.parent
 #: Distributions this repository builds that are **not yet published to any index**. Until a name is
 #: claimed, no shipped text may tell a user to install it by bare name.
 #:
-#: **`messagefoundry-toolkit` is here from ADR 0201 slice 2 until its first upload claims the name.**
-#: The other three distributions this repo builds are registered on PyPI (`messagefoundry`,
-#: `messagefoundry-harness`, `messagefoundry-webconsole` -- the last claimed 2026-07-29 by the first
-#: `webconsole-v*` release, closing the ASVS 15.2.4 exposure where README.md instructed an index
-#: install of an unclaimed name). ADR 0201 slice 3 moves the toolkit to `_PUBLISHED_DISTRIBUTIONS`
-#: after a probe of the first tag's JSON API URL, with the harness as a control, shows the upload
-#: landed. An empty set is the goal state, not a disabled guard.
+#: Every distribution this repo builds is registered on PyPI, so the set is empty. An empty set
+#: is the goal state, not a disabled guard. `messagefoundry-webconsole` was claimed 2026-07-29 by the
+#: first `webconsole-v*` release, closing the ASVS 15.2.4 exposure where README.md instructed an index
+#: install of an unclaimed name.
 #:
-#: This matches an install VERB only, so it cannot see text that names the toolkit without one. ADR
-#: 0201 section 1 does not rely on it to close the window: the release job uploads the toolkit before
-#: the engine, so no engine naming the toolkit reaches PyPI while the name is unclaimed.
+#: This matches an install VERB only, so it cannot see text that names a listed distribution without
+#: one, such as a `Requires-Dist` line or prose saying a package depends on it.
 #:
 #: The set exists for the NEXT distribution: add its name here the moment `packaging/<name>/` lands and
 #: before any doc references it, then remove it once the first release claims the name.
 #: `test_a_new_distribution_must_be_classified` fails if a packaged distribution is neither listed here
 #: nor demonstrably published, so this cannot silently rot back to vacuous.
-_UNPUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset({"messagefoundry-toolkit"})
+_UNPUBLISHED_DISTRIBUTIONS: frozenset[str] = frozenset()
 
-#: Distribution names registered on PyPI and published by this repo's release workflow. Listing one
-#: here asserts the name is CLAIMED -- the property that makes a bare-name install instruction safe.
-_PUBLISHED_DISTRIBUTIONS = frozenset({"messagefoundry-harness", "messagefoundry-webconsole"})
+#: ``PUBLISHED_DISTRIBUTIONS``, imported above, is the record of the distribution names registered
+#: on PyPI and published by this repo's release workflow. It lives in
+#: ``messagefoundry/security/audit_all_platforms.py``, because the dependency audit there refuses to
+#: skip any of them (BACKLOG #3786); edit it there, as there is no copy here. Listing one asserts the
+#: name is CLAIMED -- the property that makes a bare-name install instruction safe.
+#:
+#: **`messagefoundry-toolkit` moved into it in ADR 0201 slice 3**, from `_UNPUBLISHED_DISTRIBUTIONS`,
+#: where slice 2 put it. The probe, read 2026-10-27: PyPI's JSON API returned 200 for
+#: `/pypi/messagefoundry-toolkit/json`, `/pypi/messagefoundry-toolkit/0.5.0/json` and
+#: `/pypi/messagefoundry-toolkit/0.5.1/json`, and for the harness control
+#: `/pypi/messagefoundry-harness/0.5.1/json`; it returned 404 for the controls
+#: `/pypi/messagefoundry-toolkit/0.0.0.dev999/json` and an unregistered project name. The project
+#: lists releases 0.5.0, 0.5.1 and 0.5.2, and each wheel's provenance names publisher
+#: `MEFORORG/MessageFoundry`, workflow `release.yml`. So every release on the project is this repo's
+#: upload. That is a reading on that date, not something this test re-checks: no test here reaches
+#: the network.
 
 #: Files whose install commands are shipped to, or executed by, someone other than a maintainer.
 #: CI workflows and internal handoffs are excluded deliberately: they install from the source tree by
@@ -258,11 +268,12 @@ def test_a_new_distribution_must_be_classified() -> None:
     packaged = {
         p.name for p in (_ROOT / "packaging").iterdir() if p.is_dir() and not p.name.startswith(".")
     }
-    unclassified = sorted(packaged - _UNPUBLISHED_DISTRIBUTIONS - _PUBLISHED_DISTRIBUTIONS)
+    unclassified = sorted(packaged - _UNPUBLISHED_DISTRIBUTIONS - PUBLISHED_DISTRIBUTIONS)
     assert not unclassified, (
         f"packaged distribution(s) classified as neither unpublished nor published: {unclassified}. "
         f"Add each to _UNPUBLISHED_DISTRIBUTIONS (and keep docs on a path install) until its name is "
-        f"registered, then move it to _PUBLISHED_DISTRIBUTIONS. An unclaimed name that shipped docs "
+        f"registered, then move it to PUBLISHED_DISTRIBUTIONS in "
+        f"messagefoundry/security/audit_all_platforms.py. An unclaimed name that shipped docs "
         f"reference by name is the dependency-confusion window (ASVS 15.2.4). A tree that is not "
         f"a Python distribution does not belong under packaging/: move it out, as net-helper/ was."
     )
@@ -324,7 +335,7 @@ def test_the_synthetic_probe_name_is_not_a_real_distribution() -> None:
 # only the commands. A reader who trusted those five got the pre-claim world: install by path, the
 # name is claimable by anyone, no publishing job exists.
 #
-# Derived from `_PUBLISHED_DISTRIBUTIONS`, so it inverts on its own if a name is ever reclassified.
+# Derived from `PUBLISHED_DISTRIBUTIONS`, so it inverts on its own if a name is ever reclassified.
 
 
 #: Files the PROSE arm reads that the install-command scan deliberately does not. The install-command
@@ -369,8 +380,7 @@ _UNPUBLISHED_ASSERTION = re.compile(
 def _published_name_spellings() -> frozenset[str]:
     """Every spelling a published distribution is referred to by: its name and its import name."""
     return frozenset(
-        set(_PUBLISHED_DISTRIBUTIONS)
-        | {name.replace("-", "_") for name in _PUBLISHED_DISTRIBUTIONS}
+        set(PUBLISHED_DISTRIBUTIONS) | {name.replace("-", "_") for name in PUBLISHED_DISTRIBUTIONS}
     )
 
 
@@ -449,7 +459,7 @@ def test_no_tracked_text_asserts_a_published_distribution_is_unpublished() -> No
     problems = _unpublished_claims(_prose_files())
     assert not problems, (
         f"tracked text asserts a distribution is unpublished while this module classifies it "
-        f"PUBLISHED: {problems}. Published: {sorted(_PUBLISHED_DISTRIBUTIONS)}. Correct the prose -- "
+        f"PUBLISHED: {problems}. Published: {sorted(PUBLISHED_DISTRIBUTIONS)}. Correct the prose -- "
         f"do NOT add the name back to _UNPUBLISHED_DISTRIBUTIONS to make this pass, which is the same "
         f"defect inverted: a classification edited to agree with whichever artifact is convenient."
     )

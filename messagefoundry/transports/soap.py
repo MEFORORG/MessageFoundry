@@ -111,6 +111,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
@@ -120,6 +121,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
+    url_scheme,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -326,7 +328,7 @@ class SoapDestination(DestinationConnector):
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("SOAP destination requires a 'url' setting")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "SOAP destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"SOAP destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "SOAP destination 'url'")
@@ -376,16 +378,14 @@ class SoapDestination(DestinationConnector):
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
         # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
-        # secure, and that is accepted (WARN + audit, never a silent ALLOW). Held on the instance because
-        # the WS-Security / body-secret credential hops below are decided in helper methods.
-        self._cleartext_accepted = config.cleartext_accepted
-        self._cleartext_reason = config.cleartext_reason
-        # Held for the same reason: the acceptance audit record names the declaring connection.
+        # secure, and that is accepted (WARN + audit, never a silent ALLOW). It never reaches the
+        # credential hops below (vault BACKLOG #3533 item 4).
+        accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
+        # Held because the WS-Security / body-secret credential refusals name the connection.
         self._connection_name = config.name
-        accepted, accept_reason = self._cleartext_accepted, self._cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
-        self._validate_ws(scheme, s, attested=attested)
+        self._validate_ws(scheme, s)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
@@ -408,9 +408,12 @@ class SoapDestination(DestinationConnector):
             scheme,
             self._headers,
             self.url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(
+                ConnectorType.SOAP,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
@@ -499,9 +502,7 @@ class SoapDestination(DestinationConnector):
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
                 self.url,
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                credentials=(),
                 connection=config.name,
             )
         digest = digest_handler_from_settings(s, url=self.url)
@@ -540,13 +541,9 @@ class SoapDestination(DestinationConnector):
         # ADR 0015 amendment (#236): body-secret substitution. Parsed last so the credential validation
         # runs after the hop/TLS posture is settled. Empty tuple (no body_secrets) → send() is
         # byte-identical to before.
-        self._body_secrets: tuple[tuple[str, str], ...] = self._parse_body_secrets(
-            s, scheme, attested=attested
-        )
+        self._body_secrets: tuple[tuple[str, str], ...] = self._parse_body_secrets(s, scheme)
 
-    def _parse_body_secrets(
-        self, s: dict[str, Any], scheme: str, *, attested: bool
-    ) -> tuple[tuple[str, str], ...]:
+    def _parse_body_secrets(self, s: dict[str, Any], scheme: str) -> tuple[tuple[str, str], ...]:
         """Read the flat ``body_secret_tokens`` + ``body_secret_value_<i>`` settings (already
         env()-resolved by the loader) into ``(token, secret)`` pairs (ADR 0015 amendment, #236).
 
@@ -597,15 +594,12 @@ class SoapDestination(DestinationConnector):
                 )
             pairs.append((str(token), secret))
         # A body-carried credential over a cleartext http hop is a plaintext-credential egress, exactly
-        # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
-        # stay allowed, byte-identical).
+        # like the WS-Security UsernameToken, so it takes the same rule: only a loopback host lets it
+        # cross (vault BACKLOG #3533 item 4).
         refuse_cleartext_credential_hop(
             scheme,
             self.url,
             credential="SOAP body secret",
-            attested=attested,
-            cleartext_accepted=self._cleartext_accepted,
-            cleartext_reason=self._cleartext_reason,
             connection=self._connection_name,
         )
         return tuple(pairs)
@@ -652,7 +646,7 @@ class SoapDestination(DestinationConnector):
                     text = text.replace(form, "***")
         return text
 
-    def _validate_ws(self, scheme: str, s: dict[str, Any], *, attested: bool = False) -> None:
+    def _validate_ws(self, scheme: str, s: dict[str, Any]) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
         ``build_outbound_connection`` so ``check``/dry-run catches it without a store; the url-scheme
         checks need the resolved url and live here). ADR 0015 §6."""
@@ -683,17 +677,15 @@ class SoapDestination(DestinationConnector):
             raise ValueError("SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)")
         if self._ws_mode and self.version != "1.2":
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
-        # A UsernameToken password over cleartext http is a credential on the wire — refuse like the
-        # Authorization-header path, now posture-keyed (#200): a production-PHI hop REFUSES (escape
-        # inert), a non-prod PHI hop refuses unless the clamped escape / a per-hop attestation permits.
-        if self.ws_username:
+        # A UsernameToken password over cleartext http is a credential on the wire, refused like the
+        # header credentials: only a loopback host lets it cross, never a declaration or the escape
+        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped,
+        # and a basic_user that ws_username falls back to is judged as HTTP Basic instead.
+        if self.ws_security and self.ws_username:
             refuse_cleartext_credential_hop(
                 scheme,
                 self.url,
                 credential="WS-Security UsernameToken credential",
-                attested=attested,
-                cleartext_accepted=self._cleartext_accepted,
-                cleartext_reason=self._cleartext_reason,
                 connection=self._connection_name,
             )
 

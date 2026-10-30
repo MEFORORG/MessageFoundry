@@ -1736,6 +1736,10 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "describe is pinned by calling it in the tenth-sweep probe test, the exposure gate by "
         "tests/test_cli.py, and the lockout claim by absence only"
     ),
+    ("test_security_doc_drift.py", "test_the_changelog_records_the_re_bind_role_test"): (
+        "absence of a retired release-note sentence in CHANGELOG.md and presence of the #3081 "
+        "entry (BACKLOG #3822); the code is pinned by AST in the re-bind role-test test"
+    ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
     ),
@@ -3863,8 +3867,8 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
         ),
         # A window dropped from the posture paragraph while a table row still names it.
         "window-unnamed": (
-            "`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days` and",
-            "`[retention].dead_letter_days` and",
+            "`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days`,",
+            "`[retention].dead_letter_days`,",
             "delete_message_bodies_after_days",
         ),
     }
@@ -3904,5 +3908,42 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         "reading the stored roles after the bind returns",
         "no action-bound grant is minted",
         "charged to neither the lockout nor the session's re-proof budget",
+        # BACKLOG #3822: the paragraph cites the role rule by the opening words of the paragraph
+        # that states it, so those words must still open a paragraph.
+        "Both legs also refuse a present account that lost a role in the directory",
     ):
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
+    rule = "**Both legs also refuse a present account that lost a role in the directory"
+    assert rule in doc, "the role-rule paragraph the re-bind paragraph cites lost its opening"
+
+
+def test_the_changelog_records_the_re_bind_role_test() -> None:
+    """BACKLOG #3822: the released 0.5.2 notes said the password re-bind does not compare roles,
+    and had no entry for the #3081 refusal. RED when that exact phrase returns, or when the entry
+    is not in the 0.5.2 section exactly once, or drops a fact below. A reworded return of the old
+    claim is not caught. A text check only: the behaviour is pinned by
+    ``tests/test_reauth_directory_demotion.py``."""
+    lines = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    assert "do not compare roles yet" not in " ".join(" ".join(lines).split()), (
+        "CHANGELOG.md still says the password re-bind does not compare roles."
+    )
+    heads = [i for i, line in enumerate(lines) if line.startswith("## [")]
+    start = next(i for i in heads if lines[i].startswith("## [0.5.2]"))
+    release = lines[start : next(i for i in heads if i > start)]
+    marker = "- **The password re-bind step-up refuses a directory account demoted"
+    hits = [i for i, line in enumerate(release) if line.startswith(marker)]
+    assert len(hits) == 1, f"CHANGELOG.md [0.5.2] holds the #3081 entry {len(hits)} times, not once"
+    body = [release[hits[0]]]
+    for line in release[hits[0] + 1 :]:
+        if not line.startswith("  "):
+            break
+        body.append(line)
+    entry = " ".join(" ".join(body).split())
+    for fact in (
+        "reason=directory_roles_demoted",
+        "reason=directory_identity_conflict",
+        "reason=directory_role_map_unsealed",
+        "none of them is charged to the lockout or to the session's re-proof budget",
+        "**403** on `POST /me/reauth`",
+    ):
+        assert fact in entry, f"the #3081 changelog entry no longer says: {fact}"

@@ -430,6 +430,30 @@
     for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
+  // The get() ceremony's two halves, one home for both legs that run it (the step-up assertion and
+  // the combined passkey sign-in, BACKLOG #3937 item 7): decode the server's request options, and
+  // serialize the browser's assertion into the JSON shape the engine's verify reads.
+  function requestOptions(options) {
+    options.challenge = b64urlToBytes(options.challenge);
+    (options.allowCredentials || []).forEach(function (c) {
+      c.id = b64urlToBytes(c.id);
+    });
+    return options;
+  }
+  function assertionJson(cred) {
+    return {
+      id: cred.id,
+      rawId: bytesToB64url(cred.rawId),
+      type: cred.type,
+      clientExtensionResults: cred.getClientExtensionResults(),
+      response: {
+        clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+        authenticatorData: bytesToB64url(cred.response.authenticatorData),
+        signature: bytesToB64url(cred.response.signature),
+        userHandle: cred.response.userHandle && bytesToB64url(cred.response.userHandle),
+      },
+    };
+  }
   function statusNode(button) {
     var node = document.querySelector("[data-mf-webauthn-status]");
     return {
@@ -521,11 +545,7 @@
       button.disabled = true;
       status.set("Follow your browser's prompt…");
       try {
-        var options = JSON.parse(button.getAttribute("data-mf-webauthn-get"));
-        options.challenge = b64urlToBytes(options.challenge);
-        (options.allowCredentials || []).forEach(function (c) {
-          c.id = b64urlToBytes(c.id);
-        });
+        var options = requestOptions(JSON.parse(button.getAttribute("data-mf-webauthn-get")));
         var cred = await navigator.credentials.get({ publicKey: options });
         var resp = await fetch("/ui/reauth/webauthn", {
           method: "POST",
@@ -533,21 +553,7 @@
           redirect: "manual",
           headers: { "Content-Type": "application/json", "X-Requested-With": "fetch" },
           cache: "no-store",
-          body: JSON.stringify({
-            response: {
-              id: cred.id,
-              rawId: bytesToB64url(cred.rawId),
-              type: cred.type,
-              clientExtensionResults: cred.getClientExtensionResults(),
-              response: {
-                clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
-                authenticatorData: bytesToB64url(cred.response.authenticatorData),
-                signature: bytesToB64url(cred.response.signature),
-                userHandle:
-                  cred.response.userHandle && bytesToB64url(cred.response.userHandle),
-              },
-            },
-          }),
+          body: JSON.stringify({ response: assertionJson(cred) }),
         });
         if (resp.type === "opaqueredirect") {
           window.location.reload(); // session expired — let the server redirect to login
@@ -620,24 +626,9 @@
           button.disabled = false;
           return;
         }
-        var options = (await begin.json()).options;
-        options.challenge = b64urlToBytes(options.challenge);
-        (options.allowCredentials || []).forEach(function (c) {
-          c.id = b64urlToBytes(c.id);
-        });
+        var options = requestOptions((await begin.json()).options);
         var cred = await navigator.credentials.get({ publicKey: options });
-        field.value = JSON.stringify({
-          id: cred.id,
-          rawId: bytesToB64url(cred.rawId),
-          type: cred.type,
-          clientExtensionResults: cred.getClientExtensionResults(),
-          response: {
-            clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
-            authenticatorData: bytesToB64url(cred.response.authenticatorData),
-            signature: bytesToB64url(cred.response.signature),
-            userHandle: cred.response.userHandle && bytesToB64url(cred.response.userHandle),
-          },
-        });
+        field.value = JSON.stringify(assertionJson(cred));
         status.set("Passkey ready — signing in…");
         form.submit();
         return;
@@ -1508,6 +1499,8 @@
       controller = new AbortController();
       setBusy(true);
       if (progress) progress.textContent = "Starting…";
+      var lines = 0;
+      var started = false;
       try {
         var resp = await fetch(url, {
           credentials: "same-origin",
@@ -1524,10 +1517,10 @@
           if (progress) progress.textContent = "Export failed (" + resp.status + ").";
           return;
         }
+        started = true;
         var reader = resp.body.getReader();
         var chunks = [];
         var bytes = 0;
-        var lines = 0;
         for (;;) {
           var step = await reader.read();
           if (step.done) break;
@@ -1539,6 +1532,7 @@
             progress.textContent =
               "Exported " + lines + " messages (" + bytes + " bytes)…";
         }
+        started = false; // the stream ended cleanly; a failure past here is not a stopped export
         var blob = new Blob(chunks, { type: "application/x-ndjson" });
         var href = URL.createObjectURL(blob);
         var a = document.createElement("a");
@@ -1552,6 +1546,15 @@
       } catch (e) {
         if (e && e.name === "AbortError") {
           if (progress) progress.textContent = "Export stopped.";
+        } else if (progress && started) {
+          // The engine ends a download it stops mid-stream (a revoked session, a withdrawn
+          // permission, a changed channel scope) as a failed transfer, so a stop lands here, not on
+          // the "Saved" line above (BACKLOG #3907). The rows already read are not saved: a partial
+          // file must never pass for a whole export.
+          progress.textContent =
+            "Export did not finish after " +
+            lines +
+            " messages: the engine stopped it or the connection failed. Nothing was saved.";
         } else if (progress) {
           progress.textContent = "Network error during export.";
         }

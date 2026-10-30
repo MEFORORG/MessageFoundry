@@ -86,10 +86,9 @@ from messagefoundry.parsing.message import emit_raw_separators, reencode_with_se
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
-    EVENT_SECONDS,
+    HUNG_UP,
     HandshakeFailures,
     handshake_cause,
-    watch_loop_handshakes,
 )
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
@@ -313,13 +312,6 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
 
-# Seconds between two `tls_handshake_failed` connection events from one listener (vault BACKLOG
-# #2613). Failed handshakes are logged at DEBUG only, so before #2613 nothing an operator reads
-# showed them. One event per window, carrying the count since the last one, records a flood without
-# letting a peer that fails handshakes as fast as it connects fill the connection_event table.
-# The shared value since #3302, whose `tls_handshake_failures` module says why it is per listener.
-_TLS_FAILURE_EVENT_SECONDS = EVENT_SECONDS
-
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
@@ -372,13 +364,15 @@ class InsecureHopGuard:
 
     Built once at connector construction via :meth:`capture`, which snapshots the active hop posture
     (:func:`~messagefoundry.config.tls_policy.current_hop_posture`). :meth:`enforce_construction` is the
-    ENFORCED gate — it fires inside ``build_check`` (``messagefoundry check`` / dry-run / reload / the
-    serve pre-flight), where the derived posture IS stamped, and refuses a production-PHI cleartext hop
-    there. :meth:`assert_send` is the zero-I/O send-time backstop at the byte crossing. Both **no-op when
-    the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a direct
-    test/embedding): the enforced gate has already validated the config, so fail-closing here would
-    wrongly refuse a legitimate non-prod cleartext lane that ``build_check`` allowed (and would break
-    every live serve of such a lane, since the live-build sites are deliberately not re-gated)."""
+    ENFORCED gate. It fires wherever the derived posture is stamped, and refuses an enforcing cleartext
+    hop there: inside ``build_check`` (``messagefoundry check`` / dry-run / reload), and in the runner's
+    live builds when ``serve`` starts the graph, which stamp the same posture (there a refusal fails
+    that connection alone, ADR 0031). ``serve`` runs no ``build_check`` pre-flight of its own; the live
+    build is the check (vault BACKLOG #3514). :meth:`assert_send` is the zero-I/O send-time backstop at
+    the byte crossing. Both **no-op when the posture is unstamped** (``None``, such as a direct test
+    build or an embedding that stamps none), so such a build crosses a cleartext hop with no refusal
+    and no warning. That is an open path, not a checked one: the runner's live builds are covered
+    only because they stamp."""
 
     host: str
     port: int
@@ -445,8 +439,7 @@ class InsecureHopGuard:
         """The ENFORCED construction gate: raise
         :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on an unattested, unaccepted
         enforcing cleartext hop, loud-log (+ audit the attestation / the acceptance) on a warned hop,
-        allow the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the
-        authority; see the class docstring."""
+        allow the rest. No-op when the posture is unstamped (``None``); see the class docstring."""
         posture = self.posture
         if posture is None:
             return
@@ -594,12 +587,20 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
 # --- destination -------------------------------------------------------------
 
 
+def _tls_label(family: str, name: str) -> str:
+    """A TLS refusal's label: the family, with the connection's name when the caller passed one, as
+    the runner does, so an operator with several such connections knows which one to fix. A direct
+    build with no name keeps the bare family label (vault BACKLOG #3514)."""
+    return f"{family} {name!r}" if name else family
+
+
 def _mllp_ssl_context(
     s: Mapping[str, Any],
     *,
     server: bool,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     name: str = "",
+    listener_family: str = "MLLP listener",
 ) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
@@ -623,9 +624,16 @@ def _mllp_ssl_context(
     API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
     exactly as before.
 
-    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142),
+    and for the TLS refusal labels below (vault BACKLOG #3514), as the DICOM destination's suite
+    refusal does. Not every refusal names it yet: at least a certificate or key load failure here,
+    the DICOM listener's labels and the DICOM destination's pin refusal do not.
+    ``listener_family`` names the listener in those labels: the inbound HTTP listener builds its
+    context here too, and passes its own."""
     refuse_an_unread_ca_pin(
-        s, inbound=server, connector="MLLP listener" if server else "MLLP destination"
+        s,
+        inbound=server,
+        connector=_tls_label(listener_family if server else "MLLP destination", name),
     )
     if not s.get("tls"):
         return None
@@ -640,7 +648,10 @@ def _mllp_ssl_context(
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if not cert:
-            raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
+            raise ValueError(
+                f"{_tls_label(listener_family, name)}: tls=true requires tls_cert_file "
+                "(the server identity)"
+            )
         load_connection_cert_chain(ctx, cert, key, key_password)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
             # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
@@ -661,8 +672,9 @@ def _mllp_ssl_context(
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
         # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
         # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
-        apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
-        harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
+        listener = _tls_label(listener_family, name)
+        apply_connection_tls_ciphers(ctx, s, connector=listener)  # opt-in per-hop suite list
+        harden_cipher_suites(ctx, connector=listener)  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
@@ -673,8 +685,9 @@ def _mllp_ssl_context(
     verify = bool_setting(s, "tls_verify", default=True)
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
-            "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
-            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            f"{_tls_label('MLLP destination', name)}: tls_verify=false disables server-certificate "
+            "verification (MITM risk). Use a trusted CA (tls_ca_file), or set "
+            f"{INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
             "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
             "effect while enforcing, the default, or with no posture)."
         )
@@ -712,8 +725,9 @@ def _mllp_ssl_context(
     # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
     # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a
     # suite, and an operator who narrowed this connection meant that hop as much as any other.
-    apply_connection_tls_ciphers(ctx, s, connector="MLLP destination")  # opt-in per-hop suite list
-    harden_cipher_suites(ctx, connector="MLLP destination")  # assert forward secrecy (ASVS 12.1.2)
+    destination = _tls_label("MLLP destination", name)
+    apply_connection_tls_ciphers(ctx, s, connector=destination)  # opt-in per-hop suite list
+    harden_cipher_suites(ctx, connector=destination)  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
@@ -1545,19 +1559,37 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
 
 def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
     """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so its
-    caps and allowlist run before the handshake (BACKLOG #1606). True on the stdlib loops only.
+    caps and allowlist run before the handshake (BACKLOG #1606). True for ``asyncio.BaseEventLoop``
+    and its subclasses, which the stdlib loops are.
 
     The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
     ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
     selector transport arms its reader only if not paused, and the Proactor issues no receive while
-    paused. uvloop is a different implementation. Review of this change read its ``pause_reading``
-    as a no-op before reading starts, and its reading as starting after ``connection_made``
-    returns, and uvloop's ``start_tls`` has no counterpart to gh-142352. That reading was not
-    checked against uvloop's source here, and uvloop does not run on Windows, where this was built.
-    A wrong guess there would stall every TLS connection, so any other loop keeps the loop-level
-    handshake, and with it the documented limit: the caps and allowlist apply after the handshake.
-    uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop
-    dependency installs it for CPython outside Windows, so on Linux that limit is the one in force.
+    paused. A subclass is trusted to keep the stdlib transports; that is not read. A loop outside
+    ``BaseEventLoop`` keeps the loop-level handshake, because a wrong guess there would stall every
+    TLS connection. A source reading of uvloop's 0.22.1 and 0.23.0 sdists found the upgrade unsafe
+    there. Both versions agree on at least these three points:
+
+    * ``UVBaseTransport._call_connection_made`` (``handles/basetransport.pyx``) calls
+      ``protocol.connection_made`` and then ``self._start_reading()`` with no check for a pause, so
+      reading always starts once ``connection_made`` returns.
+    * ``UVStream.pause_reading`` (``handles/stream.pyx``) returns at once while the stream is not
+      yet reading, so a pause inside ``connection_made`` does nothing.
+    * ``Loop.start_tls`` (``loop.pyx``) pauses, swaps in its ``SSLProtocol`` and resumes, but has no
+      counterpart to gh-142352: bytes already in the ``StreamReader`` stay there, and the TLS layer
+      never sees them.
+
+    A TLS client speaks first, so its ClientHello is normally read into the plaintext
+    ``StreamReader`` before the client task first runs, and ``StreamWriter.start_tls`` would then
+    wait on it until :data:`_TLS_HANDSHAKE_TIMEOUT` aborts the handshake: nearly every connection
+    would fail. Before enabling the upgrade on a later uvloop, re-read at least those three, and how
+    the loop orders ``connection_made``, the task's first step and the first read (``_on_idle``).
+
+    So on uvloop the caps and allowlist apply after the handshake. uvicorn runs the engine on uvloop
+    wherever it is installed; the pyproject marker on the engine's own uvloop dependency says where
+    that is. ``loop.connect_accepted_socket(..., ssl=...)`` exists on the stdlib loops and on
+    uvloop. It would hand the TLS layer an admitted socket before any read, at the cost of the
+    listener running its own accept loop. It is not built.
     """
     return isinstance(loop, asyncio.BaseEventLoop)
 
@@ -1889,10 +1921,8 @@ class MLLPSource(SourceConnector):
         self._upgrade_tls = False
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
         # #2613), on every loop since #3302: `_start_tls` counts where this listener runs the
-        # handshake, and the context's hook (`_note_loop_tls_failure`) where the loop does.
-        self._tls_failures = HandshakeFailures(
-            self._emit_tls_failure, window=_TLS_FAILURE_EVENT_SECONDS
-        )
+        # handshake, and the context's hook (`HandshakeFailures.watch`) where the loop does.
+        self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
         # gave back cannot shrink the restarted listener's budget. Each holder releases the
@@ -1919,6 +1949,7 @@ class MLLPSource(SourceConnector):
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
+        self._tls_failures.open()
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
@@ -1929,6 +1960,8 @@ class MLLPSource(SourceConnector):
             asyncio.get_running_loop()
         )
         if self._ssl is None or self._upgrade_tls:
+            if self._ssl is not None:  # a context an earlier start() hooked counts nothing
+                self._tls_failures.unwatch(self._ssl)
             self._server = await asyncio.start_server(
                 self._on_tls_accept if self._upgrade_tls else self._on_client, self.host, self.port
             )
@@ -1937,7 +1970,7 @@ class MLLPSource(SourceConnector):
         # the TLS socket's life are bounded here instead: the handshake, and the close_notify
         # exchange after writer.close(). Read at start() so a test can shorten them. A failed
         # handshake never reaches `_on_client` either, so the context reports it (vault #3302).
-        watch_loop_handshakes(self._ssl, self._note_loop_tls_failure)
+        self._tls_failures.watch(self._ssl)
         self._server = await asyncio.start_server(
             self._on_client,
             self.host,
@@ -2028,11 +2061,10 @@ class MLLPSource(SourceConnector):
                 writer.get_extra_info("peername"),
                 safe_exc(exc),
             )
-            # Not counted: stop() aborting a handshake, and a peer that hung up before finishing
-            # one, which is what a load balancer's TCP health check does. A reset is how the
-            # Windows Proactor reports that hang-up. A TLS error and the handshake bound count.
-            hung_up = isinstance(exc, ConnectionResetError | BrokenPipeError)
-            if not self._stopping and not hung_up:
+            # Not counted: a peer that closed or reset the socket (`HUNG_UP`), nor stop()
+            # aborting a handshake, which `HandshakeFailures.close` covers. A TLS error and the
+            # handshake bound count.
+            if not isinstance(exc, HUNG_UP):
                 await self._tls_failures.note(_peer_host(writer), handshake_cause(exc))
             return False
         except AttributeError:
@@ -2055,13 +2087,6 @@ class MLLPSource(SourceConnector):
         """Failed TLS handshakes this listener has seen since it was built, outside its stop()s
         (vault BACKLOG #2613)."""
         return self._tls_failures.count
-
-    def _note_loop_tls_failure(self, cause: str) -> None:
-        """A handshake the LOOP ran failed (vault BACKLOG #3302, #2613 item 3). The peer is not
-        known there. Ignored where this listener runs handshakes itself, which `_start_tls` already
-        counts, and once stop() has begun, so no report outlives stop()."""
-        if not self._upgrade_tls and not self._stopping:
-            self._tls_failures.note_soon(None, cause)
 
     async def _emit_tls_failure(self, peer_host: str | None, reason: str) -> None:
         await self._emit_event("tls_handshake_failed", peer_host=peer_host, reason=reason)
@@ -2093,8 +2118,10 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
-        # First, so a connection that reaches `_on_client` from here on is refused there unread.
+        # First, so a connection that reaches `_on_client` from here on is refused there unread,
+        # and no handshake failure from here on is counted.
         self._stopping = True
+        self._tls_failures.close()
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -2152,16 +2179,11 @@ class MLLPSource(SourceConnector):
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
             self._client_tasks.clear()
-            # Vault BACKLOG #2613: report the handshake failures a trailing event still held, once
-            # no handshake can add to them. `_emit_event` is fail-soft, so this cannot fail stop().
-            # Not once a restart has begun (an abandoned stop() resuming late), whose failures are
-            # its own to report.
-            if self._stopping:
-                await self._tls_failures.flush()
+            # Vault BACKLOG #2613: report the handshake failures a trailing event still held.
+            # `_emit_event` is fail-soft, so this cannot fail stop(). `flush` says why it does
+            # nothing once a restart has begun.
+            await self._tls_failures.flush()
         finally:
-            # Again here, so a stop() cancelled above leaves no timer to fire after it.
-            if self._stopping:
-                self._tls_failures.cancel()
             # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
             # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
             # listeners already did. A client task the runner ABANDONS when a stop() overruns

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,6 +22,8 @@ from messagefoundry.verify.smoke import (
     smoke_self,
     synthetic_message,
 )
+
+_log = logging.getLogger(__name__)
 
 #: The five runnable sections; default is all of them. "federation" (ADR 0142) is offline and
 #: emits a single SKIP row when [auth].oidc_enabled is false, so it costs a non-federated
@@ -102,10 +105,11 @@ def _odbc_hops(
     shown a hop. A hop found either way is enough.
 
     Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
-    a graph that does not load, settings that did not load, or settings that came from the defaults
-    alone, with no ``--service-config``, no ``./messagefoundry.toml`` and no ``MEFOR_STORE_BACKEND``,
-    because an operator's shell need not carry the service's own environment. A generic-dialect
-    DATABASE connection is unknown too: its driver, not Driver 18, decides its TLS."""
+    a graph that does not load, settings that did not load, or a shell with no
+    ``MEFOR_STORE_BACKEND``. That variable overrides the settings file, and an operator's shell
+    need not carry the service's own environment, so without it even a file that says sqlite does
+    not show the service's store (BACKLOG #3803 R1). A generic-dialect DATABASE connection is
+    unknown too: its driver, not Driver 18, decides its TLS."""
     if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
         return OdbcHops(found=("the [store] backend is sqlserver",))
     from messagefoundry.config.models import ConnectorType
@@ -150,14 +154,18 @@ def _odbc_hops(
         )
     if settings is None:
         return OdbcHops(unknown="service settings did not load, so the store backend is not known")
-    if (
-        service_config is None
-        and not settings_file_path(None).exists()
-        and "MEFOR_STORE_BACKEND" not in os.environ
-    ):
+    # Spelled as load_settings reads it: the prefix exactly, the rest in any case.
+    if not any(n.startswith("MEFOR_") and n[6:].lower() == "store_backend" for n in os.environ):
+        if service_config is None and not settings_file_path(None).exists():
+            return OdbcHops(
+                unknown="no service config was read, so the store may be SQL Server; pass "
+                "--service-config, and set MEFOR_STORE_BACKEND as the service sets it"
+            )
         return OdbcHops(
-            unknown="no service config was read, so the store may be SQL Server; pass "
-            "--service-config"
+            unknown=f"the store backend reads {settings.store.backend.value} from the service "
+            "config or its defaults, but MEFOR_STORE_BACKEND, which overrides both, is not set in "
+            "this shell, and the service's own environment may set it to sqlserver; set it here "
+            "as the service sets it"
         )
     return OdbcHops(judged=f"the service settings and the graph in {config_dir!r}")
 
@@ -197,13 +205,24 @@ def _run_live_smoke(
 
     control_id: str | None = None
     baseline_id: str | None = None
+    baseline_error: str | None = None
     if check_disposition and settings is not None:
         try:
             control_id = Peek.parse(message).control_id
         except HL7PeekError:
             control_id = None
         if control_id:
-            baseline_id = newest_message_id(settings.store, control_id)
+            try:
+                baseline_id = newest_message_id(settings.store, control_id)
+            except Exception as exc:  # any open or driver failure: a row, never a crashed run
+                # BACKLOG #1708: the read-only open refuses a store it cannot read as it is, such
+                # as another application's SQLite file. Never fall back to no baseline: the
+                # synthetic control id is fixed, so a prior run's message would then match.
+                # Class named, and a codec error never printed raw (vault BACKLOG #3185).
+                from messagefoundry.redaction import codec_safe_line
+
+                baseline_error = codec_safe_line(exc)
+                _log.warning("verify: the pre-send baseline read failed: %s", baseline_error)
 
     ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None
     results = [smoke_live(host=host, port=port, message=message, ssl_context=ctx)]
@@ -223,6 +242,16 @@ def _run_live_smoke(
     elif not control_id:
         results.append(
             CheckResult(rid, title, Status.SKIP, "no MSH-10 control id in the synthetic message")
+        )
+    elif baseline_error is not None:
+        results.append(
+            CheckResult(
+                rid,
+                title,
+                Status.ERROR,
+                "could not read the pre-send baseline from the store, so the disposition was not "
+                f"polled: {baseline_error}",
+            )
         )
     elif results[0].status is not Status.PASS:
         results.append(
@@ -301,7 +330,11 @@ def run_verify(
         else:
             results.append(check_store_connectivity(settings.store))
             # ADR 0197 Amendment A, AC-A9: the census of accounts with no way past a lock.
-            results.append(check_lockable_accounts(settings.store, settings.auth))
+            results.append(
+                check_lockable_accounts(
+                    settings.store, settings.auth, public_origin=settings.api.public_origin
+                )
+            )
             # ADR 0197 Amendment A, Manager decision 2026-09-29: a sibling check, not part of the
             # census -- it is about the policy, not about any account.
             results.append(check_credential_generation(settings.auth))

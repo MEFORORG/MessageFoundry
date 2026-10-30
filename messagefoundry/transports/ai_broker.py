@@ -47,8 +47,6 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, weakened_tls_escape_permitted
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
 
@@ -59,10 +57,13 @@ from messagefoundry.transports.rest import (
     _redact_url,
     find_outbound_length_violation,
     refuse_url_credentials,
+    url_host_label,
+    url_scheme,
 )
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
     from messagefoundry.config.settings import AiSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 __all__ = [
     "AiBroker",
@@ -82,7 +83,7 @@ _DEFAULT_TIMEOUT = 60.0
 
 class AiBrokerError(ValueError):
     """The engine broker is mis-configured (missing endpoint/key, an endpoint outside the SSRF allowlist,
-    a cleartext-http endpoint carrying the key) or the provider call failed. Raised with a PHI-/secret-safe
+    a cleartext-http endpoint, which always carries the key) or the provider call failed. Raised with a PHI-/secret-safe
     message (redacted host + status only) so it can surface as a clean API error without leaking the
     prompt, the response, or the key."""
 
@@ -124,15 +125,27 @@ class AiBroker:
         model: str = "claude-opus-4-8",
         max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT,
-        posture: HopPosture | None = None,
     ) -> None:
         if not endpoint:
             raise AiBrokerError(
                 "engine-brokered AI requires an '[ai].endpoint' (the customer-managed LLM's URL)"
             )
-        scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise AiBrokerError(f"[ai].endpoint must be http or https, got scheme {scheme!r}")
+        # Read through url_scheme, never a bare urlsplit: a URL it cannot parse raises urlsplit's own
+        # ValueError, which quotes the netloc. The full credential screen stays after the http
+        # refusal below, so that order is unchanged (BACKLOG #2686).
+        scheme = url_scheme(endpoint, "[ai].endpoint", use="[ai].api_key", error=AiBrokerError)
+        # The api_key is a credential, and every call sends it (an empty key is refused below), so a
+        # cleartext http endpoint is refused with no escape and in every posture: vault BACKLOG #3533
+        # item 5, which applies docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+        # unverified peer*. The insecure-TLS escape released it at warn until then. Refused first,
+        # so an http endpoint is never sent to fix an allowlist entry it cannot use.
+        if scheme == "http":
+            raise AiBrokerError(
+                "[ai].endpoint over cleartext http would send the api_key in clear; refused, with "
+                "no escape. Use an https endpoint."
+            )
+        if scheme != "https":
+            raise AiBrokerError(f"[ai].endpoint must be https, got scheme {scheme!r}")
         refuse_url_credentials(endpoint, "[ai].endpoint", use="[ai].api_key", error=AiBrokerError)
         if not api_key:
             raise AiBrokerError(
@@ -142,24 +155,10 @@ class AiBroker:
         # than — and independent of — the permissive-when-empty [egress].allowed_http, so the engine can
         # never be pointed at an un-allowlisted LLM host. An EMPTY allowlist permits NOTHING.
         if not endpoint_host_allowed(endpoint, allowed_endpoints):
-            host = urllib.parse.urlsplit(endpoint).hostname or ""
+            host = url_host_label(endpoint)
             raise AiBrokerError(
                 f"[ai].endpoint host {host!r} is not in the [ai].allowed_endpoints allowlist; "
                 "list it explicitly to permit engine-brokered AI egress (SSRF fail-closed)"
-            )
-        # The api_key is a credential — refuse to send it over cleartext http (mirrors smart.py's token
-        # endpoint), unless the dev escape is set for a trusted-network dev/test box. #329: read the
-        # escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
-        # instance the blunt env var can never re-permit the key on the wire. The broker is built out of
-        # the connector-construction gate (the create_app ai_chat route), so the posture is threaded
-        # explicitly; None (a direct/test construction) fails closed since vault BACKLOG #2354 (it
-        # used to fall back to the unclamped escape).
-        if scheme == "http" and not weakened_tls_escape_permitted(posture):
-            raise AiBrokerError(
-                "[ai].endpoint over cleartext http would expose the api_key; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
-                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
-                "or with no posture) — use https"
             )
         # ASVS 4.2.5. Both values are operator-supplied via env() and both ship on every provider call
         # -- the endpoint as the request line, the key as the ``x-api-key`` header. Bounded here rather
@@ -195,7 +194,7 @@ class AiBroker:
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode("utf-8")
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to https in __init__
             self.endpoint,
             data=data,
             headers={
@@ -293,15 +292,14 @@ def ai_broker_from_settings(ai: AiSettings, *, posture: HopPosture | None = None
     when the engine broker is not fully configured. Settings arrive already ``env()``-resolved (the API
     lifespan stashes the resolved :class:`AiSettings` on ``app.state.ai``).
 
-    ``posture`` (#329) is the derived instance hop posture, threaded from the create_app ai_chat route so
-    the broker's cleartext-http credential refusal is clamped on an enforcing-PHI instance (the escape
-    can no longer put the ``api_key`` on the wire there). ``None`` refuses the escape (vault BACKLOG
-    #2354); it used to mean the unclamped escape."""
+    ``posture`` is not read. It clamped the insecure-TLS escape on the cleartext-http refusal (#329),
+    and no escape reaches that refusal since vault BACKLOG #3533 item 5. The create_app ai_chat route
+    in ``api/app.py`` still passes it; drop the parameter with that argument."""
+    del posture
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",
         allowed_endpoints=list(ai.allowed_endpoints),
         provider=ai.provider,
         model=ai.model,
-        posture=posture,
     )

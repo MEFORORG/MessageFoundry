@@ -40,7 +40,13 @@ Constraints that bound the choice:
 private vault repository's issue titled `decision-log <yyyy-MM-dd>`, labelled `decision-log`. The
 script creates the day's issue on first use. A posted record leaves the spool. A record that
 cannot be posted stays there, and the script says so and exits 4; the next `-Log` or `-Flush`
-posts it. `-NoPost` spools with no network at all, which the tripwire hook needs.
+posts it. A flush leaves alone a record whose lock another worker holds, such as a `-Log` whose
+gate is still running (*Where it is enforced* below); `-Flush` counts it as `held`, and a later
+`-Log` or `-Flush` posts it. No worker renames a record, and a record whose post was answered is
+marked posted before its spool file is deleted, so a delete that fails does not post it again; a
+flusher that dies between a post and that mark leaves a record the next flush posts again, which a
+reader reads once, by id. `scripts/coord/_decisionlog.ps1`, *The spool*, says how the lock and the
+posted mark work. `-NoPost` spools with no network at all, which the tripwire hook needs.
 
 A day's issue number never changes, so it is cached in `decisions/issues.json` and the listing
 is asked only on a miss; a record then costs one REST request. A cached number that answers 404
@@ -184,7 +190,9 @@ fewer. After a breach, any trailing 60 with more than 3, the class stays on the 
 breach above 5 percent. A rating older than the window is not read.
 
 **An unread vault is said aloud.** The digest is marked INCOMPLETE and exits 4, and `decision.ps1
--List` does the same, because an empty answer from an unread log looks like a quiet day.
+-List` does the same, because an empty answer from an unread log looks like a quiet day. An
+incomplete read of the local spool counts the same way, and the gate then answers REVIEW;
+`_decisionlog.ps1` Read-DecisionSpool says what makes a spool read incomplete.
 
 ### 6. Cloud sessions
 
@@ -274,3 +282,126 @@ trips nothing, because it runs inside the dispatcher's process.
   This change edits `shell-guard-dispatch.ps1`, and an account's own shell entry stands down only
   for the dispatcher copy the installer pinned, so until the re-install the worktree gate runs
   twice on every shell call (`install-gate.ps1 -Status` reports it as NOT CURRENT).
+
+## Amendment 2026-10-26: gate, reversal budget, chain limit, cost rung
+
+Builds plan section 4 items 5 to 7, with R4's bar for acting without review. Plan section 10
+puts the no-review path itself in wave 5, as calibration passes; this builds the check that path
+must pass, so it exists before anything depends on it. The design is this build's inside the
+owner's 2026-10-21 approval of the plan, and the owner may overrule it at review.
+
+### The gate
+
+`scripts/coord/decision.ps1 -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>]` answers which path
+a Class B act may take, as one word: **NO-REVIEW** (exit 10), **REVIEW** (exit 11) or **HALT**
+(exit 12). None is 0 or 4, so a crash (1), a usage error (2), the cloud refusal (3) or "spooled"
+(4) never reads as permission. NO-REVIEW is necessary, not sufficient: plan R4 also needs a single
+revert or PR close to undo the act, no Class C path touched, and live state read this turn, which
+the gate cannot see, so the session still checks those. The script's header lists the gate's own
+conditions; in short, NO-REVIEW needs all of them:
+
+- the kill switch reads exactly OFF;
+- the seat's Class B is calibrated, by the digest's own arithmetic, which now lives in one shared
+  function (`Get-DecisionCalibration` in `_decisionlog.ps1`) that both scripts call;
+- no decision on the item was reversed, among the records the gate reads (60 days, the digest's
+  default window);
+- the reversal budget is open;
+- the chain is no deeper than two;
+- the cost rung is not hit.
+
+**It fails closed.** A log that is not fully read, a seat that cannot be named, a decision a link
+or a reversal names that the log does not hold, an unreadable thresholds file, and any error inside
+the gate all answer REVIEW. It checks the cost rung first and the kill switch second, and stops at
+the first that closes the no-review path, so a REVIEW for the kill switch reads no log.
+
+**Today it answers REVIEW (or HALT) for every seat**, because no seat has 60 rated samples.
+`tests/test_afk_gate.py` pins that, and pins NO-REVIEW for a calibrated seat with nothing against
+it, which every other test starts from.
+
+### Reversal budget (4.5)
+
+An `outcome` record with outcome `reversed` is one reversal, deduplicated by its ref, dated by the
+earliest such record; a decision whose latest outcome is something else is not one, as the
+calibration reads it. It is charged to the seat of the **decision** it refers to, joined through
+the ref, never to the seat that logged the outcome. Three inside any 24 hours close the no-review
+path for every seat, and two of one seat's decisions close it for that seat, in each case for 24
+hours from the reversal that reached the limit. A reversal whose id is dated after now, by a
+clock running ahead, counts as now, and so does such a decision in the chain floor below; the gate
+also reads tomorrow's day for them. A reversal of a decision the log does not hold has
+no seat; it counts against every seat's budget, and for the item rule it closes the path for any
+item, since its item cannot be told.
+
+### Chain limit (4.6)
+
+`-Log` takes `-BuildsOn <id>`, split at newlines like `-Predicate`, and the record schema gains
+two fields, still version 1: `buildsOn`, the ids, and `gate`, the gate's answer on an unreviewed
+Class B record (empty otherwise; `PENDING` until the gate answers). A reader fills both for an
+older record. Depth is the unsampled
+(never rated) Class B decisions on the same item reachable through `buildsOn` links, and never
+less than the unsampled Class B decisions on that item logged in the trailing 24 hours. The floor
+exists because `-BuildsOn` is self-reported: a session that names nothing still meets it. More
+than two goes to review. The walk stops at a decision the owner rated, which ends the unsampled
+chain. A record the gate answered HALT for was deferred, not acted on, so it does not count.
+
+### Cost rung (4.7)
+
+The gate reads `scripts/coord/usage.ps1 -Json` in a child pwsh, for the 5-hour window only: a
+weekly rung names a severity and stops nobody (korus `roles/STEWARD.md` 3a). The start-nothing
+rung is HOLD NEW WORK, STEWARD.md section 3's 20 minutes to cutoff and 80 percent, unless the
+Steward's `thresholds.json` beside its `watch.py` overrides them as `watch.py` reads it. That file
+names the window `5-hour`, not `five_hour`.
+
+**The burn rate governs, which the brief for this build did not say.** STEWARD.md 9.6a records an
+owner ruling of 2026-08-14 that a level fires the protect half and does not stop new work when the
+rate says there is room. So with a rate, the rung is hit when the window is projected to run out
+within 20 minutes and before it resets. Only with no rate is 80 percent the backstop. A window at
+98 percent or more, `usage.ps1`'s own "at the ceiling" band, is hit whatever the rate: a flat rate
+there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
+CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOWN. A reader that
+does not finish within 30 seconds is UNKNOWN. A window graded HIT stays HIT whatever
+`usage.ps1` reads overall, because downgrading a hit would fail open.
+
+At the rung the answer is HALT. A 5-hour reading `usage.ps1` calls UNKNOWN, or an overall UNKNOWN
+below the rung, answers REVIEW, not HALT:
+UNKNOWN is common, because a Desktop session runs no statusLine, and halting on it would shut the
+gate for good. The Steward's `status.json` fallback, which `usage-headroom-inject.ps1` prints for
+such a session, is **not read**. Reading it would mean a third copy of `watch.py`'s pool rules. So
+a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lander is exempt from
+HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
+roster alias of the Lander.
+
+### Where it is enforced, and where it is not
+
+**`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is locked,
+then spooled with `gate` `PENDING`, so the log keeps its rule that every record is spooled locally
+first. The gate then runs, skipping that record's own id, and its answer replaces `PENDING` in the
+spooled copy before the lock is given up, so no flusher posts it first. The lock stands while the
+`-Log` process that took it runs, whatever the clock reads; once that process has exited, the
+record is posted as it stands. A gate that crashes or hangs loses no record, and a record left `PENDING` counts
+toward the chain floor. The record is posted whatever the answer. When the answer is not
+NO-REVIEW, `-Log` prints `GATE <word>` and the reasons, and exits 11 or 12 in place of 0 or 4. The
+`LOGGED` line still says whether the record was posted. Under `-NoPost` the gate reads no network,
+so it can answer HALT or REVIEW but never NO-REVIEW. A reviewed record is not gated, because its
+review has already run; a session that wants the rung before spending a review runs `-Gate` first.
+**`-Log` stops an act only when the log comes before it.** The empower skill, as read on
+2026-10-26, says to log each decision and not when, so a session following it should run `-Gate`
+before it acts. Making the skill say so is a skill edit, outside this change.
+
+**At least these do not call `-Gate`:** the spawn hooks, `wait-pr.ps1`, and the driver and empower
+skills. None of them halts on the cost rung, so plan 4.7's *"spawning, polling ... halt"* is
+**designed, not built**. The gate also enforces nothing against a session that does not log, or that logs
+`-Reviewed yes` without a review: like the rest of this ADR, it is a check a cooperating session
+meets, not a boundary.
+
+### The digest
+
+`digest.ps1` gains two sections. **Gate state**: the fleet budget, the cost rung on the account the
+digest ran on (today's digest only, since it is a live reading), each seat's budget and whether its Class B is calibrated, and each item past the
+chain floor, all from the gate's own functions. **The attic**: every `refs/attic` ref on this clone
+with its age, as a Class C prune question (plan 6.3). The digest deletes nothing.
+
+### Cost
+
+A gate that reaches the log reads about one REST request per UTC day in the 60-day window that
+has an issue, plus the listing: the digest's read, once per unreviewed Class B record. It is not
+cached; the cache that Consequences names for the digest would cut both.

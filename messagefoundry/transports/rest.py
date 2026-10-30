@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -99,6 +99,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     is_never_proxied_host,
     is_proxy_credential_header_name,
+    proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -125,6 +126,8 @@ __all__ = [
     "refuse_unrevoked_verified_hop",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "url_host_label",
+    "url_scheme",
 ]
 
 logger = logging.getLogger(__name__)
@@ -527,13 +530,17 @@ def _redact_url(url: str) -> str:
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
     does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
-    holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
-    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
-    p = urllib.parse.urlsplit(url)
-    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
-        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
-    )
-    if encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}"):
+    hides a userinfo is withheld too; :func:`_host_hides_userinfo` names the shapes, the port-field
+    ``%40`` among them. A bracketed host, such as an IPv6 literal with its zone, is exempt from the
+    ``:`` test, though not from the ``@`` one.
+
+    A URL ``urlsplit`` cannot parse renders as ``<redacted>`` alone: its ``ValueError`` quotes the
+    whole netloc."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<redacted>"
+    if _withholds_host(p):
         return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
@@ -542,11 +549,54 @@ def _redact_url(url: str) -> str:
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
 
 
+def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
+    """Does the host or port hold ``@`` once unquoted, or an unbracketed host hold ``:``? Then it
+    is userinfo written with ``%40`` or ``%3A``, and ``hostname`` is the username and some of the
+    password. The port counts: in ``svc:PW%40proxy:3128`` the ``%40`` lands in the port field and
+    ``hostname`` is ``svc``. An IPv6 literal holds ``:``, so a bracketed host never counts for it."""
+    return "@" in urllib.parse.unquote(p.netloc.rpartition("@")[2]) or _host_holds_encoded_colon(p)
+
+
+def _host_holds_encoded_colon(p: urllib.parse.SplitResult) -> bool:
+    """Does an unbracketed host hold ``:`` once unquoted? No host name holds one."""
+    return not p.netloc.rpartition("@")[2].startswith("[") and ":" in urllib.parse.unquote(
+        p.hostname or ""
+    )
+
+
+def _withholds_host(p: urllib.parse.SplitResult) -> bool:
+    """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686)."""
+    return _host_hides_userinfo(p) or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
+
+
+#: Where a refusal tells the operator to put an endpoint's credential instead of its URL.
+_URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
+
+#: What :func:`url_host_label` prints in place of a host it must not print.
+HOST_WITHHELD = "(withheld: an '@' or encoded ':' in the URL may hide a credential)"
+
+
+def url_host_label(url: str) -> str:
+    """The host a refusal may print for ``url``, or :data:`HOST_WITHHELD` (BACKLOG #1793, #2686).
+    Never raises. A host of ``""`` prints as ``""``.
+
+    Withheld wherever :func:`_redact_url` would withhold it, whether or not
+    :func:`refuse_url_credentials` has passed ``url``. That screen lets an ``@`` with no port, or
+    one in a query after a real path, through: ``https://TOKENHEAD/TAIL@host`` and
+    ``https://svc:12/a?b@host`` both pass it, and their ``hostname`` is the username or token
+    head. So any ``@`` after the authority withholds the host, an email in a query included."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return HOST_WITHHELD
+    return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
+
+
 def refuse_url_credentials(
     url: str,
     setting: str,
     *,
-    use: str = "basic_user/basic_password or bearer_token",
+    use: str = _URL_CREDENTIAL_USE,
     error: type[ValueError] = ValueError,
 ) -> None:
     """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
@@ -572,18 +622,7 @@ def refuse_url_credentials(
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    # Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
-    # all, and ``from None`` would leave it on ``__context__`` (#1796).
-    try:
-        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
-    except ValueError:
-        parsed = None
-    if parsed is None:
-        raise error(
-            f"{setting} is not a URL that can be parsed. A password written into the URL can "
-            f"cause this; set credentials in {use} instead"
-        )
-    p = parsed
+    p = _split_or_refuse(url, setting, use=use, error=error)
     if "@" in urllib.parse.unquote(p.netloc):
         raise error(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
@@ -609,18 +648,62 @@ def refuse_url_credentials(
             f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
             "default port"
         )
+    # A password head written with ``%3A`` and then ``%5D`` hides its port from both readers above,
+    # since the dialling reader takes the ``]`` for an IPv6 literal's end (BACKLOG #2686). No host
+    # name holds a ``:``, so an encoded one outside brackets is refused whatever follows it.
+    if _host_holds_encoded_colon(p):
+        raise error(
+            f"{setting} has a ':' written as %3A in its host. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+
+
+def _split_or_refuse(
+    url: str, setting: str, *, use: str, error: type[ValueError]
+) -> urllib.parse.SplitResult:
+    """``urlsplit(url)``, or a refusal that names ``setting`` and nothing of the URL.
+
+    Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
+    all, and ``from None`` would leave it on ``__context__`` (#1796)."""
+    try:
+        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise error(
+            f"{setting} is not a URL that can be parsed. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+    return parsed
+
+
+def url_scheme(
+    url: str,
+    setting: str,
+    *,
+    use: str = _URL_CREDENTIAL_USE,
+    error: type[ValueError] = ValueError,
+) -> str:
+    """``url``'s lower-cased scheme, for a constructor that checks it BEFORE
+    :func:`refuse_url_credentials` (BACKLOG #2686). A bare ``urlsplit(url).scheme`` raises urlsplit's
+    own ``ValueError`` on a URL it cannot parse, and that text quotes the whole netloc. This raises
+    the refusal :func:`refuse_url_credentials` would, with the same ``setting``, ``use`` and
+    ``error``, and nothing of the URL on the message or the exception chain."""
+    return _split_or_refuse(url, setting, use=use, error=error).scheme.lower()
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
 #
 # The HTTP-family cells (REST/SOAP/FHIR/DICOMweb + the FhirLookup read path) shipped three escape-only,
 # construction-only refusals — cleartext-credentials, cleartext body-egress, and verify_tls=false. #200
-# re-keys them onto the ONE authority (``tls_policy.insecure_hop_disposition``) so they decide on the
-# instance POSTURE (PHI? production?) instead of the blunt global escape, and adds a zero-I/O SEND-TIME
-# re-assertion at the byte-crossing (defense-in-depth). Decision 5 (no-loosen): these cells refused BOTH
-# staging and production PHI today, so :func:`_shipped_strict_disposition` FLOORS a non-prod PHI hop that
-# would otherwise warn-and-cross back to REFUSE — only the (clamped, non-prod) escape, a per-hop
-# attestation, on-box loopback, or a synthetic (non-PHI) instance relaxes it.
+# re-keyed them onto the ONE authority (``tls_policy.insecure_hop_disposition``) so they decide on the
+# instance POSTURE instead of the blunt global escape, and added a zero-I/O SEND-TIME re-assertion at
+# the byte-crossing (defense-in-depth). Decision 5 (no-loosen): these cells refused BOTH staging and
+# production PHI, so :func:`_shipped_strict_disposition` FLOORS a hop that would otherwise
+# warn-and-cross back to REFUSE. Two of the three have since left the posture: a credential over
+# off-box cleartext http (vault BACKLOG #3533 item 4) and a credential over verify_tls=false (vault
+# BACKLOG #3230) are refused with no escape. The posture still decides the body egress, a verify-off
+# hop with no credential, and the forward-proxy login's cleartext leg.
 
 
 def _current_hop_posture_fail_closed() -> HopPosture:
@@ -652,9 +735,11 @@ def _shipped_strict_disposition(
 
     **Two different cells share this function, and ADR 0153 governs only one of them.**
 
-    * A **cleartext** hop (``http://`` body or credential egress) is what 0153 decision 2 is about, so
-      it is keyed on ``cleartext_accepted`` and the blunt ``MEFOR_ALLOW_INSECURE_TLS`` escape no longer
-      reaches it (decision 5 — the variable "can no longer influence a cleartext-hop decision"). The
+    * A **cleartext** hop (``http://`` body egress, and the forward-proxy login's leg to its proxy)
+      is what 0153 decision 2 is about, so it is keyed on ``cleartext_accepted``. A destination's own
+      credential over off-box cleartext no longer reaches here: it is refused with no escape (vault
+      BACKLOG #3533 item 4). The blunt ``MEFOR_ALLOW_INSECURE_TLS`` escape no longer reaches this
+      cell (decision 5 — the variable "can no longer influence a cleartext-hop decision"). The
       floor is re-keyed to match: a WARN reached by the non-enforcing dial alone is still floored to
       REFUSE, exactly as before, but a declared acceptance survives it. Without that re-key decision 2
       would be inert for REST/SOAP/FHIR/DICOMweb — the largest cleartext-egress family in the product,
@@ -862,8 +947,11 @@ def cleartext_acceptance_from_settings(
     """``(cleartext_accepted, cleartext_reason, connection)`` off an ``env()``-resolved settings mapping.
 
     ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
-    credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers, and the ``FhirLookup``
-    read executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``.
+    credential chain and the ``FhirLookup`` read executor — receive only a settings mapping, exactly as
+    they already do for ``tls_hop_attested``. The HTTP Digest, OAuth2 and SMART token seams read it
+    too, through :func:`hop_declarations_from_settings`, but only for its strict flag check and the
+    connection name: no declaration lets their credential cross cleartext http off this machine
+    (vault BACKLOG #3533 item 4).
     The runner mirrors the declaration into those resolved settings only when it is set, and this is
     the single reader, so those resolved keys are never re-parsed by hand at five call sites.
 
@@ -939,75 +1027,98 @@ def _hop_guard_host(url: str, *, cell: str) -> str:
     return hop_url_host(url, cell=cell)
 
 
+#: The cell an off-box cleartext credential refusal names (vault BACKLOG #3533 item 4).
+_CLEARTEXT_CREDENTIAL_CELL = "HTTP cleartext credentials"
+
+#: The cell the forward-proxy login's refusal names, apart from the destination's no-escape rule,
+#: because a declaration can still lift this one.
+_PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
+
+
+def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
+    """The host ``url`` names when it is cleartext ``http`` to a host off this machine, else ``None``.
+
+    The one answer to "is this hop off-box cleartext" that the credential rule and the send-time
+    header hold share (vault BACKLOG #3533 items 4, 6). A URL that names no host raises
+    ``ValueError`` (:func:`_hop_guard_host`, BACKLOG #1924)."""
+    if scheme != "http":
+        return None
+    host = _hop_guard_host(url, cell=_CLEARTEXT_CREDENTIAL_CELL)
+    return None if is_loopback_hop_host(host) else host
+
+
+def _refuse_off_box_cleartext(scheme: str, url: str, *, sends: str, connection: str | None) -> None:
+    """Raise :class:`InsecureHopRefused` when ``url`` is cleartext ``http`` to an off-box host.
+
+    The one body of the HTTP family's cleartext credential rule (vault BACKLOG #3533 item 4, owner
+    ruling 2026-10-26, amending ADR 0153 build note 3). ``sends`` names the credentials that would
+    cross."""
+    host = _off_box_cleartext_host(scheme, url)
+    if host is None:
+        return
+    raise InsecureHopRefused(
+        f"{hop_name_prefix(connection)}{_CLEARTEXT_CREDENTIAL_CELL}: sends {sends} over cleartext "
+        f"http to {host!r}; refused, with no escape. Neither tls_hop_attested nor "
+        "cleartext_accepted lets a credential cross cleartext http off this machine. Use https."
+    )
+
+
 def refuse_cleartext_credential_hop(
     scheme: str,
     url: str,
     *,
     credential: str,
-    attested: bool = False,
-    cleartext_accepted: bool = False,
-    cleartext_reason: str | None = None,
     connection: str | None,
 ) -> None:
-    """Refuse a named ``credential`` riding a cleartext (``http``) hop (#200, amended by ADR 0153).
+    """Refuse a named ``credential`` riding a cleartext (``http``) hop to an off-box host.
 
-    The header-agnostic core of :func:`refuse_cleartext_credentials`, reused for a credential that does
-    NOT ride the ``Authorization`` header (a SOAP WS-Security UsernameToken in the body). Keyed on the
-    ONE authority: an enforcing hop is REFUSED, an on-box loopback / per-hop-attested hop is allowed, and
-    an ADR 0153 ``cleartext_accepted`` declaration crosses it with a loud, audited WARN.
+    The header-agnostic twin of :func:`refuse_cleartext_credentials`, for a credential that does
+    not ride a request header: a SOAP WS-Security UsernameToken or body secret, a Digest response,
+    an OAuth2 or SMART token request.
 
-    **``cleartext_accepted`` deliberately reaches the credential hops too**, even though putting a
-    password on the wire is a worse claim than putting a body on it. ADR 0153 is silent here, and the
-    alternative — leaving credentials with no expressible declaration — would push an operator whose
-    legacy peer needs Basic auth over a cleartext segment into writing a FALSE ``tls_hop_attested``,
-    which is precisely the defect 0153 exists to remove. The declaration stays per-connection, WARNs at
-    every construction, is audited, and is reported as a loosening, so it is strictly more visible than
-    the blanket escape that used to permit exactly this. (SMTP AUTH over cleartext remains refused
-    OUTRIGHT in ``transports.email`` — that is a hard refusal, not a posture decision, and is
-    untouched.)
+    **Nothing lifts it but a loopback host** (vault BACKLOG #3533 item 4, owner ruling 2026-10-26).
+    Not ``tls_hop_attested``, not an ADR 0153 ``cleartext_accepted`` declaration, not the posture.
+    ADR 0153 build note 3 once let ``cleartext_accepted`` reach these hops with a WARN; its dated
+    amendment records why that went. At least the forward-proxy credential is still judged by
+    the declarations; see :func:`proxy_auth_handler_from_settings`. SMTP AUTH over cleartext is
+    refused outright in ``transports.email``.
 
-    A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
-    BACKLOG #1924)."""
-    if scheme != "http":
-        return
-    host = _hop_guard_host(url, cell="HTTP cleartext credentials")
-    _enforce_shipped_hop(
-        host,
-        cell="HTTP cleartext credentials",
-        message=f"sends a {credential} over cleartext http to {host!r}",
-        attested=attested,
-        cleartext_accepted=cleartext_accepted,
-        cleartext_reason=cleartext_reason,
-        connection=connection,
-    )
+    A URL that names no host raises ``ValueError`` (:func:`_hop_guard_host`, BACKLOG #1924)."""
+    _refuse_off_box_cleartext(scheme, url, sends=f"a {credential}", connection=connection)
 
 
 def refuse_cleartext_credentials(
     scheme: str,
-    headers: dict[str, str],
+    headers: Mapping[str, str],
     url: str,
     *,
-    attested: bool = False,
-    cleartext_accepted: bool = False,
-    cleartext_reason: str | None = None,
+    credentials: Sequence[str],
     connection: str | None,
 ) -> None:
-    """Refuse to send credentials over a cleartext (``http``) channel (posture-keyed, #200).
+    """Refuse to send credentials over a cleartext (``http``) hop to an off-box host (#200, #3533).
 
-    Basic/bearer auth in an ``Authorization`` header over plain ``http`` puts the credential on the wire
-    (and the body is PHI). Delegates to :func:`refuse_cleartext_credential_hop`. Shared by the
-    REST/SOAP/FHIR/DICOMweb HTTP cells and the FhirLookup read path."""
-    if "Authorization" not in headers:
+    ``credentials`` is what :func:`http_credentials_sent` returns for the hop with
+    ``cleartext=True``: every auth setting, a static header the redaction screen masks (by name,
+    such as ``Authorization`` or an API key in any letter case, or by a credential-shaped value),
+    and a credential-looking query parameter (vault BACKLOG #3533 item 4). It is the credential half
+    of what the ``verify_tls = false`` rule counts, without that rule's name allowlist: a static
+    header with a neutral name, such as ``X-Session``, still crosses a declared cleartext hop, and
+    so does a secret in it that is not credential-shaped. That is an accepted limit (owner ruling
+    2026-10-28); ``docs/SECURITY-LOOSENING.md``, *Accepted limit: a neutral header crosses plain
+    http off this machine*, says why and defines which values are credential-shaped. A static
+    ``Proxy-Authorization``, in any spelling, is left out when the request goes to a proxy
+    (:func:`hop_reaches_a_proxy`), since the send-time proxy rule judges it then; on a hop that
+    goes direct it counts. An ``Authorization`` header in the built ``headers``,
+    in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
+    inventory and the bearer providers ever disagree. As for
+    :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
+    SOAP, FHIR and DICOMweb cells and the ``FhirLookup`` read path."""
+    sent = list(credentials)
+    if not sent and any(str(name).strip().lower() == "authorization" for name in headers):
+        sent = ["Authorization header"]
+    if not sent:
         return
-    refuse_cleartext_credential_hop(
-        scheme,
-        url,
-        credential="credential (Authorization header)",
-        attested=attested,
-        cleartext_accepted=cleartext_accepted,
-        cleartext_reason=cleartext_reason,
-        connection=connection,
-    )
+    _refuse_off_box_cleartext(scheme, url, sends=_describe_sent(sent), connection=connection)
 
 
 def refuse_cleartext_egress(
@@ -1057,37 +1168,158 @@ def refuse_cleartext_egress(
     )
 
 
+#: The static header names a ``verify_tls = false`` hop may still send, in lower case (vault
+#: BACKLOG #3533 item 7, owner ruling 2026-10-26). Any other static header refuses that hop, so a
+#: secret under a neutral name such as ``X-Session`` cannot cross it. The list fails closed and
+#: needs no secret recognition. Each entry is defined to hold a media type, a product token or a
+#: correlation id, never a secret: ``accept`` and ``content-type`` name media types,
+#: ``user-agent`` names the client, and ``x-request-id`` tags a request for tracing. Widen it only
+#: by a reviewed change; the value test in :func:`http_credentials_sent` still refuses a
+#: credential-shaped value under one of these names.
+VERIFY_OFF_STATIC_HEADER_ALLOWLIST = frozenset(
+    {"accept", "content-type", "user-agent", "x-request-id"}
+)
+
+#: The suffix :func:`http_credentials_sent` puts on a header refused only for its name. Such a
+#: header need not be a credential, so :func:`refuse_verify_off` strips the suffix and names the
+#: header apart from the credentials, as one outside the allowlist.
+_OFF_ALLOWLIST = " header, which is not on the verify-off header allowlist"
+
+
+def _header_held(name: str, value: object, *, allowlist: bool) -> str | None:
+    """Why a header may not cross the hop, as the suffix :func:`http_credentials_sent` puts on its
+    name, or ``None`` when it may.
+
+    The one test the static rule at build and the per-message rule at send share (vault BACKLOG
+    #3533 items 4, 6, 7): a header the redaction screen masks, by name or value, is a credential.
+    With ``allowlist``, on a ``verify_tls = false`` hop, any other name off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case, is refused for its name alone.
+    An off-box cleartext hop passes ``allowlist=False``: the owner's 2026-10-26 ruling on item 4
+    refuses its credentials. Its neutral headers do not meet the list, an accepted limit (owner
+    ruling 2026-10-28); ``docs/SECURITY-LOOSENING.md`` says why."""
+    # Lazy: config.wiring is not otherwise loaded by this module.
+    from messagefoundry.config.wiring import _is_secret_header
+
+    if _is_secret_header(name, value):
+        return " header"
+    if allowlist and name.strip().lower() not in VERIFY_OFF_STATIC_HEADER_ALLOWLIST:
+        return _OFF_ALLOWLIST
+    return None
+
+
+#: What a refusal shows in place of a static header key it may not echo.
+_HEADER_KEY_WITHHELD = "[a key withheld]"
+
+#: The longest static header key a refusal shows. A real header name is far shorter.
+_HEADER_KEY_SHOWN_MAX = 64
+
+
+def _shown_header_key(key: str) -> str:
+    """A static ``headers`` key as a build refusal may show it (vault BACKLOG #3533).
+
+    An operator may type a credential into a key, as in ``{"Authorization Bearer tok": "x"}``,
+    and the refusal text reaches the log and the operator's screen. So a key is shown only when
+    it is a plain header name: header-token characters only (no whitespace, which a scheme and
+    its token need), at most :data:`_HEADER_KEY_SHOWN_MAX` long, and not itself shaped like a
+    credential value (``config.wiring._looks_like_a_credential_value``: an auth-scheme prefix or
+    a JWT). Any other key shows as :data:`_HEADER_KEY_WITHHELD`. A credential typed into a key
+    that is a plain token with none of those shapes is still shown; nothing can tell it from a
+    header name."""
+    # Lazy: config.wiring is not otherwise loaded by this module.
+    from messagefoundry.config.wiring import _looks_like_a_credential_value
+
+    if (
+        len(key) <= _HEADER_KEY_SHOWN_MAX
+        and _HEADER_NAME_TOKEN.match(key)
+        and not _looks_like_a_credential_value(key)
+    ):
+        return key
+    return _HEADER_KEY_WITHHELD
+
+
+def _describe_sent(credentials: Sequence[str]) -> str:
+    """What a hop would send, worded for a refusal: its credentials, then any static headers
+    refused only for their names, apart (vault BACKLOG #3533). ``credentials`` is non-empty and
+    comes from :func:`http_credentials_sent`."""
+    unlisted = [c.removesuffix(_OFF_ALLOWLIST) for c in credentials if c.endswith(_OFF_ALLOWLIST)]
+    secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
+    noun = "header" if len(unlisted) == 1 else "headers"
+    sends = []
+    if secrets:
+        sends.append(f"its credentials ({', '.join(secrets)})")
+    if unlisted:
+        sends.append(f"static {noun} outside the verify-off allowlist ({', '.join(unlisted)})")
+    return " and ".join(sends)
+
+
 def http_credentials_sent(
-    ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    *,
+    lookup: bool = False,
+    cleartext: bool = False,
+    proxied: bool = False,
 ) -> list[str]:
-    """The credentials an HTTP-family hop sends, by name, for :func:`refuse_verify_off` (vault
-    BACKLOG #3230). Empty when it sends none.
+    """What an HTTP-family hop sends that :func:`refuse_verify_off` refuses on a verify-off hop,
+    and :func:`refuse_cleartext_credentials` on an off-box cleartext one, by name (vault BACKLOG
+    #3230, #3533). Empty when it sends none.
 
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
     static-credential inventory's own reader, so the two agree on every auth setting. The two
     additions below are this refusal's alone; the inventory does not count them yet. A
-    static ``headers`` entry is a credential when the redaction screen
-    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
-    screen leans toward a false positive, which here refuses a verify-off hop that a header name
-    such as ``X-Routing-Key`` merely resembles; on a hop that already turned verification off, that
-    is the cheaper error. A credential-looking query parameter in ``url`` counts too, by the reader
-    ``query_credential_hops`` uses. A ``Proxy-Authorization`` from the proxy settings is not one: it
-    goes to the proxy, inside the CONNECT, not across this hop.
+    static ``headers`` entry counts when the redaction screen (``config.wiring._is_secret_header``)
+    would mask it, by name or by value, or when its name is not on
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`. That over-refuses on purpose: a header whose name
+    and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
+    hop that already turned verification off that is the cheaper error. A credential-looking query
+    parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses. A
+    ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
+    CONNECT, not across this hop.
+
+    ``cleartext=True`` is the off-box cleartext rule's reading, which differs in two ways. It
+    counts credentials only, so a static header is not refused for its name alone (vault BACKLOG
+    #3533 item 4; an accepted limit by owner ruling 2026-10-28, which
+    ``docs/SECURITY-LOOSENING.md`` explains). And when
+    ``proxied`` says the request goes to a web proxy, it leaves out a static header that
+    :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name` reads as
+    ``Proxy-Authorization``, in any spelling. That header is then the proxy's, and the send-time
+    proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
+    own proxy login (vault BACKLOG #3416, #3457). The caller reads ``proxied`` with
+    :func:`hop_reaches_a_proxy`, from the proxy destination and handlers its opener is built
+    with. A ``proxy_url`` alone does not make a hop proxied: ``proxy_no_proxy``, urllib's own
+    bypass list, or ``proxy_url = "default"`` with no system proxy for the scheme sends it
+    direct. On a direct hop the header would go to the destination, and the send-time rule
+    refuses it there on each send, retryably, until the message dead-letters. So it counts as
+    the credential it is and refuses the hop at build.
+
+    Each header key is shown by :func:`_shown_header_key`, never as written, since a credential
+    may be typed into a key.
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
-    not seen here; docs/SECURITY-LOOSENING.md lists that among the hops the rule does not reach."""
-    # Lazy: both import config.wiring, which this module does not otherwise load.
+    not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
+    the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule does not
+    reach."""
+    # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
-    from messagefoundry.config.wiring import _is_secret_header
 
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     static = settings.get("headers")
+    proxied = cleartext and proxied
     if isinstance(static, Mapping):
-        sent += [
-            f"{name} header"
-            for name, value in static.items()
-            if _is_secret_header(str(name), value)
-        ]
+        for name, value in static.items():
+            key = str(name)
+            proxy_spelling = is_proxy_credential_header_name(key)
+            if proxied and proxy_spelling:
+                continue
+            if (held := _header_held(key, value, allowlist=not cleartext)) is not None:
+                # A Proxy-Authorization spelling may carry a credential typed into the name
+                # (vault BACKLOG #3457), so it is shown only as far as the plain name.
+                shown = (
+                    proxy_credential_header_name_shown(key)
+                    if proxy_spelling
+                    else _shown_header_key(key)
+                )
+                sent.append(f"{shown}{held}")
     url = settings.get("url")
     if isinstance(url, str) and (names := credential_query_params(url)):
         sent.append(f"url query parameter {', '.join(names)}")
@@ -1129,7 +1361,11 @@ def refuse_verify_off(
     0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening.
 
     **A hop that sends ``credentials`` is refused first, and nothing lifts that** (vault BACKLOG
-    #3230): not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
+    #3230). Since vault BACKLOG #3533 the list also names each static header off
+    :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, which need not be a credential. The refusal names
+    those headers apart from the credentials, and offers removing them only when nothing else is
+    listed, since removal cannot clear a credential. Nothing lifts it:
+    not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
     argument is required, so no caller can skip the question; pass :func:`http_credentials_sent`.
     The rule is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
     unverified peer*. It runs before the escape check, so a credentialed hop is never told to set an
@@ -1140,12 +1376,23 @@ def refuse_verify_off(
     if scheme != "https":
         return None
     if credentials:
+        secrets = [c for c in credentials if not c.endswith(_OFF_ALLOWLIST)]
+        noun = "header" if len(credentials) - len(secrets) == 1 else "headers"
+        # Removing the headers clears this refusal only when nothing else is listed. Even then the
+        # engine judges the hop again as a credential-less verify-off hop, which may still refuse.
+        removal = (
+            f" Or remove the {noun}; the engine then judges the hop as a verify-off hop with no "
+            "credential, which its own posture and levers may still refuse. Moving a secret into "
+            "the url path or a query parameter with a neutral name is not a fix: this refusal "
+            "cannot see a secret there. A dynamic header outside the allowlist is refused at send."
+            if not secrets
+            else ""
+        )
         raise ValueError(
-            f"{hop_name_prefix(connection)}{connector} would send its credentials "
-            f"({', '.join(credentials)}) to a peer whose certificate it does not verify "
-            "(verify_tls=false); refused, with no escape. Leave verify_tls on (the default). For a "
-            "server whose certificate comes from a private or self-signed CA, pin that CA with "
-            "tls_ca_file."
+            f"{hop_name_prefix(connection)}{connector} would send {_describe_sent(credentials)} to a peer "
+            "whose certificate it does not verify (verify_tls=false); refused, with no escape. "
+            "Leave verify_tls on (the default). For a server whose certificate comes from a "
+            f"private or self-signed CA, pin that CA with tls_ca_file.{removal}"
         )
     cell = f"{connector} verify_tls=false"
     host = _hop_guard_host(url, cell=cell)
@@ -1161,6 +1408,85 @@ def refuse_verify_off(
         return None
     return InsecureHopGuard(
         posture=posture, attested=attested, cell=cell, weakened_tls=True, connection=connection
+    )
+
+
+#: ``NegativeAckError.code`` of a send refused by :func:`refuse_held_dynamic_headers`.
+DYNAMIC_HEADER_REFUSED_CODE = "dynamic-header-refused"
+
+#: How :func:`refuse_held_dynamic_headers` judges a Handler's per-message headers on a hop:
+#: ``"allowlist"`` holds them to :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST` and refuses a
+#: credential in them, ``"credentials"`` refuses a credential in them only.
+DynamicHeaderRule = Literal["allowlist", "credentials"]
+
+
+def dynamic_header_rule(scheme: str, url: str, *, verify_tls: bool) -> DynamicHeaderRule | None:
+    """Which rule this hop holds a Handler's per-message headers to at send, or ``None``.
+
+    The same rule the hop's static ``headers`` meet at build (vault BACKLOG #3533 items 4, 6, 7).
+    ``"allowlist"`` for a ``verify_tls = false`` https hop, any host: the owner's 2026-10-26 ruling
+    on item 7. ``"credentials"`` for plain http to a host off this machine: the ruling on item 4
+    refuses a credential there, and names no allowlist. ``None`` for any other hop. Headers the
+    connector builds itself, such as ``SOAPAction``, the FHIR conditional headers,
+    ``Content-Type`` and the JWS headers, are not held. Call it after the construction guards,
+    which have already refused a URL that names no host."""
+    if scheme == "https":
+        return None if verify_tls else "allowlist"
+    return "credentials" if _off_box_cleartext_host(scheme, url) is not None else None
+
+
+def refuse_held_dynamic_headers(
+    headers: Mapping[str, str],
+    *,
+    rule: DynamicHeaderRule,
+    connector: str,
+    connection: str | None,
+) -> None:
+    """Refuse a send whose per-message headers the static rule would refuse (vault BACKLOG #3533
+    item 6, following the owner's 2026-10-26 rulings on items 4 and 7).
+
+    ``headers`` is what :func:`outbound_headers_from_metadata` built from the message, and ``rule``
+    is what :func:`dynamic_header_rule` returned for the hop. A header counts when the redaction
+    screen would mask it, by name or by a credential-shaped value. Under ``"allowlist"`` it also
+    counts when its name is off :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`, in any letter case.
+
+    The refusal is permanent, since a retry would stamp the same header, and it is not a
+    configuration fault. So the delivery worker dead-letters this one message and the lane goes on
+    to the next, as for the latin-1 refusal in :func:`outbound_headers_from_metadata`. A Handler may
+    stamp such a header on some messages only, and a configuration fault would stop the lane and keep
+    the row with its metadata, so even a fixed Handler could not clear it. The caller runs the
+    hop's send-time guard (:meth:`InsecureHopGuard.assert_delivery_url`) first, so a hop that is no
+    longer permitted still stops the lane and keeps the row, whatever headers the message holds.
+    It names the connection
+    and how many headers it refused, and **never a header's name or value**. At send a name is a metadata
+    key suffix the Handler may derive from the message, as
+    :func:`enforce_send_time_length_limits` records for its own message-derived arm, so it is
+    treated as PHI. That also keeps a crafted name from faking the refusal's structure."""
+    if not headers:
+        return
+    allowlist = rule == "allowlist"
+    refused = sum(
+        1
+        for name, value in headers.items()
+        if _header_held(name, value, allowlist=allowlist) is not None
+    )
+    if not refused:
+        return
+    noun = "header" if refused == 1 else "headers"
+    why = (
+        "Its peer is not verified (verify_tls=false), so only the allowlisted "
+        "Accept/Content-Type/User-Agent/X-Request-ID may be stamped, with no credential in them. "
+        if allowlist
+        else "It is cleartext http off this machine, so no credential may be stamped, by name or "
+        "by value; nothing lifts that but https. "
+    )
+    raise NegativeAckError(
+        f"{hop_name_prefix(connection)}{connector} send refused: a Handler stamped {refused} "
+        f"per-message {noun} under dynamic_headers that this hop may not carry. {why}"
+        "The names are withheld, since a Handler may derive them from the message",
+        code=DYNAMIC_HEADER_REFUSED_CODE,
+        # Dead-letter this message only; see the docstring for why this is no configuration fault.
+        permanent=True,
     )
 
 
@@ -1816,6 +2142,31 @@ class _HostProxy:
         return dict(self.config.auth_header) if self.credentialed else {}
 
 
+def hop_reaches_a_proxy(
+    proxy_dest: _HostProxy | None,
+    handlers: Sequence[urllib.request.BaseHandler],
+    url: str,
+) -> bool:
+    """Whether a request to ``url`` goes to a web proxy, not direct, on an opener built with
+    ``proxy_dest`` and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
+
+    ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
+    what its ``opener_handlers()`` built. ``None`` is no proxy, a ``proxy_no_proxy`` match or a
+    loopback host; an uncredentialed one is a host urllib's own bypass list names. All of those
+    go direct. Otherwise the proxy for ``url``'s scheme is read off the built handler, so
+    ``proxy_url = "default"`` with no system proxy for the scheme goes direct too. The handler
+    took the system map when it was built, so this reads the map the opener holds, not a later
+    one. An explicit ``proxy_url`` serves both schemes."""
+    if proxy_dest is None or not proxy_dest.credentialed:
+        return False
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    for handler in handlers:
+        proxies = getattr(handler, "proxies", None)
+        if isinstance(handler, urllib.request.ProxyHandler) and isinstance(proxies, Mapping):
+            return bool(proxies.get(scheme))
+    return False
+
+
 def proxy_auth_handler_from_settings(
     s: Mapping[str, Any],
     *,
@@ -1840,9 +2191,12 @@ def proxy_auth_handler_from_settings(
     Digest → the reactive stdlib handler, **refused for an https destination** (the 407 is inside the
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
     So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
-    posture-keyed authority (:func:`refuse_cleartext_credential_hop`), REGARDLESS of destination
+    posture-keyed authority (:func:`_enforce_shipped_hop`), REGARDLESS of destination
     scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
-    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states."""
+    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
+    destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
+    item 4), this leg still honours ``tls_hop_attested`` and ``cleartext_accepted``, under the
+    owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007)."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -1867,13 +2221,23 @@ def proxy_auth_handler_from_settings(
     # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
     # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
     # relied on. `proxy_scheme` now only words the refusal.
-    refuse_cleartext_credential_hop(
-        "http",
-        proxy_url,
-        credential=(
-            "web-proxy credential"
-            if proxy_scheme == "http"
-            else "web-proxy credential (urllib sends it before any TLS, even to an https:// proxy)"
+    # Not refuse_cleartext_credential_hop, which no declaration lifts (vault BACKLOG #3533 item 4).
+    # The owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007) refuses it over
+    # cleartext unless the connection declares the cleartext acceptance with a reason, so this leg
+    # is still judged by the declarations; ADR 0153's 2026-10-27 amendment records the split.
+    proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
+    credential = (
+        "web-proxy credential"
+        if proxy_scheme == "http"
+        else "web-proxy credential (urllib sends it before any TLS, even to an https:// proxy)"
+    )
+    _enforce_shipped_hop(
+        proxy_host,
+        cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL,
+        message=(
+            f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
+            "destination's own credentials, this leg can be declared with tls_hop_attested or "
+            "cleartext_accepted"
         ),
         attested=attested,
         cleartext_accepted=cleartext_accepted,
@@ -1912,14 +2276,19 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value. The key is read by the function the send-time rule uses, so
-    the two cannot differ on which spellings are this header."""
+    Names the key, never its value, and shows the key only as
+    :func:`~messagefoundry.transports.bounded_read.proxy_credential_header_name_shown` does,
+    because text around the plain name may be a credential typed into the key (vault BACKLOG
+    #3457).
+    The key is read by the function the send-time rule uses, so the two cannot differ on which
+    spellings are this header."""
     if not isinstance(headers, Mapping):
         return
     for key in headers:
         if is_proxy_credential_header_name(str(key)):
             raise ValueError(
-                f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
+                f"headers sets {proxy_credential_header_name_shown(str(key))} and the connection "
+                "also sets proxy_user and "
                 "proxy_password. Remove the static header: the proxy credential comes from "
                 "proxy_user, proxy_password and proxy_auth_type only (vault BACKLOG #3443)"
             )
@@ -2008,7 +2377,7 @@ def proxy_config_from_settings(
             digest=None,
             connection=connection,
         )
-    proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
+    proxy_scheme = url_scheme(proxy_url, "proxy_url", use="proxy_user/proxy_password")
     if proxy_scheme not in ("http", "https"):
         raise ValueError(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
@@ -2074,10 +2443,13 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
-    parsed = urllib.parse.urlsplit(sidecar)
+    # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
+    # (BACKLOG #2686).
+    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {sidecar!r} (ADR 0139)"
+            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
+            "(ADR 0139)"
         )
     if not is_never_proxied_host(parsed.hostname):
         raise ValueError(
@@ -2160,7 +2532,7 @@ class RestDestination(DestinationConnector):
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        scheme = url_scheme(url, "REST destination 'url'")
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "REST destination 'url'")
@@ -2227,9 +2599,12 @@ class RestDestination(DestinationConnector):
             scheme,
             self._headers,
             self.url,
-            attested=attested,
-            cleartext_accepted=accepted,
-            cleartext_reason=accept_reason,
+            credentials=http_credentials_sent(
+                ConnectorType.REST,
+                s,
+                cleartext=True,
+                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
+            ),
             connection=config.name,
         )
         # ASVS 12.2.1: even without an Authorization header the request body is PHI, so a cleartext
@@ -2281,9 +2656,7 @@ class RestDestination(DestinationConnector):
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
                 self.url,
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                credentials=(),
                 connection=config.name,
             )
         verify = bool_setting(s, "verify_tls", default=True)
@@ -2348,6 +2721,10 @@ class RestDestination(DestinationConnector):
                 # assertion cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
+        # Vault BACKLOG #3533 item 6: a Handler's per-message headers meet the rule this hop's
+        # static headers meet, at send.
+        self._connection_name = config.name
+        self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
             # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
@@ -2409,9 +2786,21 @@ class RestDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | ReplyBodyDropped | None:
+        # The hop first (zero I/O; _post repeats it). A hop no longer permitted is the connection's
+        # fault and stops the lane with the row kept. Judged after any per-message refusal below,
+        # it would dead-letter the row instead (Lander finding 6 on engine PR 2576).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_delivery_url(self.url, connector="REST")
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
+        if self._header_rule is not None:
+            refuse_held_dynamic_headers(
+                dynamic_headers,
+                rule=self._header_rule,
+                connector="REST destination",
+                connection=self._connection_name,
+            )
         body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
         if isinstance(body, ReplyBodyDropped):
             # Capture is off. Delivered; the worker records the drop on the message (vault

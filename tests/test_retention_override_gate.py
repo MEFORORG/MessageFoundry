@@ -311,12 +311,15 @@ def test_connection_upsert_refuses_what_an_enforcing_reload_would(
         assert rc == 1 and not written
         assert "IB_FEED" in out and "allow_keeping_phi_indefinitely" in out
         assert "No --service-config was given" not in out
+        # The named file is still the one the refusal says it read (vault BACKLOG #2908).
+        assert "are read from that file" in out and "the file --service-config named" in out
 
 
 def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The IDE's usual call names no --service-config, so the edit is judged against the defaults
+    # A call may name no --service-config: a hand-run one, or the IDE's when its serviceConfig
+    # setting is unset (vault BACKLOG #2908). The edit is then judged against the defaults
     # (enforce, no acknowledgement). The refusal must say so, or it names a switch the instance
     # may already have set.
     _clear_posture_env(monkeypatch)
@@ -335,7 +338,7 @@ def test_connection_upsert_says_which_settings_it_read_when_none_were_named(
     )
     out = capsys.readouterr().out
     assert rc == 1 and "No --service-config was given" in out
-    assert "this edit is then checked against that instance's [security] settings" in out
+    assert "[security].enforcement are read from that file" in out
 
 
 # --- check and supervise read the guard's decision (vault BACKLOG #2368 follow-up) ---------------

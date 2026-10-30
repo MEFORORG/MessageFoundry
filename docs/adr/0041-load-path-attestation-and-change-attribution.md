@@ -105,6 +105,20 @@ advisory provenance — the content digest is the integrity anchor.
 (`.IB_OLD.py`, an AppleDouble `._X.py`) is no longer hashed, because the loader no longer runs one; the
 `*.py` set is `config.wiring.config_py_files`, the one rule the loader and ADR 0036's guard share. The
 `v1` text above is kept as the record of what was decided on its date.*
+*Amended 2026-10-27 (vault BACKLOG #2596, step 1): the digest is now of the bytes that ran, and the
+scheme is `mefor-cfg-fp:v3`.* A load reads the directory once, into a snapshot
+([`config/snapshot.py`](../../messagefoundry/config/snapshot.py)), and runs only that: each module and
+`_` helper is compiled by the loader from its snapshot bytes, so a `__pycache__` file is never consulted,
+and the code sets and `connections.toml` are parsed from the same snapshot. The fingerprint folds that
+snapshot, so a reload's audit digest names the bytes it ran, and a dual-control release checks the
+snapshot it then loads (D2). A `[sandbox].mode=subprocess` worker is sent the snapshot and never reads
+the directory. What `v3` changes in what is hashed: a code-set table is matched by its suffix in lower
+case, as the loader matches it, so `codesets/x.CSV` is hashed on POSIX; and each path is hashed, so a
+path that resolves to a file another path names is no longer folded once. **Not changed, and still
+open:** `environments/*.toml` is hashed under the config directory, as before. That is not where a
+serve start reads its value file, which sits under `[environments].base_dir`; binding the value file
+by its resolved path is the remainder of #2596 step 1. The `v2` text above is kept as the record of
+what was decided on its date.
 
 This binds "reviewed-and-merged in git" to "what actually loaded," makes two reloads with different
 on-disk code distinguishable, defeats attribution-laundering (the audit now shows *which code* a given

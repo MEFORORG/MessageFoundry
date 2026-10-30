@@ -4,7 +4,9 @@
 // wizard (connectionQuickInput.ts) is a keyboard-first alternative to the connectionEditor webview
 // form; both write via the SAME `messagefoundry connection upsert` CLI. Keeping the answer→ConnObj
 // mapping, the upsert argv, the per-step validators, and the step plan here (no vscode) lets the whole
-// state machine be unit-tested node-side (the CI ide job has no Python / Extension Host).
+// state machine be unit-tested node-side (the CI ide job has no Python / Extension Host). The
+// `connection upsert|remove` argv builders here are shared with the webview form and the
+// connections.toml custom editor, so every IDE writer names the same settings file (BACKLOG #2908).
 
 import { type ConnObj, type SavePlan, planSave } from "./connectionMerge";
 
@@ -154,9 +156,81 @@ export function buildConnObj(state: WizardState): WizardConnObj {
   return conn;
 }
 
-/** The `messagefoundry connection upsert` argv (sans the `--json` the runJson helper appends). */
-export function connectionUpsertArgs(configDir: string, conn: WizardConnObj): string[] {
-  return ["connection", "upsert", "--config", configDir, "--data", JSON.stringify(conn)];
+/**
+ * The `--service-config` value a connection edit passes, or `undefined` to leave the flag off
+ * (BACKLOG #2908). `setting` is `messagefoundry.serviceConfig`; `isSet` says whether the operator
+ * set it anywhere, rather than leaving the manifest default.
+ *
+ * The CLI checks a connection edit against the named file, at least its `[egress]` allowlist, which
+ * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml` in the
+ * workspace, and only if that file exists.
+ *
+ * A set setting is always passed, whether or not its file exists, even where it spells the default
+ * name. The CLI then refuses a missing file and names it, rather than checking the edit against a
+ * file the setting did not name. A blank setting is passed as it is, and a non-string one as an
+ * empty string, and `connection` refuses both as blank. The alert and security editors pass the
+ * same setting unconditionally too, so no surface drops it.
+ *
+ * Only an unset setting leaves the flag off. Its default names `messagefoundry.toml`, the same file
+ * the CLI falls back to, so the edit is checked against that file where it exists. Where it does
+ * not, the edit is checked against no file rather than refused, so a new workspace can still edit
+ * its connections.
+ */
+export function connectionServiceConfig(setting: unknown, isSet: boolean): string | undefined {
+  if (!isSet) {
+    return undefined;
+  }
+  // The manifest declares a string, but VS Code does not enforce it on a hand-edited settings.json.
+  return typeof setting === "string" ? setting : "";
+}
+
+/**
+ * Whether a setting, as VS Code's `inspect()` reports it, is set in user or workspace settings
+ * rather than left at its default. A null there counts as set. `messagefoundry.serviceConfig`
+ * declares no scope, so it is window-scoped, and VS Code ignores a folder value for it; a folder
+ * value is not read here either.
+ */
+export function settingIsSet(
+  seen: { defaultValue?: unknown; globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown } | undefined,
+): boolean {
+  return seen !== undefined && (seen.globalValue !== undefined || seen.workspaceValue !== undefined);
+}
+
+function serviceConfigArgs(serviceConfig: string | undefined): string[] {
+  return serviceConfig === undefined ? [] : ["--service-config", serviceConfig];
+}
+
+/**
+ * The `messagefoundry connection upsert` argv (sans the `--json` the runJson helper appends). Every
+ * IDE writer of connections.toml (the webview form, the custom editor, this wizard) builds its argv
+ * here, so all of them name the instance's service settings the same way. `serviceConfig` comes from
+ * {@link connectionServiceConfig}, which can leave the flag off; the alert, security and trust
+ * editors pass theirs unconditionally.
+ */
+export function connectionUpsertArgs(
+  configDir: string,
+  serviceConfig: string | undefined,
+  conn: WizardConnObj,
+): string[] {
+  return [
+    "connection",
+    "upsert",
+    "--config",
+    configDir,
+    ...serviceConfigArgs(serviceConfig),
+    "--data",
+    JSON.stringify(conn),
+  ];
+}
+
+/** The `messagefoundry connection remove` argv (sans `--json`). A remove is validated against the
+ *  same settings as an upsert -- the remaining graph is re-checked -- so it names them too. */
+export function connectionRemoveArgs(
+  configDir: string,
+  serviceConfig: string | undefined,
+  name: string,
+): string[] {
+  return ["connection", "remove", "--config", configDir, ...serviceConfigArgs(serviceConfig), "--name", name];
 }
 
 /**

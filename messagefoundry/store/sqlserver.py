@@ -35,6 +35,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -55,6 +56,7 @@ from contextlib import (
     AsyncExitStack,
     asynccontextmanager,
     contextmanager,
+    nullcontext,
 )
 from dataclasses import replace
 from functools import partial
@@ -74,6 +76,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_text
@@ -82,6 +85,8 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    SchemaDdlLockTimeout,
+    SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreNotFoundError,
@@ -119,7 +124,9 @@ from messagefoundry.store.crypto import (
     cipher_meta_key,
     decrypt_json_cell,
     report_sealed_surface,
-    rotation_fingerprint_key,
+    reseal_rotation_fingerprints,
+    rotation_fingerprint_cipher,
+    rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
@@ -187,6 +194,7 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
@@ -216,6 +224,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    DiskFreeStatus,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -230,6 +239,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    PasskeyCounts,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -263,6 +273,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    append_rename_audits,
     approval_fails_seal,
     approval_tombstone,
     approval_update,
@@ -275,6 +286,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
     federated_bind,
@@ -322,6 +334,7 @@ from messagefoundry.store.store import (
     seal_session,
     seal_user,
     session_insert_params,
+    session_owes_unproven_factor,
     session_reseal_params,
     session_seal_ok,
     settle_newest_keyed_audit_row,
@@ -578,6 +591,9 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 # contract (see claim_fifo_heads). pyodbc surfaces the native code in the exception args (the ODBC
 # diagnostic message embeds "(1222)"); match on the code without pinning to a specific SQLSTATE.
 _LOCK_TIMEOUT_NATIVE_ERROR = 1222
+
+#: Puts a session's LOCK_TIMEOUT back to the default, wait forever (BACKLOG #1726).
+_LOCK_TIMEOUT_RESET: Final = "SET LOCK_TIMEOUT -1"
 
 
 def _is_lock_timeout(exc: BaseException) -> bool:
@@ -1024,9 +1040,11 @@ def _upload_quota_lock(uploader_id: str) -> str:
 
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
-    (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
-    REFUSES to build when ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait
-    unboundedly on the applock)."""
+    (wait forever; nothing else bounds it, since a 0 command timeout sets no pyodbc query timeout
+    either). ``0`` -> ``-1`` is why the SYNC handoff pool REFUSES to build when
+    ``command_timeout==0`` (ADR 0071 invariant: a fused hop must never wait unboundedly on the
+    applock). The schema lock does not use this: it passes ``[store].schema_lock_timeout`` instead
+    (BACKLOG #1726)."""
     return int(command_timeout * 1000) if command_timeout else -1
 
 
@@ -1034,11 +1052,30 @@ def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
     return (resource, timeout_ms)
 
 
+#: Largest ``@LockTimeout`` ``sp_getapplock`` takes: the parameter is a T-SQL ``int`` (ms).
+_APPLOCK_MAX_TIMEOUT_MS: Final[int] = 2**31 - 1
+
+
+def _schema_applock_timeout_ms(schema_lock_timeout: float) -> int:
+    """``@LockTimeout`` (ms) for the schema lock, from ``[store].schema_lock_timeout`` (BACKLOG
+    #1726). Rounded up so a sub-millisecond setting still waits, rather than becoming ``0`` (no
+    wait), and clamped to the T-SQL ``int`` range rather than overflowing it."""
+    return min(max(math.ceil(schema_lock_timeout * 1000), 1), _APPLOCK_MAX_TIMEOUT_MS)
+
+
+class _ApplockTimeout(RuntimeError):
+    """``sp_getapplock`` returned ``-1``: its ``@LockTimeout`` elapsed before the lock was granted.
+    A ``RuntimeError`` like every other refusal :func:`_applock_result` raises, so existing callers
+    are unchanged; the schema open alone tells it apart, to name its own setting."""
+
+
 def _applock_result(row: Any, resource: str) -> None:
     """Raise on a negative ``sp_getapplock`` return code (timeout/cancel/deadlock/bad-param) rather than
     proceeding unserialized — a swallowed timeout would fork the audit chain or double-finalize."""
     rc = int(row[0]) if row and row[0] is not None else -999
-    if rc < 0:  # -1 timeout, -2 cancelled, -3 deadlock victim, -999 bad param
+    if rc == -1:
+        raise _ApplockTimeout(f"sp_getapplock({resource!r}) failed: rc={rc}")
+    if rc < 0:  # -2 cancelled, -3 deadlock victim, -999 bad param
         raise RuntimeError(f"sp_getapplock({resource!r}) failed: rc={rc}")
 
 
@@ -1957,6 +1994,10 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
         CREATE INDEX ix_messages_control ON messages(channel_id, control_id)""",
+    # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's
+    # plan is pinned by a test; this backend's plan has not been measured.
+    """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_received','IndexID') IS NULL
+        CREATE INDEX ix_messages_received ON messages(received_at, id)""",
     # Unified staged queue (ADR 0001) — ingress -> routed -> outbound, one row per stage-unit with a
     # `stage` discriminator. The SQL Server backend originally shipped a flat `outbox` table; it was
     # RECREATED by this very `_SCHEMA` on every open and read by nothing (the staged pipeline and every
@@ -2235,9 +2276,9 @@ _SCHEMA: list[str] = [
         audit_hash NVARCHAR(64) NOT NULL)""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
-    # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
-    # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
-    # id-keyed tables.
+    # backends a real engine-sharded deployment runs (`require_unified_store` makes a server DB
+    # mandatory past one engine shard). No PHI (two ids, a size and a timestamp). BIN2 collation
+    # matches the other id-keyed tables.
     # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
     # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
     """IF OBJECT_ID('upload_quota','U') IS NOT NULL DROP TABLE upload_quota""",
@@ -2687,13 +2728,21 @@ _SCHEMA: list[str] = [
         CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
-    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
-    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
-    # _schema_hash() — the ADR 0064 bump — so the table is created at open on SQL Server too, engaging the
-    # engine's `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
+    # is the DEK's one-way key-id, or for any other class a store-cipher cell sealing a keyed MAC under
+    # a random per-row key (BACKLOG #3472, ADR 0213) — never the value; the dates are the tracked-since
+    # age floor + the auto-detected last-rotation stamp. Adding this DDL moves _schema_hash() — the ADR
+    # 0064 bump — so the table is created at open on SQL Server too, engaging the engine's
+    # `isinstance(store, SecretRotationMetaStore)` reconcile on the server backends (SQL Server / Postgres).
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
-        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(255) NOT NULL,
+        secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(MAX) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
+    # BACKLOG #3472: a sealed fingerprint cell can be longer than 255 characters (measured: about 240
+    # to 255 under the frozen v1 writer, 260 to 320 under the default cell-bound writer, and more
+    # for a long env() key), so a table created at NVARCHAR(255) is widened in place. COL_LENGTH is
+    # -1 for a MAX column and NULL for no table, so this runs once and never on a fresh store. The
+    # column is in no key or index, so it alters in place.
+    """IF COL_LENGTH('secret_rotation_meta','fingerprint') <> -1
+        ALTER TABLE secret_rotation_meta ALTER COLUMN fingerprint NVARCHAR(MAX) NOT NULL""",
     # ADR 0114 sub-lever A: the lane-family claim procedures, deployed as guarded,
     # self-no-op'ing CREATE OR ALTER statements (see _claim_proc_ddl — a guard miss leaves the proc
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).
@@ -2717,64 +2766,73 @@ def _schema_hash() -> str:
     return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
 
 
-def _odbc_brace(value: str) -> str:
-    """ODBC-quote a value in braces, doubling any internal ``}`` — neutralizes ``; { } =`` inside it
-    so an attacker-influenced value (e.g. a password) can't inject extra connection keywords."""
-    return "{" + value.replace("}", "}}") + "}"
-
-
-def _pin_path(settings: StoreSettings) -> str | None:
-    """The ``[store].ssl_root_cert`` pin the store sends, or ``None``: it rides only the secure
-    posture, so an escaped weakened one (verify off, or no encryption) sends none."""
-    if settings.trust_server_certificate or not settings.encrypt:
-        return None
-    return settings.ssl_root_cert or None
-
-
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
     """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
     the setting. A no-op when the store sends no pin.
 
-    Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
-    host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
+    Vault BACKLOG #2223: the pinned file is the connection's only trust anchor, because of what a
+    pin match does under ``Encrypt=strict``. The ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``
+    states that once, with the build and platform it was tested on. So:
 
-    * the file must be one server certificate (:func:`~messagefoundry.pki.read_pinned_server_certificate`);
     * it takes the trust-anchor ACL and path checks with their own rules and messages
-      (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad
+      (:func:`~messagefoundry.auth.trust_anchors.enforced_anchor`): a file or folder a broad
       principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
       and no posture counts as enforcing. The driver reads the file by path, so the spec carries
-      ``loads_verified_bytes=False``;
+      ``loads_verified_bytes=False`` (:func:`~messagefoundry.auth.trust_anchors.store_pin_anchor_spec`);
+    * it must be no larger than :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, judged by its size
+      on disk before the anchor checks read it, and again on the bytes they read;
+    * the file must be one server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`);
     * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
       still counts as valid, as RFC 5280 reads it.
+
+    The file is read once, and the certificate checks read the bytes the anchor checks read
+    (BACKLOG #3714). It writes no audit row. The audited check is the settings preflight
+    (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
     :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
     before any connect, never per query. A store opened before notAfter keeps connecting after it,
     so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
-    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, enforce_anchor
-    from messagefoundry.pki import read_pinned_server_certificate
+    from messagefoundry.auth.trust_anchors import (
+        TrustAnchorError,
+        enforced_anchor,
+        store_pin_anchor_spec,
+    )
+    from messagefoundry.pki import (
+        oversized_pin_reason,
+        pinned_server_certificate,
+        unreadable_pin_reason,
+    )
     from messagefoundry.redaction import log_timestamp
 
-    path = _pin_path(settings)
-    if path is None:
+    spec = store_pin_anchor_spec(settings)
+    if spec is None:
         return
-    cert = read_pinned_server_certificate(path)
+    path = spec.path
+    # The anchor checks read the whole file, so a file too large for a pin is refused first.
+    if (too_large := oversized_pin_reason(path)) is not None:
+        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
+    checked: bytes | str  # the bytes the anchor checks read, or the refusal
+    try:
+        enforcing = posture is None or posture.enforcing
+        # remember_warning: serve's preflight checks this file again moments later, and need not
+        # log the same warning twice (BACKLOG #3714).
+        checked = enforced_anchor(spec, enforcing=enforcing, remember_warning=True).data
+    except TrustAnchorError as exc:
+        checked = str(exc)  # the anchor module's own message, which names the setting and the fix
+    except (OSError, ValueError, TypeError) as exc:  # the last two: a path open() refuses
+        checked = f"[store].ssl_root_cert {path!r} {unreadable_pin_reason(exc)}"
+    except MemoryError:
+        # Turns a MemoryError raised while the anchor checks run into a refusal naming the setting.
+        # The store open does not guard a FIFO or an endless device: such a read can block or never end.
+        checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
+    if isinstance(checked, str):  # raised outside the handler, so no chained parser text
+        raise ValueError(checked)
+    cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
         raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
-    spec = AnchorSpec(
-        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
-    )
-    refusal: str | None = None
-    try:
-        enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
-    except TrustAnchorError as exc:
-        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
-    except OSError as exc:
-        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
-    if refusal is not None:
-        raise ValueError(refusal)
     moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
@@ -2794,10 +2852,8 @@ def check_pinned_certificate(
 def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
-    Free-text values are brace-quoted to prevent connection-string injection (STORE-5), and the
-    ``Encrypt``/``TrustServerCertificate`` security flags are emitted **last** so — ODBC being
-    last-wins on duplicate keywords — nothing earlier can downgrade TLS. Identity fields are also
-    validated up front (see ``StoreSettings._no_odbc_injection``).
+    Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (STORE-5, BACKLOG #3714). Identity
+    fields are also validated up front (see ``StoreSettings._no_odbc_injection``).
 
     ``posture`` is the deriving instance's :class:`HopPosture` (threaded from ``open_store`` by the
     serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
@@ -2826,42 +2882,37 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     parts = [
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
-        f"DATABASE={_odbc_brace(settings.database or '')}",
+        f"DATABASE={odbc_brace(settings.database or '')}",
         # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
         # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
         # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
         # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
         # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
-        f"APP={_odbc_brace(settings.application_name)}",
+        f"APP={odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
-        parts.append(f"UID={_odbc_brace(settings.username or '')}")
-        parts.append(f"PWD={_odbc_brace(settings.password or '')}")
+        parts.append(f"UID={odbc_brace(settings.username or '')}")
+        parts.append(f"PWD={odbc_brace(settings.password or '')}")
     elif settings.auth is SqlAuth.INTEGRATED:
         parts.append("Trusted_Connection=yes")
     elif settings.auth is SqlAuth.ENTRA:
         parts.append("Authentication=ActiveDirectoryDefault")
-    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes before the
-    # Encrypt/TrustServerCertificate tail and cannot disturb the last-wins TLS posture.
+    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes in the head,
+    # before the TLS tail (messagefoundry.odbc_dsn).
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
-    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
-    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
-    # Encrypt=strict: on the Driver 18.7 build tested on Windows, the pin was enforced with strict and
-    # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
-    # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
-    # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
-    # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
-    # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
-    # keywords stay inside the last-wins tail.
-    pin = _pin_path(settings)
-    if pin:
-        parts.append(f"ServerCertificate={_odbc_brace(pin)}")
-    encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
-    parts.append(f"Encrypt={encrypt}")
-    parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
-    return ";".join(parts) + ";"
+    # Driver 18.1+ `ServerCertificate` keyword, only on the SECURE posture (encrypt on, verify on; the
+    # weakened branch above already refused or escaped). The pin goes out with Encrypt=strict, and the
+    # engine checks the pinned certificate itself at store open (check_pinned_certificate). Why strict,
+    # what it needs of the server, and what it was tested on: the `ssl_root_cert` row of
+    # docs/CONFIGURATION.md (vault BACKLOG #2223). Not a revocation control.
+    return odbc_connection_string(
+        parts,
+        encrypt=settings.encrypt,
+        trust_server_certificate=settings.trust_server_certificate,
+        pin=settings.sqlserver_pin_path(),
+    )
 
 
 def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) -> ThreadPoolExecutor:
@@ -3102,8 +3153,11 @@ class SqlServerStore:
         # against this and re-reads only the sets that differ. Seeded at open (_load_reference_cache)
         # and on every write_reference_snapshot.
         self._reference_versions: dict[str, str] = {}
-        # Serializes audit-chain appends in-process (the store is the single audit writer per engine
-        # process; active-passive = one active node) — see record_audit.
+        # A near gate only: it orders the appends in THIS process that take it (record_audit and
+        # its siblings; _append_operator_audit does not). The chain's lock is `_AUDIT_APPEND_LOCK`,
+        # taken by every append in every engine-shard process (why: record_audit). That premise is
+        # tested in tests/test_control_premises.py (offline: the applock precedes the head read)
+        # and the gated tests/test_sqlserver_audit_applock.py (live: it holds across processes).
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
@@ -3658,11 +3712,10 @@ class SqlServerStore:
     # `isinstance(store, SecretRotationMetaStore)` reconcile on the SQL Server backend (mirrors
     # MessageStore's SQLite implementation).
 
-    def secret_rotation_fingerprint_key(self) -> bytes | None:
-        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
-        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
-        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
-        return rotation_fingerprint_key(self._cipher)
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        """The cipher the rotation watcher seals each non-DEK fingerprint cell with (ASVS 13.3.4,
+        BACKLOG #3472); ``None`` when keyless or ``vault_transit``. Mirrors MessageStore's."""
+        return rotation_fingerprint_cipher(self._cipher)
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
@@ -3685,7 +3738,9 @@ class SqlServerStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent via a single atomic ``MERGE``
         under ``HOLDLOCK`` (range-locks the PK so two concurrent nodes can't both INSERT), so a re-run —
-        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        or a second cluster node — writing an identical fingerprint/date is a no-op. A sealed non-DEK fingerprint draws a fresh key on every write (BACKLOG #3472), so two nodes
+        sealing one class at once each write a different cell and the last write wins; either opens
+        to the same verdict."""
         await self._execute(
             "MERGE secret_rotation_meta WITH (HOLDLOCK) AS t"
             " USING (SELECT ? AS secret_key) AS s ON t.secret_key=s.secret_key"
@@ -4563,65 +4618,167 @@ class SqlServerStore:
         ):
             await self._verify_schema_external(expected)
             return False
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
+            locked = False  # the schema applock may be held by this connection's transaction
+            lock_bounded = False
             try:
-                # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip the
-                # batch AND the exclusive schema applock. Re-running the full guarded batch under one
-                # exclusive applock on EVERY open made N concurrent opens convoy (WS-B Finding 2: a
-                # loser blows the 30s lock timeout → startup failure). The probe is two cheap SELECTs
-                # under the normal command timeout; a virgin/pre-marker DB falls through to the full
-                # run. Out-of-band drift (an operator hand-dropping an object) is no longer healed on
-                # every open — the remedy is `DELETE FROM schema_meta`, which forces one full run.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
-                    log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
-                    return False
-                if not provisioning and not create and not await self._schema_meta_present(cur):
-                    # Raised inside the try, so the except below rolls the probe's read txn back.
-                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+                async with self._cursor(conn) as cur:
+                    # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip
+                    # the batch AND the exclusive schema applock. Re-running the full guarded batch
+                    # under one exclusive applock on EVERY open made N concurrent opens convoy (WS-B
+                    # Finding 2: a loser blows the 30s lock timeout → startup failure). The probe is
+                    # two cheap SELECTs under the normal command timeout; a virgin/pre-marker DB falls
+                    # through to the full run. Out-of-band drift (an operator hand-dropping an object)
+                    # is no longer healed on every open — the remedy is `DELETE FROM schema_meta`,
+                    # which forces one full run.
+                    if await self._schema_marker_current(cur, expected):
+                        # Close the probe's read txn (autocommit=False pool).
+                        await self._commit(conn)
+                        log.debug(
+                            "sqlserver: schema current (%s…) — DDL batch skipped", expected[:12]
+                        )
+                        return False
+                    if not provisioning and not create and not await self._schema_meta_present(cur):
+                        # Raised inside the try, so the except below rolls the probe's txn back.
+                        raise StoreNotFoundError.server_schema(
+                            self.backend, self._settings.database
+                        )
+                # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
+                # so each step below runs on its own cursor, opened after the connection timeout is set
+                # for that step, and closed before the next opens (no MARS: one active statement per
+                # connection). The applock and the DDL batch run with no query timeout; the
+                # double-check between them runs under command_timeout, as the probe does (BACKLOG
+                # #1726). _acquire re-applies command_timeout on the next borrow, so no restore is
+                # needed on the way out.
+                raw = getattr(conn, "_conn", None)
+                if raw is not None:
+                    raw.timeout = 0
+                async with self._cursor(conn) as cur:
+                    # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start
+                    # against a virgin DB) — the T-SQL analog of the Postgres store's schema advisory
+                    # lock. Without it the `IF OBJECT_ID(...) IS NULL CREATE` guards below are
+                    # check-then-create: two nodes both see NULL and both CREATE, and the loser dies on
+                    # a 2714 "There is already an object named ...". The applock is transaction-scoped,
+                    # so it auto-releases on the commit/rollback below; the second node then runs the
+                    # now-no-op guarded CREATEs cleanly. It is NOT this transaction's first statement
+                    # and must not become one: the ADR 0064 fast-path probe above already ran one or
+                    # two table-reading SELECTs on this connection with no commit between (closing the
+                    # probe's cursor does not end the transaction), so the autocommit=False pool has an
+                    # open transaction for `@LockOwner='Transaction'` to attach to. (An earlier comment
+                    # here read "this first statement opens the txn" — it predated the probe and was
+                    # stale, not a contradiction of the applock rule record_audit now follows.)
+                    # The wait is bounded by [store].schema_lock_timeout, not command_timeout;
+                    # PostgresStore._ensure_schema says why. Here the bound matters more: this
+                    # cursor carries no pyodbc query timeout, SQL Server has no lock_timeout that
+                    # reaches sp_getapplock, and cancelling the open cannot interrupt the driver
+                    # thread waiting in it, so @LockTimeout is the only thing that ends the wait.
+                    log.info("sqlserver: waiting for the schema lock to apply the DDL batch")
+                    wait = self._settings.schema_lock_timeout
+                    # Raised first: a grant whose round trip then failed is still held.
+                    locked = True
+                    try:
+                        await self._applock(
+                            cur, _SCHEMA_LOCK, timeout_ms=_schema_applock_timeout_ms(wait)
+                        )
+                    except _ApplockTimeout as exc:
+                        raise SchemaLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
+                # Double-check under the lock: the peer we queued behind may have just applied this
+                # exact batch and committed its marker, so this open has nothing to do. The read runs
+                # under command_timeout, as the probe above does, so with a non-zero command_timeout
+                # neither a lock wait on schema_meta nor a stalled link holds the schema lock forever
+                # (BACKLOG #1726); a query timeout here surfaces as the driver's own error and rolls
+                # back below. command_timeout = 0 means no limit here, as everywhere it applies.
+                if raw is not None:
+                    raw.timeout = self._settings.command_timeout
+                async with self._cursor(conn) as cur:
+                    if await self._schema_marker_current(cur, expected):
+                        await self._commit(conn)  # releases the txn-scoped applock
+                        log.debug(
+                            "sqlserver: schema applied by a peer (%s…) — skipped", expected[:12]
+                        )
+                        return False
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
                 # batch and re-fail on every restart — a startup crash-loop. raw.timeout=0 = no client
-                # statement timeout for this connection; _acquire re-applies command_timeout on the next
-                # borrow, so no restore is needed. (sp_getapplock below keeps its own server-side
-                # @LockTimeout from command_timeout, so a peer's in-progress migration still bounds the
-                # lock wait rather than hanging.)
-                raw = getattr(conn, "_conn", None)
+                # statement timeout for the batch's cursor.
                 if raw is not None:
                     raw.timeout = 0
-                # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start against a
-                # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
-                # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
-                # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
-                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
-                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
-                # path probe above already ran one or two table-reading SELECTs on this connection with
-                # no commit between, so the autocommit=False pool has an open transaction for
-                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
-                # statement opens the txn" — it predated the probe and was stale, not a contradiction
-                # of the applock rule record_audit now follows.)
-                await self._applock(cur, _SCHEMA_LOCK)
-                # Double-check under the lock: the peer we queued behind may have just applied this
-                # exact batch and committed its marker — then this open has nothing to do.
-                if await self._schema_marker_current(cur, expected):
-                    await self._commit(conn)  # releases the txn-scoped applock
-                    log.debug("sqlserver: schema applied by a peer (%s…) — skipped", expected[:12])
-                    return False
-                for statement in _SCHEMA:
-                    await cur.execute(statement)
-                await cur.execute("DELETE FROM schema_meta WHERE id=1")
-                await cur.execute(
-                    "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
-                    (expected, time.time()),
-                )
-                await self._commit(conn)
-                log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
-                return True
+                async with self._cursor(conn) as cur:
+                    # The HOLDER's own lock waits are bounded too (BACKLOG #1726). The cursor has
+                    # no query timeout and the session's LOCK_TIMEOUT is -1, so without this a
+                    # CREATE INDEX or ALTER queued behind any open transaction on its table waits
+                    # forever while holding the schema lock. LOCK_TIMEOUT bounds only the wait for
+                    # each lock, never how long a build runs once it has it. It is SESSION-scoped
+                    # and survives the commit, so it is reset before the pooled connection is
+                    # released: inside the transaction before the commit, or after the rollback
+                    # below. Set AFTER the applock, which takes its own @LockTimeout. The flag is
+                    # raised first: a SET the server applied but whose round trip then failed must
+                    # still be reset.
+                    lock_bounded = True
+                    try:
+                        await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
+                        for statement in _SCHEMA:
+                            await cur.execute(statement)
+                        await cur.execute("DELETE FROM schema_meta WHERE id=1")
+                        await cur.execute(
+                            "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
+                            (expected, time.time()),
+                        )
+                        await cur.execute(_LOCK_TIMEOUT_RESET)
+                    except Exception as exc:
+                        if _is_lock_timeout(exc):
+                            raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
+                        raise
+                    await self._commit(conn)
+                    log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
+                    return True
             except Exception:
-                await conn.rollback()  # roll back the partial DDL batch (M-6)
+                # A cancellation here, or during the rollback, skips the reset below: _acquire
+                # quarantines that connection rather than pooling it, and the cancelled statement
+                # may still be running on its executor thread.
+                try:
+                    await conn.rollback()  # roll back the partial DDL batch (M-6)
+                except Exception:
+                    if locked:
+                        # Neither the transaction, which may hold the schema applock, nor the
+                        # session bound is known to be gone.
+                        log.warning(
+                            "sqlserver: rollback after a failed schema batch failed; discarding"
+                            " the connection",
+                            exc_info=True,
+                        )
+                        _detach_connection(conn)
+                    raise
+                if lock_bounded:
+                    await self._reset_schema_lock_timeout(conn)
                 raise
+
+    async def _reset_schema_lock_timeout(self, conn: Any) -> None:
+        """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
+        (BACKLOG #1726), so the pooled connection keeps the default. A ``SET`` is not undone by a
+        rollback, so the reset runs alone and is followed by a second rollback, which ends any
+        implicit transaction it opened. It runs under ``command_timeout`` again, like any other
+        statement on a borrowed connection: the batch had lifted the connection's query timeout. A
+        failed reset is logged, not raised, so it cannot mask the batch's own error, and the
+        connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
+        raw = getattr(conn, "_conn", None)
+        if raw is not None:
+            raw.timeout = self._settings.command_timeout
+        step = "reset LOCK_TIMEOUT"
+        try:
+            async with self._cursor(conn) as cur:
+                await cur.execute(_LOCK_TIMEOUT_RESET)
+            step = "roll back after the LOCK_TIMEOUT reset"
+            await conn.rollback()
+        except Exception:  # noqa: BLE001 - a reset failure must not mask the real outcome
+            log.warning(
+                "sqlserver: could not %s after a failed schema batch; discarding the connection",
+                step,
+                exc_info=True,
+            )
+            # Its future is deliberately not awaited, as in _rollback_or_discard.
+            _detach_connection(conn)
 
     async def _verify_schema_external(self, expected: str) -> None:
         """External mode's whole open-time schema step (#305): reads only, no DDL, no applock.
@@ -5495,15 +5652,17 @@ class SqlServerStore:
             (key, outbox_id, message_id, destination_name, seq, now, key),
         )
 
-    async def _applock(self, cur: Any, resource: str) -> None:
+    async def _applock(self, cur: Any, resource: str, *, timeout_ms: int | None = None) -> None:
         """Take a transaction-scoped exclusive ``sp_getapplock`` — the T-SQL analog of PG's advisory
         lock. A NAMED lock in its own space: it never locks ``queue``/``messages`` rows, so it cannot
         invert the producers' queue->messages lock order (no AB/BA deadlock), and it is re-entrant per
         (resource, transaction). ``@LockOwner='Transaction'`` auto-releases it at the caller's commit/
         rollback, so the caller MUST be in an open (autocommit=False) transaction. Raises on a negative
         return code (timeout/deadlock/error) rather than proceeding unserialized — a swallowed timeout
-        would fork the audit chain or double-finalize a message."""
-        timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
+        would fork the audit chain or double-finalize a message. ``timeout_ms`` overrides the
+        ``command_timeout``-derived ``@LockTimeout``."""
+        if timeout_ms is None:
+            timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
         await cur.execute(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
         row = await cur.fetchone()
         _applock_result(row, resource)
@@ -8592,6 +8751,8 @@ class SqlServerStore:
         total += await self._reencrypt_identity_composite(
             "alert_instance", ("event_type", "connection"), "reason", active_like, batch
         )
+        # BACKLOG #3472 (ADR 0213): each sealed secret-rotation fingerprint; store.py's twin says why.
+        total += await self._reseal_rotation_fingerprints_to_active(cipher, active_like)
         if total:
             log.info("re-encrypted %d row(s) to the active key", total)
         # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
@@ -8658,6 +8819,36 @@ class SqlServerStore:
                 column,
             )
         return total
+
+    async def _reseal_rotation_fingerprints_to_active(
+        self, cipher: AesGcmCipher, active_like: str
+    ) -> int:
+        """Re-seal each sealed ``secret_rotation_meta.fingerprint`` under the active key (BACKLOG
+        #3472). Mirrors MessageStore._reseal_rotation_fingerprints_to_active: one read, and a cell no
+        key opens is left in place."""
+        sealed, active = rotation_fingerprint_reseal_likes(active_like)
+        rows = await self._fetchall(
+            "SELECT secret_key, fingerprint FROM secret_rotation_meta"
+            " WHERE fingerprint LIKE ? AND fingerprint NOT LIKE ?",
+            (sealed, active),
+        )
+        updates = reseal_rotation_fingerprints(
+            cipher, [(r["secret_key"], r["fingerprint"]) for r in rows]
+        )
+        if updates:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for enc, skey in updates:
+                        await cur.execute(
+                            "UPDATE secret_rotation_meta SET fingerprint=? WHERE secret_key=?",
+                            (enc, skey),
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            await self._charge_bound_batch()
+        return len(updates)
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
@@ -8909,7 +9100,8 @@ class SqlServerStore:
         # ASVS 14.2.7. Whole-row DELETE — the criteria IS the payload and the row backs no count.
         # `updated_at`/`last_used_at` are FLOAT epochs here (as on SQLite/PG), so the comparison needs no
         # date handling. #306: key on the LATER of last-edited and last-used. T-SQL's GREATEST is SQL
-        # Server 2022+ and this backend's floor is 2016 SP1 (see _SCHEMA's CREATE OR ALTER guard), so the
+        # Server 2022+, newer than the 2016 SP1 that _SCHEMA's CREATE OR ALTER guard checks for, so this
+        # statement does not use it (the supported floor is docs/SYSTEM-REQUIREMENTS.md's). The
         # null-safe greatest-of-two is spelled as the equivalent PREDICATE pair — `MAX(a,b) < cutoff` is
         # exactly `a < cutoff AND (b IS NULL OR b < cutoff)`, and the NULL arm is what keeps a pre-#306
         # row (never recall-stamped) purging on `updated_at` alone. `older_than` is bound TWICE.
@@ -12446,15 +12638,7 @@ class SqlServerStore:
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
-                    # This read OPENS the transaction the applock attaches to, as in record_audit:
-                    # the autocommit=False pool begins one only on a statement that touches a
-                    # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
-                    await cur.execute(
-                        "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
-                        (uploader_id,),
-                    )
-                    await cur.fetchall()
-                    await self._applock(cur, _upload_quota_lock(uploader_id))
+                    await self._open_under_upload_quota_applock(cur, uploader_id)
                     await cur.execute(
                         "DELETE FROM upload_reservation WHERE uploader_id = ?"
                         f" AND since <= {_MSSQL_EPOCH_NOW} - ?",
@@ -12465,17 +12649,15 @@ class SqlServerStore:
                         " (reservation_id, uploader_id, size_bytes, since)"
                         " OUTPUT inserted.reservation_id"
                         f" SELECT ?, ?, ?, {_MSSQL_EPOCH_NOW}"
-                        " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
-                        " + 1 <= ?"
-                        " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
-                        " WHERE uploader_id = ?) + ? <= ?",
+                        " FROM (SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                        " FROM upload_reservation WHERE uploader_id = ?) AS held"
+                        " WHERE held.n + 1 <= ? AND held.b + ? <= ?",
                         (
                             reservation_id,
                             uploader_id,
                             int(size_bytes),
                             uploader_id,
                             int(max_files),
-                            uploader_id,
                             int(size_bytes),
                             int(max_total_bytes),
                         ),
@@ -12488,7 +12670,7 @@ class SqlServerStore:
                 raise
         return row is not None
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`.
 
         **It takes the uploader's applock before it deletes, as the reserve does (vault BACKLOG
@@ -12498,31 +12680,42 @@ class SqlServerStore:
         sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
         hold row locks at once, because each holds no row lock when it asks for the applock.
 
-        For the release that rests on how the uploader is read. ``READCOMMITTEDLOCK`` waits out a
-        reserve still committing this row rather than reading past it under RCSI, and its shared
-        lock is released when the read ends, before the applock is requested. A hint that holds
-        it longer, such as ``HOLDLOCK``, would break the argument. Nothing to release commits the
-        empty transaction and returns."""
+        The caller names the uploader, so nothing is read to learn whose lock to take, and the
+        applock is taken whether or not the row exists (vault BACKLOG #3740 item 10). The opener
+        still reads the uploader's index, without a lock; a hint that locks there would break the
+        argument above. A reserve of this uploader that holds the applock is waited out through the
+        applock itself, including one that took the lock but had not yet inserted, which a read for
+        the row would have missed. The cost is on a release with no row to delete: it can wait for
+        a sibling's reserve of the same uploader, for at most the applock timeout, which
+        ``command_timeout = 0`` removes. The delete matches the uploader too, so a row stored under
+        another uploader id is left alone."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
+                    await self._open_under_upload_quota_applock(cur, uploader_id)
                     await cur.execute(
-                        "SELECT uploader_id FROM upload_reservation WITH (READCOMMITTEDLOCK)"
-                        " WHERE reservation_id = ?",
-                        (reservation_id,),
+                        "DELETE FROM upload_reservation WHERE reservation_id = ? AND uploader_id = ?",
+                        (reservation_id, uploader_id),
                     )
-                    row = await cur.fetchone()
-                    if row is not None:
-                        await self._applock(cur, _upload_quota_lock(str(row[0])))
-                        await cur.execute(
-                            "DELETE FROM upload_reservation WHERE reservation_id = ?",
-                            (reservation_id,),
-                        )
                     await self._commit(conn)
             except Exception:
                 # The transaction may hold the applock; after the cursor closes, as the reserve.
                 await self._rollback_or_discard(conn)
                 raise
+
+    async def _open_under_upload_quota_applock(self, cur: Any, uploader_id: str) -> None:
+        """Open a transaction on ``cur`` and take ``uploader_id``'s upload-quota applock in it, for
+        the reserve and the release alike. The opener reads the uploader's index, as
+        :meth:`_open_under_audit_applock` reads ``audit_log``, because the applock needs a
+        transaction and a SELECT with no FROM begins none. Its value is discarded. Under RCSI it
+        takes no row lock, so the caller holds none when it asks for the applock, which is the
+        release's lock-order argument."""
+        await cur.execute(
+            "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
+            (uploader_id,),
+        )
+        await cur.fetchall()
+        await self._applock(cur, _upload_quota_lock(uploader_id))
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
@@ -12581,6 +12774,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
+        expected_rows: Sequence[tuple[int, str]] | None = None,
     ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
@@ -12602,6 +12796,7 @@ class SqlServerStore:
             capable=self._audit_keyed_capable(),
             expected_anchor=expected_anchor,
             expected_prefix=expected_prefix,
+            expected_rows=expected_rows,
         )
 
     # --- auth: users / roles / sessions --------------------------------------
@@ -13463,6 +13658,7 @@ class SqlServerStore:
         must_change_password: bool = True,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -13490,6 +13686,7 @@ class SqlServerStore:
                     passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13546,6 +13743,7 @@ class SqlServerStore:
         recovery_code_hashes: list[str],
         step: int,
         expected_enrolled_at: float | None,
+        expected_secret_cell: str | None,
         audit: AuditAppend,
         now: float | None = None,
     ) -> int | None:
@@ -13556,15 +13754,15 @@ class SqlServerStore:
         Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
         #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
         compare-and-set is ``totp_replace``'s, null-safe in Python. Same lock order as
-        ``record_audit``: the in-process gate, then the connection."""
+        ``record_audit``: the in-process gate, then the connection. The secret is sealed through
+        ``_enc``, as on the twins, so an empty one reaches ``totp_replace``'s refusal unsealed."""
         now = time.time() if now is None else now
         change = totp_replace(
-            sealed_secret=self._cipher.encrypt(
-                secret, aad=cell_aad("users", "totp_secret", user_id)
-            ),
+            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
+            expected_secret_cell=expected_secret_cell,
             now=now,
         )
         async with self._audit_lock:  # noqa: SIM117
@@ -13594,6 +13792,7 @@ class SqlServerStore:
         now: float | None = None,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         require_totp_rule(require_way_past, totp_usable)
@@ -13616,6 +13815,7 @@ class SqlServerStore:
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 )
                 written = await self._write_user(cur, user_id, change)
                 await self._commit(conn)
@@ -13650,17 +13850,51 @@ class SqlServerStore:
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
-    async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
+    async def add_webauthn_credential(
+        self, cred: WebAuthnCredential, *, for_session: str | None = None
+    ) -> bool:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
         material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
         for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
         already held (the primary key) and an account that does not exist
         (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
         re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
-        over its new passkey digest in the same transaction (BACKLOG #2592)."""
-        await self._write_passkeys_txn(
-            cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
-        )
+        over its new passkey digest in the same transaction (BACKLOG #2592). See
+        :meth:`AuthStore.add_webauthn_credential` for ``for_session``: the account row is taken
+        under ``UPDLOCK, ROWLOCK`` before the check, as every factor write here takes it, so a
+        factor bound elsewhere either committed before the check reads it or waits until this
+        transaction ends. The session row is taken the same way after it, users then sessions, so
+        a revoke of that session cannot land between the check and the commit either."""
+        if for_session is None:
+            await self._write_passkeys_txn(
+                cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+            )
+            return True
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                record = await self._read_user_record(cur, cred.user_id)  # UPDLOCK, ROWLOCK
+                await cur.execute(
+                    "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?",
+                    (for_session,),
+                )
+                session = await self._fetch_dicts(cur)
+                # No account: the insert below meets the foreign key (BACKLOG #1807).
+                if record is not None and session_owes_unproven_factor(
+                    self._row_sealer,
+                    SessionRecord.from_mapping(session[0]) if session else None,
+                    record,
+                    await self._account_passkeys(cur, cred.user_id),
+                ):
+                    await conn.rollback()  # only read; this releases the lock
+                    return False
+                await self._write_passkeys(
+                    cur, cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's enrolled passkeys, oldest first."""
@@ -13696,6 +13930,7 @@ class SqlServerStore:
         *,
         require_way_past: bool = False,
         totp_usable: TotpUsable | None = None,
+        passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
@@ -13722,6 +13957,7 @@ class SqlServerStore:
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
+                    passkey_counts=passkey_counts,
                 ):
                     await conn.rollback()
                     return False
@@ -13864,9 +14100,31 @@ class SqlServerStore:
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         await self._execute(
-            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-            (user_id, before),
+            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<? AND address<>?",
+            (user_id, before, LOGIN_ADDRESS_RESET_MARKER),
         )
+
+    async def reset_login_addresses(self, user_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+                # A MERGE under HOLDLOCK, as remember_login_address's: a concurrent reset of the
+                # account may have committed its marker meanwhile, and that is the record this
+                # one writes, so a match is left as it is rather than a key collision.
+                await cur.execute(
+                    "MERGE known_login_addresses WITH (HOLDLOCK) AS t"
+                    " USING (SELECT ? AS user_id, ? AS address) AS s"
+                    " ON t.user_id = s.user_id AND t.address = s.address"
+                    " WHEN NOT MATCHED THEN"
+                    " INSERT (user_id, address, first_seen, last_seen)"
+                    " VALUES (s.user_id, s.address, 0, 0);",
+                    (user_id, LOGIN_ADDRESS_RESET_MARKER),
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -13908,6 +14166,7 @@ class SqlServerStore:
                             holders,
                             self._row_sealer,
                             lambda holder: self._read_user_record(cur, holder, lock=False),
+                            role_id=admin_role_id,
                         )
                         if target and not others:
                             await conn.rollback()  # nothing written; releases the applock
@@ -13970,6 +14229,7 @@ class SqlServerStore:
                         self._row_sealer,
                         lambda holder: self._read_user_record(cur, holder, lock=False),
                         counts_as_admin,
+                        role_id=admin_role_id,
                     )
                     if others:
                         await conn.rollback()  # nothing written; releases the applock
@@ -14044,6 +14304,7 @@ class SqlServerStore:
         lockout_seconds: float,
         max_lockout_seconds: float,
         totp_usable: TotpUsable,
+        passkey_escalates: PasskeyCounts | None,
         now: float | None = None,
     ) -> LockoutIncrement:
         """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
@@ -14055,27 +14316,50 @@ class SqlServerStore:
         than three; the same locked read carries the ``auth_provider`` that decides the escalation
         (ADR 0197), and for the SIGN-IN lock the TOTP's refusal is judged by ``totp_usable`` before
         the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
-        must still hold (``store.escalation_verdict``, BACKLOG #3422). Returns ``(0, False, 0)`` for an unknown user."""
+        must still hold (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the
+        escalation is ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
-        change = lockout_increment(
+        totp_counts = await escalation_verdict(
+            self.get_user,
+            self.open_totp_secret,
+            user_id,
             counter,
+            totp_usable=totp_usable,
             threshold=threshold,
-            lockout_seconds=lockout_seconds,
-            max_lockout_seconds=max_lockout_seconds,
             now=now,
-            out=out,
-            totp_counts=await escalation_verdict(
-                self.get_user,
-                self.open_totp_secret,
-                user_id,
-                counter,
-                totp_usable=totp_usable,
-                threshold=threshold,
-                now=now,
-            ),
         )
-        written = await self._write_user_txn(user_id, change)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # The account row first, under UPDLOCK, so a concurrent passkey write waits; then
+                # the passkey set the escalation reads, in the write's own transaction (BACKLOG
+                # #3937 item 8).
+                passkeys = await escalation_passkeys(
+                    counter,
+                    passkey_escalates=passkey_escalates,
+                    threshold=threshold,
+                    now=now,
+                    read_record=lambda: self._read_user_record(cur, user_id),
+                    read_passkeys=lambda: self._account_passkeys(cur, user_id),
+                )
+                change = lockout_increment(
+                    counter,
+                    threshold=threshold,
+                    lockout_seconds=lockout_seconds,
+                    max_lockout_seconds=max_lockout_seconds,
+                    now=now,
+                    out=out,
+                    totp_counts=totp_counts,
+                    passkeys=passkeys,
+                    sealed=self._row_sealer is not None,
+                    passkey_escalates=passkey_escalates,
+                )
+                written = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
         return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(
@@ -14212,7 +14496,13 @@ class SqlServerStore:
         )
 
     async def set_user_username(
-        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+        self,
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says
@@ -14250,29 +14540,47 @@ class SqlServerStore:
         #
         # BACKLOG #2592: the guard is now a read in the same transaction, then the sealed write
         # under the account's UPDLOCK. It still only narrows the window, as above.
+        #
+        # BACKLOG #3018 step 7: ``audits`` are appended only when the write landed, before the one
+        # commit, so a failed append rolls the rename back (AuthStore says why). With audits the
+        # in-process ``_audit_lock`` is taken before the connection, the order
+        # ``_execute_with_audits`` uses, and is held across the write as there.
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
-                )
-                taken = bool(await cur.fetchall())
-                written = None
-                if not taken:
-                    written = await self._write_user(
-                        cur,
-                        user_id,
-                        lambda r: (
-                            r.changed(username=username, updated_at=float(now))
-                            if r.row.username == expected_username
-                            else None
-                        ),
-                    )
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return written is not None
+        appended: list[AppendedAuditRow] = []
+        async with self._audit_lock if audits else nullcontext():  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(
+                            "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
+                        )
+                        taken = bool(await cur.fetchall())
+                        written = None
+                        if not taken:
+                            written = await self._write_user(
+                                cur,
+                                user_id,
+                                lambda r: (
+                                    r.changed(username=username, updated_at=float(now))
+                                    if r.row.username == expected_username
+                                    else None
+                                ),
+                            )
+                        if written is not None:
+                            appended = await append_rename_audits(
+                                lambda: self._append_audits(cur, audits, now=now)
+                            )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: a rollback that fails could leave the audit INSERT open on a
+                    # recycled connection; see _rollback_or_discard. After the cursor block, as
+                    # _write_user_with_audits runs it.
+                    await self._rollback_or_discard(conn)
+                    raise
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_federated_subject(
         self,
@@ -14917,6 +15225,7 @@ class SqlServerStore:
             path=self.path,
             size_bytes=int(size["b"]) if size and size["b"] is not None else 0,
             disk_free_bytes=None,  # a remote server's disk is not ours to stat; unmeasurable, not 0
+            disk_free_status=DiskFreeStatus.NOT_APPLICABLE,
             journal_mode=str(recovery["m"]) if recovery and recovery["m"] else "",
             messages=await self._count("messages"),
             events=await self._count("message_events"),
@@ -14946,6 +15255,11 @@ class SqlServerStore:
             (MessageStatus.ERROR.value, since),
         )
         counts = {r["channel_id"]: (r["read"], r["errored"]) for r in count_rows}
+        # BACKLOG #1726: still reads every messages row. SQLite and Postgres walk this as a loose
+        # index scan (store.py _LAST_RECEIVED_SQL, a recursive CTE hopping distinct channel_id
+        # values), but SQL Server forbids scalar aggregation, TOP and subqueries in a recursive CTE
+        # member, so that form does not port. A ROW_NUMBER() variant could; it was left out of the
+        # #1726 slice, so this stays the GROUP BY.
         last_rows = await self._fetchall(
             "SELECT channel_id, MAX(received_at) AS last_at FROM messages GROUP BY channel_id"
         )

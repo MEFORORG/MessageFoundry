@@ -84,7 +84,7 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 | `MEFOR_STORE_PASSWORD` | `[store].password` | *(secret)* | **env/secret only** — never the config file |
 | `MEFOR_STORE_POOL_SIZE` | `[store].pool_size` | `40` | default 40, the inverted-U optimum — don't set higher ([ADR 0062](adr/0062-default-store-pool-size.md)); `>= 2` under `[cluster]`. **Budget:** `engines × pool_size` hit one managed-PG `max_connections` (~2 engines at 40/100) — raise it, add a pooler, or size down; never split the store ([DEPLOY-SERVER-DB.md](DEPLOY-SERVER-DB.md) §3) |
 | `MEFOR_CLUSTER_ENABLED` | `[cluster].enabled` | `true` | turns on the leader lease + graph gating |
-| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | `true` | fail-closed: refuse to start keyless (PHI at rest) |
+| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | `true` | keeps the default keyless refusal past the audited opt-out ([PHI.md](PHI.md#3-encryption-at-rest) §3). It encrypts nothing: set the key below too |
 | `MEFOR_STORE_ENCRYPTION_KEY` | `[store].encryption_key` | *(secret)* | base64 32 bytes — `messagefoundry gen-key` |
 
 `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false**, so the DB
@@ -144,9 +144,20 @@ VIP follow failover **passively**, with no engine VIP code.
     by the `monitoring:read` permission (`Depends(require(Permission.MONITORING_READ))` in
     [`api/app.py`](../messagefoundry/api/app.py)), so an unauthenticated LB health probe gets `401/403` on
     **every** node (the leader included) and the LB would mark all backends unhealthy and black-hole MLLP.
-    To use it, the LB must **inject a static bearer token / session header** into the probe (mint a
-    least-privilege `monitoring:read` token; rotate it) — and **many L4 LBs cannot send auth headers at
-    all**. If your LB cannot authenticate the probe, use the **TCP-connect-to-2575** default above (it needs
+    To use it, the probe must carry a bearer token. The engine has **no static API token and no route
+    that mints one**: the only bearer is a sign-in session's token, and that session ends at its
+    absolute limit at the latest ([SECURITY.md](SECURITY.md#sessions)). So something beside the LB
+    must sign in a dedicated account non-interactively (a local password, or Kerberos through
+    `POST /auth/negotiate`; directory password sign-in is retired) and hand the LB a fresh token
+    before each session ends. Give that account an administrator-defined custom role holding only
+    `monitoring:read` ([SECURITY.md](SECURITY.md#custom-roles-adr-0045)); the narrowest built-in
+    role, `viewer`, also grants `messages:read`. A new local account must first replace its
+    engine-generated password before its session can reach `/cluster/status`. Under the shipped
+    `[security].require_mfa` and `require_mfa_scope` the account also owes a second factor at each
+    sign-in: hand over the token of the finished sign-in, which is the one `POST /auth/login` returns
+    for a combined sign-in (password and TOTP code in one request), or the one `POST /auth/mfa-verify`
+    returns after a two-step sign-in, because that call re-keys the session and retires the earlier
+    token. **Many L4 LBs cannot send auth headers at all**. If your LB cannot authenticate the probe, use the **TCP-connect-to-2575** default above (it needs
     no auth and works on any L4 LB); there is **no** tokenless primary-only HTTP endpoint to point an
     unauthenticated L7 check at. The `/health` liveness endpoint *is* tokenless, but it is 200 on every node
     and so cannot select the primary.

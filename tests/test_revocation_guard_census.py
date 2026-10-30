@@ -19,15 +19,22 @@ to its callers, and they are the sites. A SERVER context (``PROTOCOL_TLS_SERVER`
 the listener gates are a different control.
 
 **What "guarded" proves.** The site's function, or the one its entry names, calls a name in
-:data:`_GUARDS`, and every such name reaches ``RevocationHopGuard.capture``. That ties the site to a
-guard call. It does not prove that every branch reaches the call, or that the call refuses: the
-behaviour tests (at least ``tests/test_revocation_guard_remaining_hops.py`` and
-``tests/test_hop_refusal_revocation.py``) prove that. A second hop added inside a function that is
-already guarded passes here too, so read the function in review.
+:data:`_GUARDS`, and every such name reaches a guard in :data:`_GUARD_ROOTS`. That ties the site
+to a guard call. It does not prove that every branch reaches the call, or that the call refuses,
+or that a guard checks a CRL: the behaviour tests (at least
+``tests/test_revocation_guard_remaining_hops.py``, ``tests/test_hop_refusal_revocation.py`` and
+``tests/test_vault_revocation_hop_guard.py``) prove that. A second hop added inside a function that
+is already guarded passes here too, so read the function in review.
 
 **It goes red.** Delete the guard call from one guarded site and
 :func:`test_every_guarded_site_calls_a_guard` fails naming that site; measured when this file was
 written, by deleting the ``RevocationHopGuard.capture`` call in ``DicomScuDestination.__init__``.
+Measured again when the two Vault ``_build_client`` sites became Guarded (vault BACKLOG #3587):
+renaming the ``mount_strict_reply_adapter`` call in either one failed that test naming it, and
+renaming either link of the chain from the mount to the Vault guard failed
+:func:`test_every_guard_name_reaches_a_root`. So did a second def named ``refuse_an_unrevoked_hop``
+in another module, and renaming the Vault guard's ``_crossed_unrevoked`` call failed
+:func:`test_the_vault_root_decides_through_the_authority`.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from messagefoundry.config.tls_policy import RevocationHopGuard
-from tests._ast_sites import callee_name
+from tests._ast_sites import callee_name, calls_to, find_funcs, named_func, parse_source
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE = _ROOT / "messagefoundry"
@@ -84,22 +91,45 @@ _SHARED_OPENER_MODULES = ("transports/rest.py", "pipeline/alert_sinks.py")
 #: The stdlib and truststore names. Matched only as a call: a bare ``SSLContext`` also names a type.
 _STDLIB_BUILDERS = frozenset({"create_default_context", "SSLContext"})
 
-#: Names whose call runs a revocation guard. Each one other than ``capture`` must reach ``capture``
-#: through the others (:func:`test_every_guard_name_reaches_the_guard`).
-_GUARDS = frozenset(
+#: The guards every other name in :data:`_GUARDS` must reach. The Vault hop guard, in
+#: ``transports/strict_requests.py`` (vault BACKLOG #2983), decides through
+#: ``tls_policy.revocation_hop_disposition`` and never calls ``RevocationHopGuard``; its docstring
+#: says why.
+_GUARD_ROOTS = frozenset(
     {
         "capture",  # RevocationHopGuard.capture, matched only on that receiver
+        "_refuse_an_unrevoked_vault_hop",
+    }
+)
+
+#: Names whose call runs a revocation guard. Each one outside :data:`_GUARD_ROOTS` must reach a root
+#: through the others (:func:`test_every_guard_name_reaches_a_root`).
+_GUARDS = _GUARD_ROOTS | frozenset(
+    {
         "refuse_unrevoked_verified_hop",
+        "_guard_ftps_revocation",  # transports/remotefile.py, both FTPS directions (BACKLOG #2193)
         "_refuse_store_revocation",
         "_refuse_forward_revocation",
         "_refuse_idp_revocation",
         "idp_revocation_guards",
+        "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
+        # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
+        "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
+        "mount_strict_reply_adapter",
     }
 )
 
 #: Ungated verifying hops, with the reason recorded in docs/DEPLOYMENT.md.
 _UNGATED = (
     "an ungated verifying hop, listed in docs/DEPLOYMENT.md under 'Ungated verifying TLS hop'"
+)
+#: What the two Vault entries' guard covers, and what this census does not follow there.
+_VAULT_GUARD = (
+    "through mount_strict_reply_adapter, which runs _refuse_an_unrevoked_vault_hop at "
+    "construction (vault BACKLOG #2983). No CRL lever is built for these hops, so off the box "
+    "the hop crosses an enforcing posture only on its vault_revocation_attested pair. This census "
+    "follows the construction-time call only, not the adapter's check before each send, and not "
+    "_refuse_an_unrevoked_proxy_leg (vault BACKLOG #3561), handed on as a value"
 )
 _TRAY = "the Windows tray probing the engine's own API on this box"
 _LISTENER = (
@@ -134,6 +164,15 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/service.py::AuthService.__init__": Guarded(
         note="the OIDC token and JWKS legs, through _refuse_idp_revocation"
     ),
+    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Guarded(
+        note="the LDAPS AD bind, through _refuse_ad_revocation on the finished NarrowedTls "
+        "(BACKLOG #2193). Every engine build passes it a posture: "
+        "tests/test_ldaps_revocation_guard.py pins that"
+    ),
+    "messagefoundry/auth/ldap.py::_refuse_ad_revocation": Guarded(
+        note="the LDAPS guard itself, which takes the finished NarrowedTls and reads a context "
+        "its factory builds (BACKLOG #2193)"
+    ),
     "messagefoundry/logging_setup.py::_build_syslog_handler": Guarded(
         by="messagefoundry/logging_setup.py::_build_tls_context",
         note="the builder runs _refuse_forward_revocation on the context it returns",
@@ -155,15 +194,22 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/transports/mllp.py::MLLPDestination.__init__": Guarded(),
     "messagefoundry/transports/remotefile.py::_FtpClient.__init__": Guarded(
         by="messagefoundry/transports/remotefile.py::RemoteFileDestination.__init__",
-        note="the FTPS upload. The inbound FTPS poll builds the same client and is " + _UNGATED,
+        note="the FTPS upload. The inbound FTPS poll builds the same client, and "
+        "RemoteFileSource.__init__ calls the same _guard_ftps_revocation (BACKLOG #2193); Guarded "
+        "names one caller, so the poll's call is pinned by the behaviour tests",
     ),
     "messagefoundry/transports/rest.py::RestDestination.__init__": Guarded(),
     "messagefoundry/transports/smart.py::_TokenEndpointProvider._open_token_hop": Guarded(
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
+    "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
+        note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
+    ),
+    "messagefoundry/store/keyprovider_vault.py::_build_client": Guarded(
+        note=f"the Vault Transit key provider hop, which the Transit cipher shares, {_VAULT_GUARD}"
+    ),
     # --- exempt: ungated verifying hops ------------------------------------------------------------
-    "messagefoundry/auth/ldap.py::LdapAuthenticator.__init__": Exempt(f"LDAPS: {_UNGATED}"),
     "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Exempt(
         f"the webhook alert sink: {_UNGATED}"
     ),
@@ -177,15 +223,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
         f"the AI-broker endpoint: {_UNGATED}"
-    ),
-    "messagefoundry/config/secretprovider_vault.py::_build_client": Exempt(
-        "the Vault KV secret provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated table: "
-        "its requests-based client takes one CA bundle and no revocation flag, so no CRL can reach "
-        "it (tls_policy refuses [tls].crl_file there). Found by this census; unfiled"
-    ),
-    "messagefoundry/store/keyprovider_vault.py::_build_client": Exempt(
-        "the Vault Transit key provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated "
-        "table, for the same reason as the KV provider above. Found by this census; unfiled"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(
@@ -346,9 +383,10 @@ def test_every_site_is_in_the_census() -> None:
     unlisted = sorted(_scan().sites - _CENSUS.keys())
     assert not unlisted, (
         f"verifying client TLS context(s) with no census entry: {unlisted}. Add a guard "
-        f"(RevocationHopGuard.capture, or refuse_unrevoked_verified_hop for an https hop) and list "
-        f"the site as Guarded, or list it as Exempt with the reason. See ADR 0173 and "
-        f"docs/DEPLOYMENT.md, 'Revocation-guard behavior'."
+        f"(RevocationHopGuard.capture, refuse_unrevoked_verified_hop for an https hop, or "
+        f"mount_strict_reply_adapter for an hvac Vault client, which must not use "
+        f"RevocationHopGuard) and list the site as Guarded, or list it as Exempt with the reason. "
+        f"See ADR 0173 and docs/DEPLOYMENT.md, 'Revocation-guard behavior'."
     )
 
 
@@ -373,15 +411,38 @@ def test_every_guarded_site_calls_a_guard() -> None:
     assert not unguarded, f"census sites marked Guarded whose guard call is gone: {unguarded}"
 
 
-def test_every_guard_name_reaches_the_guard() -> None:
+def _def_count(name: str) -> int:
+    """How many ``def``s named ``name`` the package holds, nested ones and methods included."""
+    return sum(
+        len(find_funcs(parse_source(source), name))
+        for path in sorted(_PACKAGE.rglob("*.py"))
+        if name in (source := path.read_text(encoding="utf-8"))
+    )
+
+
+def test_every_guard_name_reaches_a_root() -> None:
     """A wrapper that stopped calling the guard would leave every site it covers green above.
 
-    Followed through the wrappers to ``capture``, so two wrappers that only call each other are
-    hollow too. Keyed by bare function name, so a same-named def elsewhere in the package could
-    stand in for a wrapper; the guard names here are unique today."""
+    Followed through the wrappers to a root, so two wrappers that only call each other are hollow
+    too. Keyed by bare function name, so each guard name but ``capture`` must have exactly one def
+    in the package: a second same-named def could otherwise stand in for a wrapper. ``capture`` is
+    matched only on ``RevocationHopGuard``, and ``transports/mllp.py`` defines another one."""
     defs = _scan().defs
     assert callable(getattr(RevocationHopGuard, "capture", None))
-    reaches = {"capture"}
+    # Pinned exactly, so a hollow wrapper moved into the roots needs an edit here that review sees.
+    assert sorted(_GUARD_ROOTS) == ["_refuse_an_unrevoked_vault_hop", "capture"], _GUARD_ROOTS
+    # Counted from the source, not imported: the Vault guard's module needs the [vault] extra.
+    counts = {name: _def_count(name) for name in sorted(_GUARDS - {"capture"})}
+    # 8 names when this floor was set; 4 is the Vault root plus the wrapper floor below. It fails a
+    # walk over nothing, over which the one-def check would pass.
+    assert len(counts) >= 4, f"only {len(counts)} guard names besides capture, floor 4"
+    not_one = {name: n for name, n in counts.items() if n != 1}
+    assert not not_one, f"guard name(s) without exactly one def in messagefoundry/: {not_one}"
+    # 5 wrappers when this floor was set, so 3 lets two go with no edit here (BACKLOG #3512). It
+    # fails a list cut to the roots alone, over which the check below passes on nothing.
+    wrappers = _GUARDS - _GUARD_ROOTS
+    assert len(wrappers) >= 3, f"only {len(wrappers)} guard names outside the roots, floor 3"
+    reaches = set(_GUARD_ROOTS)
     grew = True
     while grew:
         grew = False
@@ -390,7 +451,27 @@ def test_every_guard_name_reaches_the_guard() -> None:
                 reaches.add(name)
                 grew = True
     hollow = sorted(_GUARDS - reaches)
-    assert not hollow, f"guard name(s) that never reach RevocationHopGuard.capture: {hollow}"
+    assert not hollow, f"guard name(s) that never reach a root in {sorted(_GUARD_ROOTS)}: {hollow}"
+
+
+def test_the_vault_root_decides_through_the_authority() -> None:
+    """The Vault root is not ``RevocationHopGuard``, so its tie to the decision is checked here.
+
+    It must call ``_crossed_unrevoked``, and that must call ``revocation_hop_disposition``, the
+    authority every other revocation guard uses. This shows the calls exist, not that their answer
+    is used: a root that returns first stays green here, and the behaviour tests in
+    ``tests/test_vault_revocation_hop_guard.py`` catch that."""
+    tree = parse_source(
+        (_PACKAGE / "transports" / "strict_requests.py").read_text(encoding="utf-8")
+    )
+    root = named_func(tree, "_refuse_an_unrevoked_vault_hop")
+    decider = named_func(tree, "_crossed_unrevoked")
+    assert calls_to(root, {"_crossed_unrevoked"}, bare_only=True), (
+        "the Vault root no longer decides"
+    )
+    assert calls_to(decider, {"revocation_hop_disposition"}, bare_only=True), (
+        "_crossed_unrevoked no longer asks tls_policy.revocation_hop_disposition"
+    )
 
 
 def test_every_builder_name_is_still_defined() -> None:

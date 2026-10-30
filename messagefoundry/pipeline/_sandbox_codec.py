@@ -55,12 +55,15 @@ import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Final
 
 from messagefoundry.config.code_sets import CodeSet, UnmappedKind, UnmappedPolicy
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.wiring import (
     Send,
     SetMeta,
@@ -69,6 +72,7 @@ from messagefoundry.config.wiring import (
     handler_item_fault,
     handler_result_items,
 )
+from messagefoundry.fhirsearch import FhirRaw, FhirToken, ForeignSearchValue
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.redaction import safe_exc
 
@@ -77,19 +81,30 @@ __all__ = [
     "SandboxError",
     "SandboxCodecError",
     "GraphShape",
+    "LOOKUP_DB",
+    "LOOKUP_FHIR",
+    "LookupRequest",
+    "PreparedLookup",
     "Request",
     "Response",
     "build_payload",
     "decode_boot",
+    "decode_answer",
     "decode_boot_reply",
     "decode_frame",
+    "decode_lookup_reply",
     "decode_request",
     "decode_response",
     "encode_bootfail",
     "encode_boot",
     "encode_fail",
     "encode_frame",
+    "encode_lookup",
+    "encode_prepared_lookup",
+    "encode_lookup_fail",
+    "encode_lookup_ok",
     "encode_ok",
+    "prepare_lookup",
     "encode_ready",
     "encode_request",
     "enc_value",
@@ -100,7 +115,7 @@ __all__ = [
 class SandboxError(RuntimeError):
     """A sandboxed Router/Handler was denied, timed out, crashed, or could not be marshalled.
 
-    Raised only on the ``subprocess`` path (``off`` never raises this). The caller treats it exactly
+    Raised only in a worker mode, ``subprocess`` or ``isolated`` (``off`` never raises this). The caller treats it exactly
     like any other post-ACK router/transform failure: ``ERROR``/dead-letter, no NAK.
 
     Defined **here**, not in :mod:`messagefoundry.pipeline.sandbox`, only because
@@ -299,6 +314,11 @@ def enc_value(value: object, blobs: _Blobs, _depth: int = 0) -> Any:
         return blobs.ref(value)
     if isinstance(value, bytes | bytearray):
         return {"b": base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, Decimal):
+        # A NUMERIC/DECIMAL/MONEY column comes back from the driver as a Decimal, so a brokered
+        # db_lookup row carries one wherever mode=off would hand the Handler one (ADR 0147). Its str()
+        # round-trips exactly, NaN and Infinity included.
+        return {"N": str(value)}
     # datetime BEFORE date — datetime is a date subclass, and tomllib produces all three natively, so a
     # .toml code set with a date value is a legitimate shape plain JSON refuses.
     if isinstance(value, _dt.datetime):
@@ -366,6 +386,13 @@ def dec_value(node: Any, reader: _Reader, _depth: int = 0) -> Any:
             return base64.b64decode(arg, validate=True)
         except (ValueError, TypeError) as exc:
             raise SandboxCodecError(f"sandbox bytes tag is not valid base64: {exc}") from exc
+    if tag == "N":
+        if not isinstance(arg, str):
+            raise SandboxCodecError("sandbox decimal tag must carry a string")
+        try:
+            return Decimal(arg)
+        except InvalidOperation as exc:
+            raise SandboxCodecError("sandbox decimal tag is not a decimal number") from exc
     if tag == "f":
         if not isinstance(arg, str) or arg not in _FLOAT_TAGS:
             raise SandboxCodecError(f"unknown sandbox float tag {arg!r}")
@@ -909,11 +936,9 @@ def enc_code_sets(code_sets: object, blobs: _Blobs) -> Any:
 
     Sent **once per spawn**, not per dispatch: re-sending them with every message was ~430 KB and
     ~4.6 ms of pure marshalling on a realistic crosswalk. Sending them at all — rather than letting the
-    child use its OWN ``load_config`` of the same directory — is what keeps ``mode=subprocess``
-    byte-identical to ``mode=off``: after a transparent respawn (a wall-cap kill, a crash) the child
-    re-reads ``codesets/`` from disk, so an operator who edits a crosswalk without a ``/config/reload``
-    would otherwise have the child serve a value the engine never would. The engine's tables are the
-    single source of truth on both sides.
+    child parse its own — is what keeps ``mode=subprocess`` byte-identical to ``mode=off``: the
+    engine's tables are the single source of truth on both sides, and with them published the boot
+    frame leaves the snapshot's ``codesets/`` files out (vault BACKLOG #2596).
 
     ``None`` means "the caller published no tables" and leaves the child on its own bootstrap load (the
     pre-existing behaviour for a session constructed without them); an empty mapping means "the engine
@@ -985,24 +1010,77 @@ def _open(body: bytes, allowed: tuple[str, ...]) -> tuple[dict[str, Any], _Reade
     return header, _Reader(blobs), kind
 
 
+def enc_snapshot(snapshot: ConfigSnapshot, blobs: _Blobs, *, code_sets: bool = True) -> Any:
+    """Describe the config snapshot the engine loaded, for the worker's bootstrap frame.
+
+    The worker runs these bytes and never reads the config directory (vault BACKLOG #2596): a
+    respawn, after a crash or a wall-cap kill, runs what the engine loaded rather than whatever is
+    on disk then. Each file's bytes travel as base64 in a segment, so source in any encoding crosses
+    unchanged. Only what a load reads is sent (:meth:`ConfigSnapshot.loaded`). Without
+    ``code_sets`` the ``codesets/`` tables are left out: the frame carries the engine's parsed
+    tables already, and both copies would halve the volume of tables :data:`MAX_FRAME` admits."""
+    loaded = snapshot.loaded(code_sets=code_sets)
+    return {
+        "dir": blobs.ref(str(loaded.directory)),
+        "files": [
+            [rel, blobs.ref(base64.b64encode(data).decode("ascii"))]
+            for rel, data in loaded.files.items()
+        ],
+    }
+
+
+def dec_snapshot(node: Any, reader: _Reader) -> ConfigSnapshot:
+    """Rebuild the engine's config snapshot in the worker. Each path is checked against the closed
+    set of names a snapshot may hold (:class:`ConfigSnapshot`), and nothing is ever opened by it."""
+    obj = _req_obj(node, "config snapshot")
+    directory = reader.text(obj.get("dir"))
+    files: dict[str, bytes] = {}
+    for pair in _req_list(obj.get("files"), "config snapshot files"):
+        if len(_req_list(pair, "config snapshot file")) != 2:
+            raise SandboxCodecError("a config snapshot file must be [path, base64]")
+        rel = _req_str(pair[0], "config snapshot path")
+        if rel in files:
+            raise SandboxCodecError(f"config snapshot path {rel!r} appears twice")
+        try:
+            files[rel] = base64.b64decode(reader.text(pair[1]), validate=True)
+        except ValueError as exc:  # binascii.Error, or a str segment that is not ASCII
+            raise SandboxCodecError(f"config snapshot file {rel!r} is not base64: {exc}") from exc
+    try:
+        return ConfigSnapshot(directory=Path(directory), files=files)
+    except ValueError as exc:
+        raise SandboxCodecError(str(exc)) from exc
+
+
 def encode_boot(
     *,
-    config_dir: str,
+    snapshot: ConfigSnapshot,
     forbidden: Sequence[str],
     mem_mb: int | None,
     code_sets: object,
+    broker: bool = False,
 ) -> bytes:
     """The one-per-spawn bootstrap frame.
 
-    ``env`` is deliberately NOT marshalled: ``load_config()`` takes only a directory and the worker
-    never read it — a dead field on the wire is a field nobody validates."""
+    It carries the config snapshot the engine loaded, not a directory: the worker loads the graph
+    from those bytes and reads nothing from disk (vault BACKLOG #2596).
+
+    ``env`` is deliberately NOT marshalled: the worker's load takes only the snapshot and the worker
+    never read it — a dead field on the wire is a field nobody validates.
+
+    ``broker`` tells the worker to ask the parent for a Handler's ``db_lookup``/``fhir_lookup``
+    (``mode=isolated``, ADR 0147) rather than refuse it in the child. It is a request for a protocol,
+    not a grant: the parent answers a ``lookup`` frame only on a session whose own policy is
+    isolated, so a worker that claims it on any other session is dropped."""
     blobs = _Blobs()
     header = _envelope(
         {
-            "config_dir": config_dir,
+            # The tables go once: as the engine's parsed ones when it published any, else as
+            # the snapshot's files, which the worker then parses.
+            "snapshot": enc_snapshot(snapshot, blobs, code_sets=code_sets is None),
             "forbidden": list(forbidden),
             "mem_mb": None if mem_mb is None else int(mem_mb),
             "code_sets": enc_code_sets(code_sets, blobs),
+            "broker": bool(broker),
         },
         "boot",
     )
@@ -1013,26 +1091,30 @@ def encode_boot(
 class Boot:
     """The decoded bootstrap frame (child side)."""
 
-    config_dir: str
+    snapshot: ConfigSnapshot
     forbidden: tuple[str, ...]
     mem_mb: int | None
     code_sets: dict[str, CodeSet] | None
+    broker: bool = False
 
 
 def decode_boot(body: bytes) -> Boot:
     header, reader, _ = _open(body, ("boot",))
-    config_dir = _req_str(header.get("config_dir"), "config_dir")
+    # Walk order matches encode_boot: the snapshot's segments BEFORE the code sets'.
+    snapshot = dec_snapshot(header.get("snapshot"), reader)
     forbidden = tuple(
         _req_str(m, "forbidden module") for m in _req_list(header.get("forbidden"), "forbidden")
     )
     mem_mb = None if header.get("mem_mb") is None else _req_int(header.get("mem_mb"), "mem_mb")
     code_sets = dec_code_sets(header.get("code_sets"), reader)
+    broker = _req_bool(header.get("broker"), "boot broker")
     reader.finish()
     return Boot(
-        config_dir=config_dir,
+        snapshot=snapshot,
         forbidden=forbidden,
         mem_mb=mem_mb,
         code_sets=code_sets,
+        broker=broker,
     )
 
 
@@ -1220,14 +1302,14 @@ def decode_response(body: bytes, *, request_id: str, phase: str, name: str) -> R
     :meth:`sandbox.SandboxSession.dispatch` supplies the other half — an unsolicited frame queued
     before or after a dispatch is fatal to the worker — so a pre-staged answer has no window at all."""
     header, reader, kind = _open(body, ("ok", "fail"))
-    if _req_str(header.get("id"), "response id") != request_id:
-        raise SandboxCodecError(
-            f"sandbox response correlation mismatch (expected request {request_id!r})"
-        )
-    if _req_str(header.get("phase"), "response phase") != phase:
-        raise SandboxCodecError(f"sandbox response phase mismatch (expected {phase!r})")
-    if _req_str(header.get("name"), "response name") != name:
-        raise SandboxCodecError(f"sandbox response name mismatch (expected {name!r})")
+    return _answer(header, reader, kind, request_id=request_id, phase=phase, name=name)
+
+
+def _answer(
+    header: dict[str, Any], reader: _Reader, kind: str, *, request_id: str, phase: str, name: str
+) -> Response:
+    """The ``ok``/``fail`` body of :func:`decode_response`, on a frame already opened."""
+    _check_binding(header, request_id, phase, name)
     if kind == "ok":
         if "result" not in header:
             raise SandboxCodecError("sandbox 'ok' frame carries no result")
@@ -1240,3 +1322,265 @@ def decode_response(body: bytes, *, request_id: str, phase: str, name: str) -> R
     error = reader.text(header.get("error"))
     reader.finish()
     return Response(ok=False, result=None, kind=fail_kind, error=error)
+
+
+def _check_binding(header: dict[str, Any], request_id: str, phase: str, name: str) -> None:
+    """Refuse a frame whose ``(id, phase, name)`` is not the dispatch's (see :func:`decode_response`)."""
+    if _req_str(header.get("id"), "response id") != request_id:
+        raise SandboxCodecError(
+            f"sandbox response correlation mismatch (expected request {request_id!r})"
+        )
+    if _req_str(header.get("phase"), "response phase") != phase:
+        raise SandboxCodecError(f"sandbox response phase mismatch (expected {phase!r})")
+    if _req_str(header.get("name"), "response name") != name:
+        raise SandboxCodecError(f"sandbox response name mismatch (expected {name!r})")
+
+
+# --- the lookup broker (mode=isolated, ADR 0147) ------------------------------
+# While a Handler runs at mode=isolated, the worker may write ``lookup`` frames before its answer: one
+# per db_lookup/fhir_lookup call, each answered by one ``lookupok``/``lookupfail`` frame from the
+# parent before the worker writes anything else. Each carries the dispatch's ``(id, phase, name)``
+# triple, so it is bound to the dispatch in flight (ADR 0147 AC-6), and a ``seq`` that starts at 1 per
+# dispatch and rises by one, so a reply cannot be taken for another call's.
+
+#: The two lookup kinds a ``lookup`` frame may name.
+LOOKUP_DB: Final = "db"
+LOOKUP_FHIR: Final = "fhir"
+
+
+@dataclass(frozen=True)
+class LookupRequest:
+    """One decoded ``lookup`` frame (parent side). ``target`` is the statement of a db lookup or the
+    query of a fhir one; ``params`` is rebuilt as the in-process call would have received it."""
+
+    seq: int
+    kind: str
+    connection: str
+    target: str
+    params: Any
+
+
+def _enc_fhir_params(params: object, blobs: _Blobs) -> Any:
+    """A ``fhir_lookup`` ``params`` mapping in its own small grammar: ``[key, is_list, items]`` per
+    key, each item ``{"s": str}``, ``{"k": [system, code]}``, ``{"r": raw}``, or ``{"x": type name}``
+    for a value of any other kind, which arrives as a
+    :class:`~messagefoundry.fhirsearch.ForeignSearchValue`. Values are not screened here: the
+    parent's executor judges each one, after its own "unavailable here" and connection checks. A
+    key that is not a ``str``, and ``params`` that is not a mapping, are still refused here, in the
+    worker, before those checks."""
+    if params is None:
+        return None
+    if not isinstance(params, Mapping):
+        raise SandboxCodecError(
+            f"fhir_lookup params must be a mapping, not {type(params).__name__}"
+        )
+    out: list[Any] = []
+    for key, value in params.items():
+        if not isinstance(key, str):
+            raise SandboxCodecError("a fhir_lookup params key must be a str")
+        is_list = isinstance(value, list)
+        items: list[Any] = []
+        for one in value if is_list else [value]:
+            if isinstance(one, str):
+                items.append({"s": blobs.ref(one)})
+            elif isinstance(one, FhirToken):
+                items.append({"k": [blobs.ref(one.system), blobs.ref(one.code)]})
+            elif isinstance(one, FhirRaw):
+                items.append({"r": blobs.ref(one.value)})
+            else:
+                # Any other kind crosses by its type name alone, never its value, so the engine's
+                # executor refuses it with the words it uses at mode=off, after its own checks.
+                items.append({"x": blobs.ref(type(one).__name__)})
+        out.append([key, is_list, items])
+    return out
+
+
+def _dec_fhir_params(node: Any, reader: _Reader) -> dict[str, Any] | None:
+    if node is None:
+        return None
+    out: dict[str, Any] = {}
+    for entry in _req_list(node, "fhir_lookup params"):
+        if len(_req_list(entry, "fhir_lookup param")) != 3:
+            raise SandboxCodecError("a fhir_lookup param must be [key, is_list, items]")
+        key = _req_str(entry[0], "fhir_lookup param key")
+        if key in out:
+            raise SandboxCodecError(f"fhir_lookup param {key!r} appears twice")
+        is_list = _req_bool(entry[1], "fhir_lookup param is_list")
+        items: list[Any] = []
+        for item in _req_list(entry[2], "fhir_lookup param items"):
+            obj = _req_obj(item, "fhir_lookup param item")
+            if len(obj) != 1:
+                raise SandboxCodecError("a fhir_lookup param item must carry exactly one tag")
+            ((tag, arg),) = obj.items()
+            if tag == "s":
+                items.append(reader.text(arg))
+            elif tag == "k":
+                pair = _req_list(arg, "FhirToken")
+                if len(pair) != 2:
+                    raise SandboxCodecError("a FhirToken must be [system, code]")
+                items.append(FhirToken(reader.text(pair[0]), reader.text(pair[1])))
+            elif tag == "r":
+                items.append(FhirRaw(reader.text(arg)))
+            elif tag == "x":
+                items.append(ForeignSearchValue(reader.text(arg)))
+            else:
+                raise SandboxCodecError(f"unknown fhir_lookup param tag {tag!r}")
+        if not is_list and len(items) != 1:
+            raise SandboxCodecError("a single fhir_lookup param must carry exactly one item")
+        out[key] = items if is_list else items[0]
+    return out
+
+
+@dataclass(frozen=True)
+class PreparedLookup:
+    """A ``lookup`` frame's arguments, described but not yet framed. Describing them runs the
+    Handler's own code (a ``Mapping`` it passed is read), so the worker does it before it takes its
+    broker lock; :func:`encode_prepared_lookup` then frames it with no user code at all."""
+
+    kind: str
+    slots: dict[str, Any]
+    blobs: tuple[str, ...]
+
+
+def prepare_lookup(
+    *, kind: str, connection: object, target: object, params: object
+) -> PreparedLookup:
+    """Describe one lookup's arguments. ``target`` is the statement of a db lookup or the query of
+    a fhir one. Raises :class:`SandboxCodecError` for an argument outside the grammar, which the
+    worker turns into the lookup's own error type, as the in-process call would fail on a bad
+    argument."""
+    blobs = _Blobs()
+    # Segment order IS walk order (see _Reader): connection, then target, then params, the order
+    # decode_answer reads them in. Building params first would number its segments ahead of the
+    # other two, and any lookup with a long params value and a long statement would not decode.
+    conn_ref = blobs.ref(connection)
+    target_ref = blobs.ref(target)
+    if kind == LOOKUP_DB:
+        if params is not None and not isinstance(params, Mapping):
+            raise SandboxCodecError(
+                f"db_lookup params must be a mapping or None, not {type(params).__name__}"
+            )
+        enc_params = None if params is None else enc_value(dict(params), blobs)
+    elif kind == LOOKUP_FHIR:
+        enc_params = _enc_fhir_params(params, blobs)
+    else:
+        raise SandboxCodecError(f"unknown lookup kind {kind!r}")
+    return PreparedLookup(
+        kind=kind,
+        slots={"connection": conn_ref, "target": target_ref, "params": enc_params},
+        blobs=tuple(blobs.items),
+    )
+
+
+def encode_prepared_lookup(
+    prepared: PreparedLookup, *, request_id: str, phase: str, name: str, seq: int
+) -> bytes:
+    """Frame a :class:`PreparedLookup` for the dispatch in flight (child side)."""
+    header = _envelope(
+        {
+            "id": request_id,
+            "phase": phase,
+            "name": name,
+            "seq": seq,
+            "kind": prepared.kind,
+            **prepared.slots,
+        },
+        "lookup",
+    )
+    return encode_frame(header, prepared.blobs)
+
+
+def encode_lookup(
+    *,
+    request_id: str,
+    phase: str,
+    name: str,
+    seq: int,
+    kind: str,
+    connection: object,
+    target: object,
+    params: object,
+) -> bytes:
+    """:func:`prepare_lookup` and :func:`encode_prepared_lookup` in one call."""
+    prepared = prepare_lookup(kind=kind, connection=connection, target=target, params=params)
+    return encode_prepared_lookup(prepared, request_id=request_id, phase=phase, name=name, seq=seq)
+
+
+def decode_answer(
+    body: bytes, *, request_id: str, phase: str, name: str
+) -> Response | LookupRequest:
+    """:func:`decode_response`, plus the ``lookup`` frame a worker may write mid-dispatch at
+    ``mode=isolated``. Only an isolated session calls this; every other one calls
+    :func:`decode_response`, which refuses a ``lookup`` frame as an unexpected frame type, so no other
+    mode can be talked into brokering a lookup."""
+    header, reader, kind = _open(body, ("ok", "fail", "lookup"))
+    if kind != "lookup":
+        return _answer(header, reader, kind, request_id=request_id, phase=phase, name=name)
+    _check_binding(header, request_id, phase, name)
+    seq = _req_int(header.get("seq"), "lookup seq")
+    lookup_kind = header.get("kind")
+    if lookup_kind not in (LOOKUP_DB, LOOKUP_FHIR):
+        raise SandboxCodecError(f"unknown lookup kind {lookup_kind!r}")
+    # Walk order matches encode_lookup: connection, target, then params.
+    connection = reader.text(header.get("connection"))
+    target = reader.text(header.get("target"))
+    params: Any
+    if lookup_kind == LOOKUP_DB:
+        node = header.get("params")
+        params = None if node is None else dec_value(node, reader)
+        if params is not None and not isinstance(params, dict):
+            raise SandboxCodecError("db_lookup params must decode to a mapping")
+    else:
+        params = _dec_fhir_params(header.get("params"), reader)
+    reader.finish()
+    return LookupRequest(
+        seq=seq, kind=lookup_kind, connection=connection, target=target, params=params
+    )
+
+
+def encode_lookup_ok(*, request_id: str, phase: str, name: str, seq: int, result: object) -> bytes:
+    """The parent's answer to one ``lookup`` frame: the rows of a db lookup or the dict of a fhir one,
+    in the closed value grammar. Raises :class:`SandboxCodecError` for a value outside it."""
+    blobs = _Blobs()
+    header = _envelope(
+        {
+            "id": request_id,
+            "phase": phase,
+            "name": name,
+            "seq": seq,
+            "result": enc_value(result, blobs),
+        },
+        "lookupok",
+    )
+    return encode_frame(header, blobs.items)
+
+
+def encode_lookup_fail(*, request_id: str, phase: str, name: str, seq: int, error: str) -> bytes:
+    """The parent's refusal of one ``lookup`` frame. The worker raises it in the Handler as the
+    lookup's own error type, so a Handler that catches the error sees what ``mode=off`` shows it."""
+    blobs = _Blobs()
+    header = _envelope(
+        {"id": request_id, "phase": phase, "name": name, "seq": seq, "error": blobs.ref(error)},
+        "lookupfail",
+    )
+    return encode_frame(header, blobs.items)
+
+
+def decode_lookup_reply(
+    body: bytes, *, request_id: str, phase: str, name: str, seq: int
+) -> tuple[bool, object, str]:
+    """``(ok, result, error)`` for one ``lookupok``/``lookupfail`` frame (child side), bound to the
+    dispatch and to the ``seq`` of the lookup it answers."""
+    header, reader, kind = _open(body, ("lookupok", "lookupfail"))
+    _check_binding(header, request_id, phase, name)
+    if _req_int(header.get("seq"), "lookup reply seq") != seq:
+        raise SandboxCodecError(f"sandbox lookup reply is out of sequence (expected {seq})")
+    if kind == "lookupfail":
+        error = reader.text(header.get("error"))
+        reader.finish()
+        return False, None, error
+    if "result" not in header:
+        raise SandboxCodecError("sandbox 'lookupok' frame carries no result")
+    result = dec_value(header["result"], reader)
+    reader.finish()
+    return True, result, ""

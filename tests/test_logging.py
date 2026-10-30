@@ -13,14 +13,15 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -45,6 +46,8 @@ from messagefoundry.logging_setup import (
 )
 from messagefoundry.redaction import clamp_untrusted, redact
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
+from messagefoundry.support import redact as support_redact
+from tests._cpu_clock import cpu_seconds
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -116,6 +119,64 @@ def test_idempotent_does_not_stack_handlers() -> None:
 def test_unknown_level_raises() -> None:
     with pytest.raises(ValueError):
         configure_logging("LOUD")
+
+
+def test_the_filtered_last_resort_redacts_what_no_handler_takes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3768: ``serve``'s ``lastResort`` for the window before its handlers. It redacts at
+    WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
+    and a record a handler takes never reaches it, so nothing is written twice."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
+    root = logging.getLogger()
+    root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
+    resort = logging_setup.install_filtered_last_resort()
+    assert resort is not None and logging.lastResort is resort
+    assert resort.level == logging.WARNING and root.handlers == []
+    assert logging_setup.install_filtered_last_resort() is resort  # a second call builds nothing
+
+    log = logging.getLogger("messagefoundry.test_filtered_last_resort")
+    log.setLevel(logging.INFO)  # so the INFO record reaches lastResort's own level gate
+    try:
+        log.warning("early %s", SYNTHETIC_PHI)
+        log.info("below the level")
+    finally:
+        log.setLevel(logging.NOTSET)
+    quiet = logging.getLogger("messagefoundry.test_filtered_last_resort_nonprop")
+    monkeypatch.setattr(quiet, "propagate", False)
+    quiet.warning("quiet %s", SYNTHETIC_PHI)
+    early = capsys.readouterr()
+    assert early.err.count("early") == 1 and early.err.count("quiet") == 1, early.err
+    assert "[redacted]" in early.err and "DOE^JANE" not in early.err, early.err
+    assert "below the level" not in early.err and early.out == ""
+
+    # sys.stderr swapped AFTER the build is followed, as the stdlib's own lastResort follows it.
+    swapped = io.StringIO()
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stderr", swapped)
+        log.warning("swapped %s", SYNTHETIC_PHI)
+    assert "swapped" in swapped.getvalue() and "DOE^JANE" not in swapped.getvalue()
+    assert capsys.readouterr().err == ""
+
+    configure_logging("INFO")
+    log.warning("late %s", SYNTHETIC_PHI)
+    late = capsys.readouterr()
+    assert late.err == "", "a record the root handler took also reached lastResort"
+    assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
+
+
+def test_the_filtered_last_resort_leaves_a_configured_root_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that configured logging first keeps the stdlib's ``lastResort``, as it keeps its
+    handlers under ``run_cli``'s sink: the choice is process-wide, so it is the host's."""
+    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
+    before = logging.lastResort
+    root = logging.getLogger()
+    hosts = logging.NullHandler()
+    root.handlers[:] = [hosts]
+    assert logging_setup.install_filtered_last_resort() is None
+    assert logging.lastResort is before and root.handlers == [hosts]
 
 
 def test_routes_uvicorn_loggers_to_root() -> None:
@@ -279,8 +340,10 @@ def test_redaction_filter_scrubs_stack_info() -> None:
 
 def test_redaction_filter_residual_bare_name_not_caught() -> None:
     # DOCUMENTED RESIDUAL (redaction.py / PHI.md §7): a bare free-text name with <2 HL7 delimiters and
-    # no segment header is not HL7-shaped, so the filter does NOT catch it — the "never put PHI in an
-    # exception message" convention is the control. Pin the boundary so a future change is deliberate.
+    # no segment header is not HL7-shaped, so the filter does NOT catch it. The "never put PHI in an
+    # exception message" convention binds only the engine's own authors, Router and Handler authors
+    # included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md section 7, "Who the
+    # exception-message convention binds"). Pin the boundary so a change is deliberate.
     rec = logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "invalid patient %s", ("DOE^JANE",), None
     )
@@ -1332,6 +1395,197 @@ def test_the_hand_off_queue_is_bounded_and_reports_what_it_drops(
     assert "8 dropped since this process started" in later[1].getMessage()
 
 
+def test_a_general_log_flood_does_not_cost_an_audit_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2612, closing step 2: audit tee lines have their own lane, so a flood of
+    general log traffic against a stalled collector cannot drop them.
+
+    The collector is gated, so nothing drains while the flood runs, and the general lane is cut to
+    five so the flood overflows it. The control is that it did: ``dropped`` counts the general
+    records that did not fit. On the single shared queue this test was written against, the audit
+    lines logged after the queue filled were dropped with them, and the test failed."""
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    gate = threading.Event()
+    target = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(target, fmt="text")
+    expected: list[str] = []
+    try:
+        for i in range(200):
+            fwd.handle(
+                logging.LogRecord(
+                    "mefor.test.flood", logging.WARNING, __file__, 1, "flood %d", (i,), None
+                )
+            )
+            if i % 20 == 0:
+                line = f'{{"event": "audit", "n": {i}}}'
+                expected.append(line)
+                fwd.handle(
+                    logging.LogRecord(
+                        audit_tee.audit_logger.name, logging.INFO, __file__, 1, line, None, None
+                    )
+                )
+    finally:
+        gate.set()
+        fwd.close()
+
+    assert fwd.dropped > 0, "the flood never overflowed the general lane, so it tested nothing"
+    delivered = [r.getMessage() for r in target.seen]
+    # Walk what was DELIVERED, so a lane that re-ordered its own lines goes red here.
+    audit = [line for m in delivered for line in expected if m.endswith(line)]
+    assert audit == expected  # every audit line, once each, in the order it was logged
+
+
+def _drop_reports(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, logger_name: str
+) -> list[str]:
+    """Fill one lane of a forwarder that is not draining with five records past its bound, and
+    return the drop reports it logged. The lanes' bounds differ, so a report that printed the
+    dropping lane's own bound would read differently per lane."""
+    general_bound, audit_bound = 3, 2
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", general_bound)
+    monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_QUEUE_MAXSIZE", audit_bound)
+    bound = audit_bound if logger_name == logging_setup.AUDIT_LOGGER_NAME else general_bound
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane fills
+    caplog.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for i in range(bound + 5):
+                fwd.handle(
+                    logging.LogRecord(logger_name, logging.INFO, __file__, 1, f"r{i}", None, None)
+                )
+    finally:
+        fwd.close()
+    assert fwd.dropped == 5  # the lane's bound fits, then five drops, whichever lane
+    return [r.getMessage() for r in caplog.records if "hand-off queue is full" in r.getMessage()]
+
+
+def test_the_drop_report_reads_the_same_whichever_lane_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The drop report reaches ``GET /logs/tail``, so it must not say which lane dropped: naming the
+    audit lane would tell that reader an audit row was written in the window (BACKLOG #1131,
+    #2612). An audit-only drop and a general-only drop of the same size log the same text, with
+    the combined counts and the one depth figure the single queue printed."""
+    from messagefoundry.store import audit_tee
+
+    audit = _drop_reports(monkeypatch, caplog, audit_tee.audit_logger.name)
+    general = _drop_reports(monkeypatch, caplog, "mefor.test")
+    assert len(audit) == 1, audit
+    assert audit == general  # the control is the general lane: same text, so no lane signal
+    assert "lane" not in audit[0].lower() and "audit" not in audit[0].lower(), audit[0]
+    assert re.findall(r"\d+", audit[0]) == ["1", "2", "1"], audit[0]  # the smaller lane bound
+
+
+def test_a_drop_counted_by_the_thread_already_holding_the_counter_lock_does_not_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal handler or a finalizer can log on a thread that is inside ``_count_drop`` and so
+    holds the counter lock. When that record is dropped too, the drop is counted under the same
+    lock on the same thread (BACKLOG #2612). A plain lock deadlocks the thread on itself; the
+    control is that the lock is held at all, so the nested count really re-enters it."""
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 1)
+    fwd = _build_queued_forwarder(_CapturingHandler(), fmt="text")
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the lane stays full
+    record = logging.LogRecord("mefor.test", logging.INFO, __file__, 1, "x", None, None)
+    fwd.handle(record)  # fills the lane
+    held: list[bool] = []
+
+    def reenter() -> None:
+        with fwd._counter_lock:
+            held.append(True)
+            fwd.handle(record)  # dropped, so counted under the lock this thread holds
+
+    worker = threading.Thread(target=reenter, daemon=True)
+    worker.start()
+    worker.join(5.0)
+    if worker.is_alive():
+        # The stuck worker holds the counter lock and the handler's own lock for good, and close()
+        # and the interpreter's logging shutdown would block on them. Fresh locks let the run
+        # fail rather than hang.
+        fwd._counter_lock = threading.RLock()
+        fwd.lock = threading.RLock()
+        fwd.close()
+        pytest.fail("the nested drop count deadlocked on the counter lock")
+    fwd.close()
+    assert held == [True] and fwd.dropped == 1
+
+
+def _lane_record(name: str, msg: str) -> logging.LogRecord:
+    return logging.LogRecord(name, logging.INFO, __file__, 1, msg, None, None)
+
+
+def test_the_audit_lane_cannot_hold_general_lines_back_for_good() -> None:
+    """Failed sign-ins write audit rows, so an unauthenticated client drives the audit rate. The
+    lanes serve at most ``_FORWARD_AUDIT_BURST`` audit lines in a row while a general record waits,
+    and serve the stop sentinel only once the audit lane is empty (BACKLOG #2612)."""
+    from messagefoundry.store import audit_tee
+
+    burst = logging_setup._FORWARD_AUDIT_BURST
+    lanes = logging_setup._ForwardLanes(100, 100)
+    for i in range(burst * 3):
+        lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, f"a{i}"))
+    lanes.put_nowait(_lane_record("mefor.test", "g0"))
+    lanes.put_nowait(_lane_record("mefor.test", "g1"))
+    lanes.put_nowait(None)
+    order = []
+    while lanes.qsize():
+        item = lanes.get_nowait()
+        order.append(None if item is None else item.getMessage())
+    audit_order = [m for m in order if m is not None and m.startswith("a")]
+    assert audit_order == [f"a{i}" for i in range(burst * 3)]  # each lane stays FIFO
+    assert order.index("g0") == burst and order.index("g1") == 2 * burst + 1
+    assert order[-1] is None  # every audit line went out ahead of the stop sentinel
+
+
+@pytest.mark.parametrize("burst", [None, 10**9], ids=["shipped-cap", "uncapped-control"])
+def test_general_lines_drain_while_the_audit_lane_stays_full(
+    monkeypatch: pytest.MonkeyPatch, burst: int | None
+) -> None:
+    """Finding 10 of PR 2601's review, measured as a bound: an unauthenticated client can keep the
+    audit lane full, by failing sign-ins faster than the collector takes lines. The lane is topped
+    back up to its bound after every line served, so it is never empty, and the general lines must
+    still all go out, one in every ``_FORWARD_AUDIT_BURST + 1`` lines served (BACKLOG #2612).
+
+    The control lifts the cap. Audit-first serving with no cap then sends no general line at all
+    under the same load, so the test can see starvation when it is there."""
+    from messagefoundry.store import audit_tee
+
+    cap = logging_setup._FORWARD_AUDIT_BURST  # the shipped cap sets the bound in both arms
+    if burst is not None:
+        monkeypatch.setattr(logging_setup, "_FORWARD_AUDIT_BURST", burst)
+    audit_bound, general = 50, 20
+    lanes = logging_setup._ForwardLanes(100, audit_bound)
+
+    def top_up() -> None:
+        while True:
+            try:
+                lanes.put_nowait(_lane_record(audit_tee.audit_logger.name, "{}"))
+            except queue.Full:
+                return
+
+    for i in range(general):
+        lanes.put_nowait(_lane_record("mefor.test", f"g{i}"))
+    top_up()
+    served = (cap + 1) * general
+    general_seen: list[str] = []
+    for _ in range(served):
+        item = lanes.get_nowait()
+        if item.name != audit_tee.audit_logger.name:
+            general_seen.append(item.getMessage())
+        top_up()
+        assert len(lanes.audit) == audit_bound  # saturated the whole time
+    if burst is None:
+        assert general_seen == [f"g{i}" for i in range(general)]
+    else:
+        assert general_seen == []  # the control: uncapped, the general lane starves
+
+
 def test_the_drop_report_does_not_recurse_on_the_root_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1468,6 +1722,113 @@ def test_a_full_queue_still_accepts_the_stop_sentinel(
     finally:
         gate.set()
     assert fwd._stopped
+
+
+def _shutdown_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    *,
+    audit_rows: int,
+    spooled: bool,
+) -> list[str]:
+    """Stall the collector on its first record, fill the general lane past its bound of five, write
+    ``audit_rows`` audit rows, then close; return the shutdown lines close() logged. Every queued
+    record is still there at the drain deadline, so they are all spooled or all undelivered."""
+    from messagefoundry.log_spool import LogSpool
+    from messagefoundry.store import audit_tee
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 5)
+    monkeypatch.setattr(logging_setup, "_FORWARD_DRAIN_TIMEOUT", 0.2)
+    spool = None
+    if spooled:
+        spool = LogSpool(tmp_path / f"spool-{audit_rows}", max_bytes=10_000_000)
+        spool.open()
+    gate = threading.Event()
+    fwd = _build_queued_forwarder(_CapturingHandler(gate=gate, wait=1.0), fmt="text", spool=spool)
+    try:
+        fwd.handle(_lane_record("mefor.test", "first"))
+        deadline = time.monotonic() + 5.0
+        while fwd._records.qsize() and time.monotonic() < deadline:
+            time.sleep(0.01)  # until the listener holds the first record inside the stalled send
+        assert fwd._records.qsize() == 0, "the listener never took the first record"
+        for i in range(8):
+            fwd.handle(_lane_record("mefor.test", f"g{i}"))
+        for i in range(audit_rows):
+            fwd.handle(_lane_record(audit_tee.audit_logger.name, f'{{"seq": {i}}}'))
+        assert fwd._records.qsize() == 5 + audit_rows  # the control: the raw depth DOES move
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="messagefoundry.logging_setup"):
+            fwd.close()
+    finally:
+        gate.set()
+        fwd.close()  # idempotent; frees the thread and the spool lock if an assert fired first
+    where = str(spool.directory) if spool is not None else "<no spool>"
+    return [
+        r.getMessage().replace(where, "<spool>")  # each run has its own directory
+        for r in caplog.records
+        if "drain deadline" in r.getMessage() or "undelivered" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("spooled", [False, True], ids=["no-spool", "spool"])
+def test_the_shutdown_counts_do_not_move_with_audit_rows_while_the_general_lane_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    spooled: bool,
+) -> None:
+    """The engine log is served by ``GET /logs/tail``, so a reader with ``logs:view`` and without
+    ``users:manage`` must not count audit rows off it (BACKLOG #1131, #2612). With the general lane
+    full, the shutdown line that counts what was undelivered, and the one that counts what moved to
+    the spool, read the same for 0 and 40 audit rows: both are capped at the smaller lane bound,
+    as the single queue was. Uncapped, they read 5 and 45."""
+    quiet = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=0, spooled=spooled)
+    busy = _shutdown_lines(monkeypatch, caplog, tmp_path, audit_rows=40, spooled=spooled)
+    assert len(quiet) == 1, quiet
+    expected = "moved at least 5 record(s)" if spooled else "at least 5 record(s) undelivered"
+    assert expected in quiet[0], quiet
+    assert busy == quiet
+
+
+def test_published_counts_share_one_budget_and_the_loss_takes_it_first() -> None:
+    """Capped together, so two counts that sum past the cap cannot tell how far past it the lanes
+    were; and the loss first, so a record that did not reach the collector is always reported."""
+    lanes = logging_setup._ForwardLanes(5, 100)
+    assert logging_setup._published_counts(lanes, 3, 7) == (3, 2)
+    assert logging_setup._published_counts(lanes, 9, 7) == (5, 0)
+    assert logging_setup._published_counts(lanes, 2, 1) == (2, 1)  # below the cap, untouched
+    unbounded: queue.Queue[Any] = queue.Queue()
+    assert logging_setup._published_counts(unbounded, 9, 7) == (9, 7)
+    # A lane bound of 0 is a cap of 0, never "no cap".
+    assert logging_setup._published_counts(logging_setup._ForwardLanes(0, 100), 9, 7) == (0, 0)
+
+
+def test_a_plain_bounded_queue_makes_room_for_the_stop_sentinel() -> None:
+    """``enqueue_sentinel``'s discard loop, on the plain bounded queue it is kept for. The shipped
+    :class:`_ForwardLanes` always takes the sentinel (BACKLOG #2612), so the test above no longer
+    reaches the loop; this one goes red if the stdlib ``enqueue_sentinel`` is restored, because
+    ``put_nowait`` on a full queue raises ``queue.Full``."""
+    records: queue.Queue[Any] = queue.Queue(maxsize=2)
+    records.put_nowait("a")
+    records.put_nowait("b")
+    listener = logging_setup._ForwardQueueListener(records, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert listener._sentinel_queued
+    assert [records.get_nowait(), records.get_nowait()] == ["b", None]  # oldest made room
+
+
+def test_the_lanes_always_take_the_stop_sentinel() -> None:
+    """The shipped queue exempts the sentinel from both bounds, so a full lane neither refuses it
+    nor discards a record for it (BACKLOG #2612)."""
+    lanes = logging_setup._ForwardLanes(1, 1)
+    lanes.put_nowait("general")
+    with pytest.raises(queue.Full):
+        lanes.put_nowait("one too many")
+    listener = logging_setup._ForwardQueueListener(lanes, _CapturingHandler())
+    listener.enqueue_sentinel()
+    assert lanes.qsize() == 2
+    assert [lanes.get_nowait(), lanes.get_nowait()] == ["general", None]
 
 
 def test_a_broken_stream_forwarder_reconnects_on_the_next_record(
@@ -2276,29 +2637,99 @@ def _timed_emit(target: str) -> float:
     return time.perf_counter() - start
 
 
-def _access_growth(rounds: int) -> float:
-    """Emit time at the long target over emit time at the short one, both with the DSN marker.
+async def _emit_beside_ticker(target: str) -> tuple[float, float]:
+    """One access record on ``target``, emitted from its own task beside a ticker task on one loop.
 
-    The emits run inside a coroutine on a running event loop, the way uvicorn's own emit does. A
-    ``logging`` emit is synchronous, so every handler filter runs on the loop thread and nothing else
-    on that loop runs until it returns: its duration IS the stall a waiting coroutine sees. That is
-    why this times the emit rather than a sleeping ticker, whose scheduler jitter on Windows swamps
-    the short length.
+    Returns the emit's duration and the LOOP GAP: the longest interval the ticker saw between two
+    consecutive wake-ups, which is how long a waiting coroutine was kept from running. The ticker
+    yields with ``asyncio.sleep(0)``, which puts it straight back on the ready queue with no timer, so
+    neither the Windows timer resolution nor a timed sleep's scheduler jitter enters the reading.
+    Between two of its wake-ups the loop ran only the other ready callbacks, here the emitter's.
 
-    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long emits
-    alternate so load that comes and goes lands on both endpoints rather than on one block."""
-    short_target = _request_target(_ACCESS_GROWTH_LENGTHS[0])
-    long_target = _request_target(_ACCESS_GROWTH_LENGTHS[1])
+    The emitter yields once before it emits, so the ticker has taken its first reading by then and
+    the interval spanning the emit is one the ticker measures.
 
-    async def measure() -> tuple[float, float]:
-        short = long_ = float("inf")
-        for _ in range(rounds):
-            short = min(short, _timed_emit(short_target))
-            long_ = min(long_, _timed_emit(long_target))
-        return short, long_
+    WHAT IT DOES NOT SEE: the ticker stops once the emit call returns, so it measures only the stall
+    the emit itself causes. A stall the emit hands off, to a queue handler, a ``call_soon`` callback
+    or another thread holding the GIL, falls outside every interval it measures. And with nothing
+    else scheduled, the gap is the emit plus a few microseconds of loop overhead, so beyond the
+    premise check it adds little detection the emit time lacks; it is kept because it is the
+    reading the row names."""
+    stop = asyncio.Event()
+    largest_gap = 0.0
 
-    short, long_ = asyncio.run(measure())
-    return long_ / short
+    async def ticker() -> None:
+        nonlocal largest_gap
+        last = time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(0)
+            now = time.perf_counter()
+            largest_gap = max(largest_gap, now - last)
+            last = now
+
+    async def emitter() -> float:
+        await asyncio.sleep(0)
+        try:
+            return _timed_emit(target)
+        finally:
+            stop.set()
+
+    ticking = asyncio.create_task(ticker())
+    emit_seconds = await asyncio.create_task(emitter())
+    await ticking
+    return emit_seconds, largest_gap
+
+
+def _alternating_growth[T](
+    sample: Callable[[T], Sequence[float]], short: T, long: T, rounds: int
+) -> tuple[float, ...]:
+    """For each reading ``sample`` returns: its minimum on ``long`` over its minimum on ``short``.
+
+    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long samples
+    alternate so load that comes and goes lands on both endpoints rather than on one block. The
+    ratio divides the same work at two lengths, so a box that runs everything k times slower
+    multiplies both endpoints by k, and k cancels. Load that is not uniform does not cancel.
+
+    A KNOWN LIMIT, LEFT ON PURPOSE: this is the simpler sampler the access arm already used.
+    ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py`` adds equal windows and a
+    random order per round, after measuring reds this form can show under a co-tenant on a 0.07 ms
+    subject. The access arm's short emit costs only about 0.3 to 0.7 ms, so it is exposed to the
+    same failure: a co-tenant that interrupts every long sample but lets short ones finish inflates
+    the ratio. That was weighed and accepted as a documented limit rather than ported; the readings
+    recorded for these arms, including under CPU-spinner load, sat well inside the bound. The
+    read-back arm gets a sampling floor from its CPU clock instead."""
+    samples = [(sample(short), sample(long)) for _ in range(rounds)]
+    best_short = [
+        min(column) for column in zip(*(on_short for on_short, _ in samples), strict=True)
+    ]
+    best_long = [min(column) for column in zip(*(on_long for _, on_long in samples), strict=True)]
+    return tuple(lg / sh for sh, lg in zip(best_short, best_long, strict=True))
+
+
+def _access_growth(rounds: int) -> tuple[float, float]:
+    """The growth of the emit time and of the loop gap, long target over short, both with the marker.
+
+    Every sample runs on one running event loop, the way uvicorn's own emit does. A ``logging``
+    emit is synchronous, so every handler filter runs on the loop thread and nothing else on that loop
+    runs until it returns: its duration should BE the stall a waiting coroutine sees, and the loop gap
+    of :func:`_emit_beside_ticker` measures the stall the emit causes rather than inferring it. The
+    two readings should agree to within the microseconds a loop iteration costs.
+
+    WALL CLOCK, ON PURPOSE, where the read-back arm below moved to CPU time. A loop gap is the time
+    a waiting coroutine spends not running, and that is wall time by definition: a CPU clock stops
+    while the runner is away, which is exactly the delay a waiting client still pays. The growth
+    ratio cancels a UNIFORM slowdown only. Load that is not uniform still reaches a wall-clock ratio,
+    which is the reason the CPU-time arms exist, so this arm stays exposed to it; that is the accepted
+    cost of measuring what a client waits, and :func:`_alternating_growth` records the limit.
+    """
+    with asyncio.Runner() as runner:
+        emit_growth, gap_growth = _alternating_growth(
+            lambda target: runner.run(_emit_beside_ticker(target)),
+            _request_target(_ACCESS_GROWTH_LENGTHS[0]),
+            _request_target(_ACCESS_GROWTH_LENGTHS[1]),
+            rounds,
+        )
+    return emit_growth, gap_growth
 
 
 class _CountingPattern:
@@ -2336,18 +2767,26 @@ class _CountingPattern:
         return counted
 
 
-def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
-    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``.
+def _dsn_passes(
+    monkeypatch: pytest.MonkeyPatch, module: ModuleType, target: str, action: Callable[[], object]
+) -> int:
+    """How many times ``module._DSN_PASSWORD`` was applied to text holding ``target`` during
+    ``action()``.
 
-    ``secretscrub._run`` reads the pattern from the module global on every call, so swapping the
-    global reaches the object the installed filter applies. The needle is the target's first 64
-    characters, all inside the hostile run, which no filter rewrites."""
+    Both ``secretscrub._run`` and ``support.redact.redact_log_line`` read the pattern from their
+    module global on every call, so swapping the global reaches the object they apply. The needle is
+    the target's first 64 characters, all inside the hostile run, which no filter rewrites."""
     seen: list[str] = []
-    recorder = _CountingPattern(secretscrub._DSN_PASSWORD, target[:64], seen)
+    recorder = _CountingPattern(module._DSN_PASSWORD, target[:64], seen)
     with monkeypatch.context() as m:
-        m.setattr(secretscrub, "_DSN_PASSWORD", recorder)
-        _emit_access(target)
+        m.setattr(module, "_DSN_PASSWORD", recorder)
+        action()
     return len(seen)
+
+
+def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
+    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``."""
+    return _dsn_passes(monkeypatch, secretscrub, target, lambda: _emit_access(target))
 
 
 def _credential_pass_inputs(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
@@ -2386,15 +2825,17 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     a file or forwarder here would time a different chain from the one this arm names, and a second
     handler's filters read a record the first one already rewrote.
 
-    One measurement covers both halves of the item. The emit runs on a running event loop and is
-    synchronous there, so its growth across lengths is the growth of the loop stall a client could
-    cause without authenticating, on first deployment. The arm bounds that GROWTH and not the stall's
-    size: an absolute budget is a reading about the runner as much as the code, and a cost-share arm
-    built that way went red on a hosted Windows runner and was deleted.
+    One measurement covers both halves of the item. The emit runs from its own task on a running
+    event loop, beside a ticker task, and returns two readings: how long the emit took, and the
+    longest the ticker waited between two wake-ups, which is the loop stall itself. The arm checks
+    that the wait spans the emit, then bounds the GROWTH of both across lengths, which is the growth
+    of the stall a client could cause without authenticating, on first deployment. It bounds growth
+    and not the stall's size: an absolute budget is a reading about the runner as much as the code,
+    and a cost-share arm built that way went red on a hosted Windows runner and was deleted.
 
     THE POSITIVE CONTROL runs in the same test: the pre-#1547 pattern is swapped into the module the
-    filter reads, and the same harness must then break the growth bound. Without it, a fast box would
-    pass whatever the pattern did.
+    filter reads, and the same harness must then break the growth bound. Without it, a fast box
+    would pass whatever the pattern did.
 
     THE NEGATIVE ARM IS A COUNT, NOT A CLOCK. The unmarked target still costs every other filter its
     time, so a timing ratio between the two would measure the other filters. Instead the DSN pass is
@@ -2404,12 +2845,13 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     thing between it and the scan. The marked count also proves the growth readings are about a
     chain in which the DSN pass actually ran.
 
-    NOT COVERED HERE, ON PURPOSE: ``messagefoundry/support/redact.py`` carries a twin of this pattern.
-    No logging handler applies it; ``redact_log_line`` does, at READ time, over log text already
-    stored, such as a log tail or a support bundle. A stored access line DOES reach it that way, so the
-    same hostile target is scanned by the twin when the log is read back, off this emit path. Its
-    growth is covered by the growth arm in ``tests/test_log_redaction_secret_domain.py``, and the same
-    file pins the two copies as identical.
+    NOT COVERED HERE, BECAUSE IT IS NOT ON THIS PATH: ``messagefoundry/support/redact.py`` carries a
+    twin of this pattern. No logging handler applies it; ``redact_log_line`` does, at READ time, over
+    log text already stored, such as a log tail or a support bundle. A stored access line reaches it
+    that way, off this emit path, and
+    ``test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time`` drives that path.
+    ``tests/test_log_redaction_secret_domain.py`` times the twin directly and pins the two copies as
+    identical.
     """
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     configure_logging("INFO")
@@ -2477,25 +2919,228 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
             "access lines without one now pay for the scan."
         )
 
+    # The stall premise, read rather than argued: the ticker's longest wait spans the whole emit, so
+    # a waiting coroutine was held off the loop for at least as long as the filters ran.
+    emit_seconds, gap_seconds = asyncio.run(_emit_beside_ticker(_request_target(longest)))
+    assert gap_seconds >= emit_seconds, (
+        f"the ticker's longest wait was {gap_seconds * 1e3:.3f} ms, shorter than the "
+        f"{emit_seconds * 1e3:.3f} ms emit, so the ticker took its first reading after the emit "
+        "began and the loop-gap readings below do not span the emit. Check the task ordering in "
+        "_emit_beside_ticker."
+    )
+
     with monkeypatch.context() as m:
         m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
         # Three rounds, against five for the arm under test: the control only has to clear the bound.
-        # Measured 2026-10-13 on a dev box, it read 70x in 2.0 s at three rounds and 112x in 0.6 s at
-        # one. Each endpoint keeps the minimum of three samples, so one slow short emit under load is
-        # discarded rather than pulling the reading under the bound and redding a sound harness.
-        before_growth = _access_growth(rounds=3)
-    assert before_growth > _ACCESS_MAX_GROWTH, (
-        f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
-        f"across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x bound. This harness is not "
-        "exercising the scan, so the assertion below cannot fail. Fix the harness, not the bound."
+        # Measured 2026-10-13 on a dev box, the emit read 70x in 2.0 s at three rounds and 112x in
+        # 0.6 s at one. Each endpoint keeps the minimum of three samples, so one slow short emit under
+        # load is discarded rather than pulling the reading under the bound and redding a sound harness.
+        before_emit, before_gap = _access_growth(rounds=3)
+    # Each gap is its emit plus a few microseconds of loop overhead, so the gap's growth reads a
+    # little LOWER than the emit's. The control therefore needs the lower of the two over the bound,
+    # and the bound holds the higher of the two under it: one assertion each.
+    assert min(before_gap, before_emit) > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped in, the access chain's loop gap grew only "
+        f"{before_gap:.1f}x and its emit time {before_emit:.1f}x across {_ACCESS_GROWTH_LENGTHS}, "
+        f"not both over the {_ACCESS_MAX_GROWTH}x bound. This harness is not exercising the scan, so "
+        "the assertion below cannot fail. Fix the harness, not the bound."
     )
 
-    growth = _access_growth(rounds=5)
+    emit_growth, gap_growth = _access_growth(rounds=5)
+    assert max(gap_growth, emit_growth) <= _ACCESS_MAX_GROWTH, (
+        f"one access record held the event loop {gap_growth:.1f}x longer (emit time "
+        f"{emit_growth:.1f}x) for 8x the request-target length, over the {_ACCESS_MAX_GROWTH}x bound; "
+        f"the pre-#1547 pattern measured {before_gap:.0f}x in this run. Something in the installed "
+        "chain scans this target in more than linear time, and the emit holds the loop for all of it."
+    )
+
+
+def _store_access_log(sink: io.StringIO, target: str, log_dir: Path) -> Path:
+    """Emit one access record on ``target`` through the installed chain, and store what the stdout
+    sink received as ``log_dir / "engine.log"``, the way the supervisor's stdout capture stores it.
+
+    The sink is emptied first, so the file holds this one record and nothing logged before it."""
+    sink.seek(0)
+    sink.truncate()
+    _emit_access(target)
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text(sink.getvalue(), encoding="utf-8")
+    return log_dir
+
+
+def _read_back(log_dir: Path) -> list[str]:
+    """One ``GET /logs/tail`` page of ``log_dir``, redaction included. ``_read_log_tail`` never
+    raises and answers an unreadable file with an empty page, so that is refused here rather than
+    read as a log with nothing in it."""
+    # Imported here, not at module level, so collecting the rest of this file does not depend on
+    # the API module importing cleanly.
+    from messagefoundry.api.app import _read_log_tail
+
+    lines, _, available = _read_log_tail(str(log_dir), limit=50, offset=0)
+    assert available and lines, f"the log read-back of {log_dir.name} came back empty"
+    return lines
+
+
+def _read_back_growth(short_dir: Path, long_dir: Path, rounds: int) -> float:
+    """CPU time redacting the stored ``long_dir`` log over that for ``short_dir``, as
+    :func:`_alternating_growth` takes it.
+
+    Each file is read and split once, OUTSIDE the clock, and each sample times
+    ``redact_log_record`` over its lines, the per-line redaction ``_read_log_tail`` applies. The
+    directory walk, the stat and the file read are a near-constant cost added to both endpoints,
+    and an added constant does not cancel in a ratio. On the wall clock, before this arm moved to CPU
+    time, the read-back with the file read inside the clock grew about 6x where the redaction alone
+    grew about 9x on a dev box, so a super-linear pass would have needed to grow far past the bound
+    before this arm saw it. On the CPU clock the redaction alone reads about 5x to 8x there. The count arm in the test proves
+    ``_read_log_tail`` reaches the twin on the same stored line.
+
+    CPU TIME, NOT WALL TIME. What is timed here is a pure CPU cost, and a wall-clock ratio of that
+    kind went red on loaded shared runners (BACKLOG #2958); :func:`tests._cpu_clock.cpu_seconds`
+    records why and is the clock used.
+
+    KNOWN LIMITS, LEFT ON PURPOSE. It times this copy of the reader's per-line loop rather than
+    ``_read_log_tail`` itself, so a super-linear step added to the reader outside
+    ``redact_log_record`` would not show here. Nor is this all of the reader's per-line work: with
+    ``audit_copies=False``, the route's mode for a reader without ``users:manage``, it also runs
+    ``is_audit_copy_line`` on every line, and neither arm drives that mode. And the linear shared PHI
+    pass dominates the timed cost, so only a severe twin regression crosses the bound here; the
+    bare-pattern growth arm in ``tests/test_log_redaction_secret_domain.py`` is the sensitive one."""
+    stored = {
+        log_dir: support_redact.split_log_lines(
+            (log_dir / "engine.log").read_text(encoding="utf-8", errors="replace")
+        )
+        for log_dir in (short_dir, long_dir)
+    }
+
+    def redact_all(lines: list[str]) -> None:
+        for line in lines:
+            support_redact.redact_log_record(line)
+
+    def timed(log_dir: Path) -> tuple[float]:
+        return (cpu_seconds(partial(redact_all, stored[log_dir]), reps=1),)
+
+    (growth,) = _alternating_growth(timed, short_dir, long_dir, rounds)
+    return growth
+
+
+def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #1547's ``support/redact.py`` twin, driven end to end through the log read-back path.
+
+    No logging handler applies the twin. ``redact_log_line`` applies it to text that has left the
+    write-time chain, at least when stored log text is read back (``GET /logs/tail`` through
+    ``api.app._read_log_tail``, and the support bundle through ``support.bundle._log_tail``, both one
+    ``redact_log_record`` per line) and to store exception text. The read-back is the path an access
+    line takes, so the hostile target is emitted through the chain production installs, exactly as
+    the arm above does, the stdout it produced is stored as the newest log file, and
+    ``_read_log_tail`` reads it back. Since BACKLOG #2694 that read runs BOTH patterns: the twin
+    first, then ``secretscrub.scrub_credentials`` as a second layer, and this arm times the two
+    together, as the reader runs them. :func:`_read_back_growth` says why the clock covers the
+    per-line redaction and not the file read.
+
+    On first deployment that cost would be planted by an unauthenticated request and paid when an
+    authenticated reader pulls the log. The route hands the read to ``asyncio.to_thread``, but a
+    regex scan holds the GIL for its whole run, so on the default build a super-linear read-back
+    would stall the event loop too, not only a worker. Like the arm above, this one bounds GROWTH
+    across the same two lengths, on a CPU-time clock for the reason :func:`_read_back_growth` gives.
+
+    THE POSITIVE CONTROL swaps the pre-#1547 pattern into ``support.redact._DSN_PASSWORD`` ONLY. The
+    fixed ``secretscrub`` copy still runs as the second layer, so the swap isolates the twin, and the
+    same harness must then break the bound.
+
+    THERE IS NO NO-MARKER NEGATIVE ARM HERE, AND THAT IS THE SURFACE, NOT AN OMISSION. The twin is not
+    admission-gated: ``support/redact.py`` says above it that nothing there gates on it, so it scans
+    every line it reads, marker or no marker. A count of zero on an unmarked line would fail against
+    the shipped code. What this arm counts instead is that the twin ran on the stored line, once per
+    read, for a marked AND an unmarked line, which proves the timings are about a path in which the
+    twin actually scanned the hostile run. The row's no-marker control belongs to the gated
+    ``secretscrub`` copy, and the arm above carries it.
+    """
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", sink)
+    configure_logging("INFO")
+
+    # The stored text and the page read back must both still hold the hostile run, or the timings
+    # below are about some other text.
+    short_dir, long_dir = (
+        _store_access_log(sink, _request_target(length), tmp_path / f"len-{length}")
+        for length in _ACCESS_GROWTH_LENGTHS
+    )
+    for length, log_dir in zip(_ACCESS_GROWTH_LENGTHS, (short_dir, long_dir), strict=True):
+        stored = (log_dir / "engine.log").read_text(encoding="utf-8")
+        assert f"GET {_request_target(length)} HTTP/1.1" in stored, (
+            f"the {length}-character target did not reach the stored log intact: {stored[:120]!r}"
+        )
+        lines = _read_back(log_dir)
+        assert len(lines) == 1, f"read back {len(lines)} line(s) from one stored record"
+        assert _hostile_run(length) in lines[0], "the read-back redaction rewrote the hostile run"
+
+    long_len = _ACCESS_GROWTH_LENGTHS[1]
+    count_dirs = {_MARKED_QUERY: long_dir}
+    for number, query in enumerate(("x=nothing", "token=nothing")):
+        target = _request_target(long_len, query)
+        count_dirs[query] = _store_access_log(sink, target, tmp_path / f"count-{number}")
+    for query, log_dir in count_dirs.items():
+        target = _request_target(long_len, query)
+        passes = _dsn_passes(monkeypatch, support_redact, target, partial(_read_back, log_dir))
+        assert passes == 1, (
+            f"reading back the stored line with ?{query} applied the twin {passes} times. One "
+            "redact_log_line call per stored line should apply it once: zero means the read-back "
+            "never reached the twin, so the timings below would be about other passes; more means "
+            "the twin now runs repeatedly."
+        )
+
+    # A DSN password behind the hostile run, in a stored line the write-time chain never saw (an
+    # older line, or one another tool wrote), is still hidden when it is read back -- by the twin
+    # alone. The secretscrub second layer would hide it too, so it is switched off for the reading;
+    # with the twin also switched off the password must then show, or the reading proves nothing.
+    sentinel = "not-a-real-pw-1547"
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "engine.log").write_text(
+        f'2026-10-26T00:00:00Z INFO     uvicorn.access: 127.0.0.1:50123 - "GET /x?next='
+        f'{_hostile_run(long_len)}postgres://svc:{sentinel}@db.invalid:5432/mefor HTTP/1.1" 401\n',
+        encoding="utf-8",
+    )
+    hidden = f"postgres://svc:{support_redact.REDACTION_PLACEHOLDER}@db.invalid"
+    (raw_line,) = _read_back(raw_dir)
+    assert sentinel not in raw_line, "the read-back printed the password"
+    assert hidden in raw_line, "the password is hidden, but the scheme, user or host went with it"
+    with monkeypatch.context() as m:
+        m.setattr(support_redact, "scrub_credentials", lambda text, **_: text)
+        (twin_only,) = _read_back(raw_dir)
+        m.setattr(support_redact, "_DSN_PASSWORD", re.compile(r"(?!)"))
+        (neither,) = _read_back(raw_dir)
+    assert sentinel not in twin_only, (
+        "with the secretscrub second layer off, the twin alone no longer hides a DSN password "
+        "stored behind the hostile run"
+    )
+    assert hidden in twin_only, (
+        "with the second layer off, the twin hid the password but lost the scheme, user or host"
+    )
+    assert sentinel in neither, (
+        "with both the twin and the second layer off, another pass still hid the password, so the "
+        "twin-only reading above does not show that the twin did it"
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(support_redact, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        # Fewer rounds than the access arm: each sample already averages every call made in its
+        # ``CPU_SAMPLE_FLOOR_SECONDS`` of CPU time, so more rounds mostly add runtime.
+        before_growth = _read_back_growth(short_dir, long_dir, rounds=2)
+    assert before_growth > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped into the twin, the log read-back grew only "
+        f"{before_growth:.1f}x across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x "
+        "bound. This harness is not exercising the twin, so the assertion below cannot fail. Fix the "
+        "harness, not the bound."
+    )
+
+    growth = _read_back_growth(short_dir, long_dir, rounds=3)
     assert growth <= _ACCESS_MAX_GROWTH, (
-        f"one access record grew {growth:.1f}x for 8x the request-target length, over the "
-        f"{_ACCESS_MAX_GROWTH}x bound; the pre-#1547 pattern measured {before_growth:.0f}x in this "
-        "run. Something in the installed chain scans this target in more than linear time, and the "
-        "emit holds the event loop for all of it."
+        f"reading back one stored access line grew {growth:.1f}x for 8x the request-target length, "
+        f"over the {_ACCESS_MAX_GROWTH}x bound; the pre-#1547 twin measured {before_growth:.0f}x in "
+        "this run. Something on the read-back path scans this line in more than linear time."
     )
 
 

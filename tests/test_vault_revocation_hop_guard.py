@@ -370,21 +370,20 @@ def test_open_store_hands_its_posture_to_the_cipher_build(
 
 
 @_ENTRY_POINTS
-def test_hvacs_own_vault_addr_fallback_is_the_hop_that_is_judged(
-    entry: EntryPoint, monkeypatch: pytest.MonkeyPatch, dials: list[object]
+@pytest.mark.parametrize("vault_addr", [_OFF_BOX, _ON_BOX], ids=["off-box", "on-box"])
+def test_an_unset_address_refuses_and_vault_addr_is_never_judged_or_dialled(
+    entry: EntryPoint, vault_addr: str, monkeypatch: pytest.MonkeyPatch, dials: list[object]
 ) -> None:
-    """With the ``MEFOR_*`` address unset, hvac dials ``VAULT_ADDR``. The guard reads the address
-    the client holds, so an unset variable is neither waved through nor refused as unreadable."""
-    monkeypatch.setenv("VAULT_ADDR", _OFF_BOX)
-    with pytest.raises(_FAIL_CLOSED) as caught:
+    """BACKLOG #2851: with the ``MEFOR_*`` address unset, hvac used to dial ``VAULT_ADDR``, and
+    this guard judged that address. There is no fallback now, so the provider refuses on the unset
+    variable before any client is built, whatever ``VAULT_ADDR`` holds: an off-box one is not the
+    hop the guard judges, and an on-box one is not dialled."""
+    own, _, section = _HOPS[entry]
+    monkeypatch.setenv("VAULT_ADDR", vault_addr)
+    with pytest.raises(_FAIL_CLOSED, match=f"MEFOR_{section.upper()}_VAULT_ADDR is not set") as c:
         entry(monkeypatch, None)
-    _assert_refused(caught, entry)
+    assert type(c.value) is own
     assert dials == []
-    monkeypatch.setenv("VAULT_ADDR", _ON_BOX)
-    with pytest.raises(_FAIL_CLOSED) as crossed:
-        entry(monkeypatch, None)
-    _assert_crossed(crossed, entry)
-    assert dials == [("127.0.0.1", 8200)]
 
 
 def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
@@ -931,9 +930,23 @@ def test_the_serve_path_upload_cipher_is_built_under_the_instance_posture(
     assert dials == ([(_HOST, 8200)] if crosses else [])
 
 
-def _verify_settings(enforcement: str, attested: bool, store_path: str) -> ServiceSettings:
-    """An instance whose OIDC client secret and store key are both held in an off-box Vault."""
-    return ServiceSettings.model_validate(
+#: The OIDC client credential held in the Vault, by the row that reads it.
+_CREDENTIALS: dict[str, dict[str, str]] = {
+    "fed.client_secret": {"oidc_client_secret_ref": "mefor/oidc"},
+    "fed.client_key": {
+        "oidc_token_endpoint_auth_method": "private_key_jwt",
+        "oidc_client_private_key_ref": "mefor/oidc-key",
+        "oidc_client_assertion_algorithm": "ES256",
+    },
+}
+
+
+def _verify_settings(
+    enforcement: str, attested: bool, store_path: str, row: str = "fed.client_secret"
+) -> ServiceSettings:
+    """An instance whose OIDC client credential and store key are both held in an off-box Vault.
+    ``row`` picks the credential: the client secret, or the ``private_key_jwt`` signing key."""
+    settings = ServiceSettings.model_validate(
         {
             "security": {"enforcement": enforcement},
             "secrets": {"provider": "vault", **_pair(attested)},
@@ -949,15 +962,17 @@ def _verify_settings(enforcement: str, attested: bool, store_path: str) -> Servi
                 "oidc_enabled": True,
                 "oidc_issuer": "https://idp.synthetic.test",
                 "oidc_client_id": "mefor-console",
-                "oidc_client_secret_ref": "mefor/oidc",
                 "oidc_authorization_endpoint": "https://idp.synthetic.test/authorize",
                 "oidc_token_endpoint": "https://idp.synthetic.test/token",
                 "oidc_jwks_uri": "https://idp.synthetic.test/jwks",
                 "oidc_allowed_endpoints": ["idp.synthetic.test"],
+                **_CREDENTIALS[row],
             },
             "api": {"public_origin": "https://ops.synthetic.test"},
         }
     )
+    assert bool(settings.auth.oidc_private_key_jwt) is (row == "fed.client_key")
+    return settings
 
 
 @pytest.mark.parametrize("enforcement", ["warn", "enforce"])
@@ -965,12 +980,12 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     enforcement: str, monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
 ) -> None:
     """``verify`` holds no posture for its store opens (vault BACKLOG #2354), so it holds none for
-    its secrets read either: one command judges both Vault hops by one rule. A ``warn`` instance
-    is not a way across here, as it is in ``serve``; only the hop's own pair is.
-    RED before the repair, on ``warn`` only: the client-credential row derived the serve posture.
-    So the secrets hop crossed with a WARNING and dialled the Vault, while the store row refused.
-    ``[enforce]`` is the control: both versions refuse there. Mutation: pass ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
-    ``_client_credential_row``."""
+    its secrets read either: one command dials neither unattested off-box Vault. A ``warn``
+    instance is not a way across here, as it is in ``serve``; only the hop's own pair is.
+    The store row FAILs on both postures. The credential row FAILs under ``enforce`` and is MANUAL
+    under ``warn``, where ``serve`` would cross (vault BACKLOG #3619). Mutation: pass
+    ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
+    ``_client_credential_row``; the ``warn`` case then dials."""
     from messagefoundry.verify.federation import _client_credential_row
     from messagefoundry.verify.model import Status
     from messagefoundry.verify.smoke import check_store_connectivity
@@ -983,9 +998,11 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     refused = _verify_settings(enforcement, False, str(store))
     secret = _client_credential_row(refused)
     opened = check_store_connectivity(refused.store)
-    for row, section in ((secret, "secrets"), (opened, "store")):
-        assert row.status is Status.FAIL, (row.id, row.detail)
-        assert f"[{section}].vault_revocation_attested = true" in row.detail, row.id
+    expected = Status.MANUAL if enforcement == "warn" else Status.FAIL
+    assert secret.status is expected, secret.detail
+    assert "[secrets].vault_revocation_attested = true" in (secret.evidence or secret.detail)
+    assert opened.status is Status.FAIL, opened.detail
+    assert "[store].vault_revocation_attested = true" in opened.detail
     assert dials == []
 
     # The control, on the same address: the hop's own pair, with its reason, is the way across.
@@ -994,3 +1011,381 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     assert secret.status is Status.FAIL
     assert "vault_revocation_attested" not in secret.detail
     assert dials == [(_HOST, 8200)]
+
+
+@pytest.mark.parametrize("row", sorted(_CREDENTIALS))
+@pytest.mark.parametrize("blanket", [False, True], ids=["no-env", "blanket-env"])
+@pytest.mark.parametrize("enforcement", ["warn", "enforce"])
+def test_verify_reports_a_hop_serve_would_cross_as_manual_and_still_dials_nothing(
+    enforcement: str,
+    blanket: bool,
+    row: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    tmp_path: Any,
+) -> None:
+    """Vault BACKLOG #3619. On ``warn`` the credential row is MANUAL, says ``serve`` would cross
+    the hop, names the hop's own pair, and keeps the guard's refusal as evidence. Under
+    ``enforce`` it stays FAIL with the refusal. ``MEFOR_TLS_REVOCATION_ATTESTED``, set in
+    ``verify``'s own process, moves neither: ``verify``'s read is strict, so the variable crosses
+    nothing there. ``verify`` dials the unattested Vault in no case.
+    RED before the repair on ``warn``: the row was FAIL with the raw refusal and no word on
+    ``serve``. Mutation: return ``None`` from ``_serve_crossing``, or drop its posture read."""
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    if blanket:
+        monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    result = _client_credential_row(
+        _verify_settings(enforcement, False, str(tmp_path / "s.db"), row)
+    )
+    refusal = (
+        f"Vault KV secret provider: {strict_requests._UNREVOKED_VAULT_HOP} "
+        f"{strict_requests._SECRETS_REVOCATION_LEVER}"
+    )
+    assert result.id == row
+    assert dials == []
+    if enforcement == "enforce":
+        assert result.status is Status.FAIL
+        assert result.detail == refusal
+        return
+    assert result.status is Status.MANUAL, result.detail
+    assert result.evidence == refusal
+    assert "`serve` would dial it" in result.detail
+    assert "log a WARNING" in result.detail
+    assert TLS_REVOCATION_ATTESTED_ENV in result.detail
+    assert "cannot say whether the reference resolves" in result.detail
+    assert "[secrets].vault_revocation_attested pair" in result.detail
+
+
+def test_a_classification_that_raises_keeps_the_reads_own_fail(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """The classification must not raise out of the check, nor hide the read's failure behind its
+    own. Mutation: let the classifier's exception propagate, or report it in place of the refusal.
+    """
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    def broken(exc: BaseException | None, section: str) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    monkeypatch.setattr(strict_requests, "is_unrevoked_vault_hop_refusal", broken)
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    result = _client_credential_row(_verify_settings("warn", False, str(tmp_path / "s.db")))
+    assert result.status is Status.FAIL
+    assert "[secrets].vault_revocation_attested = true" in result.detail
+    assert "synthetic classifier fault" in (result.evidence or "")
+    assert dials == []
+
+
+def test_any_other_refusal_of_the_hop_stays_a_fail_on_warn(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """Only the revocation refusal is one ``serve`` would cross on ``warn``. A cleartext off-box
+    Vault is refused at every posture, so its row stays FAIL. The control is the same instance on
+    ``https``, which is MANUAL. Mutation: treat every ``VaultHopRefused`` as the revocation one."""
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+
+    settings = _verify_settings("warn", False, str(tmp_path / "s.db"))
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", f"http://{_HOST}:8200")
+    cleartext = _client_credential_row(settings)
+    assert cleartext.status is Status.FAIL, cleartext.detail
+    assert "vault_revocation_attested" not in cleartext.detail
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    assert _client_credential_row(settings).status is Status.MANUAL
+    assert dials == []
+
+
+def test_the_revocation_refusal_is_told_apart_by_type_and_whole_text() -> None:
+    """The classifier takes the exact type and the whole fixed text after the label, for one
+    section. Each section's real refusal, raised by the guard, is it, and only for its own
+    section. A substring, a subclass or another refusal is not it. Mutation: compare with ``in``
+    rather than ``==``, use ``isinstance``, or let the two raise texts drift from the table."""
+    from messagefoundry.transports import strict_requests
+    from messagefoundry.transports.strict_requests import (
+        VaultAttestationSection,
+        VaultHopRefused,
+        is_unrevoked_vault_hop_refusal,
+    )
+
+    pairs: tuple[tuple[VaultAttestationSection, VaultAttestationSection], ...] = (
+        ("secrets", "store"),
+        ("store", "secrets"),
+    )
+    for section, wrong in pairs:
+        with pytest.raises(VaultHopRefused) as raised:
+            _refuse(_OFF_BOX, attestation_section=section)
+        assert is_unrevoked_vault_hop_refusal(raised.value, section), section
+        assert not is_unrevoked_vault_hop_refusal(raised.value, wrong), section
+
+    reason = strict_requests._UNREVOKED_VAULT_HOP_REASONS
+    exact = VaultHopRefused(f"Vault KV secret provider: {reason['secrets']}")
+
+    class _Elsewhere(VaultHopRefused):
+        pass
+
+    for other in (
+        _Elsewhere(str(exact)),
+        InsecureHopRefused(str(exact)),
+        VaultHopRefused(f"{exact} and more"),
+        VaultHopRefused(f"label: prefix {reason['secrets']}"),
+        VaultHopRefused(reason["secrets"]),
+        VaultHopRefused(f"label: {strict_requests._CLEARTEXT_VAULT_HOP}"),
+    ):
+        assert not is_unrevoked_vault_hop_refusal(other, "secrets"), str(other)
+
+
+# --- the TLS leg to an https:// proxy (vault BACKLOG #3561) ----------------------------------
+#
+# Proxy credentials and the Vault host name cross that leg on its TLS alone. Its guard decides
+# on the hop's own posture and attestation, off the leg's own context, before its socket opens.
+
+_HTTPS_PROXY = f"https://{_PROXY_HOST}:3128"
+#: The proxy leg guard's arguments, unless a test overrides one: unattested, unknown posture.
+_PROXY_LEG_GUARD: dict[str, Any] = {
+    "connector": "Vault test hop",
+    "revocation_attested": False,
+    "attestation_section": "store",
+}
+
+
+def _proxy_leg(
+    proxy_host: str | None = _PROXY_HOST,
+    *,
+    context: ssl.SSLContext | None = None,
+    **overrides: Any,
+) -> None:
+    """One call of the proxy leg's guard, on an unchecked context unless one is given."""
+    from messagefoundry.transports.strict_requests import _refuse_an_unrevoked_proxy_leg
+
+    _refuse_an_unrevoked_proxy_leg(
+        context if context is not None else _unchecked(),
+        proxy_host,
+        **{**_PROXY_LEG_GUARD, **overrides},
+    )
+
+
+@pytest.mark.parametrize("section", ["store", "secrets"])
+@pytest.mark.parametrize("posture", [None, _ENFORCING], ids=["unknown", "enforcing"])
+def test_an_unattested_proxy_leg_is_refused_with_fixed_text(
+    section: Any, posture: HopPosture | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED before the change: nothing judged this leg. The text names the hop's own pair, says
+    the reason must cover the proxy's certificate, and names no host, port or other lever. The
+    blanket variable is set too, so this is also the clamp. Mutation: drop the guard."""
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(strict_requests.VaultHopRefused) as caught:
+        _proxy_leg(posture=posture, attestation_section=section)
+    lever = {
+        "store": strict_requests._STORE_PROXY_LEG_LEVER,
+        "secrets": strict_requests._SECRETS_PROXY_LEG_LEVER,
+    }[section]
+    text = str(caught.value)
+    assert text == f"Vault test hop: {strict_requests._UNREVOKED_PROXY_LEG} {lever}"
+    assert f"[{section}].vault_revocation_attested = true" in text
+    assert "proxy's certificate" in text
+    other = "secrets" if section == "store" else "store"
+    for absent in (f"[{other}].", _PROXY_HOST, "3128", TLS_REVOCATION_ATTESTED_ENV, "crl_file"):
+        assert absent not in text, absent
+    # A proxy-leg refusal is not the Vault leg's, so `verify` does not read it as one.
+    assert not strict_requests.is_unrevoked_vault_hop_refusal(caught.value, section)
+
+
+def test_the_proxy_leg_under_every_posture(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The decision table, on the proxy leg's guard: the hop's attestation crosses it under any
+    posture, a posture that is not enforcing warns, and the blanket variable crosses only there,
+    silently. Mutations: pass ``enforcing=True`` to the authority (the warn row refuses); pass
+    ``blanket_attested=False`` (the blanket row warns)."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _proxy_leg(posture=_NOT_ENFORCING, connector="warned hop")
+    assert any("warned hop" in line for line in _proxy_leg_lines(caplog))
+    for posture in (None, _ENFORCING, _NOT_ENFORCING):
+        _proxy_leg(posture=posture, revocation_attested=True)
+    caplog.clear()
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    _proxy_leg(posture=_NOT_ENFORCING, connector="blanket hop")
+    assert _proxy_leg_lines(caplog) == []
+    with pytest.raises(VaultHopRefused):
+        _proxy_leg(posture=_ENFORCING)
+
+
+@pytest.mark.parametrize("section", ["store", "secrets"])
+def test_the_vault_legs_refusal_names_the_proxys_certificate(section: Any) -> None:
+    """The Vault leg's guard refuses a proxied hop first, so its lever is the one an operator
+    reads, and it must say the attestation covers the proxy's certificate too. Mutation: drop
+    the proxy clause from ``_STORE_REVOCATION_LEVER``."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    with pytest.raises(VaultHopRefused) as caught:
+        _refuse(_OFF_BOX, _HTTPS_PROXY, attestation_section=section)
+    assert "https:// proxy's certificate" in str(caught.value)
+    assert _PROXY_HOST not in str(caught.value)
+
+
+@pytest.mark.parametrize("truthy", ["true", 1, object()])
+def test_only_the_value_true_attests_the_proxy_leg(truthy: object) -> None:
+    """Mutation: ``attested = bool(revocation_attested)`` in the proxy leg's guard."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    with pytest.raises(VaultHopRefused):
+        _proxy_leg(revocation_attested=truthy)
+    _proxy_leg(revocation_attested=True)  # the control
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "[::1]", "::1", "localhost"])
+def test_a_proxy_on_a_loopback_address_needs_no_attestation(host: str) -> None:
+    """The leg ends on this machine, decided without DNS. Mutation: ``on_box = False``."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    _proxy_leg(host)
+    # A name that only resolves to loopback is not proven on the box, and no host is not either.
+    for off_box in ("localhost.synthetic.test", "", None):
+        with pytest.raises(VaultHopRefused):
+            _proxy_leg(off_box)
+
+
+def test_a_proxy_leg_whose_own_context_checks_a_crl_crosses() -> None:
+    """The flag is read off the leg's own context, never off a setting, so a later CRL lever
+    that reaches the context needs no edit here. Mutation: pass ``crl_checked=False``."""
+    checking = ssl.create_default_context()
+    checking.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    _proxy_leg(context=checking)
+
+
+def test_a_proxy_leg_answer_the_guard_does_not_know_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation: ``if disposition is not HopDisposition.REFUSE: return`` in the proxy guard."""
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setattr(strict_requests, "revocation_hop_disposition", lambda **_: object())
+    with pytest.raises(strict_requests.VaultHopRefused):
+        _proxy_leg(posture=_NOT_ENFORCING)
+
+
+def _proxied_connection(**overrides: Any) -> Any:
+    """A narrowed connection to the Vault through an https proxy, as the adapter's pool opens it,
+    with the real proxy leg guard bound as the adapter binds it."""
+    import functools
+
+    from urllib3.connection import ProxyConfig
+    from urllib3.util import parse_url
+
+    from messagefoundry.transports import strict_requests
+
+    classes = strict_requests._narrowed_pool_classes(
+        ssl.create_default_context,
+        connector=_PROXY_LEG_GUARD["connector"],
+        judge_proxy_leg=functools.partial(
+            strict_requests._refuse_an_unrevoked_proxy_leg, **{**_PROXY_LEG_GUARD, **overrides}
+        ),
+    )
+    # As urllib3's proxy pool builds it: the connection dials the proxy and tunnels to Vault.
+    conn = classes["https"].ConnectionCls(
+        _PROXY_HOST,
+        3128,
+        proxy=parse_url(_HTTPS_PROXY),
+        proxy_config=ProxyConfig(
+            ssl_context=None,
+            use_forwarding_for_https=False,
+            assert_hostname=None,
+            assert_fingerprint=None,
+        ),
+    )
+    conn.set_tunnel(_HOST, 8200, scheme="https")
+    return conn
+
+
+def test_the_proxy_leg_is_refused_before_its_socket_opens(dials: list[object]) -> None:
+    """The guard runs in the connection's ``connect``, before the socket, so before ``CONNECT``
+    and any proxy credentials cross. Mutation: drop the guard's call from
+    ``_narrow_the_proxy_leg``."""
+    from urllib3.exceptions import NewConnectionError
+
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    with pytest.raises(VaultHopRefused, match=r"\[store\]\.vault_revocation_attested = true"):
+        _proxied_connection().connect()
+    assert dials == []
+    # The control: the same connection, attested, goes on to dial the proxy.
+    with pytest.raises(NewConnectionError, match="this test dials nothing"):
+        _proxied_connection(revocation_attested=True).connect()
+    assert dials == [(_PROXY_HOST, 3128)]
+
+
+def _proxy_leg_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [line for line in _crossing_lines(caplog) if "https:// proxy" in line]
+
+
+def test_each_proxy_leg_crossing_is_logged_once_for_the_hop(
+    dials: list[object], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Warned and attested crossings of the leg each log one line per process for the hop,
+    however many connections cross, and neither names an address. A leg that checks a CRL logs
+    no warning. Mutations: drop either ``_first_crossing`` (three lines of a kind); drop
+    ``kind`` from the kinds (the proxy leg shares the Vault leg's line)."""
+    from urllib3.exceptions import NewConnectionError
+
+    from messagefoundry.secretscrub import scrub_credentials
+
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    crossings: tuple[dict[str, Any], ...] = (
+        {"posture": _NOT_ENFORCING},
+        {"posture": _ENFORCING, "revocation_attested": True, "revocation_reason": _REASON},
+    )
+    for _ in range(3):
+        for overrides in crossings:
+            with pytest.raises(NewConnectionError, match="this test dials nothing"):
+                _proxied_connection(**overrides).connect()
+    assert len(dials) == 6
+    warned, attested = sorted(_proxy_leg_lines(caplog), key=lambda line: "attestation" in line)
+    assert "because [security].enforcement is not enforce" in warned
+    assert "refused unless [store].vault_revocation_attested is true" in warned
+    assert "on operator attestation" in attested
+    assert f"[store].vault_revocation_attested; reason: {_REASON})" in attested
+    for line in (warned, attested):
+        assert "Vault test hop" in line
+        assert "Logged once per process for this hop" in line
+        # Not `_assert_names_no_address`: these lines name the leg as "https:// proxy".
+        for absent in (_HOST, _PROXY_HOST, "8200", "3128", _TOKEN):
+            assert absent not in line, absent
+        assert scrub_credentials(line) == line
+    # An unattested leg whose own context checks a CRL crosses on that, with no warning.
+    caplog.clear()
+    checking = ssl.create_default_context()
+    checking.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    _proxy_leg(context=checking, posture=_NOT_ENFORCING, connector="other")
+    assert _proxy_leg_lines(caplog) == []
+
+
+@_ENTRY_POINTS
+def test_each_entry_point_hands_its_posture_to_the_proxy_leg(
+    entry: EntryPoint,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Through an https proxy on a warn instance, both legs cross with a line each, and the hop
+    dials the proxy. The posture reaches the proxy leg only if the adapter binds it into the
+    guard it hands its pool classes. Mutation: bind ``posture=None`` there (the leg is
+    refused)."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    monkeypatch.setenv("HTTPS_PROXY", _HTTPS_PROXY)
+    with pytest.raises(_FAIL_CLOSED) as caught:
+        entry(monkeypatch, _OFF_BOX, False, _NOT_ENFORCING)
+    _assert_crossed(caught, entry)
+    assert dials == [(_PROXY_HOST, 3128)]
+    (proxy_line,) = _proxy_leg_lines(caplog)
+    assert _HOPS[entry][1] in proxy_line
+    assert len(_crossing_lines(caplog)) == 2

@@ -110,6 +110,7 @@ _ARMS: list[tuple[str, Callable[[Path, Path], list[str]]]] = [
         "restore-verify",
         lambda cfg, tmp: ["restore-verify", _archive(tmp), "--service-config", str(cfg)],
     ),
+    ("cipher-audit", lambda cfg, tmp: ["cipher-audit", "--service-config", str(cfg)]),
     (
         "restore",
         lambda cfg, tmp: [

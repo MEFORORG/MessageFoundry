@@ -143,7 +143,7 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
     ),
     _Allowed(
-        "messagefoundry/config/code_sets.py::load_policy::CodeSetError::CodeSetError",
+        "messagefoundry/config/code_sets.py::parse_policy::CodeSetError::CodeSetError",
         _SAFE + "the new message interpolates the caught CodeSetError whole",
     ),
     _Allowed(
@@ -164,7 +164,7 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "the new message is that same text",
     ),
     _Allowed(
-        "messagefoundry/config/wiring.py::EnvRef.__post_init__::ValueError::WiringError",
+        "messagefoundry/config/wiring.py::_strict_bool_default::ValueError::WiringError",
         _SAFE + "_cast_bool's fixed text withholds the value and lists the spellings, which the "
         "new message also lists",
     ),
@@ -221,8 +221,20 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "queue.Empty carries nothing",
     ),
     _Allowed(
-        "messagefoundry/pipeline/sandbox.py::SandboxSession.dispatch::Empty::SandboxError",
+        "messagefoundry/pipeline/sandbox.py::SandboxSession._await_answer::Empty::SandboxError",
         _SAFE + "queue.Empty carries nothing",
+    ),
+    _Allowed(
+        "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::SandboxError::error",
+        _SAFE + "the lookup error quotes the codec refusal, which names a slot, a type or a size "
+        "and never a value; the cause is dropped so the Handler sees the mode=off error type alone. "
+        "Two sites: describing the arguments, and framing them",
+        count=2,
+    ),
+    _Allowed(
+        "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::(OSError, SandboxError)::error",
+        _SAFE + "the lookup error quotes the pipe or frame refusal, which names a frame and never "
+        "its content (decode_frame keeps only safe_exc text)",
     ),
     _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",

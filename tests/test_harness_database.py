@@ -610,23 +610,14 @@ def test_without_credentials_in_the_environment_both_connectors_fail_isolated(
     assert rows[("destination", _database.OUTBOUND_NAME)] == "failed"
 
 
-class _MislabelledAlert(AssertionError):
-    """The one failure the xfail below is about; any other failure reports as a real failure."""
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=_MislabelledAlert,
-    reason=(
-        "engine defect: LoggingAlertSink.connection_stopped (messagefoundry/pipeline/alerts.py) "
-        "words every alert 'outbound %r halted', and RegistryRunner._record_failed calls it for an "
-        "INBOUND that failed to start too, whose detail ('failed to start: ...') names no direction "
-        "-- so an inbound startup failure would be alerted to an operator as an outbound"
-    ),
-)
 def test_an_inbound_that_fails_to_start_is_not_alerted_as_an_outbound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """RegistryRunner._record_failed routes an INBOUND's start failure through
+    ``connection_stopped`` too, and LoggingAlertSink once worded every such alert ``outbound %r
+    halted``, so an inbound that failed to start would have been alerted to an operator as an
+    outbound (BACKLOG #1741). Pin the direction-neutral wording on the end-to-end path, every line, not one old
+    substring."""
     for name in _database.REQUIRED_ENV:
         monkeypatch.delenv(name, raising=False)
     with (
@@ -634,14 +625,21 @@ def test_an_inbound_that_fails_to_start_is_not_alerted_as_an_outbound(
         _served(tmp_path),
     ):
         pass
+    # Only the sink's own lines: the runner's "alert sink raised on connection_stopped" error also
+    # names the inbound, and would satisfy the control with no alert sent.
     alerts = [
         r.getMessage()
         for r in caplog.records
-        if "connection_stopped" in r.getMessage() and repr(_database.INBOUND_NAME) in r.getMessage()
+        if r.name == "messagefoundry.pipeline.alerts"
+        and r.getMessage().startswith("ALERT connection_stopped:")
+        and repr(_database.INBOUND_NAME) in r.getMessage()
     ]
     assert alerts, "control: the inbound's failed start raised no connection_stopped alert"
-    if any(f"outbound {_database.INBOUND_NAME!r}" in line for line in alerts):
-        raise _MislabelledAlert(alerts[0])
+    expected = (
+        f"ALERT connection_stopped: connection {_database.INBOUND_NAME!r} stopped: failed to start:"
+    )
+    mislabelled = [line for line in alerts if not line.startswith(expected)]
+    assert not mislabelled, mislabelled
 
 
 # --- live: a real SQL Server, gated -------------------------------------------------------------------

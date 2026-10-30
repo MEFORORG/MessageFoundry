@@ -334,7 +334,7 @@ tool too.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). It briefs at full speed with no work-in-progress limit: at least the open PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave PR (owner ruling 2026-10-26). Usage limits still bind, at least a Steward hold and the Workflow gate; korus `roles/STEWARD.md` and `roles/COMMON.md` define them. ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
@@ -438,6 +438,20 @@ the Lander spawns a Manager rather than fixing the PR itself, because authoring 
 nobody checked it. A Manager seat added, the same day, that spawning should be rare: a subagent
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
+
+**The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
+(decided by the Lander under the owner's delegation of 2026-10-29, decision
+d20261029T165610526-c13ae6). All of these must hold: 4 hours with no author comment or commit since
+the hold; the Lander mailed the author's seat-record worktree path and had no reply; the author's
+claim and seat record show no live session; the PR is not queued and has no armed auto-merge
+request; the hold names one determinate fix, not a question of intent, of an owner ruling or of
+behaviour; and the PR is not ASVS record content, which stays a Manager's. The Builder fetches
+before it pushes, never force-pushes, stops if the head moved, and makes only the fixes the hold
+names. One repair per PR; a second hold goes to a spawned Manager. Every other non-trivial fix
+still goes to a spawned Manager session, as the paragraph above says. The Lander merges only once a
+code-review fork at `xhigh` that the Lander starts itself, on the repair head, covers it, its tag
+read with `review_tag.py`; the repair Builder's own QA does not count. That independent review is
+what keeps authoring apart from landing.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
@@ -645,7 +659,11 @@ Manager's watch reached the cloud session 29 seconds after its question.
   acts."* It covers only the question answered that way, in the asking seat's own chat: starting a
   session with either skill delegates nothing, and a peer relaying such an answer is not a record.
   Korus `roles/COMMON.md`, *An Owner answer of /driver or /empower delegates that specific
-  question*, carries the same ruling.
+  question*, carries the same ruling. A factual error in prose is a filed row, except a false
+  statement in a security or assurance record about what a control does, a score or an anchor:
+  that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
+  for that ruling. A finding the Lander cannot classify goes to the owner (decision
+  d20261029T165623191-578690).
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
@@ -692,7 +710,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   a NEW correctness defect. **Name the skill, not "a review":** the looser word lets an ad-hoc
   read of the diff pass as compliance. `code-review` is a skill and not an agent type, so call it by
   the skill name. Cap repair at **two rounds**, then
-  ship with the critic notes in your exit report. korus `roles/BUILDER.md` section 4c is the source
+  ship with the critic notes in your exit report. If a fix commit landed after the last review
+  that ran, run one more round on the pushed head, fix nothing it finds, ship its findings, and
+  write the QA line as `Rounds: 2 + 1 unrepaired` (decision d20261029T165623191-578690).
+  korus `roles/BUILDER.md` section 4c is the source
   of record for the reasoning and the traps; do not restate them here.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file

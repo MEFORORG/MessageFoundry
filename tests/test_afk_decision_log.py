@@ -32,7 +32,10 @@ DECISION = COORD / "decision.ps1"
 
 pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
 
-B_DECISION = (
+# B_DECISION is reviewed, so -Log's class B gate does not run on it. Unreviewed, -Log would exit 11
+# or 12 with the gate's answer, and its cost rung would read the host account's usage files. These
+# tests are about the log's storage; tests/test_afk_gate.py holds the unreviewed path.
+B_UNREVIEWED = (
     "-Log",
     "-Item",
     "3905",
@@ -51,6 +54,7 @@ B_DECISION = (
     "-Confidence",
     "80",
 )
+B_DECISION = (*B_UNREVIEWED, "-Reviewed", "yes", "-ReviewedBy", "a fresh-context reviewer")
 
 
 @pytest.fixture
@@ -98,7 +102,8 @@ def test_log_posts_one_comment_to_the_days_issue_with_the_full_schema(sb: Sandbo
     ]
     assert rec["alternatives"] == ["one PR"]
     assert rec["undo"] == "close the second PR" and rec["confidence"] == 80
-    assert rec["reviewed"] == "no" and rec["outcome"] == "pending"
+    assert rec["reviewed"] == "yes" and rec["reviewedBy"] == "a fresh-context reviewer"
+    assert rec["outcome"] == "pending" and rec["gate"] == "" and rec["buildsOn"] == []
     assert rec["session"] == "sess-test-0001" and rec["posted"] is True
     assert sb.spool() == [], "a posted record stayed in the spool"
 
@@ -205,7 +210,9 @@ def test_list_says_incomplete_when_the_vault_cannot_be_read(sb: Sandbox) -> None
     assert "[spooled, not posted]" in proc.stdout
 
 
-LOG_NO_SEAT = ("-Log", "-Item", "1", "-Class", "B", "-Recommendation", "x", "-NoPost")
+# Class C, which -Log's class B gate does not run on, for the reason at B_DECISION: these tests
+# are about the seat lookup.
+LOG_NO_SEAT = ("-Log", "-Item", "1", "-Class", "C", "-Recommendation", "x", "-NoPost")
 SID = "sess-test-0001"
 
 
@@ -262,7 +269,7 @@ def test_the_newer_of_the_two_boxes_names_the_seat(sb: Sandbox) -> None:
     for item, newer in (("101", "hosted"), ("102", "legacy")):
         _seat_file(seats, hosted, {**(new if newer == "hosted" else old), "seat": "hosted-seat"})
         _seat_file(seats, legacy, {**(new if newer == "legacy" else old), "seat": "legacy-seat"})
-        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        args = ("-Log", "-Item", item, "-Class", "C", "-Recommendation", "x", "-NoPost")
         proc = sb.run(DECISION, *args)
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         got[newer] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
@@ -349,7 +356,7 @@ def test_an_empty_record_skips_only_itself(sb: Sandbox) -> None:
         valid = legacy if empty == hosted else hosted
         _seat_file(seats, empty, "{}")
         _seat_file(seats, valid, {"seat": f"valid-{item}", "asOf": "2026-10-20T08:00:00Z"})
-        args = ("-Log", "-Item", item, "-Class", "B", "-Recommendation", "x", "-NoPost")
+        args = ("-Log", "-Item", item, "-Class", "C", "-Recommendation", "x", "-NoPost")
         proc = sb.run(DECISION, *args)
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         got[item] = next(str(r["seat"]) for r in _list(sb) if str(r["item"]) == item)
@@ -418,7 +425,7 @@ def test_the_sandbox_does_not_pass_the_coord_root_or_agent_through(
         pytest.param(("-Log", "-Kind", "rating", "-Ref", "x1"), "", id="bad-ref"),
         pytest.param(("-Log", "-Kind", "outcome"), "Outcome, Ref", id="outcome"),
         pytest.param(("-Log", "-Kind", "tripwire"), "Note", id="tripwire"),
-        pytest.param((*B_DECISION, "-Reviewed", "yes"), "", id="reviewed-without-reviewer"),
+        pytest.param((*B_UNREVIEWED, "-Reviewed", "yes"), "", id="reviewed-without-reviewer"),
         pytest.param(
             ("-Log", "-Item", "1", "-Class", "B", "-Seat", "m", "-Recommendation", "x")
             + ("-Predicate", "live=ok\nno-equals"),

@@ -213,14 +213,6 @@ AUDIT_MAC_HEX_LEN = 2 * hashlib.sha256().digest_size
 #: so no row can declare its chain keyless; whether a store runs keyless is its configuration.
 AUDIT_KEYLESS_MAC = "sha256"
 
-# HKDF info label for the secret-rotation fingerprint MAC key (ASVS 13.3.4, BACKLOG #282). A DEDICATED,
-# domain-separated subkey off the DEK: the rotation watcher fingerprints each tracked secret with a KEYED
-# MAC (never a salted hash — a salted hash of a low-entropy SMTP/AD password is offline-guessable), and
-# this is the key it is HMAC'd under. Versioned like _AUDIT_MAC_INFO so a future re-derivation is an
-# additive label, never a silent change to an existing deployment's derived key.
-_ROTATION_FP_INFO = b"mefor/secret-rotation-fingerprint/v1"
-_ROTATION_FP_LEN = 32  # bytes — HMAC-SHA256 key
-
 # HKDF info label for the audit body-digest key (vault BACKLOG #2615). An edit-resend's audit row holds
 # a KEYED digest of the original and the edited body, so a site can show afterwards what was sent once
 # retention has blanked both bodies. Keyed, never a plain hash: a short PHI body (one result value, one
@@ -242,7 +234,7 @@ BODY_DIGEST_UNNAMED_KDF = "hkdf-sha256:mefor/audit-chain/v1,hkdf-sha256:mefor/au
 
 # Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
 # `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
-# so it is a different key from the audit key, the rotation-fingerprint key and every data key, and a
+# so it is a different key from the audit key and every data key, and a
 # data-key roll never touches it. The ROW-SEAL KEY is derived from that root under a second label
 # followed by the store id. Both labels are fixed-length, so `label || store_id` is unambiguous.
 _AUTHZ_ROOT_INFO = b"mefor/root/authz/v1"
@@ -846,62 +838,147 @@ def row_seal_key_id(seal_key: bytes) -> str:
     return hashlib.sha256(_ROW_SEAL_KEY_ID_INFO + seal_key).hexdigest()[:_KEY_ID_LEN]
 
 
-def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
-    """Derive the secret-rotation fingerprint MAC key from the store DEK (ASVS 13.3.4, BACKLOG #282).
-
-    HKDF-SHA256 over the cipher's in-heap audit-MAC key (itself a DEK-derived subkey), under a dedicated
-    ``mefor/secret-rotation-fingerprint/v1`` info label so it is **domain-separated** from the audit-chain
-    key. The rotation watcher fingerprints each tracked secret as ``HMAC(this-key, value)`` — a KEYED MAC,
-    never a salted hash — so the persisted fingerprint of a low-entropy AD/SMTP secret is not offline-
-    guessable and reveals nothing about the value; the key is never stored beside the fingerprint.
-
-    Returns ``None`` when there is no in-heap keying material: the identity (keyless) cipher, OR a
-    ``vault_transit`` cipher whose DEK never enters the engine heap (``audit_mac_key()`` is ``None`` — the
-    audit MAC runs inside Transit). In both cases per-secret fingerprinting is unavailable in-process and
-    the watcher tracks only the non-secret DEK key-id stamp."""
-    base = cipher.audit_mac_key()
-    return None if base is None else _derive_rotation_fp_key(base)
+#: The scheme tag of a stored non-DEK secret-rotation fingerprint (BACKLOG #3472, ADR 0213): a
+#: store-cipher cell sealing a per-row random HMAC-SHA256 key, the value's MAC under it cut to 32
+#: hex, and the row's ``secret_key``. The plaintext layout belongs to
+#: :mod:`messagefoundry.pipeline.secret_rotation`. Changing it, or this sealing, means a new tag.
+ROTATION_FP_SEALED_SCHEME = "sealed-hmac-sha256-32"
 
 
-def rotation_fingerprint_keys(cipher: Cipher) -> list[bytes]:
-    """Every secret-rotation fingerprint key ``cipher`` can derive: the active DEK's and each retired
-    DEK's (BACKLOG #2242). A DEK rotation changes :func:`rotation_fingerprint_key`, so the watcher
-    uses these to recompute a stored fingerprint under the key that made it and tell a re-key from
-    a changed secret. Empty when there is no in-heap keying material."""
-    return [_derive_rotation_fp_key(base) for base in cipher.audit_mac_keyring().values()]
+def rotation_fingerprint_cipher(cipher: Cipher) -> AesGcmCipher | None:
+    """``cipher`` when a store under it fingerprints its secrets, else ``None`` (BACKLOG #3472, ADR
+    0213).
+
+    Only the in-process AES-GCM cipher does, the ``key_provider = vault`` one included. The identity
+    (keyless) cipher has no key to seal under. ``vault_transit`` could seal without a key in heap;
+    whether it should is a separate decision nobody has taken (vault BACKLOG #3473), so it stays off,
+    as it was while the fingerprint key was derived from an in-heap audit key."""
+    return cipher if isinstance(cipher, AesGcmCipher) else None
 
 
-def _derive_rotation_fp_key(audit_mac_key: bytes) -> bytes:
+def _rotation_fp_aad(secret_key: str) -> bytes:
+    """The cell AAD a sealed fingerprint is bound under: its own row, keyed by ``secret_key``."""
+    return cell_aad("secret_rotation_meta", "fingerprint", secret_key)
+
+
+def seal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, cell: str) -> str:
+    """``cell`` sealed as row ``secret_key``'s stored fingerprint, behind
+    :data:`ROTATION_FP_SEALED_SCHEME` (BACKLOG #3472)."""
+    return scheme_tagged(
+        ROTATION_FP_SEALED_SCHEME, cipher.encrypt(cell, aad=_rotation_fp_aad(secret_key))
+    )
+
+
+def open_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:
+    """The plaintext of row ``secret_key``'s sealed fingerprint ``stored``, or ``None``.
+
+    ``None`` when ``stored`` is not a sealed fingerprint (a DEK key id, a pre-#3472 keyed MAC, an
+    unknown tag, a blank), when no configured key opens it under this row's AAD (a key not
+    supplied, a cell moved from another row, a corrupt value), and when the plaintext's third
+    ``:``-field is not exactly ``secret_key``. The first two fields are hex, so only the class id
+    may hold a ``:``. That last check is what refuses a moved cell that the frozen v1 writer sealed
+    with no AAD, so the rotation pass never re-seals one as this row's. The caller keeps that row's
+    dates, so a cell it cannot read never resets a clock."""
+    head, sep, inner = stored.partition(":")
+    if not sep or head != ROTATION_FP_SEALED_SCHEME or not cipher.is_encrypted(inner):
+        return None
+    try:
+        cell = cipher.decrypt(inner, aad=_rotation_fp_aad(secret_key))
+    except CipherError:
+        return None
+    parts = cell.split(":", 2)
+    return cell if len(parts) == 3 and parts[2] == secret_key else None
+
+
+def reseal_rotation_fingerprint(cipher: AesGcmCipher, secret_key: str, stored: str) -> str | None:
+    """``stored`` re-sealed under the active key, for ``reencrypt_to_active`` (BACKLOG #3472).
+
+    ``None`` when it cannot be opened, as :func:`open_rotation_fingerprint` says. The rotation then
+    leaves the cell as it is: a fingerprint is not PHI, and a cell no key opens must not stop a key
+    rotation. The next engine start keeps that row's dates and seals a fresh cell."""
+    cell = open_rotation_fingerprint(cipher, secret_key, stored)
+    return None if cell is None else seal_rotation_fingerprint(cipher, secret_key, cell)
+
+
+def rotation_fingerprint_reseal_likes(active_like: str) -> tuple[str, str]:
+    """The two ``LIKE`` patterns each backend's rotation pass selects sealed fingerprints by: sealed,
+    and not already under the active key (``active_like`` is the cipher's active-format prefix and
+    ``%``). Built once, so the three backends select the same rows."""
+    tag = f"{ROTATION_FP_SEALED_SCHEME}:"
+    return f"{tag}%", f"{tag}{active_like}"
+
+
+def reseal_rotation_fingerprints(
+    cipher: AesGcmCipher, rows: Sequence[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """``(new stored value, secret_key)`` for each ``(secret_key, stored)`` row that re-seals under
+    the active key, for the rotation pass of every backend (BACKLOG #3472). A row no configured key
+    opens is left out and counted in one WARNING, by count only: its ``secret_key`` may be an
+    operator-chosen ``env()`` name, never logged here."""
+    updates: list[tuple[str, str]] = []
+    for secret_key, stored in rows:
+        resealed = reseal_rotation_fingerprint(cipher, secret_key, stored)
+        if resealed is not None:
+            updates.append((resealed, secret_key))
+    if len(updates) < len(rows):
+        _log.warning(
+            "key rotation: %d secret-rotation fingerprint(s) could not be read: no configured key "
+            "opens it, or it belongs to another row. They were left as they are. The next engine "
+            "start keeps those secrets' rotation dates and seals a new fingerprint for each.",
+            len(rows) - len(updates),
+        )
+    return updates
+
+
+def _derive_from_audit_key(audit_key: bytes, info: bytes) -> bytes:
+    """A 32-byte key HKDF-SHA256 derives from one audit-chain key under the label ``info``. Callers
+    go through a named wrapper, so no call site can pick up another digest's label by omission."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(), length=_ROTATION_FP_LEN, salt=None, info=_ROTATION_FP_INFO
-    )
-    return hkdf.derive(audit_mac_key)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=info)
+    return hkdf.derive(audit_key)
 
 
 def _derive_body_digest_key(audit_key: bytes) -> bytes:
     """The body-digest key derived from one audit-chain key, under its own label."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(), length=_BODY_DIGEST_LEN, salt=None, info=_BODY_DIGEST_INFO
-    )
-    return hkdf.derive(audit_key)
+    return _derive_from_audit_key(audit_key, _BODY_DIGEST_INFO)
 
 
-def _body_mac(key: bytes, body: str) -> HMAC:
-    """An HMAC-SHA256 context over ``body``, ready to finalize or verify. The ``cryptography`` HMAC
+def _mac_matches(mac: HMAC, digest: str) -> bool | None:
+    """Whether ``mac`` matches the hex ``digest``, compared in constant time; ``None`` when
+    ``digest`` is not the hex of one HMAC-SHA256 output, so a corrupt or cut record reads as
+    "could not check", never as a mismatch."""
+    try:
+        expected = bytes.fromhex(digest)
+    except ValueError:
+        return None
+    if len(expected) != hashlib.sha256().digest_size:
+        return None
+    from cryptography.exceptions import InvalidSignature
+
+    try:
+        mac.verify(expected)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def _bytes_mac(key: bytes, data: bytes) -> HMAC:
+    """An HMAC-SHA256 context over ``data``, ready to finalize or verify. The ``cryptography`` HMAC
     this module already uses for HKDF, so its ``verify`` gives the constant-time compare."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives import hmac as crypto_hmac
 
     mac = crypto_hmac.HMAC(key, hashes.SHA256())
-    # surrogatepass: a body decoded with surrogateescape still digests, rather than raising here.
-    mac.update(body.encode("utf-8", "surrogatepass"))
+    mac.update(data)
     return mac
+
+
+def _body_mac(key: bytes, body: str) -> HMAC:
+    """:func:`_bytes_mac` over ``body``'s UTF-8."""
+    # surrogatepass: a body decoded with surrogateescape still digests, rather than raising here.
+    return _bytes_mac(key, body.encode("utf-8", "surrogatepass"))
 
 
 def audit_body_digests(cipher: Cipher, /, **bodies: str) -> dict[str, str | None] | None:
@@ -973,17 +1050,69 @@ def verify_audit_body_digest(
     audit_key = cipher.audit_mac_keyring().get(key_id)
     if audit_key is None or not body or not isinstance(digest, str):
         return False
-    try:
-        expected = bytes.fromhex(digest)
-    except ValueError:
-        return False
-    from cryptography.exceptions import InvalidSignature
+    return _mac_matches(_body_mac(_derive_body_digest_key(audit_key), body), digest) is True
 
-    try:
-        _body_mac(_derive_body_digest_key(audit_key), body).verify(expected)
-    except InvalidSignature:
-        return False
-    return True
+
+# HKDF info label for the refused-body digest key (vault BACKLOG #2608). Its own label, not the
+# edit-resend one: this digest is over the received BYTES and that one over the stored TEXT, so a
+# match between the two would claim an equality of bodies it never checked.
+_REFUSED_BODY_DIGEST_INFO = b"mefor/refused-body-digest/v1"
+#: The two HKDF-SHA256 steps a refused-body digest key takes from the DEK, as its record names them.
+REFUSED_BODY_DIGEST_KDF = (
+    AUDIT_SCHEME_IN_HEAP.kdf + ",hkdf-sha256:" + _REFUSED_BODY_DIGEST_INFO.decode("ascii")
+)
+
+
+def _derive_refused_body_digest_key(audit_key: bytes) -> bytes:
+    """The refused-body digest key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _REFUSED_BODY_DIGEST_INFO)
+
+
+def refused_body_digest(cipher: Cipher, wire: bytes) -> dict[str, str] | None:
+    """A keyed digest of a body the listener refused before ingress, exactly as received (vault
+    BACKLOG #2608). When the engine records it, and why it is keyed, is stated once in
+    docs/CONFIGURATION.md under ``[inbound].refused_body_allowance_bytes``.
+
+    Returns ``{"alg", "kdf", "key_id", "digest"}``: HMAC-SHA256 under a key HKDF-SHA256 derives from
+    the in-heap audit-chain key under ``mefor/refused-body-digest/v1``, and :func:`audit_key_id` of
+    that audit key, so :func:`verify_refused_body_digest` still finds it after a rotation while the
+    retired key stays configured. Returns ``None`` when there is no in-heap key: a keyless store, or
+    a Vault Transit cipher whose audit key never enters the engine. An empty body digests like any
+    other, since it is what came in."""
+    audit_key = cipher.audit_mac_key()
+    if audit_key is None:
+        return None
+    return {
+        "alg": BODY_DIGEST_ALG,
+        "kdf": REFUSED_BODY_DIGEST_KDF,
+        "key_id": audit_key_id(audit_key),
+        "digest": _bytes_mac(_derive_refused_body_digest_key(audit_key), wire).finalize().hex(),
+    }
+
+
+def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> bool | None:
+    """Whether ``wire`` is the body a :func:`refused_body_digest` ``record`` was taken of (vault
+    BACKLOG #2608), compared in constant time.
+
+    ``record`` may be the ``body_hmac`` dict or the whole refused-body record that holds it.
+    ``True`` for a match and ``False`` for a mismatch. ``None`` when it cannot be checked, so a
+    caller never reads "unknown" as "not this body": ``record`` is not such a dict (a ``null``
+    ``body_hmac`` included), it names another scheme, its digest is not one HMAC-SHA256 output in
+    hex, or its audit key is not in the cipher's keyring, as after the retired key is dropped from
+    configuration, and always on a keyless cipher."""
+    if isinstance(record, dict) and "body_hmac" in record:
+        record = record["body_hmac"]
+    if not isinstance(record, dict):
+        return None
+    if (record.get("alg"), record.get("kdf")) != (BODY_DIGEST_ALG, REFUSED_BODY_DIGEST_KDF):
+        return None
+    key_id, digest = record.get("key_id"), record.get("digest")
+    if not isinstance(key_id, str) or not isinstance(digest, str):
+        return None
+    audit_key = cipher.audit_mac_keyring().get(key_id)
+    if audit_key is None:
+        return None
+    return _mac_matches(_bytes_mac(_derive_refused_body_digest_key(audit_key), wire), digest)
 
 
 def new_store_salt() -> bytes:
