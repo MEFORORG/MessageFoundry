@@ -121,14 +121,16 @@ here, like ADR 0014's deferred durable cross-node dedup).
 > **Amendment (2026-10-30, BACKLOG #3756) -- an inverse's background write is retried within a
 > bound.** This adds to D2 and changes none of it: an emit method still never raises into its
 > caller and never blocks on the store, because it only schedules the write. What changed is that
-> background write, for an inverse only. `NotifierAlertSink._run_state` now tries an auto-resolve
-> up to 4 times, waiting 0.25 s, 0.5 s and 1 s between tries, 1.75 s in all, which fits inside the
-> 5 s the engine gives `drain_state` at stop. The tries and their waits run under the instance
+> background write, for an inverse only. `NotifierAlertSink._run_state` now retries a failed
+> auto-resolve a bounded number of times, with the short waits
+> `NotifierAlertSink._INVERSE_RETRY_DELAYS` sets. The tries and their waits run under the instance
 > key's lock, so a write emitted later for the same key still lands after the resolve (BACKLOG
-> #2272 defect 8). When the last try fails, the sink logs an ERROR naming the alert type and the
-> connection, and the alert stays open until the next inverse resolves it. At stop, `drain_state`
-> cancels a write still running at its deadline and logs that at ERROR, so no retry outlives the
-> store. Three things are unchanged. An upsert is still tried once. Nothing persists a resolve
+> #2272 defect 8). Only the waits are bounded: each try also lasts as long as the store takes to
+> fail. When the last try fails, the sink logs an ERROR naming the alert type and the connection,
+> and the alert stays open until a later inverse or an operator resolves it. Several inverses fire
+> once per transition, so a later one may never come. At stop, `drain_state` cancels a resolve
+> still retrying at its deadline and logs that at ERROR; a write on its first try is left running
+> as before. Three things are unchanged. An upsert is still tried once. Nothing persists a resolve
 > across a restart. An emit made with no running event loop still drops the write, and a retry
 > cannot help that case, because there is no loop to run one on.
 

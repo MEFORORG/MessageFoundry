@@ -1086,6 +1086,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #3756: the state-write tasks now retrying a failed resolve, so drain_state can stop
+        # them at its deadline without touching a write still on its first attempt.
+        self._retrying: set[asyncio.Task[Any]] = set()
         # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
         # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
         # stay concurrent. An entry is dropped once no write holds or awaits it.
@@ -1952,9 +1955,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # BACKLOG #3756: the waits between an inverse's resolve attempts, so it is tried one more time
     # than there are waits before the sink gives up and logs an ERROR. Each wait runs while the
-    # retry holds the key's lock, so a later write for that key waits it out. They add up to
-    # 1.75 s, well inside the 5 s the engine gives drain_state at stop
-    # (engine._ALERT_STATE_DRAIN_SECONDS).
+    # retry holds the key's lock, so a later write for that key waits it out. Only the waits are
+    # bounded here: each attempt also takes as long as the store takes to fail, which on SQLite
+    # can be its whole busy timeout. drain_state stops a retry still running at its deadline, and
+    # test_alert_state pins that the waits alone fit inside engine._ALERT_STATE_DRAIN_SECONDS.
     _INVERSE_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
 
     def _record_state(
@@ -2070,19 +2074,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         delays = () if resolves is None else self._INVERSE_RETRY_DELAYS
         attempts = len(delays) + 1
         landed = False
+        task = asyncio.current_task()
         try:
             async with hold_keyed_lock(self._state_locks, key):
                 for attempt in range(1, attempts + 1):
                     try:
                         await write()
-                    except Exception:
+                    except Exception as exc:
                         # The alert-instance write is a side observer: a store error must never wedge
-                        # a delivery worker or drop the notification. Log metadata only (no event body),
-                        # and the traceback once, on the last attempt.
+                        # a delivery worker or drop the notification. Log metadata only (no event body):
+                        # every attempt's exception type, and the traceback once, on the last attempt.
                         log.warning(
-                            "alert-instance state write failed", exc_info=attempt == attempts
+                            "alert-instance state write failed (%s)",
+                            type(exc).__name__,
+                            exc_info=attempt == attempts,
                         )
                         if attempt < attempts:
+                            if task is not None:
+                                self._retrying.add(task)
                             await asyncio.sleep(delays[attempt - 1])
                     else:
                         landed = True
@@ -2105,6 +2114,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
             raise
         finally:
+            self._retrying.discard(task)
             # A cancel, too, is settled as not landed: the row is most likely still open.
             if on_settled is not None:
                 on_settled(landed)
@@ -2113,21 +2123,25 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
         calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
         node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
-        still running at the deadline, a resolve's retry among them, is cancelled and logged at
-        ERROR (BACKLOG #3756), so no retry outlives the store; this never raises and does not wait
+        still on its first attempt at the deadline is left to fail as before. A resolve already
+        retrying then (BACKLOG #3756), or when this wait is itself cancelled, is cancelled and
+        logged at ERROR, so it does not go on retrying against the store being closed. A resolve
+        that first fails after this returns can still retry. This never raises and does not wait
         for the cancelled writes to finish."""
-        pending = set(self._state_tasks)
-        if not pending:
-            return
-        _, late = await asyncio.wait(pending, timeout=timeout)
-        if late:
-            for task in late:
+        try:
+            pending = set(self._state_tasks)
+            if pending:
+                await asyncio.wait(pending, timeout=timeout)
+        finally:
+            retrying = [t for t in self._retrying if not t.done()]
+            for task in retrying:
                 task.cancel()
-            log.error(
-                "%d alert-instance state write(s) still running at the alert-state drain deadline "
-                "were cancelled",
-                len(late),
-            )
+            if retrying:
+                log.error(
+                    "%d alert-instance resolve(s) still retrying at the alert-state drain deadline "
+                    "were cancelled",
+                    len(retrying),
+                )
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 

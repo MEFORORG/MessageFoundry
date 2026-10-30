@@ -779,7 +779,8 @@ class _FlakyResolveStore(_GatedStore):
 
 @pytest.fixture
 def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    zeros = (0.0,) * len(NotifierAlertSink._INVERSE_RETRY_DELAYS)
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", zeros)
 
 
 _ATTEMPTS = len(NotifierAlertSink._INVERSE_RETRY_DELAYS) + 1
@@ -844,12 +845,30 @@ async def test_an_upsert_is_not_retried() -> None:
     assert store.upsert_calls == 1
 
 
+def test_the_retry_waits_fit_inside_the_stop_drain() -> None:
+    # The waits alone; an attempt's own time is not bounded here (see the constant's comment).
+    from messagefoundry.pipeline.engine import _ALERT_STATE_DRAIN_SECONDS
+
+    assert sum(NotifierAlertSink._INVERSE_RETRY_DELAYS) < _ALERT_STATE_DRAIN_SECONDS
+
+
 async def test_a_raise_emitted_during_a_resolve_retry_lands_after_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The resolve fails once and waits out its backoff. A raise emitted meanwhile for the same key
     # must not land in that gap, or the retry would then close a condition that is open again.
-    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.05, 0.05, 0.05))
+    # The backoff waits on a gate rather than the clock, so the test does not race a timer.
+    gate = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay: float, result: Any = None) -> Any:
+        if delay == 30.0:
+            await gate.wait()
+            return result
+        return await real_sleep(delay, result)
+
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (30.0, 30.0, 30.0))
+    monkeypatch.setattr(asyncio, "sleep", gated_sleep)
     store = _FlakyResolveStore(fail=1)
     sink = NotifierAlertSink([], store=store)
     sink.connection_restored("OB_X")
@@ -858,6 +877,7 @@ async def test_a_raise_emitted_during_a_resolve_retry_lands_after_it(
     sink.connection_error("OB_X", kind="connection_lost", detail="refused")
     await _spin()
     assert store.upsert_calls == 0  # queued behind the resolve's retry, under the key's lock
+    gate.set()
     await _drain(sink)
     assert store.log == ["resolve OB_X", "upsert OB_X"]
     assert store.open == {"connection_error:OB_X"}
@@ -886,7 +906,23 @@ async def test_drain_state_cancels_a_retry_still_running_at_its_deadline(
     errors = _errors(caplog)
     assert any("drain deadline" in e for e in errors)
     assert any("cancelled before it landed" in e and "'OB_X'" in e for e in errors)
-    assert sink._state_tasks == set() and sink._state_locks == {}
+    assert sink._state_tasks == set() and sink._state_locks == {} and sink._retrying == set()
+
+
+async def test_drain_state_leaves_a_first_attempt_running_at_its_deadline() -> None:
+    # A write on its first attempt is not cancelled at the deadline, so a clear raised on the way
+    # out can still land while the store closes (BACKLOG #2272). Only a retry is stopped.
+    store = _GatedStore(slow="resolve")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_restored("OB_X")
+    (task,) = sink._state_tasks
+    await _spin()
+    await asyncio.wait_for(sink.drain_state(0), timeout=5.0)
+    await _spin()
+    assert not task.done()
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X"]
 
 
 def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:

@@ -1557,7 +1557,8 @@ async def test_a_resolve_the_store_failed_to_write_once_lands_in_the_same_pass(
     """The notifier retries an inverse's resolve within a bound (BACKLOG #3756), so one failed
     store write no longer leaves the alert open until the next pass: the retry lands it in the
     same pass."""
-    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    zeros = (0.0,) * len(NotifierAlertSink._INVERSE_RETRY_DELAYS)
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", zeros)
     names = ["u1", "u2", "ok1", "ok2", "ok3"]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
         sink = NotifierAlertSink([], store=store)
@@ -1585,7 +1586,8 @@ async def test_a_resolve_the_store_never_wrote_is_retried_on_the_next_pass(
 ) -> None:
     """A resolve whose every attempt fails gives up and leaves the alert open. So the inverse is
     raised on every clear pass, not once, and the next pass resolves what the last one could not."""
-    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    zeros = (0.0,) * len(NotifierAlertSink._INVERSE_RETRY_DELAYS)
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", zeros)
     names = ["u1", "u2", "ok1", "ok2", "ok3"]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
         sink = NotifierAlertSink([], store=store)
@@ -1607,7 +1609,7 @@ async def test_a_resolve_the_store_never_wrote_is_retried_on_the_next_pass(
 
         monkeypatch.setattr(store, "resolve_alert_instances_for", failing_while_set)
         assert (await _alerted_pass(service, sink)).hold_clear
-        assert attempts == 4  # every attempt failed, and the resolve gave up
+        assert attempts == len(zeros) + 1  # every attempt failed, and the resolve gave up
         assert await _open_alerts(store) == {HELD}, "the failed resolve went through after all"
         failing = False
         assert (await _alerted_pass(service, sink)).hold_clear
