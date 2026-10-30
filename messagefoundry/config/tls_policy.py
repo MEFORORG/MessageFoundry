@@ -879,7 +879,7 @@ def verifies_peer_fully(ctx: object) -> bool:
         isinstance(ctx, ssl.SSLContext)
         and ctx.verify_mode == ssl.CERT_REQUIRED
         and ctx.check_hostname
-        and not ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME
+        and not _context_skips_time_validity(ctx)
     )
 
 
@@ -2578,8 +2578,8 @@ class RevocationHopGuard:
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
     #: Whether that CRL is a real check: :attr:`crl_checked`, on a context that does not skip time
-    #: validity (:func:`_context_skips_time_validity`). It decides only whether
-    #: :meth:`enforce_construction` logs the attested crossing, and no disposition reads it.
+    #: validity (:func:`_context_skips_time_validity`). It decides whether the attested crossing is
+    #: logged, at :meth:`enforce_construction` and the AI broker's own arm; no disposition reads it.
     crl_is_a_check: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
@@ -2709,8 +2709,9 @@ class RevocationHopGuard:
         # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
         # real check crossed on that check, so this line would be a false record there and it is
         # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
-        # the CRL flag and accepts a lapsed CRL, so that hop's line stays true and stays. It is ALLOW
-        # on its CRL flag, not on the attestation, and that is a disposition this line does not move.
+        # the CRL flag and accepts a lapsed CRL, and rest.py and remotefile.py do not let such a CRL
+        # relax a refusal, so that hop keeps this line. It is ALLOW on its CRL flag, not on the
+        # attestation, and that is a disposition this line does not move.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (

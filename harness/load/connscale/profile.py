@@ -217,8 +217,8 @@ class ConnScaleProfile:
     # pre-existing profile sweeps byte-identically (batching off is the engine default); ``[false,
     # true]`` runs both B0 (batching off) and B1 (batching on) arms per (claim_mode, fuse, count) cell.
     # Batching is SQL-Server-scoped and does NOT compose with fusion (ADR 0075), so a multi-arm
-    # ``batch_modes`` pins ``claim_modes = ["pooled"]`` + ``fuse_modes = [false]`` — at most ONE of the
-    # three A/B axes may be multi-arm in a single profile (validated below).
+    # ``batch_modes`` pins ``claim_modes = ["pooled"]`` + ``fuse_modes = [false]`` — at most ONE A/B
+    # axis (:meth:`ab_axes`) may be multi-arm in a single profile (validated below).
     batch_modes: tuple[bool, ...] = (BATCH_OFF,)
     # How many TRIALS to bank per arm in ONE invocation (ADR 0071 §6.4b, B5 PR5). Default ``1`` = the
     # pre-PR5 single-trial-per-cell behavior, so every pre-existing profile sweeps byte-identically. Set
@@ -426,8 +426,8 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: base_port {profile.base_port} + max count {max(profile.counts)} runs past "
             f"port 65535 (highest inbound port would be {top})"
         )
-    # The three A/B axes (claim_modes, fuse_modes, batch_modes) each pair records ONE axis at a time; a
-    # profile that made two multi-arm would produce >2 arms per (sweep_mode, count) cell and each
+    # The A/B axes (:meth:`ConnScaleProfile.ab_axes`) each pair records ONE axis at a time; a profile
+    # that made two multi-arm would produce >2 arms per (sweep_mode, count) cell and each
     # comparison's single-axis keying would silently collapse them. Fusion + statement-batching are
     # pooled/SQL-Server-only and don't compose (ADR 0075), so the supported shape is EXACTLY ONE multi-
     # arm boolean axis paired with claim_modes = ["pooled"] (or a multi-arm claim_modes A/B alone). Fail

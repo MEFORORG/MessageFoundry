@@ -1495,9 +1495,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   or `alerts.webhook_tls_revocation_attested`, with the reason, so `security show`,
   `GET /security/posture` and the serve-time loosening WARNING list it. It is named whenever the
   flag is set, whether or not the hop it covers is configured. A hop that crosses an enforcing
-  posture on it logs a WARNING carrying the reason. That line names the declaration as
-  `tls_revocation_attested`, the shared guard's spelling, with no connection; its cell names the
-  `[alerts]` hop. `messagefoundry check` has no line for these pairs.
+  posture on it logs a WARNING carrying the reason. That line names the setting as
+  `[alerts].email_tls_revocation_attested` or `[alerts].webhook_tls_revocation_attested`, and no
+  connection; its cell names the `[alerts]` hop. `messagefoundry check` has no line for these pairs.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused.
 - **Reversible:** yes. Delete both lines and restart.

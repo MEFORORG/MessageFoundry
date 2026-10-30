@@ -232,6 +232,19 @@ def test_an_attested_hop_whose_context_checks_a_crl_logs_no_attested_crossing(
     assert _crossing_lines(caplog) == []
 
 
+def test_an_attested_hop_whose_context_skips_time_validity_keeps_the_crossing_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Such a context accepts a lapsed CRL, so its CRL does not silence the line, as at
+    ``RevocationHopGuard.enforce_construction``. No CRL reaches this hop today, so the context's two
+    answers are stood in for; the test above is the control."""
+    monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
+    monkeypatch.setattr(tls_policy, "_context_skips_time_validity", lambda ctx: True)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _broker(posture=_ENFORCING, attested=True, reason=_REASON)
+    assert len(_crossing_lines(caplog)) == 1
+
+
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
     with pytest.raises(AiBrokerError, match="no revocation check"):
         AiBroker(

@@ -496,8 +496,8 @@ def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
 
 
 def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
-    """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check and the
-    line stays true. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
+    """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
+    silence the line. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
     the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
     guard = _attested_guard(_crl_context(skip_validity=True))
     assert guard.crl_checked is True
@@ -525,9 +525,8 @@ def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_
     with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
     saying it crossed without one would be false. ``tls_allow_expired`` sets
     ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
-    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``): the line stays true there,
-    and stays. Either way the hop is admitted by the same arm: this limb moves a log line, never a
-    disposition."""
+    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. Either
+    way the hop is admitted by the same arm: this limb moves a log line, never a disposition."""
     with active_hop_posture(ENFORCING), _guard_log() as checked:
         kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
     assert context_checks_revocation(kept._ssl) is True
