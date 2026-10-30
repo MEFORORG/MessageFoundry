@@ -31,6 +31,13 @@ this line.**
 
 ### Security
 
+- **The Approvals page lists a request that failed its integrity check, flagged, and offers its
+  Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
+  for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
+  changed outside the engine or sealed under a key the engine does not hold, and Reject with no
+  Approve. Needs the engine seam that
+  carries the `seal_failed` value. (BACKLOG #3638, #3639)
+
 - **The passkey registration finish no longer spends the ceremony budget on a session the factor
   rule refuses, and its 429 sends `Retry-After: 30`.** `POST /ui/account/webauthn/verify` asks
   `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, and skips
@@ -43,6 +50,13 @@ this line.**
   draw it, and the admin-write floor this route's gate charges first is unchanged. Its 429 now
   sends the constant `POST /ui/mfa`, `/ui/reauth` and `/ui/reauth/webauthn` send. Seam change:
   `AuthService.finish_webauthn_registration` gains the `factor_refused` keyword. (BACKLOG #3690)
+- **A step-up return's `non_navigation_fetch` row draws the engine's step-up return audit
+  budget.** `GET /ui/oidc/callback` now writes that row for a live step-up flow only when
+  `AuthService.allow_step_up_return_audit` allows it, which holds such rows to 10 per user a
+  window behind a backstop of 60 across all users that still lets each user write one row a
+  window, and pages when it stops a row. Over it the refusal is the same 303 that keeps the flow, with a
+  WARNING line and no row. A sign-in return is unchanged. Needs the engine seam that carries
+  that method. (BACKLOG #3965)
 - **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
   and still clears the cookie when the sign-out's audit row fails.** A retired cookie that
   sign-out sends now ends the session it became, with the owner as the row's actor, rather

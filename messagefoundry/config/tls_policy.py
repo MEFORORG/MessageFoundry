@@ -2598,17 +2598,19 @@ class RevocationHopGuard:
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
-    #: ``tls_revocation_attested`` — **both are inapplicable to the non-connection hops that pass
-    #: this field**. The ones that do (at least the IdP, the syslog forwarder and the
-    #: store) each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
+    #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
+    #: hop that passes this field, and ``[tls].crl_file`` to most of them**. At least the IdP, the
+    #: syslog forwarder and the store each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
     #: never reaches their contexts, and there is no connection to carry the flag; check any new one
     #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
     #: cannot be performed, which is the SDS-3.7 false-premise defect wearing a helpful voice. A
     #: non-connection hop passes the setting that actually closes its own gate. Not every
     #: non-connection hop is outside ``[tls]``: the alerts SMTP sink and the security notifier
     #: resolve the policy, so ``[tls].crl_file`` does reach their contexts on a verifying,
-    #: non-loopback hop. They build no ``RevocationHopGuard``, so neither the default remediation
-    #: nor this field applies to them.
+    #: non-loopback hop. Their login is guarded (BACKLOG #2193), by
+    #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
+    #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
+    #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for

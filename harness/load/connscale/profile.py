@@ -19,6 +19,7 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -48,6 +49,9 @@ __all__ = [
     "PER_LANE",
     "POOLED",
     "PROFILES_DIR",
+    "SANDBOX_MODES",
+    "SANDBOX_OFF",
+    "SANDBOX_SUBPROCESS",
     "SWEEP_MODES",
     "ConnScaleProfile",
     "ConnScaleProfileError",
@@ -91,6 +95,17 @@ FUSE_ON = True
 BATCH_OFF = False
 BATCH_ON = True
 
+#: The ``[sandbox].mode`` A/B axis (ADR 0087, BACKLOG #3132). ``off`` is the engine default (Routers
+#: and Handlers in-process); ``subprocess`` runs each driven inbound's Router and Handler in its own
+#: persistent worker child. The engine reads it per-process from MEFOR_SANDBOX_MODE, which the runner
+#: pins per arm. Default ``("off",)`` so every pre-existing profile sweeps as before. A worker exists
+#: only for an inbound that carries traffic, and it spawns on that inbound's first dispatch, so a
+#: profile that names ``subprocess`` must also set ``warmup_timeout_s`` (validated below): the warm-up
+#: brings every worker up before the hold, so no spawn is charged to the measured window.
+SANDBOX_OFF = "off"
+SANDBOX_SUBPROCESS = "subprocess"
+SANDBOX_MODES = frozenset({SANDBOX_OFF, SANDBOX_SUBPROCESS})
+
 _CONNSCALE_KEYS = frozenset(
     {
         "name",
@@ -99,6 +114,8 @@ _CONNSCALE_KEYS = frozenset(
         "claim_modes",
         "fuse_modes",
         "batch_modes",
+        "sandbox_modes",
+        "warmup_timeout_s",
         "trials",
         "per_conn_rate",
         "aggregate_rate",
@@ -215,6 +232,17 @@ class ConnScaleProfile:
     # run that needed it. It costs one paged sweep of the step's own store per step, so the heavy
     # operator sweeps (N=1500, long holds) can turn it off.
     intake_audit: bool = True
+    # The [sandbox].mode A/B axis (ADR 0087, BACKLOG #3132). Default single-arm ``("off",)``, the
+    # engine default, so every pre-existing profile sweeps as before. It nests inside the claim mode
+    # in the runner, beside fuse_modes and batch_modes, and it counts toward the one-multi-arm-axis
+    # rule, so the sandbox two-arm pins claim_modes to one value (the row asks for pooled).
+    sandbox_modes: tuple[str, ...] = (SANDBOX_OFF,)
+    # Seconds the runner waits, before the hold, for ONE message sent on every connection to be
+    # delivered. 0.0 (the default) runs no warm-up, so a pre-existing profile is unchanged. Under
+    # ``subprocess`` each first delivery includes that inbound's worker spawn, so the warm-up keeps
+    # spawn out of the hold and records the first-delivery latency beside ``[sandbox].startup_seconds``.
+    # Required (> 0) when ``sandbox_modes`` names ``subprocess``. Both arms of an A/B warm up alike.
+    warmup_timeout_s: float = 0.0
 
     def ab_axes(self) -> tuple[str, ...]:
         """The A/B axes this profile runs with more than one arm, in a fixed order. ``_validate``
@@ -226,6 +254,7 @@ class ConnScaleProfile:
                 ("claim_modes", self.claim_modes),
                 ("fuse_modes", self.fuse_modes),
                 ("batch_modes", self.batch_modes),
+                ("sandbox_modes", self.sandbox_modes),
             )
             if len(axis) > 1
         )
@@ -303,6 +332,7 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
     claim_modes = _claim_modes_from(cs.get("claim_modes"), f"{where} [connscale]")
     fuse_modes = _fuse_modes_from(cs.get("fuse_modes"), f"{where} [connscale]")
     batch_modes = _batch_modes_from(cs.get("batch_modes"), f"{where} [connscale]")
+    sandbox_modes = _sandbox_modes_from(cs.get("sandbox_modes"), f"{where} [connscale]")
     sweep_mode = (_opt_str(cs, "sweep_mode", f"{where} [connscale]") or "both").strip().lower()
     if sweep_mode not in SWEEP_MODES:
         raise ConnScaleProfileError(
@@ -367,6 +397,10 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
         claim_modes=claim_modes,
         fuse_modes=fuse_modes,
         batch_modes=batch_modes,
+        sandbox_modes=sandbox_modes,
+        warmup_timeout_s=_opt_float(
+            cs, "warmup_timeout_s", f"{where} [connscale]", default=0.0, minimum=0.0
+        ),
         # >= 1 trials per arm (ADR 0071 B5 PR5); default 1 = the pre-PR5 single-trial sweep. Non-int or
         # < 1 fails loud via _opt_int (mirroring the other scalars).
         trials=_opt_int(cs, "trials", f"{where} [connscale]", default=1, minimum=1),
@@ -399,8 +433,9 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: {' and '.join(multi_arm)} cannot BOTH be multi-arm in one profile — each A/B "
             f"comparison pairs one axis at a time (fusion + statement-batching are pooled/SQL-Server-"
             f"only and don't compose, ADR 0075: use claim_modes = ['pooled'] with exactly ONE of "
-            f"fuse_modes / batch_modes = [false, true]); got claim_modes={list(profile.claim_modes)}, "
-            f"fuse_modes={list(profile.fuse_modes)}, batch_modes={list(profile.batch_modes)}"
+            f"fuse_modes / batch_modes = [false, true], or a sandbox_modes A/B on its own); got "
+            f"claim_modes={list(profile.claim_modes)}, fuse_modes={list(profile.fuse_modes)}, "
+            f"batch_modes={list(profile.batch_modes)}, sandbox_modes={list(profile.sandbox_modes)}"
         )
     # `empty_claims_base_reading` grades ONLY per_lane lanes (BACKLOG #1211): the herd prediction it
     # reads assumes one router/transform/delivery worker set per lane per stage, which a pooled
@@ -429,6 +464,57 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
                 f"per_lane lanes, so with claim_modes={list(profile.claim_modes)} it would grade "
                 f"zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or unset {key}"
             )
+    _validate_sandbox(profile, where)
+
+
+def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
+    """The ``sandbox_modes`` rules (BACKLOG #3132), each decided from the profile alone, before any
+    engine is spawned."""
+    # nan would pass the "> 0" refusal below and then fail the runner's "> 0" gate, so no warm-up
+    # would run; inf would wait forever on a first message that dead-lettered.
+    if not math.isfinite(profile.warmup_timeout_s):
+        raise ConnScaleProfileError(
+            f"{where}: warmup_timeout_s must be a finite number of seconds, got "
+            f"{profile.warmup_timeout_s}"
+        )
+    if SANDBOX_SUBPROCESS not in profile.sandbox_modes:
+        return
+    # A worker spawns on its inbound's first dispatch. Without a warm-up every spawn lands inside
+    # the hold and is charged to it, and no record would show that the workers ever came up.
+    if profile.warmup_timeout_s <= 0.0:
+        raise ConnScaleProfileError(
+            f"{where}: sandbox_modes names {SANDBOX_SUBPROCESS!r}, so warmup_timeout_s must be > 0 "
+            f"-- each worker spawns on its inbound's first message, and without a warm-up that spawn "
+            f"is charged to the hold"
+        )
+    # A reload replaces every inbound's worker, so the reload probe would put N respawns inside
+    # the hold, the very cost the warm-up keeps out, with nothing in the record saying so.
+    if profile.reload_probe:
+        raise ConnScaleProfileError(
+            f"{where}: reload_probe = true with sandbox_modes naming {SANDBOX_SUBPROCESS!r}; a "
+            f"reload respawns every worker inside the hold, so leave reload_probe off for a sandbox arm"
+        )
+    # The engine hard-disables fusion when [sandbox].mode is subprocess (it would run sandboxed code
+    # in-process), so a fused subprocess arm would silently measure the unfused path.
+    if FUSE_ON in profile.fuse_modes:
+        raise ConnScaleProfileError(
+            f"{where}: fuse_modes includes true with sandbox_modes naming {SANDBOX_SUBPROCESS!r}; "
+            f"the engine disables fusion under the subprocess sandbox, so that arm would not be fused"
+        )
+    # These checks group records by (sweep_mode, claim_mode), so with two sandbox arms they would
+    # pair an off reading with a subprocess one and grade neither arm on its own.
+    if len(profile.sandbox_modes) > 1:
+        for key, armed in (
+            ("fd_monotonic", profile.slo.fd_monotonic),
+            ("empty_claims_base_reading", profile.slo.empty_claims_base_reading),
+            ("empty_claims_herd_floor_legs", bool(profile.slo.empty_claims_herd_floor_legs)),
+        ):
+            if armed:
+                raise ConnScaleProfileError(
+                    f"{where}: slo.{key} groups records by sweep mode and claim mode only, so with "
+                    f"sandbox_modes={list(profile.sandbox_modes)} it would mix the two sandbox arms; "
+                    f"unset {key} for a sandbox A/B"
+                )
 
 
 def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
@@ -541,6 +627,31 @@ def _batch_modes_from(raw: Any, where: str) -> tuple[bool, ...]:
             )
         if item not in out:
             out.append(item)
+    return tuple(out)
+
+
+def _sandbox_modes_from(raw: Any, where: str) -> tuple[str, ...]:
+    """Parse the ``sandbox_modes`` A/B axis (BACKLOG #3132). Absent -> ``("off",)``. Present -> a
+    non-empty list drawn from {off, subprocess}, de-duplicated with first-seen order kept, so the
+    baseline arm is stable. Mirrors :func:`_claim_modes_from`."""
+    if raw is None:
+        return (SANDBOX_OFF,)
+    if not isinstance(raw, list) or not raw:
+        raise ConnScaleProfileError(
+            f"{where}: 'sandbox_modes' must be a non-empty list of strings "
+            f"(subset of {sorted(SANDBOX_MODES)})"
+        )
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ConnScaleProfileError(f"{where}: every 'sandbox_modes' entry must be a string")
+        mode = item.strip().lower()
+        if mode not in SANDBOX_MODES:
+            raise ConnScaleProfileError(
+                f"{where}: sandbox_modes entry {item!r} must be one of {sorted(SANDBOX_MODES)}"
+            )
+        if mode not in out:
+            out.append(mode)
     return tuple(out)
 
 
