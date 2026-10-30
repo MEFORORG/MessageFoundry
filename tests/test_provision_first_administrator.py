@@ -23,6 +23,7 @@ import types
 from collections.abc import Callable, Iterator, Sequence
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -2168,7 +2169,7 @@ def test_cli_logs_administrator_granted_and_warns_with_no_notifier(
     out = capsys.readouterr().out
     # Beside another Administrator, so it is a WARNING that names who to tell; a first install's
     # plain run is pinned to print no WARNING by test_cli_provisions_and_names_the_store_it_wrote_to.
-    assert "WARNING: no [alerts] notifier took the administrator_granted alert" in out
+    assert "WARNING: no [alerts] transport confirmed delivery of the administrator_granted" in out
     assert "'dir-a'" in out
     assert any(
         "ALERT administrator_granted" in r.getMessage() and "provision_admin" in r.getMessage()
@@ -2481,7 +2482,7 @@ def test_a_notifier_that_cannot_build_email_keeps_the_webhook(
     assert built is not None
     assert [t.name for t in built._transports] == ["webhook"]
     err = capsys.readouterr().err
-    assert "tries again without the email transport" in err
+    assert "tries again with the webhook alone" in err
     # The class only: a provider's error text can carry its address or a reference.
     assert "synthetic unresolved SMTP secret" not in err and "ValueError" in err
 
@@ -2505,6 +2506,161 @@ def test_the_offline_alert_notifier_drops_a_refused_email_hop_and_keeps_the_webh
     assert built is not None
     assert [t.name for t in built._transports] == ["webhook"]
     assert "no alert email is sent" in capsys.readouterr().err
+
+
+def test_a_webhook_that_cannot_build_keeps_the_email(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 3: the retry after a failed build only ever dropped the
+    email, so a webhook refused at construction also cost a relay that would have worked. The
+    email transport alone is now tried too. RED before repair 3, which returned no notifier."""
+    from messagefoundry.__main__ import _offline_alert_notifier
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.pipeline import alert_sinks
+
+    real = alert_sinks.notifier_from_settings
+
+    def refuse_webhook(alerts: AlertsSettings, **kw: object) -> object:
+        if alerts.webhook_url:
+            raise ValueError("synthetic refused webhook naming hooks.example.invalid")
+        return real(alerts, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alert_sinks, "notifier_from_settings", refuse_webhook)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = _offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["email"]
+    err = capsys.readouterr().err
+    assert "hooks.example.invalid" not in err and "ValueError" in err
+
+
+@pytest.mark.parametrize("muted", [False, True], ids=["send-refused", "rule-routes-to-none"])
+def test_an_alert_no_transport_delivered_logs_the_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    muted: bool,
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 2: an alert the notifier accepted but no transport
+    delivered, because the send raised or a rule routes it to no transport, counted as paged, so
+    the fallback line and the WARNING naming the other Administrators were skipped. Only a
+    transport's confirmed delivery counts now. RED before repair 3, which answered True."""
+    from messagefoundry.config.settings import AlertRule
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    class _Refused(_AlertTransport):
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
+            raise RuntimeError("synthetic relay refusal")
+
+    transport = _AlertTransport() if muted else _Refused()
+    rules = [AlertRule(event_type="administrator_granted", transports=[])] if muted else None
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([transport], rules=rules),
+    )
+    body, err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is False
+    assert _logged_the_fallback(err)
+    assert transport.events == []
+
+
+class _LateStore:
+    """A store the alert's open instance lands in, recording whether it was closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def upsert_alert_instance(self, **_kw: object) -> None:
+        return None
+
+    async def resolve_alert_instances_for(self, **_kw: object) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_a_store_that_opens_as_its_bound_ends_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3849 repair 3, item 6: ``asyncio.timeout`` around the reopen threw the cancel
+    into the awaiting coroutine when the bound ran out after the open had finished but before that
+    coroutine resumed, so the opened store was discarded and never closed. This reproduces that
+    ordering exactly: the open's result is set, then the bound expires, before the resume. RED
+    before repair 3. The reopen now runs as its own task and keeps its result, so the spy finds no
+    reopen timeout to expire and the store is used and closed as usual; the late-arrival path is
+    pinned by the next test."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+    from messagefoundry.store import base
+
+    bound = 4.25  # distinctive, so the spy below picks out the reopen's own timeout
+    timeouts: list[Any] = []
+    real_timeout = asyncio.timeout
+
+    def spy(delay: float | None) -> Any:
+        cm = real_timeout(delay)
+        if delay == bound:
+            timeouts.append(cm)
+        return cm
+
+    late = _LateStore()
+    real_open = base.open_store
+    opens: list[int] = []
+
+    async def opening(*args: object, **kwargs: object) -> object:
+        opens.append(1)
+        if len(opens) < 3:
+            return await real_open(*args, **kwargs)  # type: ignore[arg-type]
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[object] = loop.create_future()
+        loop.call_soon(done.set_result, late)  # the open finishes...
+        if timeouts and not timeouts[-1].expired():
+            timeouts[-1].reschedule(loop.time())  # ...and the bound expires before the resume
+        return await done
+
+    argv = _beside_a_directory_administrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(asyncio, "timeout", spy)
+    monkeypatch.setattr("messagefoundry.__main__._OFFLINE_ALERT_REOPEN_SECONDS", bound)
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_alert_notifier",
+        lambda _settings, _posture: NotifierAlertSink([_AlertTransport()]),
+    )
+    body, _err = _alert_run(argv, capsys)
+    assert body["administrator_granted_alerted"] is True
+    assert len(opens) == 3
+    assert late.closed
+
+
+async def test_a_store_that_opens_after_its_bound_is_closed_when_it_arrives() -> None:
+    """Item 6: an open that finishes after the bound raises TimeoutError to the caller, and the
+    store it opens late is closed rather than leaked."""
+    from messagefoundry.__main__ import _open_within
+
+    late = _LateStore()
+    finish = asyncio.Event()
+
+    async def slow_open() -> Any:
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            # A driver that finishes its open despite the cancel, as one in a worker thread can.
+            await finish.wait()
+        return late
+
+    with pytest.raises(TimeoutError):
+        await _open_within(slow_open, 0.01)
+    assert not late.closed
+    finish.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert late.closed
 
 
 def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:

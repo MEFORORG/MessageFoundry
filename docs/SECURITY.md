@@ -409,7 +409,10 @@ was written, because every request re-reads the account's roles.
 
 The repair also empties the account's known sign-in addresses, as an administrator's reset does
 (vault BACKLOG #3849). It does so once the role is written, beside the second session revoke, so a
-run refused before the grant leaves the record alone. The earlier holder's addresses then read as new at the next sign-in, so a
+run whose grant writes no role leaves the record alone. That run has still replaced the password,
+the TOTP and the notification address. When the store answers the grant out of contract, the
+command reads the row again and clears the record only if the row holds the role, or if that read
+fails. The earlier holder's addresses then read as new at the next sign-in, so a
 sign-in from one of them faces the first-seen challenge rather than passing as known.
 
 #### Keep a local Administrator
@@ -433,10 +436,13 @@ effort. The store reopen, the notifier's close and the whole alert step each hav
 beside `_raise_offline_administrator_granted` in `messagefoundry/__main__.py`; when the step runs
 out, the command prints its result without it. A Ctrl-C during the step ends that wait, not the
 command. The process can still wait at exit for a call already in a worker thread, such as a
-send, the notifier build or a store driver's, until that call ends. With no `[alerts]` transport
-configured, one this shell cannot build, or one that raises on the alert or does not finish in
-time, the alert goes to the command's log output instead. A send a relay refuses is not one of
-these: the notifier logs that send's failure, and the alert counts as taken, as under `serve`.
+send, the notifier build or a store driver's, until that call ends. The alert counts as paged
+only when at least one transport confirms delivery in time: the relay accepts it for every
+recipient, or the webhook answers 2xx. Otherwise it goes to the command's log output instead. At
+least these land there: no `[alerts]` transport configured, one this shell cannot build, a send
+the relay or webhook refuses, a rule that routes the alert to no transport, and a step that has
+not answered in time. When both transports are configured and the notifier cannot be built, the
+command tries the webhook alone, then the email alone.
 The command then says so: as a WARNING naming the other
 enabled Administrators when there are any, as a plain note on a first install, and under `--json`
 as `administrator_granted_alerted` set to false.

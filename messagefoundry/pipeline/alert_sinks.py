@@ -889,6 +889,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
+        # raising. None, as `serve` leaves it, changes nothing.
+        self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
 
@@ -1494,6 +1497,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         None disables control actions (a ``control_action`` rule then no-ops, logged)."""
         self._control_cb = cb
 
+    def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
+        """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
+        returns without raising: the relay accepted every recipient, or the webhook answered 2xx
+        (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
+        from one the notifier only accepted. Called on the drain task; an observer that raises is
+        logged and never stops the drain."""
+        self._delivery_observer = observer
+
     # --- #143 (ADR 0044 amendment) windowed suspend / mute (notification-only) ---
 
     def suspend(self, event_type: str, connection: str, *, until: float) -> None:
@@ -1901,6 +1912,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("connection"),
                     exc_info=True,
                 )
+                continue
+            observer = self._delivery_observer
+            if observer is not None:
+                try:
+                    observer(transport.name, event)
+                except Exception:
+                    log.warning("alert delivery observer failed", exc_info=True)
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
@@ -1937,12 +1955,32 @@ def alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
       advice to configure the email that is configured.
     * The SMTP password reference is dropped, so no secret is resolved for a transport that is
       not built. A secret store that is down cannot abort the start before the CA refusal."""
-    left = sorted(configured_alert_transport_names(alerts) - {"email"})
+    return _alerts_without(
+        alerts,
+        "email",
+        {
+            "email_to": [],
+            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
+        },
+    )
 
-    def _no_email(transports: list[str] | None) -> list[str] | None:
+
+def alerts_without_webhook(alerts: AlertsSettings) -> AlertsSettings:
+    """``alerts`` with the webhook transport dropped, as :func:`alerts_without_email` drops email,
+    for an offline command whose webhook cannot be built (vault BACKLOG #3849): a webhook refused
+    at construction must not also cost a relay that would have taken the alert."""
+    return _alerts_without(alerts, "webhook", {"webhook_url": None})
+
+
+def _alerts_without(alerts: AlertsSettings, name: str, unset: dict[str, Any]) -> AlertsSettings:
+    """``alerts`` with transport ``name`` dropped by ``unset``, its rules re-routed as
+    :func:`alerts_without_email` says."""
+    left = sorted(configured_alert_transport_names(alerts) - {name})
+
+    def _without(transports: list[str] | None) -> list[str] | None:
         if transports is None:
             return None
-        kept = [t for t in transports if t != "email"]
+        kept = [t for t in transports if t != name]
         if transports and not kept:
             return list(left)
         return kept
@@ -1950,9 +1988,9 @@ def alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
     rules = [
         rule.model_copy(
             update={
-                "transports": _no_email(rule.transports),
+                "transports": _without(rule.transports),
                 "escalate": [
-                    tier.model_copy(update={"transports": _no_email(tier.transports)})
+                    tier.model_copy(update={"transports": _without(tier.transports)})
                     for tier in rule.escalate
                 ],
             }
@@ -1961,13 +1999,7 @@ def alerts_without_email(alerts: AlertsSettings) -> AlertsSettings:
     ]
     if not left:
         rules = [r for r in rules if r.transports or any(t.transports for t in r.escalate)]
-    return alerts.model_copy(
-        update={
-            "email_to": [],
-            "email_password_secret": None,  # nosec B105 -- clears a secret reference, sets no value
-            "rules": rules,
-        }
-    )
+    return alerts.model_copy(update={**unset, "rules": rules})
 
 
 def check_rule_recipients(rule: AlertRule, sender: str, where: str) -> None:

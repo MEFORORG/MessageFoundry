@@ -280,7 +280,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "-"),
         ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
-        ("__main__.py", "_offline_alert_notifier.build", "resolve_secret_provider", "posture"),
+        ("__main__.py", "_offline_alert_notifier", "resolve_secret_provider", "posture"),
         (
             "__main__.py",
             "_raise_offline_administrator_granted",

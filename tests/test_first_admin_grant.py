@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
-from messagefoundry.store.store import AdminGrant, MessageStore
+from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER, AdminGrant, MessageStore
 from tests._admin_account import PROVISION_EMAIL, create_admin, provision_totp
 from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
@@ -516,6 +517,48 @@ async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
     assert revokes == ["halfwritten", "halfwritten"]
     assert len(_error_lines(caplog)) == 1
     assert await _provisioned_rows(store) == []
+
+
+@pytest.mark.parametrize(
+    ("writes_role", "read_fails", "cleared"),
+    [
+        pytest.param(True, False, True, id="role-written"),
+        pytest.param(False, False, False, id="no-role-written"),
+        pytest.param(True, True, True, id="re-read-raises"),
+    ],
+)
+async def test_an_unknown_grant_outcome_clears_the_addresses_only_once_the_role_is_written(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    writes_role: bool,
+    read_fails: bool,
+    cleared: bool,
+) -> None:
+    """Vault BACKLOG #3849 B2, repair 3: on the repair branch an out-of-contract grant clears the
+    earlier holder's known sign-in addresses only when the re-read row holds the role, as
+    SECURITY.md says, or when that re-read fails and nobody can tell. A store that wrote no role
+    took nothing over and leaves the record alone. The no-role case is RED before repair 3, which
+    cleared the record whatever the grant wrote."""
+    await _roleless_row(store, "site-admin")
+    await store.remember_login_address("halfwritten", "10.9.9.9", now=time.time())
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    grant = _out_of_contract_grant(store, writes_role=writes_role)
+
+    async def read_raises(*_a: Any, **_k: Any) -> None:
+        raise sqlite3.OperationalError("synthetic read fault")
+
+    async def answer(*a: Any, **k: Any) -> object:
+        outcome = await grant(*a, **k)
+        if read_fails:
+            monkeypatch.setattr(store, "get_user_by_username", read_raises)
+        return outcome
+
+    monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", answer)
+    with pytest.raises((FirstAdministratorRefused, sqlite3.OperationalError)):
+        await _provision(service, "site-admin")
+    expected = [LOGIN_ADDRESS_RESET_MARKER] if cleared else ["10.9.9.9"]
+    assert await store.list_known_login_addresses("halfwritten", since=0.0) == expected
 
 
 @pytest.mark.parametrize(

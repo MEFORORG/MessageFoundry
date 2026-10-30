@@ -4272,12 +4272,26 @@ class AuthService:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
-                # And its address clear (vault BACKLOG #3849 B2): the store may have written the
-                # role, and a re-run then refuses the row, so nothing else would clear it.
-                await self._clear_login_addresses(user_id, username=username)
+            # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
+            # below, so the row is read again first. A store that wrote no role took nothing over,
+            # and the record is left, as SECURITY.md says. A read that raises leaves it unknown,
+            # and the record is cleared, the side that challenges: a re-run refuses a row that
+            # holds the role, so nothing else would clear it.
+            row: VerifiedUser | None = None
+            role_written = True
+            try:
+                row = (await self._lookup_by_username(username)).user
+                role_written = (
+                    row is not None
+                    and row.id == user_id
+                    and Role.ADMINISTRATOR.value in row.role_ids
+                )
+            finally:
+                if repaired and role_written:
+                    await self._clear_login_addresses(user_id, username=username)
             raise FirstAdministratorRefused(
                 await self._unexpected_grant_refusal(
-                    username, user_id, enrolled=totp_secret is not None
+                    username, user_id, row, enrolled=totp_secret is not None
                 )
             )
         if repaired:
@@ -4290,9 +4304,10 @@ class AuthService:
             # not the new Administrator's, so they go too, as after an administrator's reset
             # (#2946). Otherwise a sign-in from one of them would read as known and skip the
             # first-seen challenge. HERE, after the grant, and not with the first clear: a sign-in
-            # the earlier holder finished before ``set_password`` can still record its address,
-            # and a run refused before the grant takes nothing over, so it must not reset the
-            # holder's record. Best effort, as at a reset.
+            # the earlier holder finished before ``set_password`` can still record its address.
+            # A run the grant refuses (ADMIN_EXISTS, ACCOUNT_CHANGED) has already replaced the
+            # password, the TOTP and the notification address, but it wrote no role, so the
+            # addresses are left as they were. Best effort, as at a reset.
             await self._clear_login_addresses(user_id, username=username)
         await self._audit(
             "auth.first_administrator_provisioned",
@@ -4327,14 +4342,15 @@ class AuthService:
         )
 
     async def _unexpected_grant_refusal(
-        self, username: str, user_id: str, *, enrolled: bool
+        self, username: str, user_id: str, row: VerifiedUser | None, *, enrolled: bool
     ) -> str:
         """The operator-facing text for a first-admin grant that answered out of contract (#3078).
 
-        Such a store MAY still have written a role, so the row is read again, through the same
-        seal-checked loader a re-run uses, and the advice matches what it holds. The read runs
-        after the grant's transaction, so it can also see another run's work; the text says
-        "may" for that reason. "Keep the entry and re-run" is wrong in at least two states: a re-run
+        Such a store MAY still have written a role, so the caller reads the row again, through the
+        same seal-checked loader a re-run uses, and passes it as ``row``; the advice matches what
+        it holds. The caller's read runs after the grant's transaction, so it can also see another
+        run's work; the text says "may" for that reason. "Keep the entry and re-run" is wrong in at
+        least two states: a re-run
         refuses a row that holds the Administrator role, and on a roleless row it clears the
         authenticator this run enrolled.
         """
@@ -4346,8 +4362,6 @@ class AuthService:
             "If the command is refused the same way again, the store has a fault this command "
             "cannot repair"
         )
-        lookup = await self._lookup_by_username(username)
-        row = lookup.user
         if row is None or row.id != user_id:
             return f"{prefix}, and could not read what that account holds now. {again}"
         if Role.ADMINISTRATOR.value in row.role_ids:
