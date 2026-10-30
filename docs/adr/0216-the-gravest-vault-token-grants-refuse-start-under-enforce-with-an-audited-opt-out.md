@@ -52,9 +52,10 @@ two hops, and an extra capability beside the one the engine needs, are ordinary 
   is not plain printable ASCII, which the probe cannot tell from root by reading it, so it cannot
   judge rather than having seen root.
 
-**`vault_preflight_outcome` in `privilege_check.py` states the decision once.** The startup
-preflight and `check-privileges` both call it, and it returns the store preflight's own
-`PreflightOutcome`.
+**`vault_preflight_outcome` in `privilege_check.py` states the decision on the grants once.** The
+startup preflight and `check-privileges` both call it, and it returns the store preflight's own
+`PreflightOutcome`. The last two rows of the table below are the preflight's own, because only a
+start can say what failed in its own probe.
 
 | Finding | `enforcement` | `allow_over_granted_vault_token` | Outcome |
 |---|---|---|---|
@@ -63,7 +64,22 @@ preflight and `check-privileges` both call it, and it returns the store prefligh
 | refusing class | `enforce` | `false` | **refuse** |
 | refusing class | `enforce` | `true` | start, audited |
 | warning class only | any | any | warn and start |
-| unobservable | any | any | warn and start |
+| unobservable: a network failure, a timeout or a 403 | any | any | warn and start |
+| probe failed for any other reason | `warn` | any | warn and start |
+| probe failed for any other reason | `enforce` | any | **refuse** |
+
+**Only a network failure, a timeout or a 403 is an unobservable probe in the ruling's sense.**
+`excused_failure` in `privilege_probes.py` names them: an `OSError` (requests' connection and
+timeout errors, socket errors, `TimeoutError` and TLS errors are all `OSError`s) or hvac's
+`Forbidden`. Any other failure left the token unjudged for a reason the ruling does not excuse. At
+least these are in that class: a `TypeError` or `AttributeError` after an hvac rename or signature
+drift, an engine refusal such as an unset token variable, another Vault error status, and an
+answer that names no capabilities for a path. The reading names each in `unexcused`, whether the
+probe caught it or raised it, and under `enforce` the preflight refuses the start on one. The
+opt-out does not lift that refusal: it accepts a grant that was seen, and this token was never
+fully read. `check-privileges` still reports such a hop as one it could not read. A catch-all that
+read every failure as unobservable would have let a code defect start an enforcing instance on a
+root token, with nothing but the exception's type in the log.
 
 **The preflight runs at every `serve` start**, in `messagefoundry/vault_preflight.py`, called from
 the managed lifespan in `api/app.py` after the store privilege preflight and before any listener
@@ -100,7 +116,12 @@ codes are unchanged: an over-grant of either class exits 3.
   amendment and ADR 0199. It rests on the 2026-10-04 ruling. None of the three generalises.
 - **`serve` makes two read-only Vault calls per token at every start**: the self-lookup and the
   capabilities read, both in Vault's `default` policy. A token made with `-no-default-policy` reads
-  as unobservable at every start unless its policy grants the two paths, and that only warns.
+  as unobservable at every start unless its policy grants the two paths, and that only warns,
+  because Vault answers it with a 403.
+- **An unset token variable, or a Vault error status other than 403, such as a sealed Vault's
+  503, refuses an enforcing start at the preflight.** None is a network failure, a timeout or a
+  403. Neither was measured against a live Vault or a connector-secret hop that resolves its
+  secrets later; under `warn` both still only warn.
 - **The probe's limits are unchanged and are not fixed here.** It asks about exact paths only, so a
   wildcard grant such as `secret/data/*` would read clean. Neither limit, nor the classes, was
   measured against a live Vault.

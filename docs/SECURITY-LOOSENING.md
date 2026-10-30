@@ -1864,7 +1864,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `GET /security/posture`.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
-  not read the token, only warn, so there is nothing for it to lift there.
+  not read the token because of a network failure, a timeout or a 403, only warn, so there is
+  nothing for it to lift there. A probe that failed for any other reason, such as a code defect,
+  refuses under `enforce`, and this switch does not lift that refusal.
 - **How to turn it off:** remove it, after the token's policy matches the grant
   [`SECURITY.md`](SECURITY.md) prescribes for that hop. `messagefoundry check-privileges` shows the
   grant and what `serve` would do with it.

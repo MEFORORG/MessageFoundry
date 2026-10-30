@@ -1072,8 +1072,14 @@ at that moment. The over-grants above fall in two classes:
   `GET /security/posture`.
 - **The warning class:** everything else the probe calls over-granted, at least one token serving
   both hops, an extra capability on a path the engine calls, and a policy name the probe cannot tell
-  apart from `root` by reading it. These, and a probe that could not read the token, log a warning
-  and write the audit row; they never refuse.
+  apart from `root` by reading it. These log a warning and write the audit row; they never refuse.
+
+A probe that could not read the token because of a network failure, a timeout or a 403 also only
+warns. Any other failure leaves the token unjudged for a reason the ruling does not excuse: at
+least a code defect such as a `TypeError` after an hvac change, an engine refusal such as an unset
+token variable, another Vault error status, and an answer that names no capabilities for a path.
+Under `enforce` such a failure **refuses to start**, the audit row names it under `unexcused`, and
+the opt-out does not lift it.
 
 Under `enforcement = warn` nothing refuses. The probe's limits stay: it asks about exact paths only,
 so a wildcard grant such as `secret/data/*` would read clean, and a token made with `-no-default-policy` reads
