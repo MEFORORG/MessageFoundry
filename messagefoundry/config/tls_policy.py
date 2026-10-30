@@ -2577,8 +2577,10 @@ class RevocationHopGuard:
     #: non-connection hop passes the setting that actually closes its own gate. Not every
     #: non-connection hop is outside ``[tls]``: the alerts SMTP sink and the security notifier
     #: resolve the policy, so ``[tls].crl_file`` does reach their contexts on a verifying,
-    #: non-loopback hop. They build no ``RevocationHopGuard``, so neither the default remediation
-    #: nor this field applies to them.
+    #: non-loopback hop. Their login is guarded (BACKLOG #2193), by
+    #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
+    #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
+    #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
