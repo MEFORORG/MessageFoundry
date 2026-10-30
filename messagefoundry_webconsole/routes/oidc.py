@@ -512,7 +512,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
-            await auth.audit_oidc_reject("non_navigation_fetch", client=client)
+            # On a step-up return the row also draws that return's audit budget, which has a
+            # global ceiling across users (BACKLOG #3965). Over it the refusal is the same and is
+            # logged, not audited. A sign-in return was already charged to the sign-in window.
+            if staged is None or auth.allow_step_up_return_audit(staged.user_id):
+                await auth.audit_oidc_reject("non_navigation_fetch", client=client)
+            else:
+                _log.warning(
+                    "federated step-up return refused (non_navigation_fetch) for %s; its audit "
+                    "budget is spent, so no row is written",
+                    client or "<unknown>",
+                )
             # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
             return _fail(request, "oidc_failed", keep_flow=True)
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".

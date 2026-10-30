@@ -3302,6 +3302,25 @@ class AuthService:
             if settings.login_rate_limit_enabled
             else None
         )
+        # BACKLOG #3965: the budget for the audit rows an IdP step-up's RETURN writes on the
+        # branches that consume nothing: a `state` mismatch (an abandon whose `state` does not
+        # match among them) and a non-navigation fetch. The flow cookie is SameSite=Lax, so a
+        # foreign page can repeat those while a flow lives. _reauth_limiter bounds them per user
+        # and has no global term, on purpose (one user's ceremonies must never refuse another's),
+        # so K users could write about K x login_rate_limit_per_ip rows a window. This adds the
+        # global ceiling on the login knobs, as _repeated_credential_limiter has one. It gates the
+        # ROW, never the return: an over-budget branch answers as before and is logged instead,
+        # so a flood across many users cannot refuse anyone's step-up. It never draws on
+        # _login_limiter or _reauth_limiter.
+        self._step_up_return_audit_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.login_rate_limit_per_ip,
+                glob=settings.login_rate_limit_global,
+                window_seconds=settings.login_rate_limit_window_seconds,
+            )
+            if settings.login_rate_limit_enabled
+            else None
+        )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -3539,6 +3558,17 @@ class AuthService:
         if self._reauth_limiter is None:
             return True
         return self._reauth_limiter.allow(actor)
+
+    def allow_step_up_return_audit(self, user_id: str) -> bool:
+        """Whether a refusal on an IdP step-up's return that consumed nothing may write its audit
+        row (BACKLOG #3965): a ``state_mismatch``, on the completion or the abandon leg, or the
+        console's ``non_navigation_fetch``. Keyed on the user the staged flow names, with a global
+        ceiling across users. It gates the row only, never the return, and draws neither the
+        sign-in window nor the ceremony budget. True = write; always True when the limiter is
+        disabled."""
+        if self._step_up_return_audit_limiter is None:
+            return True
+        return self._step_up_return_audit_limiter.allow(user_id)
 
     def allow_phi_read(self, actor: str) -> bool:
         """Per-actor anti-automation gate for the PHI-read endpoints (WP-8, ASVS 2.4.1). True =
@@ -6356,12 +6386,24 @@ class AuthService:
         if flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
         if not consumed:
+            # Repeatable while the flow lives, so its row draws the step-up return's audit budget
+            # (BACKLOG #3965). A flow naming no user is a sign-in flow, which the callback sends to
+            # the sign-in window and its global ceiling instead, so its row is not charged here.
+            user_id = flow.step_up_user_id
+            audit = user_id is None or self.allow_step_up_return_audit(user_id)
+            if not audit:
+                _log.warning(
+                    "federated step-up return refused (state_mismatch) for %s; its audit budget "
+                    "is spent, so no row is written",
+                    scrub_log_argument(client or "<unknown>"),
+                )
             return await self._step_up_refused(
                 "state_mismatch",
                 actor="<oidc>",
                 client=client,
                 return_to=flow.return_to,
                 flow_consumed=False,
+                audit=audit,
             )
         return flow
 
@@ -6637,11 +6679,15 @@ class AuthService:
         extra: Mapping[str, object] | None = None,
         flow_consumed: bool = True,
         flow: PendingFlow | None = None,
+        audit: bool = True,
     ) -> OidcStepUp:
         """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
 
         ``extra`` adds fields to the audit row only, such as a received status or an exception
         type (BACKLOG #1948). It never carries IdP text.
+
+        ``audit=False`` packages the same refusal and writes no row: the caller found the step-up
+        return's audit budget spent (BACKLOG #3965) and logged the refusal instead.
 
         ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
         BACKLOG #3145). Only a refusal made after a STEP-UP flow was redeemed passes it: before
@@ -6657,7 +6703,8 @@ class AuthService:
             "reason": reason,
             **(self._step_up_address_fields(flow, client) if flow is not None else {}),
         }
-        await self._audit("auth.reauth", actor=actor, detail=_json(detail), client=client)
+        if audit:
+            await self._audit("auth.reauth", actor=actor, detail=_json(detail), client=client)
         return OidcStepUp(
             elevation=Elevation(session_lost=lost),
             return_to=return_to,

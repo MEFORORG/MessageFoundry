@@ -1403,3 +1403,84 @@ def test_a_step_up_flow_stages_its_session_and_user_together(
             step_up_session_hash=session_hash,
             step_up_user_id=user_id,
         )
+
+
+def _stage_step_up_flow(service: AuthService, user_id: str, client_ip: str) -> str:
+    """A live step-up flow naming ``user_id``, staged as ``begin_oidc_step_up`` stages one. A
+    ``state`` mismatch reads only the flow, so no session or account stands behind it."""
+    assert service._oidc_flows is not None
+    flow_id, _flow = oidc.start_flow(
+        service._oidc_flows,
+        return_to=NEXT,
+        client_ip=client_ip,
+        step_up_session_hash=f"session-of-{user_id}",
+        step_up_user_id=user_id,
+    )
+    return flow_id
+
+
+async def _forged_return(service: AuthService, flow_id: str, n: int) -> Any:
+    """One forged return to a live step-up flow, alternating the completion and the abandon leg,
+    each with a ``state`` that does not match."""
+    if n % 2:
+        return await service.abandon_oidc_step_up(
+            flow_id, state="forged", reason="idp_error", client="203.0.113.9"
+        )
+    return await service.complete_oidc_step_up(
+        flow_id=flow_id, state="forged", code=AUTH_CODE, client="203.0.113.9", public_origin=ORIGIN
+    )
+
+
+async def test_state_mismatch_rows_on_step_up_returns_stop_at_a_global_ceiling(
+    rsa_key: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3965. RED when: the ``state_mismatch`` rows of step-up returns are bounded only per
+    user, so K users' forged returns write about K x ``login_rate_limit_per_ip`` rows a window. They
+    now draw a budget of their own, per user AND across users. Past it each return is refused
+    exactly as before, consumes nothing, and is logged instead of audited."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        per_user = service._settings.login_rate_limit_per_ip
+        ceiling = service._settings.login_rate_limit_global
+        users = ceiling // per_user + 1  # enough users to pass the ceiling on per-user budgets
+        assert per_user * users > ceiling, "fixture: the per-user budgets alone pass the ceiling"
+        flows = {
+            f"user-{i}": _stage_step_up_flow(service, f"user-{i}", f"198.51.100.{i}")
+            for i in range(users)
+        }
+        rows_before = await store.count_audit(limit=None, action="auth.reauth")
+
+        # One user alone stops at their own budget, with the ceiling far from spent.
+        first = next(iter(flows.values()))
+        for n in range(per_user + 2):
+            out = await _forged_return(service, first, n)
+            assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user
+
+        # Every user past their own budget: the rows stop at the ceiling across all of them.
+        for flow_id in flows.values():
+            for n in range(per_user + 1):
+                out = await _forged_return(service, flow_id, n)
+                assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_before == ceiling
+        # Refused as before: no flow was consumed, so each still waits for its real IdP return.
+        assert all(service.oidc_step_up_flow(f) is not None for f in flows.values())
+        assert "its audit budget is spent" in caplog.text
+        # The budget is its own: neither the ceremony keys nor the sign-in window were drawn.
+        assert all(service.allow_reauth_attempt(user) for user in flows)
+        assert service.allow_login_attempt("203.0.113.9")
+    finally:
+        await store.close()
+
+
+async def test_the_step_up_return_audit_budget_goes_with_the_login_limiter_switch() -> None:
+    """BACKLOG #3965: one switch, as for every limiter on the login knobs. Off, every row is
+    written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(login_rate_limit_enabled=False))
+        assert service._step_up_return_audit_limiter is None
+        assert all(service.allow_step_up_return_audit("user-1") for _ in range(1000))
+    finally:
+        await store.close()
