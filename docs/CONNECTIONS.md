@@ -287,7 +287,10 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > connections at all: the **PostgreSQL store hop**, the
 > **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** and, since BACKLOG #2193, the **LDAPS AD bind**; those last two are refused when
 > `serve` builds the auth service. `messagefoundry check` reports the OIDC legs in its
-> `oidc-revocation` leg and has none for the LDAPS bind. Read it as "at least these" rather than as a covered estate
+> `oidc-revocation` leg and has none for the LDAPS bind. Since BACKLOG #2193 the **`[alerts]`
+> https webhook** and the **`[alerts]` SMTP relay when it carries a login** are refused when `serve`
+> builds the alert notifier, with `[alerts]` levers of their own
+> ([DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior)). Read it as "at least these" rather than as a covered estate
 > (SDS-3.6); the count moved from seven with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §4.3 and each gated hop names itself when it refuses. On a stock instance that means `MLLP(..., tls=True)`, an
 > `https://` `Rest()`/`Soap()`/`FHIR()`/`DICOMweb()` destination and an `Email()` STARTTLS relay are all

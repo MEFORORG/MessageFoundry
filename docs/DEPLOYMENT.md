@@ -1000,6 +1000,22 @@ bind-guard ladder above:
     [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) names which callers hand their posture to
     the guard. Attest the hop rather than lowering the dial.
 
+  **Two `[alerts]` hops are gated too** (BACKLOG #2193, owner ruling 2026-10-27). When its host is
+  off the box, each is refused under `enforcement = enforce` as `serve` builds the alert notifier,
+  and builds with a WARNING under `warn`. `messagefoundry check` builds neither, so it does not
+  report them; the loosening report names a set attestation.
+
+  - **The SMTP relay, when `[alerts].email_username` is set.** The login password crosses that
+    hop, and the per-user security-event notifier sends over it with the same login, so both
+    builds are refused, and so is the alerts test send. The levers are a `[tls].crl_file`, which
+    reaches this hop's context, or `[alerts].email_tls_revocation_attested = true` with its
+    reason. A relay with no login stays ungated (the table below).
+  - **The https webhook.** The POST carries the webhook's path token. Its one lever is
+    `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
+    opener built at import, so no CRL reaches it, as on the Vault hops.
+  - **A build with no instance posture is not refused**, as for the LDAPS bind and the OIDC legs:
+    `serve` always hands the posture down, and an embedding that passes no `[ai]` hands none.
+
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine
 control**: confirming the refusal on MLLP and REST tells you nothing about these, which cross silently
@@ -1009,14 +1025,16 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **AI-broker endpoint** | verifying https opener |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, and an alert body carries no PHI, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and
 `MEFOR_TLS_REVOCATION_ATTESTED=1` is not consulted for them either. A deployment that runs the SQL
 Server store has **no** engine-enforced revocation on that hop. *(Until 2026-10-28 this also named
-the inbound FTPS poll, which BACKLOG #2193 has since gated.)*
+the inbound FTPS poll, which BACKLOG #2193 has since gated. Until 2026-10-30 it named the webhook
+alert sink and every `[alerts]` SMTP hop, which the same item gated: the webhook, and the SMTP hop
+when it carries a login.)*
 
 The two gates compose with — never duplicate — the cleartext gates: a cleartext or `verify_tls=false`
 hop is already refused by the [hop authority](#channel--tls-posture-matrix), so revocation only ever

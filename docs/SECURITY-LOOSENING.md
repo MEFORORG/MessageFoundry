@@ -241,6 +241,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
 | | `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested` | `false` / `false` (`true`, with its mandatory reason, lifts the revocation refusal on that section's Vault hops; named as `store.vault_revocation_attested` and `secrets.vault_revocation_attested`) |
+| | `[alerts].email_tls_revocation_attested`, `[alerts].webhook_tls_revocation_attested` | `false` / `false` (`true`, with its mandatory reason, lifts the revocation refusal on the `[alerts]` SMTP relay when it carries a login, or on the https webhook (BACKLOG #2193); named as `alerts.email_tls_revocation_attested` and `alerts.webhook_tls_revocation_attested`) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -267,7 +268,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
-`[store].vault_revocation_attested` and `[secrets].vault_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
+`[alerts].email_tls_revocation_attested` and `[alerts].webhook_tls_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
