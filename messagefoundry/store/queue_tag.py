@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BODY_INLINE",
     "BODY_REF",
+    "LIVE_INLINE_ROW",
     "QUEUE_TAG_COLUMNS",
     "QUEUE_TAG_SELECT",
     "QUEUE_TAG_FAILED_ACTION",
@@ -62,6 +63,14 @@ _log = logging.getLogger(__name__)
 BODY_INLINE: Final = "inline"
 #: The body kind of a store-once row: its ``payload`` holds the sealed ``shared_body`` key.
 BODY_REF: Final = "ref"
+
+#: A queue row a blank ``payload`` on a keyless store is a real, empty body for (BACKLOG #3495): an
+#: inline row that is still owed work. Retention blanks only ``done``, ``cancelled`` and ``dead`` rows,
+#: so a blank on one of these can only be a keyless writer's ``encrypt('')``, while a blank on a
+#: terminal row may be an erasure and cannot be told from an empty body. A ``ref`` row is left out
+#: because its writer always stores the reference, so a blank there is damage. Literal status values,
+#: so each backend can splice this beside its own spelling of "blank".
+LIVE_INLINE_ROW: Final = "body_ref IS NULL AND status IN ('pending', 'inflight')"
 
 #: The ``seal_bytes`` kind the routing fields are encoded under. Its own kind, so a queue tag can
 #: never equal the encoding of an authority-row seal.
@@ -169,7 +178,9 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     body_ref = row["body_ref"]
     if payload == "" and (cipher.encrypts or body_ref is not None):
         # A keyed writer seals every body, an empty one included, and a ref row always holds its
-        # reference. Blank is what retention leaves, so it is never a cell to deliver.
+        # reference. Blank is what retention leaves, so it is never a cell to deliver. A keyless
+        # writer's live empty body is not a counter-example: the first keyed open seals it (BACKLOG
+        # #3495), so a blank that reaches this line on a keyed store is an erasure or a plant.
         raise QueueTagError("integrity: the queue row holds no sealed payload")
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))

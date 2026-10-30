@@ -160,6 +160,7 @@ from messagefoundry.store.metadata import (
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -9202,8 +9203,9 @@ class MessageStore:
         **When the marker is written.** Every writable keyed open that completes this sweep visits
         every surface, and leaves each one marked:
 
-        1. Nothing to seal (empty, all blank or NULL, or all marked): the marker is written in its
-           own transaction. This is what keys an empty surface at the first keyed open.
+        1. Nothing to seal (empty, all blank or NULL with no live empty row, or all marked): the
+           marker is written in its own transaction. This is what keys an empty surface at the
+           first keyed open.
         2. Sealed, with unmarked values: they are left, logged and alerted, and the marker is written
            if it was missing.
         3. Unsealed, with legacy plaintext: the marker is written FIRST, inside the seal's one
@@ -9228,7 +9230,22 @@ class MessageStore:
         marker while the setting is on. Turning it off again restores the refusal on every marked
         surface.
 
-        NULL and blank ``''`` are never sealed: ``''`` is what every purge path writes.
+        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The one
+        exception is a live empty queue row on a surface that is still unsealed (BACKLOG #3495).** A
+        keyless store writes an empty body as ``''``, and :func:`open_queue_cell` refuses a blank on
+        a keyed store, so that row would dead-letter with a false ``integrity_drift`` alarm the first
+        time it was claimed. This open seals it under its own tag instead, in the marker's
+        transaction, and the row stays what it was: owed work, delivered as an empty body, and
+        finalized by what that delivery does. :data:`LIVE_INLINE_ROW` says which rows qualify. The
+        sweep and the claim then agree on every blank:
+
+        - Live, on an unsealed surface: a real row. It is sealed here and delivered.
+        - Terminal: not a row to deliver. A blank ``done``, ``cancelled`` or ``dead`` row may be an
+          erasure, and a keyless store cannot tell that from an empty body, so it stays blank and
+          :data:`_REPLAYABLE_BODY` and the claim both treat it as erased.
+        - Live, on a sealed surface: refused at the claim, dead-lettered and alerted. Nothing a keyed
+          writer does leaves one, so it is what a plant looks like, and sealing it here would launder
+          the plant. That is why this exception reads the sealed state and not the row.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -9260,6 +9277,7 @@ class MessageStore:
                 aad_cols=QUEUE_TAG_COLUMNS,
                 key_cols=("id",),
                 aad_of=queue_row_aad,
+                blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
             )
             # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
             total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
@@ -9322,6 +9340,7 @@ class MessageStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[aiosqlite.Row], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
@@ -9329,14 +9348,18 @@ class MessageStore:
         The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
         ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
-        queue payload's routing tag, BACKLOG #2593). All identifiers are code constants from
-        :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
+        queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
+        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
+        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
+        something to seal, so the marker can never be written over them unsealed. All identifiers
+        are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
+        parameter.
 
         Three steps, in this order:
 
         1. **Decide whether the surface is sealed.** It is when its ``keyed_surface`` marker exists or
-           it holds a marked value (BACKLOG #3383). No unmarked non-blank value: write the marker if it
-           is missing, and stop. Sealed with unmarked values: leave them in place, refused at read,
+           it holds a marked value (BACKLOG #3383). Nothing to seal: write the marker if it is
+           missing, and stop. Sealed with unmarked values: leave them in place, refused at read,
            and write the marker if it is missing (unless the opt-out is on).
         2. **Reserve the whole burst on the AES-GCM bound first** (ASVS 11.3.4). On SQLite the
            reservation commits the one writer connection, so it cannot happen once the seal's
@@ -9356,27 +9379,34 @@ class MessageStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
-                # its legitimate seal is not reported as a plant.
+                # its legitimate seal is not reported as a plant. A blank here stays refused.
+                blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._insert_keyed_marker(table, column)
                 await self._commit()
             return 0
-        await reserve_invocations_ahead(self._cipher, self._add_cipher_invocations_locked, pending)
+        await reserve_invocations_ahead(
+            self._cipher, self._add_cipher_invocations_locked, pending + blanks
+        )
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=?" for c in keys)
         sealed = 0
         try:
             # The marker goes in FIRST, in the seal's own transaction, so a crash undoes both.
-            if not await self._insert_keyed_marker(table, column) and strict:
+            claimed = await self._insert_keyed_marker(table, column)
+            if not claimed and strict:
                 # Another process keyed this surface after step 1, so it sealed the legacy rows.
                 left = await self._count_unmarked(table, pending_where, like)
                 await self._db.rollback()  # the insert changed nothing; this closes the transaction
@@ -9384,12 +9414,16 @@ class MessageStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
+            # The opt-out reseals plaintext, never a blank on a surface another process keyed.
+            seal_where = (
+                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+            )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.
                 cur = await self._db.execute(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
-                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    f" WHERE {seal_where} LIMIT {int(batch)}",
                     (like,),
                 )
                 rows = list(await cur.fetchall())
@@ -9437,11 +9471,10 @@ class MessageStore:
         )
         return await cur.fetchone() is not None
 
-    async def _count_unmarked(self, table: str, pending_where: str, like: str) -> int:
-        """How many values ``pending_where`` matches in ``table``: the non-blank unmarked ones."""
-        cur = await self._db.execute(
-            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
+    async def _count_unmarked(self, table: str, where: str, *params: str) -> int:
+        """How many values ``where`` matches in ``table``: the non-blank unmarked ones, or the
+        blank ones that are real rows."""
+        cur = await self._db.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE {where}", params)
         row = await cur.fetchone()
         return int(row["n"]) if row is not None else 0
 
@@ -10779,8 +10812,11 @@ class MessageStore:
         # so a legitimately EMPTY body would land as '' — indistinguishable at rest from a retention
         # erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The direct
         # `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two apart
-        # on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
-        # guard is replay-only, so a first delivery is unaffected either way.)
+        # on a keyed store. Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse. A first
+        # delivery still goes out there, because a keyless `open_queue_cell` has no tag to check. If
+        # the store gains a key while the row is live, the first keyed open seals it (BACKLOG #3495),
+        # because a keyed claim refuses a blank. Once the row is terminal, the blank stays and reads
+        # as an erasure.
         stored_payload = self._cipher.encrypt(
             payload if body_ref is None else body_ref,
             aad=queue_payload_aad(

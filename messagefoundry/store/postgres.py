@@ -167,6 +167,7 @@ from messagefoundry.store.privilege import (
     postgres_excess,
 )
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -3031,6 +3032,7 @@ class PostgresStore:
             aad_cols=QUEUE_TAG_COLUMNS,
             key_cols=("id",),
             aad_of=queue_row_aad,
+            blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
         )
         total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         total += await self._seal_surface(
@@ -3091,6 +3093,7 @@ class PostgresStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[Any], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -3100,8 +3103,9 @@ class PostgresStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593). Identifiers are code constants; only the
-        marker pattern is a parameter.
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
+        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        Identifiers are code constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
         transaction opens, because a reservation must commit independently of the seal it covers.
@@ -3114,20 +3118,27 @@ class PostgresStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = int(await self._fetchval(count_sql, like) or 0)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = int(
+                await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {blank_where}") or 0
+            )
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant.
+                # so count again rather than report its legitimate seal as a plant. A blank here
+                # stays refused.
+                blanks = 0
                 pending = int(await self._fetchval(count_sql, like) or 0)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._execute(_INSERT_KEYED_MARKER, table, column, time.time())
             return 0
-        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending + blanks)
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
         sealed = 0
@@ -3143,10 +3154,16 @@ class PostgresStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
+            # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
+            seal_where = (
+                f"({pending_where}) OR ({blank_where})"
+                if blanks and claimed is not None
+                else pending_where
+            )
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
-                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    f" WHERE {seal_where} LIMIT {int(batch)}",
                     like,
                 )
                 if not rows:
