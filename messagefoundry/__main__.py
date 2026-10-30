@@ -7975,8 +7975,7 @@ async def _raise_offline_administrator_granted(
     from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
 
     log = logging.getLogger(__name__)
-    # By keyword, so the posture census (tests/test_vault_posture_census.py) reads what it passes.
-    notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture=posture)
+    notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
     taken = False
     if notifier is not None:
         try:
