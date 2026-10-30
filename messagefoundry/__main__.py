@@ -10325,10 +10325,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
     either data pass, the audit range rolls after both, and the stamp and the record's close come
-    last, on a run with no skip and a good roll. Every run that reaches the roll takes it, one that
-    skipped an upload included (owner ruling 2026-10-30), so an engine started on the new key alone
-    keeps a chain that verifies. That costs the way back to the prior key, which docs/PHI.md states.
-    A re-run finds the roll a verified no-op, and the stamp and the close follow. A run that stops
+    last, on a run with no skip and a good roll. A skip does not stop the roll (owner ruling
+    2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
+    that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
+    key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
+    the close follow. A run that stops
     short leaves the record open, so no ``serve`` start stamps its key, unless one already did before
     this run: that start's stamp stands and no record opens.
     """
@@ -10618,15 +10619,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
     if uploads.skipped:
-        # BACKLOG #3737, owner ruling 2026-10-30: a skipped run reaches the audit step like any other,
-        # so an operator who reads PARTIAL as "go back" must be told. Conditional, because this run
-        # cannot see whether the key changed: a same-key run or a keyless chain rolled nothing.
+        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
+        # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
+        # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
+        # here, because the file skips the same way under it.
         print(
-            "note: this run did not complete. Fix the cause and re-run. If this store is moving to "
-            "a new key and its audit chain is keyed, the chain has rolled to that key, and a key "
-            "opens one audit range, so you cannot go back to the prior key: keep it in "
-            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, and if the cause cannot be fixed, rotate to a new "
-            "key."
+            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
+            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
+            "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
+            "range, so you cannot go back to the prior key: keep it in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."
         )
     return 0 if complete else 1
 

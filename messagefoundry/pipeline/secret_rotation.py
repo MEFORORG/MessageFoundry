@@ -329,8 +329,8 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
             "secret rotation: rotate-key has not completed for the store key in use, so its "
             "rotation date was not stamped and its age was not reset. Run `messagefoundry "
             "rotate-key` until it exits 0. Whether the prior key can go back into use depends on "
-            "whether a run reached the audit step, which this record does not say. docs/PHI.md "
-            "says how to tell, and what to do in each case."
+            "whether a run's roll of the audit chain succeeded, which this record does not say. "
+            "docs/PHI.md says how to read the chain. If you cannot tell, do not put it back."
         )
     return None
 

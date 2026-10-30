@@ -634,19 +634,19 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    next start, including a start between setting the new key and the first run, so a stamp proves
    a changed key, not that a `rotate-key` ran. Do not start `serve` between setting a new key and
    running `rotate-key`: that stamp stands however the run ends.
-   **Once a run has rolled a keyed audit chain to a new key, you cannot go back to the prior key
-   (owner ruling 2026-10-30, BACKLOG #3737).** A run that reaches the audit step rolls the chain, one
-   that skipped an upload included, so an engine started on the new key alone keeps a chain that
-   verifies. A key opens one audit range, so the prior key can never open another. `rotate-key`
-   under it re-seals the data and then refuses at the audit step, and leaves you worse off. Recovery
-   is forward: fix the cause and re-run, where the roll is a verified no-op and the stamp follows,
-   or rotate to a new key. Either way, keep the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`
-   until a run completes, because a skipped upload may still be under it. **This does not apply
-   where nothing rolled:** a run with the key already in use, a keyless chain, which has no ranges,
-   or a run that stopped before the audit step. To tell, a rolled chain has a new `audit.key_epoch`
-   row from `system:rotate-key` in its audit log, and that run printed an audit line. After a run
-   that stopped before that step, values may already be under the new key, so if you put the prior
-   key back, keep the new key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and re-run. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
+   **After a run whose roll succeeded on a keyed audit chain, moving it to a new key, you cannot go
+   back to the prior key (owner ruling 2026-10-30, BACKLOG #3737).** A skip does not stop the roll,
+   so an engine started on the new key alone keeps a chain that verifies. A key opens one audit
+   range, so the prior key can never open another. `rotate-key` under it re-seals the data and then
+   refuses at the audit step, and leaves you worse off. A skip clears when you fix its cause, or
+   remove that upload's two files, and re-run: the roll is then a verified no-op and the stamp
+   follows. A new key is only for leaving this key, and clears no skip. Keep the prior key in
+   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` until a run completes, because a skipped upload may still be
+   under it. **To read the chain,** run `messagefoundry audit-verify` with the new key active and the
+   prior key retired. If it warns that the audit chain's current range is keyed under a retired
+   store key, the chain has not rolled, so you may put the prior key back, with the new key in
+   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` because values may already be under it, and re-run. If it
+   gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
    UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
    key will ever open it. Restore that upload, or remove its two files from the uploads directory.
    The log names each skipped file, and says whether the key its marker names is configured. A file
