@@ -127,8 +127,9 @@ _PASSKEY_SIGN_IN_COOKIE_SECONDS = int(CHALLENGE_TTL_SECONDS)
 #: a longer value is clamped, which makes it an invalid assertion rather than a large parse.
 _PASSKEY_ASSERTION_MAX_CHARS = 16_384
 
-#: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth`` and
-#: ``/ui/reauth/webauthn``: a constant, not the bucket's exact wait (BACKLOG #3293). The reason is
+#: The ``Retry-After`` of the per-actor ceremony 429s on ``POST /ui/mfa``, ``/ui/reauth``,
+#: ``/ui/reauth/webauthn`` and ``/ui/account/webauthn/verify``: a constant, not the bucket's exact
+#: wait (BACKLOG #3293, #3690). The reason is
 #: stated once, in docs/SECURITY.md, under the PHI-read ``Retry-After`` paragraph.
 _CEREMONY_RETRY_AFTER = "30"
 

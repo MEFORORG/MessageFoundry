@@ -12432,12 +12432,12 @@ class AuthService:
         self, token_hash: str, *, local_only: bool = False
     ) -> bool:
         """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
-        if await self._mfa_satisfied_hash(token_hash):
-            return False
         session = await self._load_session(token_hash)
         if session is None:
             return True  # no session to act on, so fail closed
-        user = await self._load_user(session.user_id)
+        satisfied, user = await self._session_satisfaction(session)
+        if satisfied:
+            return False
         if user is None:
             return True
         if local_only and user.auth_provider == AuthProvider.AD.value:
@@ -13431,14 +13431,25 @@ class AuthService:
         session = await self._load_session(token_hash)
         if session is None or session.revoked_at is not None:
             return False
+        satisfied, _user = await self._session_satisfaction(session)
+        return satisfied
+
+    async def _session_satisfaction(
+        self, session: SessionRecord
+    ) -> tuple[bool, VerifiedUser | None]:
+        """Whether a session :meth:`_load_session` returned is MFA-satisfied, and the account read
+        to decide it: ``None`` when the stamp decided it or the account is gone. Neither it nor
+        :meth:`_load_session` checks expiry. The one rule
+        :meth:`_mfa_satisfied_hash` and :meth:`_owes_enrolled_factor_hash` share, so the second can
+        reuse the rows it read rather than read them again (BACKLOG #3690 item 7)."""
         if session.mfa_verified_at is not None:
-            return True
-        user = await self._load_user(session.user_id)
-        if user is None:
-            return False
+            return True, None
         # The extra store reads only execute for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
-        return not await self._unverified_session_owes_factor(user)
+        user = await self._load_user(session.user_id)
+        if user is None:
+            return False, None
+        return not await self._unverified_session_owes_factor(user), user
 
     async def _unverified_session_owes_factor(self, user: VerifiedUser) -> bool:
         """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
@@ -14846,6 +14857,7 @@ class AuthService:
         client: str | None = None,
         rp_id: str,
         origin: str,
+        factor_refused: bool = False,
     ) -> Elevation:
         """Verify an attestation response and persist the passkey. Returns a not-``ok``
         :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
@@ -14879,7 +14891,15 @@ class AuthService:
         server did not store it. ``docs/SECURITY.md``, *A refused registration can leave a passkey
         on the authenticator*, states which refusals and how the finish can still fail after the
         passkey was stored, and that the console sends the user to the account's passkey list
-        before deleting anything."""
+        before deleting anything.
+
+        ``factor_refused`` is the caller saying its own :meth:`factor_binding_is_blocked` read
+        refused this session, so it drew nothing from its ceremony budget. The first factor check
+        then refuses on that read rather than its own (BACKLOG #3690): otherwise the account losing
+        its factor between the two reads (a delete on another session, an administrator's reset)
+        would let a request nothing charged finish. Proving the factor on this session instead
+        re-keys it, so that interleaving is answered lost. A revoked session is still answered lost
+        first, whatever the caller read."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -14909,7 +14929,9 @@ class AuthService:
         ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             return Elevation(session_lost=True)
-        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+        if factor_refused or await self._factor_binding_is_blocked(
+            token, STEP_UP_ACTION_WEBAUTHN_ENROLL
+        ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
             raise ValueError(self._FACTOR_PRESENT)

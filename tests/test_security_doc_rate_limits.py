@@ -2452,6 +2452,8 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
     session that has already proven its password, so it draws the SAME per-actor ceremony budget as
     ``POST /ui/reauth`` and sends the same ``Retry-After``. All three send the constant ``30``,
     which is not the budget's clear-time (BACKLOG #3293; docs/SECURITY.md says why).
+    ``POST /ui/account/webauthn/verify``, the passkey registration finish, joined for the same
+    reason: it draws that budget too, and its 429 sends the same constant (BACKLOG #3690 item 5).
     """
     emitting = _retry_after_routes()
     assert emitting == {
@@ -2459,6 +2461,7 @@ def test_retry_after_is_attributed_to_every_route_that_sends_it() -> None:
         "POST /ui/reauth",
         "POST /ui/reauth/webauthn",
         "POST /ui/mfa",
+        "POST /ui/account/webauthn/verify",
     }, (
         f"the throttle branches emitting Retry-After changed: {sorted(emitting)}. Restate the "
         "consequences paragraph and the Route -> limiter map in the same change."

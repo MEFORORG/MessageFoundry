@@ -722,6 +722,13 @@ from typing import Any
 #: 36c5fa9d74fc1625; this branch at 7c5b0091271a1294). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3690: ``AuthService.finish_webauthn_registration`` gained the ``factor_refused``
+#: keyword, which ``POST /ui/account/webauthn/verify`` passes when it skipped its ceremony-budget
+#: draw, so the finish refuses on the route's read rather than a later one. A newer console on an
+#: older engine would raise TypeError at the passkey finish, and the pinned digest refuses that
+#: pair, and an older console on this engine, at mount. The digest moved from
+#: ``9cd9fe02e6e90c18`` (derived with ``--digest``).
+#:
 #: BACKLOG #3965: the ``/ui/oidc/callback`` route calls the new
 #: ``AuthService.allow_step_up_return_audit`` before it writes a step-up return's
 #: ``non_navigation_fetch`` row. A newer console on an older engine would raise AttributeError on
@@ -734,12 +741,16 @@ from typing import Any
 #: ``reason``'s closed set out in the signature, so the digest records it; re-derived again (from
 #: 17b6da621787ad8b).
 #:
+#: BACKLOG #3965 merged with main again, after BACKLOG #3690 landed there (digest
+#: 84ae818da5f2f1ed; this branch at dd768841fe24ec45). Neither parent's value covered both, so
+#: the value below was re-derived with ``--write`` on the merged tree.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "dd768841fe24ec45"
+ENGINE_UI_SEAM: str = "75c4b3550c195a62"
 
 
 @dataclass(frozen=True, slots=True)
