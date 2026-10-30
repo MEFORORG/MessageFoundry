@@ -485,6 +485,7 @@ def test_the_scan_finds_exactly_the_real_templates_and_not_the_prose(
     assert found == {
         "messagefoundry/corepoint_import.py",
         "harness/config/connscale/gen_toml.py",
+        "harness/load/connscale/stepconfig.py",
     }, f"the template scan drifted: {sorted(found)}"
 
     # Stated separately from the equality above, because this is the half that regresses quietly: an

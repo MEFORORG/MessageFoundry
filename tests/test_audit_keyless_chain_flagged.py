@@ -35,6 +35,7 @@ import pytest
 from messagefoundry.__main__ import _keyless_store_gate, _store_key_configured, main
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_UNREAD_KEY,
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -290,6 +291,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=audit_chain_unkeyed,
             remote_debug=None,
