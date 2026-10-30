@@ -10733,8 +10733,9 @@ def _restore_verify(args: argparse.Namespace) -> int:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
-    # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
-    # reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
+    # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
+    # with a reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
+    # Its later cipher build is outside that handler; the key arm below says what reaches it.
     try:
         result = run_guarded(
             run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
