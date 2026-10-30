@@ -13,7 +13,7 @@
   #2624 (a console action has no grant row to fall back on), #2709 (the console route-gate digest),
   #2424 and #2450 (the seam snapshot's gaps), #2604 (the route guard, closed);
   [ADR 0065](0065-web-ops-dashboard.md) and
-  [ADR 0088](0088-apiclient-service-cli-extraction.md) (both amended by the build, section 7),
+  [ADR 0088](0088-apiclient-service-cli-extraction.md) (both amended, section 7),
   [ADR 0077](0077-action-bound-step-up.md), [ADR 0083](0083-mtls-client-certificate-identity.md),
   [ADR 0150](0150-client-address-on-audit-entries.md),
   [ADR 0151](0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md),
@@ -138,7 +138,7 @@ confirmation page, sub-requests a new gate-only route. Slice 2 registers one per
 policy table read, not a permission taken from the request. Each runs what `require` runs, in its
 order: the session resolution and idle-clock touch, must-change confinement, the MFA access gate
 with its `auth.mfa_denied` row, the notification-address gate, the permission loop with its denial
-row, and the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
+row, and, on a route that names a permission, the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
 from must-change confinement, and it names no permission, so it writes no grant row. A check route
 tells a caller nothing it cannot already read from its own `GET /auth/me`, which lists its
 permissions, and a pending session is answered before the permission loop, as `require` does. A form
@@ -253,30 +253,38 @@ as refused.
      no permission is decided inline. That is 240 to 480 rows an hour per tab, and a bearer client
      gets the same rollup. Each row records the JSON path that was authorized and names the console
      route from the extension beside it, so an investigator can tell a console action from a bearer
-     call. That form is decided by the owner (*To resolve on acceptance*, item 3).
+     call. That form is decided by the owner (*To resolve on acceptance*, the grant-row form
+     question), and AC-12 pins it for every console grant row.
    - The nav poll is not the heaviest. At least `/ui/monitoring/live` (`graph_edges` and
      `metrics_history`) and `/ui/cluster/live` (`cluster_status` and `cluster_nodes`) poll every
      5 seconds with two reads each: 1,440 sub-requests and grant rows an hour per open tab, or 720
      composed. The `/ui/session-status` heartbeat is in the confinement set and makes none.
    - *Timer-driven reads write grant rows, on both planes* (decided by the owner, *To resolve on
-     acceptance*, item 2). Every authorized read writes its grant row on both planes, polls
-     included: neither plane exempts a timer-driven read under `audit_all_authz`, and the poll flag
-     changes only the idle clock. The rules that already decide which grants get a row apply to a
-     poll exactly as to any other request, so at least these get none on either plane: a PHI-view
-     grant, which the PHI-access audit row records instead, and a GET when `audit_all_authz` is
+     acceptance*, the timer-driven reads question). Polls included: a timer-driven read writes the
+     grant row any other authorized read writes, on both planes. Neither plane exempts a poll under
+     `audit_all_authz`, and the poll flag changes only the idle clock. The rules that already decide
+     which grants get a row apply to a poll exactly as to any other request, so at least these get
+     none on either plane: a PHI-view grant, which the PHI-access audit row records instead; a route
+     gated by a bare `require()`, which names no permission; and a GET when `audit_all_authz` is
      switched off.
-   - *The cost is a commit, not only a row.* `config/settings.py` says so on `audit_all_authz`: the
-     gate awaits `record_audit`, which commits standalone on the store write lock the
-     staged-pipeline handoffs use. Composed, one tab with the nav poll and one live page open adds
-     up to about 1,200 such commits an hour. Slice 5's measurements include that contention. The
-     remedies `settings.py` names, a rate or sampling bound on read grants or enrolling audit in
-     group commit, are not part of this design. Either would be its own decision, taken for both
-     planes, and a bound on read grants would revisit the owner's answer above.
+   - *The cost is a commit, not only a row.* The `audit_all_authz` field in `config/settings.py`
+     holds the reasoning once, with its remedies; this ADR does not restate it. Composed, one tab
+     with the nav poll and one live page open adds up to about 1,200 grant rows an hour. Slice 5
+     measures their effect with pipeline load running, since an idle engine cannot show contention
+     with the stage handoffs. A remedy that bounds read grants would revisit the owner's answer
+     above, so it would be its own decision, taken for both planes. This ADR builds none.
+   - *Premises this ruling makes false.* At least these say no console page view can write a grant
+     row: the `audit_all_authz` note in `config/settings.py`, ADR 0118's amendment, and
+     `packaging/messagefoundry-webconsole/tests/test_authz_audit_rate.py`, whose
+     `test_console_has_no_grant_audit_call_anywhere` and
+     `test_arm_a_console_tab_writes_no_audit_rows_at_head` pin it. The first slice 5 group that
+     makes console grant rows updates each in the same change.
 4. **One JSON encode and decode per call.** Measured on a stand-in FastAPI app, not the engine: a
    sub-request through an in-process transport plus decoding a 2,961-byte response took about
    0.44 ms (2,000 calls, Python 3.14.7, FastAPI 0.146.0, httpx 0.28.1). The engine's middleware
-   stack adds to it, and that is unmeasured. The first migration group measures `/ui/nav-status` and
-   one PHI page before and after, on the engine.
+   stack adds to it, and that is unmeasured. Slice 5 measures it on the engine, before and after:
+   `/ui/nav-status` with the first migration group, and one PHI page with the second, which is the
+   group that migrates PHI pages.
 
 ### 4. The JSON plane's policy table
 
@@ -318,10 +326,10 @@ is built.
 ### 7. What this amends
 
 It supersedes no ADR whole. It amends two. Since this ADR's acceptance on 2026-10-30 each carries
-an *Amended by ADR 0215* note under its Status line, saying what changes and that its body still
-describes the shipped code. Each body is rewritten by the slices that change what it describes:
-ADR 0088's by slice 3, and ADR 0065's by every slice from 4 to 6, each for the console gate or the
-page groups it moves. Those slices' *Closes* lists name it.
+an *Amended by ADR 0215* note under its Status line. ADRs are append-only, so neither body is
+rewritten. The slice that changes what an ADR describes adds a dated amendment section to it: ADR
+0088's in slice 3, and ADR 0065's in each of slices 4 to 6, for the console gate or the page groups
+it moves. Those slices' *Closes* lists name it.
 
 - **ADR 0065.** The handler reuse in section 6 and the M2b addendum: `/ui` routes stop calling
   handlers and stop re-applying gates (`require_ui_step_up` and its family). Section 1's in-process
@@ -355,7 +363,7 @@ the tests for the criteria it closes.
   Test: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-5** — WHEN a timer-driven console poll makes a sub-request, THE SYSTEM SHALL leave the
   session's idle clock where it was, and SHALL write a grant row wherever a bearer request to the
-  same JSON route would, naming that JSON path with the console route that caused it beside it.
+  same JSON route would.
   Test: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-6** — IF a JSON route refuses a console sub-request, THEN THE SYSTEM SHALL answer the browser
   with the row of section 2's table that matches, and SHALL run no handler for that sub-request.
@@ -376,6 +384,9 @@ the tests for the criteria it closes.
 - **AC-11** — WHEN the console views a message body, THE SYSTEM SHALL record the body view's
   surface as `console`.
   Test: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
+- **AC-12** -- WHEN any console sub-request, a poll or not, writes a grant row, THE SYSTEM SHALL
+  record in it the JSON path that was authorized, with the console route that caused it beside it.
+  Test: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 
 ## Build order
 
@@ -395,21 +406,21 @@ Each slice is one pull request, and each names what closes it.
    unpaced JSON writes section 2 names, and any JSON routes slice 1 found missing. Each new route
    gets its gate, its policy class and its route-map row. With no
    extension present, a bearer client sees no change beyond the new headers and routes. *Closes:*
-   the JSON-plane halves of AC-5 and AC-11.
+   the JSON-plane halves of AC-5, AC-11 and AC-12.
 3. **The transport and the async client.** The derived scope, response streaming, fresh headers.
-   *Closes:* AC-2, AC-3, AC-10, and ADR 0088 AC-1 still green; ADR 0088's body rewritten for the
-   async client and the transport (section 7).
-4. **The shrunk gate and the refusal map.** *Closes:* AC-6, AC-7, and AC-8 still green; ADR 0065's
-   body rewritten for the shrunk console gate (section 7).
+   *Closes:* AC-2, AC-3, AC-10, and ADR 0088 AC-1 still green; a dated amendment section in ADR
+   0088 for the async client and the transport (section 7).
+4. **The shrunk gate and the refusal map.** *Closes:* AC-6, AC-7, and AC-8 still green; a dated
+   amendment section in ADR 0065 for the shrunk console gate (section 7).
 5. **Migrate by page group, in this order:** monitoring and status reads (with the before and after
    measurement in section 3), PHI reads, connection and message writes, step-up and action-bound
    writes, then administration. Each group removes its fields from the bundles and deletes the
    `require_ui*` variants it no longer uses. Slice 5 also owns the open session-read question under
    *To resolve on acceptance*, decided on a measurement taken once a PHI or paced page has
    migrated, since a group-1 read costs only one extra session read; a memoising answer goes to
-   the owner, as that item says. *Closes per group:* its routes
-   reach no seam handler, by call or by reference, and the seam digest moves; ADR 0065's body
-   rewritten for the group's pages (section 7).
+   the owner, as that item says. *Closes per group:* its routes reach no seam handler, by call or
+   by reference, and the seam digest moves; a dated amendment section in ADR 0065 for the group's
+   pages (section 7).
 6. **Remove the second family.** Delete at least: `CoreHandlers`, `AdminHandlers`, `get_engine` and
    `get_gate` from `UiDeps`; the rest of the `require_ui*` factories; the console step-up spend
    machinery other than the presentation in section 2; and every test and table that pairs console
@@ -423,8 +434,8 @@ Each slice is one pull request, and each names what closes it.
    parameter or path moves it (FastAPI ignores an unknown query parameter, so a skewed console
    would otherwise lose a filter silently). Update `docs/SECURITY.md`'s `/ui` route map and
    `docs/WEBCONSOLE-PACKAGE.md` sections 1 and 2. *Closes:* AC-1, AC-4; #1197's console grant-row
-   limb; the handler-signature half of #2424; and ADR 0065's body rewritten for the removed second
-   family, with its *Amended by ADR 0215* note updated to say so (section 7).
+   limb; the handler-signature half of #2424; and a dated amendment section in ADR 0065 for the
+   removed second family (section 7).
 7. **The policy table** (section 4). Independent of slices 1 to 6. *Closes:* AC-9.
 
 ## Options considered
@@ -457,7 +468,8 @@ Each slice is one pull request, and each names what closes it.
 
 **Positive** — One gate family. The console holds no injected handle on a handler, the engine or
 the approval gate, and AC-1's guard refuses one reached through `app.state`.
-Route gates ship in the engine wheel. Every console action gets a grant row. Six drift rows' worth
+Route gates ship in the engine wheel. Every console action gets the grant row a bearer request to
+the same JSON route gets. Six drift rows' worth
 of hand-synchronised checks go away, with the parity tests that watched them. A later step that
 moves the JSON plane into a separate management process takes the console with it, and only the
 transport changes.
@@ -482,7 +494,8 @@ enforcement is unchanged; it stays where the handlers apply it.
 ## To resolve on acceptance
 
 The owner answered the first three on 2026-10-30, in session to the batch 459 Manager through
-AskUserQuestion.
+AskUserQuestion. The fourth stays open after acceptance, as open items did on ADR 0201 and ADR
+0207, because no answer to it is possible before slice 5's measurement.
 
 - [x] The owner accepts or rejects this design. Answered 2026-10-30: asked whether to accept ADR
       0215 as the design for the #2603 build slices, the owner chose *"Accept (Recommended)"*.
@@ -498,7 +511,7 @@ AskUserQuestion.
 - [x] Is the grant row's form right: the authorized JSON path, with the console route named beside
       it? Answered 2026-10-30: asked whether the audit row should name the authorized JSON path,
       with the console route that caused it beside it, the owner chose *"JSON path + route
-      (Recommended)"*. Section 3, cost 3, and AC-5 state the form as decided.
+      (Recommended)"*. Section 3, cost 3, and AC-12 state the form as decided.
 - [ ] After slice 5's measurement, are the extra session reads (one to three per sub-request, plus
       step 1's) acceptable, or should the gate memoise the session for the length of one browser
       request? Open, owned by slice 5. The batch 459 Manager did not put it to the owner and kept it
