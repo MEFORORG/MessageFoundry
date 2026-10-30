@@ -2102,7 +2102,7 @@ def test_cli_raises_administrator_granted_beside_a_directory_administrator(
     transport = _AlertTransport()
     monkeypatch.setattr(
         "messagefoundry.__main__._offline_alert_notifier",
-        lambda _settings, _posture: NotifierAlertSink([transport]),
+        lambda _settings, posture: NotifierAlertSink([transport]),
     )
     monkeypatch.setattr("getpass.getuser", lambda: "host-operator")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
@@ -2176,7 +2176,7 @@ def test_a_failing_alert_still_shows_the_recovery_codes(
     _keyed_store_with_directory_administrator(db, key)
     monkeypatch.setattr(
         "messagefoundry.__main__._offline_alert_notifier",
-        lambda _settings, _posture: _Broken([_AlertTransport()]),
+        lambda _settings, posture: _Broken([_AlertTransport()]),
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]

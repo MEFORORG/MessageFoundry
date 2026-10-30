@@ -1334,6 +1334,9 @@ _CLI_OPENERS = {
     # the read-only "an Administrator exists" probe before the prompt: at the refusing default it
     # would refuse an existing empty store even under the opt-out the CLI gate already accepted
     "_provision_admin.administrator_exists",
+    # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
+    # alert's open instance lands in the store; no create, and the write's verdict and posture
+    "_provision_admin.alert",
     # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
     "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",
