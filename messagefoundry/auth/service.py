@@ -6832,7 +6832,7 @@ class AuthService:
             # A programming error, not a login outcome: a verified federated pair minted under any
             # other mechanism would let that OIDC session step up by password (ADR 0142 Amendment B).
             raise ValueError(
-                "a federated login (federated_subject or mech='oidc') needs the OIDC session"
+                "a federated login (one carrying federated_subject) needs the OIDC session"
                 " mechanism, and only a federated login may use it"
             )
         if federated and idp_auth_time is None:
@@ -16324,9 +16324,8 @@ class AuthService:
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
         routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
-        the sweep can miss a session rotated mid-scan. The session epoch the bind raises refuses
-        that session the next time it is presented; docs/SECURITY.md, *Limits of the session
-        sweep*, states what that costs.
+        the sweep can miss a session rotated mid-scan. docs/SECURITY.md, *Limits of the session
+        sweep*, states what becomes of that session.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).

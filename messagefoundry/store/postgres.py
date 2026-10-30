@@ -9778,8 +9778,8 @@ class PostgresStore:
         # unbind and revoke_user_sessions lock this row FOR UPDATE and then the account's sessions,
         # so a delete that took the sessions first could deadlock against any of them. NO KEY
         # UPDATE still waits on their FOR UPDATE, but not on the FOR KEY SHARE a child row's
-        # foreign-key insert takes, as UPDLOCK does not wait on SQL Server's S lock. FOR UPDATE
-        # would deadlock with reset_login_addresses, which deletes child rows and then inserts one.
+        # foreign-key insert takes. FOR UPDATE would deadlock with reset_login_addresses, which
+        # deletes child rows and then inserts one.
         await conn.execute("SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE", user_id)
         await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
         await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)

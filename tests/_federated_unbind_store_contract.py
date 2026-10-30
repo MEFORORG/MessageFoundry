@@ -8,7 +8,9 @@ live sessions, and reports the pair it cleared -- all in one transaction.
 conditional on that pair still being there, so a login already in flight cannot outrun the unbind.
 One shared body each, run by the SQLite, PostgreSQL and SQL Server suites, so "the three backends
 agree" is an assertion rather than a reading of three separately-worded tests. The two server legs
-run only in CI, so that is where their bodies first execute.
+run only in CI, so that is where their bodies first execute. The bind-versus-delete lock-order body
+runs on the two server legs only: the SQLite store runs one writer at a time, so it has no lock
+order to test.
 
 Driven against the REAL store object on every leg. A fake would move in lockstep with a broken
 implementation and the test would see nothing.
@@ -374,7 +376,7 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
 
     async def _paused_write(handle: Any, user_id: str, change: Any) -> Any:
         written = await real_write(handle, user_id, change)
-        if not holder:  # the bind's write; nothing else writes this account in the window
+        if not holder and user_id == account:  # the bind's write, the first to this account
             holder.append(await holder_of(handle))
             holding.set()
             await release.wait()
