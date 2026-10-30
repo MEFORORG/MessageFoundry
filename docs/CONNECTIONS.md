@@ -1836,9 +1836,15 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
 > `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. So the
 > delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
-> when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
+> when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
-> dropped to DEBUG only once a keyword is set to something outside that deny-list. A passphrase keyword
+> dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **Those two
+> are the only keywords that can set a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`,
+> `SSLCAPATH` and `SSLCIPHER` set none, so one of them alone, or a blank mode, counts as no mode:
+> libpq defaults to `sslmode=prefer`, which can fall back to plaintext. Name the mode as well as the
+> files. `Encrypt` is **unproven** on psqlODBC and on MySQL drivers: no test shows either reads it,
+> so on those drivers use `SSLmode` or `SSLMODE`, and do not take `Encrypt=yes` as a tested control.
+> A passphrase keyword
 > such as `sslpassword` is not a TLS keyword here: it sets no TLS mode, and its value is never read or
 > reported (BACKLOG #1352). It is also reported
 > by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
@@ -1856,8 +1862,8 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > build when `serve` starts it fails that connection, which is recorded failed while the rest of the
 > graph starts (ADR 0031).
 >
-> What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
-> a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
+> What is gated is the case the classifier can judge: **no** TLS mode, or one pinned to
+> a no-TLS value. A mode set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
 > unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
 > per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by

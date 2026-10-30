@@ -1781,7 +1781,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > (2026-07-12 amendment).
 - **What you lose:** on `dialect='generic'` MessageFoundry cannot introspect an arbitrary ODBC driver's
   TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
-  the driver's own keyword. With no such keyword — or with one pinned to a no-TLS value — the rows, and
+  the driver's own keyword. With no mode set — or with one pinned to a no-TLS value — the rows, and
   the credential in the DSN, may cross in plaintext.
 - **Why it is a delegation rather than a refusal:** the engine cannot enumerate an arbitrary driver's
   keywords, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
@@ -1789,17 +1789,25 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
-- **How it is detected, precisely:** a TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) whose
-  **value** is not one of the known no-TLS spellings. The value check matters: matching the key alone
-  read `SSLmode=disable` as TLS ownership. A passphrase-shaped key such as `sslpassword` is not
+- **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
+  case, has a value and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
+  no-TLS spellings. The value check matters: matching the key alone read `SSLmode=disable` as TLS
+  ownership. So did a lone key or certificate path, or a blank mode, none of which sets a mode
+  (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not
   TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
-  **Known residual:** an *encrypted-but-unverified* value
+  **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
-  for "verified" are not consistent enough to grade without guessing.
+  for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
+  is delegated however it is spelled, so a typo clears the check. `encrypt` is unproven on psqlODBC and
+  on MySQL drivers: no test shows either reads it, so `Encrypt=yes` there clears the check and may
+  change nothing on the wire.
 - **It is never silent:** a WARN at each construction naming the connection and the offending keyword;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
-- **What it cannot do:** it is advisory only, on every posture, in both directions. Nothing refuses it.
+- **What it cannot do:** the WARN and these reports refuse nothing. The refusal is
+  `generic_cleartext_hop_guard` (BACKLOG #1178): an enforcing instance refuses this hop off-loopback,
+  in both directions, unless a per-connection declaration relaxes it
+  ([CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql)).
 
 ### `store_principal_over_granted` — the engine's database credential holds more than its runbook allows
 
