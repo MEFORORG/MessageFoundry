@@ -24,6 +24,7 @@ runs before any driver is loaded.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections.abc import Mapping
@@ -313,17 +314,33 @@ def test_a_file_keyword_that_leads_off_the_host_or_cannot_be_cleared_is_refused(
     assert database.driver_file_spellings(sent) == ()
 
 
-def test_a_padded_spelling_the_walk_cannot_clear_is_not_read(
+def test_a_padded_spelling_the_walk_cannot_clear_is_read_as_before(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Windows reads ``" C:\\x"`` as a stream name under the working directory, which the walk
-    cannot clear. That spelling is not refused, since the trimmed path is the one the build judges,
-    but it is not handed to a check to open either. A padded spelling that leads off the host is
-    refused."""
+    cannot clear, and so does a padded spelling whose walk stops on a ``PermissionError`` or the
+    hop limit. That spelling is not refused, since the trimmed path is the one the build judges,
+    but the driver may be given it as sent, so it is read, as it was before the walk existed: it
+    never reaches the driver both unread and unrefused. Red with ``driver_file_spellings`` keeping
+    only the spellings the walk cleared. A padded spelling that leads off the host is refused."""
     sent = r" C:\certs\ca.pem"
-    verdicts = {sent: None, sent.strip(): False}
+    verdicts: dict[str, bool | None] = {sent: None, sent.strip(): False}
     monkeypatch.setattr(database, "_path_verdict", lambda p: verdicts[p])
-    assert database.driver_file_spellings(sent) == (sent.strip(),)
+    assert database.driver_file_spellings(sent) == (sent, sent.strip())
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        if path == sent:
+            raise PermissionError(5, "denied")  # what a walk stopped on, met again by the read
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    monkeypatch.setattr(os.path, "isdir", lambda _p: False)
+    with pytest.raises(ValueError, match="could not be read"):
+        _build(odbc_params={"sslca": sent})
+    assert read == [sent]
     verdicts[sent] = True
     with pytest.raises(ValueError, match="must be a plain local path"):
         _build(odbc_params={"sslca": sent})
@@ -506,6 +523,39 @@ def test_a_ca_off_the_host_is_left_unread_when_tls_is_off(
         _build(odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
     with pytest.raises(ValueError, match="must be a plain local path"):
         _build(odbc_params={"SSLmode": "verify-full", "sslca": ca})
+
+
+@pytest.mark.parametrize("keyword", ["sslca", "sslcapath"])
+@pytest.mark.parametrize(
+    "path", [r"\\files.test\share\ca.pem", r"\\?\UNC\files.test\share\ca.pem", "//files.test/ca"]
+)
+def test_a_ca_share_spelling_is_refused_even_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, path: str
+) -> None:
+    """The TLS-off leniency covers only what the walk alone finds, a mapped drive or a link. A share
+    spelling was refused in every mode before the walk existed, and still is. Red with the
+    leniency applied to every CA keyword that names another host. The control: a mapped drive,
+    which only the walk detects, still builds under ``disable``, unread."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a CA left to the driver must not be read")
+
+    monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
+    monkeypatch.setattr(database, "read_if_regular", never)
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"SSLmode": "disable", keyword: path})
+    assert "files.test" not in str(refused.value)
+    assert f"{keyword}={{Z:\\ca}}" in _build(odbc_params={"SSLmode": "disable", keyword: r"Z:\ca"})
+
+
+def test_a_ca_the_walk_cannot_clear_is_refused_even_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With TLS off the CA check reads nothing it is not given, so a trimmed path the walk could
+    not clear is refused rather than reaching the driver both unread and unrefused."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: None)
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"SSLmode": "disable", "sslca": r"C:\locked\ca.pem"})
 
 
 def _symlink_or_skip(target: str, link: Path, *, directory: bool = False) -> None:

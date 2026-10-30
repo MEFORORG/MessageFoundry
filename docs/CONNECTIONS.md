@@ -1748,8 +1748,10 @@ another host: a mapped network drive, or a link, a chain of links or a `subst` d
 at a share. So is a path the check cannot read through. The check reads links without following
 them and asks a drive's type rather than opening it. A missing folder, or a drive letter with no
 volume on this host, is left to the driver. With TLS off, as under `SSLmode=disable`, the
-driver reads no CA, so an `SSLCA` or `SSLCAPATH` that leads to another host is left to it unread
-rather than refused. The driver still gets the value as you wrote it.
+driver reads no CA, so an `SSLCA` or `SSLCAPATH` that only the check's walk finds leads to
+another host, through a mapped drive or a link, is left to it unread rather than refused. A share
+spelling, and a path the check cannot read through, are still refused in every mode. The driver
+still gets the value as you wrote it.
 
 At least these are not caught, so keep those files on a local disk:
 

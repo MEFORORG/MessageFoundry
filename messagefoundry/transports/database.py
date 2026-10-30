@@ -720,8 +720,9 @@ def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> b
     """Whether a file keyword's ``value`` must be refused: any spelling leads off this host, or the
     trimmed spelling, which the build treats as the path, cannot be cleared. A padded spelling that
     cannot be cleared is not refused, since Windows reads ``" C:\\x"`` as a stream name under the
-    working directory, but it is not read either (:func:`driver_file_spellings`). A falsy value
-    names no path. ``verdicts`` are this value's, when the caller already has them."""
+    working directory. It is read instead, as it was before the walk existed
+    (:func:`driver_file_spellings`), so it never reaches the driver both unread and unrefused. A
+    falsy value names no path. ``verdicts`` are this value's, when the caller already has them."""
     if not value:
         return False
     if verdicts is None:
@@ -733,9 +734,12 @@ def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> b
 def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
     """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
     since a driver may trim it. Empty for a value that can name another host, so no check opens a
-    remote path (vault BACKLOG #3090), and without a spelling the walk could not clear. Any value,
-    a ``Path`` too, is read as its ``str()``: the text the build sends and the remote screen reads,
-    so the engine checks the file the driver is told to load.
+    remote path (vault BACKLOG #3090), or whose trimmed spelling the walk could not clear. A padded
+    spelling the walk could not clear, beside a trimmed one it cleared, is kept: the driver may be
+    given it as sent, so it is read, and :func:`_read_driver_file` judges what that read finds, as
+    it did before the walk existed. Any value, a ``Path`` too, is read as its ``str()``: the text
+    the build sends and the remote screen reads, so the engine checks the file the driver is told
+    to load.
 
     ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
     whenever there is one. Empty is then an answer that judgement already acted on, by refusing
@@ -747,7 +751,7 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
         verdicts = file_keyword_verdicts(value)
     if names_another_host(value, verdicts):
         return ()
-    return tuple(p for p, leaves in verdicts.items() if leaves is False)
+    return tuple(verdicts)  # none leads off the host here: names_another_host refuses any that does
 
 
 def _refuse_remote_path(
@@ -775,25 +779,37 @@ def _refuse_remote_paths(
     """Judge every file keyword in ``named`` once, refuse each that is not a plain local path, and
     return the verdicts for the checks that read the files.
 
-    With TLS off (:func:`generic_odbc_tls_off`) the driver reads no CA, so a CA keyword that leads
-    off the host is not refused: it is left to the driver unread, the outcome the CA check's
+    With TLS off (:func:`generic_odbc_tls_off`) the driver reads no CA, so a CA keyword the WALK
+    finds leads off the host (a mapped drive, or a link to a share, that the spelling does not
+    show) is not refused: it is left to the driver unread, the outcome the CA check's
     unreached-share leniency gives (:class:`_UnreachedShare`), and its verdicts make that check
-    read nothing. A client certificate or key is still refused."""
+    read nothing. Only that is lenient. A share spelling is refused in every mode, as it was before
+    the walk existed, and so is a trimmed path the walk cannot clear, which would otherwise reach
+    the driver both unread and unrefused. A client certificate or key is refused in every mode."""
     tls_off = generic_odbc_tls_off({"dialect": "generic", "odbc_params": named})
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
-        verdicts[name] = file_keyword_verdicts(named[name])
-        if tls_off and name in _ODBC_CA_KEYS:
-            if names_another_host(named[name], verdicts[name]):
-                logger.debug(
-                    "%sDATABASE odbc_params %s: not a local path, left to the driver unread, "
-                    "which reads no CA with TLS off",
-                    hop_name_prefix(connection),
-                    name,
-                )
+        value = named[name]
+        verdicts[name] = file_keyword_verdicts(value)
+        if tls_off and name in _ODBC_CA_KEYS and _off_host_by_walk_only(value, verdicts[name]):
+            logger.debug(
+                "%sDATABASE odbc_params %s: leads to another host, left to the driver unread, "
+                "which reads no CA with TLS off",
+                hop_name_prefix(connection),
+                name,
+            )
             continue
-        _refuse_remote_path(named[name], verdicts[name], name=name, connection=connection)
+        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
+
+
+def _off_host_by_walk_only(value: object, verdicts: FileVerdicts) -> bool:
+    """Whether ``value`` leads off the host by its walk alone: it is not a share spelling (which
+    reads every spelling trimmed), and its trimmed spelling, which the build treats as the path,
+    was walked to another host. ``False`` for a share spelling, for a trimmed path the walk could
+    not clear, and for a local path."""
+    trimmed = str(value).strip()
+    return bool(trimmed) and not _is_remote_spelling(trimmed) and verdicts.get(trimmed) is True
 
 
 def _refuse_weak_driver_key(
