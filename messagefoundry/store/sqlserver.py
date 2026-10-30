@@ -2851,17 +2851,18 @@ async def _assert_autocommit(conn: Any) -> None:
     transaction right after a store on the same DSN closed, and a ``CREATE LOGIN`` sent on such a
     connection held its locks until the process died, which failed every logon on the server. The
     pooling mechanism is inferred, not reproduced; the explicit set is correct either way. The
-    setter goes through the ODBC driver, so it runs off the event loop, and through the
-    connection's call gate when it has one: a cancellation during the set must not let the
-    connection's close free the handle under it (BACKLOG #2394)."""
+    setter goes through the ODBC driver, so it runs off the event loop, through the connection's
+    own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
+    cancellation during the set cannot let the connection's close free the handle under it
+    (BACKLOG #2394). A stand-in with no ``_execute`` gets a plain thread."""
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
-    gate = _call_gate(conn)
-    if gate is None:
-        await asyncio.to_thread(setattr, raw, "autocommit", True)
+    execute = getattr(conn, "_execute", None)
+    if callable(execute):
+        await execute(setattr, raw, "autocommit", True)
     else:
-        await asyncio.to_thread(gate.run, setattr, raw, "autocommit", True)
+        await asyncio.to_thread(setattr, raw, "autocommit", True)
 
 
 def _options_off(row: Any) -> list[str]:
@@ -4193,7 +4194,7 @@ class SqlServerStore:
 
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture),
+                dsn=dsn,
                 autocommit=True,
                 timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )

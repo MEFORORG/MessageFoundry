@@ -37,7 +37,6 @@ import messagefoundry.store.sqlserver as sqlserver
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.odbc_call_gate import call_gate
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
-from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
@@ -46,6 +45,9 @@ from tests._odbc_cancel_fakes import (
     Pool,
     RawConn,
     assert_never_within,
+    bare_store,
+    cancel_once_started,
+    never,
     wait_for_entry,
 )
 
@@ -55,12 +57,8 @@ _STATE_READ = (
 )
 _PROBE_READ = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
 _ALTER_RCSI = "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
-# Without the gate the close it watches for lands in milliseconds.
-_EARLY = 0.3
-
-
-def _never(sql: str) -> bool:
-    return False
+# Measured from the close's submission: without the gate that close lands in milliseconds.
+_EARLY = 0.1
 
 
 def _selects(sql: str) -> bool:
@@ -119,13 +117,6 @@ def _aioodbc_serving(
     return made
 
 
-async def _cancel_once_started(rig: _Rig, coro: Any) -> asyncio.Task[Any]:
-    task = asyncio.create_task(coro)
-    assert await asyncio.to_thread(rig.started.wait, WAIT), "the blocking call never started"
-    task.cancel()
-    return task
-
-
 async def _release_and_reap(rig: _Rig, task: asyncio.Task[Any]) -> None:
     rig.release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -140,8 +131,11 @@ async def test_a_cancelled_state_read_frees_nothing_until_it_returns(
 ) -> None:
     """The RCSI connection. Red before #2394: its close ran on another thread at once."""
     _aioodbc_serving(monkeypatch, rig, [rig.raw(blocks=_selects, rows={_STATE_READ: (1, 1)})])
-    task = await _cancel_once_started(rig, SqlServerStore._ensure_database_options(_settings()))
+    task = await cancel_once_started(
+        rig.started, SqlServerStore._ensure_database_options(_settings())
+    )
 
+    await wait_for_entry(rig.log, "close:submitted")
     await assert_never_within(rig.log, "conn.close", _EARLY)
     await _release_and_reap(rig, task)
     await wait_for_entry(rig.log, "conn.close")
@@ -158,10 +152,13 @@ async def test_a_cancelled_autocommit_set_frees_nothing_until_it_returns(
     _aioodbc_serving(
         monkeypatch,
         rig,
-        [rig.raw(blocks=_never, rows={_STATE_READ: (1, 1)}, block_autocommit=True)],
+        [rig.raw(blocks=never, rows={_STATE_READ: (1, 1)}, block_autocommit=True)],
     )
-    task = await _cancel_once_started(rig, SqlServerStore._ensure_database_options(_settings()))
+    task = await cancel_once_started(
+        rig.started, SqlServerStore._ensure_database_options(_settings())
+    )
 
+    await wait_for_entry(rig.log, "close:submitted")
     await assert_never_within(rig.log, "conn.close", _EARLY)
     await _release_and_reap(rig, task)
     await wait_for_entry(rig.log, "conn.close")
@@ -175,14 +172,15 @@ async def test_a_cancelled_reread_on_a_probe_frees_nothing_until_it_returns(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """``_rcsi_on_after_a_peer``'s fresh probe connection, reached when our ALTER fails."""
-    main = rig.raw(
-        "main", blocks=_never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI})
-    )
+    main = rig.raw("main", blocks=never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI}))
     probe = rig.raw("probe", blocks=_selects, rows={_PROBE_READ: (1,)})
     made = _aioodbc_serving(monkeypatch, rig, [main, probe])
-    task = await _cancel_once_started(rig, SqlServerStore._ensure_database_options(_settings()))
+    task = await cancel_once_started(
+        rig.started, SqlServerStore._ensure_database_options(_settings())
+    )
 
     assert len(made) == 2, "the arm is vacuous: the cancel did not land on the probe"
+    await wait_for_entry(rig.log, "probe:close:submitted")
     await assert_never_within(rig.log, "probe:conn.close", _EARLY)
     await _release_and_reap(rig, task)
     await wait_for_entry(rig.log, "probe:conn.close")
@@ -198,17 +196,14 @@ async def test_an_ordinary_open_gates_every_connection_it_makes(
     """The control. With no cancellation both connections are gated, put into autocommit, read,
     and closed, so the arms above cannot pass on a path that never ran."""
     rig.release.set()
-    main = rig.raw(
-        "main", blocks=_never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI})
-    )
-    probe = rig.raw("probe", blocks=_never, rows={_PROBE_READ: (1,)})
+    main = rig.raw("main", blocks=never, rows={_STATE_READ: (0, 1)}, fails=frozenset({_ALTER_RCSI}))
+    probe = rig.raw("probe", blocks=never, rows={_PROBE_READ: (1,)})
     made = _aioodbc_serving(monkeypatch, rig, [main, probe])
 
     await SqlServerStore._ensure_database_options(_settings())
 
     assert len(made) == 2
     assert all(call_gate(conn) is not None for conn in made)
-    assert all(conn.closed for conn in made)
     assert main.closed and probe.closed and main.autocommit
     assert USE_AFTER_FREE not in rig.log, rig.log
 
@@ -218,15 +213,7 @@ async def test_an_ordinary_open_gates_every_connection_it_makes(
 
 def _cluster_store(rig: _Rig, raw: RawConn) -> tuple[SqlServerStore, Pool]:
     pool = Pool(AioConn(raw, rig.executor))
-    store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = pool
-    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
-        command_timeout=0, acquire_timeout=30.0
-    )
-    store._acquire_wait = AcquireWaitHistogram()
-    store.committed_txns = 0
-    store.body_copies = 0
-    return store, pool
+    return bare_store(pool), pool
 
 
 def _first_select(sql: str) -> bool:
@@ -238,7 +225,7 @@ async def test_a_cancelled_cluster_table_setup_hands_its_cursor_to_the_gate(rig:
     the connection with no explicit close of the cursor ahead of it."""
     store, pool = _cluster_store(rig, rig.raw(blocks=_first_select))
     coordinator = SqlServerCoordinator(store, "N")
-    task = await _cancel_once_started(rig, coordinator._ensure_tables())
+    task = await cancel_once_started(rig.started, coordinator._ensure_tables())
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, WAIT)  # the cancel does not wait for the statement
     assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
@@ -260,7 +247,7 @@ async def test_an_ordinary_cluster_table_setup_closes_its_cursor_before_release(
     """The control, and the EF-6 half: the cursor closes after the commit and before the
     connection goes back to the pool, which the bare cursor never did."""
     rig.release.set()
-    store, pool = _cluster_store(rig, rig.raw(blocks=_never, rows={sqlserver._SQL_APPLOCK: (0,)}))
+    store, pool = _cluster_store(rig, rig.raw(blocks=never, rows={sqlserver._SQL_APPLOCK: (0,)}))
 
     await SqlServerCoordinator(store, "N")._ensure_tables()
 

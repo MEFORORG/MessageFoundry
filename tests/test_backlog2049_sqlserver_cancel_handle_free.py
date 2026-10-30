@@ -25,14 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
-from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
@@ -40,6 +38,8 @@ from tests._odbc_cancel_fakes import (
     AioConn,
     Pool,
     RawConn,
+    bare_store,
+    cancel_once_started,
     wait_for_entry,
 )
 
@@ -63,14 +63,7 @@ async def rig() -> Any:
     started = threading.Event()
     raw = RawConn(log, release, started)
     pool = Pool(AioConn(raw, executor))
-    store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = pool
-    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
-        command_timeout=0, acquire_timeout=30.0
-    )
-    store._acquire_wait = AcquireWaitHistogram()
-    store.committed_txns = 0
-    store.body_copies = 0
+    store = bare_store(pool)
     try:
         yield _Rig(store, pool, log, release, started)
     finally:
@@ -80,14 +73,7 @@ async def rig() -> Any:
 
 async def _cancel_mid_statement(r: _Rig) -> asyncio.Task[Any]:
     """Start a store read, wait until its statement is running on a worker thread, cancel it."""
-    task = asyncio.create_task(r.store._fetchall("SELECT 1 AS r"))
-    assert await asyncio.to_thread(r.started.wait, WAIT), "the statement never started"
-    task.cancel()
-    return task
-
-
-async def _wait_for(r: _Rig, entry: str) -> None:
-    await wait_for_entry(r.log, entry)
+    return await cancel_once_started(r.started, r.store._fetchall("SELECT 1 AS r"))
 
 
 async def test_a_cancelled_call_frees_no_handle_until_its_statement_returns(rig: _Rig) -> None:
@@ -104,7 +90,7 @@ async def test_a_cancelled_call_frees_no_handle_until_its_statement_returns(rig:
     )
 
     rig.release.set()
-    await _wait_for(rig, "conn.close")
+    await wait_for_entry(rig.log, "conn.close")
 
     assert USE_AFTER_FREE not in rig.log, f"the statement returned to a freed handle ({rig.log})"
     end = rig.log.index("execute:end")
@@ -134,7 +120,7 @@ async def test_a_second_cancellation_still_frees_nothing_early(rig: _Rig) -> Non
     assert "cursor.close" not in rig.log and "conn.close" not in rig.log, rig.log
 
     rig.release.set()
-    await _wait_for(rig, "conn.close")
+    await wait_for_entry(rig.log, "conn.close")
     assert USE_AFTER_FREE not in rig.log, rig.log
     assert rig.pool.free == []
 
@@ -157,7 +143,7 @@ async def test_a_cancel_between_calls_closes_the_cursor_then_the_connection(rig:
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, WAIT)
 
-    await _wait_for(rig, "conn.close")
+    await wait_for_entry(rig.log, "conn.close")
     assert USE_AFTER_FREE not in rig.log, rig.log
     end = rig.log.index("execute:end")
     assert end < rig.log.index("cursor.close") < rig.log.index("conn.close"), rig.log

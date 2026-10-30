@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import types
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
+
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.sqlserver import SqlServerStore
 
 # Bound on every wait for a worker thread. Generous, since these steps take milliseconds, but finite
 # so a wedged case fails as a timeout instead of hanging the suite.
@@ -28,8 +32,14 @@ WAIT = 5.0
 USE_AFTER_FREE = "USE-AFTER-FREE"
 
 
-def _always(sql: str) -> bool:
+def always(sql: str) -> bool:
+    """A ``blocks`` predicate: every statement waits for ``release``."""
     return True
+
+
+def never(sql: str) -> bool:
+    """A ``blocks`` predicate: no statement waits."""
+    return False
 
 
 class RawCursor:
@@ -89,7 +99,7 @@ class RawConn:
         started: threading.Event,
         *,
         name: str = "",
-        blocks: Callable[[str], bool] = _always,
+        blocks: Callable[[str], bool] = always,
         rows: Mapping[str, tuple[Any, ...]] | None = None,
         fails: frozenset[str] = frozenset(),
         block_autocommit: bool = False,
@@ -207,6 +217,9 @@ class AioConn:
     async def close(self) -> None:
         if self._conn is None:
             return
+        # Logged on the loop as the close is submitted, so an arm can start its "not yet" window
+        # at the close rather than at the cancel.
+        self._conn.note("close:submitted")
         await self._execute(self._conn.close)
         self._conn = None
 
@@ -230,6 +243,27 @@ class Pool:
             await self.hold.wait()
         if not conn.closed:
             self.free.append(conn)
+
+
+def bare_store(pool: Pool) -> SqlServerStore:
+    """A ``SqlServerStore`` with only what ``_acquire`` and ``_cursor`` read, over ``pool``."""
+    store = SqlServerStore.__new__(SqlServerStore)
+    store._pool = pool
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=0, acquire_timeout=30.0
+    )
+    store._acquire_wait = AcquireWaitHistogram()
+    store.committed_txns = 0
+    store.body_copies = 0
+    return store
+
+
+async def cancel_once_started(started: threading.Event, coro: Any) -> asyncio.Task[Any]:
+    """Run ``coro`` as a task, wait until its blocking call is running on a worker, cancel it."""
+    task = asyncio.create_task(coro)
+    assert await asyncio.to_thread(started.wait, WAIT), "the blocking call never started"
+    task.cancel()
+    return task
 
 
 async def wait_for_entry(log: list[str], entry: str) -> None:
