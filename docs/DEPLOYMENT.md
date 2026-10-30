@@ -637,7 +637,7 @@ them covers, and it is one of at least two TLS relaxations whose **setting no po
 (the other is `tls_check_hostname = false`; CORRECTED 2026-10-01, this said "the only") — so
 an audit built from those columns alone has a hole. CORRECTED 2026-10-30: the heading said "no posture
 gate at all", and this said "no posture gate whatsoever". The setting itself is still not refused, but
-on an enforcing instance it changes the revocation guard's answer, as the end of this section says:
+in either posture it changes the revocation guard's answer, as the end of this section says:
 
 **`tls_allow_expired = true`** is a **per-connection** setting on **six** outbound connectors, and on
 the `Ftp` (FTPS) inbound poller, which dials out through the same context. The six are **MLLP,
@@ -660,9 +660,12 @@ alongside the WARNING each construction logs. Like every connection-scoped decla
 the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
 gated — nothing refuses the setting, and nothing takes it away again. It does take one lever away: on a hop
 that sets it, a `[tls].crl_file` does not cross the revocation gate, so off the box on an enforcing
-instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13).
+instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13). On an instance that
+does not enforce, that hop logs the revocation WARNING at each build, except at least when
+`MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own `tls_revocation_attested`,
+or on a loopback hop.
 
-Two consequences worth stating plainly. **(1)** Every connector that takes `tls_allow_expired` runs the
+Two consequences worth stating plainly. **(1)** Every connector that takes `tls_allow_expired` today runs the
 revocation guard on its verifying hop ([Revocation-guard behavior](#revocation-guard-behavior)), and a CRL earns that hop no
 credit there. A PHI hop can still be pinned to a certificate that is **both long-expired and revoked**
 with nothing refusing it, at least when the connection combines `tls_allow_expired` with
@@ -1138,7 +1141,7 @@ the Vault guard in `transports/strict_requests.py` calls that function itself an
 `RevocationHopGuard`) and every *other* verifying TLS hop must be named as
 ungated, never covered by an "every verifying hop" sentence; a weakening whose setting no posture gate
 refuses (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no
-refusal keys on the setting itself — **reported is not gated**, and the two must never be written as if
+posture gate refuses the setting itself — **reported is not gated**, and the two must never be written as if
 either implied the other. `tls_allow_expired` is not inert to the revocation guard, though: it also
 skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
 hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
@@ -1146,7 +1149,8 @@ context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directi
 site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
 setting and hands the guard its relaxed context lets a stale CRL admit the hop. CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
-true when the guard gave such a hop no CRL credit (vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`
+true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
+credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:
 `tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it
 when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refusal_revocation.py` and

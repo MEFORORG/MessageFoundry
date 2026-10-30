@@ -1682,8 +1682,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   no end date, and nothing removes it when the peer renews. The same flag also skips a CRL's own
   validity window, so a `[tls].crl_file` that reaches the hop earns it no credit with the revocation
   guard. Off the box on an enforcing instance such a hop is therefore refused unless the connection
-  sets `tls_revocation_attested` with a reason: on REST, SOAP and FHIR since vault BACKLOG #2188, on
-  both FTPS directions since vault BACKLOG #2193, and on MLLP and the DICOM C-STORE SCU since vault
+  sets `tls_revocation_attested` with a reason: on REST, SOAP and FHIR, already refused on main; on
+  both FTPS directions since vault BACKLOG #2193; and on MLLP and the DICOM C-STORE SCU since vault
   BACKLOG #2978
   ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
   §13). A CRL that reaches the hop still refuses a leaf certificate it lists. CORRECTED 2026-10-30:
@@ -1712,12 +1712,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   posture gate refuses the setting itself, `[security].enforcement = enforce` does not clamp it, and no
   `MEFOR_ALLOW_INSECURE_TLS` is needed to set it. Reported is not gated. What it does change is the
   revocation guard's answer, in either posture. Under an enforcing posture the hop is refused as *What
-  you lose* says. On an instance that does not enforce, an MLLP or DICOM C-STORE SCU hop that sets it
-  and that a CRL used to admit silently now logs the revocation WARNING at each build, except at
+  you lose* says. On an instance that does not enforce, an MLLP or DICOM C-STORE SCU hop that sets it,
+  which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
   least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
   `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
-  this said "No posture gate keys on it", which was false once the revocation guard gave such a hop no
-  CRL credit. The engine will tell you *which* connections have it set,
+  this said "No posture gate keys on it", which was false once the call sites handed the guard no
+  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
