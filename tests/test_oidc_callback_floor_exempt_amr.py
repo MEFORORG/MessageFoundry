@@ -301,9 +301,10 @@ async def test_a_refused_sign_in_carries_the_marker_only_when_the_exemption_appl
         failed = await _audit_rows(store, "auth.login_failed")
         assert all(_detail(r).get("reason") != "locked" for r in failed)
         if refusal == "locked":
-            # BACKLOG #3728 item 6: read the trail through the store's own filtered read, the one
-            # the audit routes use for a reader without users:manage, rather than comparing the
-            # exclusion's row set. The marked lock row is gone from it and nothing else is.
+            # BACKLOG #3728 item 6: read the trail through the store's own filtered read, with the
+            # exclusion a reader without users:manage is given, rather than comparing the
+            # exclusion's row set. The marked lock row is gone from it and nothing else is. Which
+            # exclusion the routes pick is pinned end to end in test_combined_sign_in_audit_oracle.
             everything = [(r["action"], r["detail"]) for r in await store.list_audit(limit=1000)]
             filtered = [
                 (r["action"], r["detail"])
@@ -711,14 +712,15 @@ async def test_a_failed_exchange_on_a_deferred_step_up_is_tied_to_the_exemption(
 # --- BACKLOG #3728 item 1: a guard derived from the code, so a NEW outcome writer is caught --------
 #
 # The marker is passed by hand to every outcome writer after the exemption is decided. A test that
-# names today's arms cannot catch tomorrow's, so this one reads the three methods' syntax trees and
-# checks every outcome write in the region the marker covers, descending into each AuthService
-# method the region calls. An outcome row that does not pass the marker fails it, and so does an
-# audit write whose action the guard cannot read.
+# names today's arms cannot catch tomorrow's, so this one reads the three methods' syntax trees. In
+# the region the marker covers, every audit write must be an outcome row that passes the marker, or
+# a side effect named below; an action it cannot read, or a write straight to the store, fails it.
+# Each AuthService method the region calls is checked too, and must write no outcome row at all.
 #
-# Other actions, the side-effect rows docs/SECURITY.md says carry no marker, are not listed, so a
-# new one anywhere under these methods does not fail this test. The cost: a NEW outcome action
-# written by a direct `_audit` call would pass unseen until it is added below.
+# WHAT IT DOES NOT CATCH, at least: a helper under the region writing a NEW outcome action (only the
+# actions listed below are known as outcomes there); a marker named in the expression but dropped
+# before the row is written (`extra=floor_marker and {}`); a writer outside the three methods. The
+# behavioural tests above hold today's arms; this holds the next arm written in the same shape.
 
 #: Audit actions that record a sign-in or step-up attempt's OUTCOME. Each must carry the marker.
 _OUTCOME_ACTIONS = frozenset(
@@ -730,11 +732,21 @@ _OUTCOME_ACTIONS = frozenset(
         DIRECTORY_LOGIN_LOCKED_ACTION,
     }
 )
+#: The side-effect rows a region writes directly, which docs/SECURITY.md says carry no marker. Any
+#: other action written directly in a region fails the guard until it is sorted.
+_REGION_SIDE_EFFECTS = frozenset({"auth.ad_roles_resynced"})
 #: Writers that take the marker through a keyword, and that keyword.
 _KEYWORD_WRITERS = {
     "_directory_reject_audit": "extra",
     "_refuse_directory_row": "extra",
     "_complete_ad_login": "outcome_extra",
+}
+#: The writers that put a keyword into the row they write, checked by
+#: :func:`test_each_writer_puts_the_marker_keyword_into_its_row`.
+_SINKS = {
+    "_directory_reject_audit": "extra",
+    "_refuse_directory_row": "extra",
+    "_step_up_refused": "floor",
 }
 
 
@@ -809,6 +821,22 @@ def _carries(fn: ast.AST, expr: ast.expr | None, markers: set[str]) -> bool:
     return bool(names & markers) or any(_built_from(fn, n) & markers for n in names)
 
 
+def _not_branches(fn: ast.AST, decision: str | None) -> list[tuple[int, int]]:
+    """The line spans of each ``if`` body whose test reads ``not <decision>``: the branch where the
+    exemption did not apply, so a row written there has no marker to carry."""
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(fn) if decision else ():
+        if isinstance(node, ast.If) and any(
+            isinstance(n, ast.UnaryOp)
+            and isinstance(n.op, ast.Not)
+            and isinstance(n.operand, ast.Name)
+            and n.operand.id == decision
+            for n in ast.walk(node.test)
+        ):
+            spans.append((node.body[0].lineno, node.body[-1].end_lineno or node.body[-1].lineno))
+    return spans
+
+
 def _unmarked(
     methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -816,20 +844,29 @@ def _unmarked(
     after: int,
     markers: set[str],
     seen: set[str],
+    decision: str | None = None,
 ) -> tuple[list[str], int]:
     """Every outcome write in ``fn`` past line ``after`` that does not pass one of ``markers``, and
-    how many outcome writes were checked (the positive control's count)."""
+    how many outcome writes were checked (the positive control's count). An empty ``markers`` is a
+    method the region calls, which may write no outcome row at all."""
     problems: list[str] = []
     checked = 0
     where = fn.name
+    unmarked_spans = _not_branches(fn, decision)
     for call in _calls(fn, after):
+        if any(lo <= call.lineno <= hi for lo, hi in unmarked_spans):
+            continue
         callee = _callee(call)
-        if callee == "_audit":
+        if markers and isinstance(call.func, ast.Attribute) and call.func.attr == "record_audit":
+            problems.append(f"{where}:{call.lineno} writes the audit store directly")
+        elif callee == "_audit":
             action = _action(call)
             if action is None:
                 problems.append(f"{where}:{call.lineno} writes an action the guard cannot read")
                 continue
             if action not in _OUTCOME_ACTIONS:
+                if markers and action not in _REGION_SIDE_EFFECTS:
+                    problems.append(f"{where}:{call.lineno} writes {action!r}, not sorted")
                 continue
             checked += 1
             if not _carries(fn, _keyword(call, "detail"), markers):
@@ -870,10 +907,10 @@ def _region_start(fn: ast.AST, target: str, keyword: str | None = None) -> int:
     raise AssertionError(f"no assignment to {target} in {getattr(fn, 'name', fn)}")
 
 
-#: The three regions the marker covers: the method, where the region starts, and the names the
-#: marker travels under there.
+#: The three regions the marker covers: the method, where the region starts (the exemption's
+#: decision, or the deferral's binding), and the names the marker travels under there.
 _REGIONS = [
-    ("_authenticate_oidc", ("floor_marker",), {"floor_marker"}),
+    ("_authenticate_oidc", ("floor_exempt_amr",), {"floor_marker"}),
     ("_complete_ad_login", None, {"outcome_extra"}),
     ("complete_oidc_step_up", ("refuse", "floor"), {"floor_fields"}),
 ]
@@ -888,28 +925,105 @@ def test_every_outcome_writer_after_the_exemption_passes_the_marker(
 ) -> None:
     fn = service_methods[method]
     after = _region_start(fn, *start) if start else 0
-    problems, checked = _unmarked(service_methods, fn, after=after, markers=markers, seen=set())
+    problems, checked = _unmarked(
+        service_methods, fn, after=after, markers=markers, seen=set(), decision="floor_exempt_amr"
+    )
     assert problems == [], problems
     # The positive control: the walk found the region's writers, so an empty list is not the
     # vacuous answer of a region that matched nothing.
     assert checked >= 5, (method, checked)
 
 
+def _assign_before(fn: ast.AST, target: str, line: int) -> ast.Assign | ast.AnnAssign:
+    """The last assignment to ``target`` above ``line``."""
+    found = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.Assign, ast.AnnAssign))
+        and n.lineno < line
+        and any(
+            isinstance(t, ast.Name) and t.id == target
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+        )
+    ]
+    assert found, (target, line)
+    return max(found, key=lambda n: n.lineno)
+
+
+def test_the_step_up_binds_both_floor_fields_before_the_refusals_that_need_them(
+    service_methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> None:
+    """The step-up leg's guard above checks that no refusal REPLACES the bound fields. This checks
+    the bindings themselves: the deferral is bound before the code exchange, and the matched values
+    are bound before every refusal after it. Dropping either binding, or either field from the one
+    that holds it, fails here."""
+    fn = service_methods["complete_oidc_step_up"]
+    bindings = sorted(
+        (
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "refuse" for t in n.targets)
+            and isinstance(n.value, ast.Call)
+            and _keyword(n.value, "floor") is not None
+        ),
+        key=lambda n: n.lineno,
+    )
+    assert len(bindings) == 2, [b.lineno for b in bindings]
+    deferred, matched = bindings
+    [exchange] = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Try) and "_exchange_and_validate" in ast.unparse(n.body[0])
+    ]
+    assert deferred.lineno < exchange.lineno < matched.lineno
+    assert "_FLOOR_DEFERRED_MARKER" in _names(_assign_before(fn, "floor_fields", deferred.lineno))
+    matched_from = _names(_assign_before(fn, "floor_fields", matched.lineno))
+    assert {"floor_fields", "_floor_exempt_marker"} <= matched_from, matched_from
+    after_exchange = [
+        c.lineno
+        for c in _calls(fn, exchange.end_lineno or exchange.lineno)
+        if _callee(c) == "refuse"
+    ]
+    assert after_exchange, "no refusal after the exchange, so the order below proves nothing"
+    assert min(after_exchange) > matched.lineno
+
+
+def test_each_writer_puts_the_marker_keyword_into_its_row(
+    service_methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> None:
+    """The region guard stops at a writer's call and trusts it to write what it was passed. This
+    checks that trust: each writer's own audit row is built from that keyword."""
+    for sink, keyword in _SINKS.items():
+        fn = service_methods[sink]
+        writes = [c for c in _calls(fn) if _callee(c) == "_audit"]
+        assert writes, sink
+        for call in writes:
+            assert _carries(fn, _keyword(call, "detail"), {keyword}), (sink, call.lineno)
+
+
 def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
-    """The negative control, on synthetic code shaped like the real legs: a new refusal written
-    without the marker, a refuse that replaces the bound fields, an action the guard cannot read,
-    and a helper that writes an outcome row the marker cannot reach. Each is reported, and the
-    marked writer and the side-effect row are not."""
+    """The negative control, on synthetic code shaped like the real legs: a refusal between the
+    decision and the marker, a new refusal written without the marker, a refuse that replaces the
+    bound fields, an action the guard cannot read, an unsorted action, a write straight to the
+    store, and a helper that writes an outcome row the marker cannot reach. Each is reported. The
+    marked writer, the side-effect row, and the row in the branch where the exemption did not apply
+    are not."""
     source = textwrap.dedent(
         """
         class AuthService:
             async def leg(self, client, action):
+                floor_exempt_amr = ()
+                if not floor_exempt_amr:
+                    await self._audit("auth.login_failed", detail=_json({"reason": "too_early"}))
+                await self._audit("auth.login_failed", detail=_json({"reason": "above"}))
                 floor_marker = {}
                 await self._directory_reject_audit("u", "oidc", "x", client=client, extra=floor_marker)
                 await self._audit("auth.ad_roles_resynced", detail=_json({}))
                 await self._directory_reject_audit("u", "oidc", "new_arm", client=client)
-                await self._audit("auth.login_failed", detail=_json({"reason": "y"}))
                 await self._audit(action, detail=_json({}))
+                await self._audit("auth.federated_refused", detail=_json({}))
+                await self._store.record_audit("auth.login_failed", detail="{}")
                 await refuse("z", floor={})
                 await self._helper()
 
@@ -922,12 +1036,17 @@ def test_the_guard_fires_on_an_arm_that_drops_the_marker() -> None:
     methods = _methods_of(cls)
     fn = methods["leg"]
     problems, _checked = _unmarked(
-        methods, fn, after=_region_start(fn, "floor_marker"), markers={"floor_marker"}, seen=set()
+        methods,
+        fn,
+        after=_region_start(fn, "floor_exempt_amr"),
+        markers={"floor_marker"},
+        seen=set(),
+        decision="floor_exempt_amr",
     )
-    assert len(problems) == 5, problems
+    assert len(problems) == 7, problems
     assert sum("without the marker" in p for p in problems) == 3, problems
-    assert any("cannot read" in p for p in problems), problems
-    assert any("floor=" in p for p in problems), problems
+    for expected in ("cannot read", "not sorted", "store directly", "floor="):
+        assert any(expected in p for p in problems), (expected, problems)
 
 
 # --- BACKLOG #3221: a verified token clears the IdP flag, and the step-up's generic text ----------

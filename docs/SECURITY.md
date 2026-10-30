@@ -823,16 +823,18 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). A value `oidc_mfa_amr_values` also accepts is
   refused at load while the claim gate is on. **This paragraph is the source of record for which
   audit rows carry the exemption's fields**; other documents link here. Each exempted pass records
-  the matched values as `callback_floor_exempt_amr`, at the top level of every outcome row it
-  writes: the `auth.login_success` or `auth.reauth` row when it is served, and its refusal row when
-  it is refused (BACKLOG #3220, #3728). That includes a directory lock refusal: that row has its own
+  the matched values as `callback_floor_exempt_amr`, at the top level of its outcome rows: at least
+  the `auth.login_success` or `auth.reauth` row when it is served, and its refusal row when it is
+  refused (BACKLOG #3220, #3728). That includes a directory lock refusal: that row has its own
   action, `auth.directory_login_locked`, which the audit read routes show only to `users:manage`
   ([Audit](#audit) names them), so the marker shows a reader without it no lock there (BACKLOG
   #3726). The other rows the attempt writes, such as a role resync or a session rotation, do not
   carry it. With the list set, a too-early step-up's code is redeemed before the refusal, because
-  only the exchange yields the `amr`. Every outcome row of such a step-up carries
-  `callback_floor_deferred: true`, so a refusal the exchange itself causes, which comes before any
-  `amr` is known, is still tied to the exemption (BACKLOG #3728). The exemption lifts
+  only the exchange yields the `amr`. Each outcome row of such a step-up carries
+  `callback_floor_deferred: true` (BACKLOG #3728). It says the floor decision waited for the
+  exchange, not that the exemption applied: a refusal the exchange itself causes comes before any
+  `amr` is known and carries only this field, and so does a `too_early` refusal whose `amr` named
+  no listed value. A review of exempted attempts reads both fields. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
   the exempt value is refused as `mfa_claim_missing`.
