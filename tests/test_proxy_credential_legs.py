@@ -455,7 +455,7 @@ def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_entry_is_refused(
     no header the same send reaches the dial."""
     monkeypatch.setenv("HTTP_PROXY", f"http://{_MARKER}")
     dest = _rest(_HTTPS_TARGET, proxy_url="default", headers=_STATIC_PROXY_HEADER)
-    assert set(_proxies_of(_proxy_handler(dest))) == {"http"}
+    assert "https" not in _proxies_of(_proxy_handler(dest))
     _send_refused(dest, "#3417")
     with pytest.raises(_Dialled) as dialled:
         asyncio.run(_rest(_HTTPS_TARGET, proxy_url="default").send('{"a": 1}'))

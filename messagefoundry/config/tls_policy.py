@@ -2111,15 +2111,21 @@ def is_loopback_hop_host(host: str) -> bool:
     resolve to a loopback address is still refused, because resolution is attacker-influenceable and
     would let a hostname smuggle an off-box hop past the on-box carve-out.
 
-    **A limit (vault BACKLOG #2706): only case is normalised.** ``localhost.``, ``127.0.0.1.`` and
-    ``%6cocalhost`` each read as remote here, though a resolver may take the first two as this box.
-    So the cleartext guards refuse them, and a proxy takes them with the connection's proxy
-    credential, as for any remote hop. The limit errs one way: it lets no hop the engine judged
-    on-box leave the host. ``transports.rest._proxy_bypasses`` strips a trailing dot and this does
-    not, so a ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as
-    remote here. The two disagree only toward "remote": that match takes the proxy off the hop and
-    opens no on-box carve-out. A plain ``rstrip(".")`` is not the fix, because the host of
-    ``http://./x`` is ``.``, and stripping it leaves the empty host, which reads as loopback."""
+    **A limit (vault BACKLOG #2706): apart from case, a name is read as written, and a host is an
+    address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``
+    and ``%6cocalhost`` read as remote here, though a resolver may take the first two as this box,
+    and urllib decodes the third to ``localhost`` before it dials. The cleartext guards judge them
+    as they judge any remote hop, and a proxy that applies takes them with the connection's proxy
+    credential. For those two readers remote is the cautious answer, so the limit errs one way: it
+    lets no hop the engine judged on-box leave the host. A caller for whom remote is the permissive
+    answer normalises first, as ``config.settings._names_this_host`` does.
+
+    ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
+    ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.
+    The two disagree only toward "remote": that match takes the connection's own proxy off the hop,
+    a proxy from the environment still takes it, and it opens no on-box carve-out. A plain
+    ``rstrip(".")`` is not the fix, because the host of ``http://./x`` is ``.``, and stripping it
+    leaves the empty host, which reads as loopback."""
     h = host.lower()
     if h in _LOOPBACK_HOP_HOST_NAMES:
         return True

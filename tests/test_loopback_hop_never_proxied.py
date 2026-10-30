@@ -68,7 +68,7 @@ _LOOPBACK_URLS = (
     "https://[::1]/x",
 )
 
-#: Hosts the guard does not accept. Three of them only look like loopback. The last four spell a
+#: Hosts the guard does not accept. Three of them only look like loopback. The last five spell a
 #: loopback host in a form the predicate does not normalise (vault BACKLOG #2706).
 _OFF_BOX_URLS = (
     "http://partner.invalid/x",
@@ -79,6 +79,7 @@ _OFF_BOX_URLS = (
     "http://10.0.0.5/x",
     "http://[2001:db8::1]:18080/x",
     "http://localhost./x",
+    "https://localhost./x",
     "http://LOCALHOST./x",
     "http://127.0.0.1./x",
     "http://%6cocalhost/x",
@@ -417,7 +418,7 @@ def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target()
     assert hop is not None and hop.name == "proxy:OB"
 
 
-# --- the limit stated on is_loopback_hop_host: only case is normalised ---------------------------
+# --- the limit stated on is_loopback_hop_host: spellings it reads as remote ----------------------
 
 
 @pytest.mark.parametrize(
@@ -451,23 +452,36 @@ def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
     resolved = config.for_host("https://localhost./x")
     assert resolved is not None
     assert resolved.auth_headers()["Proxy-Authorization"].startswith("Basic ")
+    opener = build_strict_opener(*resolved.opener_handlers())
+    assert _dialled(opener, "https://localhost./x") == "127.0.0.1:3128"
     assert config.for_host("https://localhost/x") is None
 
 
 def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out() -> None:
     """``_proxy_bypasses`` strips the dot and the predicate does not, so the two disagree on
-    ``localhost.``. The match takes the proxy off the hop, and the cleartext guard, which reads
-    the predicate, still refuses it (vault BACKLOG #2706). CONTROL: with no entry there is no
-    match."""
+    ``localhost.``. The match takes the connection's own proxy off the hop, and the cleartext
+    guard, which reads the predicate, still refuses it (vault BACKLOG #2706). CONTROLS: with no
+    entry there is no match, and the plain spelling builds."""
+    settings = {"proxy_url": _PROXY, "proxy_no_proxy": "localhost"}
     assert rest.proxy_bypasses_host("localhost.", ["localhost"])
     assert not rest.proxy_bypasses_host("localhost.", None)
-    with active_hop_posture(HopPosture(enforcing=True)), pytest.raises(InsecureHopRefused):
-        _rest("http://localhost./x", proxy_url=_PROXY, proxy_no_proxy="localhost")
+    with active_hop_posture(HopPosture(enforcing=True)):
+        with pytest.raises(InsecureHopRefused, match="HTTP cleartext egress"):
+            _rest("http://localhost./x", **settings)
+        _rest("http://localhost/x", **settings)
+
+
+def test_a_percent_encoded_host_goes_to_this_box_on_a_direct_leg() -> None:
+    """The predicate reads ``%6cocalhost`` as remote, and with no proxy urllib decodes it and dials
+    ``localhost``. So that hop is judged as remote and lands on the box, which is the direction
+    the limit errs in (vault BACKLOG #2706)."""
+    opener = build_strict_opener(urllib.request.ProxyHandler({}))
+    assert _dialled(opener, "http://%6cocalhost:18080/x") == "localhost:18080"
 
 
 def test_the_host_a_plain_rstrip_would_empty_stays_off_box() -> None:
-    """Why the limit is not closed by stripping the dot. ``http://./x`` names the host ``.``, which
-    is remote today; stripped, it would be the empty host, which the predicate reads as loopback."""
+    """Why a plain ``rstrip`` is not the fix. ``http://./x`` names the host ``.``, which is remote
+    today; stripped, it would be the empty host, which the predicate reads as loopback."""
     host = hop_url_host("http://./x", cell="test")
     assert host == "."
     assert not is_loopback_hop_host(host)
