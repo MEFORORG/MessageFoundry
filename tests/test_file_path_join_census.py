@@ -707,7 +707,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
     ),
-    "messagefoundry/pipeline/dr_backup.py::_sweep_abandoned_staging": Site(
+    "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(
         3,
         INTERNAL,
         "Fixed lock and marker names inside directories listed by this module's own prefix, after "

@@ -54,16 +54,13 @@ def _link_dir(target: Path, link: Path) -> None:
 # --- the owner filter on the backup's own sweep -------------------------------------------------
 
 
-async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_directory(
-    tmp_path, monkeypatch
-) -> None:
-    """A server-DB store stages in `.mefor-staging` under the destination. A dead-looking directory
-    there owned by another account is not swept, while this account's abandoned one still is."""
+async def _store_and_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A keyed SQLite store holding one synthetic message, and a backup runner for it. The OS temp
+    dir is pointed at an empty directory of the test's own."""
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "ostemp"))
     (tmp_path / "ostemp").mkdir()
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    dest = tmp_path / "dest"
     key = generate_key()
     store = await MessageStore.open(data_dir / "msg.db", cipher=make_cipher(key))
     await store.enqueue_message(
@@ -73,6 +70,25 @@ async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_dir
         control_id="CID-1",
         now=1.0,
     )
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest")),
+        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
+        config_dir=None,
+        instance="dev",
+    )
+    return store, runner
+
+
+async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_directory(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A server-DB store stages in `.mefor-staging` under the destination. A dead-looking directory
+    there owned by another account is not swept, and the sweep says so, while this account's
+    abandoned one still is."""
+    import logging
+
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
     # Stage where a server-DB store would, while still snapshotting this SQLite store.
     real_root_for = dr_backup._staging_root_for
 
@@ -80,7 +96,7 @@ async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_dir
         return real_root_for(server_db=True, store_path=store_path, destination=destination)
 
     monkeypatch.setattr(dr_backup, "_staging_root_for", server_db_root)
-    root = dest.absolute() / ".mefor-staging"
+    root = (tmp_path / "dest").absolute() / ".mefor-staging"
     ours = _abandoned(root, "mefor-backup-")
     planted = _abandoned(root, "mefor-backup-")
     real_owner = dr_backup._owner_of
@@ -89,23 +105,45 @@ async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_dir
         return "someone-else" if Path(path) == planted else real_owner(path)
 
     monkeypatch.setattr(dr_backup, "_owner_of", owner)
-    runner = BackupRunner(
-        store,
-        BackupSettings(enabled=True, destination=str(dest)),
-        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
-        config_dir=None,
-        instance="dev",
-    )
     try:
-        result = await runner.run_once(now=1.0)
+        with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+            result = await runner.run_once(now=1.0)
     finally:
         await store.close()
     assert result is not None and result.verify is not None and result.verify.ok
     # The control: this account's abandoned directory is gone.
     assert not ours.exists()
-    # The plant is untouched, its bytes whole.
+    # The plant is untouched, its bytes whole, and named in the log.
     assert (planted / "archive.tar").read_bytes() == b"synthetic plaintext"
     assert sorted(p.name for p in root.iterdir()) == [planted.name]
+    assert any(
+        "has another owner" in r.getMessage() and planted.name in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sweeps by its uid before the open")
+async def test_a_dead_runs_leftover_is_swept_before_the_staging_directory_is_made(
+    tmp_path, monkeypatch
+) -> None:
+    """A killed run can leave a volume full, and then making this run's own directory fails. On
+    POSIX the sweep therefore runs first, keyed on the effective uid."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    dead = _abandoned((tmp_path / "data").absolute(), "mefor-backup-")
+    real_open = dr_backup._open_staging
+    dead_at_open: list[bool] = []
+
+    def open_after_the_sweep(root: Path, prefix: str, *, secure: bool):
+        dead_at_open.append(dead.exists())
+        return real_open(root, prefix, secure=secure)
+
+    monkeypatch.setattr(dr_backup, "_open_staging", open_after_the_sweep)
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None
+    assert dead_at_open[0] is False
 
 
 # --- the fail-safe truncates the object it checked ----------------------------------------------
@@ -198,8 +236,9 @@ def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     assert (outside_dir / "victim.dat").read_bytes() == _OUTSIDE
     assert (staging / "own.tar").read_bytes() == b""
     if sys.platform == "win32":
-        # Reached by path through the junction, and refused on its final path, without its name.
-        assert unproven == ["a file outside the directory (reached through a link, not truncated)"]
+        # Reached by path through the junction, and refused without its name, before any file in
+        # it is opened or named.
+        assert unproven == [dr_backup._OUTSIDE_REASON]
     else:
         # `fwalk` does not enter a directory that changed after it was listed.
         assert unproven == []
