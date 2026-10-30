@@ -40,8 +40,10 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
+    HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    RevocationHopGuard,
     TrustAnchorPolicy,
     active_hop_posture,
     build_smtp_tls_context,
@@ -459,6 +461,85 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     ):
         DicomScuDestination(_scu(REMOTE))
     assert "connection 'OB_PACS';" in str(exc.value)
+
+
+def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+    return RevocationHopGuard.capture(
+        host=REMOTE,
+        cell="test",
+        description="verified TLS egress (no revocation check)",
+        attested=True,
+        attested_reason=REASON,
+        context=context,
+        posture=ENFORCING,
+        connection="OB_TEST",
+        **over,
+    )
+
+
+def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    if skip_validity:
+        relax_verify_expiry(ctx, host=REMOTE)
+    return ctx
+
+
+def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
+    """The line says the hop crossed WITHOUT a revocation check, so on a hop that has one it is a
+    false record. ``_attested_guard(None)`` is the control: the same hop with no CRL logs it."""
+    with _guard_log() as log:
+        _attested_guard(_crl_context(skip_validity=False)).enforce_construction()
+        assert not log.audit, log.state()
+        _attested_guard(None).enforce_construction()
+    assert log.audit, log.state()
+
+
+def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
+    """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check and the
+    line stays true. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
+    the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
+    guard = _attested_guard(_crl_context(skip_validity=True))
+    assert guard.crl_checked is True
+    assert guard.disposition() is HopDisposition.ALLOW
+    with _guard_log() as log:
+        guard.enforce_construction()
+    assert "crossed without certificate revocation checking" in log.audit, log.state()
+
+
+def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
+    """The default keeps every connection's record byte-identical; a hop whose operator set another
+    setting names that one, so the record leads back to what they set."""
+    with _guard_log() as default:
+        _attested_guard(None).enforce_construction()
+    assert default.audit.endswith(f"(tls_revocation_attested; reason: {REASON})"), default.state()
+    with _guard_log() as named:
+        _attested_guard(None, declaration="[x].y_attested").enforce_construction()
+    assert named.audit.endswith(f"([x].y_attested; reason: {REASON})"), named.state()
+
+
+def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_check(
+    bare_crl: str,
+) -> None:
+    """What the attested-crossing line says, read off the context the association really dials
+    with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
+    saying it crossed without one would be false. ``tls_allow_expired`` sets
+    ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
+    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``): the line stays true there,
+    and stays. Either way the hop is admitted by the same arm: this limb moves a log line, never a
+    disposition."""
+    with active_hop_posture(ENFORCING), _guard_log() as checked:
+        kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(kept._ssl) is True
+    assert not checked.audit, checked.state()
+    relaxed_cfg = _scu(REMOTE, attested=True, policy=_crl_policy(bare_crl))
+    relaxed_cfg.settings["tls_allow_expired"] = True
+    with active_hop_posture(ENFORCING), _guard_log() as relaxed:
+        skipped = DicomScuDestination(relaxed_cfg)
+    assert context_checks_revocation(skipped._ssl) is True
+    assert "crossed without certificate revocation checking" in relaxed.audit, relaxed.state()
+    assert "connection 'OB_PACS';" in relaxed.audit, relaxed.state()
+    assert REASON in relaxed.audit, relaxed.state()
 
 
 def test_a_dicom_tls_association_is_admitted_when_a_crl_reaches_its_own_context(
