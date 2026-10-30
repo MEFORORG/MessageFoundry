@@ -699,9 +699,6 @@ def _path_verdict(text: str) -> bool | None:
 #: to every reader of it, so the refusal and the checks that read the file cannot disagree.
 FileVerdicts = Mapping[str, bool | None]
 
-#: The file keywords that name CA material, which no driver reads with TLS off.
-_ODBC_CA_KEYS = frozenset({"sslca", "sslcapath"})
-
 
 def file_keyword_verdicts(value: object) -> FileVerdicts:
     """:data:`FileVerdicts` for ``value``, empty for a falsy one. A spelling the spelling check
@@ -742,9 +739,9 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
     to load.
 
     ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
-    whenever there is one. Empty is then an answer that judgement already acted on, by refusing
-    the value or by leaving CA material with TLS off to the driver. Without them the path is walked
-    again here, and a caller must treat an empty answer for a set value as its own refusal."""
+    whenever there is one, so the path is walked once. Empty is then an answer that judgement
+    already acted on by refusing the value. Without them the path is walked here, once, and a
+    caller must treat an empty answer for a set value as its own refusal."""
     if not value:
         return ()
     if verdicts is None:
@@ -777,39 +774,18 @@ def _refuse_remote_paths(
     named: Mapping[str, Any], *, connection: str | None
 ) -> dict[str, FileVerdicts]:
     """Judge every file keyword in ``named`` once, refuse each that is not a plain local path, and
-    return the verdicts for the checks that read the files.
+    return the verdicts for the checks that read the files: one entry per file keyword ``named``
+    holds, set or not.
 
-    With TLS off (:func:`generic_odbc_tls_off`) the driver reads no CA, so a CA keyword the WALK
-    finds leads off the host (a mapped drive, or a link to a share, that the spelling does not
-    show) is not refused: it is left to the driver unread, the outcome the CA check's
-    unreached-share leniency gives (:class:`_UnreachedShare`), and its verdicts make that check
-    read nothing. Only that is lenient. A share spelling is refused in every mode, as it was before
-    the walk existed, and so is a trimmed path the walk cannot clear, which would otherwise reach
-    the driver both unread and unrefused. A client certificate or key is refused in every mode."""
-    tls_off = generic_odbc_tls_off({"dialect": "generic", "odbc_params": named})
+    It refuses in every ``sslmode``. With TLS off the driver reads no CA, but an ``sslca`` or
+    ``sslcapath`` that leads off the host, by its spelling or by the walk, is refused all the same,
+    as a client certificate or key is: the build never hands the driver a path to another host."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
-        if tls_off and name in _ODBC_CA_KEYS and _off_host_by_walk_only(value, verdicts[name]):
-            logger.debug(
-                "%sDATABASE odbc_params %s: leads to another host, left to the driver unread, "
-                "which reads no CA with TLS off",
-                hop_name_prefix(connection),
-                name,
-            )
-            continue
         _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
-
-
-def _off_host_by_walk_only(value: object, verdicts: FileVerdicts) -> bool:
-    """Whether ``value`` leads off the host by its walk alone: it is not a share spelling (which
-    reads every spelling trimmed), and its trimmed spelling, which the build treats as the path,
-    was walked to another host. ``False`` for a share spelling, for a trimmed path the walk could
-    not clear, and for a local path."""
-    trimmed = str(value).strip()
-    return bool(trimmed) and not _is_remote_spelling(trimmed) and verdicts.get(trimmed) is True
 
 
 def _refuse_weak_driver_key(
@@ -979,12 +955,16 @@ def _driver_file_spellings(
     an unreached share: another spelling of it would wait out the same network timeout.
 
     ``verdicts`` are the build's (:func:`_refuse_remote_paths`), so the spellings read here are the
-    ones that judgement cleared, never a second walk that could disagree with it. Without them the
-    path is walked here, and a set value that walk does not clear is refused."""
+    ones that judgement cleared, never a second walk that could disagree with it. A map that lacks
+    a set ``keyword`` raises ``KeyError``: it is a caller's bug, and reading it as no verdicts would
+    leave the file unread and unrefused. Without a map the path is walked here, once. Either way a
+    set value that does not clear is refused, never passed unread."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     value = named.get(keyword)
-    given = None if verdicts is None else verdicts.get(keyword, {})
-    if given is None and value and names_another_host(value):
+    if not value:
+        return
+    given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
+    if names_another_host(value, given):
         raise error(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
             f"to check {checked_for}"

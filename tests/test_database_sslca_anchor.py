@@ -452,14 +452,18 @@ def test_a_ca_that_leads_off_the_host_after_the_build_is_refused_not_skipped(
     """BACKLOG #2705: a local CA the build cleared, whose path later leads to another host (a link
     swapped in), must not leave the lane check with no spec and no row. It is refused as a
     setting, and nothing is opened. Red with ``database_ca_anchor_spec`` back on a silent ``None``.
-    The control: under TLS off the driver reads no CA, so there is still no spec."""
+    It is refused under TLS off too, as the build refuses it in every mode: red with the TLS-off
+    return ahead of the judgement. The control: a local CA under TLS off, which the driver never
+    reads, still has no spec."""
     ca = _ca(tmp_path)
+    off = {**_settings(ca), "odbc_params": {"SSLMODE": "DISABLED", "SSLCA": str(ca)}}
     assert ta.lane_anchor_spec("outbound", _OUT, _settings(ca)) is not None
+    assert ta.lane_anchor_spec("outbound", _OUT, off) is None
     monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
     with pytest.raises(ValueError, match="must be a plain local path"):
         ta.lane_anchor_spec("outbound", _OUT, _settings(ca))
-    off = {**_settings(ca), "odbc_params": {"SSLMODE": "DISABLED", "SSLCA": str(ca)}}
-    assert ta.lane_anchor_spec("outbound", _OUT, off) is None
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        ta.lane_anchor_spec("outbound", _OUT, off)
 
 
 def test_a_device_named_as_sslca_is_refused_unread(tmp_path: Path) -> None:

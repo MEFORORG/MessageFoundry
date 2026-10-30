@@ -500,29 +500,71 @@ def test_a_direct_check_refuses_a_set_value_its_own_walk_does_not_clear(
         database._refuse_encrypted_driver_ca({"sslca": r"Z:\certs\ca.pem"}, connection=_CONNECTION)
 
 
-@pytest.mark.parametrize("mode", ["disable", "DISABLED"])
-def test_a_ca_off_the_host_is_left_unread_when_tls_is_off(
-    monkeypatch: pytest.MonkeyPatch, mode: str
+def test_a_direct_check_walks_each_spelling_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check called without the build's verdicts judges the path once and reads from that one
+    judgement, so a second walk cannot disagree with the first. Red with the refusal and the
+    spellings each walking the path on their own."""
+    walked: list[str] = []
+
+    def once(path: str) -> bool | None:
+        walked.append(path)
+        return walked.count(path) > 1  # a second look at the same path flips to off-host
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "_path_verdict", once)
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    database._refuse_encrypted_driver_ca({"sslca": r"C:\certs\ca.pem"}, connection=_CONNECTION)
+    assert walked == [r"C:\certs\ca.pem"]
+    assert read == [r"C:\certs\ca.pem"]
+
+
+def test_a_verdicts_map_without_the_keyword_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verdicts map that lacks a set keyword is a caller's bug. Read as no verdicts, it would
+    leave the file unread and unrefused, so it raises. Red with the lookup back on a default."""
+    monkeypatch.setattr(database, "read_if_regular", lambda *_a: b"")
+    with pytest.raises(KeyError):
+        database._refuse_encrypted_driver_ca(
+            {"sslca": r"C:\certs\ca.pem"}, connection=_CONNECTION, verdicts={}
+        )
+
+
+@pytest.mark.parametrize("mode", ["disable", "DISABLED", "verify-full"])
+@pytest.mark.parametrize(
+    ("keyword", "path"), [("sslca", r"Z:\certs\ca.pem"), ("sslcapath", r"Z:\certs")]
+)
+def test_a_ca_the_walk_finds_off_the_host_is_refused_in_every_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str, keyword: str, path: str
 ) -> None:
-    """With TLS off the driver reads no CA, so an ``sslca`` or ``sslcapath`` on a mapped drive is
-    not refused: it is left to the driver unread, the outcome the CA check's unreached-share
-    leniency gives. A client key is still refused, and with TLS on the CA is refused. Red with the
-    remote refusal applied whatever the mode."""
+    """With TLS off the driver reads no CA, but an ``sslca`` or ``sslcapath`` on a mapped drive,
+    which only the walk finds off the host, is refused all the same, as with TLS on and as a client
+    key is: the build never hands the driver a path to another host, and nothing reads it. Red
+    with the TLS-off leniency back, which built it unread under ``disable``."""
 
     def never(*_args: object) -> bytes:
-        raise AssertionError("a CA left to the driver must not be read")
+        raise AssertionError("a path refused as off the host must not be read")
 
     monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
     monkeypatch.setattr(database, "read_if_regular", never)
-    ca = r"Z:\certs\ca.pem"
-    assert f"sslca={{{ca}}}" in _build(odbc_params={"SSLmode": mode, "sslca": ca})
-    assert "sslcapath={Z:\\certs}" in _build(
-        odbc_params={"SSLmode": mode, "sslcapath": r"Z:\certs"}
-    )
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"SSLmode": mode, keyword: path})
+    assert "Z:" not in str(refused.value)
     with pytest.raises(ValueError, match="must be a plain local path"):
         _build(odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
-    with pytest.raises(ValueError, match="must be a plain local path"):
-        _build(odbc_params={"SSLmode": "verify-full", "sslca": ca})
+
+
+def test_a_ca_on_the_local_disk_still_builds_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the refusal above: with TLS off a local CA still builds."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    monkeypatch.setattr(database, "read_if_regular", lambda *_a: b"-----BEGIN CERTIFICATE-----\n")
+    ca = r"C:\certs\ca.pem"
+    assert f"sslca={{{ca}}}" in _build(odbc_params={"SSLmode": "disable", "sslca": ca})
 
 
 @pytest.mark.parametrize("keyword", ["sslca", "sslcapath"])
@@ -532,20 +574,17 @@ def test_a_ca_off_the_host_is_left_unread_when_tls_is_off(
 def test_a_ca_share_spelling_is_refused_even_with_tls_off(
     monkeypatch: pytest.MonkeyPatch, keyword: str, path: str
 ) -> None:
-    """The TLS-off leniency covers only what the walk alone finds, a mapped drive or a link. A share
-    spelling was refused in every mode before the walk existed, and still is. Red with the
-    leniency applied to every CA keyword that names another host. The control: a mapped drive,
-    which only the walk detects, still builds under ``disable``, unread."""
+    """A share spelling was refused in every mode before the walk existed, and still is. Red with
+    the remote refusal skipped for a CA keyword under ``disable``."""
 
     def never(*_args: object) -> bytes:
-        raise AssertionError("a CA left to the driver must not be read")
+        raise AssertionError("a path refused as off the host must not be read")
 
     monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
     monkeypatch.setattr(database, "read_if_regular", never)
     with pytest.raises(ValueError, match="must be a plain local path") as refused:
         _build(odbc_params={"SSLmode": "disable", keyword: path})
     assert "files.test" not in str(refused.value)
-    assert f"{keyword}={{Z:\\ca}}" in _build(odbc_params={"SSLmode": "disable", keyword: r"Z:\ca"})
 
 
 def test_a_ca_the_walk_cannot_clear_is_refused_even_with_tls_off(

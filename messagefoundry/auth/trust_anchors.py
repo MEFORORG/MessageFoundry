@@ -197,7 +197,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value that can name or lead to another host is refused here as a
-    setting, unread, as the build refuses it (BACKLOG #2705).
+    setting, unread, in every ``sslmode``, as the build refuses it (BACKLOG #2705).
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -1716,19 +1716,20 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`), and when no spelling the build checks names an existing path other
-    than a directory: a missing file or a directory is left to the driver, as the build leaves it.
-    The first spelling that names one is checked. A pipe or device is a spec, and
+    (:func:`unread_ca_reason`) and the value stays on this host, and when no spelling the build
+    checks names an existing path other than a directory: a missing file or a directory is left to
+    the driver, as the build leaves it. The first spelling that names one is checked. A pipe or device is a spec, and
     :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
     :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers.
 
     A value that leads to another host, or that the walk cannot clear (BACKLOG #2705), raises
-    ``ValueError`` and is never opened here. It is checked again here, not taken from the build:
-    a link swapped in after the build would otherwise leave this check with no spec and no row.
+    ``ValueError`` and is never opened here, in every ``sslmode``, as the build refuses it. It is
+    checked again here, not taken from the build: a link swapped in after the build would
+    otherwise leave this check with no spec and no row.
     The lane check turns the ``ValueError`` into a refused setting, as it does a bad pin. The path
     is judged once, and the spellings come from that one judgement."""
     value = _generic_odbc_param(settings, "sslca")
-    if value is None or unread_ca_reason(settings) is not None:
+    if value is None:
         return None
     from messagefoundry.transports.database import (
         driver_file_spellings,
@@ -1742,6 +1743,8 @@ def database_ca_anchor_spec(
             f"{kind} '{name}' odbc_params sslca must be a plain local path on this host: not a "
             "share, a network drive, a link to one, or a path the check cannot read"
         )
+    if unread_ca_reason(settings) is not None:
+        return None
     spellings = driver_file_spellings(value, verdicts)
     path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
     if path is None:
