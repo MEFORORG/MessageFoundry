@@ -172,8 +172,7 @@ async def assert_erased_after_replay_is_dead_lettered(
     """The window a row predicate cannot see: the token was re-pended, then the reply was erased.
 
     SQL Server materializes its eligible set once, so a replay can commit between that read and the
-    artifact's erasure. This builds the result of that race directly. A token with no artifact row at
-    all reads the same way."""
+    artifact's erasure. This builds the result of that race directly."""
     gone_mid, gone = await dead_token(store, now=0.0, control="ER-RACE")
     kept_mid, _ = await dead_token(store, now=0.0, control="ER-RACE-KEPT")
     assert await store.replay(gone_mid, now=1.0) == 1
@@ -227,6 +226,44 @@ async def assert_purge_concurrent_with_replay_keeps_the_invariant(
             assert message is not None and message["raw"] == REPLY, first
 
 
+async def assert_missing_artifact_row_is_a_corrupt_reference(
+    store: Any, fetch: RawFetch, raw: RawSql
+) -> None:
+    """Retention keeps the ``response`` row and NULLs its body, so a row that is gone is damage, not
+    an erasure. It dead-letters as a corrupt reference and keeps the reference for whoever looks."""
+    mid, token = await dead_token(store, now=0.0, control="ER-MISSING")
+    assert await store.replay(mid, now=1.0) == 1
+    await raw("DELETE FROM response WHERE message_id=?", (mid,))
+
+    assert await run_reingress(store, now=2.0)
+
+    row = await token_row(fetch, token)
+    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] != ""
+    assert await status_of(store, mid) == MessageStatus.ERROR.value
+    events = await store.events_for(mid)
+    assert [e for e in events if e["event"] == "dead" and "corrupt" in str(e["detail"])]
+    assert await children(fetch) == []
+
+
+async def assert_dead_letter_purge_clears_the_blanked_token(
+    store: Any, fetch: RawFetch, _raw: RawSql
+) -> None:
+    """The message purge blanks a dead token and leaves its ``last_error`` for the dead-letter window.
+    That window must still reach a row whose payload is already blank, or the error outlives it."""
+    mid, token = await dead_token(store, now=0.0, control="ER-DLQ")
+    await store.purge_message_bodies(older_than=10 * DAY, now=50 * DAY)
+    errors = "SELECT last_error FROM queue WHERE id=?"
+    assert (await fetch(errors, (token,)))[0]["last_error"] is not None
+    assert await status_of(store, mid) == MessageStatus.ERROR.value
+
+    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+
+    assert (await fetch(errors, (token,)))[0]["last_error"] is None
+    row = await token_row(fetch, token)
+    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == ""
+    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 0  # idempotent
+
+
 #: Every case, for ``pytest.mark.parametrize``. Each takes ``(store, fetch, raw)`` and needs a store
 #: with no loopback messages yet, so each runs on its own clean store.
 CASES = [
@@ -234,4 +271,6 @@ CASES = [
     pytest.param(assert_mixed_message_recovers_only_what_remains, id="mixed"),
     pytest.param(assert_erased_after_replay_is_dead_lettered, id="erased_after_replay"),
     pytest.param(assert_purge_concurrent_with_replay_keeps_the_invariant, id="concurrent"),
+    pytest.param(assert_missing_artifact_row_is_a_corrupt_reference, id="missing_artifact"),
+    pytest.param(assert_dead_letter_purge_clears_the_blanked_token, id="dead_letter_purge"),
 ]

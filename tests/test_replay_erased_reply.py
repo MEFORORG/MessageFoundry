@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 from typing import Any
 
 import pytest
@@ -23,7 +24,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import generate_key, make_cipher
 from tests import _erased_reply_contract as contract
-from tests._ast_sites import code_names, code_strings, named_func, parse_source
+from tests._ast_sites import call_sites, code_names, code_strings, named_func, parse_source
 from tests._queue_tag_contract import RawFetch, RawSql
 
 _STORE_DIR = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store"
@@ -214,10 +215,14 @@ def test_every_backend_blanks_the_token_before_it_erases_the_reply(module: str) 
     source = (_STORE_DIR / module).read_text(encoding="utf-8")
     text = ast.get_source_segment(source, named_func(parse_source(source), "purge_message_bodies"))
     assert text is not None
-    blank = text.index("Stage.RESPONSE.value")
+    # Not the done/cancelled statement, which clears `last_error` in the same SET.
+    statement = re.search(r"UPDATE queue SET payload=''(?!,)", text)
+    assert statement is not None
     attachments = text.index("_release_message_attachments")
     erase = text.index("UPDATE response SET body=NULL")
-    assert blank < attachments < erase
+    assert statement.start() < attachments < erase
+    binds = text[statement.start() : attachments]
+    assert "Stage.RESPONSE.value" in binds and "OutboxStatus.DEAD.value" in binds
 
 
 @pytest.mark.parametrize("module", _BACKENDS)
@@ -228,3 +233,8 @@ def test_every_backend_dead_letters_a_missing_artifact(module: str) -> None:
     fn = named_func(tree, name)
     assert "REINGRESS_ARTIFACT_ERASED" in code_names(fn)
     assert ", payload=''" in code_strings(fn)
+    calls = [
+        c for c in call_sites(fn, "_consume_dead") if "REINGRESS_ARTIFACT_ERASED" in ast.dump(c)
+    ]
+    assert len(calls) == 1
+    assert [kw.arg for kw in calls[0].keywords] == ["erased"]

@@ -5545,7 +5545,7 @@ async def test_queue_tag_contract(store) -> None:
         await keyed.close()
 
 
-def _erased_reply_adapters(s) -> tuple[object, object]:
+def _raw_adapters(s) -> tuple[object, object]:
     """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
     from tests._session_seal_contract import dollar_placeholders
 
@@ -5560,12 +5560,25 @@ def _erased_reply_adapters(s) -> tuple[object, object]:
     return raw, fetch
 
 
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
 @pytest.mark.parametrize("case", ERASED_REPLY_CASES)
-async def test_erased_reply_contract(store, case) -> None:
+async def test_erased_reply_contract(store, case, keyed) -> None:
     """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
-    SQLite suite runs."""
-    raw, fetch = _erased_reply_adapters(store)
-    await case(store, fetch, raw)
+    SQLite suite runs, on both cipher shapes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    raw, fetch = _raw_adapters(store)
+    if not keyed:
+        await case(store, fetch, raw)
+        return
+    sealed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
 
 
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
@@ -5582,7 +5595,7 @@ async def test_keyless_blank_contract(store, case) -> None:
             load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
         )
 
-    raw, fetch = _erased_reply_adapters(store)
+    raw, fetch = _raw_adapters(store)
     await case(store, open_keyed, fetch, raw)
 
 

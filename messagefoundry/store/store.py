@@ -9221,7 +9221,8 @@ class MessageStore:
         surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
         it. On a surface that already holds ciphertext the data check refuses it instead. A value
         written into a marked surface by a later KEYLESS run of the same store, or by hand, is
-        refused even if the table had emptied out; the opt-out below seals it for one open. A read-only open writes no marker. A store restored from a file copy keeps
+        refused even if the table had emptied out; the opt-out below seals it for one open, a blank
+        queue row excepted (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -9245,7 +9246,9 @@ class MessageStore:
           :data:`_REPLAYABLE_BODY` and the claim both treat it as erased.
         - Live, on a sealed surface: refused at the claim, dead-lettered and alerted. Nothing a keyed
           writer does leaves one, so it is what a plant looks like, and sealing it here would launder
-          the plant. That is why this exception reads the sealed state and not the row.
+          the plant. That is why this exception reads the sealed state and not the row. The limit: an
+          empty body written by a keyless run of a store that was keyed before reads the same way,
+          and it is refused too, under the opt-out as well.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -12573,7 +12576,9 @@ class MessageStore:
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
-        it is dead-lettered and consumed like a corrupt reference, and the failure is audited."""
+        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
+        whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
+        produces no child and cannot be replayed."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12653,15 +12658,22 @@ class MessageStore:
                 )
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
-            #    message purge-ineligible, but a DEAD one does not, and a replay can race the purge.
-            #    An erased reply must never become a child message, so dead-letter the token.
+            #    message purge-ineligible, and a DEAD one is blanked with its reply. But on a server
+            #    backend the blank and the erasure read the eligible set apart, so a replay or a
+            #    sibling's completion between them can leave a token naming an erased reply. It must
+            #    never become a child message, so dead-letter the token. Retention keeps the
+            #    `response` row, so a row that is missing altogether is a corrupt reference.
             cur = await self._db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
                 (origin_msg_id, dest, seq),
             )
             art = await cur.fetchone()
-            if art is None or art["body"] is None:
+            if art is None:
+                return await _consume_dead(
+                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
+                )
+            if art["body"] is None:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
                 )
@@ -12821,9 +12833,10 @@ class MessageStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
-        parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row or artifact is gone (a
-        committed prior handoff). The ``ingress_handoff`` it precedes re-reads the same immutable artifact
-        for the message raw, so the peek and the raw always agree."""
+        parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
+        prior handoff), and ``""`` if the artifact is, which ``ingress_handoff`` then dead-letters. The
+        ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
+        peek and the raw always agree."""
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",

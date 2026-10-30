@@ -5386,7 +5386,7 @@ class PostgresStore:
             pass
 
         now = time.time() if now is None else now
-        # ADR 0157 C1 — both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND finalize
+        # ADR 0157 C1 — every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND finalizes
         # the origin message, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
         # *admits* a message, and fencing it would convert a permitted duplicate into a LOST re-ingress,
         # breaking count-and-log.
@@ -5451,9 +5451,16 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # Retention erased the reply (BACKLOG #1560; the SQLite twin says how a token
-                    # reaches here). It must never become a child message.
-                    if art is None or art["body"] is None:
+                    # A missing row is a corrupt reference. A NULL body means retention erased the
+                    # reply (BACKLOG #1560; the SQLite twin says how a token reaches here), and it
+                    # must never become a child message.
+                    if art is None:
+                        return await _consume_dead(
+                            "ingress_handoff(missing-artifact)",
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            "re-ingress ref corrupt",
+                        )
+                    if art["body"] is None:
                         return await _consume_dead(
                             "ingress_handoff(erased)",
                             REINGRESS_ARTIFACT_ERASED,
@@ -10802,7 +10809,8 @@ class PostgresStore:
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
+                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
+                    f" AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

@@ -7876,8 +7876,9 @@ class SqlServerStore:
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
-        ``False`` if the work-row was already consumed. A corrupt/unparseable ref or a re-ingress that
-        would exceed ``correlation_depth_cap`` is dead-lettered (and the token still consumed). The
+        ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
+        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        dead-lettered (and the token still consumed; an erased one is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed."""
@@ -7914,7 +7915,7 @@ class SqlServerStore:
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures`` for the caller to audit."""
-        # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
+        # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
         output, guard, guard_params = self._resolve_guard()
@@ -7985,10 +7986,17 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # Retention erased the reply (BACKLOG #1560; the SQLite twin says how a token reaches
-                # here). `#eligible` is materialized once, so a replay can commit between that read
-                # and the artifact's erasure. It must never become a child message.
-                if art is None or art[0] is None:
+                # A missing row is a corrupt reference. A NULL body means retention erased the reply
+                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
+                # materialized once, so a replay can commit between that read and the erasure. It
+                # must never become a child message.
+                if art is None:
+                    return await _consume_dead(
+                        "ingress_handoff(missing-artifact)",
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
+                if art[0] is None:
                     return await _consume_dead(
                         "ingress_handoff(erased)",
                         REINGRESS_ARTIFACT_ERASED,
@@ -7999,9 +8007,8 @@ class SqlServerStore:
                     self._cipher.decrypt(
                         art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
                     )
-                    if art[0]
-                    else ""
-                ) or ""
+                    or ""
+                )
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -9271,7 +9278,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
+                    f" AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount

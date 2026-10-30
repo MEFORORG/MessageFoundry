@@ -2082,7 +2082,8 @@ is enforced by the engine on all three backends.**
 More than the historical "raw/summary/error". Eligibility is `received_at < ` the per-connection-or-global
 cutoff **and** no `queue` row still `pending`/`inflight`, so at-least-once is preserved — a dead row
 stays replayable (re-queueing its *own* stored payload) until `purge_dead_letters` takes it, which is why
-the two windows are independent. In **one transaction** the pass:
+the two windows are independent. A dead `response` work-row is the exception, because its payload is a
+reference to the reply this pass erases, not a body of its own. In **one transaction** the pass:
 
 - sets `messages.raw` to `''` and `messages.summary`, `messages.error` and `messages.metadata` to
   `NULL` — all four in **one** statement, so operator-attached metadata can never outlive the body it
@@ -2090,6 +2091,8 @@ the two windows are independent. In **one transaction** the pass:
   **pre-upgrade** engine — blank `raw`, metadata intact — is swept on the first pass after upgrade and
   **counted**, so that historical sweep lands in the `retention_purge` audit row like any other;
 - blanks `queue.payload` and `queue.last_error` for **done/cancelled** outbound rows;
+- blanks `queue.payload` for a **dead** `response` work-row (vault BACKLOG #1560), and leaves its
+  `last_error` for `purge_dead_letters`;
 - sets `message_events.detail` to `NULL`;
 - sets `response.body`, `response.detail` and `response.resp_headers` to `NULL`;
 - releases `shared_body.body` refs (SQLite — decref, GC at 0) and decrefs the message's streaming

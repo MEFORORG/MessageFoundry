@@ -728,7 +728,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   sealed. One example is rows written by a keyless run of a store that was keyed before. Since
   BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
   even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
-  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+  keyed open to seal them, then turn it back off. It does not seal a blank: an empty body such a run
+  left on a live queue row stays refused at the claim, as a plant would be (BACKLOG #3495). It is a
+  no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything

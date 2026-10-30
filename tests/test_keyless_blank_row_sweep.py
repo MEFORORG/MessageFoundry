@@ -147,15 +147,24 @@ async def test_the_seal_reserves_the_blanks_on_the_invocation_bound(
     """A blank seal is a GCM invocation like any other, so the burst must reserve it (ASVS 11.3.4)."""
     db = tmp_path / "bound.db"
     await _blank_row_at_rest(db)
-    seen: list[int] = []
+    seal = MessageStore._seal_surface
+    surface: list[tuple[str, str]] = []
+    seen: dict[tuple[str, str], int] = {}
+
+    async def tracking(self: MessageStore, table: str, column: str, *args: Any, **kw: Any) -> int:
+        surface[:] = [(table, column)]
+        return int(await seal(self, table, column, *args, **kw))
 
     async def spy(_cipher: Any, _add: Any, count: int) -> None:
-        seen.append(count)
+        seen[surface[0]] = count
 
-    with patch("messagefoundry.store.store.reserve_invocations_ahead", spy):
+    with (
+        patch.object(MessageStore, "_seal_surface", tracking),
+        patch("messagefoundry.store.store.reserve_invocations_ahead", spy),
+    ):
         store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
         await store.close()
-    assert 1 in seen  # the queue surface: no plaintext to seal, one blank
+    assert seen[("queue", "payload")] == 1  # no plaintext on this surface, one blank
 
 
 def test_the_live_row_literal_names_the_statuses_it_means() -> None:
