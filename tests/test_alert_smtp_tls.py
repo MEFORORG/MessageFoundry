@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -229,6 +230,7 @@ def _names(**kw: Any) -> list[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -288,6 +290,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

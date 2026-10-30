@@ -86,6 +86,9 @@ FHIR_BASE = "https://fhir.example.org/fhir"
 DICOMWEB_BASE = "https://pacs.example.org/dicom-web"
 TOKEN_URL = "https://auth.example.com/token"
 AI_ENDPOINT = "https://ai.internal/v1/messages"
+# BACKLOG #2193 slice (e): the off-box AI endpoint is refused unless its revocation is attested.
+# These tests read the reply, so their brokers carry the pair.
+_AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
 
 
 # --- the fakes ----------------------------------------------------------------------------------
@@ -508,7 +511,11 @@ def test_ai_broker_maps_an_over_cap_reply_onto_its_own_error_type() -> None:
     """A DeliveryError escaping the broker would be unmapped at the API route, so the refusal is
     re-raised as AiBrokerError -- still naming only the redacted host and the bound."""
     broker = AiBroker(
-        endpoint=AI_ENDPOINT, api_key="sk-secret-key-value", allowed_endpoints=["ai.internal"]
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
     )
     broker._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as err:
@@ -888,7 +895,11 @@ def test_the_ai_broker_maps_a_truncated_reply_onto_its_own_error_type() -> None:
     """A DeliveryError escaping chat() is unmapped at the /ai/assist route, so it would surface as
     an unhandled 500 rather than the mapped 502."""
     broker = AiBroker(
-        endpoint=AI_ENDPOINT, api_key="sk-secret-key-value", allowed_endpoints=["ai.internal"]
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
     )
     broker._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as err:
@@ -1061,7 +1072,13 @@ def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: st
         provider.access_token()
     assert str(token_err.value).startswith("SMART token endpoint returned")
     assert "auth.example.com" not in str(token_err.value)
-    broker = AiBroker(endpoint=AI_ENDPOINT, api_key="sk-x", allowed_endpoints=["ai.internal"])
+    broker = AiBroker(
+        endpoint=AI_ENDPOINT,
+        api_key="sk-x",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
     broker._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(AiBrokerError) as ai_err:
         broker.chat("def handle(msg): ...")

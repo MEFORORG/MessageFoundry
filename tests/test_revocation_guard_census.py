@@ -119,16 +119,13 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         # pipeline/alert_sinks.py, the [alerts] SMTP login and the webhook (BACKLOG #2193)
         "_refuse_alert_smtp_revocation",
         "_refuse_webhook_revocation",
+        "_refuse_an_unrevoked_ai_hop",  # transports/ai_broker.py, the AI endpoint (BACKLOG #2193)
         # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
         "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
         "mount_strict_reply_adapter",
     }
 )
 
-#: Ungated verifying hops, with the reason recorded in docs/DEPLOYMENT.md.
-_UNGATED = (
-    "an ungated verifying hop, listed in docs/DEPLOYMENT.md under 'Ungated verifying TLS hop'"
-)
 #: What the two Vault entries' guard covers, and what this census does not follow there.
 _VAULT_GUARD = (
     "through mount_strict_reply_adapter, which runs _refuse_an_unrevoked_vault_hop at "
@@ -209,6 +206,11 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
+    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
+        note="the AI endpoint, through _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). No "
+        "CRL lever is built for this hop, so off the box it crosses an enforcing posture only on "
+        "its [ai].endpoint_revocation_attested pair; an unknown posture counts as enforcing"
+    ),
     "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
         note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
     ),
@@ -234,10 +236,6 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/pipeline/alert_sinks.py::_refuse_alert_smtp_revocation": Guarded(
         note="the SMTP login guard itself, which builds the context each send builds (BACKLOG #2193)"
-    ),
-    # --- exempt: ungated verifying hops ------------------------------------------------------------
-    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
-        f"the AI-broker endpoint: {_UNGATED}"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(

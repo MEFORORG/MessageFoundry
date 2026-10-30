@@ -648,7 +648,7 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
     ``models.require_hop_reason`` holds a connection's reason to. A lone surrogate cannot be
     encoded as UTF-8, so the route could not serialize its answer; an environment value with a
     byte that is not UTF-8 decodes to one."""
-    _check_hop_revocation_attestation(
+    _check_revocation_attestation_pair(
         flag,
         reason,
         flag_name=f"[{section}].vault_revocation_attested",
@@ -659,7 +659,7 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
     )
 
 
-def _check_hop_revocation_attestation(
+def _check_revocation_attestation_pair(
     flag: bool,
     reason: str | None,
     *,
@@ -672,8 +672,9 @@ def _check_hop_revocation_attestation(
 
     The rules :func:`_check_vault_revocation_attestation` gives, for any section's pair: the three
     flag-plus-reason rules, and no control character or lone surrogate in the reason, which is
-    printed in the loosening report. The ``[alerts]`` SMTP login and webhook pairs (BACKLOG #2193)
-    use it too."""
+    printed in the loosening report. Every settings-scoped pair goes through it: the Vault pairs,
+    the ``[alerts]`` SMTP login and webhook pairs, and ``[ai].endpoint_revocation_attested``
+    (BACKLOG #2193)."""
     _check_flag_with_reason(
         flag,
         reason,
@@ -4726,6 +4727,33 @@ class AiSettings(_Section):
     # is REFUSED. Deliberately independent of [egress].allowed_http, which is permissive-when-empty and so
     # cannot be the gate for this new egress surface.
     allowed_endpoints: list[str] = []
+    # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
+    # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
+    # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
+    # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
+    # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
+    # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
+    # blank one, a reason without the flag, or a control character in the reason refuses at load.
+    # It is a LOOSENING: security_loosenings()
+    # names it, with the reason. Not a secret.
+    endpoint_revocation_attested: bool = False
+    endpoint_revocation_attested_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _endpoint_revocation_attestation_pair(self) -> AiSettings:
+        """The flag and its reason travel together (BACKLOG #2193 slice (e)), under the rules the
+        Vault pairs follow: :func:`_check_revocation_attestation_pair`."""
+        _check_revocation_attestation_pair(
+            self.endpoint_revocation_attested,
+            self.endpoint_revocation_attested_reason,
+            flag_name="[ai].endpoint_revocation_attested",
+            reason_name="[ai].endpoint_revocation_attested_reason",
+            flag_means="attest revocation checking for the AI endpoint hop",
+            why="say what covers revocation of the AI endpoint's server certificate (for "
+            "example, that the certificate is short-lived, with its lifetime), so the record says "
+            "what was relied on",
+        )
+        return self
 
     @field_validator("provider")
     @classmethod
@@ -5924,7 +5952,7 @@ class AlertsSettings(_Section):
     @model_validator(mode="after")
     def _revocation_attestation_pairs(self) -> AlertsSettings:
         """Each flag and its reason travel together (BACKLOG #2193); the rules are on the helper."""
-        _check_hop_revocation_attestation(
+        _check_revocation_attestation_pair(
             self.email_tls_revocation_attested,
             self.email_tls_revocation_attested_reason,
             flag_name="[alerts].email_tls_revocation_attested",
@@ -5933,7 +5961,7 @@ class AlertsSettings(_Section):
             why="say what covers revocation of the relay's certificate (for example, that it is "
             "short-lived, with its lifetime), so the record says what was relied on",
         )
-        _check_hop_revocation_attestation(
+        _check_revocation_attestation_pair(
             self.webhook_tls_revocation_attested,
             self.webhook_tls_revocation_attested_reason,
             flag_name="[alerts].webhook_tls_revocation_attested",
@@ -9758,6 +9786,7 @@ def security_loosenings(
     cert_monitor: CertMonitorSettings,
     backup: BackupSettings,
     secrets: SecretsSettings,
+    ai: AiSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -9789,6 +9818,7 @@ def security_loosenings(
     ``[store].vault_revocation_attested`` and ``[secrets].vault_revocation_attested`` (vault BACKLOG
     #2983), ``[alerts].email_tls_revocation_attested`` and
     ``[alerts].webhook_tls_revocation_attested`` (BACKLOG #2193),
+    ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
@@ -9836,7 +9866,8 @@ def security_loosenings(
     held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
-    ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983).
+    ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). ``ai`` joins them for
+    ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
@@ -10346,6 +10377,22 @@ def security_loosenings(
         )
         for switch, hop, crl, reason in alert_revocation_attestations(alerts)
     )
+    # BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern: the AI endpoint's revocation
+    # attestation. Named whenever the flag is set, whatever [ai].mode is, so the text claims no hop
+    # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
+    if ai.endpoint_revocation_attested:
+        out.append(
+            (
+                "ai.endpoint_revocation_attested",
+                "revocation of the [ai].endpoint server certificate is attested as covered outside "
+                f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
+                "verifies that certificate but its own handshake checks no CRL and no OCSP, and the "
+                "attestation adds no check. Wherever the revocation refusal would apply to that hop "
+                "it is lifted, so a revoked certificate is caught only if what the reason names "
+                "really covers it. No CRL lever is built for this hop. It never lifts a cleartext "
+                "refusal",
+            )
+        )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
     # acknowledgment of it are different facts and an operator can hold either without the other. A hop
     # with verification off under enforcement=warn needs no acknowledgment to run, so keying the report

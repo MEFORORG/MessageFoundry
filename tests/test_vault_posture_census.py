@@ -440,6 +440,9 @@ _POSTURES_BUILT = sorted(
         ("config/settings.py", "hop_posture_from_ai"),
         # An enforcing default for a connector built with no posture stamped. It cannot relax.
         ("transports/rest.py", "_current_hop_posture_fail_closed"),
+        # The AI broker's revocation guard, for a broker built with no posture: HopPosture's
+        # fail_closed(enforcing=None), which is enforcing. It cannot relax (BACKLOG #2193 (e)).
+        ("transports/ai_broker.py", "_refuse_an_unrevoked_ai_hop"),
         # The synthetic load rigs, which declare a warn posture for their own rig stores. Only
         # the `open_store` one reaches a link of this chain; `_NOT_HANDED_DOWN` argues it.
         ("harness/load/connscale/runner.py", "_reset_server_store"),
