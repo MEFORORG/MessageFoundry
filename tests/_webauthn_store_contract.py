@@ -407,9 +407,9 @@ async def _assert_totp_contract(store: Any) -> None:
     )
 
     # replace_totp_enrolment (ADR 0171 Amendment B, BACKLOG #2226): conditional on TOTP being ON
-    # and on the enrolment instant the caller read, so it can never turn TOTP on for an account
-    # without it, nor overwrite a re-enrolment. The swap, the session sweep and the audit row are
-    # one transaction, so a refused write leaves none of them.
+    # and on the enrolment the caller read, its instant and its stored cell (BACKLOG #3778), so it
+    # can never turn TOTP on for an account without it, nor overwrite a re-enrolment. The swap, the
+    # session sweep and the audit row are one transaction, so a refused write leaves none of them.
     from messagefoundry.store.store import AuditAppend
 
     action = "auth.admin_totp_reset"
@@ -418,12 +418,23 @@ async def _assert_totp_contract(store: Any) -> None:
     async def audit_rows() -> int:
         return len(await store.list_audit(limit=10, action=action))
 
+    async def held_cell() -> str | None:
+        user = await store.get_user("totp-u1")
+        assert user is not None and user.row is not None
+        return user.row.totp_secret
+
     # The old seed reversed: a different valid base32 seed, without a second key-shaped literal.
-    new_seed = "JBSWY3DPEHPK3PXP"[::-1]
+    old_seed = "JBSWY3DPEHPK3PXP"
+    new_seed = old_seed[::-1]
     replaced: dict[str, Any] = {"secret": new_seed, "recovery_code_hashes": ["n1"], "audit": audit}
     assert (
         await store.replace_totp_enrolment(
-            "totp-u1", step=200, expected_enrolled_at=None, now=10.0, **replaced
+            "totp-u1",
+            step=200,
+            expected_enrolled_at=None,
+            expected_secret_cell=None,
+            now=10.0,
+            **replaced,
         )
         is None
     )
@@ -432,13 +443,16 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.get_totp_secret("totp-u1") is None
     assert await audit_rows() == 0
     # On an enabled row it swaps the seed, the codes and the step in one write, with TOTP still on.
-    staged_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=11.0)
+    staged_cell = await store.set_totp_secret("totp-u1", secret=old_seed, now=11.0)
     assert (
         await store.enable_totp(
             "totp-u1", expected_secret_cell=staged_cell, recovery_code_hashes=["o1", "o2"], now=12.0
         )
         is True
     )
+    assert await held_cell() == staged_cell
+    # From here every call pins the cell the row holds unless it says otherwise.
+    replaced["expected_secret_cell"] = staged_cell
     assert await store.consume_totp_step("totp-u1", 300) is True  # the old seed's history
     await store.create_session(
         token_hash="totp-u1-session", user_id="totp-u1", expires_at=1e12, auth_mechanism="password"
@@ -448,8 +462,25 @@ async def _assert_totp_contract(store: Any) -> None:
         "totp-u1", step=200, expected_enrolled_at=11.5, now=12.5, **replaced
     )
     assert stale is None
-    assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP"
+    # So does the right stamp beside another cell, or beside none (BACKLOG #3778).
+    for cell in (f"{staged_cell}-not", None):
+        other = await store.replace_totp_enrolment(
+            "totp-u1",
+            step=200,
+            expected_enrolled_at=12.0,
+            now=12.5,
+            **{**replaced, "expected_secret_cell": cell},
+        )
+        assert other is None, cell
+    assert await store.get_totp_secret("totp-u1") == old_seed
     assert len(await store.list_sessions("totp-u1")) == 1
+    assert await audit_rows() == 0
+    # An empty secret is refused before any write, as set_totp_secret refuses one.
+    with pytest.raises(ValueError, match="a TOTP secret is required"):
+        await store.replace_totp_enrolment(
+            "totp-u1", step=200, expected_enrolled_at=12.0, now=12.5, **{**replaced, "secret": ""}
+        )
+    assert await store.get_totp_secret("totp-u1") == old_seed
     assert await audit_rows() == 0
     # A refused audit append, or a refused COMMIT where the store has a seam for one, leaves the
     # seed, the sessions and the audit log as they were and tees nothing, and the swap that commits
@@ -498,11 +529,50 @@ async def _assert_totp_contract(store: Any) -> None:
     # The high-water mark is the proving code's step, not the old seed's: 200 is spent, 201 is not.
     assert await store.consume_totp_step("totp-u1", 200) is False
     assert await store.consume_totp_step("totp-u1", 201) is True
+
+    # THE SAME STAMP (BACKLOG #3778). The caller pins the enrolment the swap above wrote; then the
+    # factor is removed and enrolled again with another seed inside the same clock reading, so the
+    # row carries the very stamp that was pinned. Only the cell tells the two enrolments apart.
+    user = await store.get_user("totp-u1")
+    assert user is not None and user.totp_enrolled_at == 13.0
+    swapped_cell = await held_cell()
+    await store.disable_totp("totp-u1", now=13.0)
+    third_seed = old_seed[8:] + old_seed[:8]
+    third_cell = await store.set_totp_secret("totp-u1", secret=third_seed, now=13.0)
+    assert (
+        await store.enable_totp(
+            "totp-u1", expected_secret_cell=third_cell, recovery_code_hashes=["t1"], now=13.0
+        )
+        is True
+    )
+    user = await store.get_user("totp-u1")
+    assert user is not None and user.totp_enabled is True and user.totp_enrolled_at == 13.0
+    fourth_seed = old_seed[4:] + old_seed[:4]
+    # Pinned to the enrolment the swap above wrote, then to the one the row does hold: the first
+    # writes nothing, and the second, the control, swaps it.
+    for pinned, ended_sessions, seed_after, codes_after, rows in (
+        (swapped_cell, None, third_seed, ["t1"], 1),
+        (third_cell, 0, fourth_seed, ["n1"], 2),
+    ):
+        assert (
+            await store.replace_totp_enrolment(
+                "totp-u1",
+                step=400,
+                expected_enrolled_at=13.0,
+                now=13.5,
+                **{**replaced, "secret": fourth_seed, "expected_secret_cell": pinned},
+            )
+            == ended_sessions
+        )
+        assert await store.get_totp_secret("totp-u1") == seed_after
+        assert await store.get_recovery_code_hashes("totp-u1") == codes_after
+        assert await audit_rows() == rows
+
     missing = await store.replace_totp_enrolment(
         "missing-user", step=1, expected_enrolled_at=None, now=14.0, **replaced
     )
     assert missing is None
-    assert await audit_rows() == 1
+    assert await audit_rows() == 2
 
     await store.delete_user("totp-u1")
     await _assert_totp_binding_contract(store)
