@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Vault BACKLOG #3180: each upload-quota reservation has its own identity, the ledger calls a
-cancelled save leaves running are bounded, and they are drained before the store closes.
+cancelled save leaves running are bounded, and the shutdown drain waits for them, then cancels
+them, before the store closes.
 
 The ledger used to hold one row per uploader, so a release could not say which slot it paid back,
 a reserve whose outcome was unknown could not be reconciled, and one clock kept every slot alive
@@ -15,6 +16,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +27,7 @@ from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import UploadedFileMeta, UploadStore, _Observed
-from tests.test_uploads import _GatedLedger, _hold_after_the_sidecar_lands
+from tests.test_uploads import _cancel_once_landed, _GatedLedger, _hold_after_the_sidecar_lands
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 
@@ -68,8 +70,10 @@ class _PassThrough:
     async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
         return await self.store.reserve_upload_quota(*args, **kwargs)
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
-        await self.store.release_upload_quota(reservation_id)
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
+        await self.store.release_upload_quota(
+            uploader_id=uploader_id, reservation_id=reservation_id
+        )
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         await self.store.touch_upload_quota(reservation_id)
@@ -112,7 +116,7 @@ async def test_a_late_release_is_cancelled_at_its_cap_rather_than_absorbed(
         async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
             raise ConnectionError("store unreachable")
 
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.Event().wait()
 
         async def touch_upload_quota(self, reservation_id: str) -> None:
@@ -188,6 +192,38 @@ async def test_the_drain_cancels_what_is_left_and_starts_no_release(
     assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
 
 
+async def test_the_drain_cancels_a_held_touch_once(tmp_path: Path) -> None:
+    """Vault BACKLOG #3740 item 14. A touch the drain cancelled may take a while to unwind, as the
+    SQLite writer guard's rollback does, and a second cancel would cut that unwind short. Red
+    with the cancel of every task left after the wait: a straggler outlasting the wait put the
+    touch in that set, so it was cancelled twice."""
+    store = _uploads(tmp_path, None)
+    cancels = 0
+
+    async def _touch() -> None:
+        nonlocal cancels
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancels += 1
+            try:
+                await asyncio.sleep(0.3)  # the store's unwind of the cancelled statement
+            except asyncio.CancelledError:
+                cancels += 1
+            raise
+
+    touch = asyncio.ensure_future(_touch())
+    store._touches.add(touch)
+    touch.add_done_callback(store._touches.discard)
+    store._hold(touch)
+    stalled = asyncio.ensure_future(asyncio.Event().wait())
+    store._hold(stalled)  # outlasts the drain's wait, so the cancel pass runs
+    await asyncio.sleep(0)  # the touch starts, so a cancel lands inside it
+    await store.drain_stragglers(0.05, grace=0.5)
+    await asyncio.gather(touch, stalled, return_exceptions=True)
+    assert cancels == 1
+
+
 async def test_the_drain_returns_at_once_with_nothing_left_running(tmp_path: Path) -> None:
     store = _uploads(tmp_path, None)
     await asyncio.wait_for(store.drain_stragglers(timeout=30.0), 1.0)
@@ -238,6 +274,252 @@ async def test_a_cancelled_save_removes_its_pair_before_another_save_scans(
         await asyncio.wait_for(a, 10)
     assert isinstance(await asyncio.wait_for(b, 10), UploadedFileMeta)
     assert [m.filename for m in await store.list_files()] == ["b.txt"]
+
+
+async def test_a_hung_removal_of_a_cancelled_pair_does_not_hold_the_quota_lock(
+    tmp_path: Path,
+    ledger_db: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3740 item 4: the removal of a cancelled save's landed pair waited under
+    ``_quota_lock`` with no bound, so one hung unlink queued every upload in the process. Past
+    ``_CANCELLED_REMOVAL_WAIT_SECONDS`` the cancelled save drops the lock with the removal still
+    running, names the file at ERROR, and the next upload reserves and lands; the pair goes once
+    the unlink returns. Red before: B never reached its reserve while A's unlink hung."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
+    reserved: list[str] = []
+
+    class _Recording(_PassThrough):
+        async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+            reserved.append(args[1])
+            return await super().reserve_upload_quota(*args, **kwargs)
+
+    store = _uploads(tmp_path, _Recording(ledger_db))
+    landed, finish = _hold_after_the_sidecar_lands(monkeypatch)
+    unhang, removed = threading.Event(), threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> None:
+        unhang.wait(30)  # bounded, so a red run cannot hang the suite
+        real_discard(file_id)
+        removed.set()
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
+    a = asyncio.create_task(
+        store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
+    )
+    try:
+        try:
+            assert await asyncio.to_thread(landed.wait, 10), "A's sidecar never landed"
+            b = asyncio.create_task(
+                store.save(data=b"second\n", filename="b.txt", uploader="op", uploader_id="u-op")
+            )
+            await asyncio.sleep(0.05)  # B is queued on the lock
+            assert len(reserved) == 1, "the control: B has not reserved while A holds the lock"
+            a.cancel()
+        finally:
+            finish.set()
+        done, _ = await asyncio.wait({a, b}, timeout=5)
+        assert b in done, "B waited on the lock for A's hung unlink"
+        assert isinstance(b.result(), UploadedFileMeta)
+        assert len(reserved) == 2
+        assert a in done and a.cancelled()
+        assert "has no upload.create audit row; its removal did not finish" in caplog.text
+        assert len(await store.list_files()) == 2, "the control: A's pair is still on disk"
+    finally:
+        unhang.set()
+    assert await asyncio.to_thread(removed.wait, 10), "A's removal never finished"
+    assert [m.filename for m in await store.list_files()] == ["b.txt"]
+    assert await _settled(store), "a ledger call was left running"
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    withdrawn = "its removal finished after it was named at ERROR"
+    for _ in range(50):  # the done callback runs one loop pass after the thread returns
+        if withdrawn in caplog.text:
+            break
+        await asyncio.sleep(0.02)
+    assert withdrawn in caplog.text, caplog.text
+
+
+async def test_abandoned_removals_run_on_their_own_capped_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 4, the Lander's hold on PR 2645: each removal abandoned at the
+    bound kept a default-executor worker, with no cap, so hung unlinks could fill the pool every
+    ``asyncio.to_thread`` in the engine shares. Removals now run on their own small pool, so a
+    hung one past its cap queues there. Red before: three hung removals ran at once on the
+    default executor."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 0.05)
+    real_pool = getattr(uploads_mod, "_removal_executor", None)
+    if real_pool is not None:  # the real pool is capped as the constant says
+        assert real_pool()._max_workers == uploads_mod._CANCELLED_REMOVAL_WORKERS <= 4
+    pool = ThreadPoolExecutor(max_workers=1)
+    # raising=False, so the unfixed module, which has no such pool, fails on the count below.
+    monkeypatch.setattr(uploads_mod, "_removal_executor", lambda: pool, raising=False)
+    store = _uploads(tmp_path, None)
+    metas = [
+        await store.save(data=b"x\n", filename=f"{n}.txt", uploader="op", uploader_id="u-op")
+        for n in range(3)
+    ]
+    unhang, count = threading.Event(), threading.Lock()
+    running, peak, finished = 0, 0, 0
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        nonlocal running, peak, finished
+        with count:
+            running += 1
+            peak = max(peak, running)
+        try:
+            unhang.wait(30)  # bounded, so a red run cannot hang the suite
+            return real_discard(file_id)
+        finally:
+            with count:
+                running -= 1
+                finished += 1
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    try:
+        for meta in metas:
+            await store._remove_cancelled_pair(meta.file_id)
+        await asyncio.sleep(0.1)  # time for a queued removal to start, were nothing capping it
+        assert peak == 1, f"{peak} hung removals ran at once"
+    finally:
+        unhang.set()
+        await asyncio.to_thread(pool.shutdown, True)  # runs the queued removals, then returns
+    assert finished == 3
+    assert await store.list_files() == []
+
+
+async def test_the_drain_names_a_removal_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3740 item 4: a removal's bound ERROR is a loop timer, which a closing loop
+    drops, so the shutdown drain names a removal still running inside its bound at ERROR. Once
+    the removal lands, a WARNING withdraws it."""
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 30.0)
+    store = _uploads(tmp_path, None)
+    meta = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    unhang, removed = threading.Event(), threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        unhang.wait(30)
+        try:
+            return real_discard(file_id)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.uploads")
+    try:
+        task = asyncio.create_task(store._remove_cancelled_pair(meta.file_id))
+        await asyncio.sleep(0.05)
+        task.cancel()  # the repeat cancellation that ends the cancelled save's wait
+        await asyncio.wait_for(task, 5)
+        await store.drain_stragglers(timeout=0.0, grace=0.0)
+        assert f"upload {meta.file_id} was cancelled after its file landed" in caplog.text
+        assert "its removal was still running at shutdown" in caplog.text, caplog.text
+        assert not store._pending_removals, "the drain left the removal holding later saves"
+    finally:
+        unhang.set()
+    assert await asyncio.to_thread(removed.wait, 10)
+    for _ in range(50):
+        if "its removal finished after it was named at ERROR" in caplog.text:
+            break
+        await asyncio.sleep(0.02)
+    assert "its removal finished after it was named at ERROR" in caplog.text, caplog.text
+    assert await store.list_files() == []
+
+
+async def test_a_removal_that_cannot_start_is_named_and_the_cancel_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3740 item 4: submit() can refuse the removal, at least after interpreter
+    shutdown. The cancellation still propagates, and an ERROR names the file as stored with no
+    ``upload.create`` row."""
+
+    class _Refusing(ThreadPoolExecutor):
+        def submit(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+    refusing = _Refusing(max_workers=1)
+    monkeypatch.setattr(uploads_mod, "_removal_executor", lambda: refusing, raising=False)
+    store = _uploads(tmp_path, None)
+    caplog.set_level(logging.ERROR, logger="messagefoundry.uploads")
+    await _cancel_once_landed(store, monkeypatch)  # asserts the CancelledError propagates
+    assert "its removal could not be started, so the file is still stored" in caplog.text
+    assert not store._pending_removals
+    refusing.shutdown()
+
+
+async def test_a_repeated_cancel_does_not_spin_a_cancelled_save_on_its_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 4, the Lander's hold on PR 2645: the removal's wait absorbed every
+    cancellation in a loop, under ``_quota_lock``, so an anyio scope, which cancels again on every
+    loop pass, spun the cancelled save for the whole bound while every other upload queued. The
+    cancelled save now stops waiting at the next cancellation, and the next save waits for the
+    removal, without spinning, before it scans. Red before: A ran out the whole bound."""
+    import anyio
+
+    # Long enough that B is still inside it on a slow runner, so B is waiting, not past it.
+    monkeypatch.setattr(uploads_mod, "_CANCELLED_REMOVAL_WAIT_SECONDS", 5.0)
+    store = _uploads(tmp_path, None)
+    landed, finish = _hold_after_the_sidecar_lands(monkeypatch)
+    unhang = threading.Event()
+    real_discard = store._discard_cancelled_sync
+
+    def _hung_discard(file_id: str) -> bool:
+        unhang.wait(30)  # bounded, so a red run cannot hang the suite
+        return real_discard(file_id)
+
+    monkeypatch.setattr(store, "_discard_cancelled_sync", _hung_discard)
+    loop = asyncio.get_running_loop()
+    ended: list[float] = []
+
+    async def _a() -> None:
+        try:
+            await store.save(
+                data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op"
+            )
+        finally:
+            ended.append(loop.time())
+
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_a)
+            try:
+                assert await asyncio.to_thread(landed.wait, 10), "A's sidecar never landed"
+                cancelled_at = loop.time()
+                tg.cancel_scope.cancel()
+            finally:
+                finish.set()
+        assert ended[0] - cancelled_at < 2.0, "A waited out the bound under repeated cancels"
+        b = asyncio.create_task(
+            store.save(data=b"second\n", filename="b.txt", uploader="op", uploader_id="u-op")
+        )
+        await asyncio.sleep(0.1)
+        assert not b.done(), "B went on while A's pair was still being removed"
+    finally:
+        unhang.set()
+    assert isinstance(await asyncio.wait_for(b, 10), UploadedFileMeta)
+    assert [m.filename for m in await store.list_files()] == ["b.txt"]
+
+
+async def test_the_drain_reads_its_default_waits_when_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 12: the drain's default waits were bound when the method was
+    defined, so a changed module default never reached a caller that passed none."""
+    monkeypatch.setattr(uploads_mod, "_STRAGGLER_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(uploads_mod, "_STRAGGLER_CANCEL_GRACE_SECONDS", 0.05)
+    store = _uploads(tmp_path, None)
+    stalled = asyncio.ensure_future(asyncio.Event().wait())
+    store._hold(stalled)
+    await asyncio.wait_for(store.drain_stragglers(), 1.0)
+    assert stalled.cancelled()
 
 
 async def test_the_managed_teardown_drains_the_upload_stragglers_before_the_engine_stops(
@@ -293,9 +575,11 @@ async def test_a_retry_right_after_a_failed_reserve_is_not_refused_for_its_own_o
                 raise ConnectionError("lost after the commit")
             return applied
 
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.sleep(0.05)  # a release slower than the retry's reserve
-            await self.store.release_upload_quota(reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _FirstReserveCommitsThenFails(ledger_db), max_files=1)
     with pytest.raises(ConnectionError):
@@ -352,9 +636,11 @@ async def test_a_straggler_that_ends_after_the_drain_returned_starts_no_release(
                 raise
             return applied
 
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             released.append(reservation_id)
-            await self.store.release_upload_quota(reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _ReserveOutlivesItsCancel(ledger_db))
     save = asyncio.create_task(
@@ -417,12 +703,26 @@ async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_ste
 
 
 @pytest.mark.parametrize(
-    ("budget", "expected"),
-    [(0.3, (0.2, 0.1)), (10.0, (2.0, 1.0)), (0.0, (0.0, 0.0))],
+    ("budget", "expected", "defaults"),
+    [
+        (0.3, (0.2, 0.1), None),
+        (10.0, (2.0, 1.0), None),
+        (0.0, (0.0, 0.0), None),
+        # Vault BACKLOG #3740 item 17: the split moves with the defaults it is derived from. Red
+        # before: two thirds was written by hand, so equal defaults still got (2/3, 1/3).
+        (1.0, (0.5, 0.5), (1.0, 1.0)),
+    ],
 )
 async def test_drain_stragglers_within_fits_both_waits_inside_the_budget(
-    tmp_path: Path, budget: float, expected: tuple[float, float]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: float,
+    expected: tuple[float, float],
+    defaults: tuple[float, float] | None,
 ) -> None:
+    if defaults is not None:
+        monkeypatch.setattr(uploads_mod, "_STRAGGLER_DRAIN_SECONDS", defaults[0])
+        monkeypatch.setattr(uploads_mod, "_STRAGGLER_CANCEL_GRACE_SECONDS", defaults[1])
     store = _uploads(tmp_path, None)
     waits: list[tuple[float, float]] = []
 
@@ -436,10 +736,33 @@ async def test_drain_stragglers_within_fits_both_waits_inside_the_budget(
     assert timeout + grace <= budget + 1e-9
 
 
+async def test_drain_stragglers_within_settles_first_inside_its_wait(tmp_path: Path) -> None:
+    """Vault BACKLOG #3740 item 6: ``settle`` gets the wait's share, and the drain's own wait what
+    it leaves; the grace is not touched."""
+    store = _uploads(tmp_path, None)
+    settled: list[float] = []
+    waits: list[tuple[float, float]] = []
+
+    async def _settle(timeout: float) -> None:
+        settled.append(timeout)
+        await asyncio.sleep(0.1)
+
+    async def _drain(timeout: float, *, grace: float) -> None:
+        waits.append((timeout, grace))
+
+    store.drain_stragglers = _drain  # type: ignore[method-assign,assignment]
+    await store.drain_stragglers_within(0.9, settle=_settle)
+    [(timeout, grace)] = waits
+    assert settled == [pytest.approx(0.6)]
+    assert 0.0 <= timeout <= 0.5 + 0.02
+    assert grace == pytest.approx(0.3)
+
+
 async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path) -> None:
     """``create_app(engine=...)`` runs the same drains as the managed lifespan
     (``_app_drain_steps``), the upload store's included, so a caller that stops its engine after
-    the app has shut down closes no store under a running ledger call."""
+    the app has shut down closes no store under a ledger call the drain waited for or cancelled.
+    The drain is bounded, so one that outlives its grace can still meet the closed store."""
     from messagefoundry.api import create_app
     from messagefoundry.pipeline.engine import Engine
 
@@ -451,7 +774,7 @@ async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path
         calls: list[str] = []
 
         class _Uploads:
-            async def drain_stragglers_within(self, budget: float) -> None:
+            async def drain_stragglers_within(self, budget: float, **_kwargs: Any) -> None:
                 calls.append("uploads")
 
         async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:
@@ -501,10 +824,12 @@ async def test_a_reserve_already_done_when_the_drain_cancels_still_pays_its_slot
     released: list[str] = []
 
     class _Recording(_PassThrough):
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.sleep(0.05)  # slower than one loop pass, so only a wait covers it
             released.append(reservation_id)
-            await self.store.release_upload_quota(reservation_id)
+            await self.store.release_upload_quota(
+                uploader_id=uploader_id, reservation_id=reservation_id
+            )
 
     store = _uploads(tmp_path, _Recording(ledger_db))
     reserve: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
@@ -522,7 +847,7 @@ async def test_a_release_still_running_at_the_grace_is_cancelled(
     so nothing the drain saw outlives it."""
 
     class _Stalls(_PassThrough):
-        async def release_upload_quota(self, reservation_id: str) -> None:
+        async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
             await asyncio.Event().wait()
 
     store = _uploads(tmp_path, _Stalls(ledger_db))

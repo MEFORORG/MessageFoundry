@@ -1520,7 +1520,7 @@ class QueueStore(StoreLifecycle, Protocol):
         scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
         hold N independent locks and each can overshoot the budget by one file. Every shard sits on
         the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
-        past one shard), so these rows are authoritative for all of them.
+        past one engine shard), so these rows are authoritative for all of them.
 
         **What is counted here, and what is not.** The files already ON DISK are counted by the
         caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
@@ -1545,11 +1545,15 @@ class QueueStore(StoreLifecycle, Protocol):
         worse."""
         ...
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
-        """Pay back the reservation ``reservation_id`` by deleting its row (vault BACKLOG #3180).
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
+        """Pay back ``uploader_id``'s reservation ``reservation_id`` by deleting its row (vault
+        BACKLOG #3180).
 
         Idempotent, and it touches no other reservation, so it is safe after a reserve whose outcome
-        is unknown: a reserve that never committed leaves no row, and this deletes nothing."""
+        is unknown: a reserve that never committed leaves no row, and this deletes nothing. A row
+        held by another uploader is left alone. The caller names the uploader, as it does to
+        :meth:`reserve_upload_quota`, so a backend that serializes per uploader takes that lock
+        without first reading the row to learn whose it is (vault BACKLOG #3740 item 10)."""
         ...
 
     async def touch_upload_quota(self, reservation_id: str) -> None:

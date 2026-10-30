@@ -16,6 +16,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -235,18 +236,236 @@ async def test_a_step_that_ends_cancelled_on_its_own_is_not_taken_for_a_cancel()
     assert calls == ["after"]
 
 
+#: The managed lifespan's shutdown steps, every optional one present, in the order they run.
+_MANAGED_ORDER = [
+    "the upload retention runner's stop",
+    "the store-reading tasks",
+    "the long-operations drain",
+    "the upload straggler drain",
+    "the approval request- and outcome-write drain",
+    "the lock-notice drain",
+    "the summary-access flush (a cut loses the unwritten windows' audit rows)",
+    "the config-write drain",
+    "the security notifier's close",
+    "the security-signal removal",
+    "engine.stop()",
+    "the instrumented executor's shutdown",
+    "the alert notifier's close",
+]
+
+
+def _every_managed_step(*, harness: bool) -> list[_TeardownStep]:
+    """The real managed step list with every optional part present. The parts are stand-ins,
+    because building the list calls none of them; ``harness`` adds the harness-only executor."""
+    state = SimpleNamespace(
+        outliving_operations=object(),
+        upload_store=object(),
+        approval_gate=object(),
+        connscale_executor=SimpleNamespace(shutdown=lambda wait: None) if harness else None,
+    )
+    app: Any = SimpleNamespace(state=state)
+    part: Any = object()
+    return app_module._managed_teardown_steps(
+        app,
+        part,
+        part,
+        part,
+        background=[],
+        upload_retention_runner=part,
+        security_notifier=part,
+        remove_security_signals=lambda: None,
+        notifier=part,
+    )
+
+
 def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
     """The install script's AppStopMethodConsole is the window. The budget, plus uvicorn's own drain
-    bound where serve sets one (BACKLOG #3256), must leave room in it for the interpreter to exit."""
+    bound where serve sets one (BACKLOG #3256), plus a cut grace for every bounded step a
+    production shutdown can run, since each can be cut (vault BACKLOG #3740 item 15), must leave
+    room in it for the interpreter to exit. The steps are counted from the real list, so a new
+    bounded step is counted without anyone remembering to. The harness-only executor is not."""
     script = (_REPO / "scripts" / "service" / "install-service.ps1").read_text(encoding="utf-8")
     match = re.search(r"AppStopMethodConsole\s+(\d+)", script)
     assert match is not None, "the install script no longer sets AppStopMethodConsole"
     window = int(match.group(1)) / 1000.0
     import messagefoundry.__main__ as cli
 
-    shutdown = app_module._SHUTDOWN_BUDGET_SECONDS + cli._UVICORN_DRAIN_SECONDS
-    assert shutdown + 1.0 <= window
+    bounded = sum(step.bounded for step in _every_managed_step(harness=False))
+    graces = bounded * app_module._CUT_GRACE_SECONDS
+    shutdown = app_module._SHUTDOWN_BUDGET_SECONDS + cli._UVICORN_DRAIN_SECONDS + graces
+    assert shutdown + 1.0 <= window + 1e-9, (bounded, shutdown, window)
     assert app_module._ENGINE_STOP_RESERVE_SECONDS < app_module._SHUTDOWN_BUDGET_SECONDS
+
+
+def test_the_managed_steps_are_built_in_their_pinned_order() -> None:
+    """Vault BACKLOG #3740 item 16: the order is read off the list the lifespan runs, not off fakes
+    that record their own calls. At least these constraints depend on it: the drains run while the
+    store is open, the lock notices before the security notifier that sends their mail, and the
+    alert notifier last, after engine.stop()."""
+    assert [step.label for step in _every_managed_step(harness=True)] == _MANAGED_ORDER
+
+
+async def test_the_managed_lifespan_runs_its_real_steps_in_the_pinned_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same order, from the steps a real managed app runs at shutdown, none of them replaced."""
+    from messagefoundry.config.settings import StoreSettings
+
+    ran: list[str] = []
+    labels: dict[int, str] = {}
+    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+
+    async def _run(steps: list[_TeardownStep], budget: float) -> None:
+        labels.update((id(step.run), step.label) for step in steps)
+        await real_run(steps, budget)
+
+    async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+        ran.append(labels[id(run)])
+        return await real_invoke(run, bound)
+
+    monkeypatch.setattr(app_module, "_run_teardown", _run)
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    settings = StoreSettings(path=str(tmp_path / "order.db"), uploads_dir=str(tmp_path / "up"))
+    app = create_managed_app(
+        store_settings=settings, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    assert ran == [label for label in _MANAGED_ORDER if label in ran]
+    # The control: the steps this app builds did run, the upload ones among them.
+    assert {"the upload retention runner's stop", "the upload straggler drain"} <= set(ran)
+    assert {"the long-operations drain", "engine.stop()"} <= set(ran)
+
+
+async def test_the_long_operations_drain_splits_its_share_by_its_named_wait_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3740 item 17: the split is read off ``_OUTLIVING_WAIT_SHARE``, the one place
+    that states it and why it is not the drain defaults' ratio, rather than a literal quarter."""
+    monkeypatch.setattr(app_module, "_OUTLIVING_WAIT_SHARE", 0.5)
+    monkeypatch.setattr(app_module, "OUTLIVING_DRAIN_SECONDS", 10.0)
+    monkeypatch.setattr(app_module, "CANCEL_GRACE_SECONDS", 10.0)
+    calls: list[tuple[float, float]] = []
+
+    class _Operations:
+        async def drain(self, timeout: float, *, grace: float) -> list[str]:
+            calls.append((timeout, grace))
+            return []
+
+    app: Any = SimpleNamespace(state=SimpleNamespace(outliving_operations=_Operations()))
+    [step] = app_module._app_drain_steps(app, None, None, owns_auth=False)
+    await step.run(2.5)
+    [(wait, grace)] = calls
+    share = 2.5 * app_module._INNER_SHARE
+    assert (wait, grace) == pytest.approx((share / 2, share / 2))
+
+
+async def test_a_stuck_non_upload_operation_does_not_hold_the_upload_straggler_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 6: the upload drain settles the ``upload.create`` operations, at
+    least one kind whose arm starts an upload removal, and not a DR change or reload still rolling
+    back at shutdown, which would hold the step for its whole wait share, about 1.3 s here,
+    although its only straggler had finished at 0.2 s."""
+    from messagefoundry.api.app import _app_drain_steps
+    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    monkeypatch.setattr(app_module, "OUTLIVING_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "CANCEL_GRACE_SECONDS", 0.1)
+    uploads = UploadStore(tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096)
+    outliving = OutlivingOperations()
+    release = asyncio.Event()
+
+    async def _stuck_rollback() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # a DR hook reap that outlasts the drain's grace
+            raise
+
+    caller = asyncio.ensure_future(outliving.run(_stuck_rollback(), "DR activate"))
+    finished: list[float] = []
+    began = time.monotonic()
+
+    async def _ledger_call() -> None:
+        await asyncio.sleep(0.2)
+        finished.append(time.monotonic() - began)
+
+    straggler = asyncio.ensure_future(_ledger_call())
+    uploads._hold(straggler)
+    await asyncio.sleep(0)
+    try:
+        app: Any = SimpleNamespace(
+            state=SimpleNamespace(outliving_operations=outliving, upload_store=uploads)
+        )
+        await _run_teardown(_app_drain_steps(app, None, None, owns_auth=False), 2.6)
+        elapsed = time.monotonic() - began
+        assert finished, "the straggler was cancelled before its 0.2 s"
+        assert outliving.inflight == ["DR activate"], "the control: the DR arm is still running"
+        assert elapsed < 1.1, f"the upload drain waited on the DR arm: {elapsed:.2f}s"
+    finally:
+        release.set()
+        await asyncio.gather(caller, straggler, return_exceptions=True)
+
+
+async def test_a_removal_a_cancelled_create_row_starts_late_is_drained_before_the_teardown_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3740 item 6. The long-operations drain cancels an ``upload.create`` row whose
+    unwind outlasts that drain's grace, as a rollback queued behind a slow statement does. The
+    row's arm then removes the stored file. Red before: the upload straggler drain found nothing
+    held yet, returned at once, and the removal began after the teardown had moved on, so the
+    file was still stored when the teardown ended."""
+    from messagefoundry.api.app import _app_drain_steps, _record_upload_create
+    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    monkeypatch.setattr(app_module, "OUTLIVING_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "CANCEL_GRACE_SECONDS", 0.1)
+    uploads = UploadStore(tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096)
+    meta = await uploads.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    writing = asyncio.Event()
+
+    class _SlowUnwind:
+        async def record_audit(self, action: str, **_kwargs: Any) -> None:
+            if action != "upload.create":
+                return  # any later row, such as one for the removal itself
+            writing.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.3)  # longer than the drain's wait and grace together
+                raise
+
+    outliving = OutlivingOperations()
+    store: Any = _SlowUnwind()
+    row = _record_upload_create(
+        store,
+        uploads,
+        meta,
+        actor="op",
+        client=None,
+    )
+    caller = asyncio.ensure_future(outliving.run(row, app_module._UPLOAD_CREATE_OPERATION))
+    try:
+        await asyncio.wait_for(writing.wait(), _WAIT_S)
+        assert await uploads.list_files(), "the control: the pair is stored"
+        app: Any = SimpleNamespace(
+            state=SimpleNamespace(outliving_operations=outliving, upload_store=uploads)
+        )
+        await _run_teardown(_app_drain_steps(app, None, None, owns_auth=False), 2.6)
+        assert await uploads.list_files() == [], "the removal had not run when the teardown ended"
+        assert not list((tmp_path / "uploads").glob("*.blob"))
+    finally:
+        await asyncio.gather(caller, return_exceptions=True)
+        # Red, the arm is still running: let it finish before tmp_path goes.
+        for _ in range(100):
+            if not outliving.inflight and not uploads._stragglers:
+                break
+            await asyncio.sleep(0.02)
 
 
 # --- the managed lifespan -----------------------------------------------------------------------

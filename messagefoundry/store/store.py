@@ -7946,8 +7946,8 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN
 -- FLIGHT: reserved but not yet landed in `uploads_dir`, and therefore invisible to the sidecar scan
 -- that counts everything already on disk. The scan is uncached and so already fleet-visible; these
--- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: a shard's upload in
--- flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
+-- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: an engine shard's upload
+-- in flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
 -- (BACKLOG #1941). `reservation_id` is the save's own id, so a release pays back only its own slot
 -- (vault BACKLOG #3180). `since` is that reservation's last activity: its reserve or a live save's
 -- heartbeat (BACKLOG #2648). A reservation idle that long is a leak, from a killed process or a
@@ -15549,8 +15549,10 @@ class MessageStore:
 
         The reclaim and the reserve run in one transaction under the one writer connection, and the
         reserve is ONE statement whose ``WHERE`` carries the budget, so no other connection can
-        write between the sums it reads and the row it inserts. ``rowcount`` discriminates applied
-        from refused."""
+        write between the sums it reads and the row it inserts. The count and the byte total come
+        from one aggregate over the uploader's rows, which always yields exactly one row, so the
+        ``WHERE`` decides whether one row is inserted or none (vault BACKLOG #3740 item 12).
+        ``rowcount`` discriminates applied from refused."""
         if max_files < 1 or size_bytes > max_total_bytes:
             # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
@@ -15563,10 +15565,9 @@ class MessageStore:
             )
             cur = await self._db.execute(
                 "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
-                " SELECT ?, ?, ?, ?"
-                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?) + 1 <= ?"
-                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
-                " WHERE uploader_id = ?) + ? <= ?",
+                " SELECT ?, ?, ?, ? FROM (SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                " FROM upload_reservation WHERE uploader_id = ?) AS held"
+                " WHERE held.n + 1 <= ? AND held.b + ? <= ?",
                 (
                     reservation_id,
                     uploader_id,
@@ -15574,7 +15575,6 @@ class MessageStore:
                     now,
                     uploader_id,
                     int(max_files),
-                    uploader_id,
                     int(size_bytes),
                     int(max_total_bytes),
                 ),
@@ -15583,11 +15583,12 @@ class MessageStore:
             await self._commit()
         return applied
 
-    async def release_upload_quota(self, reservation_id: str) -> None:
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "DELETE FROM upload_reservation WHERE reservation_id = ?", (reservation_id,)
+                "DELETE FROM upload_reservation WHERE reservation_id = ? AND uploader_id = ?",
+                (reservation_id, uploader_id),
             )
             await self._commit()
 

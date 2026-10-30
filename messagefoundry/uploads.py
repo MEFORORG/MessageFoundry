@@ -39,6 +39,7 @@ import secrets
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from stat import S_ISREG
@@ -99,6 +100,37 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
+# How long the removal of a cancelled save's landed pair keeps the next save in this process from
+# scanning the disk (UploadStore._remove_cancelled_pair, vault BACKLOG #3740 item 4). A filesystem
+# bound, apart from the ledger's, so tuning one does not move the other. A healthy unlink takes
+# milliseconds.
+_CANCELLED_REMOVAL_WAIT_SECONDS = 5.0
+# How many of those removals run at once, on their own pool rather than the default executor, so
+# unlinks that hang can hold at most this many threads, never the pool every ``asyncio.to_thread``
+# in the engine shares. A removal past the cap queues on the pool and still runs.
+_CANCELLED_REMOVAL_WORKERS = 2
+
+
+@functools.cache
+def _removal_executor() -> ThreadPoolExecutor:
+    """The process's pool for cancelled-pair removals (``_CANCELLED_REMOVAL_WORKERS``), built on
+    first use. It is never shut down: a queued removal must still run, and the interpreter joins
+    its threads at exit as it does the default executor's."""
+    return ThreadPoolExecutor(
+        max_workers=_CANCELLED_REMOVAL_WORKERS, thread_name_prefix="mefor-upload-removal"
+    )
+
+
+@dataclass(slots=True)
+class _PendingRemoval:
+    """A cancelled save's removal that later saves still wait for, until ``deadline`` (loop
+    time). ``flagged`` is set once an ERROR has named it as possibly stored."""
+
+    file_id: str
+    deadline: float
+    flagged: bool = False
+
+
 # How often a save that holds an engine-shard reservation touches the ledger row, so a slow save
 # keeps its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it
 # reclaimed by a sibling engine shard's reserve (BACKLOG #2648). A third of that window, which
@@ -111,11 +143,12 @@ _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # BACKLOG #3180). A write is
 # bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
-# How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). The
-# heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
+# How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). A
+# running heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
 # refreshes the reservation. One still running when the heartbeat ends is held as a straggler, so
 # it is cancelled at ``_LEDGER_STRAGGLER_MAX_SECONDS`` or by the shutdown drain (vault BACKLOG
-# #3180). Well under the interval, so the wait never delays the next beat by much.
+# #3180), which does not wait for it (#3740 item 14). Well under the interval, so the wait never
+# delays the next beat by much.
 _RESERVATION_TOUCH_WAIT_SECONDS = 10.0
 
 # How long a ledger call a cancelled save left running may run before it is cancelled (vault
@@ -255,12 +288,16 @@ class UploadQuotaError(UploadError):
       ``file_id`` (vault BACKLOG #3180). So a leaked slot is reclaimed
       ``UPLOAD_RESERVATION_STALE_AFTER`` after its last touch however active the uploader stays,
       and a release pays back only its own slot. A cancelled ``save`` waits a bounded time for its
-      reserve and release (BACKLOG #2263), and releases by id even a reserve whose outcome it never
-      learned. At least these still leak until the window passes: a release that fails; a ledger
-      call still running ``_LEDGER_STRAGGLER_MAX_SECONDS`` after its save was cancelled, which is
-      cancelled there; a reserve whose statement commits after its call was cancelled; and a call
-      the shutdown drain cancels. The module logs each at WARNING. **On Postgres and SQL Server the
-      stamp and the staleness test both read the database server's clock (BACKLOG #3256),** so an
+      reserve and release (BACKLOG #2263), and starts a release by id even for a reserve whose
+      outcome it never learned. That release pays back a slot only if one is committed when it
+      runs, and it can fail or be cancelled like any other. At least these still leak until the
+      window passes: a release that fails; a release cancelled at its
+      ``_LEDGER_STRAGGLER_MAX_SECONDS`` cap or by the shutdown drain; a reserve whose statement
+      commits after the release by id ran; and a reserve the shutdown drain cancels, which starts
+      no release. The module logs a WARNING when it gives up on a call, but it cannot see a
+      statement that commits later, so that leak has no line of its own, only the earlier
+      WARNING that the reserve was cancelled or failed. **On Postgres and SQL Server the stamp
+      and the staleness test both read the database server's clock (BACKLOG #3256),** so an
       engine host's skew no longer moves either. A server clock that ran ahead and is stepped
       back still holds a slot it stamped meanwhile longer by the step, because that stamp was
       written ahead, and so does a failover to a replica whose clock lags the old primary's. A
@@ -273,16 +310,16 @@ class UploadQuotaError(UploadError):
       one. A live save touches its own reservation every ``_RESERVATION_HEARTBEAT_SECONDS``
       (:meth:`UploadStore._start_heartbeat`), so a slow save keeps its slot. A live slot is still
       reclaimed in at least these cases: its holder lands no touch for the whole window while it is
-      alive (a suspended process or VM, an event loop starved for minutes, or a store this shard
-      cannot reach while a sibling can); its save outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``;
-      its touches stall on the store for the whole window; one touch never returns, since no
-      second touch starts while one runs (BACKLOG #3256); or the database server's clock steps
-      forward by a large part of the window, or a failover lands on a replica whose clock runs
-      that far ahead. A sibling then counts neither that file
-      nor its slot until the file lands. The holder's later release deletes only its own row, so
-      the undercount ends with that save. That restores the N-1 bound above while it lasts, never
-      worse than the pre-#1112 behaviour. Host clock skew is not one of these cases on the server
-      backends (the bullet above says why).
+      alive (a suspended process or VM, an event loop starved for minutes, or a store this engine
+      shard cannot reach while a sibling can); its save outlives
+      ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; its touches stall on the store for the whole
+      window; one touch never returns, since no second touch starts while one runs (BACKLOG
+      #3256); or the database server's clock steps forward by a large part of the window, or a
+      failover lands on a replica whose clock runs that far ahead. A sibling then counts neither
+      that file nor its slot until the file lands. The holder's later release deletes only its
+      own row, so the undercount ends with that save. That restores the N-1 bound above while it
+      lasts, never worse than the pre-#1112 behaviour. Host clock skew is not one of these cases
+      on the server backends (the bullet above says why).
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -642,7 +679,7 @@ class UploadQuotaLedger(Protocol):
         max_total_bytes: int,
     ) -> bool: ...
 
-    async def release_upload_quota(self, reservation_id: str) -> None: ...
+    async def release_upload_quota(self, *, uploader_id: str, reservation_id: str) -> None: ...
 
     async def touch_upload_quota(self, reservation_id: str) -> None: ...
 
@@ -705,6 +742,14 @@ class UploadStore:
         # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
         # once its save sets the stop Event. See _start_heartbeat.
         self._heartbeats: set[asyncio.Future[None]] = set()
+        # Removals of cancelled saves' landed pairs that later saves still wait for before they
+        # scan, until each ends, passes its bound or the shutdown drain names it (vault BACKLOG
+        # #3740 item 4).
+        self._pending_removals: dict[asyncio.Future[bool], _PendingRemoval] = {}
+        # The heartbeat touches among the stragglers. A touch only refreshes its reservation's
+        # clock, so the shutdown drain cancels one rather than waiting for it (vault BACKLOG #3740
+        # item 14).
+        self._touches: set[asyncio.Future[Any]] = set()
         # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
         # and every save's quota scan asks, so a body that has not changed is not read twice.
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
@@ -1045,10 +1090,14 @@ class UploadStore:
 
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
-        no creation row, while the client was told the upload failed and may well retry it. A
-        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. The API writes
-        the row after this returns as an operation the request deadline cannot cancel, and a row
-        that fails there removes the pair through :meth:`discard` (vault BACKLOG #3178)."""
+        no creation row, while the client was told the upload failed and may well retry it. The
+        cancellation can propagate before the removal ends; the next save in this process waits
+        for it before it scans. A removal the filesystem refuses is logged at ERROR, and so is one
+        still running after ``_CANCELLED_REMOVAL_WAIT_SECONDS``, which may not finish before the
+        process stops (:meth:`_remove_cancelled_pair`). This covers ``save`` only. The
+        API writes the row after this returns as an operation the request deadline cannot cancel,
+        and a row that fails there removes the pair through :meth:`discard` (vault BACKLOG
+        #3178)."""
         if not uploader_id:
             raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
@@ -1136,15 +1185,18 @@ class UploadStore:
         # the argument needs.
         #
         # The cancel handler sits outside the release, so it also catches a cancellation that lands
-        # in the release await, after the write returned, and INSIDE the lock, so no other save in
-        # this process scans the disk while a pair about to be removed is still on it (vault BACKLOG
-        # #3180; that scan answered a spurious 409 at the quota edge). A sibling engine shard's scan between
+        # in the release await, after the write returned, and INSIDE the lock. It starts the
+        # removal there, and the next save in this process waits for that removal before it scans,
+        # so it does not scan the disk while a pair about to be removed is still on it (vault
+        # BACKLOG #3180; that scan answered a spurious 409 at the quota edge), for a bounded time:
+        # see _remove_cancelled_pair. A sibling engine shard's scan between
         # the release and the removal over-counts the pair, which can refuse it but never admits one
         # too many. The reserve and the release each get a bounded wait to finish before a
         # cancellation propagates, so a cancelled save normally pays its slot back (BACKLOG #2263).
         # The cases that still leak are listed once, in UploadQuotaError.
         async with self._quota_lock:
             try:
+                await self._wait_for_pending_removals()
                 reserved = await self._reserve_across_shards(
                     uploader_id=uploader_id, uploader=uploader, size=len(data), reservation=file_id
                 )
@@ -1166,16 +1218,19 @@ class UploadStore:
                         )
             except asyncio.CancelledError:
                 if landed:
-                    # Cancel-resistant, like the write. A request deadline is delivered through
-                    # anyio task groups, which cancel again at every await, and a plain to_thread
-                    # job that is cancelled before a worker picks it up never runs at all. A
-                    # cleanup failure must not replace the cancellation, so it is logged and the
-                    # cancel raised.
+                    # Not discard(): this already holds _quota_lock. Nothing cancels the removal
+                    # once started, and _remove_cancelled_pair logs how it ends. A failure to start
+                    # it must not replace the cancellation, so it is logged and the cancel raised.
                     try:
-                        # Not discard(): this already holds _quota_lock.
-                        await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
-                    except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
-                        _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
+                        await self._remove_cancelled_pair(file_id)
+                    except RuntimeError:  # at least submit() after interpreter shutdown
+                        _log.error(
+                            "upload %s was cancelled after its file landed and has no "
+                            "upload.create audit row; its removal could not be started, so the "
+                            "file is still stored",
+                            file_id,
+                            exc_info=True,
+                        )
                 raise
 
     async def discard(self, file_id: str) -> bool:
@@ -1334,11 +1389,14 @@ class UploadStore:
 
         Only a refusal holds none. A reserve that was cancelled or raised may have committed, and
         the release is by its own id, so paying it back can never touch a sibling's slot (vault
-        BACKLOG #3180). Either is logged, which also marks its error retrieved."""
+        BACKLOG #3180). Either is logged, which also marks its error retrieved. The line says a
+        release is started, not that the slot is paid back: a statement that commits after the
+        release ran, or a release that fails, leaves the slot to go stale (vault BACKLOG #3740
+        item 11)."""
         if reserve.cancelled():
             _log.warning(
-                "the engine-shard upload reserve for %s was cancelled before it finished; a slot "
-                "it may have taken is released by its id",
+                "the engine-shard upload reserve for %s was cancelled before it finished; a "
+                "release by its id is started for a slot it may have taken",
                 uploader_id,
             )
             return True
@@ -1346,7 +1404,7 @@ class UploadStore:
         if exc is not None:
             _log.warning(
                 "the engine-shard upload reserve for %s failed while the upload was being "
-                "cancelled; a slot it may have taken is released by its id",
+                "cancelled; a release by its id is started for a slot it may have taken",
                 uploader_id,
                 exc_info=exc,
             )
@@ -1360,16 +1418,17 @@ class UploadStore:
         that lands after the save's release finds no row and changes nothing, so ``stop`` is a
         signal, never a wait. A failed touch is logged and the next one tried.
 
-        **The wait for a touch is bounded, and the heartbeat never cancels a touch (BACKLOG
+        **The wait for a touch is bounded, and a running heartbeat never cancels a touch (BACKLOG
         #3256).** The heartbeat waits ``_RESERVATION_TOUCH_WAIT_SECONDS`` for it, then goes on, so a
         touch stuck on the store no longer holds the heartbeat or its lifetime cap, and a ``stop``
         during the wait ends it at once. The stuck touch is left to land on its own, which still
         moves the reservation's clock when it does, and no second touch starts while it runs, so a
         stalled store never collects one abandoned statement per interval. One still running when
         the heartbeat ends is held like the other stragglers, and so is capped at
-        ``_LEDGER_STRAGGLER_MAX_SECONDS`` and cancelled by the shutdown drain. The cost: a touch
-        that never returns ends the refreshing for that save, which :class:`UploadQuotaError`
-        lists."""
+        ``_LEDGER_STRAGGLER_MAX_SECONDS`` and cancelled by the shutdown drain, which does not wait
+        for it. A heartbeat that is itself cancelled, as by that drain, cancels its touch as it
+        ends (vault BACKLOG #3740 item 14). The cost: a touch that never returns ends the
+        refreshing for that save, which :class:`UploadQuotaError` lists."""
         ledger = self._ledger
         if ledger is None:
             return
@@ -1425,7 +1484,14 @@ class UploadStore:
                     # Still referenced, and _missed still logs its outcome. Capped like every other
                     # straggler, so a stalled store does not collect one per save (vault BACKLOG
                     # #3180); a touch cancelled there moves no clock, which is all it would do.
+                    self._touches.add(touch)
+                    touch.add_done_callback(self._touches.discard)
                     self._hold(touch, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        # The shutdown drain cancelled this heartbeat, so its touch goes now, not
+                        # at the drain's next pass, and once only (vault BACKLOG #3740 item 14).
+                        self._cancel_touches()
 
         task = asyncio.ensure_future(_beat())
         self._heartbeats.add(task)
@@ -1504,21 +1570,167 @@ class UploadStore:
 
         fut.add_done_callback(_done)
 
-    async def drain_stragglers_within(self, budget: float) -> None:
-        """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
-        form a shutdown step under one teardown budget calls (BACKLOG #3191). Two thirds of it
-        waiting and the rest the grace for what it then cancels, each capped at the drain's own
-        default."""
-        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * 2 / 3))
-        await self.drain_stragglers(
-            wait, grace=max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+    async def _remove_cancelled_pair(self, file_id: str) -> None:
+        """Start the removal of a cancelled save's landed pair, and wait for it until the next
+        cancellation or ``_CANCELLED_REMOVAL_WAIT_SECONDS`` (vault BACKLOG #3740 item 4).
+
+        ``save`` calls this holding ``_quota_lock``. The removal is registered in
+        ``_pending_removals`` until it ends, its bound passes or the shutdown drain names it, and
+        the next save in this process waits for it there before it scans
+        (:meth:`_wait_for_pending_removals`), so it neither counts a pair about to go nor holds
+        its sidecar open. That wait is the next save's, not this cancelled one's. A request
+        deadline arrives through anyio scopes that cancel again on every loop pass, so a wait here
+        that absorbed each cancellation spun the loop for the whole bound while every other upload
+        queued on the lock. This wait ends at the first cancellation it meets instead. With no
+        bound at all, one hung unlink held the lock for as long as the filesystem took.
+
+        A thread cannot be stopped, so past the bound the removal goes on, and until it lands the
+        pair is on disk and billed: a save that scans meanwhile, in this process or on a sibling
+        engine shard, counts it. That can refuse an upload at the quota edge, but never admits one
+        too many. At the bound, or at the end of the shutdown drain's wait if that comes first, an
+        ERROR names the ``file_id`` as a stored file with no ``upload.create`` row, since the
+        process may stop before the removal answers (vault BACKLOG #3178). A removal that then
+        takes the pair away logs a WARNING withdrawing it, from its own thread. Any removal that
+        fails or is refused logs an ERROR, at whatever time it ends.
+
+        The removals run on :func:`_removal_executor`, never the default executor, so unlinks that
+        hang hold at most ``_CANCELLED_REMOVAL_WORKERS`` threads, and the pool every
+        ``asyncio.to_thread`` in the engine shares stays free. A removal past that cap queues and
+        still runs: its Future is the executor's own, which nothing cancels, so it is not held as a
+        straggler the shutdown drain would cancel. The cost: while that many unlinks hang, every
+        later removal in the process waits behind them, its bound counted from when it was queued,
+        so its pair stays stored and billed until they return, each named at ERROR at its bound.
+        The cap is read once, when the pool is first built. Once a removal outlives its bound, a
+        save that scans can hold the sidecar open while it unlinks; on Windows that refuses the
+        unlink, which is logged, and the sidecar stays listed until the retention prune clears it.
+
+        This covers the cancelled-save path only. :meth:`discard`'s removal, after a failed
+        ``upload.create`` row, still waits on its unlink under the lock with no bound."""
+        loop = asyncio.get_running_loop()
+        entry = _PendingRemoval(file_id, loop.time() + _CANCELLED_REMOVAL_WAIT_SECONDS)
+        # submit() can raise, at least after interpreter shutdown; save logs that and propagates
+        # its cancellation.
+        removal = _submit_to_thread(
+            self._remove_and_report_sync, entry, executor=_removal_executor()
         )
+        self._pending_removals[removal] = entry
+        overdue = loop.call_at(
+            entry.deadline,
+            self._flag_removal,
+            removal,
+            f"its removal did not finish within {_CANCELLED_REMOVAL_WAIT_SECONDS:g}s and goes "
+            "on without holding back other uploads",
+        )
+
+        def _ended(done: asyncio.Future[bool]) -> None:
+            self._pending_removals.pop(done, None)
+            overdue.cancel()
+            if done.cancelled() or done.exception() is not None:
+                _log_discard_unfinished(done, file_id)
+
+        removal.add_done_callback(_ended)
+        # Only for a caller already propagating a cancellation, as save's arm is: a repeat
+        # cancellation ends the wait and is not passed on.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait((removal,), timeout=_CANCELLED_REMOVAL_WAIT_SECONDS)
+
+    def _flag_removal(self, removal: asyncio.Future[bool], why: str) -> None:
+        """Name a cancelled-pair removal still running at ERROR, once, as a stored file with no
+        ``upload.create`` row, and stop holding later saves for it. Called at its bound and by the
+        shutdown drain, since the process may stop before the removal answers (vault BACKLOG #3178,
+        #3740 item 4)."""
+        entry = self._pending_removals.pop(removal, None)
+        if entry is None or removal.done():
+            return
+        entry.flagged = True
+        _log.error(
+            "upload %s was cancelled after its file landed and has no upload.create audit row; "
+            "%s, so the file may still be stored, and counts against its uploader's quota until "
+            "it goes",
+            entry.file_id,
+            why,
+        )
+
+    async def _wait_for_pending_removals(self) -> None:
+        """Wait, holding ``_quota_lock``, for the cancelled-pair removals still inside their bound
+        before this save scans the disk (vault BACKLOG #3740 item 4). Every uploader's: the scan
+        opens every sidecar, and on Windows an open sidecar refuses its unlink. A cancellation of
+        this save propagates as usual: it has reserved nothing yet. The deadline is read here as
+        well as by the bound's timer, so an entry whose timer never ran cannot hold a save."""
+        loop = asyncio.get_running_loop()
+        while pending := {
+            removal: entry.deadline
+            for removal, entry in self._pending_removals.items()
+            if not removal.done() and entry.deadline > loop.time()
+        }:
+            await asyncio.wait(pending.keys(), timeout=min(pending.values()) - loop.time())
+
+    def _remove_and_report_sync(self, entry: _PendingRemoval) -> bool:
+        """In the removal's thread: :meth:`_discard_cancelled_sync`, then whether neither half of
+        the pair is left. A removal an ERROR already named that takes the pair away withdraws it
+        here, in the thread, since a loop callback would not run once the loop has closed, as it
+        may have by then at shutdown. Reading ``entry.flagged`` from this thread races the loop
+        setting it, so a removal that lands just as it is named may leave the ERROR standing."""
+        self._discard_cancelled_sync(entry.file_id)
+        gone = not any(path.exists() for path in self._paths(entry.file_id))
+        if gone and entry.flagged:
+            _log.warning(
+                "upload %s: its removal finished after it was named at ERROR, so the earlier "
+                "ERROR that it may still be stored no longer applies",
+                entry.file_id,
+            )
+        return gone
+
+    def _running(self, left: set[asyncio.Future[Any]]) -> set[asyncio.Future[Any]]:
+        """What of ``left`` and the stragglers held now has not ended, for the drain's grace."""
+        return {t for t in left | self._stragglers if not t.done()}
+
+    def _cancel_touches(self) -> None:
+        """Cancel every heartbeat touch held as a straggler, once each, since a store's unwind of
+        the cancelled statement may itself take a while (vault BACKLOG #3740 item 14)."""
+        for touch in self._touches:
+            if not (isinstance(touch, asyncio.Task) and touch.cancelling()):
+                touch.cancel()
+
+    async def drain_stragglers_within(
+        self, budget: float, *, settle: Callable[[float], Awaitable[object]] | None = None
+    ) -> None:
+        """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
+        form a shutdown step under one teardown budget calls (BACKLOG #3191). The budget is split
+        between the wait and the grace for what it then cancels in the ratio of the drain's own
+        defaults, and each is capped at its default (vault BACKLOG #3740 item 17).
+
+        ``settle``, when given, is awaited first with the wait's share, and the drain's own wait
+        gets what it leaves. It waits for work that may still start a straggler, so the drain does
+        not return before that straggler is held (vault BACKLOG #3740 item 6)."""
+        loop = asyncio.get_running_loop()
+        ratio = _STRAGGLER_DRAIN_SECONDS / (
+            _STRAGGLER_DRAIN_SECONDS + _STRAGGLER_CANCEL_GRACE_SECONDS
+        )
+        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * ratio))
+        grace = max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+        if settle is None:
+            await self.drain_stragglers(wait, grace=grace)
+            return
+        self._cancel_touches()  # not left running through the settle
+        began = loop.time()
+        try:
+            await settle(wait)
+        except asyncio.CancelledError:
+            # The step was cut: cancel what is left, and wait for none of it.
+            await self.drain_stragglers(0.0, grace=0.0)
+            raise
+        except Exception:
+            # A settle that fails still leaves the drain to run, since that is the step's point.
+            await self.drain_stragglers(max(0.0, wait - (loop.time() - began)), grace=grace)
+            raise
+        await self.drain_stragglers(max(0.0, wait - (loop.time() - began)), grace=grace)
 
     async def drain_stragglers(
         self,
-        timeout: float = _STRAGGLER_DRAIN_SECONDS,
+        timeout: float | None = None,
         *,
-        grace: float = _STRAGGLER_CANCEL_GRACE_SECONDS,
+        grace: float | None = None,
     ) -> None:
         """Let what a cancelled save left running finish before the store closes (vault BACKLOG
         #3180): the ledger calls, the late releases they spawn, and the save-time sweeps. The
@@ -1531,26 +1743,51 @@ class UploadStore:
         spawns no release when it ends, however long past ``grace`` that is, so nothing new starts
         against a store about to close; a slot it may have taken goes stale. Only those reserves
         are refused, so a lifespan that runs again on this store releases normally. A sweep it
-        cancels logs each file it removed with no row, as a shutdown cancel always has."""
+        cancels logs each file it removed with no row, as a shutdown cancel always has.
+
+        ``None`` for either wait reads its module default, ``_STRAGGLER_DRAIN_SECONDS`` or
+        ``_STRAGGLER_CANCEL_GRACE_SECONDS``, when the drain runs rather than when this method was
+        defined (vault BACKLOG #3740 item 12).
+
+        A heartbeat touch is not waited for, and each pass of either wait cancels every touch
+        held then (vault BACKLOG #3740 item 14). A touch would only refresh this process's
+        reservation, whose save does not outlive the shutdown, so landing late would only put off
+        the moment a sibling engine shard may reclaim the slot."""
+        if timeout is None:
+            timeout = _STRAGGLER_DRAIN_SECONDS
+        if grace is None:
+            grace = _STRAGGLER_CANCEL_GRACE_SECONDS
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while self._stragglers and (remaining := deadline - loop.time()) > 0:
-            await asyncio.wait(set(self._stragglers), timeout=remaining)
+        # A cancelled save's removal still running is waited for here too, but it is not a
+        # straggler: cancelling its job could keep it from running at all. Its bound's ERROR is a
+        # loop timer the closing loop would drop, so one still running at the end of this wait
+        # is named here instead (vault BACKLOG #3740 item 4).
+        while (waited := (self._stragglers - self._touches) | set(self._pending_removals)) and (
+            remaining := deadline - loop.time()
+        ) > 0:
+            self._cancel_touches()
+            await asyncio.wait(waited, timeout=remaining)
+        for removal in list(self._pending_removals):
+            self._flag_removal(removal, "its removal was still running at shutdown")
+        self._cancel_touches()
         left = set(self._stragglers) | set(self._heartbeats)
         if not left:
             return
-        if self._stragglers:
+        if calls := self._stragglers - self._touches:
             _log.warning(
                 "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
                 "running after %gs",
-                len(self._stragglers),
+                len(calls),
                 timeout,
             )
         # Each discard is registered after the task's own callbacks, so a reserve's done callback
         # still finds it here and starts no release.
         # A task already done is not cancelled and keeps its own outcome: a reserve that finished
         # in the same pass as the wait's timeout still pays its slot back.
-        for task in left:
+        # Not the touches, which _cancel_touches has cancelled once already: a second cancel
+        # would cut short the store's unwind of the first.
+        for task in left - self._touches:
             if task.cancel():
                 self._drain_cancelled.add(task)
                 task.add_done_callback(self._drain_cancelled.discard)
@@ -1559,14 +1796,20 @@ class UploadStore:
         # marked like the rest, so a reserve among them starts no release; the drain does not wait
         # for it to unwind, as it does not for anything still stuck in `left`.
         # The first wait runs even when everything in `left` is done: it is also the loop pass in
-        # which a done task's own callbacks run and start that release.
+        # which a done task's own callbacks run and start that release. A touch is in no wait,
+        # since a store can take a while to unwind a cancelled statement.
         deadline = loop.time() + grace
-        await asyncio.wait(left, timeout=grace)
-        while (pending := {t for t in left | self._stragglers if not t.done()}) and (
+        if unwinding := left - self._touches:
+            await asyncio.wait(unwinding, timeout=grace)
+        else:
+            await asyncio.sleep(0)
+        while (pending := self._running(left) - self._touches) and (
             remaining := deadline - loop.time()
         ) > 0:
+            self._cancel_touches()  # one a heartbeat that ended held meanwhile
             await asyncio.wait(pending, timeout=remaining)
-        stuck = {t for t in left | self._stragglers if not t.done()}
+        self._cancel_touches()
+        stuck = self._running(left) - self._touches
         for task in stuck - left:
             if task.cancel():
                 self._drain_cancelled.add(task)
@@ -1576,6 +1819,12 @@ class UploadStore:
                 "shutdown: %d cancelled upload task(s) had not finished after %gs",
                 len(stuck),
                 grace,
+            )
+        if unwinding_touches := self._running(set()) & self._touches:
+            # Not waited for, but named: on SQLite one still holds the writer lock as it unwinds.
+            _log.warning(
+                "shutdown: %d cancelled engine-shard reservation touch(es) still unwinding",
+                len(unwinding_touches),
             )
 
     def _shard_refusal(self, *, uploader: str, observed: _Observed) -> UploadQuotaError:
@@ -2622,9 +2871,17 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     cancels every pending TASK at shutdown, so a Task here would be cancelled out from under the
     wait and end it early. A plain Future is not in ``asyncio.all_tasks()``, and nothing else holds
     it, so only the thread finishing can complete it."""
-    loop = asyncio.get_running_loop()
+    return await _wait_to_completion(_submit_to_thread(func, arg))
+
+
+def _submit_to_thread[T, A](
+    func: Callable[[A], T], arg: A, *, executor: Executor | None = None
+) -> asyncio.Future[T]:
+    """Start ``func(arg)`` on ``executor``, the default one when ``None``, as ``asyncio.to_thread``
+    would, and return the executor's own Future rather than a Task
+    (:func:`_to_thread_to_completion` says why)."""
     ctx = contextvars.copy_context()  # what to_thread passes to the thread, kept the same
-    return await _wait_to_completion(loop.run_in_executor(None, ctx.run, func, arg))
+    return asyncio.get_running_loop().run_in_executor(executor, ctx.run, func, arg)
 
 
 def _log_late_failure(task: asyncio.Future[Any], *, what: str) -> None:
@@ -2677,7 +2934,7 @@ async def _release_reservation(
     in this module's words whether or not anyone still waits, and the task never ends in an error
     of its own; a release failure must not fail an upload that landed."""
     try:
-        await ledger.release_upload_quota(reservation)
+        await ledger.release_upload_quota(uploader_id=uploader_id, reservation_id=reservation)
     except Exception:  # noqa: BLE001 — logged; the slot is reclaimed once it goes stale
         _log.warning(
             "could not release the engine-shard upload reservation for %s; it will be "

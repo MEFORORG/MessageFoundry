@@ -1368,12 +1368,20 @@ _TRUST_ALL_PROXIES_REFUSAL = (
 
 _ZONED_HOST = (
     "an IPv6 entry with a zone. The engine reports every peer without its zone and uvicorn "
-    "compares a host entry's zone, so uvicorn would parse this entry and match no peer, "
+    "compares a host entry's zone, so uvicorn would parse this entry and match no socket peer, "
     "collapsing every client source IP to the proxy."
 )
 _ZONED_NETWORK = (
     "an IPv6 entry with a zone. uvicorn ignores a network's zone, so it would trust this prefix "
     "on every interface, not only on the one the zone names."
+)
+#: The gap the advice for a zoned host leaves open (BACKLOG #3764 item 1). The trusted_proxies row
+#: of docs/CONFIGURATION.md is where its cost is stated. The zone is never echoed: ipaddress takes
+#: almost any text after the '%', and the entry is already quoted escaped.
+_ZONED_HOP_CAVEAT = (
+    "A hop an inner proxy writes into X-Forwarded-For with a zone will not match '{host}', and "
+    "becomes the client address; the trusted_proxies row of docs/CONFIGURATION.md says what "
+    "that costs."
 )
 
 #: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
@@ -1469,10 +1477,9 @@ def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
         why = _ZONED_NETWORK if isinstance(form, ipaddress.IPv6Network) else _ZONED_HOST
         if isinstance(form, ipaddress.IPv6Network) and form.num_addresses > 1:
             fix = _span_wording(form)  # a range is named, never recommended
-        elif isinstance(form, ipaddress.IPv6Network):
-            fix = f"List '{form.network_address}' instead."
         else:
-            fix = f"List '{form}' instead."
+            host = form.network_address if isinstance(form, ipaddress.IPv6Network) else form
+            fix = f"List '{host}' instead. {_ZONED_HOP_CAVEAT.format(host=host)}"
         raise ValueError(f"[api].trusted_proxies entry {entry!r} is {why} {fix}")
     return parsed
 
@@ -1493,12 +1500,16 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
             f"{exc} (uvicorn would silently treat it as a literal that never matches, "
             "collapsing every client source IP to the proxy)"
         )
-    host = _as_matched(ipaddress.ip_address(entry.partition("/")[0]))
+    written = ipaddress.ip_address(entry.partition("/")[0])
+    host = _as_matched(written)
     spanned = ipaddress.ip_network(_as_matched(network))  # a network's matching form is a network
+    # A zoned entry gets the zoned-hop caveat here too: the advice is the same zoneless host.
+    caveat = f" {_ZONED_HOP_CAVEAT.format(host=host)}" if host != written else ""
     return (
         f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
-        f"source IP to the proxy. List the proxy's own address '{host}'. {_span_wording(spanned)}"
+        f"source IP to the proxy. List the proxy's own address '{host}'.{caveat} "
+        f"{_span_wording(spanned)}"
     )
 
 
