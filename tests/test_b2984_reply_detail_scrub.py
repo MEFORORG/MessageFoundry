@@ -8,17 +8,21 @@ reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, so no in-t
 the store was not the chokepoint ``docs/PHI.md`` names it as. Both methods now scrub before the writer
 lock (SQLite) or the pooled connection and its transaction (Postgres, SQL Server) is taken.
 
-``resp_headers`` is deliberately NOT scrubbed: the connector's per-connection allow-list is its control
-(ADR 0013, amendment 2026-07-12), and a Handler reads the captured values back through
-``response_get(dest).headers``. ``safe_text`` over the encoded JSON would rewrite an allow-listed value
+``resp_headers`` is deliberately NOT scrubbed: a Handler reads the captured values back through
+``response_get(dest).headers``. The connector's per-connection allow-list (ADR 0013, amendment
+2026-07-12) bounds which header names are captured, not their values, so the cipher alone covers an
+allow-listed value at rest. ``safe_text`` over the encoded JSON would rewrite an allow-listed value
 and, once cut, make the decode return ``{}`` with no error. One test pins that it round-trips unchanged.
+
+The Postgres and SQL Server value arms live in ``tests/test_postgres_store.py`` and
+``tests/test_sqlserver_store.py``, which the server CI legs run; this file pins only their ordering,
+offline.
 
 Synthetic values only: ``ZEPHYRTEST^QUINN`` and ``MRN7731`` are invented for this file.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -104,8 +108,10 @@ async def test_reply_detail_is_held_to_the_200_bound(sqlite_store: MessageStore)
 async def test_in_tree_reply_details_are_unchanged(
     sqlite_store: MessageStore, detail: str | None
 ) -> None:
-    # What every in-tree connector writes passes the scrub byte-identical, so the operator's reason
-    # (and the empty and absent cases) reads exactly as before.
+    # At least these in-tree fixed phrases and status codes pass the scrub byte-identical, so the
+    # operator's reason (and the empty and absent cases) reads exactly as before. Not every in-tree
+    # detail does: MLLP's and X12's unparseable-reply details embed safe_exc text, which the store
+    # cuts again near its bound (the item 4 test below).
     mid, item = await _delivered(sqlite_store)
     await sqlite_store.complete_with_response(
         item.id, body="x", outcome="accepted", detail=detail, now=101.0
@@ -200,7 +206,7 @@ async def test_server_backends_scrub_before_taking_a_connection(
     assert calls == ["scrub"]
 
 
-# --- resp_headers: the allow-list is the control, and the store keeps the value whole --------------
+# --- resp_headers: the store keeps an allow-listed value whole -------------------------------------
 
 
 async def test_allow_listed_headers_round_trip_unchanged(sqlite_store: MessageStore) -> None:
@@ -239,46 +245,3 @@ async def test_a_second_bound_counts_only_its_own_input(sqlite_store: MessageSto
     assert detail.startswith(head)
     assert reply.detail.endswith("(+43 chars)")  # this call's cut only; the (+400) note is gone
     assert "(+400 chars)" not in reply.detail
-
-
-# --- Postgres and SQL Server, against a real server ------------------------------------------------
-
-
-@pytest.fixture
-async def pg_store() -> AsyncIterator[Any]:
-    if not os.getenv("MEFOR_TEST_POSTGRES"):
-        pytest.skip(
-            "set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* connection env) to run Postgres tests"
-        )
-    from tests import test_postgres_store
-
-    gen = test_postgres_store.store.__wrapped__()  # type: ignore[attr-defined]
-    s = await gen.__anext__()
-    try:
-        yield s
-    finally:
-        await gen.aclose()
-
-
-@pytest.fixture
-async def mssql_store() -> AsyncIterator[Any]:
-    if not os.getenv("MEFOR_TEST_SQLSERVER"):
-        pytest.skip(
-            "set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* connection env) to run SQL Server tests"
-        )
-    from tests import test_sqlserver_store
-
-    gen = test_sqlserver_store.store.__wrapped__()  # type: ignore[attr-defined]
-    s = await gen.__anext__()
-    try:
-        yield s
-    finally:
-        await gen.aclose()
-
-
-async def test_reply_detail_is_stored_scrubbed_on_postgres(pg_store: Any) -> None:
-    await _assert_reply_detail_scrubbed(pg_store)
-
-
-async def test_reply_detail_is_stored_scrubbed_on_sqlserver(mssql_store: Any) -> None:
-    await _assert_reply_detail_scrubbed(mssql_store)

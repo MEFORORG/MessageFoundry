@@ -1054,7 +1054,10 @@ class DeliveryResponse:
       frame **was received** but its content could not be parsed — **never** "no reply was received",
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
-    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest.
+    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest. The
+      store scrubs and bounds it with ``safe_text(detail, limit=200)`` before it is written (BACKLOG
+      #2984), so a longer or PHI-shaped reason reads back redacted or cut, with a ``(+N chars)``
+      note, through ``response_get(dest).detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
