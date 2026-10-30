@@ -1926,8 +1926,19 @@ _RENDER_CALLS = frozenset(
 #: other callee does with it, so a helper of the code's own, a constructor and ``errors.append(exc)``
 #: are all refused until the callee is read and named here. ``_decode_refusal`` in
 #: pipeline/ingress_guards.py renders it through ``safe_exc``.
+#: ``_safe_db_error`` (transports/database.py) hands a ``UnicodeError`` to ``safe_exc`` and renders
+#: anything else as ``safe_exc`` or as a type, SQLSTATE and driver number;
+#: ``tests/test_database_transport.py`` pins the Unicode arm.
 _SAFE_CALLS = frozenset(
-    {"safe_exc", "codec_safe_str", "codec_safe_line", "type", "isinstance", "_decode_refusal"}
+    {
+        "safe_exc",
+        "codec_safe_str",
+        "codec_safe_line",
+        "type",
+        "isinstance",
+        "_decode_refusal",
+        "_safe_db_error",
+    }
 )
 #: An arm that names one of these also receives a Unicode error, which is a ``ValueError``.
 _BROAD_TYPES = frozenset({"ValueError", "Exception", "BaseException"})

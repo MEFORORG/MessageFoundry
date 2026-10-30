@@ -50,8 +50,8 @@ from messagefoundry.transports.database import (
     DatabaseDestination,
     DatabaseSource,
     _build_odbc_dsn,
-    _odbc_keyword_name,
 )
+from messagefoundry.transports.db_endpoint import odbc_keyword_name
 
 _CONNECTION = "OB_DB_GEN"
 # A value no refusal may repeat: a refusal names the keyword, never what it was set to.
@@ -116,7 +116,7 @@ def test_a_keyword_off_the_list_is_refused(keyword: str) -> None:
     with pytest.raises(ValueError, match="must not set") as refused:
         _build(odbc_params={"SSLmode": "verify-full", keyword: _VALUE})
     message = str(refused.value)
-    named = f"'{_odbc_keyword_name(keyword)}'"
+    named = f"'{odbc_keyword_name(keyword)}'"
     assert named in message
     assert _CONNECTION in message
     assert _VALUE not in message
@@ -157,7 +157,7 @@ def test_the_list_holds_no_keyword_the_connector_emits_itself() -> None:
 
 def test_the_list_is_stored_in_the_form_keywords_are_compared_in() -> None:
     for keyword in _ODBC_PARAM_ALLOWLIST | _ODBC_USER_KEYS | _ODBC_PASSWORD_KEYS:
-        assert keyword == _odbc_keyword_name(keyword)
+        assert keyword == odbc_keyword_name(keyword)
 
 
 # The keyword is sent as spelled and not every driver trims it, so a spelling that needs trimming
@@ -197,7 +197,7 @@ def test_a_credential_keyword_off_its_list_is_refused(setting: str, keyword: str
     with pytest.raises(ValueError, match=f"{setting} must be one of") as refused:
         _build(username=_VALUE, password=_VALUE, **{setting: keyword})
     message = str(refused.value)
-    assert f"'{_odbc_keyword_name(keyword)}'" in message
+    assert f"'{odbc_keyword_name(keyword)}'" in message
     assert _CONNECTION in message
     assert _VALUE not in message
 
