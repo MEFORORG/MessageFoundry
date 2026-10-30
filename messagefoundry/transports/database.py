@@ -46,10 +46,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import itertools
 import json
 import logging
 import os
 import re
+import traceback
 import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
@@ -1406,12 +1408,59 @@ def _safe_db_error(exc: BaseException) -> str:
     because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
     identifier in the middle rather than removing it. Anything without a SQLSTATE is not a driver
     error, carries no embedded column value by construction, and keeps the ``safe_exc`` rendering —
-    which is the more useful text for a bug or an unreachable host."""
-    state = _sqlstate(exc)
+    which is the more useful text for a bug or an unreachable host.
+
+    A ``UnicodeError`` goes to ``safe_exc`` first, whatever its arguments: ``UnicodeEncodeError``'s
+    first argument is the codec name, and ``ascii`` is five alphanumerics, so it would otherwise read
+    as a SQLSTATE. That keeps this function exactly as codec-safe as ``safe_exc``, which is why
+    ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers."""
+    state = None if isinstance(exc, UnicodeError) else _sqlstate(exc)
     if state is None:
         return safe_exc(exc)
     code = _driver_code(str(exc))
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
+
+
+def _safe_db_traceback(exc: BaseException) -> str:
+    """``exc``'s traceback with each exception's own line rendered by :func:`_safe_db_error`, for a
+    log line that must keep the frames but never a driver message (BACKLOG #1661).
+
+    ``logger.exception`` ends each exception with its ``str()``, and a driver error's ``str()`` is
+    the text that embeds the offending value. The frames are code: file, line, function and source
+    line, never a local or an argument, so they are kept. The chain is walked as the stdlib walks it,
+    explicit cause first and an unsuppressed context otherwise, oldest printed first. ``__notes__``
+    and an exception group's members are not printed, since either can carry free text. It never
+    raises: it runs in the poll loop's error arm, which must not kill the poller, so a render that
+    fails gives the :func:`_safe_db_error` line alone, as ``redaction.prepare_log_record`` falls
+    back for its own render."""
+    try:
+        chain: list[BaseException] = []
+        seen: set[int] = set()
+        link: BaseException | None = exc
+        while link is not None and id(link) not in seen:
+            seen.add(id(link))
+            chain.append(link)
+            link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+        parts = _safe_db_frames(chain[-1])
+        for older, newer in itertools.pairwise(reversed(chain)):
+            parts.append(
+                "\nThe above exception was the direct cause of the following exception:\n\n"
+                if newer.__cause__ is older
+                else "\nDuring handling of the above exception, another exception occurred:\n\n"
+            )
+            parts += _safe_db_frames(newer)
+        return "".join(parts).removesuffix("\n")
+    except Exception:  # noqa: BLE001 - see docstring: the poller outlives a failed render
+        return _safe_db_error(exc)
+
+
+def _safe_db_frames(exc: BaseException) -> list[str]:
+    """One exception's frames and its :func:`_safe_db_error` line, as a traceback prints them."""
+    return [
+        "Traceback (most recent call last):\n",
+        *traceback.format_tb(exc.__traceback__),
+        f"{_safe_db_error(exc)}\n",
+    ]
 
 
 class _DriverMissingError(RuntimeError):
@@ -1796,7 +1845,7 @@ async def _close_cursor(cur: Any) -> None:
     try:
         await cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
@@ -1852,7 +1901,7 @@ def _close_raw_cursor(raw_cur: Any) -> None:
     try:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _probe_db(
@@ -2351,7 +2400,7 @@ class DatabaseSource(SourceConnector):
             if self._task is task:
                 self._task = None
                 if fault is not None:
-                    logger.warning("DATABASE source poll task failed: %s", safe_exc(fault))
+                    logger.warning("DATABASE source poll task failed: %s", _safe_db_error(fault))
         if task is not None and self._task is not None and self._task is not task:
             return  # a later start() made a new poll task, and the pool is now that task's
         try:
@@ -2359,7 +2408,9 @@ class DatabaseSource(SourceConnector):
         except Exception as exc:
             if not interrupted:
                 raise
-            logger.warning("DATABASE source pool close failed during a cancel: %s", safe_exc(exc))
+            logger.warning(
+                "DATABASE source pool close failed during a cancel: %s", _safe_db_error(exc)
+            )
 
     async def _join_poll(self, task: asyncio.Task[None]) -> None:
         """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
@@ -2410,7 +2461,9 @@ class DatabaseSource(SourceConnector):
         try:
             return self._leads()
         except Exception as exc:  # noqa: BLE001 - the cancel in flight is the outcome that matters
-            logger.warning("DATABASE source leader gate failed; cutting the row step: %s", exc)
+            logger.warning(
+                "DATABASE source leader gate failed; cutting the row step: %s", _safe_db_error(exc)
+            )
             return False
 
     async def _get_pool(self) -> Any:
@@ -2436,11 +2489,17 @@ class DatabaseSource(SourceConnector):
                     await self._poll_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A poll error (connection drop, a bad poll_statement, an unserializable column) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
-                logger.exception("DATABASE source poll failed; retrying next interval")
+                # Not logger.exception: its traceback ends in the driver's text, which quotes the
+                # offending value, such as a 245 conversion error naming the column value it could not
+                # convert. The frames are kept and each exception line is _safe_db_error's (#1661).
+                logger.error(
+                    "DATABASE source poll failed; retrying next interval\n%s",
+                    _safe_db_traceback(exc),
+                )
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
             except TimeoutError:
@@ -2480,7 +2539,7 @@ class DatabaseSource(SourceConnector):
         try:
             await sink(kind, None, reason)
         except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
-            logger.warning("DATABASE connection-event emit failed: %s", safe_exc(exc))
+            logger.warning("DATABASE connection-event emit failed: %s", _safe_db_error(exc))
 
     async def _poll_once(self) -> None:
         assert self._handler is not None
@@ -2527,9 +2586,11 @@ class DatabaseSource(SourceConnector):
             # returns, so an exception here is an infrastructure failure (the durable store write
             # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
             # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # _safe_db_error: on a SQL Server store the handler's write is itself a pyodbc call,
+            # and a rejection such as a 2628 truncation quotes the value it refused (#1661).
             logger.warning(
                 "DATABASE source handler failed (row left unmarked, will retry): %s",
-                safe_exc(exc),
+                _safe_db_error(exc),
             )
             return
         try:
