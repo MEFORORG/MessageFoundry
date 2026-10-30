@@ -14,6 +14,7 @@ import json
 
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
+from fastapi import HTTPException
 
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
@@ -112,10 +113,7 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
 async def test_ui_flag_gives_another_503_no_audit_page(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3811: the console named the audit fix for ANY 503, on the claim that the handler
-    had no other. A 503 that is not the audit refusal must reach the operator as itself, not as
-    "the audit log did not record the change"."""
-    from fastapi import HTTPException
+    """BACKLOG #3811: a 503 that is not the audit refusal is not given the audit page."""
 
     async def _other_503(*_args: object, **_kwargs: object) -> None:
         raise HTTPException(503, "some other unavailable")

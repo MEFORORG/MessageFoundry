@@ -196,8 +196,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except ConfigWriteNotRecorded as exc:
             # The audit log did not record the toggle (vault BACKLOG #2945), whose fix is neither
-            # of flag_rejected's. Named by type, not by status: any other 503 is not this refusal,
-            # so it is re-raised below rather than given this page (BACKLOG #3811).
+            # of flag_rejected's. By type: any other 503 is re-raised below (BACKLOG #3811).
             return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
         except HTTPException as exc:
             # At least: the scope fork (code-first), a validate-before-persist failure, or a

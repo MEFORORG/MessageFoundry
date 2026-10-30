@@ -5437,9 +5437,8 @@ def create_app(
         except ConfigWriteAuditFailed as exc:
             # The audit log did not record the row, so the engine refused the toggle and undid it,
             # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
-            # fault, so 503 as for any refused audit write. Not the route's only 503 (at least
-            # _get_engine's and RequestTimeoutMiddleware's answer one too), so the console names
-            # this fix by the type it raises, never by the status (BACKLOG #3811).
+            # fault, so 503 as for any refused audit write. Typed, because it is not the route's
+            # only 503 and the console names this fix (BACKLOG #3811).
             raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
             # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
