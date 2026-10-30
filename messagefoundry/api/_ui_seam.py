@@ -733,12 +733,23 @@ from typing import Any
 #: 9dffd6dc9d2a0b5d). Neither parent's value covered both, so the value below was
 #: re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3690: ``AuthService.finish_webauthn_registration`` gained the ``factor_refused``
+#: keyword, which ``POST /ui/account/webauthn/verify`` passes when it skipped its ceremony-budget
+#: draw, so the finish refuses on the route's read rather than a later one. A newer console on an
+#: older engine would raise TypeError at the passkey finish, and the pinned digest refuses that
+#: pair, and an older console on this engine, at mount. The digest moved from
+#: ``9cd9fe02e6e90c18`` (derived with ``--digest``).
+#:
+#: BACKLOG #3638 and #3639 merged with main again, after BACKLOG #3690 landed there (digest
+#: 84ae818da5f2f1ed; this branch at 57a4b8457b930c63). Neither parent's value covered both, so
+#: the value below was re-derived with ``--write`` on the merged tree.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "57a4b8457b930c63"
+ENGINE_UI_SEAM: str = "9ad245683e8594e1"
 
 
 @dataclass(frozen=True, slots=True)
