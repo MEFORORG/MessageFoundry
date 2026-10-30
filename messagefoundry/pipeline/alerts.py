@@ -592,8 +592,9 @@ class AlertSink(Protocol):
         event, so no
         rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
         the connection-name grammar. Repeated failures on one key fold into one instance, and
-        every inline reload's into the one ``config_reload:inline`` instance until an operator
-        resolves it. Nothing resolves it automatically. Carries the key and the action name only:
+        every inline reload's into the one ``config_reload:inline`` instance, and every queue
+        listing's into the one ``approval:listing`` instance, until an operator resolves it.
+        Nothing resolves it automatically. Carries the key and the action name only:
         no username, no params, no PHI."""
         ...
 

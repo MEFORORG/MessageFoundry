@@ -336,9 +336,11 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
         assert (await c.get("/approvals", headers=admin)).json()["approvals"] == []
 
 
-async def _quiesced_outbound_with_a_pending_row(engine: Engine, tmp_path: Path) -> str:
-    """Start a graph, stop its outbound ``OB`` until it quiesces, and queue one delivery to it,
-    which the paused lane keeps PENDING. Returns the message id."""
+async def _quiesced_outbound_with_a_pending_row(
+    engine: Engine, tmp_path: Path, outbound: str = "OB"
+) -> str:
+    """Start a graph, stop its one outbound until it quiesces, and queue one delivery to it, which
+    the paused lane keeps PENDING. Returns the message id."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     (tmp_path / "out").mkdir()
@@ -355,26 +357,26 @@ async def _quiesced_outbound_with_a_pending_row(engine: Engine, tmp_path: Path) 
     )
     reg.add_outbound(
         OutboundConnection(
-            "OB", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
+            outbound, ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
         )
     )
     reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send("OB", m))
+    reg.add_handler("h", lambda m: Send(outbound, m))
     engine.add_registry(reg)
     await engine.start()
     rr = engine.registry_runner
     assert rr is not None
 
     # Stop OB (idle lane → quiesces), then queue a delivery it retains PENDING while paused.
-    await rr.stop_outbound("OB")
+    await rr.stop_outbound(outbound)
     for _ in range(200):
-        if rr.outbound_quiesced("OB"):
+        if rr.outbound_quiesced(outbound):
             break
         await asyncio.sleep(0.02)
-    assert rr.outbound_quiesced("OB") is True
+    assert rr.outbound_quiesced(outbound) is True
     return str(
         await engine.store.enqueue_message(
-            channel_id="in1", raw=ADT, deliveries=[("OB", ADT)], source_type="file"
+            channel_id="in1", raw=ADT, deliveries=[(outbound, ADT)], source_type="file"
         )
     )
 
@@ -421,8 +423,8 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
     assert await engine.store.list_audit(action="connection_purge") == []
 
 
-async def _hold_a_purge(c: httpx.AsyncClient) -> str:
-    held = await c.post("/connections/OB/purge?scope=top", headers=await _token(c, "op"))
+async def _hold_a_purge(c: httpx.AsyncClient, outbound: str = "OB") -> str:
+    held = await c.post(f"/connections/{outbound}/purge?scope=top", headers=await _token(c, "op"))
     assert held.status_code == 202, held.text
     assert held.json()["operation"] == "connection_purge"
     return str(held.json()["approval_id"])
@@ -575,6 +577,41 @@ async def test_a_released_purge_of_an_outbound_another_engine_shard_owns_cancels
     assert ok.json()["result"]["cancelled"] == 0
     assert "owned by engine shard 'other-shard'" in ok.json()["result"]["skipped"]
     await _assert_nothing_purged(engine, mid)
+
+
+async def test_a_skipped_release_keeps_the_owning_engine_shard_in_the_cut_tee_line(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3798: the tee cuts ``approval.approved``'s detail, and a skip's reason comes
+    last in it. So the ownership refusal names the engine shard before the outbound, whose name
+    could otherwise push the engine shard past the cut. Other refusals carry no such promise, and
+    a requester's name long enough leaves no reason at all (docs/SECURITY.md)."""
+    outbound = "OB_A_PARTNER_WITH_A_LONG_NAME_ADT"
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await _quiesced_outbound_with_a_pending_row(engine, tmp_path, outbound)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c, outbound)
+        monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
+        admin = await _token(c, "approver")
+        with caplog.at_level(logging.INFO, logger="messagefoundry.audit"):
+            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+    assert ok.status_code == 200, ok.text
+    [shipped] = [
+        line["detail"]
+        for line in (
+            json.loads(r.getMessage()) for r in caplog.records if r.name == "messagefoundry.audit"
+        )
+        if line["action"] == "approval.approved"
+    ]
+    assert "(+" in shipped  # the cut happened, or this test proves nothing
+    assert "owned by engine shard 'other-shard'" in shipped
 
 
 @pytest.mark.parametrize(

@@ -1175,9 +1175,11 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
     # vacuous (it never runs the lane), so it would green-light a purge racing the owner's claims.
     owner = rr.destination_owner(name)
     if owner is not None and owner != rr.registry.shard_id:
+        # The engine shard before the name: a skipped release carries this text off-box, where the
+        # row's detail is cut, and an outbound name can be long.
         return HTTPException(
             409,
-            f"outbound {name!r} is owned by engine shard {owner!r} — stop and purge it on that "
+            f"owned by engine shard {owner!r}, so stop and purge outbound {name!r} on that engine "
             "shard's API",
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
