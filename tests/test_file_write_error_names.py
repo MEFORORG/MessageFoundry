@@ -16,6 +16,7 @@ import asyncio
 import errno
 import logging
 import os
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -27,7 +28,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, Registry
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -82,22 +83,34 @@ def _blocked(tmp_path: Path) -> Path:
     return out
 
 
+def _traceback(exc: BaseException) -> str:
+    """Everything a log line with ``exc_info`` would print for ``exc``, its chain included."""
+    return "".join(traceback.format_exception(exc))
+
+
 async def test_a_real_os_error_leaves_no_rendered_name(tmp_path: Path) -> None:
-    dest = _file_destination(_blocked(tmp_path))
+    out = _blocked(tmp_path)
+    dest = _file_destination(out)
+    # Positive control: the OS error itself quotes the name, so this test can see a leak.
+    with pytest.raises(OSError) as os_error:
+        dest._write_as(NAME, out / NAME, BODY)
+    assert MRN in str(os_error.value)
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
-    # Positive control: the OS error under it quoted the name, so this test can see a leak.
-    cause = raised.value.__cause__
-    assert isinstance(cause, OSError) and MRN in str(cause)
     text = str(raised.value)
-    assert text.startswith("file write failed: ") and type(cause).__name__ in text
+    assert text.startswith("file write failed: ") and type(os_error.value).__name__ in text
     assert MRN not in text and MRN not in safe_exc(raised.value)
+    # The OS error is not chained, so a traceback of the delivery error cannot print it.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert MRN not in _traceback(raised.value)
 
 
-def _refuse_publish(monkeypatch: pytest.MonkeyPatch) -> list[OSError]:
+def _refuse_replace(monkeypatch: pytest.MonkeyPatch) -> list[OSError]:
     """Fail the publish step's replace with the error a share that refuses the write raises,
     quoting the target. The directory is relative, so the text stays short: with an absolute temp
-    path the store's 200-character bound cut the name off on the unfixed code, which then passed."""
+    path the store's 200-character bound cut the name off on the unfixed code, which then passed.
+    ``monkeypatch`` is a context the caller closes right after the delivery, so nothing else in the
+    test meets the patched ``os.replace``."""
     raised: list[OSError] = []
 
     def refuse(src: object, dst: object) -> None:
@@ -114,7 +127,6 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
     monkeypatch.chdir(tmp_path)
     out = Path("out")
-    forced = _refuse_publish(monkeypatch)
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
         sink = _Sink()
@@ -130,7 +142,9 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
         )
         item = await store.claim_next_fifo(OUT, now=1e12)
         assert item is not None
-        await runner._process_delivery_item(OUT, item)
+        with monkeypatch.context() as patch:
+            forced = _refuse_replace(patch)
+            await runner._process_delivery_item(OUT, item)
 
         (row,) = await store.outbox_for(mid)
         events = []
@@ -156,35 +170,52 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
 
 
 class _EchoingClient(_FakeClient):
-    """A server whose refusals quote the paths they name, as an FTP 550 reply can."""
+    """A server whose refusal at ``step`` quotes the paths it names, as an FTP 550 reply can. The
+    rename reply quotes the name lower-cased, as a case-insensitive server's stored case can."""
 
-    def __init__(self, *, permanent: bool) -> None:
+    def __init__(self, step: str, *, permanent: bool) -> None:
         super().__init__()
+        self.step = step
         self.permanent = permanent
 
-    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
-        self.ops.append(("publish", src))
-        raise _RemoteError(
-            f"FTP rejected the operation: 550 {src} -> {candidates[0]}, {candidates[1]}: "
-            "Permission denied",
+    def _refuse(self, quoted: str) -> _RemoteError:
+        return _RemoteError(
+            f"FTP rejected the operation: 550 {quoted}: Permission denied",
             permanent=self.permanent,
             credential_fault=self.permanent,
         )
 
+    def store(self, path: str, data: bytes) -> None:
+        self.ops.append(("store", path))
+        if self.step == "store":
+            raise self._refuse(path)
+        self.files[path] = data
+
+    def rename(self, src: str, dst: str) -> None:
+        self.ops.append(("rename", dst))
+        raise self._refuse(f"{src} -> {dst.lower()}")
+
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        self.ops.append(("publish", candidates[1]))
+        raise self._refuse(f"{src} -> {candidates[0]}, {candidates[1]}")
+
 
 @pytest.mark.parametrize("permanent", [False, True], ids=["transient", "permanent"])
+@pytest.mark.parametrize("step", ["store", "publish", "rename"])
 async def test_the_remotefile_error_text_holds_no_rendered_name(
-    monkeypatch: pytest.MonkeyPatch, permanent: bool
+    monkeypatch: pytest.MonkeyPatch, step: str, permanent: bool
 ) -> None:
-    client = _EchoingClient(permanent=permanent)
-    dest = _dest(monkeypatch, client, filename=TEMPLATE)
+    client = _EchoingClient(step, permanent=permanent)
+    dest = _dest(monkeypatch, client, filename=TEMPLATE, overwrite=step == "rename")
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
-    (src,) = [path for op, path in client.ops if op == "publish"]
-    assert MRN in src  # the reply quoted a path that held the name
+    (quoted,) = [path for op, path in client.ops if op == step]
+    assert MRN in quoted  # the reply quoted a path that held the name
     text = str(raised.value)
     assert text.startswith("FTP rejected the operation: 550 ") and "Permission denied" in text
-    assert MRN not in text and MRN not in safe_exc(raised.value)
+    assert MRN not in text.upper() and MRN not in safe_exc(raised.value).upper()
+    # The unscrubbed reply is not chained, so a traceback of the delivery error cannot print it.
+    assert MRN not in _traceback(raised.value).upper()
     # The markers survive the scrub: a permanent credential refusal still stops the lane.
     assert isinstance(raised.value, NegativeAckError) is permanent
     if permanent:
@@ -195,3 +226,12 @@ def test_without_names_keeps_text_that_names_no_file() -> None:
     exc = _RemoteError("FTP operation failed: timed out", permanent=False, config_fault=True)
     scrubbed = exc.without_names([f"/in/{NAME}"])
     assert str(scrubbed) == str(exc) and scrubbed.config_fault and not scrubbed.permanent
+
+
+def test_without_names_swaps_each_name_once_in_one_pass() -> None:
+    # A shorter name must not be matched again inside the label a longer one became.
+    names = ["/in/1.hl7", "/in/1-1.hl7", "/in/11.hl7"]
+    exc = _RemoteError("550 /in/1-1.hl7 and /in/1.HL7", permanent=True)
+    assert str(exc.without_names(names)) == (
+        f"550 /in/{safe_name('1-1.hl7')} and /in/{safe_name('1.HL7')}"
+    )

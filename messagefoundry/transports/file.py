@@ -584,11 +584,14 @@ class FileDestination(DestinationConnector):
         except OSError as exc:
             # An OS error quotes the path it failed on, and its last part is this name, rendered
             # from message fields, or a bumped name-1.ext of it. The error text reaches last_error,
-            # the connection event and the alert, so it keeps the type, errno and OS text only
-            # (BACKLOG #2814).
-            raise DeliveryError(
-                f"file write failed: {_describe_os_error(exc, file_name=name)}"
-            ) from exc
+            # the connection event and the alert, so it keeps the type, errno and OS text only, and
+            # an OSError with no errno keeps its type alone (BACKLOG #2814).
+            reason = _describe_os_error(exc) if exc.errno is not None else type(exc).__name__
+        else:
+            return
+        # Raised outside the handler, so the OS error, which quotes the path, is on neither
+        # __cause__ nor __context__ for a traceback to print.
+        raise DeliveryError(f"file write failed: {reason}")
 
     def _write_as(self, name: str, target: Path, payload: str) -> None:
         """Write ``payload`` to ``target``, the destination directory joined with ``name``:
@@ -2482,9 +2485,9 @@ def _describe_os_error(exc: OSError | ValueError, *, file_name: str | None = Non
 
     Used where the path is not known here to swap for a label: a failed directory listing, whose path
     under ``recursive`` can be a partner-created SUBDIRECTORY, and a failed archive claim, whose path
-    can be a bumped ``name-1.ext``, as can a failed destination write's (BACKLOG #2814). An
-    ``OSError`` is reported by its type, errno and OS text, never its path. A ``ValueError`` from a
-    listing is an invalid glob pattern, which is operator configuration."""
+    can be a bumped ``name-1.ext``. An ``OSError`` is reported by its type, errno and OS text, never
+    its path. A ``ValueError`` from a listing is an invalid glob pattern, which is operator
+    configuration."""
     if isinstance(exc, OSError) and exc.errno is not None:
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     # A message-only OSError keeps its message, redacted, with the known name swapped for a label.

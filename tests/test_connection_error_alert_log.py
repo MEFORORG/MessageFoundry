@@ -43,7 +43,7 @@ def test_the_sink_logs_the_class_and_not_the_detail(caplog: pytest.LogCaptureFix
     (line,) = _warnings(caplog)
     assert line.getMessage() == (
         f"ALERT connection_error: outbound {OUT!r} connection_lost (DeliveryError); "
-        "the reason is stored on its event"
+        "the reason is not logged"
     )
     assert_no_token(caplog.records)
 

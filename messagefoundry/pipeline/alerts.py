@@ -326,8 +326,10 @@ class AlertSink(Protocol):
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
-        event kind (``connection_lost``); ``detail`` is a ``safe_exc``-scrubbed reason (no PHI). A
-        partner *rejection* (``NegativeAckError``) is NOT a connection error and never fires this."""
+        event kind (``connection_lost``); ``detail`` is a ``safe_exc``-scrubbed reason. That is
+        redacted and bounded, but it keeps transport text that can echo payload content, so
+        :class:`LoggingAlertSink` logs its class alone (BACKLOG #3210). A partner *rejection*
+        (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
@@ -991,13 +993,17 @@ class LoggingAlertSink:
 
         ``detail`` is a ``safe_exc`` rendering, and that keeps the transport's own text, which can
         echo payload content: a partner's reply, or an OS error naming a file built from message
-        fields (BACKLOG #3210). The full reason is stored, masked, on the connection event and the
-        alert instance. ``safe_exc`` puts the class first; a head that is not a plain ASCII name is
-        not trusted to be one, so the line then names no class."""
+        fields (BACKLOG #3210). The runner keeps the same text, masked until an audited reveal, on
+        the ``connection_lost`` event, unless the event queue was full and dropped it.
+
+        ``safe_exc`` puts the class first, so the head before the first colon is taken as the class.
+        A head that is not a plain ASCII name is not trusted to be one, and the line then names no
+        class. A caller that passes text of another shape can have an identifier-shaped head logged;
+        every caller today passes ``safe_exc`` output."""
         head = (detail or "").partition(":")[0]
         error_class = head if head.isascii() and head.isidentifier() else "unnamed error"
         log.warning(
-            "ALERT connection_error: outbound %r %s (%s); the reason is stored on its event",
+            "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
             error_class,
