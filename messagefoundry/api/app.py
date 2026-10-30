@@ -11662,56 +11662,43 @@ def create_managed_app(
         # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
         # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
         # server principal), so the default single-node path is a log line and nothing else.
+        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
+        # probe check-privileges runs and through the provider's own client, in the same try and so
+        # under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+        # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
+        # it (audited); every other finding warns and audits. It names the consumers from the
+        # resolved service settings, which serve always passes; an embedding that passes none has
+        # no Vault consumer this lifespan could name.
+        _security = security_settings or SecuritySettings()
+        # The dial falls back to [security].enforcement when no explicit one was passed, so an
+        # embedder that sets only security_settings gets its own dial.
+        _enforcing = (security_enforcement or _security.enforcement) is SecurityEnforcement.ENFORCE
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    # The dial falls back to [security].enforcement when no explicit one was
-                    # passed, so an embedder that sets only security_settings gets its own dial.
-                    enforcing=(
-                        security_enforcement
-                        or (security_settings or SecuritySettings()).enforcement
-                    )
-                    is SecurityEnforcement.ENFORCE,
-                    over_grant_accepted=(
-                        security_settings or SecuritySettings()
-                    ).allow_over_granted_store_principal,
+                    enforcing=_enforcing,
+                    over_grant_accepted=_security.allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
-        except BaseException:
-            if notifier is not None:
-                await notifier.aclose()
-            await store.close()
-            raise
-        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): probe each Vault token the engine uses, with the
-        # probe check-privileges runs and through the provider's own client, at the same seam and
-        # under the same teardown discipline as the store preflight above. Under
-        # [security].enforcement=enforce the root policy or any grant on an administrative path
-        # refuses unless [security].allow_over_granted_vault_token accepts it (audited); every other
-        # finding warns and audits. Needs the resolved service settings to name the consumers, so it
-        # runs on the serve path, which always passes them; an embedding that passes none has no
-        # Vault consumer this lifespan could name.
-        if static_credential_settings is not None:
-            _security = security_settings or SecuritySettings()
-            try:
+            if static_credential_settings is not None:
                 await run_vault_privilege_preflight(
                     static_credential_settings,
                     store,
-                    enforcing=(security_enforcement or _security.enforcement)
-                    is SecurityEnforcement.ENFORCE,
+                    enforcing=_enforcing,
                     over_grant_accepted=_security.allow_over_granted_vault_token,
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
                 )
-            except BaseException:
-                if notifier is not None:
-                    await notifier.aclose()
-                await store.close()
-                raise
+        except BaseException:
+            if notifier is not None:
+                await notifier.aclose()
+            await store.close()
+            raise
         # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
         # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
         # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop

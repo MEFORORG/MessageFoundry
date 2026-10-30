@@ -102,6 +102,11 @@ codes are unchanged: an over-grant of either class exits 3.
 - **The probe's limits are unchanged and are not fixed here.** It asks about exact paths only, so a
   wildcard grant such as `secret/data/*` would read clean. Neither limit, nor the classes, was
   measured against a live Vault.
+- **Two more limits follow from the ruling and the seam, and are stated rather than fixed.** A
+  token whose policy denies the probe's two paths reads as unobservable, which only warns by the
+  ruling, so it never refuses however wide its other grants are. And the probe runs at start only:
+  a token replaced in the secrets directory after start is used by the provider and not judged
+  until the next start.
 - **Not built in this slice: the alert.** The ruling says a warning-class finding warns, alerts and
   audits. This slice warns and audits. The alert, with an inverse that resolves it on a clean start
   as `store_privilege_clean` does for the store, needs a new event type in the notifier and is the

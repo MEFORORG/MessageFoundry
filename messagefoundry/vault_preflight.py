@@ -82,7 +82,21 @@ class VaultAuditStore(Protocol):
 def _probe_all(
     consumers: list[VaultConsumer], probe: Callable[[VaultConsumer], VaultTokenReading]
 ) -> list[VaultTokenReading]:
-    return [probe(c) for c in consumers]
+    """Each consumer's reading. A probe that raises reads as unobservable rather than aborting the
+    start: the probe reports its own failures, but a token re-read or an unrouted consumer kind can
+    still raise, and under ``enforcement = warn`` nothing here may refuse. Only the exception's type
+    is kept, so no library or server text reaches the log or the audit row."""
+    from messagefoundry.privilege_probes import VaultTokenReading
+
+    out: list[VaultTokenReading] = []
+    for consumer in consumers:
+        try:
+            out.append(probe(consumer))
+        except Exception as exc:  # noqa: BLE001 - any probe failure is unobservable, never a pass
+            problem = f"the probe raised {type(exc).__name__}"
+            log.warning("vault privilege preflight: %s: %s", consumer.hop, problem)
+            out.append(VaultTokenReading(problems=(problem,)))
+    return out
 
 
 async def run_vault_privilege_preflight(

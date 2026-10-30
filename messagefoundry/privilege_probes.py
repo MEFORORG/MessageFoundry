@@ -90,7 +90,8 @@ def _problem(text: str) -> str:
     is logged with every character in ``CONTROL_CATEGORIES`` escaped visibly, by the log's own
     rule, as the terminal escapes them (``privilege_check.render_text``), so neither deletes a
     character the server sent (BACKLOG #2891)."""
-    logger.warning("check-privileges: %s", scrub_log_argument(text))
+    # Not "check-privileges:": serve runs these probes at every start too (BACKLOG #2903).
+    logger.warning("privilege probe: %s", scrub_log_argument(text))
     return text
 
 

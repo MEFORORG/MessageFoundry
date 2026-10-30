@@ -132,13 +132,14 @@ class HopPrivilege:
     detail: str
     refusing: tuple[str, ...] = ()
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, str | list[str]]:
         return {
             "hop": self.hop,
             "state": self.state.value,
             "identity": self.identity,
             "minimal": self.minimal,
             "detail": self.detail,
+            "refusing": list(self.refusing),
         }
 
 
@@ -259,7 +260,8 @@ def vault_admin_paths(
 #: What the check itself needs on every token: both are in Vault's ``default`` policy, so a token
 #: made with ``-no-default-policy`` needs them granted to read clean.
 _SELF_READ_GRANT = (
-    "read on auth/token/lookup-self and update on sys/capabilities-self, for this check"
+    "read on auth/token/lookup-self and update on sys/capabilities-self, for the privilege probe "
+    "serve and this check run"
 )
 
 #: Which provider uses a token, and so which paths its probe asks about.
@@ -404,9 +406,17 @@ def vault_hop(
     # characters are dropped would otherwise print as "root" while being judged as something else.
     # A name that is not plain printable ASCII (a homoglyph such as a Cyrillic o) cannot be told
     # apart from root on a terminal at all, so it is reported rather than guessed at.
+    # Only the exact name is the refusing class: a lookalike is a name the probe cannot tell from
+    # root by reading it, which the owner ruling of 2026-10-04 puts in the warning class (ADR 0216).
     for p in reading.policies:
-        if p == "root" or printable(p) == "root":
+        if p == "root":
             grave.append("the token carries the root policy")
+        elif printable(p) == "root":
+            over.append(
+                "the token carries the root policy as far as reading it can tell: the name "
+                f"{_quoted(p)} reads as root once its invisible characters are dropped; read the "
+                "policy by hand"
+            )
         elif not (p.isascii() and p.isprintable()):
             over.append(
                 f"the policy name {_quoted(p)} is not plain printable ASCII, so it cannot be told "
@@ -765,16 +775,17 @@ def serve_verdict(
             vault.setdefault(outcome, []).append(h.hop)
     store = _store_verdict(report, settings)
     refused = vault.get(PreflightOutcome.REFUSE, [])
-    if refused:
-        reason = vault_refusal_reason(refused)
-        verdict = (
-            f"{store}; and {reason}"
-            if store.startswith("would REFUSE")
-            else f"would REFUSE to start: {reason}"
-        )
+    notes: list[str] = []
+    if refused and store.startswith("would REFUSE"):
+        verdict = f"{store}; and {vault_refusal_reason(refused)}"
+    elif refused:
+        verdict = f"would REFUSE to start: {vault_refusal_reason(refused)}"
+        if store != _STORE_CLEAN:
+            # An accepted or warned store finding must not drop out of the line because a Vault
+            # token refuses first.
+            notes.append(f"the store alone {store}")
     else:
         verdict = store
-    notes: list[str] = []
     if accepted := vault.get(PreflightOutcome.ACCEPTED):
         notes.append(
             f"the over-grant on {', '.join(accepted)} is accepted by {VAULT_OVER_GRANT_OPT_OUT} "
@@ -794,6 +805,9 @@ def serve_verdict(
     return verdict + "".join(f" ({n})" for n in notes)
 
 
+_STORE_CLEAN = "would start: the store probe found nothing to refuse"
+
+
 def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> str:
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     rlp = settings.store.require_least_privilege
@@ -810,7 +824,7 @@ def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> s
     if outcome is PreflightOutcome.WARN:
         why = "the probe could not observe the principal" if enforcing else "enforcement is 'warn'"
         return f"would start with a warning ({why})"
-    return "would start: the store probe found nothing to refuse"
+    return _STORE_CLEAN
 
 
 def render_text(hops: Iterable[HopPrivilege]) -> list[str]:

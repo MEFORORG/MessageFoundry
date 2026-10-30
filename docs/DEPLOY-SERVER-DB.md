@@ -184,8 +184,12 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 
 It also probes each Vault token the engine uses and the AD bind account, when they are
 configured. A Vault token that holds more than the engine needs, or an AD bind account in an
-administrative group, makes it exit 3. A Vault or AD probe that cannot run makes it exit 4. Those
-findings are reported only; they never stop a start.
+administrative group, makes it exit 3. A Vault or AD probe that cannot run makes it exit 4. An AD
+finding is reported only and never stops a start. `serve` probes each Vault token too, at every
+start: under `enforcement = enforce` a token holding the root policy or a grant on an administrative
+path refuses the start, and every other Vault finding only warns
+([ADR 0216](adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md)).
+The `serve:` line says which applies.
 
 **Do not copy the Vault token or the AD bind password into the scheduled task.** That task usually
 lacks them, so in it the Vault and AD hops read as not observed and the command exits 4 even for a

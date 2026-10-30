@@ -131,6 +131,23 @@ def test_a_policy_name_the_probe_cannot_judge_only_warns() -> None:
     )
 
 
+def test_a_name_that_reads_as_root_only_once_stripped_only_warns() -> None:
+    """A lookalike is a name the probe cannot tell from root by reading it, so it is reported as
+    over-granted but is in the warning class, and the refusal never says the token holds root."""
+    hop = _hop(caps=_least_caps(), policies=("default", "r​oot"))
+    assert hop.state is HopState.OVER_GRANTED
+    assert hop.refusing == ()
+    assert "as far as reading it can tell" in hop.detail
+    assert vault_preflight_outcome(hop, enforcing=True, over_grant_accepted=False) is (
+        PreflightOutcome.WARN
+    )
+
+
+def test_the_json_read_out_names_the_refusing_reasons() -> None:
+    assert _hop(policies=("root",)).as_dict()["refusing"] == ["the token carries the root policy"]
+    assert _hop(caps=_least_caps()).as_dict()["refusing"] == []
+
+
 def test_one_token_shared_by_two_hops_only_warns() -> None:
     """The row's first ordinary setup: one token serving two hops is over-granted, and warns."""
     caps = _least_caps() | {_KV_PATH: ["read"]}
@@ -317,6 +334,26 @@ async def test_no_vault_consumer_probes_nothing_and_writes_no_row() -> None:
     assert store.audits == []
 
 
+@pytest.mark.parametrize("enforcing", [True, False])
+async def test_a_probe_that_raises_is_unobservable_and_never_aborts_the_start(
+    enforcing: bool,
+) -> None:
+    """A raise from the probe (a token re-read that fails, an unrouted consumer kind) must not
+    escape: under warn nothing may refuse, and under enforce an unobservable probe only warns."""
+    store = _AuditStore()
+
+    def probe(consumer: VaultConsumer) -> VaultTokenReading:
+        raise ValueError(f"synthetic failure quoting {_TOKEN}")
+
+    [hop] = await run_vault_privilege_preflight(
+        _VAULT_SETTINGS, store, enforcing=enforcing, over_grant_accepted=False, probe=probe
+    )
+    assert hop.state is HopState.UNOBSERVABLE
+    assert "the probe raised ValueError" in hop.detail
+    assert _TOKEN not in json.dumps(store.audits)
+    assert store.audits[0][1]["refused"] is False
+
+
 async def test_an_audit_failure_never_masks_the_refusal() -> None:
     class _AuditFails:
         async def record_audit(self, action: str, *, actor: str | None, detail: str | None) -> None:
@@ -347,6 +384,24 @@ def test_serve_verdict_refuses_on_a_gravest_vault_grant() -> None:
     verdict = serve_verdict(_sqlite_report(), _VAULT_SETTINGS, [_hop(policies=("root",))])
     assert verdict.startswith("would REFUSE to start")
     assert "vault.store" in verdict and "allow_over_granted_vault_token" in verdict
+
+
+def test_serve_verdict_keeps_an_accepted_store_over_grant_beside_a_vault_refusal() -> None:
+    from messagefoundry.config.settings import StoreBackend
+
+    over = StorePrivilegeReport(
+        backend=StoreBackend.SQLSERVER,
+        status=StorePrivilegeStatus.OBSERVED,
+        principal="CORP\mefor-svc$",
+        database="MessageFoundry",
+        excess=("server role sysadmin",),
+    )
+    settings = _VAULT_SETTINGS.model_copy(
+        update={"security": SecuritySettings(allow_over_granted_store_principal=True)}
+    )
+    verdict = serve_verdict(over, settings, [_hop(policies=("root",))])
+    assert verdict.startswith("would REFUSE to start: a Vault token on vault.store")
+    assert "allow_over_granted_store_principal" in verdict
 
 
 def test_serve_verdict_names_an_accepted_vault_grant() -> None:

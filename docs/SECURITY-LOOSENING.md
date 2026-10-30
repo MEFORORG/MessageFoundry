@@ -1855,9 +1855,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the refusal under `enforce` that a Vault token the engine uses earns when the
   startup probe finds it holding the root policy, any grant on an administrative path (a policy
   write, including one of its own policies, an identity group, a mount, an auth method or
-  `auth/token/create`), or a Transit key's `config`, `rotate`, `export` or `backup`. Such a token can
-  widen its own reach, or take the store key out of Vault. Any code path that reaches the token
-  inherits that.
+  `auth/token/create`), or a Transit key's `config`, `rotate`, `export` or `backup`. Any grant there
+  but `deny` counts, a read included. A write there lets the token widen its own reach, or take the
+  store key out of Vault, and any code path that reaches the token inherits that.
 - **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
 - **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
   `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in

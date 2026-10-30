@@ -377,7 +377,7 @@ def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFi
     error = ConnectionError(f"https://vault.invalid/ token={_TOKEN}")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
         _reading(_FakeVault(lookup_error=error))
-    assert "check-privileges: token lookup-self failed: ConnectionError" in caplog.text
+    assert "privilege probe: token lookup-self failed: ConnectionError" in caplog.text
     assert _TOKEN not in caplog.text
 
 
@@ -1183,7 +1183,10 @@ def test_cli_exits_0_on_a_least_privilege_token(
 ) -> None:
     argv = _cli(monkeypatch, tmp_path, lambda a, t: _FakeVault(caps=_least_caps()))
     assert main(argv) == 0
-    assert "does not gate a start" not in json.loads(capsys.readouterr().out)["serve"]
+    # The whole line: a clean Vault hop adds no note, so a hop wrongly judged as one that warns or
+    # refuses changes it (BACKLOG #2903).
+    serve = json.loads(capsys.readouterr().out)["serve"]
+    assert serve == "would start: the store probe found nothing to refuse"
 
 
 def test_cli_probes_the_ldap_bind_when_ad_is_on(
