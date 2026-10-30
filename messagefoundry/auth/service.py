@@ -4273,21 +4273,22 @@ class AuthService:
                 # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
             # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
-            # below, so the row is read again first. A store that wrote no role took nothing over,
-            # and the record is left, as SECURITY.md says. A read that raises leaves it unknown,
-            # and the record is cleared, the side that challenges: a re-run refuses a row that
-            # holds the role, so nothing else would clear it.
+            # below, so the row is read again first. Only a read of this very row without the role
+            # shows the store wrote none and took nothing over, and leaves the record, as
+            # SECURITY.md says. Anything else, a read that raises or finds no verified row of this
+            # id, leaves it unknown, and the record is cleared, the side that challenges: a re-run
+            # refuses a row that holds the role, so nothing else would clear it.
             row: VerifiedUser | None = None
-            role_written = True
+            may_hold_role = True
             try:
                 row = (await self._lookup_by_username(username)).user
-                role_written = (
+                may_hold_role = not (
                     row is not None
                     and row.id == user_id
-                    and Role.ADMINISTRATOR.value in row.role_ids
+                    and Role.ADMINISTRATOR.value not in row.role_ids
                 )
             finally:
-                if repaired and role_written:
+                if repaired and may_hold_role:
                     await self._clear_login_addresses(user_id, username=username)
             raise FirstAdministratorRefused(
                 await self._unexpected_grant_refusal(

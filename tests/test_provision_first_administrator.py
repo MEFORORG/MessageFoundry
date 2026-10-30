@@ -2537,6 +2537,7 @@ def test_a_webhook_that_cannot_build_keeps_the_email(
     assert [t.name for t in built._transports] == ["email"]
     err = capsys.readouterr().err
     assert "hooks.example.invalid" not in err and "ValueError" in err
+    assert "built without the webhook transport" in err
 
 
 @pytest.mark.parametrize("muted", [False, True], ids=["send-refused", "rule-routes-to-none"])
@@ -2640,27 +2641,76 @@ def test_a_store_that_opens_as_its_bound_ends_is_closed(
 
 async def test_a_store_that_opens_after_its_bound_is_closed_when_it_arrives() -> None:
     """Item 6: an open that finishes after the bound raises TimeoutError to the caller, and the
-    store it opens late is closed rather than leaked."""
-    from messagefoundry.__main__ import _open_within
+    open is not cancelled: a real driver cancelled mid-open can drop a handle it holds. The store
+    it opens late is closed when it arrives, rather than leaked."""
+    from messagefoundry.__main__ import _close_late_store, _within
 
     late = _LateStore()
     finish = asyncio.Event()
+    cancelled: list[bool] = []
 
     async def slow_open() -> Any:
         try:
-            await asyncio.sleep(0.05)
-        except asyncio.CancelledError:
-            # A driver that finishes its open despite the cancel, as one in a worker thread can.
             await finish.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
         return late
 
     with pytest.raises(TimeoutError):
-        await _open_within(slow_open, 0.01)
+        await _within(slow_open(), 0.01, _close_late_store)
     assert not late.closed
     finish.set()
     for _ in range(10):
         await asyncio.sleep(0)
+    assert cancelled == []
     assert late.closed
+
+
+async def test_a_close_still_running_at_its_bound_is_left_to_finish() -> None:
+    """Review round 1 of repair 3: the alert's store close used ``asyncio.timeout`` too, so a slow
+    close was cancelled half way. It is left to finish now, and the caller is told it timed out."""
+    from messagefoundry.__main__ import _log_late_close, _within
+
+    finish = asyncio.Event()
+    closed: list[bool] = []
+
+    async def slow_close() -> None:
+        await finish.wait()
+        closed.append(True)
+
+    with pytest.raises(TimeoutError):
+        await _within(slow_close(), 0.01, _log_late_close)
+    finish.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert closed == [True]
+
+
+def test_a_hop_check_that_raises_costs_the_email_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 1 of repair 3: a relay CA check that raises, rather than refusing, cost the
+    webhook too once the checks moved out of the build's retry. It costs the email only."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import ServiceSettings
+
+    def raising_check(_settings: object, *, what: str) -> bool:
+        raise RuntimeError("synthetic anchor parse fault naming ca.example.invalid")
+
+    monkeypatch.setattr(cli, "_offline_smtp_relay_ca_accepted", raising_check)
+    alerts = AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_to=["ops@example.invalid"],
+        webhook_url="https://hooks.example.invalid/x",
+    )
+    built = cli._offline_alert_notifier(ServiceSettings(alerts=alerts), None)
+    assert built is not None
+    assert [t.name for t in built._transports] == ["webhook"]
+    err = capsys.readouterr().err
+    assert "no alert email is sent" in err and "RuntimeError" in err
+    assert "ca.example.invalid" not in err
 
 
 def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:

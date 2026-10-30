@@ -525,6 +525,7 @@ async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
         pytest.param(True, False, True, id="role-written"),
         pytest.param(False, False, False, id="no-role-written"),
         pytest.param(True, True, True, id="re-read-raises"),
+        pytest.param(False, True, True, id="re-read-raises-no-role"),
     ],
 )
 async def test_an_unknown_grant_outcome_clears_the_addresses_only_once_the_role_is_written(
@@ -535,8 +536,8 @@ async def test_an_unknown_grant_outcome_clears_the_addresses_only_once_the_role_
     cleared: bool,
 ) -> None:
     """Vault BACKLOG #3849 B2, repair 3: on the repair branch an out-of-contract grant clears the
-    earlier holder's known sign-in addresses only when the re-read row holds the role, as
-    SECURITY.md says, or when that re-read fails and nobody can tell. A store that wrote no role
+    earlier holder's known sign-in addresses unless the re-read finds this row without the role, as
+    SECURITY.md says. A re-read that fails leaves it unknown and clears. A store that wrote no role
     took nothing over and leaves the record alone. The no-role case is RED before repair 3, which
     cleared the record whatever the grant wrote."""
     await _roleless_row(store, "site-admin")
@@ -555,7 +556,8 @@ async def test_an_unknown_grant_outcome_clears_the_addresses_only_once_the_role_
         return outcome
 
     monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", answer)
-    with pytest.raises((FirstAdministratorRefused, sqlite3.OperationalError)):
+    raised = sqlite3.OperationalError if read_fails else FirstAdministratorRefused
+    with pytest.raises(raised):
         await _provision(service, "site-admin")
     expected = [LOGIN_ADDRESS_RESET_MARKER] if cleared else ["10.9.9.9"]
     assert await store.list_known_login_addresses("halfwritten", since=0.0) == expected

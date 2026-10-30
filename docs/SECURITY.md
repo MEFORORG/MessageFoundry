@@ -411,8 +411,8 @@ The repair also empties the account's known sign-in addresses, as an administrat
 (vault BACKLOG #3849). It does so once the role is written, beside the second session revoke, so a
 run whose grant writes no role leaves the record alone. That run has still replaced the password,
 the TOTP and the notification address. When the store answers the grant out of contract, the
-command reads the row again and clears the record only if the row holds the role, or if that read
-fails. The earlier holder's addresses then read as new at the next sign-in, so a
+command reads the row again and leaves the record only when that read finds this account without
+the role. A read that fails, or finds no verified row for it, clears the record. The earlier holder's addresses then read as new at the next sign-in, so a
 sign-in from one of them faces the first-seen challenge rather than passing as known.
 
 #### Keep a local Administrator

@@ -94,6 +94,8 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    import asyncio
+
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
@@ -8113,13 +8115,14 @@ def _offline_alert_notifier(
         notifier_from_settings,
     )
 
-    def give_up(exc: Exception) -> None:
-        # The class only, as `_build_provision_auth_service` names a secret failure: the text of
-        # a provider's error can carry its address or a reference.
-        print(
-            f"WARNING: the [alerts] notifier could not be built ({type(exc).__name__}), so this "
-            "command's alert goes to the log only.",
-            file=sys.stderr,
+    def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
+        # Resolved on each attempt, not once: the webhook alone needs no secret, so a provider
+        # this shell cannot reach must not cost it.
+        return notifier_from_settings(
+            alerts,
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
+            trust_anchor_policy=settings.tls.policy(),
+            posture=posture,
         )
 
     alerts = settings.alerts
@@ -8128,85 +8131,112 @@ def _offline_alert_notifier(
         # As `serve` with no transport: the logging sink. Nothing is resolved for it.
         return None
     emails = "email" in names
-    try:
-        if emails and not (
-            _offline_smtp_hop_unauthenticated_permitted(settings, what="alert email")
-            and _offline_smtp_relay_ca_accepted(settings, what="alert email")
-        ):
-            alerts, emails = alerts_without_email(alerts), False
-        # Once, before any build: a provider that cannot be reached fails every retry the same way.
-        provider = resolve_secret_provider(settings.secrets, posture=posture)
-        policy = settings.tls.policy()
-    except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
-        give_up(exc)
-        return None
-
-    def build(alerts: AlertsSettings) -> NotifierAlertSink | None:
-        return notifier_from_settings(
-            alerts, secret_provider=provider, trust_anchor_policy=policy, posture=posture
-        )
-
-    try:
-        return build(alerts)
-    except Exception as exc:  # noqa: BLE001 - as above
-        failure = exc
-        if emails and len(names) > 1:
+    if emails:
+        try:
+            hop_accepted = _offline_smtp_hop_unauthenticated_permitted(
+                settings, what="alert email"
+            ) and _offline_smtp_relay_ca_accepted(settings, what="alert email")
+        except Exception as exc:  # noqa: BLE001 - a check that cannot decide costs the email only
             print(
-                f"WARNING: the [alerts] notifier could not be built ({type(exc).__name__}); this "
-                "command tries again with the webhook alone, then with the email transport alone.",
+                f"WARNING: the [alerts] SMTP hop could not be checked ({type(exc).__name__}), so "
+                "no alert email is sent from this command.",
                 file=sys.stderr,
             )
-            for alone in (alerts_without_email(alerts), alerts_without_webhook(alerts)):
-                try:
-                    return build(alone)
-                except Exception as retry:  # noqa: BLE001 - as above
-                    failure = retry
-        give_up(failure)
-        return None
+            hop_accepted = False
+        if not hop_accepted:
+            alerts, emails = alerts_without_email(alerts), False
+    # The class only, here and below, as `_build_provision_auth_service` names a secret failure:
+    # the text of a provider's error can carry its address or a reference.
+    failures: list[str] = []
+    try:
+        return build(alerts)
+    except Exception as exc:  # noqa: BLE001 - best-effort channel; the grant is already written
+        failures.append(type(exc).__name__)
+    if emails and len(names) > 1:
+        print(
+            f"WARNING: the [alerts] notifier could not be built ({failures[0]}); this command "
+            "tries again with the webhook alone, then with the email transport alone.",
+            file=sys.stderr,
+        )
+        for alone, dropped in (
+            (alerts_without_email(alerts), "email"),
+            (alerts_without_webhook(alerts), "webhook"),
+        ):
+            try:
+                built = build(alone)
+            except Exception as retry:  # noqa: BLE001 - as above
+                failures.append(type(retry).__name__)
+                continue
+            print(
+                f"WARNING: the [alerts] notifier was built without the {dropped} transport, so "
+                f"this command's alert is not sent by {dropped}.",
+                file=sys.stderr,
+            )
+            return built
+    print(
+        f"WARNING: the [alerts] notifier could not be built ({', '.join(failures)}), so this "
+        "command's alert goes to the log only.",
+        file=sys.stderr,
+    )
+    return None
 
 
-#: The closes :func:`_open_within` schedules for a store that opened after its bound, held so the
-#: loop's weak task references cannot drop one mid-close.
-_LATE_STORE_CLOSES: set[Any] = set()
+#: Tasks :func:`_within` stopped waiting for, held so the loop's weak task references cannot drop
+#: one before it settles.
+_LATE_TASKS: set[Any] = set()
 
 
-async def _open_within(opener: Callable[[], Awaitable[Store]], timeout: float) -> Store:
-    """``opener()``, waited on for at most ``timeout`` seconds, else :class:`TimeoutError`.
+async def _within[T](
+    awaitable: Awaitable[T], timeout: float, on_late: Callable[[asyncio.Future[T]], None]
+) -> T:
+    """``awaitable``'s result, waited on for at most ``timeout`` seconds, else
+    :class:`TimeoutError`; ``on_late`` gets the task once it settles, when this stopped waiting first.
 
     Not ``asyncio.timeout`` around the await (vault BACKLOG #3849, repair 3): a cancel that lands
-    after the open finished but before the awaiting coroutine resumed throws into it, the opened
-    store is discarded, and nothing closes it. The open runs as its own task instead, so a result
-    is never thrown away: one that arrives in time is returned, and one that arrives after the
-    bound, or after this wait was itself cancelled, is closed when it does."""
+    after the awaited call finished but before the awaiting coroutine resumed throws into it, and
+    the result, an opened store, is discarded with nothing to close it. Nor is the task cancelled
+    at the bound: a driver cancelled mid-open can drop a handle it already holds, and a close
+    cancelled mid-way leaves one half closed. The work runs as its own task, left to finish, so a
+    result is never thrown away. A task still running when its event loop shuts down is cancelled
+    by that shutdown, and its own cancel handling then owns the cleanup."""
     import asyncio
 
-    log = logging.getLogger(__name__)
+    task = asyncio.ensure_future(awaitable)
 
-    def close_late(opened: asyncio.Future[Store]) -> None:
-        if opened.cancelled() or opened.exception() is not None:
-            return
-        closing = asyncio.ensure_future(opened.result().close())
-        _LATE_STORE_CLOSES.add(closing)
+    def hold() -> None:
+        _LATE_TASKS.add(task)
+        task.add_done_callback(_LATE_TASKS.discard)
+        task.add_done_callback(on_late)
 
-        def closed(task: asyncio.Future[None]) -> None:
-            _LATE_STORE_CLOSES.discard(task)
-            if not task.cancelled() and (exc := task.exception()) is not None:
-                log.warning(
-                    "a store opened too late did not close cleanly (%s)", type(exc).__name__
-                )
-
-        closing.add_done_callback(closed)
-
-    opening = asyncio.ensure_future(opener())
     try:
-        await asyncio.wait({opening}, timeout=timeout)
-        if not opening.done():
-            raise TimeoutError
+        await asyncio.wait({task}, timeout=timeout)
     except BaseException:
-        opening.cancel()
-        opening.add_done_callback(close_late)
+        hold()
         raise
-    return opening.result()
+    if not task.done():
+        hold()
+        raise TimeoutError
+    return task.result()
+
+
+def _close_late_store(opened: asyncio.Future[Store]) -> None:
+    """``on_late`` for the alert's store open: close a store that opened after its bound."""
+    import asyncio
+
+    if opened.cancelled() or opened.exception() is not None:
+        return
+    closing = asyncio.ensure_future(opened.result().close())
+    _LATE_TASKS.add(closing)
+    closing.add_done_callback(_LATE_TASKS.discard)
+    closing.add_done_callback(_log_late_close)
+
+
+def _log_late_close(closing: asyncio.Future[None]) -> None:
+    """``on_late`` for the alert's store close, and for a late store's: name a failure's class."""
+    if not closing.cancelled() and (exc := closing.exception()) is not None:
+        logging.getLogger(__name__).warning(
+            "the alert's store did not close cleanly (%s)", type(exc).__name__
+        )
 
 
 async def _raise_offline_administrator_granted(
@@ -8258,7 +8288,7 @@ async def _raise_offline_administrator_granted(
         return False
     store: Store | None = None
     try:
-        store = await _open_within(open_alert_store, _OFFLINE_ALERT_REOPEN_SECONDS)
+        store = await _within(open_alert_store(), _OFFLINE_ALERT_REOPEN_SECONDS, _close_late_store)
     except Exception as exc:  # noqa: BLE001 - the page goes on without the open-instance record
         log.warning(
             "could not reopen the store for the administrator_granted open alert (%s); the alert "
@@ -8271,9 +8301,9 @@ async def _raise_offline_administrator_granted(
         if store is not None:
             try:
                 # Bounded: the answer is read only once this returns, and a close that waits on a
-                # write still running would otherwise hold a True answer past the step's bound.
-                async with asyncio.timeout(_OFFLINE_ALERT_REOPEN_SECONDS):
-                    await store.close()
+                # write still running would otherwise hold a True answer past the step's bound. A
+                # close still running at the bound is left to finish, not cancelled half way.
+                await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
             except Exception as exc:  # noqa: BLE001 - the alert's answer stands
                 log.warning("the alert's store did not close cleanly (%s)", type(exc).__name__)
 
