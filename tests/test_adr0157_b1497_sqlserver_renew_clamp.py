@@ -19,6 +19,7 @@ the driver really ends a statement at the clamp, which no fake can.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -356,6 +357,63 @@ def test_a_sub_second_clamp_still_loads_on_postgres(tmp_path: Path) -> None:
     assert s.cluster.lease_renew_timeout_seconds == 0.5
 
 
+# --- the load-time warning on the SQL Server bound --------------------------------
+
+_SETTINGS_LOGGER = "messagefoundry.config.settings"
+_TWICE_THE_CLAMP = "twice lease_renew_timeout_seconds"
+
+
+def _renew_bound_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == _SETTINGS_LOGGER
+        and r.levelno == logging.WARNING
+        and _TWICE_THE_CLAMP in r.getMessage()
+    ]
+
+
+def test_sqlserver_warns_when_twice_the_clamp_reaches_the_margin(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Margin 9.0 at 10/20/30; a 4.6 clamp passes the margin check (4.6 < 9.0) but 9.2 >= 9.0."""
+    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
+    s = _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 4.6\n")
+    assert s.cluster.lease_renew_timeout_seconds == 4.6
+    (record,) = _renew_bound_warnings(caplog)
+    assert "9.0" in record.getMessage()
+
+
+def test_sqlserver_warns_at_the_shipped_timings(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The derived 4.5 at 10/20/30 is exactly half the 9.0 margin, so twice it reaches the margin.
+    Pinned because the changelog and CONFIGURATION.md say a stock SQL Server cluster warns."""
+    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
+    assert _load(tmp_path, _SQLSERVER).cluster.lease_renew_timeout_seconds == 4.5
+    assert len(_renew_bound_warnings(caplog)) == 1
+
+
+def test_postgres_does_not_warn_with_the_same_numbers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control: on Postgres the borrow and statement share one deadline, so the clamp is the bound."""
+    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
+    _load(tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 4.6\n")
+    _load(tmp_path, _POSTGRES)
+    assert _renew_bound_warnings(caplog) == []
+
+
+def test_sqlserver_with_ample_margin_does_not_warn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control: 2 x 4.4 = 8.8 < 9.0, just inside; and 2 x 2.0 well inside."""
+    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
+    _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 4.4\n")
+    _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 2.0\n")
+    assert _renew_bound_warnings(caplog) == []
+
+
 # --- against a real server -----------------------------------------------------
 
 
@@ -375,7 +433,9 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
         if 0 < settings.command_timeout <= 4:
             pytest.skip("command_timeout would end the 4 s statement before the clamp could")
         started = time.monotonic()
-        with pytest.raises(Exception, match="(?i)timeout|HYT00"):
+        # HYT00 alone: the ODBC query timeout. A bare "timeout" would also match the
+        # StoreAcquireTimeout a clamped borrow raises, which is not the bound under test.
+        with pytest.raises(Exception, match="HYT00"):
             await store._fetchone_clamped(
                 "WAITFOR DELAY '00:00:04'; SELECT 1 AS x", (), timeout_clamp=1.5
             )

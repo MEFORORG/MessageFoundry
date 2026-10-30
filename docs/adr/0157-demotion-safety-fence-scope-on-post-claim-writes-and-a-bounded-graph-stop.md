@@ -11,9 +11,13 @@
 > conjunct" line; it now binds the terminal resolves only.
 
 > **All six increments are BUILT: 0, 1, 2, 3, 4 and 5.** C1 (terminal writes only, fail-open) and C6
-> (yes, bounded, abandon-don't-await) were decided by the owner. One named residual stays open: the
-> same-process re-promotion case (Consequence 1c). The SQL Server renew clamp (Inc 0, deviation 3)
-> was BUILT on 2026-10-30 (BACKLOG #1497); the as-built note is at deviation 3.
+> (yes, bounded, abandon-don't-await) were decided by the owner. The SQL Server renew clamp (Inc 0,
+> deviation 3) was BUILT on 2026-10-30 (BACKLOG #1497); the as-built note is at deviation 3. At least
+> these residuals stay open: the same-process re-promotion case (Consequence 1c); on SQL Server, a
+> renew that can land up to about twice the clamp after it is issued, because its borrow and its
+> statement each get the full clamp while the margin check compares the clamp alone; the SQL Server
+> claim's COMMIT, which the clamp does not bound; and the SQL Server heartbeat, config-version refresh
+> and stepdown release, which still run under `[store].command_timeout`.
 >
 > **Inc 3 is BUILT (2026-09-26, BACKLOG #1497), on a measured premise.** Its gate asked whether a
 > coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. Hosted CI
@@ -371,10 +375,10 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    drafted fired on stock defaults, and a hard failure on every install is unshippable. Once the
 >    defaults pass cleanly that constraint is gone, the three neighbouring `[cluster]` validators all
 >    raise, and — CLAUDE.md §0 — with zero deployments a breaking default costs nothing to change.
-> 3. **The clamp is POSTGRES-ONLY, and that is a named residual, not an oversight.** The SQL Server
->    coordinator's renew still inherits `[store].command_timeout` from the ODBC connection; a
->    per-statement override there lives in `store/sqlserver.py`, which was held by other in-flight
->    work. `build_coordinator` therefore does not pass the clamp to `SqlServerCoordinator` at all —
+> 3. **The clamp shipped POSTGRES-ONLY on 2026-09-10, as a named residual, not an oversight.** The
+>    SQL Server coordinator's renew then inherited `[store].command_timeout` from the ODBC connection;
+>    a per-statement override there lives in `store/sqlserver.py`, which was held by other in-flight
+>    work. `build_coordinator` therefore did not pass the clamp to `SqlServerCoordinator` at all —
 >    naming a bound that does not bind is the defect in 1, one level down. The **baseline stamp** did
 >    land on both coordinators, and on SQL Server it was then the only thing keeping the margin
 >    real, which is why it was not scoped to Postgres with the clamp.
@@ -384,16 +388,19 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    `SqlServerStore._fetchone_clamped`. That sets the clamp as the pyodbc connection's statement
 >    timeout before the cursor is opened, and puts `[store].command_timeout` back afterwards, on an
 >    ordinary error too. A cancellation skips the restore, because the connection is quarantined on
->    the same exit. Three differences from Postgres, each on purpose. The timeout counts whole
->    seconds, so the clamp is rounded DOWN, never above the value `_renew_fits_the_margin` checked,
->    and never below 1, and `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp
->    under 1 s on this backend. A shorter `command_timeout` still wins, as on Postgres. And it binds
->    the claim call only: its borrow waits at most the clamp too, but unlike Postgres the borrow and
->    the statement do not share one deadline (a whole-second timeout cannot carry what a borrow
->    leaves of a 1 s clamp), so a renew can land up to about twice the clamp after it is issued,
->    while the margin check compares the clamp alone. The COMMIT after the statement is not bounded
->    by it, and the heartbeat, config-version refresh and stepdown release still run under
->    `command_timeout`.
+>    the same exit. As on Postgres, a shorter `command_timeout` still wins. Two differences from
+>    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
+>    value `_renew_fits_the_margin` checked, and never below 1, and
+>    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
+>    backend. Second, it binds the claim call only: its borrow waits at most the clamp too, but
+>    unlike Postgres the borrow and the statement do not share one deadline (a whole-second timeout
+>    cannot carry what a borrow leaves of a 1 s clamp), so a renew can land up to about twice the
+>    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
+>    statement is not bounded by it, and the heartbeat, config-version refresh and stepdown release
+>    still run under `command_timeout`. The first difference is on purpose; the second is a kept
+>    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
+>    `ServiceSettings._warn_sqlserver_renew_bound` logs a warning at load, without refusing, when
+>    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
 >    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
@@ -415,7 +422,12 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    a function of the fence/TTL pair. The 0.5 is deliberately the same fraction as
 >    `pipeline.cluster._DEMOTE_BUDGET_FRACTION`, off the same margin: the teardown and a still-in-
 >    flight renew are **concurrent**, both start at the fence moment, so each takes half and each is
->    strictly inside. An **explicitly set** clamp is still checked and still refused — never silently
+>    strictly inside. **That holds on Postgres only**, where the renew's borrow and statement share one
+>    deadline. On SQL Server each gets the full clamp (deviation 3), so the derived default is not
+>    safe by construction there: at the shipped 10/20/30 the 4.5 s clamp runs as a 4.5 s borrow plus
+>    a 4 s statement, about 8.5 s of the 9.0 s margin, and at the failover profile above (margin
+>    1.2 s, clamp floored to 1.0 s) as about 2 s, past the margin. An **explicitly set** clamp is
+>    still checked and still refused — never silently
 >    shrunk to fit, which would make the check accept everything — and a fence/TTL pair with **no
 >    margin at all** (`ttl − fence − fence_tick <= 0`, which `_fence_ordering` accepts: fence 4.0 /
 >    TTL 4.5 orders fine and leaves −0.3) is refused before the clamp is resolved, naming the pair
