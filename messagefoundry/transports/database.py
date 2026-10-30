@@ -540,9 +540,70 @@ def _odbc_literal(value: object, *, what: str, connection: str | None, refused: 
 
 def _is_remote_spelling(value: object) -> bool:
     """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`_refuse_remote_path` says what it misses."""
+    can name another host. The spelling only; :func:`_names_another_host` adds the resolved path."""
     text = str(value).strip()
     return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
+
+
+# A resolved Windows path in the device namespace, `\\?\` or `\\.\`, and its first component.
+# realpath gives one for a local drive it cannot shorten (`\\?\C:\certs\ca.pem`) and for a device
+# (`nul` resolves to `\\.\nul`), and both are local. Only `UNC` and `GLOBALROOT` there can lead to
+# another host, so those, an empty component, and every other path with two leading separators
+# are judged remote.
+_DEVICE_PATH = re.compile(r"[\\/]{2}[?.][\\/]([^\\/]*)")
+_REMOTE_DEVICE_ROOTS = frozenset({"", "UNC", "GLOBALROOT"})
+
+
+def _is_remote_target(path: str) -> bool:
+    """Whether a resolved path, or a link's target, names another host (:data:`_DEVICE_PATH`)."""
+    if not _is_remote_spelling(path):
+        return False
+    device = _DEVICE_PATH.match(path.strip())
+    return device is None or device.group(1).upper() in _REMOTE_DEVICE_ROOTS
+
+
+def _resolves_to_another_host(path: str) -> bool:
+    """Whether ``path`` resolves to another host: its ``os.path.realpath``, or, where realpath left
+    a link in place, that link's target.
+
+    On Windows, realpath follows a mapped drive to its share (``Z:\\`` resolves to
+    ``\\\\server\\share``) and a symbolic link or junction to the path it names. A link whose
+    target cannot be opened is left in place, measured on Python 3.14.7: a symbolic link to an
+    unreachable share resolves to the link itself. So each component of the result is read back
+    with ``os.readlink``, which reads the link and not its target. A path that cannot be resolved
+    or read is judged remote, so the check fails closed."""
+    try:
+        resolved = os.path.realpath(path)
+        if _is_remote_target(resolved):
+            return True
+        part = resolved
+        while True:
+            if (os.path.islink(part) or os.path.isjunction(part)) and _is_remote_target(
+                os.readlink(part)
+            ):
+                return True
+            parent = os.path.dirname(part)
+            if parent == part:
+                return False
+            part = parent
+    except (OSError, ValueError):
+        return True
+
+
+def _names_another_host(value: object) -> bool:
+    """Whether a file keyword's ``value`` can name another host: by its spelling
+    (:func:`_is_remote_spelling`), or by where each spelling the engine checks resolves
+    (:func:`_resolves_to_another_host`). What it does not catch is listed at
+    :func:`_refuse_remote_path`. A falsy value names no path, so it is not resolved."""
+    if not value:
+        return False
+    return _is_remote_spelling(value) or any(map(_resolves_to_another_host, _spellings(value)))
+
+
+def _spellings(value: object) -> tuple[str, ...]:
+    """``str(value)`` as sent, then trimmed, without repeats or empties."""
+    raw = str(value)
+    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
 
 
 def driver_file_spellings(value: object) -> tuple[str, ...]:
@@ -551,20 +612,31 @@ def driver_file_spellings(value: object) -> tuple[str, ...]:
     refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
     #3090). Any value, a ``Path`` too, is read as its ``str()``: the text the build sends and the
     remote screen reads, so the engine checks the file the driver is told to load."""
-    if not value or _is_remote_spelling(value):
+    if not value or _names_another_host(value):
         return ()
-    raw = str(value)
-    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
+    return _spellings(value)
 
 
 def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
     """Refuse a file keyword whose path is not a plain local one.
 
     A path that starts with two separators, or with the device prefix, can name another host, and
-    the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. This
-    reads the spelling only. It does not resolve the path, so a mapped drive or a link that leads
-    to another host is not caught here."""
-    if _is_remote_spelling(value):
+    the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. So
+    can a path that resolves to one: a mapped drive, or a symbolic link or junction to a share
+    (:func:`_names_another_host`, BACKLOG #2705). The value sent to the driver is unchanged; only
+    the judgement reads the resolved path.
+
+    At least these are not caught:
+
+    * a network filesystem mounted at a local path, such as an NFS or SMB mount under ``/mnt`` on
+      POSIX, or a share mounted into an NTFS folder, since the resolved path is a local one;
+    * a change after the check: it runs when the connection is built, and the driver resolves the
+      path again at each connect, so a drive mapped or a link made later is not seen.
+
+    The check can itself reach the other host: on Windows, realpath opens the path, so a link to
+    a share is followed to that share once, at the build, before it is refused. A path the check
+    cannot resolve or read is refused rather than passed."""
+    if _names_another_host(value):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
             "local path: a drive letter, or one leading separator"

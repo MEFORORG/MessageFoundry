@@ -24,7 +24,9 @@ runs before any driver is loaded.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports import database
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.database import (
     _ODBC_PARAM_ALLOWLIST,
@@ -291,6 +294,86 @@ def test_a_file_keyword_must_be_a_plain_local_path(keyword: str, path: str) -> N
     message = str(refused.value)
     assert _CONNECTION in message
     assert "files.test" not in message
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        r"\\files.test\share\certs\ca.pem",  # a mapped drive, as realpath resolves Z:\ on Windows
+        r"\\?\UNC\files.test\share\certs\ca.pem",
+        r"\\?\GLOBALROOT\Device\Mup\files.test\share\certs\ca.pem",
+        "//files.test/share/certs/ca.pem",
+    ],
+)
+def test_a_file_keyword_that_resolves_to_another_host_is_refused(
+    resolved: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2705, limb 4: a mapped drive or a link passes the spelling check, so the path it
+    resolves to is judged too. The driver is still sent the value as written; only the judgement
+    reads the resolved path. Red with ``_names_another_host`` back on the spelling alone."""
+    sent = r"Z:\certs\ca.pem"
+    monkeypatch.setattr(os.path, "realpath", lambda p: resolved)
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"sslca": sent})
+    assert "files.test" not in str(refused.value)
+    assert database.driver_file_spellings(sent) == ()  # no check opens it either
+
+
+@pytest.mark.parametrize("resolved", [r"\\?\C:\certs\ca.pem", r"\\.\nul"])
+def test_a_file_keyword_that_resolves_to_a_local_device_path_still_builds(
+    resolved: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: realpath keeps the device prefix on a local path it cannot shorten, and gives
+    one for a device (``nul`` resolves to ``\\\\.\\nul`` on Windows, which the CA check then refuses
+    unread). Both are local. The driver gets the value as written, not the resolved one."""
+    sent = r"C:\certs\ca.pem"
+    monkeypatch.setattr(os.path, "realpath", lambda p: resolved)
+    assert f"sslca={{{sent}}}" in _build(odbc_params={"sslca": sent})
+
+
+def test_a_file_keyword_that_cannot_be_resolved_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check fails closed: a path it cannot resolve is refused, not passed."""
+
+    def broken(p: object) -> str:
+        raise OSError(1, "resolve failed")
+
+    monkeypatch.setattr(os.path, "realpath", broken)
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"sslca": r"C:\certs\ca.pem"})
+
+
+def _symlink_or_skip(target: str, link: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"cannot create a symbolic link here: {exc}")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a share path is a Windows spelling")
+@pytest.mark.parametrize("directory", [False, True])
+def test_a_link_to_a_share_is_refused(tmp_path: Path, directory: bool) -> None:
+    """A real symbolic link to a share, as the file itself or as a directory on its path. realpath
+    leaves a link whose target it cannot open in place, measured on Python 3.14.7, so the link is
+    read back. ``.invalid`` never resolves, so the check reaches no host. Red with
+    ``_names_another_host`` back on the spelling alone, and red on the file case with the
+    ``os.readlink`` walk taken out."""
+    if directory:
+        _symlink_or_skip(r"\\files.invalid\share", tmp_path / "certs", directory=True)
+        sent = str(tmp_path / "certs" / "ca.pem")
+    else:
+        _symlink_or_skip(r"\\files.invalid\share\ca.pem", tmp_path / "ca.pem")
+        sent = str(tmp_path / "ca.pem")
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"sslca": sent})
+
+
+def test_a_link_to_a_local_file_still_builds(tmp_path: Path) -> None:
+    """The control: a link that resolves to a local file builds, with the link's own path sent."""
+    target = tmp_path / "real.pem"
+    target.write_text("x", encoding="ascii")
+    _symlink_or_skip(str(target), tmp_path / "ca.pem")
+    sent = str(tmp_path / "ca.pem")
+    assert f"sslca={{{sent}}}" in _build(odbc_params={"sslca": sent})
 
 
 @pytest.mark.parametrize(
