@@ -67,7 +67,6 @@ from messagefoundry.pipeline.ingress_guards import (
     strict_validation_due,
 )
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
-from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.metadata import encode_reference_value
 
@@ -618,12 +617,13 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             }
         except CodeSetError as exc:
             # A missing or unreadable file. Say so, or a later read of the set reports it missing
-            # with nothing to say why. The reason is the loader's own, redacted; it can quote a key
-            # of the set (a duplicate one, say), as the same error does when wiring loads the file.
+            # with nothing to say why. The set name and the error CLASS only, as the live sync logs
+            # it (reference_sync): the loader's text can quote a KEY (a duplicate one), which may be
+            # PHI for a patient-keyed set, and `check` writes this line into a CI log.
             log.warning(
-                "dry-run: reference set %r skipped, its file did not load: %s",
+                "dry-run: reference set %r skipped, its file did not load (%s)",
                 spec.name,
-                safe_exc(exc),
+                type(exc).__name__,
             )
             continue
         except TypeError:
