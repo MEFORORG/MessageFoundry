@@ -314,15 +314,20 @@ def test_a_failed_read_is_judged_from_the_first_error_with_no_second_stat(
     could not reach, a second look waits out the same network timeout on the event loop, whether
     the share's failure arrives as a missing name or as an EINVAL (1231,
     ERROR_NETWORK_UNREACHABLE). Red with ``os.path.isdir`` asked after every failure: it is called
-    for the path."""
+    for the path.
+
+    Only the looks AFTER the failed read count. Before it, the remote-path screen walks the path's
+    own components (BACKLOG #2705), which is a first look, and it never stats anything on a share
+    or a network drive: it stops at either before reading it."""
     path = _write(tmp_path, b"unread")
     error = _read_failure(shape)
+    looked = _record_looks(monkeypatch)
 
     def failing(*_args: Any) -> bytes | None:
+        looked.clear()
         raise error
 
     monkeypatch.setattr(database, "read_if_regular", failing)
-    looked = _record_looks(monkeypatch)
     if refused:
         with pytest.raises(ValueError, match="could not be read"):
             _build(path, spelling="sslca")

@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import sys
 import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
@@ -57,6 +58,7 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, NamedTuple
 
+from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
 from messagefoundry.auth.trust_anchors import (
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
@@ -545,65 +547,101 @@ def _is_remote_spelling(value: object) -> bool:
     return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
 
 
-# A resolved Windows path in the device namespace, `\\?\` or `\\.\`, and its first component.
-# realpath gives one for a local drive it cannot shorten (`\\?\C:\certs\ca.pem`) and for a device
-# (`nul` resolves to `\\.\nul`), and both are local. Only `UNC` and `GLOBALROOT` there can lead to
-# another host, so those, an empty component, and every other path with two leading separators
-# are judged remote.
-_DEVICE_PATH = re.compile(r"[\\/]{2}[?.][\\/]([^\\/]*)")
-_REMOTE_DEVICE_ROOTS = frozenset({"", "UNC", "GLOBALROOT"})
+#: ``GetDriveTypeW`` answers: a mapped network drive, and the two that say the volume cannot be read.
+_DRIVE_REMOTE = 4
+_DRIVE_UNREADABLE = frozenset({0, 1})  # DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR
 
 
-def _is_remote_target(path: str) -> bool:
-    """Whether a resolved path, or a link's target, names another host (:data:`_DEVICE_PATH`)."""
-    if not _is_remote_spelling(path):
+class _LeavesHost(Exception):
+    """Raised through :func:`~messagefoundry.auth.anchor_path.windows_chain` by a drive reader that
+    met a network drive, or a volume whose type it cannot read. Not an ``OSError``, which the walk
+    would catch and report as a cause."""
+
+
+class _PathEnds(Exception):
+    """Raised through the walk where a component does not exist yet: nothing past it is a link, so
+    the rest of the path is local text. Not an ``OSError``, for the same reason."""
+
+
+def _windows_drive_type(root: str) -> int:
+    """``GetDriveTypeW`` for a volume root, read locally: a mapped drive answers without the share
+    being opened, as ``tray/actions.py`` and ``auth/anchor_path.py`` read it too."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the drive type is read only on Windows")
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return int(kernel32.GetDriveTypeW(root))
+
+
+def _leaves_host_windows(
+    path: str,
+    *,
+    probe: WinProbe,
+    drive_type: Callable[[str], int],
+    cwd: str | Callable[[], str],
+) -> bool:
+    """Whether a Windows ``path`` leads off this host, judged without following it.
+
+    :func:`~messagefoundry.auth.anchor_path.windows_chain` walks the path from its volume root. It
+    reads each symbolic link or junction with ``readlink`` and splices its target in, up to its hop
+    limit, so a chain of links is followed to its end, and it stops at a share. A drive is judged by
+    ``drive_type`` before anything on it is read, so a mapped drive is caught whether its server is
+    up or down, and never opened. A component that does not exist ends the walk as local. Any other
+    stop (a share, a link to a path the walk does not read, an unreadable component, too many
+    links) means the path cannot be cleared, and it is judged remote."""
+
+    def volume_cause(root: str) -> str | None:
+        kind = drive_type(root)
+        if kind == _DRIVE_REMOTE or kind in _DRIVE_UNREADABLE:
+            raise _LeavesHost
+        return None
+
+    def probing(part: str) -> tuple[str, str | None]:
+        try:
+            return probe(part)
+        except (FileNotFoundError, NotADirectoryError):
+            raise _PathEnds from None
+
+    try:
+        _chain, cause = windows_chain(path, cwd, probing, volume_cause=volume_cause)
+    except _LeavesHost:
+        return True
+    except _PathEnds:
         return False
-    device = _DEVICE_PATH.match(path.strip())
-    return device is None or device.group(1).upper() in _REMOTE_DEVICE_ROOTS
+    return cause is not None
 
 
 def _resolves_to_another_host(path: str) -> bool:
-    """Whether ``path`` resolves to another host: its ``os.path.realpath``, or, where realpath left
-    a link in place, that link's target.
+    """Whether ``path`` leads to another host once its links and drive are resolved.
 
-    On Windows, realpath follows a mapped drive to its share (``Z:\\`` resolves to
-    ``\\\\server\\share``) and a symbolic link or junction to the path it names. A link whose
-    target cannot be opened is left in place, measured on Python 3.14.7: a symbolic link to an
-    unreachable share resolves to the link itself. So each component of the result is read back
-    with ``os.readlink``, which reads the link and not its target. A path that cannot be resolved
-    or read is judged remote, so the check fails closed."""
+    On Windows, :func:`_leaves_host_windows`. On POSIX, the spelling of ``os.path.realpath``, which
+    follows each link. A path the check cannot read is judged remote, so the check fails closed."""
     try:
-        resolved = os.path.realpath(path)
-        if _is_remote_target(resolved):
-            return True
-        part = resolved
-        while True:
-            if (os.path.islink(part) or os.path.isjunction(part)) and _is_remote_target(
-                os.readlink(part)
-            ):
-                return True
-            parent = os.path.dirname(part)
-            if parent == part:
-                return False
-            part = parent
+        if sys.platform == "win32":
+            return _leaves_host_windows(
+                path, probe=_win_probe, drive_type=_windows_drive_type, cwd=os.getcwd
+            )
+        return _is_remote_spelling(os.path.realpath(path))
     except (OSError, ValueError):
         return True
 
 
 def _names_another_host(value: object) -> bool:
     """Whether a file keyword's ``value`` can name another host: by its spelling
-    (:func:`_is_remote_spelling`), or by where each spelling the engine checks resolves
+    (:func:`_is_remote_spelling`), or by where its trimmed spelling leads
     (:func:`_resolves_to_another_host`). What it does not catch is listed at
-    :func:`_refuse_remote_path`. A falsy value names no path, so it is not resolved."""
+    :func:`_refuse_remote_path`. A falsy value names no path, so it is not resolved.
+
+    Only the trimmed spelling is walked. Windows drops trailing blanks from a path itself, and a
+    leading blank makes the rest a name under the working directory, where ``C:`` would read as a
+    stream name; the spelling check already reads the value trimmed."""
     if not value:
         return False
-    return _is_remote_spelling(value) or any(map(_resolves_to_another_host, _spellings(value)))
-
-
-def _spellings(value: object) -> tuple[str, ...]:
-    """``str(value)`` as sent, then trimmed, without repeats or empties."""
-    raw = str(value)
-    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
+    text = str(value).strip()
+    return _is_remote_spelling(text) or (bool(text) and _resolves_to_another_host(text))
 
 
 def driver_file_spellings(value: object) -> tuple[str, ...]:
@@ -614,7 +652,8 @@ def driver_file_spellings(value: object) -> tuple[str, ...]:
     remote screen reads, so the engine checks the file the driver is told to load."""
     if not value or _names_another_host(value):
         return ()
-    return _spellings(value)
+    raw = str(value)
+    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
 
 
 def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
@@ -622,24 +661,24 @@ def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> 
 
     A path that starts with two separators, or with the device prefix, can name another host, and
     the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. So
-    can a path that resolves to one: a mapped drive, or a symbolic link or junction to a share
-    (:func:`_names_another_host`, BACKLOG #2705). The value sent to the driver is unchanged; only
-    the judgement reads the resolved path.
+    can a path that resolves to one: a mapped network drive, or a symbolic link or junction, or a
+    chain of them, to a share (:func:`_names_another_host`, BACKLOG #2705). The value sent to the
+    driver is unchanged; only the judgement resolves it. On Windows the check reads each link
+    without following it and asks a drive's type rather than opening it, so it does not reach the
+    other host itself. A path it cannot clear is refused rather than passed.
 
     At least these are not caught:
 
     * a network filesystem mounted at a local path, such as an NFS or SMB mount under ``/mnt`` on
-      POSIX, or a share mounted into an NTFS folder, since the resolved path is a local one;
+      POSIX, since the resolved path is a local one;
     * a change after the check: it runs when the connection is built, and the driver resolves the
-      path again at each connect, so a drive mapped or a link made later is not seen.
-
-    The check can itself reach the other host: on Windows, realpath opens the path, so a link to
-    a share is followed to that share once, at the build, before it is refused. A path the check
-    cannot resolve or read is refused rather than passed."""
+      path again at each connect, so a drive mapped or a link made later is not seen;
+    * on Windows, a link whose stored target is an NT object path such as ``\\Device\\...``, which
+      the walk reads as a folder on the link's own drive."""
     if _names_another_host(value):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
-            "local path: a drive letter, or one leading separator"
+            "local path that stays on this host: not a share, a network drive, or a link to one"
         )
 
 
@@ -998,11 +1037,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 "(keywords are case-insensitive); give it once"
             )
         named[name] = value
-        if name in _ODBC_PATH_KEYS:
-            _refuse_remote_path(value, name=name, connection=connection)
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
+        if name in _ODBC_PATH_KEYS:  # after the text check: a value refused there is not resolved
+            _refuse_remote_path(value, name=name, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
