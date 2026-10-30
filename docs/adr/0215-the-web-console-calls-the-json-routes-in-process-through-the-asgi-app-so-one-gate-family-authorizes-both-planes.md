@@ -1,12 +1,22 @@
 # 0215 — The web console calls the JSON routes in-process through the ASGI app, so one gate family authorizes both planes
 
-- **Status:** Proposed
+- **Status:** **Accepted -- 2026-10-30, by an owner ruling given in session to the batch 459
+  Manager through AskUserQuestion.** Asked whether to accept ADR 0215 as the design for the #2603
+  build slices, the owner chose *"Accept (Recommended)"*. The build slices go ahead in order. In the
+  same sitting the owner answered two of the four questions this ADR left open. Asked whether
+  timer-driven console reads (polls with no user action) should write a grant audit row on both
+  planes or be exempt on both under `audit_all_authz`, the owner chose *"Row on both
+  (Recommended)"*. Asked whether the grant row should name the authorized JSON path with the console
+  route that caused it beside it, the owner chose *"JSON path + route (Recommended)"*. Both are
+  recorded at section 3, cost 3, and under *To resolve on acceptance*. The fourth question, on extra
+  session reads, was not put to the owner and stays open to slice 5. No code yet.
+  > **Superseded status text, kept as a record.** Until 2026-10-30 this line read: *"Proposed"*.
 - **Date:** 2026-10-29
 - **Related:** vault BACKLOG #2603 (this ADR is its research step); #1197 (console grant rows),
   #2624 (a console action has no grant row to fall back on), #2709 (the console route-gate digest),
   #2424 and #2450 (the seam snapshot's gaps), #2604 (the route guard, closed);
   [ADR 0065](0065-web-ops-dashboard.md) and
-  [ADR 0088](0088-apiclient-service-cli-extraction.md) (both amended on acceptance, section 7),
+  [ADR 0088](0088-apiclient-service-cli-extraction.md) (both amended by the build, section 7),
   [ADR 0077](0077-action-bound-step-up.md), [ADR 0083](0083-mtls-client-certificate-identity.md),
   [ADR 0150](0150-client-address-on-audit-entries.md),
   [ADR 0151](0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md),
@@ -245,13 +255,18 @@ as refused.
      `monitoring:diagnose` route, called only when the display identity holds that permission, so
      no permission is decided inline. That is 240 to 480 rows an hour per tab, and a bearer client
      gets the same rollup. Each row records the JSON path that was authorized and names the console
-     route from the extension, so an investigator can tell a console action from a bearer call.
+     route from the extension beside it, so an investigator can tell a console action from a bearer
+     call. That form is decided: owner ruling 2026-10-30, *"JSON path + route (Recommended)"*.
    - The nav poll is not the heaviest. At least `/ui/monitoring/live` (`graph_edges` and
      `metrics_history`) and `/ui/cluster/live` (`cluster_status` and `cluster_nodes`) poll every
      5 seconds with two reads each: 1,440 sub-requests and grant rows an hour per open tab, or 720
      composed. The `/ui/session-status` heartbeat is in the confinement set and makes none.
-   - Whether timer-driven reads should write grant rows at all is a question for both planes
-     together. It is listed for the owner below, not decided here.
+   - *Timer-driven reads write grant rows, on both planes.* Every authorized read writes its grant
+     row on both planes, polls included: neither plane exempts a timer-driven read under
+     `audit_all_authz`, and the poll flag changes only the idle clock. Owner ruling 2026-10-30,
+     *"Row on both (Recommended)"*. The rules that already decide which grants get a row, at least
+     the PHI-view exclusion and the narrower set when `audit_all_authz` is switched off, apply to a
+     poll exactly as to any other request.
 4. **One JSON encode and decode per call.** Measured on a stand-in FastAPI app, not the engine: a
    sub-request through an in-process transport plus decoding a 2,961-byte response took about
    0.44 ms (2,000 calls, Python 3.14.7, FastAPI 0.146.0, httpx 0.28.1). The engine's middleware
@@ -295,9 +310,12 @@ is given, now by the JSON gate. With zero deployments there is no older console 
 working. The seam digest moves and the startup handshake refuses the skew, so no compatibility shim
 is built.
 
-### 7. What this amends, once accepted
+### 7. What this amends
 
-It supersedes no ADR whole. It amends two, and their text changes only when this one is accepted.
+It supersedes no ADR whole. It amends two. This ADR was accepted on 2026-10-30, and neither ADR's
+text has been amended yet: each still describes the shipped code, which no slice has changed. Their
+text changes with the slice that changes what it describes, ADR 0088's with slice 3 and ADR 0065's
+with slice 6.
 
 - **ADR 0065.** The handler reuse in section 6 and the M2b addendum: `/ui` routes stop calling
   handlers and stop re-applying gates (`require_ui_step_up` and its family). Section 1's in-process
@@ -315,40 +333,40 @@ The files for AC-8 and AC-9 exist today. Each slice in the build order writes th
   the sign-in legs plus the read-only `identity_for_token` of `require_ui`'s step 1; and a static
   guard SHALL refuse a console module that reads the engine, the approval gate or the auth store off
   `app.state`, or calls a route's endpoint, with a planted read as its positive control.
-  → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-2** — WHEN a console route serves a browser request from address A, THE SYSTEM SHALL present
   A as the client of every sub-request it makes, so the new-address check and the audit `client`
   column read A.
-  → `tests/test_inprocess_transport.py`
+  Verified by: `tests/test_inprocess_transport.py`
 - **AC-3** — WHEN the console makes a sub-request, THE SYSTEM SHALL send exactly one
   `Authorization` header built from the session cookie, no other browser header except a passed
   body's `Content-Type` and `Content-Length`, and a scope holding no copied `state`.
-  → `tests/test_inprocess_transport.py`
+  Verified by: `tests/test_inprocess_transport.py`
 - **AC-4** — WHEN a console route outside the reviewed public and confinement sets serves a
   request, THE SYSTEM SHALL make at least one sub-request before it renders.
-  → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-5** — WHEN a timer-driven console poll makes a sub-request, THE SYSTEM SHALL leave the
   session's idle clock where it was, and SHALL write the grant row a bearer request would.
-  → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 - **AC-6** — IF a JSON route refuses a console sub-request, THEN THE SYSTEM SHALL answer the browser
   with the row of section 2's table that matches, and SHALL run no handler for that sub-request.
-  → `packaging/messagefoundry-webconsole/tests/test_console_refusal_map.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_refusal_map.py`
 - **AC-7** — WHEN a console write arrives without a same-origin proof, THE SYSTEM SHALL refuse it
   before any sub-request, and SHALL spend no budget and write no grant row.
-  → `packaging/messagefoundry-webconsole/tests/test_console_refusal_map.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_refusal_map.py`
 - **AC-8** — WHEN a browser request to a JSON route carries only the session cookie, THE SYSTEM
   SHALL answer 401, as ADR 0065 section 3 requires.
-  → `packaging/messagefoundry-webconsole/tests/test_webui_core.py::test_cookie_not_accepted_on_json_api`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_webui_core.py::test_cookie_not_accepted_on_json_api`
 - **AC-9** — WHEN a JSON route's gate is below the minimum its policy class names, THE SYSTEM SHALL
   fail the policy-table test, with a planted weaker gate as its positive control.
-  → `tests/test_security_doc_drift.py`
+  Verified by: `tests/test_security_doc_drift.py`
 - **AC-10** — WHEN the console serves an attachment or the audit export, THE SYSTEM SHALL stream
   the sub-response through the in-process transport without buffering it whole; IF the browser
   disconnects first, THEN THE SYSTEM SHALL cancel the inner request's task.
-  → `tests/test_inprocess_transport.py`
+  Verified by: `tests/test_inprocess_transport.py`
 - **AC-11** — WHEN the console views a message body, THE SYSTEM SHALL record the body view's
   surface as `console`.
-  → `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
+  Verified by: `packaging/messagefoundry-webconsole/tests/test_console_calls_json_routes.py`
 
 ## Build order
 
@@ -375,8 +393,9 @@ Each slice is one pull request, and each names what closes it.
 5. **Migrate by page group, in this order:** monitoring and status reads (with the before and after
    measurement in section 3), PHI reads, connection and message writes, step-up and action-bound
    writes, then administration. Each group removes its fields from the bundles and deletes the
-   `require_ui*` variants it no longer uses. *Closes per group:* its routes reach no seam handler,
-   by call or by reference, and the seam digest moves.
+   `require_ui*` variants it no longer uses. The first group's measurement also decides the open
+   session-read question under *To resolve on acceptance*. *Closes per group:* its routes reach no
+   seam handler, by call or by reference, and the seam digest moves.
 6. **Remove the second family.** Delete at least: `CoreHandlers`, `AdminHandlers`, `get_engine` and
    `get_gate` from `UiDeps`; the rest of the `require_ui*` factories; the console step-up spend
    machinery other than the presentation in section 2; and every test and table that pairs console
@@ -447,14 +466,20 @@ enforcement is unchanged; it stays where the handlers apply it.
 
 ## To resolve on acceptance
 
-- [ ] The owner accepts or rejects this design. Acceptance is the owner's, and this ADR stays
-      Proposed until then.
-- [ ] Timer-driven reads: should they write a grant row (under this design, 240 to 480 an hour per
+- [x] The owner accepts or rejects this design. Answered 2026-10-30 by the owner, in session to the
+      batch 459 Manager: asked whether to accept ADR 0215 as the design for the #2603 build slices,
+      the owner chose *"Accept (Recommended)"*. The Status line records it.
+- [x] Timer-driven reads: should they write a grant row (under this design, 240 to 480 an hour per
       tab for `/ui/nav-status` and 720 composed for each 5-second live page, the same as a bearer
       client polling those routes), or should both planes exempt them under `audit_all_authz`? A
       console-only exemption would re-open a plane difference, so this design does not take one.
-- [ ] Is the grant row's form right: the authorized JSON path, with the console route named beside
-      it?
+      Answered 2026-10-30 by the owner: *"Row on both (Recommended)"*. Every authorized read writes
+      a grant row on both planes, polls included; section 3, cost 3, states the rule.
+- [x] Is the grant row's form right: the authorized JSON path, with the console route named beside
+      it? Answered 2026-10-30 by the owner: *"JSON path + route (Recommended)"*. Section 3, cost 3,
+      states the form as decided.
 - [ ] After slice 5's measurement, are the extra session reads (one to three per sub-request, plus
       step 1's) acceptable, or should the gate memoise the session for the length of one browser
-      request?
+      request? Open, owned by slice 5. The batch 459 Manager did not put it to the owner and kept it
+      open (a class B decision, 2026-10-30): it is a cost question that only the before and after
+      measurement on the engine can answer, and that measurement is slice 5's first group.
