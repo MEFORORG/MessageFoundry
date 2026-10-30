@@ -118,16 +118,18 @@ class ConnScaleDriver:
         if not conn.submit_nowait(out):
             self._m.counters.deferred += 1
 
-    def send_one_each(self, *, corpus: Corpus, mix: TypeMix) -> int:
+    def send_one_each(self, *, corpus: Corpus, mix: TypeMix) -> list[int]:
         """Queue exactly one send on EVERY connection, for the warm-up (BACKLOG #3132), and return
-        how many were queued. A full buffer counts deferred, as in :meth:`_emit_one`; it cannot happen
-        on a fresh connection, but a warm-up that queued fewer than N must say so rather than wait
-        for deliveries that were never sent."""
+        the seq of each queued send, so a delivery can be pinned to the connection that sent it. A
+        full buffer counts deferred, as in :meth:`_emit_one`; it cannot happen on a fresh connection,
+        but a warm-up that queued fewer than N must say so rather than wait for deliveries that were
+        never sent."""
         sampler = corpus.sampler(mix)
-        queued = 0
+        queued: list[int] = []
         for conn in self._conns:
-            if conn.submit_nowait(corpus.next(sampler)):
-                queued += 1
+            out = corpus.next(sampler)
+            if conn.submit_nowait(out):
+                queued.append(out.seq)
             else:
                 self._m.counters.deferred += 1
         return queued

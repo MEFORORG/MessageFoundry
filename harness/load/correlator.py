@@ -20,6 +20,7 @@ The ``seq``↔control-id string mapping lives in :class:`~harness.load.corpus.Co
 from __future__ import annotations
 
 from array import array
+from collections.abc import Iterable
 
 from harness.load.metrics import LiveMetrics
 
@@ -35,7 +36,7 @@ class Correlator:
     Records into ``metrics.e2e``, which the runner swaps per phase; the ring itself spans the run.
     """
 
-    __slots__ = ("_cap", "_send_ns", "_seq_at", "_m", "_matched")
+    __slots__ = ("_cap", "_send_ns", "_seq_at", "_m", "_matched", "_undelivered")
 
     def __init__(self, capacity: int, metrics: LiveMetrics) -> None:
         if capacity <= 0:
@@ -45,6 +46,18 @@ class Correlator:
         self._seq_at: array[int] = array("q", [_EMPTY]) * capacity
         self._m = metrics
         self._matched = 0  # cumulative across phases (metrics.e2e is swapped per phase)
+        self._undelivered: set[int] = set()
+
+    def await_first_deliveries(self, seqs: Iterable[int]) -> None:
+        """Track ``seqs`` until each has arrived once, for :attr:`undelivered`. A count of arrivals
+        cannot say this: an at-least-once redelivery of one message stands in for another that
+        never arrived. The set is only as large as ``seqs``, so memory stays bounded."""
+        self._undelivered = set(seqs)
+
+    @property
+    def undelivered(self) -> int:
+        """How many of the seqs last given to :meth:`await_first_deliveries` have not arrived."""
+        return len(self._undelivered)
 
     def on_send(self, seq: int, send_ns: int) -> None:
         i = seq % self._cap
@@ -60,6 +73,7 @@ class Correlator:
         the report estimates them from ``sink_received`` vs the engine's ``written``.) A mismatch means
         the ring lapped (more in flight than ``capacity``) or the id isn't this run's — a miss."""
         self._m.counters.sink_received += 1
+        self._undelivered.discard(seq)
         i = seq % self._cap
         if self._seq_at[i] != seq:
             self._m.counters.correlation_misses += 1

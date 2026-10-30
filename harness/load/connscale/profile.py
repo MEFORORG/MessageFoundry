@@ -259,6 +259,11 @@ class ConnScaleProfile:
             if len(axis) > 1
         )
 
+    @property
+    def sandbox_ab(self) -> bool:
+        """Whether this is a sandbox A/B, the one A/B with no comparison table."""
+        return self.ab_axes() == ("sandbox_modes",)
+
     def modes(self) -> tuple[str, ...]:
         """The sweep modes to run (``both`` expands to both, in a stable order)."""
         if self.sweep_mode == "both":

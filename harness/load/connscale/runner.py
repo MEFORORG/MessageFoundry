@@ -267,7 +267,7 @@ async def run_connscale(
     # Counted at the swallow itself, so the run-level gate below does not depend on which of the
     # detail dicts above a later change keeps writing.
     ab_axis = bool(profile.ab_axes())
-    sandbox_ab = profile.ab_axes() == ("sandbox_modes",)
+    sandbox_ab = profile.sandbox_ab
     steps_missed = 0
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
@@ -280,8 +280,8 @@ async def run_connscale(
     # batch_mode (ADR 0075 Bench B) nests alongside fuse_mode: each (claim_mode, fuse, count) cell runs
     # each batching arm (B0 off / B1 on) as a distinct step, tagged on the record so the batch A/B can
     # pair them. The default single-arm (False,) iterates once ⇒ byte-identical to pre-ADR-0075. At most
-    # ONE of {claim_modes, fuse_modes, batch_modes} is multi-arm per profile (validated in profile.py),
-    # so fusion stays OFF in both batching arms (the two levers don't compose, ADR 0075).
+    # ONE of {claim_modes, fuse_modes, batch_modes, sandbox_modes} is multi-arm per profile (validated
+    # in profile.py), so fusion stays OFF in both batching arms (the two levers don't compose, ADR 0075).
     for claim_mode in profile.claim_modes:
         for fuse_mode in profile.fuse_modes:
             # sandbox_mode (BACKLOG #3132) nests beside batch_mode: each cell runs each [sandbox].mode
@@ -386,8 +386,9 @@ async def run_connscale(
     )
     # The statement-batching A/B (ADR 0075 Bench B) reuses the SAME comparator via build_batch_comparison
     # (keyed on batch_handoff_statements). It is None for a single-arm batch_modes (the pre-ADR-0075
-    # shape), and at most one of {claim, fuse, batch} is multi-arm per profile, so at most one of the
-    # three comparisons is non-None for a given run.
+    # shape), and at most one of {claim, fuse, batch, sandbox} is multi-arm per profile, so at most one
+    # of the three comparisons is non-None for a given run, and none is under a sandbox A/B, which
+    # has no comparison.
     batch_comparison: FuseModeComparison | None = build_batch_comparison(
         records, profile.batch_modes, missing_detail=batch_missing_detail
     )
@@ -460,11 +461,12 @@ async def _run_one_step(
     # On SQLite (no server backend) give each step its OWN DB file so a prior N's residue can't bleed
     # into this step's counters. On a server backend the connection comes from MEFOR_STORE_* in base_env.
     db_path: str | None = None
-    # A per-arm + per-trial tag: the fusion arm (b0/b1), the batching arm (bt0/bt1), and the trial index
-    # (t{trial}) so the two fusion arms, the two batching arms, and the ``profile.trials`` repeats of one
-    # (claim_mode, mode, count) cell never collide on the SQLite DB filename or the engine-node name
-    # (which prefixes the node's log file). A single-arm axis always emits its b0/bt0 segment, so the
-    # only string delta vs pre-ADR-0075 is the constant -bt0 insert; the measurements are unchanged.
+    # A per-arm + per-trial tag: the fusion arm (b0/b1), the batching arm (bt0/bt1), the sandbox arm
+    # (sb{sandbox_mode}), and the trial index (t{trial}) so the arms of each axis and the
+    # ``profile.trials`` repeats of one (claim_mode, mode, count) cell never collide on the SQLite DB
+    # filename or the engine-node name (which prefixes the node's log file). A single-arm axis always
+    # emits its segment, so the only string deltas vs pre-ADR-0075 are the constant -bt0 and -sboff
+    # inserts; the measurements are unchanged.
     fuse_tag = "b1" if fuse_mode else "b0"
     batch_tag = "bt1" if batch_mode else "bt0"
     tag = f"cs-{claim_mode}-{fuse_tag}-{batch_tag}-sb{sandbox_mode}-{mode}-{count}-t{trial}"
@@ -637,6 +639,7 @@ async def _run_started_step(
                 driver=driver,
                 corpus=corpus,
                 metrics=metrics,
+                correlator=correlator,
                 pid=pid,
                 timeout=profile.warmup_timeout_s,
             )
@@ -890,11 +893,14 @@ async def _warm_up(
     driver: ConnScaleDriver,
     corpus: Corpus,
     metrics: LiveMetrics,
+    correlator: Correlator,
     pid: int | None,
     timeout: float,
 ) -> SandboxReading:
     """Send one message on every connection and wait, up to ``timeout``, for each to be delivered
-    (BACKLOG #3132). Returns ``sandbox`` with the warm-up's readings added.
+    (BACKLOG #3132). Returns ``sandbox`` with the warm-up's readings added. Each send is tracked by
+    its own seq, so a redelivery on one connection cannot stand in for a connection that delivered
+    nothing, as it could in a count of the sink's arrivals.
 
     A sandbox worker spawns on its inbound's first dispatch, so under ``subprocess`` this is where
     every worker comes up, and the step's hold then measures running workers rather than spawns. The
@@ -913,18 +919,20 @@ async def _warm_up(
     hold_ack, hold_e2e = metrics.ack, metrics.e2e
     warm_e2e = Histogram()
     metrics.ack, metrics.e2e = Histogram(), warm_e2e
-    received_before = metrics.counters.sink_received
     loop = asyncio.get_running_loop()
     start = loop.time()
     try:
-        sent = driver.send_one_each(corpus=corpus, mix=_MIX)
+        seqs = driver.send_one_each(corpus=corpus, mix=_MIX)
+        sent = len(seqs)
+        # Nothing has awaited since the sends were queued, so no arrival can precede this.
+        correlator.await_first_deliveries(seqs)
         deadline = start + timeout
-        while metrics.counters.sink_received - received_before < sent and loop.time() < deadline:
+        while correlator.undelivered > 0 and loop.time() < deadline:
             await asyncio.sleep(_WARMUP_POLL_S)
         seconds = loop.time() - start
     finally:
         metrics.ack, metrics.e2e = hold_ack, hold_e2e
-    delivered = min(sent, metrics.counters.sink_received - received_before)
+    delivered = sent - correlator.undelivered
     after = None if pid is None else await asyncio.to_thread(subtree_size, pid)
     if delivered < sent:
         log.warning(
