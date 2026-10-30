@@ -128,11 +128,12 @@ here, like ADR 0014's deferred durable cross-node dedup).
 > #2272 defect 8). Only the waits are bounded: each try also lasts as long as the store takes to
 > fail. When the last try fails, the sink logs an ERROR naming the alert type and the connection,
 > and the alert stays open until a later inverse or an operator resolves it. Several inverses fire
-> once per transition, so a later one may never come. At stop, `drain_state` cancels a resolve
-> still retrying at its deadline and logs that at ERROR; a write on its first try is left running
-> as before. Three things are unchanged. An upsert is still tried once. Nothing persists a resolve
-> across a restart. An emit made with no running event loop still drops the write, and a retry
-> cannot help that case, because there is no loop to run one on.
+> once per transition, so a later one may never come. At stop, once `drain_state` has waited, no
+> write starts a retry, and a resolve then waiting out its retry backoff is cancelled and logged at
+> ERROR; a write in flight is left running as before. At least these are unchanged. An upsert is
+> still tried once. Nothing persists a resolve across a restart. An emit made with no running event
+> loop still drops the write, and a retry cannot help that case, because there is no loop to run
+> one on.
 
 ### D3 — `GET /alerts/active` + ack/resolve, RBAC `MONITORING_DIAGNOSE`
 

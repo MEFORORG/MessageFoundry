@@ -874,10 +874,12 @@ async def test_a_raise_emitted_during_a_resolve_retry_lands_after_it(
     sink.connection_restored("OB_X")
     await _spin()
     assert store.resolve_calls == 1  # the first attempt failed; the retry is waiting
-    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
-    await _spin()
-    assert store.upsert_calls == 0  # queued behind the resolve's retry, under the key's lock
-    gate.set()
+    try:
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        await _spin()
+        assert store.upsert_calls == 0  # queued behind the resolve's retry, under the key's lock
+    finally:
+        gate.set()
     await _drain(sink)
     assert store.log == ["resolve OB_X", "upsert OB_X"]
     assert store.open == {"connection_error:OB_X"}
@@ -896,15 +898,18 @@ async def test_drain_state_cancels_a_retry_still_running_at_its_deadline(
             {"type": "connection_restored", "connection": "OB_X"}, "info", on_settled=settled.append
         )
         (task,) = sink._state_tasks
-        await _spin()
-        assert store.resolve_calls == 1  # failed once, now sleeping its 30 s backoff
-        await asyncio.wait_for(sink.drain_state(0), timeout=5.0)
-        await _spin()
+        try:
+            await _spin()
+            assert store.resolve_calls == 1  # failed once, now sleeping its 30 s backoff
+            await asyncio.wait_for(sink.drain_state(0), timeout=5.0)
+            await _spin()
+        finally:
+            task.cancel()
     assert task.cancelled()
     assert store.resolve_calls == 1
     assert settled == [False]
     errors = _errors(caplog)
-    assert any("drain deadline" in e for e in errors)
+    assert any("alert-state drain ended" in e for e in errors)
     assert any("cancelled before it landed" in e and "'OB_X'" in e for e in errors)
     assert sink._state_tasks == set() and sink._state_locks == {} and sink._retrying == set()
 
@@ -923,6 +928,20 @@ async def test_drain_state_leaves_a_first_attempt_running_at_its_deadline() -> N
     store.gate.set()
     await _drain(sink)
     assert store.log == ["resolve OB_X"]
+
+
+@pytest.mark.usefixtures("no_backoff")
+async def test_no_retry_starts_once_drain_state_has_run(caplog: pytest.LogCaptureFixture) -> None:
+    # The store is about to close, so a resolve that fails after the drain gives up at once.
+    store = _FlakyResolveStore(fail=10 * _ATTEMPTS)
+    sink = NotifierAlertSink([], store=store)
+    await sink.drain_state(0)
+    with caplog.at_level(logging.WARNING, logger=_SINK_LOG):
+        sink.connection_restored("OB_X")
+        await _drain(sink)
+    assert store.resolve_calls == 1
+    (error,) = _errors(caplog)
+    assert "gave up after 1 attempt" in error
 
 
 def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:
