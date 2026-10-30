@@ -135,10 +135,17 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
-        # ADR 0157 Inc 0: the clamp on the claim/renew statement alone, in place of the inherited
-        # [store].command_timeout; SqlServerStore._fetchone_clamped says how it is applied. Unlike
-        # DbCoordinator._renew_timeout it bounds neither the borrow nor the loop's other statements.
+        # ADR 0157 Inc 0: the clamp on the claim/renew call alone; SqlServerStore._fetchone_clamped
+        # says how it is applied. Unlike DbCoordinator._renew_timeout it does not bound the loop's
+        # other statements or the stepdown's release write.
         self._renew_timeout = lease_renew_timeout_seconds
+        if lease_renew_timeout_seconds < 1.0:
+            # ServiceSettings refuses this at config load; a coordinator built another way is told.
+            log.warning(
+                "cluster: lease_renew_timeout_seconds=%s runs as 1 s on SQL Server, whose statement"
+                " timeout counts whole seconds",
+                lease_renew_timeout_seconds,
+            )
         # BACKLOG #2540: the whole-call budget for the paused tick's owner read. The store's own
         # [store].command_timeout still ends the statement first when it is the shorter of the two;
         # paused_read_budget_seconds says why that matters here.
@@ -435,10 +442,10 @@ class SqlServerCoordinator:
             # conservative direction. In lockstep with DbCoordinator._maintain_leadership, whose
             # docstring carries the full argument.
             #
-            # The claim's statement is clamped at _renew_timeout (whole seconds, rounded down) rather
-            # than [store].command_timeout (30 s, the stock lease TTL itself), so this lock is held
-            # for that clamp plus the borrow, which [store].acquire_timeout bounds. A stepdown waits
-            # on this lock for the fence timeout (acquire_leadership_lock).
+            # The claim's borrow and statement are each bounded by _renew_timeout rather than
+            # [store].acquire_timeout and [store].command_timeout (both 30 s, the stock lease TTL
+            # itself); SqlServerStore._fetchone_clamped says what that leaves unbounded. A stepdown
+            # waits on this lock for the fence timeout (acquire_leadership_lock).
             issued_at = self._monotonic()
             held = await self._claim_or_renew_lease()
             if held:

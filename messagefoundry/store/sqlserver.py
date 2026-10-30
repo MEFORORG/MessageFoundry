@@ -5208,6 +5208,12 @@ class SqlServerStore:
         limit, and a rotation's fail-closed revokes run under that lock after it. ``tests/test_store_pool_acquire_timeout.py`` pins which methods reach this borrow."""
         return self._borrow(self._settings.acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR)
 
+    def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
+        """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
+        and ``clamp_seconds``. Only the cluster lease claim/renew borrows this way
+        (:meth:`_fetchone_clamped` says why)."""
+        return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
+
     @asynccontextmanager
     async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
@@ -5437,12 +5443,18 @@ class SqlServerStore:
         return await self._fetch_rows(sql, params)
 
     async def _fetch_rows(
-        self, sql: str, params: tuple[Any, ...], statement_timeout: int | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        statement_timeout: int | None = None,
+        borrow_clamp: float | None = None,
     ) -> list[dict[str, Any]]:
-        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``statement_timeout`` is
-        ``None`` for every caller but the cluster lease claim/renew (:meth:`_statement_timeout`)."""
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``statement_timeout`` and
+        ``borrow_clamp`` are ``None`` for every caller but the cluster lease claim/renew, and
+        ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``."""
+        borrow = self._acquire() if borrow_clamp is None else self._acquire_clamped(borrow_clamp)
         async with (
-            self._acquire() as conn,
+            borrow as conn,
             self._statement_timeout(conn, statement_timeout),
             self._cursor(conn) as cur,
         ):
@@ -5470,12 +5482,18 @@ class SqlServerStore:
     async def _fetchone_clamped(
         self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
     ) -> dict[str, Any] | None:
-        """:meth:`_fetchone` with the statement bounded by ``timeout_clamp`` rather than
-        ``[store].command_timeout``, whichever is shorter (ADR 0157 Inc 0). The cluster lease
-        claim/renew is its only caller: :func:`_clamped_statement_timeout` says how the clamp becomes
-        whole seconds, and :meth:`_statement_timeout` how it is applied and put back."""
+        """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
+        claim/renew is its only caller.
+
+        Two bounds, each at most the clamp, so the call runs about twice the clamp at worst, as
+        ``DbCoordinator._call_tick`` does on Postgres. The wait for a pooled connection is the smaller
+        of the clamp and ``[store].acquire_timeout``: a renew that waited out a saturated pool past
+        the fence would otherwise still extend the lease after this node self-fenced. The statement's
+        own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+        The COMMIT and a ROLLBACK after it are not statements, so the clamp does not bound them;
+        they run under whatever bounds every other store call."""
         seconds = _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout)
-        rows = await self._fetch_rows(sql, params, seconds)
+        rows = await self._fetch_rows(sql, params, seconds, timeout_clamp)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:

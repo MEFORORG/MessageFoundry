@@ -6210,11 +6210,9 @@ class ClusterSettings(_Section):
     # take over until the lease it just re-extended expires again.
     #
     # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
-    # this is asyncpg's own per-statement `timeout=`, and it bounds every maintenance-loop statement
-    # with its borrow (BACKLOG #2523). On SQL SERVER it is the ODBC statement timeout of the
-    # claim/renew statement alone, in WHOLE SECONDS rounded down (pyodbc's timeout is an integer), so
-    # a value under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds). On
-    # both, a shorter `[store].command_timeout` still ends the statement first.
+    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER only
+    # the claim/renew, as SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused
+    # there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -6361,11 +6359,10 @@ class ClusterSettings(_Section):
         **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157 Inc 4/5) is derived
         from the same margin and bounds the source phase only.
 
-        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the renew on both coordinators. On
-        SQL Server the bound is the clamp rounded DOWN to whole seconds, so it is never above the value
-        checked here; a clamp under one second cannot be expressed there, and
-        :meth:`ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses it, because this section
-        cannot see ``[store]``."""
+        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the renew on both coordinators. The
+        SQL Server rounding, and its refusal of a sub-second clamp, are
+        :meth:`ServiceSettings._sqlserver_renew_clamp_whole_seconds`'s, because this section cannot
+        see ``[store]``."""
         tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
         margin = _detection_margin_seconds(
             self.leader_fence_timeout_seconds, self.leader_lease_ttl_seconds
@@ -7613,11 +7610,11 @@ class ServiceSettings(_InputHidingModel):
 
     @model_validator(mode="after")
     def _sqlserver_renew_clamp_whole_seconds(self) -> ServiceSettings:
-        """On SQL Server the renew clamp is the claim statement's pyodbc timeout, an integer number of
-        seconds, rounded down and never below 1 (ADR 0157 Inc 0). A clamp under one second would
-        therefore run at 1 s, a bound above the value ``ClusterSettings._renew_fits_the_margin``
-        checked, so it is refused here rather than quietly widened. The derived clamp is floored at
-        1 s and never trips this. Spans two sections, so it lives here."""
+        """On SQL Server a clamp under one second would run at 1 s
+        (``store.sqlserver._clamped_statement_timeout`` says why), a bound above the value
+        ``ClusterSettings._renew_fits_the_margin`` checked, so it is refused here rather than quietly
+        widened. The derived clamp is floored at 1 s and never trips this. Spans two sections, so it
+        lives here."""
         clamp = self.cluster.lease_renew_timeout_seconds
         if (
             self.cluster.enabled

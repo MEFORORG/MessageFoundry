@@ -388,8 +388,9 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    seconds, so the clamp is rounded DOWN, never above the value `_renew_fits_the_margin` checked,
 >    and never below 1, and `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp
 >    under 1 s on this backend. A shorter `command_timeout` still wins, as on Postgres. And it binds
->    the claim statement only: the borrow before it is bounded by `[store].acquire_timeout`, and the
->    heartbeat, config-version refresh and stepdown release still run under `command_timeout`.
+>    the claim call only: its borrow waits at most the clamp too, so the call costs about twice the
+>    clamp at worst, but the COMMIT after the statement is not bounded by it, and the heartbeat,
+>    config-version refresh and stepdown release still run under `command_timeout`.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
 >    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
@@ -710,8 +711,8 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 - Consequence 1(c): a promote, demote and re-promote in one process passes every guard, on both
   backends. Only a per-claim token closes it.
 - The SQL Server renew inherited `[store].command_timeout` until 2026-10-30 (Inc 0, deviation 3,
-  now BUILT). Its claim statement is clamped; the borrow before it and the heartbeat, config-version
-  and release statements are not.
+  now BUILT). Its claim's borrow and statement are clamped; the claim's COMMIT and the heartbeat,
+  config-version and release statements are not.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as
@@ -890,8 +891,8 @@ Plus the stalled-renew case. **The stock 30/30 `command_timeout` collision this 
 against is gone on Postgres** — Inc 0 stopped the renew inheriting `command_timeout` — but the case it
 was probing is not: a renew that stalls past the fence must still leave the fence rejecting post-claim
 writes, i.e. Inc 1 holds where Inc 5's timing argument does not. **On SQL Server the collision went
-with the clamp on 2026-10-30** (deviation 3), but a renew can still stall in its borrow, which
-`[store].acquire_timeout` bounds; construct it there.
+with the clamp on 2026-10-30** (deviation 3), but a renew can still stall in its COMMIT, which the
+clamp does not bound; construct it there.
 
 **Standing gate, every increment:** `ruff check` + `ruff format --check`, `mypy` strict, `pytest`, and the
 Windows CI legs. Local pytest **silently skips** the Postgres and SQL Server legs, so a green local run

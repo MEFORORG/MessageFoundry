@@ -133,12 +133,25 @@ class _Pool:
         self.released.append(conn)
 
 
-def _store(conn: _Conn, command_timeout: int = 30) -> Any:
+class _HangingPool:
+    """A pool whose acquire never returns: every connection is out, or the server is unreachable."""
+
+    async def acquire(self) -> _Conn:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def release(self, conn: _Conn) -> None:
+        pass
+
+
+def _store(conn: _Conn, command_timeout: int = 30, acquire_timeout: float = 30.0) -> Any:
     from messagefoundry.store.sqlserver import SqlServerStore
 
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _Pool(conn)
-    store._settings = StoreSettings(command_timeout=command_timeout)
+    store._settings = StoreSettings(
+        command_timeout=command_timeout, acquire_timeout=acquire_timeout
+    )
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store.body_copies = 0
@@ -189,13 +202,33 @@ async def test_a_cancelled_claim_quarantines_and_does_not_touch_the_timeout() ->
     task = asyncio.create_task(
         store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     )
-    while not conn.statement_timeouts:
+    while not conn.statement_timeouts and not task.done():
         await asyncio.sleep(0)
+    assert not task.done(), "the claim ended before its statement started"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert raw.assigned == [30, 4], "no restore may run beside a cancelled statement"
     assert conn.closed is True  # _borrow quarantined it
+
+
+async def test_the_claim_waits_for_a_pooled_connection_at_most_the_clamp() -> None:
+    """A renew that waited out a saturated pool past the fence would still extend the lease after
+    this node self-fenced, so the borrow is bounded by the clamp too. Control: an ordinary read on
+    the same wedged pool waits the full acquire_timeout."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    store = _store(_Conn(), acquire_timeout=1.0)
+    store._pool = _HangingPool()
+    started = time.monotonic()
+    with pytest.raises(StoreAcquireTimeout):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=0.1)
+    clamped = time.monotonic() - started
+    started = time.monotonic()
+    with pytest.raises(StoreAcquireTimeout):
+        await store._fetchone("SELECT 1", ())
+    unclamped = time.monotonic() - started
+    assert clamped < 0.6 <= unclamped, (clamped, unclamped)
 
 
 async def test_the_unclamped_read_is_unchanged() -> None:
@@ -308,8 +341,9 @@ def test_a_sub_second_clamp_still_loads_on_postgres(tmp_path: Path) -> None:
     reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* connection env) to run SQL Server tests",
 )
 async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
-    """A statement slower than the clamp ends at the clamp, not at command_timeout, and the pooled
-    connection that ran it comes back with command_timeout and still works."""
+    """A statement slower than the clamp ends at the clamp, not at command_timeout, and the store
+    still works afterwards. That the clamp is put back is pinned offline above: here every borrow
+    re-applies command_timeout, so a live read of it could not tell."""
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -322,9 +356,6 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
                 "WAITFOR DELAY '00:00:04'; SELECT 1 AS x", (), timeout_clamp=1.5
             )
         assert time.monotonic() - started < 3.5, "the clamp did not end the statement"
-        # The connection that timed out is reusable, and back under command_timeout.
-        async with store._acquire() as conn:
-            assert conn._conn.timeout == settings.command_timeout
         assert await store._fetchone("SELECT 1 AS x") == {"x": 1}
     finally:
         await store.close()
