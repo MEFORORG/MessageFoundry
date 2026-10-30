@@ -24,11 +24,11 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry
+from messagefoundry.config.wiring import ConnectionSpec, Registry
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore
-from messagefoundry.transports import file as file_transport
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -37,6 +37,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.file import FileDestination
 from messagefoundry.transports.remotefile import _RemoteError
+from tests._refusal_log_capture import record_texts
 from tests.test_remotefile_transport import _dest, _FakeClient
 
 MRN = "SYN900002"
@@ -50,17 +51,15 @@ BODY = (
 )
 
 
-class _Sink:
-    """Records the connection_error alert's detail; every other alert is ignored."""
+class _Sink(LoggingAlertSink):
+    """The default sink, which also records the connection_error alert's detail."""
 
     def __init__(self) -> None:
         self.details: list[str | None] = []
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         self.details.append(detail)
-
-    def __getattr__(self, name: str) -> object:
-        return lambda *args, **kwargs: None
+        super().connection_error(name, kind=kind, detail=detail)
 
 
 def _file_destination(directory: Path) -> FileDestination:
@@ -105,7 +104,7 @@ def _refuse_publish(monkeypatch: pytest.MonkeyPatch) -> list[OSError]:
         raised.append(PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(dst)))
         raise raised[-1]
 
-    monkeypatch.setattr(file_transport.os, "replace", refuse)
+    monkeypatch.setattr(os, "replace", refuse)  # the module file.py calls
     return raised
 
 
@@ -118,19 +117,9 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     forced = _refuse_publish(monkeypatch)
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
-        reg = Registry()
-        reg.add_outbound(
-            OutboundConnection(
-                OUT,
-                ConnectionSpec(
-                    ConnectorType.FILE,
-                    {"directory": str(out), "filename": TEMPLATE, "overwrite": True},
-                ),
-            )
-        )
         sink = _Sink()
         runner = RegistryRunner(
-            reg, store, alert_sink=sink, egress=EgressSettings(deny_by_default=False)
+            Registry(), store, alert_sink=sink, egress=EgressSettings(deny_by_default=False)
         )
         runner._destinations[OUT] = cast(DestinationConnector, _file_destination(out))
         runner._retry[OUT] = RetryPolicy(max_attempts=5)
@@ -163,7 +152,7 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     assert detail
     for text in (row["last_error"], event.reason, detail):
         assert MRN not in text
-    assert not [r for r in caplog.records if MRN in r.getMessage()]
+    assert not [r for r in caplog.records if any(MRN in t for t in record_texts(r))]
 
 
 class _EchoingClient(_FakeClient):
@@ -191,7 +180,8 @@ async def test_the_remotefile_error_text_holds_no_rendered_name(
     dest = _dest(monkeypatch, client, filename=TEMPLATE)
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
-    assert ("publish", client.ops[-1][1]) in client.ops and MRN in client.ops[-1][1]
+    (src,) = [path for op, path in client.ops if op == "publish"]
+    assert MRN in src  # the reply quoted a path that held the name
     text = str(raised.value)
     assert text.startswith("FTP rejected the operation: 550 ") and "Permission denied" in text
     assert MRN not in text and MRN not in safe_exc(raised.value)
