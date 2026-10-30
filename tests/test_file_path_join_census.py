@@ -680,6 +680,12 @@ SITES: dict[str, Site] = {
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
+        1,
+        REVIEWED,
+        "Display path for a directory listed by descriptor; every open goes by name relative to "
+        "the parent's descriptor with O_NOFOLLOW, never through this path (BACKLOG #2420).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
     ),

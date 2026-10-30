@@ -122,12 +122,11 @@ async def test_the_backups_sweep_of_its_staging_root_leaves_another_accounts_dir
     )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sweeps by its uid before the open")
 async def test_a_dead_runs_leftover_is_swept_before_the_staging_directory_is_made(
     tmp_path, monkeypatch
 ) -> None:
-    """A killed run can leave a volume full, and then making this run's own directory fails. On
-    POSIX the sweep therefore runs first, keyed on the effective uid."""
+    """A killed run can leave a volume full, and then making this run's own directory fails. The
+    sweep therefore runs first, keyed on the owner a new directory of this process gets."""
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     dead = _abandoned((tmp_path / "data").absolute(), "mefor-backup-")
     real_open = dr_backup._open_staging
@@ -240,8 +239,8 @@ def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
         # it is opened or named.
         assert unproven == [dr_backup._OUTSIDE_REASON]
     else:
-        # `fwalk` does not enter a directory that changed after it was listed.
-        assert unproven == []
+        # The descriptor walk refuses to enter it, and says so.
+        assert unproven == ["sub/ (not listed)"]
 
 
 def test_a_staging_root_that_is_a_link_is_not_walked(tmp_path) -> None:
@@ -267,3 +266,18 @@ def test_the_fail_safe_still_empties_its_own_files_in_nested_directories(tmp_pat
         f.write_bytes(b"synthetic plaintext")
     assert dr_backup._empty_files_in_place(staging) == []
     assert [f.read_bytes() for f in files] == [b"", b"", b""]
+
+
+def test_two_files_of_one_name_that_refuse_are_both_reported(tmp_path, monkeypatch) -> None:
+    """Only the nameless reason for something outside is said once; two refusing files that share a
+    name in different directories are two entries, so the report does not under-count."""
+    staging = tmp_path / "mefor-verify-own"
+    for sub in ("a", "b"):
+        (staging / sub).mkdir(parents=True)
+        (staging / sub / "extracted_store.db").write_bytes(b"synthetic plaintext")
+
+    def refuse(entry: Path, dir_fd: int | None) -> int:
+        raise PermissionError(13, "synthetic sharing violation", str(entry))
+
+    monkeypatch.setattr(dr_backup, "_open_unfollowed", refuse)
+    assert dr_backup._empty_files_in_place(staging) == ["extracted_store.db", "extracted_store.db"]

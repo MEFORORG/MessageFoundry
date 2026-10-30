@@ -53,7 +53,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -532,15 +532,18 @@ class BackupRunner:
                 raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything in one staging directory: the data dir on a SQLite store, `.mefor-staging`
-        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). This run's own
-        # directory is opened first, because the sweeps below take only what has its owner.
+        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). The sweep removes what
+        # a crashed or killed run left in the staging root. It goes by each directory's lock, never by
+        # age, so a sibling engine shard's live run survives it, and only by this account's owner:
+        # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
+        # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
+        # owner a new directory of this process gets, so a volume a killed run filled is freed before
+        # this run needs room for its own directory, and a run whose open fails still sweeps. Off the
+        # loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
-        if sys.platform != "win32":
-            # Except on POSIX, where that owner is known without a directory: a new one's st_uid is
-            # the effective uid. Swept now, so a volume a killed run filled is freed before this run
-            # needs room for its own directory. Windows has no read of the owner a new directory
-            # gets that matches `_owner_of`, so there the sweep waits for the directory.
-            await asyncio.to_thread(_sweep_owned, staging_root, os.geteuid(), own=None)
+        early_owner = await asyncio.to_thread(_process_owner)
+        if early_owner is not None:
+            await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
         loop = asyncio.get_running_loop()
         opening = loop.run_in_executor(
             None,
@@ -574,12 +577,17 @@ class BackupRunner:
         # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
         staging_leftover: str | None = None
         try:
-            # The sweep removes what a crashed or killed run left in the staging root. It goes by each
-            # directory's lock, never by age, so a sibling engine shard's live run survives it, and
-            # only by this run's owner: `.mefor-staging` inherits whatever the destination grants, so
-            # another account could plant a directory there for the teardown to run on (BACKLOG
-            # #2420). Off the loop, like the rest.
-            await asyncio.to_thread(_sweep_abandoned_staging, staging_root, owned_like=work.path)
+            # Swept again by this run's own directory's owner only where that differs, such as a
+            # share whose server sets the owner, or where the early read failed.
+            own_owner = await asyncio.to_thread(_owner_of, work.path)
+            if own_owner is None:
+                log.warning(
+                    "DR staging: cannot read the owner of %s, so %s is not swept",
+                    work.path,
+                    staging_root,
+                )
+            elif own_owner != early_owner:
+                await asyncio.to_thread(_sweep_owned, staging_root, own_owner, own=work.path)
             # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
             # leaves its decrypted copy there. Each backup sweeps it too, by the same owner rule.
             await asyncio.to_thread(_sweep_os_temp, work.path)
@@ -1604,15 +1612,61 @@ def _remove_tree(path: Path) -> bool:
     return not os.path.lexists(path)
 
 
+def _fd_walk(
+    top: Path, onerror: Callable[[OSError], object]
+) -> Iterator[tuple[str, list[str], list[str], int]]:
+    """``os.fwalk``'s shape, top down, for the POSIX fail-safe: each directory comes with a descriptor
+    and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
+    reports EVERY failure to ``onerror`` and walks on: a directory that will not list or open, or one
+    swapped for a link after it was listed, is reported, never silently skipped and never the end of
+    the walk."""
+    if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
+        raise OSError("the descriptor walk runs only on POSIX")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        stack = [(os.fspath(top), os.open(top, flags))]
+    except OSError as exc:
+        onerror(exc)
+        return
+    try:
+        while stack:
+            path, fd = stack.pop()
+            try:
+                try:
+                    entries = list(os.scandir(fd))
+                except OSError as exc:
+                    onerror(OSError(exc.errno, exc.strerror, path))
+                    continue
+                dirs: list[str] = []
+                files: list[str] = []
+                for entry in entries:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    (dirs if is_dir else files).append(entry.name)
+                yield path, dirs, files, fd
+                for name in reversed(dirs):
+                    child = os.path.join(path, name)
+                    try:
+                        stack.append((child, os.open(name, flags, dir_fd=fd)))
+                    except OSError as exc:
+                        onerror(OSError(exc.errno, exc.strerror, child))
+            finally:
+                os.close(fd)
+    finally:
+        for _path, fd in stack:
+            os.close(fd)
+
+
 #: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
-#: every caller's walk. On POSIX it is ``os.fwalk``: each directory comes with a descriptor, a child is
-#: opened relative to it, and a child directory swapped for a link after it was listed is not entered.
-#: Windows has no ``fwalk``, so there the walk goes by path and each file's final path is checked
-#: instead (see :func:`_empty_files_in_place`).
+#: every caller's walk. POSIX walks by descriptor (:func:`_fd_walk`). Windows has no such walk, so there
+#: it goes by path and each directory's and file's final path is checked instead (see
+#: :func:`_empty_files_in_place`).
 if sys.platform == "win32":
     _walk = os.walk
 else:
-    _walk = os.fwalk
+    _walk = _fd_walk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
@@ -1628,29 +1682,23 @@ def _empty_files_in_place(staging: Path) -> list[str]:
     checked, never a name it checked a moment earlier (BACKLOG #2420). Each file is opened without
     following a link, and the OPEN handle must be a regular file with one link before it is truncated:
 
-    - POSIX: ``os.fwalk`` hands over a descriptor per directory and does not enter one swapped for a
-      link after it was listed; each file is opened with ``O_NOFOLLOW`` relative to that descriptor.
+    - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
+      ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
     - Windows: ``staging`` and each directory under it are opened without following a reparse point
       that names another path, and must lie under ``staging``'s final path, or the directory is left
       unwalked and reported without its name. Each file is opened the same way, and its final path
-      must lie under ``staging``'s too, which catches a parent swapped for a junction after its check.
-      A reparse point that names no path (a cloud, deduplicated or tiered file) is opened again so its
-      filter serves it, and must still be the same file.
+      must lie under ``staging``'s too. A reparse point that names no path (a cloud, deduplicated or
+      tiered file) is opened again so its filter serves it, and must still be the same file.
 
-    What stays open: a hard link added to a file AFTER its handle was checked names the object the
-    engine checked, so it cannot point the truncate at anything else, but that object is then emptied
-    under its new name too. On Windows a junction swapped in after a directory's check and before a
-    file's open can still put that file's name in the report, though never truncate it."""
+    What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
     unproven: list[str] = []
 
     def _unlisted(exc: OSError) -> None:
-        # A descriptor-based walk can name the failure by descriptor, which is no name at all.
-        named = exc.filename if isinstance(exc.filename, (str, os.PathLike)) else None
-        unproven.append(f"{Path(named or staging).name}/ (not listed)")
+        unproven.append(f"{Path(exc.filename or staging).name}/ (not listed)")
 
     def _report(reason: str | None) -> None:
-        # Once each: the reason for a directory or file reached through a junction carries no name.
-        if reason is not None and reason not in unproven:
+        # The reason for something reached through a link carries no name, so it is said once.
+        if reason is not None and not (reason == _OUTSIDE_REASON and reason in unproven):
             unproven.append(reason)
 
     walked = False
@@ -1665,10 +1713,14 @@ def _empty_files_in_place(staging: Path) -> list[str]:
             # Checked before any of its entries is opened or named: a directory swapped for a
             # junction after its listing, or reached through one, is not walked.
             try:
-                here: str | None = _win_real_directory(Path(dirpath))
-            except OSError:
-                here = None
-            if here is None or not here.startswith(inside):
+                outside = not _win_real_directory(Path(dirpath)).startswith(inside)
+            except NotADirectoryError:
+                outside = True
+            except OSError as exc:
+                dirnames[:] = []
+                _unlisted(exc)
+                continue
+            if outside:
                 dirnames[:] = []
                 _report(_OUTSIDE_REASON)
                 continue
@@ -1682,17 +1734,12 @@ def _empty_files_in_place(staging: Path) -> list[str]:
             for name in filenames:
                 _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
     else:
-        try:
-            for dirpath, _dirnames, filenames, dirfd in _walk(
-                staging, onerror=_unlisted, follow_symlinks=False
-            ):
-                walked = True
-                for name in filenames:
-                    _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
-        except OSError as exc:  # `fwalk` raises, rather than reports, a root it cannot open
-            _unlisted(exc)
+        for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
+            walked = True
+            for name in filenames:
+                _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
     if not walked and not unproven:
-        # A root that is no directory, or that was swapped for a link, yields nothing at all.
+        # A walk that yields nothing at all and reports nothing still did not show the root empty.
         unproven.append(f"{staging.name}/ (not listed)")
     return unproven
 
@@ -1790,6 +1837,9 @@ def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
 #: Win32 constants for the fail-safe: ``FILE_FLAG_OPEN_REPARSE_POINT``, the bit a reparse tag carries
 #: when it names another path (a symbolic link, a junction), and ``FileAttributeTagInfo``.
 _WIN_OPEN_REPARSE_POINT = 0x00200000
+#: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
+#: lock file or marker planted as a link. Windows has none, and follows one there.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _WIN_NAME_SURROGATE = 0x20000000
 _WIN_FILE_ATTRIBUTE_TAG_INFO = 9
 
@@ -2107,7 +2157,7 @@ def _teardown_staging(path: Path) -> str | None:
     if os.path.lexists(path):
         try:
             for name in (_LOCK_NAME, _HELD_MARKER_NAME):
-                os.close(os.open(path / name, os.O_WRONLY | os.O_CREAT, 0o600))
+                os.close(os.open(path / name, os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW, 0o600))
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
@@ -2347,10 +2397,32 @@ def _sweep_os_temp(owned_like: Path) -> int:
     return _sweep_abandoned_staging(root, owned_like=owned_like)
 
 
+def _process_owner() -> object | None:
+    """The owner a directory this process creates gets, as :func:`_owner_of` reports it, read
+    without creating one in the staging root. ``None`` when it cannot be read.
+
+    POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
+    directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
+    default owner wherever it is made. On a share whose server sets the owner this answer differs
+    from what a directory there gets, and the backup then sweeps by its own directory's owner too."""
+    if sys.platform != "win32":
+        return os.geteuid()
+    try:
+        probe = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-"))
+    except OSError:
+        return None
+    try:
+        return _owner_of(probe)
+    finally:
+        with contextlib.suppress(OSError):
+            probe.rmdir()
+
+
 def _owner_of(path: Path) -> object | None:
     """Who owns ``path``: a uid on POSIX, an owner SID on Windows. ``None`` when it cannot be read,
-    and ``None`` for a link or any other reparse point, whose owner is never reported: Windows would
-    read through it to its target. Compared only with another ``_owner_of`` answer.
+    and ``None`` for a link or a junction, whose owner is never reported: Windows would read through
+    it to its target. A reparse point that names no other path, such as a cloud placeholder, is read
+    as itself (BACKLOG #2420). Compared only with another ``_owner_of`` answer.
 
     On Windows an elevated process's default owner is Administrators, not its user, so every elevated
     account on the box, and SYSTEM, can share one owner here."""
@@ -2358,8 +2430,10 @@ def _owner_of(path: Path) -> object | None:
         st = os.lstat(path)
     except OSError:
         return None
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & reparse:
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if stat.S_ISLNK(st.st_mode) or (
+        reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
+    ):
         return None
     if sys.platform != "win32":
         return st.st_uid
@@ -2381,10 +2455,10 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
 
     ``owned_like`` names a directory this run just created, and only a directory with its owner is a
     candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
-    standalone verify passes it for the OS temp dir, which can be shared, and each backup passes it for
-    the OS temp dir and for its own staging root, whose `.mefor-staging` inherits what the destination
-    grants. Another account could plant a directory in either holding a lock file and a marker, and
-    the teardown must never run on a tree it controls."""
+    standalone verify and each backup pass it for the OS temp dir, which can be shared. A backup sweeps
+    its own staging root, whose `.mefor-staging` inherits what the destination grants, with
+    :func:`_sweep_owned` by the same rule. Another account could plant a directory in either holding a
+    lock file and a marker, and the teardown must never run on a tree it controls."""
     owner = _owner_of(owned_like)
     if owner is None:
         log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
@@ -2426,7 +2500,7 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             )
             continue
         try:
-            fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0))
+            fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW)
         except FileNotFoundError:
             continue  # no lock file: no proof either way
         except OSError as exc:
