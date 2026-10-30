@@ -155,7 +155,6 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
-    listener_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -7783,9 +7782,8 @@ class RegistryRunner:
             return mid
 
         # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
-        encoding = listener_encoding(ic)
         try:
-            text = decode_body(raw, ic, encoding=encoding)
+            text = decode_body(raw, ic)
         except IngressGuardError as exc:
             await self._record_refused(
                 ic,
@@ -8037,11 +8035,10 @@ class RegistryRunner:
         # raw and the delivered copy (review H-3). HL7 also normalizes line endings to \r; a non-HL7
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
         # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
-        # the dry-run makes. The encoding setting reaches decode_body unresolved on purpose;
-        # listener_encoding says why.
-        encoding = listener_encoding(ic)
+        # the dry-run makes, and decode_body resolves the codec name by the dry-run's rule, so a bad
+        # name is this same ERROR row and AR rather than an escape into the transport (BACKLOG #2431).
         try:
-            text = decode_body(raw, ic, encoding=encoding)
+            text = decode_body(raw, ic)
         except IngressGuardError as exc:
             decode_err = exc.reason
             mid = await self._record_refused(

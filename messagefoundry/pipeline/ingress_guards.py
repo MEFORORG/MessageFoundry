@@ -23,8 +23,8 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 :func:`carry_binary_ingress`. So the listener carries no copy of these guards, and
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
-**The two callers still differ in at least these places.** How they resolve the codec NAME, stated
-at :func:`decode_ingress`. The declared-type sniff, which the dry-run does not run: ``messagefoundry
+**The two callers still differ in at least these places.** The declared-type sniff, which the
+dry-run does not run: ``messagefoundry
 check`` sends each fixture to every inbound, so adding the sniff there would fail an HL7 fixture on
 every X12 or FHIR inbound of a mixed config, and that choice is not this module's to make. The HL7
 parse step, which each caller runs itself: the stored ``parse error`` text differs, and the dry-run
@@ -50,7 +50,6 @@ from __future__ import annotations
 import asyncio
 import codecs
 import re
-from typing import Any
 
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
@@ -91,7 +90,6 @@ __all__ = [
     "decode_ingress",
     "ingress_encoding",
     "ingress_size_error",
-    "listener_encoding",
     "peek_max_bytes",
     "raise_if_strictly_invalid",
     "reingress_size_error",
@@ -167,18 +165,13 @@ class IngressGuardError(Exception):
 def ingress_encoding(ic: InboundConnection) -> str:
     """The charset this inbound declares for decoding received bodies (default ``utf-8``).
 
-    An explicit ``None`` in the settings means "not declared", not "no encoding", so it falls back the
-    same way an absent key does."""
+    The one rule for the codec name, read by both live listeners and the dry-run alike (BACKLOG
+    #2431). An explicit ``None`` in the settings means "not declared", not "no encoding", so it falls
+    back the same way an absent key does. Any other value is stringified, so the name is always a
+    ``str``: a value naming no codec then fails as a ``LookupError`` that :func:`decode_body` refuses,
+    never as a ``TypeError`` out of ``bytes.decode``."""
     declared = ic.spec.settings.get("encoding")
     return str(declared) if declared else "utf-8"
-
-
-def listener_encoding(ic: InboundConnection) -> Any:
-    """The ``encoding`` setting as the live listener reads it: the value as declared, unresolved.
-
-    Only an absent key falls back to ``utf-8``. How that differs from :func:`ingress_encoding`, and
-    what it costs, is stated once, at :func:`decode_ingress`."""
-    return ic.spec.settings.get("encoding", "utf-8")
 
 
 def peek_max_bytes(ic: InboundConnection) -> int:
@@ -414,33 +407,37 @@ class IngressMultipleMessagesRejected(IngressBodyRejected):
         super().__init__(MULTIPLE_MESSAGES_REJECTED_REASON)
 
 
-def decode_body(raw: str | bytes, ic: InboundConnection, *, encoding: str) -> str:
-    """Decode one received text body for ``ic`` in ``encoding`` at ``errors="strict"``; return the text.
+def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
+    """Decode one received text body for ``ic`` at ``errors="strict"``; return the text.
 
-    HL7 additionally collapses line endings to ``\\r``. A non-HL7 body is decoded verbatim, since
-    ``\\r``-normalizing JSON/XML/X12 would corrupt it. A ``str`` ``raw`` has nothing to decode, so it
-    passes through (HL7 still gets its line endings collapsed).
+    The charset is :func:`ingress_encoding`'s, resolved here so that no caller can hand in a name
+    resolved another way. HL7 additionally collapses line endings to ``\\r``. A non-HL7 body is decoded
+    verbatim, since ``\\r``-normalizing JSON/XML/X12 would corrupt it. A ``str`` ``raw`` has nothing to
+    decode, so it passes through (HL7 still gets its line endings collapsed).
 
-    A ``UnicodeDecodeError`` is the ``decode``-phase :class:`IngressGuardError`. Nothing else is
-    caught, on purpose: a bad codec name escapes to the caller, which is the live listener's rule.
-    :func:`decode_ingress` states where the dry-run parts from it."""
+    Every failure to decode is the ``decode``-phase :class:`IngressGuardError` (BACKLOG #2431): bytes
+    invalid in the charset (``UnicodeDecodeError``), a registered codec that refuses the conversion
+    (``undefined`` raises a bare ``UnicodeError``) and a name naming no text codec (``LookupError``).
+    So a listener records each as an ``ERROR`` row and NAKs, rather than letting it escape into the
+    transport with no row at all."""
     if ic.content_type.is_binary:
         raise ValueError(
             f"inbound {ic.name!r} declares binary content_type {ic.content_type.value!r}; "
             "use carry_binary_ingress (ADR 0028), never a text decode"
         )
+    encoding = ingress_encoding(ic)
     try:
         if ic.content_type is ContentType.HL7V2:
             return normalize(raw, encoding=encoding, errors="strict")
         return raw.decode(encoding) if isinstance(raw, bytes) else raw
-    except UnicodeDecodeError as exc:
+    except (UnicodeError, LookupError) as exc:
         refused = _decode_refusal(encoding, exc)
     raise IngressGuardError(refused, phase="decode")
 
 
 def _decode_refusal(encoding: str, exc: Exception) -> str:
-    """The ``decode``-phase reason, one wording for the listener's charset failure and the dry-run's
-    unknown codec. ``safe_exc`` keeps the body out of it."""
+    """The ``decode``-phase reason. ``safe_exc`` keeps the body out of it: a ``UnicodeDecodeError``'s
+    ``.object`` is the whole body, which is also why the caller raises after its handler ends."""
     return f"decode error ({encoding}): {safe_exc(exc)}"
 
 
@@ -477,23 +474,12 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     charset guard and still gets the NUL, frame-byte and size guards: the dry-run entry points accept text, and the
     transport-fed listener never does.
 
-    **One deliberate difference from the listener, and it sits in the codec name, not the guards.**
-    This resolves the name with :func:`ingress_encoding`, so an absent or ``None`` declaration decodes
-    as ``utf-8``. It also refuses an unknown codec (``LookupError``) as a ``decode`` error. The listener
-    passes :func:`listener_encoding` to :func:`decode_body` and lets both failures escape into its
-    transport.
-    ``Registry.encoding_problems`` refuses an unknown literal name at load, so the case that remains
-    live is a non-``str`` setting: ``None`` from code-first config, or an unresolved inbound ``env()``
-    reference (see ``resolved_encoding_problems`` in ``config/wiring.py``)."""
-    encoding = ingress_encoding(ic)
-    try:
-        text = decode_body(raw, ic, encoding=encoding)
-    except LookupError as exc:
-        refused = _decode_refusal(encoding, exc)
-    else:
-        check_decoded(text, ic)
-        return text
-    raise IngressGuardError(refused, phase="decode")
+    The codec name is resolved the listener's way too, inside :func:`decode_body`, so an absent or
+    ``None`` declaration decodes as ``utf-8`` on both and a name naming no codec is the same
+    ``decode`` refusal on both (BACKLOG #2431)."""
+    text = decode_body(raw, ic)
+    check_decoded(text, ic)
+    return text
 
 
 def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:

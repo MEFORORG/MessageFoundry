@@ -5426,12 +5426,12 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     **A clean pass here does NOT mean an ``env()``-supplied INBOUND encoding decodes.** Measured
     2026-09-18: both listener decode sites read ``ic.spec.settings["encoding"]`` RAW, and
     ``_source_config``'s :func:`resolve_env_settings` writes its result into a copy that is never read
-    back — so the value reaching ``bytes.decode`` is the ``EnvRef`` object itself (``TypeError``), and
-    ``ingress_guards.ingress_encoding`` stringifies the same ref into ``"EnvRef(key=...)"`` and fails
-    the preview with that as the codec name. The outbound half is fine: ``_dest_config`` resolves, so
-    an outbound ``env()`` encoding works and this pass guards it properly. Recorded here because a
-    validation pass that reads as certifying a config the runtime cannot execute is the
-    false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
+    back. ``ingress_guards.ingress_encoding``, which the listeners and the preview share since BACKLOG
+    #2431, stringifies the ref into ``"EnvRef(key=...)"``, so every message would be refused as a
+    ``decode`` ERROR row with that as the codec name. The outbound half is fine: ``_dest_config``
+    resolves, so an outbound ``env()`` encoding works and this pass guards it properly. Recorded
+    here because a validation pass that reads as certifying a config the runtime cannot execute is
+    the false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
     nothing about whether the inbound path can use a good one. Resolving the listener's encoding is a
     separate change to the ingress hot path — unfiled, and named rather than numbered."""
     problems: list[str] = []

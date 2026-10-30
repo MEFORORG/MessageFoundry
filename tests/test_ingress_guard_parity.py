@@ -28,6 +28,7 @@ from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
+    EnvRef,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -505,20 +506,67 @@ def test_the_nul_reason_is_the_listeners_stored_wording() -> None:
     )
 
 
-async def test_the_codec_name_is_where_the_two_callers_still_differ(store: MessageStore) -> None:
-    """Pins the codec-name difference ``decode_ingress``'s docstring states, so a change to it has to
-    update that docstring too. It is reported, not endorsed: the listener's side is a raise with no
-    ERROR row."""
-    ic = InboundConnection(
+def _inbound_declaring(encoding: object) -> InboundConnection:
+    """An inbound whose ``encoding`` setting holds ``encoding`` as-is, past the load-time name check."""
+    return InboundConnection(
         "in",
-        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": None}),
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": encoding}),
         router="r",
         content_type=ContentType.HL7V2,
     )
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_a_null_encoding_decodes_as_utf8_on_the_listener_as_in_the_dry_run(
+    store: MessageStore, listener: str
+) -> None:
+    """BACKLOG #2431: an explicit ``None`` is "not declared" on both callers. Before the fix the
+    listener handed ``None`` to ``bytes.decode`` and a ``TypeError`` escaped with no row at all."""
+    ic = _inbound_declaring(None)
     assert dry_run(_registry(ic), ADT_UTF8).disposition is MessageStatus.RECEIVED
 
-    with pytest.raises(TypeError):
-        await _live_rows(store, ic, ADT_UTF8, "_handle_inbound")
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert rows == [{"status": MessageStatus.RECEIVED.value, "error": None}]
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param("not-a-real-codec", id="unknown_name"),
+        pytest.param("base64", id="not_a_text_codec"),
+        pytest.param("undefined", id="refusing_codec"),
+        # What an inbound env() encoding is at the listener: the ref itself, never resolved (see
+        # resolved_encoding_problems in config/wiring.py).
+        pytest.param(EnvRef("charset"), id="unresolved_env_ref"),
+    ],
+)
+async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_callers(
+    store: MessageStore, listener: str, declared: object
+) -> None:
+    """BACKLOG #2431: a name that sets up no decode is a ``decode`` ERROR row on the listener, worded
+    as the dry-run words it. Before the fix a ``LookupError`` or ``TypeError`` escaped the listener
+    into its transport with no row."""
+    ic = _inbound_declaring(declared)
+    preview = dry_run(_registry(ic), ADT_UTF8)
+
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert preview.disposition is MessageStatus.ERROR
+    assert preview.error is not None and preview.error.startswith("decode error (")
+    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+
+
+async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:
+    """The NAK half: the MLLP listener answers an AR, as it does for bytes invalid in the charset."""
+    ic = _inbound_declaring("not-a-real-codec")
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
+
+    ack = await runner._handle_inbound(reg.inbound["in"], ADT_UTF8)
+
+    assert ack is not None and "MSA|AR|" in ack
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:
