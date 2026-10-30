@@ -187,8 +187,9 @@ def _strip_header_control_chars(value: str) -> str:
 # capturing reply as a DeliveryResponse (ADR 0013); #154 folds a CONFIGURED ALLOW-LIST of response
 # header names into that carriage so a re-ingressed answer's Handler reads them via
 # `response_get(dest).headers`. Only the allow-listed names are ever captured — NEVER all headers:
-# a partner reply header could carry sensitive data, so the allow-list is the PHI gate (the captured
-# value is then encrypted at rest exactly like the reply body/detail).
+# a partner reply header could carry sensitive data, so capture is opt-in by name. The allow-list
+# bounds which names are captured, not their values; the captured value is then encrypted at rest
+# exactly like the reply body/detail (docs/PHI.md section 3, BACKLOG #2984).
 
 
 def normalize_header_allowlist(setting: Any) -> frozenset[str]:

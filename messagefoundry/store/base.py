@@ -782,8 +782,8 @@ class QueueStore(StoreLifecycle, Protocol):
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
         ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
-        the values a Handler reads back. The connector's allow-list bounds which header names are
-        captured, not their values, so only the cipher covers an allow-listed value (BACKLOG #2984).
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
 
         ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
         every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""

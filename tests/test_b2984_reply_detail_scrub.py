@@ -3,16 +3,16 @@
 """BACKLOG #2984: the store scrubs a captured reply's ``detail``, and scrubs before it holds the writer.
 
 ``complete_with_response`` stored ``detail`` as the connector handed it, on all three backends, while
-``record_ack_sent`` ran it through ``safe_text(detail, limit=200)``. Every in-tree connector builds a
-reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, so no in-tree caller leaked, but
-the store was not the chokepoint ``docs/PHI.md`` names it as. Both methods now scrub before the writer
-lock (SQLite) or the pooled connection and its transaction (Postgres, SQL Server) is taken.
+``record_ack_sent`` ran it through ``safe_text(detail, limit=200)``. Most in-tree connectors build a
+reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, but at least X12's ``TA1*`` detail
+carries the partner's TA1-04 element verbatim, and the store was not the chokepoint ``docs/PHI.md``
+names it as. Both methods now scrub before the writer lock (SQLite) or the pooled connection and its
+transaction (Postgres, SQL Server) is taken.
 
 ``resp_headers`` is deliberately NOT scrubbed: a Handler reads the captured values back through
-``response_get(dest).headers``. The connector's per-connection allow-list (ADR 0013, amendment
-2026-07-12) bounds which header names are captured, not their values, so the cipher alone covers an
-allow-listed value at rest. ``safe_text`` over the encoded JSON would rewrite an allow-listed value
-and, once cut, make the decode return ``{}`` with no error. One test pins that it round-trips unchanged.
+``response_get(dest).headers``, and ``docs/PHI.md`` section 3 says what covers it. ``safe_text`` over
+the encoded JSON would rewrite an allow-listed value and, once cut, make the decode return ``{}`` with
+no error. One test pins that it round-trips unchanged.
 
 The Postgres and SQL Server value arms live in ``tests/test_postgres_store.py`` and
 ``tests/test_sqlserver_store.py``, which the server CI legs run; this file pins only their ordering,
@@ -111,7 +111,8 @@ async def test_in_tree_reply_details_are_unchanged(
     # At least these in-tree fixed phrases and status codes pass the scrub byte-identical, so the
     # operator's reason (and the empty and absent cases) reads exactly as before. Not every in-tree
     # detail does: MLLP's and X12's unparseable-reply details embed safe_exc text, which the store
-    # cuts again near its bound (the item 4 test below).
+    # cuts again near its bound (the item 4 test below), and a number the scrubber reads as a date,
+    # such as a capture_max_bytes cap of 20971520, reads back as [redacted].
     mid, item = await _delivered(sqlite_store)
     await sqlite_store.complete_with_response(
         item.id, body="x", outcome="accepted", detail=detail, now=101.0
@@ -178,6 +179,10 @@ async def test_server_backends_scrub_before_taking_a_connection(
     calls: list[str] = []
 
     def scrub(text: str, *, limit: int = 200) -> str:
+        # Only this test's detail stops the method, so another safe_text call ahead of the acquire
+        # cannot stand in for the detail scrub.
+        if text != _PHI_DETAIL:
+            return text
         calls.append("scrub")
         raise _Stop
 

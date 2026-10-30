@@ -1061,9 +1061,11 @@ class DeliveryResponse:
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
-      ever captured (PHI gate: a partner reply header could carry sensitive data, so it is opt-in by
-      name — never all headers). This is a **captured external value** (like the ``fhir_lookup``
-      read-only carve-out): it is read off the wire at delivery and, unlike a pure transform output,
+      ever captured: a partner reply header could carry sensitive data, so it is opt-in by name,
+      never all headers. The allow-list bounds which names are captured, not their values;
+      ``docs/PHI.md`` section 3 says what covers a captured value (BACKLOG #2984). This is a
+      **captured external value** (like the ``fhir_lookup`` read-only carve-out): it is read off
+      the wire at delivery and, unlike a pure transform output,
       reflects the partner's reply at that pass — the capture itself is deterministic per reply
       (the same names off the same reply → the same dict), so it re-ingresses re-run-stably from the
       immutable stored copy. Surfaced to a re-ingressed answer's Handler via
