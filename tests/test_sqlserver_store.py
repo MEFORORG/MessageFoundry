@@ -1956,8 +1956,10 @@ async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
     """BACKLOG #1588: ``state.namespace`` and ``state.[key]`` are BIN2, so two spellings the cache
     holds apart stay two rows, and a keyed reopen decrypts each under the AAD it was sealed with.
     Passes on every database collation, for a ``state`` table this build created: the DDL runs only
-    where the table is absent, so a reused database whose table predates it fails here, on purpose.
-    The CI legs create their database fresh. Encryption is on because the keyed symptom of a merged row is a
+    where the table is absent, so a reused database whose table predates it fails here, and that
+    failure is the defect being real on that database. The hosted ``sqlserver-store`` legs create
+    their database fresh; the on-demand self-hosted 2025 workflow reuses ``mefor_ci``, so there the
+    old ``state`` table must be dropped once before this passes. Encryption is on because the keyed symptom of a merged row is a
     CipherError when ``_load_state_cache`` rebuilds the AAD from the stored spelling. Accent and
     composed-versus-decomposed spellings ride along: BIN2 compares code points, as the cache does.
 

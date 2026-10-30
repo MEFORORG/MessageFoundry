@@ -112,8 +112,10 @@ def test_setstate_rejects_a_trailing_space_and_names_no_value() -> None:
         assert SetState(ns, key, "v").key == key
     # The JSON check beside it names no value either.
     with pytest.raises(WiringError, match="JSON-serializable") as json_exc:
-        SetState("MRN-NS", "MRN-KEY", object())
+        SetState("MRN-NS", "MRN-KEY", {"MRN-IN-VALUE": object()})
     assert "MRN" not in str(json_exc.value)
+    # Nothing chained: json's own exception carries a note naming the dict key it failed on.
+    assert json_exc.value.__cause__ is None and json_exc.value.__context__ is None
 
 
 # --- write side: applied in the handoff transaction --------------------------

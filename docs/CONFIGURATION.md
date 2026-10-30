@@ -609,7 +609,7 @@ from messagefoundry import handler, Send, SetState, state_get
 
 @handler("anonymize")
 def anonymize(msg):
-    mrn = msg["PID-3.1"].rstrip(" ")               # a state key may not end in a space
+    mrn = (msg["PID-3.1"] or "").rstrip(" ")       # a state key may not end in a space
     anon = state_get("patient_anon", mrn)          # synchronous read; None on a miss
     ops = []
     if anon is None:
@@ -629,8 +629,10 @@ def anonymize(msg):
   store backend, and the error names the field, never its value. SQL Server ignores trailing spaces
   when it compares keys, so `k` and `k ` would otherwise be one stored row there and two everywhere
   else. A field read from a fixed-width sender can carry such padding: strip it before keying on it,
-  for example `msg["PID-3.1"].rstrip(" ")`. Case and accents are compared exactly on every backend
-  (BACKLOG #1588).
+  for example `(msg["PID-3.1"] or "").rstrip(" ")`. Case and accents are compared exactly on
+  SQLite, on Postgres, and on a SQL Server database whose `state` table this release or a later one
+  created. A SQL Server `state` table created earlier keeps the database's default collation, which
+  may fold case (BACKLOG #1588).
 - **Exactly-once / re-run safety.** Because the write commits in the **same transaction** as the
   outbound rows, a crash before commit leaves **no** state (atomic with the handoff) and the attempt
   that commits applies the write **exactly once per message** — this preserves the staged pipeline's
