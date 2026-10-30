@@ -429,9 +429,15 @@ enabled Administrator the run found. Every run that grants the role also raises 
 `granted_by` set to `cli:<OS user>` (vault BACKLOG #3849). It is raised after the recovery codes
 are shown. The command builds the `[alerts]` notifier as `serve` does, and also tries to record
 the alert as an open alert the web console lists once the engine runs; that record is best
-effort. The notifier gets 15 seconds to finish. With no `[alerts]` transport configured, one this
-shell cannot build, or one that fails or does not finish in time, the alert also goes to the
-command's log output. The command then says so: as a WARNING naming the other
+effort. The store reopen, the notifier's close and the whole alert step each have a bound, set
+beside `_raise_offline_administrator_granted` in `messagefoundry/__main__.py`; when the step runs
+out, the command prints its result without it. A Ctrl-C during the step ends that wait, not the
+command. The process can still wait at exit for a call already in a worker thread, such as a
+send, the notifier build or a store driver's, until that call ends. With no `[alerts]` transport
+configured, one this shell cannot build, or one that raises on the alert or does not finish in
+time, the alert goes to the command's log output instead. A send a relay refuses is not one of
+these: the notifier logs that send's failure, and the alert counts as taken, as under `serve`.
+The command then says so: as a WARNING naming the other
 enabled Administrators when there are any, as a plain note on a first install, and under `--json`
 as `administrator_granted_alerted` set to false.
 **CORRECTED 2026-10-29:** this read "No alert goes to them, so read that row."

@@ -293,7 +293,7 @@ _CENSUS: list[Row] = sorted(
             "_raise_offline_administrator_granted",
             "posture",
         ),
-        ("__main__.py", "_provision_admin.alert", "open_store", "posture"),
+        ("__main__.py", "_provision_admin.reopen", "open_store", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),

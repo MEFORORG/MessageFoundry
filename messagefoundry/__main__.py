@@ -7869,10 +7869,22 @@ def _offline_smtp_relay_ca_accepted(settings: ServiceSettings, *, what: str) -> 
 
 #: ``via`` on the ``administrator_granted`` alert ``provision-admin`` raises (vault BACKLOG #3849 B5).
 _PROVISION_ADMIN_GRANT_VIA = "provision_admin"
-#: How long ``provision-admin`` waits, in all, for the alert's sends and its open-instance write
-#: before it closes the store. Bounded because the operator's recovery codes are shown only after
-#: it, and a relay that hangs would otherwise hold them for every transport's timeout in turn.
+#: How long ``provision-admin``'s alert step waits, in all, for the alert's sends and its
+#: open-instance write before it closes the store. The recovery codes are shown before the step
+#: starts, so this bound protects the command's result and not the codes; the step as a whole is
+#: bounded by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
 _OFFLINE_ALERT_WAIT_SECONDS = 15.0
+#: How long the alert step waits for each of the store reopen its open-instance record needs and
+#: that store's close. A store that does not open in time costs that record, not the page. It
+#: bounds an await only: a synchronous hop inside the open, such as the key provider's, is bounded
+#: by its own client's timeout and by :data:`_OFFLINE_ALERT_STEP_SECONDS`.
+_OFFLINE_ALERT_REOPEN_SECONDS = 5.0
+#: How long ``provision-admin`` waits for its whole alert step, the notifier build, the store
+#: reopen, the sends, the open-instance write and the close, before it prints its result without
+#: the step's answer. The build has no bound of its own, so a slow build can run a step past this
+#: that would have answered True; the command then reports the alert as not taken and logs the
+#: fallback, the safe direction.
+_OFFLINE_ALERT_STEP_SECONDS = 30.0
 
 
 def _offline_alert_notifier(
@@ -7945,13 +7957,13 @@ def _offline_alert_notifier(
 async def _raise_offline_administrator_granted(
     settings: ServiceSettings,
     posture: HopPosture | None,
-    store: Store | None,
+    open_alert_store: Callable[[], Awaitable[Store]],
     *,
     username: str,
     granted_by: str,
 ) -> bool:
     """Raise ``administrator_granted`` for an Administrator ``provision-admin`` just granted (vault
-    BACKLOG #3849 B5), and return whether an ``[alerts]`` notifier carried it rather than the log.
+    BACKLOG #3849 B5), and return whether an ``[alerts]`` notifier carried it.
 
     Every role grant the web console makes raises this alert. Since vault BACKLOG #2711 step 1 this
     command can add an Administrator beside directory ones that still sign in, and before this
@@ -7959,54 +7971,189 @@ async def _raise_offline_administrator_granted(
     console pages every grant too and a "beside others" condition would be one more read that can
     race.
 
-    The notifier is the one ``serve`` wires. With ``store`` set it also records the alert as an
-    open alert instance the web console lists once the engine runs (ADR 0044), best effort. Started,
-    fed and drained here, because the loop ends with the command, within
-    :data:`_OFFLINE_ALERT_WAIT_SECONDS`. No suspend window is primed: a muted key would page anyway,
-    the safe direction for one alert. The caller runs this AFTER the recovery codes are shown, so
-    a slow relay or an interrupt here never costs them.
+    The notifier is the one ``serve`` wires. When one is built, ``open_alert_store`` is called so
+    the alert also lands as an open alert instance the web console lists once the engine runs (ADR
+    0044), best effort: a store that does not open within :data:`_OFFLINE_ALERT_REOPEN_SECONDS`
+    costs that record, not the page. With no notifier nothing would record one, so the store is
+    not opened. The notifier is started, fed and drained here, because the loop ends with the
+    step, within :data:`_OFFLINE_ALERT_WAIT_SECONDS`. No suspend window is primed: a muted key
+    would page anyway, the safe direction for one alert.
 
-    True only when the notifier took the alert and closed in time. A notifier that could not be
-    built, raised on the alert, or did not finish in time leaves it to the logging sink as well,
-    and the caller then says nobody may have been paged. Best effort, and it never raises: the
-    grant is written and audited, and the page is the smaller loss."""
+    True only when the notifier took the alert and its sends closed in time. False when none was
+    built, it raised, or it did not finish in time: the CALLER then writes the logging sink's line,
+    so the line is written once whether or not this step answers at all. It never raises. Its own
+    failure lines name the exception's class only, because a provider's or driver's text can carry
+    an address. The notifier's lines are not this step's: a failed send or open-instance write is
+    logged inside :class:`NotifierAlertSink` as ``serve`` logs it, through the command's redacting
+    handler."""
     import asyncio
 
-    from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
+    log = logging.getLogger(__name__)
+    try:
+        notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
+    except Exception as exc:  # noqa: BLE001 - the grant is written; the log carries the alert
+        log.warning(
+            "the [alerts] notifier could not be built (%s), so the administrator_granted alert "
+            "goes to the log only",
+            type(exc).__name__,
+        )
+        return False
+    if notifier is None:
+        return False
+    store: Store | None = None
+    try:
+        async with asyncio.timeout(_OFFLINE_ALERT_REOPEN_SECONDS):
+            store = await open_alert_store()
+    except Exception as exc:  # noqa: BLE001 - the page goes on without the open-instance record
+        log.warning(
+            "could not reopen the store for the administrator_granted open alert (%s); the alert "
+            "is sent without it",
+            type(exc).__name__,
+        )
+    try:
+        return await _feed_offline_alert(notifier, store, username=username, granted_by=granted_by)
+    finally:
+        if store is not None:
+            try:
+                # Bounded: the answer is read only once this returns, and a close that waits on a
+                # write still running would otherwise hold a True answer past the step's bound.
+                async with asyncio.timeout(_OFFLINE_ALERT_REOPEN_SECONDS):
+                    await store.close()
+            except Exception as exc:  # noqa: BLE001 - the alert's answer stands
+                log.warning("the alert's store did not close cleanly (%s)", type(exc).__name__)
+
+
+async def _feed_offline_alert(
+    notifier: NotifierAlertSink, store: Store | None, *, username: str, granted_by: str
+) -> bool:
+    """Start ``notifier``, raise the one alert on it, and drain it within
+    :data:`_OFFLINE_ALERT_WAIT_SECONDS`. Whether it took the alert and its sends closed in time.
+
+    The open-instance write is scheduled at the emit, so it is drained BESIDE the close, on every
+    path, each against the same deadline: a hung send cannot take the write's time, nor a slow
+    write the sends'. A write still running at the deadline is left to fail as
+    :meth:`NotifierAlertSink.drain_state` says. A send still running in a worker thread at the
+    deadline cannot be recalled: it may yet page, after the caller has logged the fallback line.
+    Both, never neither.
+
+    "Took" means the notifier accepted the alert and closed in time. It is not a delivery receipt:
+    a send a relay refuses is logged by the notifier and still counts, and so does an alert an
+    ``[alerts]`` rule mutes, as ``serve`` treats it."""
+    import asyncio
 
     log = logging.getLogger(__name__)
-    notifier = await asyncio.to_thread(_offline_alert_notifier, settings, posture)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _OFFLINE_ALERT_WAIT_SECONDS
     taken = False
-    if notifier is not None:
-        try:
-            notifier.set_store(store)
-            notifier.start()
-            try:
-                notifier.administrator_granted(
-                    f"user:{username}", via=_PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
-                )
-                taken = True
-            finally:
-                # The sends first, then the state write, inside one bound.
-                async with asyncio.timeout(_OFFLINE_ALERT_WAIT_SECONDS):
-                    await notifier.aclose()
-                    await notifier.drain_state(timeout=_OFFLINE_ALERT_WAIT_SECONDS)
-        except TimeoutError:
-            taken = False
-            log.warning(
-                "the [alerts] notifier did not finish within %.0f s, so the administrator_granted "
-                "alert may not have been sent, or recorded as an open alert",
-                _OFFLINE_ALERT_WAIT_SECONDS,
-            )
-        except Exception:  # noqa: BLE001 - never raise past the caller's own output
-            taken = False
-            log.exception("the [alerts] notifier failed on the administrator_granted alert")
-    if not taken:
-        # Builds the key and swallows a sink fault, as the reconciler's raise does.
-        administrator_granted_alert(LoggingAlertSink(), granted_by=granted_by)(
-            username, _PROVISION_ADMIN_GRANT_VIA
+    try:
+        notifier.set_store(store)
+        notifier.start()
+        notifier.administrator_granted(
+            f"user:{username}", via=_PROVISION_ADMIN_GRANT_VIA, granted_by=granted_by
         )
+        taken = True
+    except Exception as exc:  # noqa: BLE001 - never raise past the caller's own output
+        log.warning(
+            "the [alerts] notifier failed on the administrator_granted alert (%s)",
+            type(exc).__name__,
+        )
+    drained = asyncio.ensure_future(notifier.drain_state(timeout=max(0.0, deadline - loop.time())))
+    try:
+        async with asyncio.timeout_at(deadline):
+            await notifier.aclose()
+    except TimeoutError:
+        taken = False
+        log.warning(
+            "the [alerts] notifier did not finish within %.0f s, so the administrator_granted "
+            "alert may not have been sent",
+            _OFFLINE_ALERT_WAIT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - as above
+        taken = False
+        log.warning("the [alerts] notifier failed while closing (%s)", type(exc).__name__)
+    await drained  # never raises, and ends by the deadline
     return taken
+
+
+def _log_administrator_granted(username: str, granted_by: str) -> None:
+    """The logging sink's ``administrator_granted`` line, ``serve``'s fallback when no notifier
+    takes the alert. Builds the key and swallows a sink fault, as the reconciler's raise does."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, administrator_granted_alert
+
+    administrator_granted_alert(LoggingAlertSink(), granted_by=granted_by)(
+        username, _PROVISION_ADMIN_GRANT_VIA
+    )
+
+
+def _run_offline_alert_step(step: Callable[[], Awaitable[bool]]) -> bool:
+    """Run ``provision-admin``'s alert step on its own event loop in a daemon thread, and wait for
+    its answer for at most :data:`_OFFLINE_ALERT_STEP_SECONDS`. The step's answer, or False, with
+    a WARNING naming why, when it did not answer in time, raised, or the wait was interrupted
+    (Ctrl-C).
+
+    In a thread because nothing inside a loop can bound the command: a send left running in a
+    worker thread at the step's own deadline held ``asyncio.run`` at its executor shutdown, for up
+    to 300 s, and a hung notifier build or store reopen held it with no bound at all. The answer is
+    read when the step's coroutine finishes, not when its loop has shut down, so the command prints
+    its result then. The process can still wait at EXIT for a call already in a worker thread, a
+    send, the notifier build or a store driver's, until that call's own timeouts end it; the result
+    is printed before that. Bounding exit too would need the process killed or the transports
+    rewritten, which this step does not do.
+
+    The wait polls, so a Ctrl-C is taken between polls on every platform. It ends the wait, not
+    the command: the account is written and its codes shown, so the caller still prints its
+    result. A thread that cannot be started is the same: no answer, and False."""
+    import threading
+    import time
+
+    from messagefoundry.last_resort import run_guarded
+
+    log = logging.getLogger(__name__)
+    answered = threading.Event()
+    answer: list[bool] = []
+
+    async def answering() -> None:
+        try:
+            answer.append(await step())
+        except Exception as exc:  # noqa: BLE001 - named now, before the loop's teardown can wait
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # Here, so the answer is read before the loop's executor shutdown.
+            answered.set()
+
+    def run() -> None:
+        try:
+            run_guarded(answering())
+        except Exception as exc:  # noqa: BLE001 - the caller logs the fallback on False
+            log.warning("the administrator_granted alert step failed (%s)", type(exc).__name__)
+        finally:
+            # And here, for a failure before the coroutine ran at all.
+            answered.set()
+
+    deadline = time.monotonic() + _OFFLINE_ALERT_STEP_SECONDS
+    try:
+        try:
+            threading.Thread(target=run, name="provision-admin-alert", daemon=True).start()
+        except RuntimeError as exc:  # "can't start new thread": the account is written regardless
+            log.warning(
+                "the administrator_granted alert step did not start (%s)", type(exc).__name__
+            )
+            return False
+        while not answered.wait(min(0.25, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "the administrator_granted alert step did not finish within %.0f s, so the "
+                    "alert may not have been sent",
+                    _OFFLINE_ALERT_STEP_SECONDS,
+                )
+                return False
+    except KeyboardInterrupt:
+        log.warning(
+            "the administrator_granted alert step was interrupted, so the alert may not have "
+            "been sent"
+        )
+        return False
+    return bool(answer) and answer[0]
 
 
 class _ProvisionStore:
@@ -8549,35 +8696,30 @@ def _provision_admin(args: argparse.Namespace) -> int:
         "`admin-reset-totp`, so create a second Administrator soon.",
     )
 
+    async def reopen() -> Store:
+        # The store opened again, as `serve` opens it, only so the alert's open instance lands in
+        # it. Called only when a notifier was built.
+        return await open_store(
+            settings.store,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
+
+    # The name alone: the step's thread can outlive this function, and `outcome` holds the codes.
+    granted = outcome.username
+
     async def alert() -> bool:
         # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every console
-        # grant does. AFTER the codes are shown, so a slow relay or an interrupt here never costs
-        # them. The store is opened again, as `serve` opens it, only so the alert's open instance
-        # lands in it; a store that does not open costs that record, not the page.
-        reopened: Store | None = None
-        try:
-            reopened = await open_store(
-                settings.store,
-                posture=posture,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            )
-        except Exception:  # noqa: BLE001 - the page goes on without the open-instance record
-            logging.getLogger(__name__).warning(
-                "could not reopen the store for the administrator_granted open alert", exc_info=True
-            )
-        try:
-            return await _raise_offline_administrator_granted(
-                settings, posture, reopened, username=outcome.username, granted_by=actor
-            )
-        finally:
-            if reopened is not None:
-                await reopened.close()
+        # grant does. AFTER the codes are shown, and bounded with an interrupt taken, so a slow
+        # relay or a Ctrl-C here costs neither the codes nor the result printed below.
+        return await _raise_offline_administrator_granted(
+            settings, posture, reopen, username=granted, granted_by=actor
+        )
 
-    try:
-        alerted = run_guarded(alert())
-    except Exception:  # noqa: BLE001 - the account and its codes are done; report, do not fail
-        logging.getLogger(__name__).exception("the administrator_granted alert step failed")
-        alerted = False
+    alerted = _run_offline_alert_step(alert)
+    if not alerted:
+        # Here, not in the step, so the line is written once, whether or not the step answered.
+        _log_administrator_granted(granted, actor)
     if args.json:
         _print_json(
             {
