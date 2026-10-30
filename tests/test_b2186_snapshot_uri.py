@@ -204,7 +204,7 @@ def bare_file_uris(source: str) -> list[tuple[int, str]]:
             visit(child, func)
 
     # A one-shot parse, not the shared cached one: these trees are not probed twice.
-    visit(ast.parse(source.removeprefix("﻿")), "")
+    visit(ast.parse(source.removeprefix("\ufeff")), "")
     return sorted(hits)
 
 
