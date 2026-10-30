@@ -1743,13 +1743,17 @@ driver reads, so check the driver's own manual.
 
 A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path: a drive
 letter, or one leading separator. A path that starts with two separators, or with a device
-prefix, is refused, because it can name another host. So is a path that leads to another host,
-such as a mapped network drive or a link to a share, and a path the check cannot clear. The
-driver still gets the value as you wrote it. On Windows the check reads links without following
-them and does not open the share. At least these are not caught, so keep those files on a local
-disk: a network filesystem mounted at a local path, and a drive mapped or a link made after the
-connection is built, since the check runs at the build and the driver resolves the path at each
-connect.
+prefix, is refused, because it can name another host. On Windows, so is a path that leads to
+another host: a mapped network drive, or a link, a chain of links or a `subst` drive that ends
+at a share. So is a path the check cannot read through. The check reads links without following
+them and asks a drive's type rather than opening it. A missing folder, or a drive letter with no
+volume on this host, is left to the driver. The driver still gets the value as you wrote it.
+
+At least these are not caught, so keep those files on a local disk:
+
+- on POSIX, anything past the spelling, including a network filesystem mounted at a local path;
+- a drive mapped or a link made after the connection is built: the check runs at the build, and
+  the driver resolves the path again at each connect.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.

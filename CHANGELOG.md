@@ -14,6 +14,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   proxy or a credential of its own needs that name listed. The `pass_environment` row of the
   `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
   setting refuses. (`BACKLOG #2587`)
+- **A generic DATABASE file keyword is refused on Windows when it leads to another host.** An
+  `SSLCA`, `SSLCAPATH`, `SSLCERT` or `SSLKEY` path on a mapped network drive, or behind a link, a
+  chain of links or a `subst` drive that ends at a share, now fails the build as a share spelling
+  already did. So does a path the check cannot read through. The Generic ODBC section of
+  [CONNECTIONS.md](docs/CONNECTIONS.md) says what is still not caught. (`BACKLOG #2705`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
