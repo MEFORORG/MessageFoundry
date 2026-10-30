@@ -2941,8 +2941,8 @@ def _unopened_cause(cipher: AesGcmCipher, stored: str) -> str:
     key_id = cipher.named_key_id(head)
     if key_id is None:
         return (
-            "its marker names no key id this cipher reads, so it is old, damaged, planted or "
-            "sealed by another cipher"
+            "its marker names no key id this cipher reads. A prior key not supplied may still "
+            "open it, or it is damaged, planted or sealed by another cipher"
         )
     if cipher.holds_key_for(head):
         return f"key {key_id} is configured and did not open it, so it is damaged or was moved"

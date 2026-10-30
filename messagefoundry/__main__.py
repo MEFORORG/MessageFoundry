@@ -10329,7 +10329,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     audit range, so a key that was rolled away from can never be active again. Until the roll commits,
     both data passes can be re-run in either direction, by this key or by the prior one made active
     again, and each skips what is already under the key it is given. A run that stops short leaves the
-    record open, so no ``serve`` start stamps its key.
+    record open, so no ``serve`` start stamps its key, unless one already did before this run: that
+    start's stamp stands and no record opens.
     """
     from pathlib import Path
 
@@ -10412,7 +10413,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -10430,9 +10431,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
             key_id = store.cipher_info().active_key_id
             # BACKLOG #3737: before anything changes, so a kill or an abort leaves it open too.
-            rotating = False
             if isinstance(store, SecretRotationMetaStore) and key_id:
-                rotating = await open_rotation_record(store, key_id, today)
+                await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
@@ -10500,7 +10500,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             last_rotated=today,
                         )
                 await close_rotation_record(store, today)
-            return count, uploads, rolled, rotating
+            return count, uploads, rolled
         finally:
             await store.close()
 
@@ -10514,7 +10514,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg), rotating = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -10602,15 +10602,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         # BACKLOG #3737: the roll is the one step that cannot be undone, so a run that skipped a file
-        # leaves it for the run that completes. The back-out is offered only to a run that is
-        # changing the key: there is no prior key to go back to otherwise.
-        print("note: the audit chain was not rolled, because this run skipped uploaded files.")
-        if rotating:
-            print(
-                "note: to go on, fix the cause and re-run. To back out, make the prior key active, "
-                "keep this key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, and re-run. The back-out is "
-                "open until the chain rolls, and it is refused if an earlier run already rolled it."
-            )
+        # leaves it for the run that completes. This run cannot see whether an earlier one rolled
+        # the chain, or whether a prior key exists, so the back-out is said conditionally.
+        print(
+            "note: the audit chain was not rolled, because this run skipped uploaded files. To go "
+            "on, fix the cause and re-run. If this run is moving the store off a prior key, you "
+            "can still back out: make that key active, keep this key in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, and re-run. The back-out is refused once any run "
+            "has rolled the chain to this key."
+        )
         return 1
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under

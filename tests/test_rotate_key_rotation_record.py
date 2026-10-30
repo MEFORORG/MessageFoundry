@@ -16,6 +16,7 @@ it, and it fails the run the way any skip does."""
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 from pathlib import Path
 
@@ -211,7 +212,7 @@ def test_a_partial_run_leaves_the_prior_key_usable_for_a_back_out(
     captured = capsys.readouterr()
     assert "PARTIAL:" in captured.out
     assert "the audit chain was not rolled" in captured.out
-    assert "To back out, make the prior key active" in captured.out
+    assert "you can still back out: make that key active" in captured.out
     assert "Do NOT remove" not in captured.err  # no roll was attempted, so none failed
 
     for path in planted:
@@ -249,21 +250,6 @@ def test_a_run_with_the_same_key_opens_no_record(
     assert main(["rotate-key", "--db", str(db)]) == 0
     capsys.readouterr()
     assert ROTATION_RECORD_ID not in asyncio.run(_rows(db, key_a))
-
-
-def test_a_same_key_run_that_skips_offers_no_back_out(
-    rig: tuple[Path, Path, str, str],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """It changed no key, so there is no prior key to go back to."""
-    db, uploads, key_a, _key_b = rig
-    _plant_unopenable_upload(uploads)
-    _env(monkeypatch, key_a, "", uploads)
-    assert main(["rotate-key", "--db", str(db)]) == 1
-    out = capsys.readouterr().out
-    assert "the audit chain was not rolled" in out
-    assert "To back out" not in out
 
 
 def test_a_key_changed_with_no_rotate_key_still_stamps(tmp_path: Path) -> None:
@@ -355,14 +341,18 @@ def test_an_unreadable_record_fails_toward_not_stamping(
     assert "the rotation record could not be read" in caplog.text
 
 
-def test_a_store_with_no_stamp_yet_persists_none_while_the_record_stands(tmp_path: Path) -> None:
-    """Nothing is written, so the completing run still stamps. The start still tracks an age floor,
-    as a first start does, so an undetermined age does not refuse a store that has never had one."""
+def test_a_store_with_no_stamp_yet_ages_from_the_record_and_persists_nothing(
+    tmp_path: Path,
+) -> None:
+    """Nothing is written, so the completing run still stamps. The key's age runs from the day the
+    record opened, and a re-run's open keeps that day. A floor of today would restart at every
+    start, and a key held that way could never go overdue."""
     db, key = tmp_path / "first.db", generate_key()
 
-    async def run() -> tuple[bool, str | None]:
+    async def run() -> tuple[bool, str | None, datetime.date, datetime.date]:
         store = await _open(db, key)
         try:
+            await open_rotation_record(store, _key_id(key), "2020-02-02")
             await open_rotation_record(store, _key_id(key), "2026-10-30")
             stamps = await reconcile_rotation_meta(
                 store,
@@ -372,13 +362,41 @@ def test_a_store_with_no_stamp_yet_persists_none_while_the_record_stands(tmp_pat
                 env_values={},
             )
             rows = await store.get_secret_rotation_meta()
-            return _DEK in rows, stamps[_DEK].fingerprint
+            stamp = stamps[_DEK]
+            return _DEK in rows, stamp.fingerprint, stamp.tracked_since, stamp.last_rotated
         finally:
             await store.close()
 
-    persisted, tracked = asyncio.run(run())
+    persisted, tracked, since, rotated = asyncio.run(run())
     assert not persisted
     assert tracked == dek_fingerprint(_key_id(key))
+    assert since == rotated == datetime.date(2020, 2, 2)
+
+
+def test_an_unreadable_record_logs_only_that_it_is_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing says a run ever started, so the line about an unfinished one would be false."""
+    db, key_a, key_b = tmp_path / "one.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def plant() -> None:
+        store = await _open(db, key_a)
+        try:
+            await store.upsert_secret_rotation_meta(
+                ROTATION_RECORD_ID,
+                fingerprint="garbage",
+                tracked_since="2026-10-30",
+                last_rotated="2026-10-30",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(plant())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
+        asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert "the rotation record could not be read" in caplog.text
+    assert "rotate-key has not completed" not in caplog.text
 
 
 def test_the_record_is_never_read_as_a_credential(tmp_path: Path) -> None:

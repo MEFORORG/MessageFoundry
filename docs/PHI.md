@@ -627,10 +627,13 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before it changes
    anything and closes it only when a run completes, so a killed or failed run leaves it open. While
    it names the key in use, or cannot be read, `serve` logs a WARNING and reads the key's age from
-   the prior date, and under `[security].enforcement = enforce` that date can refuse the start
-   ([`[secret_rotation]`](CONFIGURATION.md)). A key changed with no `rotate-key` still stamps at the
+   the prior date, or from the date the record opened where there is none, and under
+   `[security].enforcement = enforce` that date can refuse the start
+   ([`[secret_rotation]`](CONFIGURATION.md)). A key changed with no record still stamps at the
    next start, including a start between setting the new key and the first run, so a stamp proves
-   a changed key, not that a `rotate-key` ran. **A run that skipped an
+   a changed key, not that a `rotate-key` ran. Do not start `serve` between setting a new key and
+   running `rotate-key`: that stamp stands however the run ends, and backing out to the prior key
+   then stamps that key as changed too. **A run that skipped an
    upload does not roll the audit chain**, because that roll cannot be undone: a key keys one audit
    range, so the prior key can never be active again after it. Until the chain rolls you can
    back out: make the prior key active, keep the new key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`,
