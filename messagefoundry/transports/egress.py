@@ -26,6 +26,7 @@ from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, Egr
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
+from messagefoundry.transports.proxy_address import parse_proxy_url
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
     refuse_url_credentials,
@@ -261,16 +262,27 @@ def _check_forward_proxy_egress(
         url_scheme(
             proxy_url, f"{label} proxy_url", use="proxy_user/proxy_password", error=WiringError
         )
-    except WiringError:
+        # The one parse the connector dials from (vault BACKLOG #2965). urlsplit and urllib's
+        # proxy parser read another host from some values, so the gate judges the parsed host and
+        # port, and a value the two could read differently is refused here, at load. The refusal
+        # is fixed text and carries no part of the value.
+        address = parse_proxy_url(proxy_url)
+    except ValueError as exc:
         # The egress-denied WARNING this arm's other refusals write; it names the connection only.
         log.warning("egress denied: %s forward proxy URL cannot be parsed", label)
-        raise
-    if not _http_egress_allowed(proxy_url, allowed_proxy):
+        if isinstance(exc, WiringError):
+            raise
+        raise WiringError(
+            f"{label}: the forward proxy host is withheld and cannot be checked against "
+            f"[egress].allowed_proxy. {exc}"
+        ) from None
+    if not host_port_allowed(address.hostname, address.port, allowed_proxy):
         # The four HTTP-family allowlist arms in this module print the host through
         # url_host_label. refuse_url_credentials, which the other three run first and this one
         # cannot (a proxy may carry its own userinfo), still passes shapes whose hostname is a
-        # username or token head, so none of them may print it raw (BACKLOG #1793, #2686).
-        host = url_host_label(proxy_url)
+        # username or token head, so none of them may print it raw (BACKLOG #1793, #2686). Here
+        # it reads the rebuilt URL, which carries no userinfo, path, query or fragment.
+        host = url_host_label(address.label_url)
         log.warning(
             "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
         )
