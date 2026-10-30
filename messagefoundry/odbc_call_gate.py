@@ -25,7 +25,6 @@ cursor's ``_impl``, as aioodbc 0.5.0 names them.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import logging
 import threading
@@ -89,7 +88,11 @@ class CallGate:
                     self._close_locked(deferred, reraise=False)
 
     def abandon(self, raw_cursor: Any) -> None:
-        """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop."""
+        """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop.
+
+        Call it BEFORE handing over the connection's close (:meth:`close_after_running_call` or
+        :meth:`close`). A cursor abandoned after a close already drained the list stays in it, and
+        the collector frees it after its connection closed."""
         self._abandoned.append(raw_cursor)
 
     def close_after_running_call(self, raw_conn: Any) -> bool:
@@ -198,21 +201,29 @@ async def close_one_shot(conn: Any, cur: Any) -> None:
 
     **A cancellation cannot cut the close short.** The handle is dropped before the job is
     scheduled, so aioodbc's ``__del__`` never closes it, and the job is awaited through
-    :func:`asyncio.shield`: the cancellation propagates at once, and the job still closes the
-    cursor once, then the connection once, whether it was waiting for a worker or running. An
-    ungated connection gets a gate of its own for the job, whose lock nothing else contends.
+    :func:`asyncio.wait`, which never cancels what it waits on: the cancellation propagates at
+    once, and the job still closes the cursor once, then the connection once, whether it was
+    waiting for a worker or running. Its outcome is logged by the job's own callback. An ungated
+    connection gets a gate of its own for the job, whose lock nothing else contends.
 
     A connection or cursor with no raw handle (a stand-in) is closed through its own ``close``
-    methods instead, best effort."""
+    methods instead, best effort, and a cancellation can cut that short. A real aioodbc cursor
+    with no ``_impl`` takes that path too, which is logged at ERROR, as an ungateable connection
+    is: aioodbc renamed what this reads."""
     raw = getattr(conn, "_conn", None)
     raw_cur = getattr(cur, "_impl", None)
     if raw is None or (cur is not None and raw_cur is None):
+        if raw is not None and type(cur).__module__.startswith("aioodbc"):
+            log.error(
+                "odbc: aioodbc %s has no _impl; a one-shot close is not run as one job through"
+                " the call gate (BACKLOG #2394)",
+                type(cur).__qualname__,
+            )
         await _close_through_methods(conn, cur)
         return
     closing = _hand_off(conn, raw, raw_cur, call_gate(conn) or CallGate(), logging.DEBUG)
     if closing is not None:
-        with contextlib.suppress(Exception):  # the close's own callback logs it
-            await asyncio.shield(closing)
+        await asyncio.wait((closing,))
 
 
 def _hand_off(
@@ -234,10 +245,9 @@ def _schedule_close(
     """Run ``close`` on ``conn``'s executor, where aioodbc runs its calls, and log a failure at
     ``level``. ``None`` when the executor refused the work, at loop teardown: pyodbc then closes
     the handle when it is collected."""
+    loop = asyncio.get_running_loop()  # outside the try: no loop is a caller's bug, not teardown
     try:
-        closing = asyncio.get_running_loop().run_in_executor(
-            getattr(conn, "_executor", None), close
-        )
+        closing = loop.run_in_executor(getattr(conn, "_executor", None), close)
     except RuntimeError:  # the executor is shut down; see the docstring
         log.warning(
             "odbc: could not schedule the close of a one-shot connection; it closes when collected",
@@ -251,7 +261,7 @@ def _schedule_close(
 def _log_close_failure(level: int, fut: asyncio.Future[None]) -> None:
     exc = None if fut.cancelled() else fut.exception()
     if exc is not None:
-        log.log(level, "odbc: close of a one-shot connection failed: %s", exc)
+        log.log(level, "odbc: close of a one-shot connection failed: %s", exc, exc_info=exc)
 
 
 async def _close_through_methods(conn: Any, cur: Any) -> None:
