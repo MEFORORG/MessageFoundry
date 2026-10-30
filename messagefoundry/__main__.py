@@ -1216,6 +1216,44 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     restore_verify.add_argument("--json", action="store_true", help="emit JSON")
 
+    cipher_audit = sub.add_parser(
+        "cipher-audit",
+        help="read every sealed value in the LIVE SQLite store back through the store cipher, "
+        "read-only, and report per-cell counts and the first failing row, never a value. Exit 0 "
+        "PASS, 1 FAIL (a value that does not decrypt, a non-blank value with no at-rest marker on a "
+        "surface the keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, an "
+        "unreadable row or the key service), 2 could not start, 3 NOT COVERED (a PostgreSQL or SQL "
+        "Server store: this "
+        "command reads SQLite only), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
+        "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
+        "'vault_transit' every value is one Transit request (BACKLOG #1719)",
+    )
+    cipher_audit.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source",
+    )
+    cipher_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    cipher_audit.add_argument(
+        "--table",
+        action="append",
+        default=None,
+        help="audit only this table's cipher cells (repeatable; default: every cipher-covered table)",
+    )
+    cipher_audit.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=None,
+        help="rows read per statement, each its own short read transaction (default 500)",
+    )
+    cipher_audit.add_argument(
+        "--busy-timeout",
+        type=float,
+        default=5.0,
+        help="seconds a read waits on a lock the running service holds (default 5)",
+    )
+    cipher_audit.add_argument("--json", action="store_true", help="emit JSON")
+
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
@@ -10246,6 +10284,228 @@ def _restore_verify(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _cipher_audit(args: argparse.Namespace) -> int:
+    """Read every sealed value in the LIVE SQLite store back through the store cipher (BACKLOG #1719).
+
+    ``PRAGMA quick_check``, row counts and ``audit-verify`` all pass a store whose AEAD tag no longer
+    authenticates a cell, so without this a damaged value surfaces only when something next reads
+    it. This walks the same cell inventory the full restore-verify does
+    (:data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`) on a read-only connection, in
+    short chunks, so it can run beside the service. It reports per-cell counts and each cell's first
+    failing row by its locator, never a value. In a keyed store it also counts the non-blank text
+    values that carry no marker, which a walk selecting by the marker never reads: a FAIL on a
+    surface the store has sealed, which refuses them at read, and reported only on one no keyed
+    open has sealed yet. A BLOB in a cipher-covered cell fails as one, under any cipher. A VACUUM
+    part way, or the key service going unreachable, stops it with a FAIL rather than a count over
+    a subset.
+
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server backend), 4 KEY_MISMATCH (a
+    sealed value and no key resolved, the usual cause being a shell without the service's key)."""
+    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.store.base import build_store_cipher
+    from messagefoundry.store.cipher_cells import (
+        DEFAULT_CHUNK_ROWS,
+        SQLITE_CIPHER_CELLS,
+        CipherAudit,
+        CipherWalkInterrupted,
+        audit_cipher_cells,
+        cell_present,
+        connect_readonly,
+        store_tables,
+    )
+    from messagefoundry.store.crypto import CipherError
+
+    as_json = bool(args.json)
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        _emit_error(detail or "could not load the service settings", as_json=as_json)
+        return 2
+    store = settings.store
+    if store.backend != StoreBackend.SQLITE:
+        # NOT exit 0, and not 1 either: nothing was read, so a job keying on the code must neither
+        # read this as a clean store nor as a damaged one.
+        reason = (
+            f"cipher-audit reads a SQLite store only, and [store].backend is "
+            f"{store.backend.value!r}; no cell of {_store_label(store)} was read"
+        )
+        if as_json:
+            _print_json({"status": "NOT_COVERED", "reason": reason}, compact=True)
+        else:
+            print(f"NOT COVERED: {reason}")
+        return 3
+    chunk_rows = DEFAULT_CHUNK_ROWS if args.chunk_rows is None else args.chunk_rows
+    if chunk_rows < 1 or args.busy_timeout < 0:
+        _emit_error(
+            "--chunk-rows must be at least 1 and --busy-timeout not negative", as_json=as_json
+        )
+        return 2
+    cells = SQLITE_CIPHER_CELLS
+    if args.table:
+        known = sorted({c.table for c in SQLITE_CIPHER_CELLS})
+        unknown = sorted(set(args.table) - set(known))
+        if unknown:
+            _emit_error(
+                f"no cipher-covered table named {', '.join(unknown)}; the tables are "
+                f"{', '.join(known)}",
+                as_json=as_json,
+            )
+            return 2
+        cells = tuple(c for c in SQLITE_CIPHER_CELLS if c.table in set(args.table))
+    path = store.path
+    if not Path(path).is_file():
+        # Checked first so the message names the cause; the read-only open would refuse it too, and
+        # neither creates a file.
+        _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
+        return 2
+    # The instance's own posture, derived as `serve` derives it, for the Vault hops the cipher
+    # build can dial (vault BACKLOG #2983).
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    try:
+        cipher = build_store_cipher(store, posture=posture)
+    except _key_unresolved() as exc:
+        # Through `codec_safe_str`, as rotate-key prints it: a DPAPI key file that unprotects to
+        # bytes that are not ASCII raises a decode error whose text quotes a byte of the key.
+        from messagefoundry.redaction import codec_safe_str
+
+        _emit_error(f"the store key could not be resolved: {codec_safe_str(exc)}", as_json=as_json)
+        return 2
+    try:
+        conn = connect_readonly(path, busy_timeout=args.busy_timeout)
+    except sqlite3.Error as exc:
+        return _emit_store_open_error(exc, path, as_json=as_json)
+    stopped: str | None = None
+    audit = CipherAudit()
+    key_service_down: tuple[type[Exception], ...] = (CipherError, *_key_unresolved())
+    try:
+        try:
+            # A file that is not a database fails here, before any cell is read: could not start.
+            tables = store_tables(conn)
+        except sqlite3.Error as exc:
+            return _emit_store_open_error(exc, path, as_json=as_json)
+        if not any(cell_present(conn, c, tables) for c in cells):
+            # An empty file is a valid SQLite database, so a typo'd --db or a failed copy would
+            # otherwise read every cell as absent and PASS: a store this command cannot read.
+            _emit_error(
+                f"{path} holds none of the cipher-covered tables asked for, so it is not a "
+                "MessageFoundry store this command can audit (check --db / [store].path)",
+                as_json=as_json,
+            )
+            return 2
+        audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
+    except sqlite3.Error as exc:
+        # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot read.
+        # The rendering quotes no row's content.
+        stopped = _store_error_text(exc)
+    except CipherWalkInterrupted as exc:
+        stopped = str(exc)
+    except key_service_down as exc:
+        # The key service failing part way: unreachable Transit (the walk raises that rather than
+        # count every later value as damaged), or a key provider. Its classes only: under Transit
+        # the error is raised for one value, and its text is not this command's to print.
+        cause = exc.__cause__
+        stopped = type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+    finally:
+        conn.close()
+
+    if audit.key_mismatch is not None:
+        status, code = "KEY_MISMATCH", 4
+        reason = (
+            f"{audit.key_mismatch}. Run cipher-audit with the key the service runs with; a shell "
+            "without it resolves keyless"
+        )
+    elif stopped is not None:
+        status, code = "FAIL", 1
+        reason = (
+            f"the audit stopped part way on an error ({stopped}). The values after it were not "
+            "read, and the counts are not reported: treat the store as unaudited until a run that "
+            "finishes says otherwise"
+        )
+    elif audit.failed or audit.blob:
+        status, code = "FAIL", 1
+        first = next(t.first_failure for t in audit.tallies if t.first_failure)
+        reason = (
+            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
+            f"store writes only text; the first: {first}"
+        )
+    elif audit.unmarked and not store.allow_unmarked_ciphertext:
+        status, code = "FAIL", 1
+        first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
+        reason = (
+            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
+            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
+            f"planted row (BACKLOG #1169); the first: {first}"
+        )
+    else:
+        status, code = "PASS", 0
+        reason = f"{audit.opened} sealed value(s) decrypted and authenticated"
+        if not cipher.encrypts:
+            reason += "; the store settings resolved no key, and no cell read holds a sealed value"
+        elif audit.unmarked:
+            reason += (
+                f"; {audit.unmarked} unmarked value(s) are read as plaintext under "
+                "[store].allow_unmarked_ciphertext"
+            )
+    if code in (0, 1) and stopped is None:
+        if audit.legacy:
+            reason += (
+                f"; {audit.legacy} plaintext value(s) on surfaces no keyed open has sealed yet, "
+                "which the service's next keyed open seals"
+            )
+        if audit.absent:
+            reason += f"; not in this store, so not read: {', '.join(audit.absent)}"
+
+    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
+    # would read as an empty store.
+    counted = stopped is None and audit.key_mismatch is None
+    cell_rows = audit.tallies if counted else []
+    if as_json:
+        _print_json(
+            {
+                "status": status,
+                "reason": reason,
+                "keyed": cipher.encrypts,
+                "opened": audit.opened if counted else None,
+                "failed": audit.failed if counted else None,
+                "blob": audit.blob if counted else None,
+                "unmarked": audit.unmarked if counted else None,
+                "legacy": audit.legacy if counted else None,
+                "cells": [
+                    {
+                        "cell": t.name,
+                        "present": t.present,
+                        "opened": t.opened,
+                        "failed": t.failed,
+                        "blob": t.blob,
+                        "unmarked": t.unmarked,
+                        "legacy": t.legacy,
+                        "first_failure": t.first_failure,
+                        "first_unmarked": t.first_unmarked,
+                    }
+                    for t in cell_rows
+                ],
+            },
+            compact=True,
+        )
+    else:
+        print(f"{status}: {reason}")
+        for t in cell_rows:
+            if not t.present:
+                print(f"  {t.name} not in this store, not read")
+                continue
+            print(
+                f"  {t.name} opened={t.opened} failed={t.failed} blob={t.blob} "
+                f"unmarked={t.unmarked} legacy={t.legacy}"
+            )
+            for line in (t.first_failure, t.first_unmarked):
+                if line:
+                    print(f"    {line}")
+    return code
+
+
 def _restore(args: argparse.Namespace) -> int:
     """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
 
@@ -10533,6 +10793,7 @@ def _connection(args: argparse.Namespace) -> int:
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
         insecure_bind_escape,
+        settings_file_path,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -10557,6 +10818,15 @@ def _connection(args: argparse.Namespace) -> int:
     # upsert / remove: validate the candidate dir against this instance's [egress] allowlist + active
     # environment before persisting, so a GUI edit pointing at a non-allowlisted host fails at edit
     # time exactly as it would at reload.
+    # A blank --service-config would name the working directory itself, and the open then fails
+    # with an OS error that does not say the name was blank. The IDE passes a blank
+    # messagefoundry.serviceConfig setting through (vault BACKLOG #2908), so refuse it by name.
+    if args.service_config is not None and not args.service_config.strip():
+        return _emit_error(
+            "--service-config is blank; name the instance's settings file "
+            "(in the VS Code extension, the messagefoundry.serviceConfig setting)",
+            as_json=args.json,
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -10641,33 +10911,42 @@ def _connection(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:
         message = str(exc)
-        # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
-        # --service-config, the IDE's usual call, the edit was checked against whatever settings
-        # load_settings found, so say where the list belongs rather than leave the analyst guessing.
-        # The keep-forever retention refusal (vault BACKLOG #2368) reads [security] the same way, so
-        # it gets the same account of which settings were read.
+        # At least these three refusals say which settings file the edit was checked against and
+        # what to change there: the deny default's unlisted outbound (vault BACKLOG #2605), the
+        # keep-forever retention refusal (vault BACKLOG #2368) and the exposure refusal. They say it
+        # whether or not --service-config named the file (vault BACKLOG #2908).
         advice = None
         if BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
-            advice = "list the connection's host in that file's [egress] allowed_* list for its transport"
+            advice = "list the refused destination's host in that file's [egress] allowed_* list for its transport"
         elif BODY_ACKNOWLEDGEMENT_SETTING in message:
-            advice = "this edit is then checked against that instance's [security] settings"
+            advice = (
+                f"{BODY_ACKNOWLEDGEMENT_SETTING} and [security].enforcement are read from that file"
+            )
         elif INSECURE_BIND_FLAG in message:
             # BACKLOG #3063 item 7: the exposure refusal names serve's flag, which this command
             # does not take (item 1), so say which escape it does read and where it was read from.
             message = insecure_bind_note(message, "connection")
-            advice = "the cleartext escape is then read from that instance's [security] settings"
-        if args.service_config is None and advice is not None:
-            # load_settings falls back to ./messagefoundry.toml, so say which case this was.
-            local = Path("messagefoundry.toml")
-            read = (
-                f"against {local.resolve()}, the settings file in the working directory"
-                if local.is_file()
-                else "with no instance settings file, since none was found"
-            )
-            message += (
-                f". No --service-config was given, so this edit was checked {read}. Pass "
-                f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
-            )
+            advice = "the cleartext escape is read from that file's [security] settings"
+        if advice is not None:
+            # The path load_settings read, made absolute but not resolved: resolve() follows links
+            # and can turn a mapped drive into a UNC name the operator never typed.
+            read_from = settings_file_path(args.service_config).absolute()
+            if args.service_config is None:
+                # load_settings falls back to ./messagefoundry.toml, so say which case this was.
+                read = (
+                    f"against {read_from}, the settings file in the working directory"
+                    if read_from.is_file()
+                    else "with no instance settings file, since none was found"
+                )
+                message += (
+                    f". No --service-config was given, so this edit was checked {read}. Pass "
+                    f"--service-config <path to the instance's messagefoundry.toml>, and {advice}"
+                )
+            else:
+                message += (
+                    f". This edit was checked against {read_from}, the file --service-config "
+                    f"named, with any MEFOR_* environment override applied over it; {advice}"
+                )
         return _emit_error(message, as_json=args.json)
     except OSError as exc:
         return _emit_error(str(exc), as_json=args.json)
@@ -11524,6 +11803,7 @@ _DISPATCH = {
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,
+    "cipher-audit": _cipher_audit,
     "restore": _restore,
     "ai-policy": _ai_policy,
     "cluster-vip": _cluster_vip,
