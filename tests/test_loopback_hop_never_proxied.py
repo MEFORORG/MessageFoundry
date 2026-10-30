@@ -124,10 +124,13 @@ def environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", _PROXY)
 
 
-def _dialled(opener: urllib.request.OpenerDirector, url: str) -> str:
+def _dialled(
+    opener: urllib.request.OpenerDirector, url: str, headers: dict[str, str] | None = None
+) -> str:
     """The ``host:port`` ``opener`` would connect to for ``url``."""
+    request = urllib.request.Request(url, data=b"synthetic", headers=headers or {}, method="POST")
     with pytest.raises(_Dialled) as caught:
-        opener.open(urllib.request.Request(url, data=b"synthetic", method="POST"), timeout=1)
+        opener.open(request, timeout=1)
     return caught.value.host
 
 
@@ -451,20 +454,30 @@ def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
     assert config is not None
     resolved = config.for_host("https://localhost./x")
     assert resolved is not None
-    assert resolved.auth_headers()["Proxy-Authorization"].startswith("Basic ")
+    headers = resolved.auth_headers()
+    assert headers["Proxy-Authorization"].startswith("Basic ")
+    # The header rides the request: a refusal of it would raise here in place of the dial.
     opener = build_strict_opener(*resolved.opener_handlers())
-    assert _dialled(opener, "https://localhost./x") == "127.0.0.1:3128"
+    assert _dialled(opener, "https://localhost./x", headers) == "127.0.0.1:3128"
     assert config.for_host("https://localhost/x") is None
 
 
-def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out() -> None:
+def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
+    environment_proxy: None,
+) -> None:
     """``_proxy_bypasses`` strips the dot and the predicate does not, so the two disagree on
-    ``localhost.``. The match takes the connection's own proxy off the hop, and the cleartext
-    guard, which reads the predicate, still refuses it (vault BACKLOG #2706). CONTROLS: with no
-    entry there is no match, and the plain spelling builds."""
+    ``localhost.``. The match takes the connection's own proxy off the hop, a proxy from the
+    environment still takes it, and the cleartext guard, which reads the predicate, still refuses
+    it (vault BACKLOG #2706). CONTROLS: with no entry there is no match, and the plain spelling
+    builds."""
     settings = {"proxy_url": _PROXY, "proxy_no_proxy": "localhost"}
     assert rest.proxy_bypasses_host("localhost.", ["localhost"])
     assert not rest.proxy_bypasses_host("localhost.", None)
+    config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
+    assert config is not None
+    assert config.for_host("https://localhost./x") is None
+    # A connection with no resolved proxy sends on the shared opener; this is that opener's builder.
+    assert _dialled(rest._no_redirect_opener(), "https://localhost./x") == _PROXY_HOST
     with active_hop_posture(HopPosture(enforcing=True)):
         with pytest.raises(InsecureHopRefused, match="HTTP cleartext egress"):
             _rest("http://localhost./x", **settings)

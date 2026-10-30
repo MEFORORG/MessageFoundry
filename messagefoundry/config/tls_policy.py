@@ -2116,9 +2116,10 @@ def is_loopback_hop_host(host: str) -> bool:
     and ``%6cocalhost`` read as remote here, though a resolver may take the first two as this box,
     and urllib decodes the third to ``localhost`` before it dials. The cleartext guards judge them
     as they judge any remote hop, and a proxy that applies takes them with the connection's proxy
-    credential. For those two readers remote is the cautious answer, so the limit errs one way: it
-    lets no hop the engine judged on-box leave the host. A caller for whom remote is the permissive
-    answer normalises first, as ``config.settings._names_this_host`` does.
+    credential, so a hop spelled this way can leave the box through a proxy. What the limit rules
+    out is the reverse: it lets no hop the engine judged on-box leave the host. Where remote is
+    the permissive answer this reading is not enough, as ``config.settings._names_this_host``
+    records.
 
     ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
     ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.

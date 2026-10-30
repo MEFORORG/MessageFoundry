@@ -22,8 +22,8 @@ It also pins #3442: a connection whose target urllib's own bypass list names att
 so that send goes direct and is not refused. And #3443: a static ``Proxy-Authorization`` beside the
 connection's own proxy credential is refused at build, so it cannot ride that admission.
 
-Each refusal is read on the wire, at a loopback socket that records what reaches it, as well as in
-the result. Each has a control in the other polarity.
+Each refusal is read at a loopback socket that records what reaches it, or at a recorder in place of
+the dial, as well as in the result. Each has a control in the other polarity.
 
 Synthetic data only: the credentials are made up and every off-box host name is reserved.
 """
@@ -444,7 +444,7 @@ def test_a_rest_send_with_a_static_proxy_header_to_a_loopback_host_is_refused() 
     assert len(destination.cleartext) == 1
 
 
-def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_entry_is_refused(
+def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_for_its_scheme_is_refused(
     recorded: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``proxy_url = "default"`` reads the environment when the connection is built; the shared
@@ -482,6 +482,26 @@ def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
     _send_refused(dest, "#3417")
     monkeypatch.delenv("NO_PROXY")  # urllib reads its list on every request
     _send_refused(dest, "#3416")
+
+
+def test_a_rest_send_its_own_bypass_list_sends_direct_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``proxy_no_proxy`` match, where ``for_host`` drops the proxy and the connection sends on
+    the shared opener. That opener is built again here, because the one built at import read
+    whatever the environment held then. The static header is refused before the dial (vault
+    BACKLOG #3417). Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg``
+    replaced by a no-op, the dial was reached with the header on the request and this test failed.
+    Control: with no header the same send reaches the dial."""
+    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    settings: dict[str, Any] = {
+        "proxy_url": f"http://{_MARKER}",
+        "proxy_no_proxy": "partner.example.test",
+    }
+    _send_refused(_rest(_HTTPS_TARGET, headers=_STATIC_PROXY_HEADER, **settings), "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, **settings).send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
 
 
 # --- #3443: a static Proxy-Authorization beside the connection's own proxy credential -----------
