@@ -492,6 +492,8 @@ class FileDestination(DestinationConnector):
         try:
             await self._run_fs(self._write, payload)
         except OSError as exc:
+            # Raised before a name was rendered, so the only path it can quote is the configured
+            # directory. A failure after it comes back from _write already as a DeliveryError.
             raise DeliveryError(f"file write failed: {exc}") from exc
 
     async def validate_startup(self) -> None:
@@ -577,6 +579,20 @@ class FileDestination(DestinationConnector):
             max_bytes=self._name_max_bytes,
         )
         target = self.directory / name
+        try:
+            self._write_as(name, target, payload)
+        except OSError as exc:
+            # An OS error quotes the path it failed on, and its last part is this name, rendered
+            # from message fields, or a bumped name-1.ext of it. The error text reaches last_error,
+            # the connection event and the alert, so it keeps the type, errno and OS text only
+            # (BACKLOG #2814).
+            raise DeliveryError(
+                f"file write failed: {_describe_os_error(exc, file_name=name)}"
+            ) from exc
+
+    def _write_as(self, name: str, target: Path, payload: str) -> None:
+        """Write ``payload`` to ``target``, the destination directory joined with ``name``:
+        :meth:`_write`'s body once the name is rendered."""
         # Defence in depth atop the filename sanitization (FILE-1): never write outside the
         # configured directory even if a name somehow carried a path component. A name that itself
         # carries a separator or is a dot name came from the message, and a retry renders it again:
@@ -2466,9 +2482,9 @@ def _describe_os_error(exc: OSError | ValueError, *, file_name: str | None = Non
 
     Used where the path is not known here to swap for a label: a failed directory listing, whose path
     under ``recursive`` can be a partner-created SUBDIRECTORY, and a failed archive claim, whose path
-    can be a bumped ``name-1.ext``. An ``OSError`` is reported by its type, errno and OS text, never
-    its path. A ``ValueError`` from a listing is an invalid glob pattern, which is operator
-    configuration."""
+    can be a bumped ``name-1.ext``, as can a failed destination write's (BACKLOG #2814). An
+    ``OSError`` is reported by its type, errno and OS text, never its path. A ``ValueError`` from a
+    listing is an invalid glob pattern, which is operator configuration."""
     if isinstance(exc, OSError) and exc.errno is not None:
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     # A message-only OSError keeps its message, redacted, with the known name swapped for a label.
