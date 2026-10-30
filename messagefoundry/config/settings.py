@@ -2498,7 +2498,7 @@ class PipelineSettings(_Section):
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
     # ONE OTHER SETTING CAN CANCEL THIS ONE, and you must be told here rather than in that knob's
-    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is subprocess (it ships off, so
+    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is not off (it ships off, so
     # this bites only a site that turned the sandbox on). Fusion runs Router/Handler/accepts= code
     # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
     # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
@@ -2595,13 +2595,15 @@ class SandboxSettings(_Section):
 
     * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
       process boundary breaks, so they fail closed inside the child. **A Handler needing either must
-      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
-      single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
+      run ``mode="off"``, or ``mode="isolated"``** — the off escape is supported and is not going
+      away. ``mode="isolated"`` (ADR 0147, vault BACKLOG #3131) is the same worker with both lookups
+      brokered through the engine; ``docs/CONFIGURATION.md``, section ``[sandbox]``, says what it
+      does and does not do. ``[sandbox]`` is a single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
       renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
       post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
       to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
@@ -2620,9 +2622,10 @@ class SandboxSettings(_Section):
     **restart to change**, exactly like ``claim_mode``)."""
 
     # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
-    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
-    # connection: one policy is rendered for the whole graph.
-    mode: Literal["off", "subprocess"] = Field(default="off")
+    # live enrichment) | subprocess (persistent per-inbound worker child) | isolated (that worker,
+    # with db_lookup/fhir_lookup brokered through the engine; ADR 0147). Any other value refuses to
+    # load. ENGINE-WIDE, not per connection: one policy is rendered for the whole graph.
+    mode: Literal["off", "subprocess", "isolated"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
