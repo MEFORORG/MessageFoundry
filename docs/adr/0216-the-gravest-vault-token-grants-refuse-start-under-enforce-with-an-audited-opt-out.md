@@ -76,8 +76,8 @@ rename or signature drift, an engine refusal such as an unset token variable, an
 status, and an answer that names no capabilities for a path. The hop names each in `unexcused`,
 whether the probe caught it or raised it, and under `enforce` `vault_preflight_outcome` refuses on
 one. The opt-out does not lift that refusal: it accepts a grant that was seen, and this token was
-never fully read. `check-privileges` says so for a hop it read in part; a hop it could not read at
-all it names as unread, because its own run may lack what `serve` has, such as the token. A
+never fully read. `check-privileges` names such a failure after its verdict rather than in it,
+because its own run may meet one `serve`'s does not, such as an unset key name. A
 catch-all that read every failure as unobservable would have let a code defect start an enforcing
 instance on a root token, with nothing but the exception's type in the log.
 

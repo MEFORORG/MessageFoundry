@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -467,7 +467,7 @@ def vault_hop(
         seen.append("; ".join(f"{p}: {_caps(reading.capabilities[p])}" for p in checked))
     if grave or over:
         state = HopState.OVER_GRANTED
-    elif reading.problems:
+    elif reading.problems or reading.unexcused:
         state = HopState.UNOBSERVABLE
     else:
         state = HopState.CLEAN
@@ -566,9 +566,15 @@ def vault_refusal_reason(hops: Iterable[HopPrivilege], *, over_grant_accepted: b
             f"the Vault privilege probe on {', '.join(unjudged)} failed for a reason that is not a "
             "network failure, a timeout or a 403, so the token was never judged, under "
             f"[security].enforcement = 'enforce'. {VAULT_OVER_GRANT_OPT_OUT} does not accept "
-            "this. Fix the cause the preflight's warning names"
+            f"this. Fix the cause: {_unexcused_causes(hops)}"
         )
     return "; and ".join(reasons)
+
+
+def _unexcused_causes(hops: Iterable[HopPrivilege]) -> str:
+    """Each hop's unexcused causes, for a line an operator acts on. A cause is a type name or the
+    engine's own fixed words, never server text."""
+    return "; ".join(f"{h.hop}: {', '.join(h.unexcused)}" for h in hops if h.unexcused)
 
 
 # --- LDAP: the AD bind account ------------------------------------------------------------------
@@ -791,29 +797,36 @@ def serve_verdict(
     serve gates cannot disagree. The exit code does NOT follow them: an over-grant exits 3 whether or
     not serve would start, because the grant is still wider than the runbook's.
 
-    The store finding and a Vault grant in the refusing class gate a start. A Vault finding that
-    only warns, an accepted Vault over-grant, a Vault hop this run could not read, and an LDAP
-    over-grant are named after the verdict, so nobody reads one as a refusal or as a clean start."""
+    The store finding and a Vault grant in the refusing class gate a start, and so does an unexcused
+    Vault probe failure, but only one serve's own probe meets. A Vault finding that only warns, an
+    accepted Vault over-grant, a Vault hop this run could not read, an unexcused failure this run
+    met, and an LDAP over-grant are named after the verdict, so nobody reads one as a refusal or as
+    a clean start."""
     hops = list(hops)
     security = settings.security
     enforcing = security.enforcement is SecurityEnforcement.ENFORCE
     accepting = security.allow_over_granted_vault_token
     vault: dict[PreflightOutcome, list[str]] = {}
     refused_hops: list[HopPrivilege] = []
-    unread: list[HopPrivilege] = []
+    unread: list[str] = []
+    unjudged = [h for h in hops if h.hop.startswith("vault") and h.unexcused]
     for h in hops:
         if not h.hop.startswith("vault"):
             continue
         if h.state is HopState.UNOBSERVABLE:
             # Not "warns only": what this run could not read says nothing about the token serve
-            # will read, which may be a different one (a scheduled task often lacks it). That holds
-            # for an unexcused failure too, such as an unset token variable here.
-            unread.append(h)
+            # will read, which may be a different one (a scheduled task often lacks it).
+            unread.append(h.hop)
             continue
-        outcome = vault_preflight_outcome(h, enforcing=enforcing, over_grant_accepted=accepting)
+        # The grants seen are judged here; an unexcused failure is named in a note instead, since
+        # this run's environment may meet one serve's does not, such as an unset key name.
+        judged = replace(h, unexcused=())
+        outcome = vault_preflight_outcome(
+            judged, enforcing=enforcing, over_grant_accepted=accepting
+        )
         vault.setdefault(outcome, []).append(h.hop)
         if outcome is PreflightOutcome.REFUSE:
-            refused_hops.append(h)
+            refused_hops.append(judged)
     store_outcome, store = _store_verdict(report, settings)
     notes: list[str] = []
     why = vault_refusal_reason(refused_hops, over_grant_accepted=accepting)
@@ -836,14 +849,18 @@ def serve_verdict(
         notes.append(f"{', '.join(warned)} warns only; it does not refuse a start")
     if unread:
         notes.append(
-            f"{', '.join(h.hop for h in unread)} could not be read here, so this line cannot say "
-            "what serve would do with it; serve reads the token again at start"
+            f"{', '.join(unread)} could not be read here, so this line cannot say what serve "
+            "would do with it; serve reads the token again at start"
         )
-        if enforcing and any(h.unexcused for h in unread):
-            notes.append(
-                "a probe failure other than a network failure, a timeout or a 403 refuses an "
-                "enforcing start if serve's own probe meets it"
-            )
+    if unjudged:
+        serve_does = (
+            f"refuses to start, whatever {VAULT_OVER_GRANT_OPT_OUT} says," if enforcing else "warns"
+        )
+        notes.append(
+            "the probe failed here for a reason that is not a network failure, a timeout or a "
+            f"403 ({_unexcused_causes(unjudged)}); serve {serve_does} if its own probe meets the "
+            "same failure"
+        )
     ungated = [
         h.hop
         for h in hops

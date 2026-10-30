@@ -35,12 +35,14 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
-from collections.abc import Callable, Mapping
+import socket
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.privilege_check import vault_admin_paths
+from messagefoundry.transports.bounded_read import TruncatedResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,7 @@ __all__ = [
     "probe_vault",
     "read_ldap_bind",
     "read_vault_token",
+    "unexcused_cause",
 ]
 
 
@@ -114,24 +117,25 @@ def excused_failure(exc: BaseException) -> bool:
     0216): a network failure, a timeout, or a 403 (:func:`_is_forbidden`).
 
     A network failure or a timeout is a refused, reset or dropped connection, a name that did not
-    resolve, a connect or read timeout, or a reply cut short of its declared length. That is the
-    builtin ``ConnectionError`` and ``TimeoutError``, ``socket.gaierror``, requests'
-    ``ConnectionError``, ``Timeout`` and ``ChunkedEncodingError``, and the strict reply adapter's
-    ``TruncatedResponseError``. It is not every ``OSError``: requests' ``InvalidHeader`` and
-    ``InvalidURL``, a missing CA file and a TLS verification failure are configuration, and requests'
-    ``SSLError`` is left out though it subclasses its ``ConnectionError``.
+    resolve, a connect or read timeout, a TLS handshake the peer cut off, or a reply cut short of
+    its declared length. That is the builtin ``ConnectionError`` and ``TimeoutError``,
+    ``socket.gaierror``, requests' ``ConnectionError``, ``Timeout`` and ``ChunkedEncodingError``,
+    and the strict reply adapter's ``TruncatedResponseError``. It is not every ``OSError``:
+    requests' ``InvalidHeader`` and ``InvalidURL``, a missing CA file and a TLS failure other than
+    a cut-off handshake are configuration. A TLS failure is looked for in the whole chain, because
+    requests reports one on the proxy leg as a ``ProxyError``, and on either leg the wrapped
+    ``ssl.SSLError`` is what tells a verification failure from a dropped handshake.
 
     Any other failure left the token unjudged for a reason the ruling does not excuse. At least
     these are in that class: a ``TypeError`` or ``AttributeError`` after an hvac rename or a
     signature drift, an engine refusal such as an unset token variable, and any other Vault error
     status. The startup preflight refuses on one under ``enforce``
     (:func:`~messagefoundry.privilege_check.vault_preflight_outcome`)."""
-    import socket
-
-    from messagefoundry.transports.bounded_read import TruncatedResponseError
-
     if _is_forbidden(exc):
         return True
+    chain = list(_chain(exc))
+    if any(_is_ssl(e, "SSLError") and not _is_ssl(e, "SSLEOFError") for e in chain):
+        return False
     if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):
         return True
     try:
@@ -139,8 +143,39 @@ def excused_failure(exc: BaseException) -> bool:
     except ImportError:  # no requests, so none of its errors can be the one raised
         return False
     if isinstance(exc, rex.SSLError):
-        return False
+        # Excused only where the chain shows a handshake the peer cut off.
+        return any(_is_ssl(e, "SSLEOFError") for e in chain)
     return isinstance(exc, (rex.ConnectionError, rex.Timeout, rex.ChunkedEncodingError))
+
+
+def _is_ssl(exc: BaseException, name: str) -> bool:
+    """Whether ``exc`` is the stdlib ``ssl`` module's class ``name`` or a subclass of it. Read off
+    the class's MRO, so this module reads an exception's type without importing ``ssl``, which the
+    crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
+    return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
+
+
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and every exception it wraps: its cause and context, and the exceptions urllib3 and
+    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once."""
+    seen: set[int] = set()
+    todo: list[BaseException] = [exc]
+    while todo:
+        e = todo.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        inner: list[object] = [e.__cause__, e.__context__, *e.args]
+        inner += [getattr(e, "reason", None), getattr(e, "original_error", None)]
+        todo += [i for i in inner if isinstance(i, BaseException)]
+
+
+def unexcused_cause(exc: BaseException) -> str | None:
+    """How a reading names ``exc`` in ``unexcused``: its type name, or ``None`` when
+    :func:`excused_failure` excuses it. The one spelling for a failure the probe caught and one
+    the preflight caught."""
+    return None if excused_failure(exc) else type(exc).__name__
 
 
 def _why(exc: BaseException) -> str:
@@ -233,8 +268,8 @@ def read_vault_token(
             unexcused.append(cause)
 
     def why(exc: BaseException) -> str:
-        if not excused_failure(exc):
-            unjudged(type(exc).__name__)
+        if (cause := unexcused_cause(exc)) is not None:
+            unjudged(cause)
         return _why(exc)
 
     needed: dict[str, frozenset[str]] = {}

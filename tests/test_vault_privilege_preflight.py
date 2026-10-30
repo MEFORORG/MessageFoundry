@@ -485,6 +485,31 @@ def test_the_real_library_classes_are_excused() -> None:
         assert not excused_failure(error), type(error).__name__
 
 
+def test_a_tls_failure_is_read_through_its_wrapper() -> None:
+    """Review round two: requests reports a TLS failure on the proxy leg as a ProxyError, which is
+    a ConnectionError, and a handshake the peer cut off as an SSLError. The wrapped ssl error, not
+    the wrapper, says which: verification is configuration, a cut-off handshake is the network."""
+    import ssl
+
+    from messagefoundry.privilege_probes import excused_failure
+
+    rex = pytest.importorskip("requests.exceptions")
+
+    def wrapping(outer: BaseException, inner: BaseException) -> BaseException:
+        outer.__cause__ = inner
+        return outer
+
+    verify = ssl.SSLCertVerificationError("synthetic")
+    cut = ssl.SSLEOFError("synthetic")
+    assert not excused_failure(wrapping(rex.ProxyError("synthetic"), verify))
+    assert not excused_failure(wrapping(rex.SSLError("synthetic"), verify))
+    # urllib3 keeps the cause in args, not __cause__.
+    assert not excused_failure(rex.ProxyError(rex.SSLError(verify)))
+    assert excused_failure(wrapping(rex.SSLError("synthetic"), cut))
+    assert excused_failure(wrapping(rex.ProxyError("synthetic"), cut))
+    assert excused_failure(rex.ProxyError("synthetic"))
+
+
 def test_an_unexcused_failure_is_named_once_however_often_it_recurs() -> None:
     from messagefoundry.store.keyprovider import KeyProviderError
 
@@ -508,25 +533,92 @@ def _over_granted_and_unjudged(**kwargs: Any) -> Any:
 
 
 @pytest.mark.parametrize("accepted", [True, False])
-def test_check_privileges_and_serve_agree_on_a_read_hop_with_an_unexcused_failure(
-    accepted: bool,
-) -> None:
-    """Review round one: serve refused a hop that check-privileges said would start, because the
-    failure was judged outside the shared decision. Both now read it from vault_preflight_outcome,
-    and the opt-out lifts neither."""
+def test_serve_refuses_an_unexcused_failure_the_opt_out_cannot_lift(accepted: bool) -> None:
     hop = _over_granted_and_unjudged(policies=("root",))
     assert hop.state is HopState.OVER_GRANTED
     assert vault_preflight_outcome(hop, enforcing=True, over_grant_accepted=accepted) is (
         PreflightOutcome.REFUSE
     )
+    assert vault_preflight_outcome(hop, enforcing=False, over_grant_accepted=accepted) is (
+        PreflightOutcome.WARN
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "accepted", "starts"),
+    [
+        ({"policies": ("root",)}, True, True),
+        ({"policies": ("root",)}, False, False),
+        ({"caps": _least_caps()}, False, True),
+    ],
+)
+def test_check_privileges_names_an_unexcused_failure_beside_its_verdict(
+    kwargs: dict[str, Any], accepted: bool, starts: bool
+) -> None:
+    """Review rounds one and two: check-privileges judged a hop's grants and said nothing of the
+    failure serve refuses on. It now judges the grants it saw and names the failure in a note,
+    because its own run may meet a failure serve's does not, such as an unset key name."""
+    hop = _over_granted_and_unjudged(**kwargs)
     settings = _VAULT_SETTINGS.model_copy(
         update={"security": SecuritySettings(allow_over_granted_vault_token=accepted)}
     )
     verdict = serve_verdict(_sqlite_report(), settings, [hop])
-    assert verdict.startswith("would REFUSE to start")
-    assert "not a network failure" in verdict
-    # Without the opt-out the grave grant is named too, so fixing one cause does not hide the other.
-    assert ("holds the root policy" in verdict) is (not accepted)
+    assert verdict.startswith("would start" if starts else "would REFUSE to start"), verdict
+    assert "a timeout or a 403 (vault.store: TypeError); serve refuses to start" in verdict
+
+
+def test_an_unexcused_reading_with_no_problem_is_never_clean() -> None:
+    """A reading naming an unexcused failure is never CLEAN, even one that lists no problem."""
+    reading = VaultTokenReading(
+        looked_up=True,
+        required=dict(_reading(_FakeVault(caps=_least_caps())).required),
+        capabilities={p: tuple(c) for p, c in _least_caps().items()},
+        unexcused=("TypeError",),
+    )
+    hop = vault_hop(_STORE, reading)
+    assert hop.state is HopState.UNOBSERVABLE
+    assert vault_preflight_outcome(hop, enforcing=True, over_grant_accepted=False) is (
+        PreflightOutcome.REFUSE
+    )
+
+
+async def test_an_accepted_grant_is_not_recorded_as_accepted_when_another_hop_refuses(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With one hop accepted and another refusing, nothing started, so no row and no AUDIT line
+    may say the opt-out let a start through. The control is the same pair with the second hop
+    clean, which records the acceptance."""
+    from messagefoundry import vault_preflight
+
+    monkeypatch.setattr(vault_preflight, "vault_consumers", lambda settings: [_STORE, _KV])
+
+    def probe_with(second: BaseException | None) -> Any:
+        def probe(consumer: VaultConsumer) -> VaultTokenReading:
+            if consumer.hop == _STORE.hop:
+                return _reading(_FakeVault(policies=("root",)))
+            if second is not None:
+                raise second
+            return VaultTokenReading()
+
+        return probe
+
+    store = _AuditStore()
+    with caplog.at_level(logging.WARNING), pytest.raises(VaultPrivilegeError):
+        await run_vault_privilege_preflight(
+            _VAULT_SETTINGS,
+            store,
+            enforcing=True,
+            over_grant_accepted=True,
+            probe=probe_with(TypeError("synthetic")),
+        )
+    assert "AUDIT:" not in caplog.text
+    assert [d["over_grant_accepted"] for _, d in store.audits] == [False, False]
+
+    control = _AuditStore()
+    await run_vault_privilege_preflight(
+        _VAULT_SETTINGS, control, enforcing=True, over_grant_accepted=True, probe=probe_with(None)
+    )
+    assert [d["over_grant_accepted"] for _, d in control.audits] == [True, False]
 
 
 async def test_the_refusal_names_both_causes_of_one_hop() -> None:

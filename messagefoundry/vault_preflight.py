@@ -47,7 +47,7 @@ from messagefoundry.privilege_check import (
     vault_preflight_outcome,
     vault_refusal_reason,
 )
-from messagefoundry.privilege_probes import VaultTokenReading, excused_failure
+from messagefoundry.privilege_probes import VaultTokenReading, unexcused_cause
 from messagefoundry.store.privilege import PreflightOutcome
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -97,10 +97,10 @@ def _probe_all(
         try:
             out.append(probe(consumer))
         except Exception as exc:  # noqa: BLE001 - classified below, never a pass
-            name = type(exc).__name__
-            problem = f"the probe raised {name}"
+            problem = f"the probe raised {type(exc).__name__}"
             log.warning("vault privilege preflight: %s: %s", consumer.hop, problem)
-            unexcused = () if excused_failure(exc) else (name,)
+            cause = unexcused_cause(exc)
+            unexcused = () if cause is None else (cause,)
             out.append(VaultTokenReading(problems=(problem,), unexcused=unexcused))
     return out
 
@@ -130,12 +130,16 @@ async def run_vault_privilege_preflight(
         return []
     readings = await asyncio.to_thread(_probe_all, consumers, probe)
     hops = vault_hops(consumers, readings)
-    refused: list[HopPrivilege] = []
-    for hop in hops:
-        outcome = vault_preflight_outcome(
-            hop, enforcing=enforcing, over_grant_accepted=over_grant_accepted
-        )
+    outcomes = [
+        vault_preflight_outcome(hop, enforcing=enforcing, over_grant_accepted=over_grant_accepted)
+        for hop in hops
+    ]
+    refused = [h for h, o in zip(hops, outcomes, strict=True) if o is PreflightOutcome.REFUSE]
+    for hop, outcome in zip(hops, outcomes, strict=True):
         refusing = outcome is PreflightOutcome.REFUSE
+        # An accepted grant is recorded as accepted only where the start goes ahead: with another
+        # hop refusing, the opt-out let nothing start.
+        accepted = outcome is PreflightOutcome.ACCEPTED and not refused
         if outcome is PreflightOutcome.CLEAN:
             log.info("vault privilege preflight: %s %s", hop.hop, hop.state.value)
         else:
@@ -147,7 +151,7 @@ async def run_vault_privilege_preflight(
                 scrub_log_argument(hop.detail),
                 "; REFUSING to start" if refusing else "",
             )
-        if outcome is PreflightOutcome.ACCEPTED:
+        if accepted:
             log.warning(
                 "AUDIT: starting an enforcing instance on an over-granted Vault token (%s) because "
                 "%s=true -- the token holds the root policy or a grant on an administrative path "
@@ -163,7 +167,7 @@ async def run_vault_privilege_preflight(
             "detail": hop.detail[:_AUDIT_DETAIL_LIMIT],
             "enforcing": enforcing,
             "refused": refusing,
-            "over_grant_accepted": outcome is PreflightOutcome.ACCEPTED,
+            "over_grant_accepted": accepted,
         }
         # Best effort, and ``defects=()``: a raise here would mask the refusal below, as in the
         # store preflight (vault BACKLOG #2260).
@@ -178,8 +182,6 @@ async def run_vault_privilege_preflight(
             message="vault privilege preflight: failed to record the audit row",
             defects=(),
         )
-        if refusing:
-            refused.append(hop)
     if refused:
         reason = vault_refusal_reason(refused, over_grant_accepted=over_grant_accepted)
         raise VaultPrivilegeError(f"{reason}; refusing to start")
