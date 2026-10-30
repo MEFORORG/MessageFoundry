@@ -44,6 +44,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     TlsSettings,
 )
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store import MessageStore
 
 _posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits (icacls is the nt path)")
@@ -3312,7 +3313,7 @@ def test_a_refused_alerts_ca_never_makes_an_email_only_alert_quieter(
     )
     stripped = alerts_without_email(alerts)
     with caplog.at_level("WARNING", logger="messagefoundry.pipeline.alert_sinks"):
-        sink = notifier_from_settings(stripped)
+        sink = notifier_from_settings(stripped, posture=HopPosture(enforcing=False))
     assert "no transport is configured" not in caplog.text
     if not webhook:
         # No notifier: the lifespan puts the engine on LoggingAlertSink, which logs at WARNING.

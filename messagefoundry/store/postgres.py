@@ -274,6 +274,8 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     append_rename_audits,
+    approval_fails_seal,
+    approval_tombstone,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -292,6 +294,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    held_approval_tombstone,
     if_applied,
     judge_totp,
     load_audit_chain,
@@ -1345,6 +1348,17 @@ _PG_APPROVAL_INSERT: Final = (
 _PG_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3, claim_owner = $4,"
     " seal = $5 WHERE id = $6 AND status = $7 AND seal = $8"
+)
+#: The ``$n`` twin of store.py's ``_SQLITE_APPROVAL_TOMBSTONE`` (BACKLOG #3638), which states the
+#: contract. Used only by `_tombstone_approval`.
+_PG_APPROVAL_TOMBSTONE: Final = (
+    "UPDATE pending_approvals SET status = 'rejected', approver = $1, decided_at = $2, seal = $3"
+    " WHERE id = $4 AND status = 'pending' AND seal = $5"
+)
+#: The ``$n`` twin of store.py's ``_SQLITE_APPROVAL_TOMBSTONE_RESEAL`` (BACKLOG #3638), which
+#: states the contract. Used only by `_reseal_tombstone`.
+_PG_APPROVAL_TOMBSTONE_RESEAL: Final = (
+    "UPDATE pending_approvals SET seal = $1 WHERE id = $2 AND status = 'rejected' AND seal = $3"
 )
 # The `$n` twins of store.py's role write and AD map statements (BACKLOG #2592); store.py states
 # the contract. The role write is used only by `_write_role`.
@@ -8436,7 +8450,7 @@ class PostgresStore:
     async def _write_approval(
         self, conn: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
     ) -> bool:
-        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        """The writer of a sealed ``pending_approvals`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_approval`` states the contract. Call it inside ``conn``'s
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
@@ -8516,6 +8530,58 @@ class PostgresStore:
         tee_audits(audits, appended, ts=now)
         return moved
 
+    async def reject_seal_failed_approval(
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        decided_at: float,
+        seal_read: object,
+        audits: Sequence[AuditAppend] = (),
+    ) -> bool:
+        """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
+        #3638); the Store protocol states the contract. The row is read ``FOR UPDATE``, as
+        :meth:`decide_pending_approval` reads it, so a concurrent decision waits for this one."""
+        now = time.time()
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            found = await conn.fetchrow(
+                _PG_APPROVAL_SELECT + " WHERE id = $1 FOR UPDATE", approval_id
+            )
+            moved = (
+                found is not None
+                and str(found["status"]) == "pending"
+                and found["seal"] == seal_read
+                and approval_fails_seal(self._row_sealer, found)
+                and await self._tombstone_approval(
+                    conn,
+                    approval_id,
+                    approver=approver,
+                    decided_at=decided_at,
+                    seal_read=seal_read,
+                )
+            )
+            appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
+            appended = await self._append_audits(conn, appended_audits, now=now)
+        tee_audits(appended_audits, appended, ts=now)
+        return moved
+
+    async def _tombstone_approval(
+        self, conn: Any, approval_id: str, *, approver: str, decided_at: float, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_PG_APPROVAL_TOMBSTONE` (BACKLOG #3638); store.py's
+        ``MessageStore._tombstone_approval`` states the contract."""
+        result = await conn.execute(
+            _PG_APPROVAL_TOMBSTONE,
+            approver,
+            float(decided_at),
+            approval_tombstone(
+                self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+            ),
+            approval_id,
+            seal_read,
+        )
+        return _rowcount(result) > 0
+
     async def list_executing_approvals(
         self, *, claim_owner: str | None = None, limit: int = 1000
     ) -> Sequence[Row]:
@@ -8562,11 +8628,41 @@ class PostgresStore:
                         _PG_APPROVAL_SELECT + " WHERE id = $1 FOR UPDATE", str(found["id"])
                     )
                     if locked is not None:
-                        current = ApprovalRow.from_mapping(locked)
-                        resealed += await self._write_approval(conn, current, current=current)
+                        resealed += await self._reseal_approval(conn, locked)
             except RowSealError:
                 refused += 1
         return resealed, refused
+
+    async def _reseal_approval(self, conn: Any, found: Row) -> bool:
+        """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
+        or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
+        :class:`RowSealError` when neither holds, before any statement runs, so the transaction
+        rolls back clean; store.py's twin states the rest of the contract."""
+        try:
+            current = ApprovalRow.from_mapping(found)
+            return await self._write_approval(conn, current, current=current)
+        except RowSealError:
+            tombstone = held_approval_tombstone(self._row_sealer, found)
+            if tombstone is None:
+                raise
+        return await self._reseal_tombstone(
+            conn, str(found["id"]), *tombstone, seal_read=found["seal"]
+        )
+
+    async def _reseal_tombstone(
+        self, conn: Any, approval_id: str, approver: str, decided_at: float, *, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_PG_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638); store.py's
+        ``MessageStore._reseal_tombstone`` states the contract."""
+        result = await conn.execute(
+            _PG_APPROVAL_TOMBSTONE_RESEAL,
+            approval_tombstone(
+                self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+            ),
+            approval_id,
+            seal_read,
+        )
+        return _rowcount(result) > 0
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

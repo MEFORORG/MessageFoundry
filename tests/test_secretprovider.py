@@ -27,7 +27,12 @@ from messagefoundry.config.secretprovider import (
     resolve_secret_provider,
 )
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, SecretsSettings
+from messagefoundry.config.tls_policy import HopPosture
 from tests._vault_hop_env import SECRETS, supply_vault_hop
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 @pytest.fixture(autouse=True)
@@ -289,7 +294,9 @@ def test_notifier_uses_resolved_smtp_password() -> None:
 
     provider = _FakeProvider({"mefor/smtp#password": "resolved-smtp-pw"})
     sink = notifier_from_settings(
-        _smtp_settings(email_password_secret="mefor/smtp#password"), secret_provider=provider
+        _smtp_settings(email_password_secret="mefor/smtp#password"),
+        secret_provider=provider,
+        posture=_NOT_ENFORCING,
     )
     assert sink is not None
     email = next(t for t in sink._transports if isinstance(t, EmailTransport))
@@ -300,7 +307,9 @@ def test_notifier_uses_resolved_smtp_password() -> None:
 def test_notifier_default_env_password_is_byte_identical() -> None:
     from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 
-    sink = notifier_from_settings(_smtp_settings(email_password="env-smtp-pw"))
+    sink = notifier_from_settings(
+        _smtp_settings(email_password="env-smtp-pw"), posture=_NOT_ENFORCING
+    )
     assert sink is not None
     email = next(t for t in sink._transports if isinstance(t, EmailTransport))
     assert email.password == "env-smtp-pw"
@@ -311,7 +320,9 @@ def test_security_notifier_uses_resolved_smtp_password() -> None:
 
     provider = _FakeProvider({"mefor/smtp#password": "resolved-smtp-pw"})
     notifier = security_notifier_from_settings(
-        _smtp_settings(email_password_secret="mefor/smtp#password"), secret_provider=provider
+        _smtp_settings(email_password_secret="mefor/smtp#password"),
+        secret_provider=provider,
+        posture=_NOT_ENFORCING,
     )
     assert notifier is not None
     assert notifier._password == "resolved-smtp-pw"
