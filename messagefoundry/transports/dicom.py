@@ -1421,10 +1421,10 @@ class DicomScuDestination(DestinationConnector):
         # it never reached keeps it. Disjoint from the cleartext guard above, which is taken only
         # when TLS is off.
         #
-        # A context that skips validity-period checks (tls_allow_expired) is handed to the guard as
-        # no context, so a CRL on it cannot admit the hop and only the attestation crosses it, as on
-        # MLLP and FTPS (vault BACKLOG #2978, ADR 0173 §13). The owner's 2026-10-05 ruling names MLLP;
-        # its reach to this hop is the batch 191 Manager's reading of "one rule everywhere".
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
+        # is handed to the guard as no context: see skips_validity_period (vault BACKLOG #2978, ADR
+        # 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is the batch 191
+        # Manager's reading of "one rule everywhere".
         if self._ssl is not None:
             expiry_relaxed = skips_validity_period(self._ssl)
             RevocationHopGuard.capture(

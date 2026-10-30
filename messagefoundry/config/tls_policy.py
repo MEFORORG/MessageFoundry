@@ -931,10 +931,11 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
 
     OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
     ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
-    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal: a hop
-    whose context answers True hands the guard no context, and names
-    :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2188 for the HTTP family, #2978 for MLLP and
-    the DICOM SCU). Read off the context, as :func:`context_checks_revocation` reads the CRL flag."""
+    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
+    destination and the DICOM SCU ask this of the context they dial with and, on True, hand the
+    guard no context and name :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173
+    §13). The REST family and FTPS reach the same answer from the ``tls_allow_expired`` setting
+    instead (vault BACKLOG #2188), and of those only FTPS names that remedy."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 

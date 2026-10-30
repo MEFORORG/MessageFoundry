@@ -43,6 +43,7 @@ from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopPosture,
     InsecureHopRefused,
+    RevocationHopGuard,
     TrustAnchorPolicy,
     active_hop_posture,
     build_smtp_tls_context,
@@ -1007,13 +1008,12 @@ def test_a_credentialed_direct_hop_that_verifies_nothing_keeps_its_own_refusal(
 
 # --- tls_allow_expired on the MLLP destination and the DICOM SCU (vault BACKLOG #2978) -------------
 #
-# ``tls_allow_expired`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's validity
-# window too, so a CRL past ``nextUpdate`` is accepted at the handshake on that context. REST, SOAP,
-# FHIR and FTPS already gave such a hop no CRL credit. These two handed the guard the relaxed
-# context, so a CRL that reached them admitted an off-box hop under an enforcing posture. Owner
-# ruling 2026-10-05 names MLLP; the DICOM SCU's reach is the batch 191 Manager's reading of "one
-# rule everywhere" (ADR 0173 §13). Each hop gets three arms: refused with the CRL on the relaxed
-# context, crossed and audited on its attestation, and unchanged without the relaxation.
+# A context that skips validity-period checks earns no CRL credit (``skips_validity_period``).
+# These two hops handed the guard that context, so a CRL that reached them admitted an off-box hop
+# under an enforcing posture. Owner ruling 2026-10-05 names MLLP; the DICOM SCU's reach is the batch
+# 191 Manager's reading of "one rule everywhere" (ADR 0173 §13). Each hop gets four arms: refused
+# with the CRL on the relaxed context, crossed and audited on its attestation with no CRL credit,
+# warned rather than silently admitted when not enforcing, and unchanged without the relaxation.
 
 
 def _mllp(
@@ -1113,15 +1113,38 @@ def test_a_crl_does_not_admit_a_dicom_scu_that_ignores_certificate_expiry(
 
 
 def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
-    bare_crl: str,
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The SCU keeps no guard on itself, so the guard it captures is recorded on the way out.
+    guards: list[RevocationHopGuard] = []
+    real_capture = RevocationHopGuard.capture
+
+    def recording_capture(**kwargs: Any) -> RevocationHopGuard:
+        guard = real_capture(**kwargs)
+        guards.append(guard)
+        return guard
+
+    monkeypatch.setattr(RevocationHopGuard, "capture", staticmethod(recording_capture))
     with active_hop_posture(ENFORCING), _guard_log() as log:
         DicomScuDestination(
             _scu(REMOTE, allow_expired=True, attested=True, policy=_crl_policy(bare_crl))
         )
+    assert [guard.crl_checked for guard in guards] == [False]
     shipped = _shipped(log.audit)
     assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
+
+
+def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:
+    """Before vault BACKLOG #2978 the CRL admitted both hops silently here. With no CRL credit they
+    take the same WARN as any unchecked hop on a non-enforcing instance."""
+    policy = _crl_policy(bare_crl)
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+        MLLPDestination(_mllp(REMOTE, allow_expired=True, policy=policy))
+        DicomScuDestination(_scu(REMOTE, allow_expired=True, policy=policy))
+    revocation = [m for m in log.messages if "revocation" in m]
+    assert any("verified MLLP-over-TLS egress" in m for m in revocation), log.state()
+    assert any("verified DICOM-over-TLS association" in m for m in revocation), log.state()
 
 
 def test_a_crl_still_admits_a_dicom_scu_that_checks_expiry(bare_crl: str) -> None:

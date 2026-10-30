@@ -1474,11 +1474,20 @@ on first deployment, with no attestation.
   sites; on these hops the setting and the flag are set together.
 - The attested crossing still logs its audit line, which §4.3 names as the only record of the
   attestation on this shape: with no CRL credit, the attestation is what crosses the hop.
+- On an instance that does not enforce, these hops used to cross silently on the CRL. They now log
+  the revocation WARNING at each build, as any hop without a check does.
 - Without `tls_allow_expired` both hops are unchanged: a CRL that reaches the context admits them.
+- **Two older passages read as before this amendment.** Where the §7.1 rows for the MLLP destination
+  and the DICOM SCU say a CRL that reaches the context relaxes the refusal, that now holds only for
+  a hop without `tls_allow_expired`. And the reason §4.3's *One audit line still over-states* gives
+  for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
+  `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
+  so the fix would not silence it. This amendment does not revisit that fix.
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
-refused with a CRL on the relaxed context, admitted and audited on the attestation, and admitted by
-the same CRL without the relaxation, for each hop.
+refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
+credit, warned when not enforcing, and admitted by the same CRL without the relaxation, for each
+hop.
 
 **Left open.** The REST, SOAP and FHIR refusals on this shape still name the default remedy, which
 offers `[tls].crl_file`; they hand the guard no opener, so that lever cannot cross them. This

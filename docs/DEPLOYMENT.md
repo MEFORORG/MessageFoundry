@@ -655,7 +655,9 @@ It **is reported**: `security_loosenings()`, and therefore `GET /security/postur
 plus a `tls-allow-expired` line from `messagefoundry check` naming each connection and its peer,
 alongside the WARNING each construction logs. Like every connection-scoped declaration it is **not** in
 the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
-gated — nothing refuses it, and nothing takes it away again.
+gated — nothing refuses it, and nothing takes it away again. It does take one lever away: on a hop
+that sets it, a `[tls].crl_file` no longer crosses the revocation gate, so off the box on an enforcing
+instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13).
 
 Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in
 [Revocation-guard behavior](#revocation-guard-behavior), a PHI hop can be pinned to a certificate that
@@ -1068,7 +1070,7 @@ attestation:
 4. **Check revocation in the engine — outbound gate and mTLS listeners.** Load a CRL with
    `[tls].crl_file` where it reaches the hop. The guard reads the CRL check off that hop's own TLS
    context and lets the hop through (BACKLOG #299). This is not a declaration: the engine checks the
-   CRL on the wire. An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
+   CRL on the wire. A hop that sets `tls_allow_expired` gets no credit from it (ADR 0173 §13). An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
    its own CRL setting (above). The Vault hops and the `[api]` listener gate have no CRL lever.
 5. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was

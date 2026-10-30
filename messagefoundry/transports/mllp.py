@@ -907,9 +907,9 @@ class MLLPDestination(DestinationConnector):
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
         #
-        # A context that skips validity-period checks (tls_allow_expired) is handed to the guard as
-        # no context, so a CRL on it cannot admit the hop and only the attestation crosses it, as on
-        # REST, SOAP, FHIR and FTPS (owner ruling 2026-10-05; vault BACKLOG #2978, ADR 0173 §13).
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
+        # is handed to the guard as no context: see skips_validity_period (owner ruling 2026-10-05;
+        # vault BACKLOG #2978, ADR 0173 §13).
         expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
