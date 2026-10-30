@@ -1982,6 +1982,36 @@ class AuditStore(Protocol):
         moved row and a new seal, guarded on the status and the seal it read."""
         ...
 
+    async def reject_seal_failed_approval(
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        decided_at: float,
+        seal_read: object,
+        audits: Sequence[AuditAppend] = (),
+    ) -> bool:
+        """Move a ``pending`` request whose row FAILS its integrity seal to ``rejected`` (BACKLOG
+        #3638; owner ruling 2026-10-26). ``True`` iff this call moved it.
+
+        The narrow exception to :meth:`decide_pending_approval`'s rule that a failing row is never
+        written. Without it such a request could not be closed at all, and with
+        ``[approvals].expiry_hours = 0`` it never expires. It reads the row in the write and moves
+        it only while it reads ``pending``, still carries ``seal_read`` (the seal value the caller
+        read, exactly as read) and fails its seal; a sound row, a missing one, one changed since
+        the caller's read or one in any other status is left alone and ``False`` returned. The
+        UPDATE writes the status ``rejected`` as a literal, guarded in the SQL on
+        ``status = 'pending'`` and on ``seal_read``, so it can never move a row to ``executing`` or
+        ``approved``, and it is parameterized. It sets ``approver``,
+        ``decided_at`` and a tombstone seal (``store.approval_tombstone``), which covers only the
+        id, the status, the approver and the decision time, under a kind of its own: it never
+        vouches for the params or the requester, and the row keeps failing its approval seal.
+
+        ``audits`` are appended in the SAME transaction, only when the row moved, so the move, the
+        ``integrity.authority_seal_failed`` row and ``approval.rejected`` land together or not at
+        all. They are teed off-box after the commit."""
+        ...
+
     async def list_executing_approvals(
         self, *, claim_owner: str | None = None, limit: int = 1000
     ) -> Sequence[Row]:
@@ -2004,7 +2034,9 @@ class AuditStore(Protocol):
 
     async def reseal_approval_records(self) -> tuple[int, int]:
         """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
-        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is."""
+        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is. A
+        ``rejected`` tombstone (BACKLOG #3638) that holds as a tombstone is given one under the
+        active key and counted re-sealed, never refused."""
         ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...

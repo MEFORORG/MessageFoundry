@@ -1433,17 +1433,26 @@ UPLOAD_CIPHER_SUBJECT = "upload-cipher"
 #: #2592). Its own subject, so it throttles and routes apart from the cipher and the audit chain.
 AUTHORITY_SEAL_SUBJECT = "authority-seal"
 
+#: The ``integrity_drift`` subject prefix for a seal-failed dual-control request that was rejected
+#: (BACKLOG #3638), written ``<prefix>:<approval id>``. Apart from :data:`AUTHORITY_SEAL_SUBJECT`
+#: because the notifier's cooldown and escalation count are per subject. On that subject, any
+#: authority row's report inside the cooldown would hold this page back, and a second reject's too.
+AUTHORITY_SEAL_REJECTED_SUBJECT = "authority-seal-rejected"
 
-def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+
+def authority_seal_alert(
+    sink: AlertSink, *, subject: str = AUTHORITY_SEAL_SUBJECT
+) -> Callable[[str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call raises
-    ``integrity_drift`` under :data:`AUTHORITY_SEAL_SUBJECT` with the given reason.
+    ``integrity_drift`` under ``subject`` with the given reason.
 
-    The reason names a row kind and a short id prefix, never a row value, so it carries no PHI.
+    The reason names a row kind and an id (a short prefix, or an approval request's full id), never
+    another row value, so it carries no PHI.
     Never raises: an alert failure must not change what a sign-in or a request resolves to."""
 
     def _raise(reason: str) -> None:
         try:
-            sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
+            sink.integrity_drift(subject, reason=reason, drift_count=1)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("authority-seal integrity alert could not be delivered")
 

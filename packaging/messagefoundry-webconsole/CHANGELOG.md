@@ -31,6 +31,13 @@ this line.**
 
 ### Security
 
+- **The Approvals page lists a request that failed its integrity check, flagged, and offers its
+  Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
+  for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
+  changed outside the engine or sealed under a key the engine does not hold, and Reject with no
+  Approve. Needs the engine seam that
+  carries the `seal_failed` value. (BACKLOG #3638, #3639)
+
 - **The passkey registration finish no longer spends the ceremony budget on a session the factor
   rule refuses, and its 429 sends `Retry-After: 30`.** `POST /ui/account/webauthn/verify` asks
   `AuthService.factor_binding_is_blocked` before it draws the per-actor ceremony budget, and skips

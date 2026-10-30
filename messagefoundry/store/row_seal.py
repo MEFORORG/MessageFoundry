@@ -62,6 +62,11 @@ ADSET_KIND: Final = "adset"
 #: the whole row, so its captured params and its requester id are bound to the request.
 APPROVAL_KIND: Final = "approval"
 
+#: The kind a rejected request's tombstone seal is computed under (BACKLOG #3638): the seal a
+#: Reject writes on a ``pending_approvals`` row that failed its own seal. A kind of its own, so a
+#: tombstone never verifies as an approval seal and never vouches for the row's other columns.
+APPROVAL_TOMBSTONE_KIND: Final = "approval_tombstone"
+
 #: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
 #: the user seal covers, so it needs no key of its own.
 PASSKEYS_LABEL: Final = "passkeys"

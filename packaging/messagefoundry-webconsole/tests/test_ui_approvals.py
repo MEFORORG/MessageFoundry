@@ -15,6 +15,7 @@ import json
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import get_args
 from urllib.parse import quote
 from uuid import uuid4
@@ -305,6 +306,62 @@ async def test_reject_declines_the_hold_and_says_so(engine: Engine) -> None:
     assert await _status(engine, approval_id) == "rejected"
     rows = await engine.store.list_audit(action="approval.rejected")
     assert [row["actor"] for row in rows] == ["checker"]
+
+
+async def test_a_hold_that_fails_its_seal_is_listed_flagged_and_rejected(
+    tmp_path: Path, engine: Engine
+) -> None:
+    """BACKLOG #3638, #3639: a hold whose row was changed outside the engine is listed, flagged,
+    with its parameters withheld, and the reject closes it. A REAL hold, then a write straight to
+    the store file: the params gain a marker, and ``requested_at`` takes a value no reader can
+    type, which fails the row's check even on this keyless store. The marker never reaches the
+    page. The control is the page before the write, which shows the params and offers Approve."""
+    service, _maker, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        before = await checker.get("/ui/approvals")
+        assert "channel_id: ch1" in before.text  # control
+        assert f'action="/ui/approvals/{approval_id}/approve"' in before.text
+        raw = sqlite3.connect(tmp_path / "webui.db")
+        try:
+            raw.execute(
+                "UPDATE pending_approvals SET params=?, requested_at=? WHERE id=?",
+                ('{"channel_id": "TAMPERED-MARKER"}', "not-a-time", approval_id),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        listing = await checker.get("/ui/approvals")
+        assert approval_id in listing.text and "FLAGGED" in listing.text
+        assert ">withheld<" in listing.text and "TAMPERED-MARKER" not in listing.text
+        assert f'action="/ui/approvals/{approval_id}/approve"' not in listing.text
+        assert f'action="/ui/approvals/{approval_id}/reject"' in listing.text
+        r = await checker.post(f"/ui/approvals/{approval_id}/reject", headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        after = await checker.get("/ui/approvals")
+    assert approval_id not in after.text
+    assert await _status(engine, approval_id) == "rejected"
+    rows = await engine.store.list_audit(action="approval.rejected")
+    assert [row["actor"] for row in rows] == ["checker"]
+    assert await engine.store.list_audit(action="integrity.authority_seal_failed")
+
+
+def test_a_seal_failed_row_never_renders_params() -> None:
+    """The engine sends none for such a row; the page renders "withheld" even if some did."""
+    aid = "e" * 32
+    html = str(
+        pages.approvals_page(
+            ApprovalList(
+                approvals=[
+                    _row(aid, params={"channel_id": "LEAK-MARKER"}, release_blocked="seal_failed")
+                ]
+            )
+        )
+    )
+    assert ">withheld<" in html and "LEAK-MARKER" not in html
+    assert "/approve" not in html and f'action="/ui/approvals/{aid}/reject"' in html
 
 
 async def test_the_requester_may_withdraw_their_own_hold(engine: Engine) -> None:

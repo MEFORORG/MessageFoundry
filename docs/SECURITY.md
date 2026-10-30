@@ -2910,6 +2910,66 @@ The provenance check flags rather than refuses on purpose. A refusal would stop 
 route, and it would also refuse an honest directory approver whose engine row is created at first
 sign-in.
 
+**A request whose row fails its integrity seal can only be rejected, and the queue lists it
+flagged (BACKLOG #3638, #3639; owner ruling 2026-10-26).** On a store that holds a key, each
+request row carries a seal over every column (vault BACKLOG #2592). A row changed outside the
+store fails it, and is never released or resolved. The failure writes an
+`integrity.authority_seal_failed` audit row and raises `integrity_drift`. Nothing expires such a
+request when `[approvals].expiry_hours` is 0, so the reject is what closes it:
+
+- `GET /approvals` and the Approvals page list a failing `pending` request after the sound
+  `pending` ones,
+  with `release_blocked` set to `seal_failed`. Its `params` are always withheld, never decoded or
+  sent. Its `approver` and `decided_at` are withheld, and its status reads `pending`. Its other
+  values are shown as stored and are unverified; a time no page can render is
+  shown as the epoch, or as no expiry. The page offers Reject and no Approve. RBAC is unchanged:
+  the queue and the reject still need `approvals:approve`.
+- The reject is a narrow store write on SQLite, SQL Server and PostgreSQL. It reads the row in the
+  write and moves it only while it reads `pending` and fails its seal. Its SQL writes the status
+  `rejected` as a literal, guarded on `status = 'pending'` and on the seal it read, so it cannot
+  move a row to `executing` or `approved`. It writes a tombstone seal, under a kind of its own,
+  over the id, the status, the approver and the decision time. It never seals the changed values
+  in, so the row keeps failing its approval seal. The params stay in the row as found.
+- The move, an unthrottled `integrity.authority_seal_failed` row and an `approval.rejected` row
+  holding only the id and `seal_failed` commit in one transaction. The first keeps the
+  `approver`, `decided_at` and seal the tombstone overwrote, as read, under `prior`. The
+  `integrity_drift` alert is raised after the commit, because an alert sink cannot join a
+  transaction. A crash in that gap leaves the audit rows and no page, and nothing raises it again.
+  The alert's subject is `authority-seal-rejected:<approval id>`, apart from `authority-seal`, so
+  a report inside the notifier's cooldown cannot hold it back. A rule matches every such subject
+  with the glob `authority-seal-rejected:*`. Each is its own alert instance, so an escalation tier
+  above one occurrence never fires on it. One reject writes one such row and raises one such alert.
+- A reject whose write moved nothing (its status or seal changed since the read), raised a store
+  fault, or raised a defect writes the ordinary report instead, throttled per request as the queue
+  listing and an approve do: an `integrity.authority_seal_failed` row and an `integrity_drift`
+  alert under `authority-seal`. A store fault is read as nothing committed, so where a COMMIT
+  landed and only its reply was lost, this report and a 503 stand in for the rejection's alert.
+  The audit rows committed with it, and a second reject answers that it is already rejected.
+- `rotate-key`'s re-seal pass checks a row that fails its approval seal as a tombstone, under the
+  key the tombstone names. One that holds gets a tombstone under the active key and is counted
+  re-sealed. One that fails, like any other failing row, is left as it is, counted and logged.
+- A seal also fails for a row sealed under a store key this engine does not hold, so a flag is not
+  proof of tampering. The page says so, and says to restore a missing key first: a reject cannot be
+  undone.
+
+At least these limits remain:
+
+- a row no honest write leaves can be listed flagged and still not be rejectable: one whose id the
+  routes refuse (not 32 lowercase hex), or, on SQL Server, one whose status matches `pending` only
+  under the column's case-insensitive collation. Its reject answers 422 or 409;
+- the queue reads only requests unexpired by their own stored `expires_at`, an unverified value.
+  A failing row whose stored expiry has passed is not listed, and the queue does not report it.
+  A reject by its id still closes it;
+- a failing `interrupted` release is still left out of its list, and its resolve answers 409;
+- the write compares only the status and the seal. Another column changed between the reject's read
+  and its write, with the seal left alone, is tombstoned as it then stands, and `prior` holds what
+  the read found;
+- on SQLite, a column holding invalid UTF-8 fails the store's read itself, before any seal check, so
+  the queue answers 503 for every request, and so does that request's reject, until the row is
+  repaired by hand;
+- the listing reads the newest 100 open requests by their stored request time, an unverified value,
+  so a failing row past them is neither listed nor reported, and planted rows can push others out.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
 either out is named as a security loosening (vault BACKLOG #3123);
