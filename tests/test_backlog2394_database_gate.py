@@ -32,7 +32,11 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.odbc_call_gate import call_gate
 from messagefoundry.pipeline.reference_sync import _load_database_source
 from messagefoundry.transports import database
-from messagefoundry.transports.database import DatabaseDestination, DatabaseSource
+from messagefoundry.transports.database import (
+    DatabaseDestination,
+    DatabaseLookupExecutor,
+    DatabaseSource,
+)
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
     WAIT,
@@ -60,6 +64,7 @@ class _ClosingPool(Pool):
         super().__init__(conn)
         self.closed = False
         self.returned = False
+        self.waits = 0  # wait_closed calls: aioodbc wakes one waiter per return
 
     def close(self) -> None:
         self.closed = True
@@ -72,6 +77,7 @@ class _ClosingPool(Pool):
         await super().release(conn)
 
     async def wait_closed(self) -> None:
+        self.waits += 1
         assert await wait_until(lambda: self.returned), "the borrowed connection never came back"
 
 
@@ -471,6 +477,76 @@ async def test_a_close_already_waiting_stops_once_a_borrow_is_cancelled(
     rig.release.set()
     await wait_for_entry(rig.log, "conn.close")
     _assert_closed_and_rolled_back_after_the_statement(rig)
+
+
+async def test_a_retried_close_waits_on_the_close_already_in_flight(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A close cancelled while it waits leaves its ``wait_closed`` running, and the pool still
+    referenced. A retried close waits on that same one, never a second waiter: aioodbc wakes one
+    waiter per returned connection, so a second could wait forever. Red with a fresh
+    ``wait_closed`` per close: the pool sees two."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.1)
+    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
+    destination = _destination()
+    sending = asyncio.create_task(destination.send('{"a": 1}'))
+    assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
+    closing = asyncio.create_task(destination.aclose())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert destination._pool is not None, "a cancelled close dropped a pool it had not closed"
+
+    retry = asyncio.create_task(destination.aclose())
+    done, _pending = await asyncio.wait({retry}, timeout=0.3)
+    assert not done, "the retried close stopped waiting for an ordinary in-flight send"
+    rig.release.set()
+    assert await asyncio.wait_for(sending, WAIT) is None
+    await asyncio.wait_for(retry, WAIT)
+    assert destination._pool is None and rig.pools[0].waits == 1
+
+
+class _FailingClose:
+    """A lookup pool whose close fails, or, given ``then``, runs it before succeeding."""
+
+    def __init__(self, error: str | None, then: Any = None) -> None:
+        self._error = error
+        self._then = then
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        if self._then is not None:
+            self._then()
+        if self._error is not None:
+            raise RuntimeError(self._error)
+
+
+async def test_a_lookup_close_reports_every_failure_and_keeps_a_pool_opened_meanwhile(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The lookup executor closes its pools together. Every failure is reported, the first
+    raised and the rest logged, rather than the rest consumed unseen; a pool that failed to close
+    stays, as before, for a later close; and a pool a lookup opened under a name after the
+    snapshot is not dropped with the closed one. Red with the plain ``gather``: nothing logs the
+    second failure. Red with the pop by name: the new pool is dropped unclosed."""
+    executor = DatabaseLookupExecutor.__new__(DatabaseLookupExecutor)
+    reopened = _FailingClose(None)
+
+    def _reopen() -> None:
+        executor._pools["c"] = reopened  # a lookup on "c" opened a new pool during the close
+
+    first, second = _FailingClose("refused one"), _FailingClose("refused two")
+    executor._pools = {"a": first, "b": second, "c": _FailingClose(None, then=_reopen)}
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.transports.database"),
+        pytest.raises(RuntimeError, match="refused one"),
+    ):
+        await executor.aclose()
+    assert "DatabaseLookup pool close failed" in caplog.text
+    assert executor._pools == {"a": first, "b": second, "c": reopened}
 
 
 async def test_after_a_cancelled_send_a_new_pool_opens_beside_the_closing_one(

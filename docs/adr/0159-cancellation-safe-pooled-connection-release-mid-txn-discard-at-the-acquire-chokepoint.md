@@ -579,13 +579,17 @@ the next reader does not re-derive the wrong precedent from the same comment.
     pool read one count. Every close of a DATABASE pool goes through `_close_pool_bounded`: the
     destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool teardown,
     and `DatabaseSource.aclose()`, the ordinary `stop()` included. It stops waiting at the bound
-    only while that count is above zero, read again at each tick, so a borrow cancelled after the
-    close began counts too. With the count at zero an in-flight call is an ordinary one, and the
-    close waits for it without a bound, as before this amendment. `DatabaseSource.stop()` after a
-    cancel keeps its BACKLOG #1620 bound whatever the count. The bound only stops the wait: the
-    close goes on by itself, never cancelled part-way, and the held connection is released only once
-    its statement returns. So the connection test in `api/app.py`, which stops a source it probed,
-    no longer waits past its own timeout for a `SELECT 1` its timeout cancelled.
+    only while that count is above zero. The count is read at the end of each tick of
+    `_POOL_CLOSE_TIMEOUT_S`, so a close that starts with a connection held back waits one tick, and
+    a borrow cancelled after the close began stops it at the end of the tick it lands in, up to two
+    ticks after it. With the count at zero an in-flight call is an ordinary one, and the close waits
+    for it without a bound, as before this amendment. `DatabaseSource.stop()` after a cancel keeps
+    its BACKLOG #1620 bound whatever the count. The bound only stops the wait: the close goes on by
+    itself, never cancelled part-way, and the held connection is released only once its statement
+    returns. A retried close waits on the close already in flight rather than a second
+    `wait_closed`. So the connection test in `api/app.py`, which stops a source it probed, now
+    returns about `_POOL_CLOSE_TIMEOUT_S` after its own timeout for a `SELECT 1` its timeout
+    cancelled, rather than when that statement returns.
   - **After the bound, a second pool can open beside the one still closing.** The destination and
     the source drop their pool when the wait stops, and the next borrow opens a new one. Until the
     cancelled statement returns the server can then see more connections than `pool_max`. That is

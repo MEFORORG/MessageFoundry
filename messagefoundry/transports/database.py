@@ -2010,8 +2010,9 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     """Close ``pool``. Wait for its connections in use as an unbounded ``wait_closed`` would, but
     stop waiting once a connection of it is held back behind a cancelled borrow (BACKLOG #2394).
 
-    **The bound applies only while that count is above zero** (:func:`_holds_back`), whether it is
-    when the close starts or becomes so while it waits. Such a connection goes back only once its
+    **The bound applies only while that count is above zero** (:func:`_holds_back`), read at the end
+    of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
+    tick, and one held back mid-wait ends the wait at the end of its tick. Such a connection goes back only once its
     cancelled call returns, which nothing bounds (ADR 0159, amendment of 2026-10-30), so a stop or a
     reload would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
@@ -2024,11 +2025,15 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     its call has returned, to a pool already closing. A caller that then opens a new pool has two
     open beside each other until that call returns, the trade the source's stop after a cancel
     already makes. A close that fails while waited on raises, as before; one that fails after the
-    wait has stopped is logged."""
+    wait has stopped is logged.
+
+    **A retried close waits on the close already in flight** (:func:`_pool_closing`), never a
+    second ``wait_closed`` beside it: aioodbc wakes one waiter per returned connection, so a second
+    waiter on the same pool might never be woken."""
     pool.close()
-    closing = asyncio.ensure_future(pool.wait_closed())
-    _DETACHED_SETTLES.add(closing)
-    closing.add_done_callback(_DETACHED_SETTLES.discard)
+    closing = _pool_closing(pool)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     tick = _POOL_CLOSE_TIMEOUT_S if bound is None else bound
     try:
         while True:
@@ -2044,27 +2049,55 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
         closing.result()
         return
     closing.add_done_callback(partial(_log_late_pool_close, what))
+    waited = loop.time() - started
     if held:
         logger.warning(
-            "%s pool did not close within %.1fs; %d connection(s) held behind a cancelled call go "
-            "back when that call returns, and the close goes on meanwhile",
+            "%s pool did not close in %.1fs of waiting; %d connection(s) held behind a cancelled "
+            "call go back when that call returns, and the close goes on meanwhile",
             what,
-            tick,
+            waited,
             held,
         )
     else:  # only a caller's own bound ends the wait with nothing held back
         logger.warning(
-            "%s pool did not close within %.1fs; the close goes on, and a connection still in use "
-            "closes when its borrower returns it",
+            "%s pool did not close in %.1fs of waiting; the close goes on, and a connection still "
+            "in use closes when its borrower returns it",
             what,
-            tick,
+            waited,
         )
+
+
+#: The close in flight for each pool, keyed as :data:`_HELD_BACK` is (:func:`_pool_closing`).
+_CLOSING: weakref.WeakKeyDictionary[Any, asyncio.Future[None]] = weakref.WeakKeyDictionary()
+
+
+def _pool_closing(pool: Any) -> asyncio.Future[None]:
+    """``pool``'s ``wait_closed``, run detached: the one already in flight if a close that stopped
+    waiting, or was cancelled, left one, otherwise a new one. A finished one, a failed close
+    included, is not reused, so a retry after a failure closes again."""
+    key = _pool_key(pool)
+    try:
+        closing = _CLOSING.get(key)
+    except TypeError:  # cannot be weakly keyed: each close waits on its own
+        closing = None
+    if closing is not None and not closing.done():
+        return closing
+    fresh: asyncio.Task[None] = asyncio.ensure_future(pool.wait_closed())
+    _DETACHED_SETTLES.add(fresh)
+    fresh.add_done_callback(_DETACHED_SETTLES.discard)
+    with contextlib.suppress(TypeError):
+        _CLOSING[key] = fresh
+    return fresh
 
 
 def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
     error = None if closing.cancelled() else closing.exception()
     if error is not None:
-        logger.warning("%s pool close failed after its bound: %s", what, _safe_db_error(error))
+        logger.warning(
+            "%s pool close failed after its caller stopped waiting: %s",
+            what,
+            _safe_db_error(error),
+        )
 
 
 async def _probe_db(
@@ -3196,8 +3229,17 @@ class DatabaseLookupExecutor:
         waiting at a bound only while a cancelled lookup holds a connection back, as the
         destination's does (BACKLOG #2394, :func:`_close_pool_bounded`)."""
         pools = list(self._pools.items())  # a snapshot: a lookup may open a pool meanwhile
-        await asyncio.gather(
-            *(_close_pool_bounded(pool, f"DatabaseLookup {name!r}") for name, pool in pools)
+        outcomes = await asyncio.gather(
+            *(_close_pool_bounded(pool, f"DatabaseLookup {name!r}") for name, pool in pools),
+            return_exceptions=True,
         )
-        for name, _pool in pools:
-            self._pools.pop(name, None)
+        failures: list[BaseException] = []
+        for (name, pool), outcome in zip(pools, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                failures.append(outcome)  # kept, as before, so a later aclose() closes it again
+            elif self._pools.get(name) is pool:  # not a pool a lookup opened under it meanwhile
+                del self._pools[name]
+        for failure in failures[1:]:  # the first is raised; nothing else would report these
+            logger.warning("DatabaseLookup pool close failed: %s", _safe_db_error(failure))
+        if failures:
+            raise failures[0]
