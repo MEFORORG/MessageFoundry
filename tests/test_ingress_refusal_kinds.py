@@ -13,8 +13,7 @@ outbound to that listener and reads how the outbound classifies each answer.
 
 from __future__ import annotations
 
-import base64
-import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -46,19 +45,15 @@ from messagefoundry.transports.http_listener import (
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind
 from messagefoundry.transports.rest import RestDestination
 from tests.test_inbound_http_source import _http, _Response
+from tests.test_ingress_document_detach import _big_b64
+from tests.test_ingress_document_detach import _hl7_with_doc as _detach_fixture
 
 HL7 = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
 
 def _hl7_with_doc(nbytes: int) -> str:
     """An MDM^T02 carrying one OBX-5 ED base64 document, so a streaming inbound detaches it."""
-    b64 = base64.b64encode(b"P" * nbytes).decode("ascii")
-    return (
-        "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGID001|P|2.5\r"
-        "EVN|T02|20260101120000\r"
-        "PID|1||MRN123^^^FAC||DOE^JOHN\r"
-        f"OBX|1|ED|PDF^Report||^Application^PDF^Base64^{b64}||||||F\r"
-    )
+    return _detach_fixture(_big_b64(nbytes))
 
 
 @pytest.fixture
@@ -152,14 +147,18 @@ async def test_the_strict_validation_timeout_stays_a_permanent_422(
     # Deliberately NOT temporary (ADR 0154 amendment 2026-10-30): the same pathological body times
     # out on every re-send, and each attempt orphans another hl7apy thread the listener cannot kill,
     # so inviting a retry would multiply the load the timeout bounds.
-    def _slow_validate(text: str, **_: Any) -> Any:
-        time.sleep(0.3)
-        raise AssertionError("the timeout must have answered first")
+    release = threading.Event()
 
-    monkeypatch.setattr(wiring_runner, "validate", _slow_validate)
+    def _stuck_validate(text: str, **_: Any) -> Any:
+        release.wait(10.0)  # held until the answer is read, so the orphaned thread ends at once
+
+    monkeypatch.setattr(wiring_runner, "validate", _stuck_validate)
     monkeypatch.setattr(wiring_runner, "_strict_validate_timeout", lambda ic: 0.01)
     ic = _ic(validation=Validation(strict=True))
-    resp = await _post_through_runner(store, ic, HL7.encode("ascii"))
+    try:
+        resp = await _post_through_runner(store, ic, HL7.encode("ascii"))
+    finally:
+        release.set()
     assert resp.status == 422
     assert "retry-after" not in resp.headers
     row = await _the_one_error_row(store)
@@ -171,10 +170,10 @@ async def test_the_strict_validation_timeout_stays_a_permanent_422(
 
 
 @pytest.mark.parametrize(
-    ("content_type", "body", "error"),
+    ("content_type", "body"),
     [
-        (ContentType.JSON, b'{"mrn": "100", "type": "obs"}', "exceeds"),
-        (ContentType.BINARY, b"\x00\x01" * 16, "exceeds"),
+        (ContentType.JSON, b'{"mrn": "100", "type": "obs"}'),
+        (ContentType.BINARY, b"\x00\x01" * 16),
     ],
     ids=["text_engine_ceiling", "binary_engine_ceiling"],
 )
@@ -183,7 +182,6 @@ async def test_a_body_over_the_engine_ceiling_is_413_and_names_its_row(
     monkeypatch: pytest.MonkeyPatch,
     content_type: ContentType,
     body: bytes,
-    error: str,
 ) -> None:
     # Under the listener's max_body_bytes, so the listener reads it; over the engine's ingress
     # ceiling, so the runner refuses it. Base answered 422 here and 413 for max_body_bytes.
@@ -191,7 +189,7 @@ async def test_a_body_over_the_engine_ceiling_is_413_and_names_its_row(
     resp = await _post_through_runner(store, _ic(content_type), body)
     assert resp.status == 413
     row = await _the_one_error_row(store)
-    assert error in row["error"]
+    assert "exceeds" in row["error"]
     _assert_names_the_row(resp, row)
 
 
@@ -231,7 +229,7 @@ async def test_a_body_over_max_body_bytes_is_413_before_any_row(store: MessageSt
 # --- the classifier itself ------------------------------------------------------------------------
 
 
-async def test_a_size_phase_guard_is_oversize_and_every_other_phase_is_permanent(
+async def test_the_too_large_guard_is_oversize_and_every_other_guard_is_permanent(
     store: MessageStore,
 ) -> None:
     reg = Registry()
@@ -239,14 +237,20 @@ async def test_a_size_phase_guard_is_oversize_and_every_other_phase_is_permanent
     reg.add_inbound(ic)
     runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     kinds = {}
-    for phase in ("size", "decode", "type", "parse", "strict"):
-        receipt = await runner._refuse_guarded(
-            ic, b"x", None, ingress_guards.IngressGuardError("r", phase=phase), message_type=None
-        )
+    guards = {
+        "too_large": ingress_guards.IngressTooLarge("r"),
+        "decode": ingress_guards.IngressGuardError("r", phase="decode"),
+        "type": ingress_guards.IngressGuardError("r", phase="type"),
+        "parse": ingress_guards.IngressGuardError("r", phase="parse"),
+        "strict": ingress_guards.IngressGuardError("r", phase="strict"),
+    }
+    for name, guard in guards.items():
+        receipt = await runner._refuse_guarded(ic, b"x", None, guard, message_type=None)
         assert isinstance(receipt, IngressReceipt) and receipt.message_id
-        kinds[phase] = receipt.refusal
+        kinds[name] = receipt.refusal
+    assert ingress_guards.IngressTooLarge("r").phase == "size"  # the label callers read is kept
     assert kinds == {
-        "size": RefusalKind.OVERSIZE,
+        "too_large": RefusalKind.OVERSIZE,
         "decode": RefusalKind.PERMANENT,
         "type": RefusalKind.PERMANENT,
         "parse": RefusalKind.PERMANENT,

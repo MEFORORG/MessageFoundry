@@ -231,7 +231,8 @@ _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _NOT_ACCEPTED = "message was not accepted"
 
 #: The ``Retry-After`` seconds on the ``503`` answering a TEMPORARY ingress refusal (owner ruling
-#: 2026-09-30, BACKLOG #2105). Stated once, here, and in ADR 0154's 2026-10-30 amendment.
+#: 2026-09-30, BACKLOG #2105), as ADR 0154's 2026-10-30 amendment states it. The sync path's
+#: shutting-down ``503`` in ``_reply_to_wire`` is a different answer and sets its own.
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
 #: The status each refusal kind is answered with (ADR 0154 amendment 2026-10-30). Only a temporary

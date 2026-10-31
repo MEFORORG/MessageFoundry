@@ -150,6 +150,7 @@ from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
     IngressGuardError,
+    IngressTooLarge,
     carry_binary_ingress,
     check_binary_size,
     check_declared_type,
@@ -7834,24 +7835,21 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
-            mid = await self._record_refused(
+            # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
+            # other parse refusal is about the body's content.
+            return await self._refuse(
                 ic,
                 raw,
                 text,
+                RefusalKind.OVERSIZE
+                if isinstance(exc, HL7MessageTooLarge)
+                else RefusalKind.PERMANENT,
                 error=(
                     f"parse error: {safe_exc(exc)}"
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
             )
-            # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
-            # other parse refusal is about the body's content.
-            kind = (
-                RefusalKind.OVERSIZE
-                if isinstance(exc, HL7MessageTooLarge)
-                else RefusalKind.PERMANENT
-            )
-            return IngressReceipt.refused(kind, mid)
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
             # MSH structure Peek.parse validated) — see _handle_inbound for the rationale.
@@ -7883,12 +7881,14 @@ class RegistryRunner:
                 # retry would multiply the very load this timeout bounds. ADR 0154's 2026-10-30
                 # amendment records when it may be reclassified.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
-                return IngressReceipt.refused(RefusalKind.PERMANENT, mid)
+                return await self._refuse(
+                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
+                )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                return IngressReceipt.refused(RefusalKind.PERMANENT, mid)
+                return await self._refuse(
+                    ic, raw, text, RefusalKind.PERMANENT, error=persisted, peek=peek
+                )
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns a refusal — never accepted-and-dropped.
         skeleton = text
@@ -7897,9 +7897,6 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
-                mid = await self._record_refused(
-                    ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
-                )
                 # Only the in-flight budget is the engine's own and clears as concurrent detaches
                 # finish, so only it invites a re-send. An unsupported backend and a malformed handle
                 # refuse the same body every time.
@@ -7908,7 +7905,14 @@ class RegistryRunner:
                     if isinstance(exc, _StreamBudgetExceeded)
                     else RefusalKind.PERMANENT
                 )
-                return IngressReceipt.refused(kind, mid)
+                return await self._refuse(
+                    ic,
+                    raw,
+                    text,
+                    kind,
+                    error=f"streaming detach failed: {safe_exc(exc)}",
+                    peek=peek,
+                )
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
@@ -7921,6 +7925,25 @@ class RegistryRunner:
         self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
         return IngressReceipt.accepted(mid)
 
+    async def _refuse(
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        text: str | None,
+        kind: RefusalKind,
+        *,
+        error: str,
+        message_type: str | None = None,
+        peek: Peek | None = None,
+    ) -> IngressReceipt:
+        """Record a refused body as ``ERROR`` and return that row as a receipt refusal of ``kind``.
+
+        The receipt is built from the id ``_record_refused`` returned, so it always names the row."""
+        mid = await self._record_refused(
+            ic, raw, text, error=error, message_type=message_type, peek=peek
+        )
+        return IngressReceipt.refused(kind, mid)
+
     async def _refuse_guarded(
         self,
         ic: InboundConnection,
@@ -7932,11 +7955,10 @@ class RegistryRunner:
     ) -> IngressReceipt:
         """Record an ingress-guard refusal as ``ERROR`` and return it as a receipt refusal.
 
-        The guard's ``phase`` decides the kind: ``size`` is the engine ceiling, answered as over-size
-        on every path (BACKLOG #2105); every other phase is about the body and is permanent."""
-        mid = await self._record_refused(ic, raw, text, error=exc.reason, message_type=message_type)
-        kind = RefusalKind.OVERSIZE if exc.phase == "size" else RefusalKind.PERMANENT
-        return IngressReceipt.refused(kind, mid)
+        The engine ceiling (:class:`IngressTooLarge`) is answered as over-size on every path (BACKLOG
+        #2105); every other guard is about the body and is permanent."""
+        kind = RefusalKind.OVERSIZE if isinstance(exc, IngressTooLarge) else RefusalKind.PERMANENT
+        return await self._refuse(ic, raw, text, kind, error=exc.reason, message_type=message_type)
 
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above

@@ -1195,7 +1195,7 @@ class DicomScpSource(SourceConnector):
                 sop_instance,
             )
             return _STATUS_OUT_OF_RESOURCES
-        # The runner's receipt handler is an async def (a Coroutine), but InboundHandler is typed as the
+        # The runner's receipt handler is an async def (a Coroutine), but ReceiptHandler is typed as the
         # Awaitable; run_coroutine_threadsafe needs a Coroutine, so narrow it.
         coro = cast("Coroutine[Any, Any, IngressReceipt]", handler(object_bytes))
         try:
