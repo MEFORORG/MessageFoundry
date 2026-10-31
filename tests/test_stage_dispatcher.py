@@ -321,12 +321,18 @@ class RecordingStub:
             self._active.discard(lane)
 
 
+_CLAIM_SHIM_MODES = frozenset(
+    {"rearm_once", "empty_block_once", "lock_timeout_once", "head_skip_once", "empty_once"}
+)
+
+
 class _ClaimShim:
     """Wraps the real store, delegating everything (``list_fifo_lanes`` / ``release_claimed`` /
     ``mark_failed`` / ``enqueue_ingress`` / …) EXCEPT ``claim_fifo_heads``, which it intercepts ONCE for
     ``lane`` to unit-test a dispatcher claim-outcome branch the real store only reaches via the intricate
     OUTBOUND H2 path (T10 ``rearm``), a genuine wake/claim race (T11 EMPTY+dirty), or a live SQL Server
-    lock timeout (BACKLOG #1270 ``lock_timeout``).
+    lock timeout (BACKLOG #1270 ``lock_timeout``). ``empty_once`` answers with a plain EMPTY and no
+    store round-trip, for an arm whose subject is a genuinely empty claim (BACKLOG #1270).
 
     ``extra_lanes`` widens the intercept to SEVERAL lanes so one round-trip can carry more than one
     outcome. It defaults empty, which leaves every existing mode's intercept condition unchanged.
@@ -347,7 +353,11 @@ class _ClaimShim:
         self._real = real
         self._lane = lane
         self._targets = frozenset({lane}) | extra_lanes
-        # "rearm_once" | "empty_block_once" | "lock_timeout_once" | "head_skip_once"
+        # "rearm_once" | "empty_block_once" | "lock_timeout_once" | "head_skip_once" | "empty_once"
+        if mode not in _CLAIM_SHIM_MODES:
+            # A misspelt mode would otherwise fall through to the plain EMPTY at the bottom of
+            # claim_fifo_heads and pass for "empty_once" without anyone having asked for it.
+            raise ValueError(f"unknown _ClaimShim mode {mode!r}")
         self._mode = mode
         self._block = block
         self._remaining = times
@@ -382,6 +392,11 @@ class _ClaimShim:
                 # probe could not lock. EMPTY for each of them, and no row moves. This is the shape
                 # both server stores return when a lane's head is held by another transaction.
                 return ClaimedHeads(by_lane={}, rearm=frozenset(), head_skipped=frozenset(hit))
+            if self._mode == "empty_once":
+                # BACKLOG #1270: a GENUINELY empty claim with no store round-trip, so neither route's
+                # counter can move. Why a real claim cannot stand in for it: the docstring of
+                # test_the_expiry_report_names_which_empty_route_has_evidence.
+                return ClaimedHeads(by_lane={}, rearm=frozenset())
             if self._block is not None:
                 await (
                     self._block.wait()
@@ -2947,9 +2962,21 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
 
     ARM 2 ALSO PINS THE WORDING, not just the number. A zero on this counter means the 1222 route is
     NOT ESTABLISHED; it does NOT mean there was no contention. The counter covers one route on one
-    backend, so a READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip increments nothing on either
-    backend and stays consistent with a zero. A reader who takes the zero for "no contention" stops
-    looking at the only route this item calls worse.
+    backend, so a READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip does not move it and stays
+    consistent with a zero. That skip has its own counter, ``claim_head_skips`` (engine PR 1782),
+    which the report prints beside it and arm 3 pins. A reader who takes the zero for "no contention"
+    stops looking at the route this item calls worse.
+
+    ARM 2 RUNS NO REAL CLAIM. A real SQL Server claim under SET LOCK_TIMEOUT 0 may legally answer even
+    an unseeded lane with a 1222 EMPTY-all, and on 2026-10-02 one did, on the 2022 leg. What the arm
+    pins is the report's wording for a zero, which needs no live store, so the shim supplies the
+    genuinely empty claim. Retrying the claim, or loosening ``== 0``, would hide that 1222 instead.
+
+    WHAT THIS GIVES UP, stated so nobody reads the green as an answer. Arm 2 no longer runs a live
+    claim on an unseeded lane, so the 1222 seen on the 2022 leg on 2026-10-02 is no longer reachable
+    from this test. That 1222 is unexplained: what held a lock on a lane with no rows is not
+    established. It stays open under BACKLOG #1270; this arm did not explain it, it stopped tripping
+    over it.
     """
     # ARM 1 — an aborted claim: the 1222 route has evidence and the report must say so.
     mc = ManualClock(1000.0)
@@ -2973,6 +3000,7 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
             f" with: {counters!r}"
         )
         assert "ESTABLISHED" in text and "NOT ESTABLISHED" not in text
+        assert "claim_head_skips=0" in counters.split()  # an abort is not a skip (arm 3's mirror)
     finally:
         await d.stop()
 
@@ -2984,21 +3012,50 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
     mc2 = ManualClock(1000.0)
     stub2 = RecordingStub(store, mc2.time)
     lane2 = "IB_ROUTE_NOTHING"
-    d2 = _make(store, stub2, set(), clock=mc2)
+    shim2 = _ClaimShim(store, lane2, mode="empty_once")
+    d2 = _make(shim2, stub2, set(), clock=mc2)
     await d2.start()
     try:
-        d2.mark_ready(lane2)  # no rows seeded: a genuinely empty claim
+        d2.mark_ready(lane2)  # no rows seeded, and the shim answers: a genuinely empty claim
         assert await _wait_until(lambda: d2.empty_claims[0] > 0)
+        assert shim2._remaining == 0, "the EMPTY did not come from the shim, so a real claim ran"
         assert d2.claim_lock_timeouts == 0
         text2 = await _expiry_report(lane=lane2)
         assert "claim_lock_timeouts=0" in _counters_line(text2)
-        assert "NOT ESTABLISHED" in text2, (
+        # Read the ROUTE sentence itself: the verdict prose above it says READPAST on every T12
+        # report, so a search of the whole dump could not fail.
+        assert " ROUTE: " in text2 and " HEAD SKIP: " in text2, f"a route sentence is gone: {text2}"
+        route2 = text2.split(" ROUTE: ", 1)[1].split(" HEAD SKIP: ", 1)[0]
+        assert "NOT ESTABLISHED" in route2, (
             f"the zero is reported without its reading, which is how it becomes 'no contention':"
-            f" {text2}"
+            f" {route2!r}"
         )
-        assert "READPAST" in text2, (
+        assert "READPAST" in route2, (
             "the route the zero says nothing about must be named beside it, or the dump points the"
-            f" next reader at the one route it can see: {text2}"
+            f" next reader at the one route it can see: {route2!r}"
         )
+        assert "HEAD SKIP: claim_head_skips=0," in text2  # and that route reports its own zero
     finally:
         await d2.stop()
+
+    _LIVE_DISPATCHERS.clear()  # the same reason as above: arm 2's dispatcher must not ride out here
+
+    # ARM 3 — a head-of-line skip: the OTHER route's counter moves, on the counters line.
+    mc3 = ManualClock(1000.0)
+    stub3 = RecordingStub(store, mc3.time)
+    lane3 = "IB_ROUTE_HEADSKIP"
+    d3 = _make(_ClaimShim(store, lane3, mode="head_skip_once"), stub3, set(), clock=mc3)
+    await d3.start()
+    try:
+        d3.mark_ready(lane3)
+        assert await _wait_until(lambda: d3.claim_head_skips >= 1)
+        text3 = await _expiry_report(lane=lane3)
+        counters3 = _counters_line(text3).split()  # whole tokens, so =1 cannot match =10
+        assert "claim_head_skips=1" in counters3, (
+            f"the head-skip counter is not on the counters line beside its sibling: {counters3!r}"
+        )
+        assert "claim_lock_timeouts=0" in counters3  # a skip is not an abort; the routes stay apart
+        head3 = text3.split(" HEAD SKIP: ", 1)[-1]
+        assert head3.startswith("claim_head_skips=1,") and "has evidence" in head3, text3
+    finally:
+        await d3.stop()
