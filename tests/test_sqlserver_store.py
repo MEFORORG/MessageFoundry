@@ -1631,6 +1631,54 @@ async def test_staged_flow_end_to_end_processed(store) -> None:
     ]
 
 
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+    """BACKLOG #3462: the SQL Server twin of the SQLite test of the same name. ``reply_dropped``
+    rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
+    False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
+    ``events_for``, which decrypts ``detail``."""
+    detail = "HTTP 200; reply body over the 64-byte bound"
+
+    async def _to_outbound(now: float) -> tuple[str, Any]:
+        mid, rid = await _ss_seed_routed(store, channel_id="IB", raw=RAW, now=now)
+        assert await store.transform_handoff(
+            routed_id=rid, message_id=mid, channel_id="IB", deliveries=[("OB1", "body")], now=now
+        )
+        ob = await store.claim_next_fifo("OB1", stage=Stage.OUTBOUND.value, now=now)
+        assert ob is not None and ob.stage == Stage.OUTBOUND.value
+        return mid, ob
+
+    def _tail(events: list[dict[str, Any]]) -> list[tuple[str, str | None, str | None]]:
+        return [
+            (e["event"], e["destination"], e["detail"] if e["event"] == "reply_dropped" else None)
+            for e in events
+            if e["event"] in ("delivered", "reply_dropped")
+        ]
+
+    mid, ob = await _to_outbound(100.0)
+    assert await store.mark_done(ob.id, now=110.0, reply_dropped=detail) is True
+    after_drop = await store.events_for(mid)
+    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+    async def _dropped_anywhere() -> int:
+        # A count over every message, so a stray write against another message would show. It
+        # reads no detail, so no ciphertext comes back.
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM message_events WHERE event = 'reply_dropped'"
+        )
+        return int(rows[0]["n"])
+
+    assert await _dropped_anywhere() == 1
+    assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
+    assert await store.events_for(mid) == after_drop
+    assert await _dropped_anywhere() == 1  # the vanished row wrote nothing anywhere
+
+    plain, other = await _to_outbound(120.0)
+    assert await store.mark_done(other.id, now=130.0) is True
+    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert await _dropped_anywhere() == 1
+
+
 async def test_all_declined_finalizes_not_deployed(store) -> None:
     """#233 (ADR 0111) parity: a routed message whose only handler declined every Send (each to a
     present-but-not-deployed target) finalizes NOT_DEPLOYED — not FILTERED — carries a ``not_deployed``
@@ -1886,6 +1934,117 @@ async def test_transform_state_persists_and_reloads_on_reopen(store) -> None:
         assert dict(s2.state_view())[("ns", "k")] == {"v": 1}  # _load_state_cache repopulated it
     finally:
         await s2.close()
+
+
+async def test_state_merge_collapses_case_variants_under_a_ci_default(store) -> None:
+    """BACKLOG #1588, the control: the defect is real on this server. This is the experiment the
+    row asked for, and the positive control for the next test.
+
+    On a ``_CI_`` database it runs the shipped ``_SQL_STATE_MERGE`` against a scratch table whose key
+    columns take the database default, and shows the two spellings collapse into one row that keeps
+    the stored spelling. The scratch table sits in the user database, not ``#temp``, because tempdb
+    carries the server collation. It skips only off ``_CI_``, where there is no collapse to show."""
+    from messagefoundry.store.sqlserver import _SQL_STATE_MERGE, _state_merge_params
+
+    db = await store._fetchall(
+        "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS c"
+    )
+    collation = str(db[0]["c"])
+    if "_CI_" not in collation.upper():
+        pytest.skip(f"collation {collation} is not _CI_, so there is no collapse to show here")
+
+    probe = f"state_collation_probe_{uuid4().hex[:12]}"
+    merge = _SQL_STATE_MERGE.replace("MERGE state ", f"MERGE {probe} ", 1)
+    assert merge != _SQL_STATE_MERGE, "the MERGE no longer targets `state`; re-point the probe"
+    # One transaction, never committed: DDL is transactional here, so the scratch table cannot
+    # outlive the test even if the run is killed mid-way.
+    async with store._acquire() as conn, store._cursor(conn) as cur:
+        try:
+            await cur.execute(
+                f"CREATE TABLE {probe} ("
+                " namespace NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+                " [key] NVARCHAR(256) COLLATE DATABASE_DEFAULT NOT NULL,"
+                " value NVARCHAR(MAX) NOT NULL, set_at FLOAT NOT NULL,"
+                f" message_id NVARCHAR(64) NULL, CONSTRAINT pk_{probe} PRIMARY KEY (namespace, [key]))"
+            )
+            for key in ("MRN-abc", "mrn-ABC"):
+                await cur.execute(merge, _state_merge_params("ns", key, "v", 1.0, "m"))
+            await cur.execute(f"SELECT [key] FROM {probe}")
+            collapsed = [str(r[0]) for r in await cur.fetchall()]
+        finally:
+            await conn.rollback()
+    assert collapsed == ["MRN-abc"], (
+        f"collation {collation} is case-insensitive, so the two spellings must merge into the"
+        " stored one; if they did not, this control no longer shows the defect"
+    )
+
+
+async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
+    """BACKLOG #1588: ``state.namespace`` and ``state.[key]`` are BIN2, so two spellings the cache
+    holds apart stay two rows, and a keyed reopen decrypts each under the AAD it was sealed with.
+    Passes on every database collation, for a ``state`` table this build created: the DDL runs only
+    where the table is absent, so a reused database whose table predates it fails here, and that
+    failure is the defect being real on that database. The hosted ``sqlserver-store`` legs create
+    their database fresh; the on-demand self-hosted 2025 workflow reuses ``mefor_ci``, so there the
+    old ``state`` table must be dropped once before this passes. Encryption is on because the keyed symptom of a merged row is a
+    CipherError when ``_load_state_cache`` rebuilds the AAD from the stored spelling. Accent and
+    composed-versus-decomposed spellings ride along: BIN2 compares code points, as the cache does.
+
+    Trailing spaces are not covered: SQL Server pads ``=`` under BIN2 too, so 'k' and 'k ' still
+    collide. That limit stays open."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    first = [("ns", "MRN-abc", {"v": 1}), ("NS", "k", {"v": 2}), ("ns", "caf\u00e9", {"v": 3})]
+    second = [("ns", "mrn-ABC", {"v": 4}), ("ns", "k", {"v": 5}), ("ns", "cafe\u0301", {"v": 6})]
+    expected = {(ns, k): v for ns, k, v in first + second}
+
+    async def _handoff(s: Any, state_ops: list[tuple[str, str, Any]], now: float) -> None:
+        mid, rid = await _ss_seed_routed(s, channel_id="IB", raw=RAW, now=now)
+        assert await s.transform_handoff(
+            routed_id=rid,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB", "b")],
+            state_ops=state_ops,
+            now=now,
+        )
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    try:
+        keyed = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        try:
+            await _handoff(keyed, first, 100.0)
+            await _handoff(keyed, second, 200.0)
+            rows = await keyed._fetchall("SELECT namespace, [key] FROM state")
+            assert {(r["namespace"], r["key"]) for r in rows} == set(expected)
+            assert dict(keyed.state_view()) == expected
+            cols = await keyed._fetchall(
+                "SELECT name, collation_name FROM sys.columns"
+                " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
+            )
+            assert {r["name"]: r["collation_name"] for r in cols} == {
+                "namespace": "Latin1_General_100_BIN2",
+                "key": "Latin1_General_100_BIN2",
+            }
+        finally:
+            await keyed.close()
+
+        reopened = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        try:
+            assert dict(reopened.state_view()) == expected  # every row decrypts under its own AAD
+        finally:
+            await reopened.close()
+    finally:
+        # Purge the sealed rows so the next keyless fixture open does not fail closed inside
+        # _load_state_cache. Through the fixture's already-open pool, not a keyed open: a keyed open
+        # warms the same cache, so it would raise on exactly the rows a failing run leaves.
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in ("message_events", "state", "response", "queue", "messages"):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
 
 
 async def test_concurrent_route_handoff_exactly_one_wins(store) -> None:
