@@ -3239,14 +3239,14 @@ class _ScanShare:
     :func:`_added_pass` and :func:`safe_traceback` point here.
 
     BUDGETS. A link is each exception in the chain :func:`safe_traceback` walks, group members
-    included; the passes below are those of a link it scans. Each link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan
-    with no share runs its added pass on what its first pass left. In a traceback, a link's added
-    pass runs on the smaller of that and what is left of ``added``, one more budget the added
-    passes of every link share, so a long chain whose scans each run out is not read once per link.
-    The first passes never draw on ``added``. Any pass, first or added, with or without a share,
-    can end up to two units past what it was given (a dict read at an odd limit). ``added`` is
-    charged what a link's added pass spent, at most what it was given. One
-    link's added reads of a single large object, such as an exception group in its chain, can spend
+    included; the passes below are those of a link it scans. Each link's first pass has a whole
+    :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan with no share runs its added
+    pass on what its first pass left. In a traceback, a link's added pass runs on the smaller of
+    that and what is left of ``added``, one more budget the added passes of every link share, so a
+    long chain whose scans each run out is not read once per link. The first passes never draw on
+    ``added``. Any pass, first or added, with or without a share, can end up to two units past what
+    it was given (a dict read at an odd limit). ``added`` is charged what a link's added pass
+    spent, at most what it was given. One link's added reads of a single large object, such as an exception group in its chain, can spend
     all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
     error only they would reach prints raw. That link prints as it did before this change, except at
     least where a verdict was handed on to it (below), which it then uses without a scan of its own.
