@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -48,9 +50,10 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 # what a provisioned operator is (scope grant, rotation clear) lands once.
 from tests._approval_queue import release_blocked as _release_blocked
 from tests.test_alert_sinks import _drain, _RecordingTransport
-from tests.test_approvals import ON, _add, _service, _token
+from tests.test_approvals import ON, _add, _client, _service, _stored_purge_hold, _token
 
 STALE = "the requester no longer holds the authority"
+_SHOWN = "approval.standing_shown"
 
 
 class _Sink(LoggingAlertSink):
@@ -63,6 +66,9 @@ class _Sink(LoggingAlertSink):
         self.events.append(
             ("approval_stale_requester", approval_id, {"operation": operation, "reason": reason})
         )
+
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        self.events.append(("audit_write_failed", name, {"action": action}))
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         self.events.append(
@@ -302,6 +308,95 @@ async def test_the_queue_reads_each_requester_once_and_survives_one_whose_read_f
     }
     # Once each, not once per request, a failed read included.
     assert sorted(calls) == sorted([maker, viewer, broken])
+
+
+async def test_a_listing_that_shows_a_lost_standing_writes_one_row_each_time(
+    engine: Engine,
+) -> None:
+    """Vault BACKLOG #3747: the listing tells an approver a requester's standing changed, with no
+    step-up, so each listing that shows it leaves one row naming the caller and the requests it
+    marked. Each listing, not the first: a held request may have no expiry, and a de-dup key would
+    hide months of views."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    await _add(service, "steady", Role.OPERATOR)
+    await _add(service, "checker", Role.ADMINISTRATOR)
+    sink = _Sink()
+    c, _ = _client_with_sink(engine, service, sink)
+    async with c:
+        maker_headers = await _token(c, "maker")
+        lost = await _hold_replay(c, maker_headers, {"channel_id": "IB_ACME_ADT"})
+        lost_too = await _hold_replay(c, maker_headers, {"channel_id": "IB_OTHER_ADT"})
+        kept = await _hold_replay(c, await _token(c, "steady"), {"channel_id": "IB_ACME_ADT"})
+        checker = await _token(c, "checker")
+        # The control: the same queue, nothing withdrawn, nothing shown and no row.
+        assert await _release_blocked(c, lost, checker) is None
+        assert await engine.store.list_audit(action=_SHOWN) == []
+        await service.set_roles(maker, [Role.VIEWER.value], actor="test")
+        for _ in range(2):
+            listed = await c.get("/approvals", headers=checker)
+            assert listed.status_code == 200, listed.text
+    blocked = {a["id"]: a["release_blocked"] for a in listed.json()["approvals"]}
+    assert blocked == {
+        lost: "requester_not_authorized",
+        lost_too: "requester_not_authorized",
+        kept: None,
+    }
+    rows = await engine.store.list_audit(action=_SHOWN)
+    assert len(rows) == 2
+    for row in rows:
+        assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
+        detail = json.loads(str(row["detail"]))
+        assert list(detail) == ["count", "approval_ids"]  # the order: see record_standing_shown
+        assert detail["count"] == 2
+        assert sorted(detail["approval_ids"]) == sorted([lost, lost_too])
+    assert sink.events == []
+
+
+async def test_a_listing_blocked_for_another_reason_writes_no_row(engine: Engine) -> None:
+    """The control on the value: a row whose ``release_blocked`` names something other than the
+    requester's standing discloses nothing about a person, so it leaves no row."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    await _add(service, "checker", Role.ADMINISTRATOR)
+    approval_id = await _stored_purge_hold(
+        engine, maker, {"name": "OB", "scope": "all"}, requester="maker"
+    )
+    async with _client(engine, service, ON) as c:
+        checker = await _token(c, "checker")
+        assert await _release_blocked(c, approval_id, checker) == "params_no_requester"
+    assert await engine.store.list_audit(action=_SHOWN) == []
+
+
+async def test_a_lost_standing_row_still_answers_200_and_pages(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3747: a lost row must not cost the approver the queue, which is where they
+    reject the request, so the listing answers and the loss pages on one fixed key."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    await _add(service, "checker", Role.ADMINISTRATOR)
+    record_audit = engine.store.record_audit
+
+    async def _refusing(action: str, **kw: Any) -> Any:
+        if action == _SHOWN:
+            raise sqlite3.OperationalError("disk I/O error")
+        return await record_audit(action, **kw)
+
+    sink = _Sink()
+    c, _ = _client_with_sink(engine, service, sink)
+    async with c:
+        approval_id = await _hold_replay(c, await _token(c, "maker"))
+        await service.set_roles(maker, [Role.VIEWER.value], actor="test")
+        checker = await _token(c, "checker")
+        monkeypatch.setattr(engine.store, "record_audit", _refusing)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+            assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
+    assert sink.events == [("audit_write_failed", "approval:listing", {"action": _SHOWN})]
+    assert await engine.store.list_audit(action=_SHOWN) == []
+    # What the row would have said survives in the log line: who, from where, and which requests.
+    [lost] = [r.getMessage() for r in caplog.records if _SHOWN in r.getMessage()]
+    assert approval_id in lost and "checker" in lost and "127.0.0.1" in lost
 
 
 async def test_the_live_purge_registration_requires_an_unscoped_requester(engine: Engine) -> None:
