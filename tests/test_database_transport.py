@@ -1427,30 +1427,38 @@ async def test_a_further_cancel_during_the_cut_cannot_hang_the_pool_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cancel to stop() while the cut poll task is in its cursor close is not forwarded into the
-    task. stop() returns with the task still registered and the pool closed under it; the held
-    connection goes back once its close finishes, and the next stop() joins the task. Red on head
-    9a719f564, whose cancelling ``gather`` forwarded the cancel into the close, skipped the
-    release, and hung in ``wait_closed``."""
+    task. stop() returns with the pool closed under the held connection, which goes back once its
+    close finishes. Red on head 9a719f564, whose cancelling ``gather`` forwarded the cancel into
+    the close, skipped the release, and hung in ``wait_closed``.
+
+    Since BACKLOG #2394 the cut task hands its cursor close off and ends at once, so the task is
+    no longer held past the cut; the connection is, until the close finishes."""
     src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
     assert cur.close_gate is not None
     await asyncio.wait_for(cur.in_close.wait(), 5.0)  # the grace ran out and the mark was cut
     stop.cancel()
     done, _ = await asyncio.wait({stop}, timeout=5.0)  # wait: see the next test
     assert done and stop.cancelled()
-    assert src._task is poll and not poll.done() and pool.closed and src._pool is None
+    assert poll.cancelled() and src._task is None and pool.closed and src._pool is None
+    assert pool.in_use == 1  # its cursor close is still running
     cur.close_gate.set()
+    await asyncio.wait_for(pool.wait_closed(), 5.0)
+    assert pool.in_use == 0
     await asyncio.wait_for(src.stop(), 5.0)
-    assert poll.cancelled() and pool.in_use == 0 and src._task is None
     assert cur.marks == []
 
 
-async def test_a_cut_task_a_driver_call_holds_does_not_hold_stop(
+async def test_a_cut_whose_cursor_close_a_driver_call_holds_does_not_hold_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The join of the cut task is bounded: a cursor close held on a driver thread keeps the task
-    alive past the cut, and stop() still returns, with the pool closed so a source nobody stops
-    again leaks no connection. Red on head 9a719f564: stop() never returns. ``raising=False`` lets
-    the test run, and fail on time, against a head without the bounds."""
+    """A cursor close held on a driver thread after the cut does not hold stop(), which returns with
+    the pool closed so a source nobody stops again leaks no connection. Red on head 9a719f564:
+    stop() never returns. ``raising=False`` lets the test run, and fail on time, against a head
+    without the bounds.
+
+    Until BACKLOG #2394 the held close kept the cut task alive past the cut, and the bounded join
+    let stop() return. Now the task hands the close off and ends at once, and the connection is
+    held back instead, so the bounded pool close is what lets stop() return."""
     monkeypatch.setattr(database_module, "_CUT_JOIN_TIMEOUT_S", 0.05, raising=False)
     src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
     assert cur.close_gate is not None
@@ -1460,10 +1468,9 @@ async def test_a_cut_task_a_driver_call_holds_does_not_hold_stop(
         done, _ = await asyncio.wait({stop}, timeout=5.0)
         assert done, "a cancelled stop() did not return behind a held driver call"
         assert stop.cancelled()
-        assert src._task is poll and not poll.done() and pool.closed
+        assert poll.cancelled() and src._task is None and pool.closed and pool.in_use == 1
     finally:
         cur.close_gate.set()
-        await asyncio.wait_for(asyncio.gather(poll, return_exceptions=True), 5.0)
     await asyncio.wait_for(pool.wait_closed(), 5.0)
     assert pool.in_use == 0
 

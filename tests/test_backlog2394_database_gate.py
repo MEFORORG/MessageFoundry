@@ -337,3 +337,169 @@ async def test_an_ordinary_send_gates_its_connection_and_returns_it_before_send_
     assert rig.log.index("execute:end") < rig.log.index("commit") < rig.log.index("cursor.close")
     assert "rollback" not in rig.log, rig.log
     assert USE_AFTER_FREE not in rig.log, rig.log
+
+
+def _block_first(statement: str) -> Any:
+    """A ``blocks`` predicate: only the first run of ``statement`` waits, on whichever connection
+    runs it, so a second pool's call returns at once."""
+    first = [True]
+
+    def blocks(sql: str) -> bool:
+        if sql == statement and first:
+            first.pop()
+            return True
+        return False
+
+    return blocks
+
+
+async def test_a_source_probe_cancelled_in_a_hung_select_does_not_hold_its_stop(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The API's connection test cuts ``test_connection`` at its timeout, then stops the source in
+    a ``finally``. The cancelled ``SELECT 1`` still holds its connection, so an unbounded pool close
+    hung the request. The connection is held back behind a cancelled borrow, so the stop stops
+    waiting at the bound, and the connection is still not returned, or closed, while its statement
+    runs. Red with the count condition reverted: stop() never returns while the statement runs."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.2)
+    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == "SELECT 1")
+    source = _source()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(source.test_connection(), 0.5)  # the route's wait_for, shortened
+    pool = rig.pools[0]
+    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
+    assert database._holds_back(pool) == 1
+
+    await asyncio.wait_for(source.stop(), 1.0)
+    assert pool.closed and source._pool is None
+    assert not pool.returned and pool.free == [] and not rig.conn.closed, rig.log
+    assert "cursor.close" not in rig.log, rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")  # released into the closing pool, so closed
+    _assert_closed_and_rolled_back_after_the_statement(rig)
+    assert pool.returned and database._holds_back(pool) == 0
+
+
+async def test_a_borrow_cancelled_in_its_autocommit_set_does_not_hold_the_stop(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The other connection a cancelled borrow holds back: the autocommit set an abandoned borrow
+    leaves running on its thread. It counts too, so the source's stop stops waiting at the bound,
+    and the connection goes back, off the count, once the set returns. Red with that count
+    dropped: stop() waits for the set."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.2)
+    _aioodbc_serving(monkeypatch, rig, blocks=never, block_autocommit=True)
+    source = _source()
+    task = await cancel_once_started(rig.started, source._mark({"code": "A", "value": "1"}))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done and task.cancelled(), task
+    pool = rig.pools[0]
+    assert database._holds_back(pool) == 1
+
+    await asyncio.wait_for(source.stop(), 1.0)
+    assert "autocommit:end" not in rig.log, "the arm is vacuous: the set had already returned"
+    assert not pool.returned and not rig.conn.closed, rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    assert pool.returned and database._holds_back(pool) == 0
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    assert rig.log.index("autocommit:end") < rig.log.index("conn.close"), rig.log
+
+
+async def _close_beside_an_ordinary_call(make: Any, start: Any, close: Any, rig: _Rig) -> None:
+    """Start a borrow whose statement blocks, close the connector beside it with no cancellation,
+    and pin that the close waits for the statement past several ticks of the bound."""
+    connector = make()
+    borrowing = asyncio.create_task(start(connector))
+    assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
+    closing = asyncio.create_task(close(connector))
+    done, _pending = await asyncio.wait({closing}, timeout=0.5)  # five ticks of the 0.1 s bound
+    assert not done, "the close stopped waiting for an ordinary in-flight call"
+    assert database._holds_back(rig.pools[0]) == 0
+
+    rig.release.set()
+    assert await asyncio.wait_for(borrowing, WAIT) is None
+    await asyncio.wait_for(closing, WAIT)
+    assert connector._pool is None
+    assert rig.log.index("execute:end") < rig.log.index("conn.close"), rig.log
+    assert "rollback" not in rig.log and USE_AFTER_FREE not in rig.log, rig.log
+
+
+@pytest.mark.parametrize("side", ["destination", "source"])
+async def test_an_ordinary_close_still_waits_for_an_in_flight_call(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, side: str
+) -> None:
+    """With no cancelled borrow, an in-flight call is an ordinary one, and the pool close waits
+    for it however long it takes, as before BACKLOG #2394: the destination's ``aclose`` and the
+    source's ordinary ``stop``. Red with the close bounded whatever the count: the close returns
+    at the first tick, with the statement still running."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.1)
+    if side == "destination":
+        _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
+        await _close_beside_an_ordinary_call(
+            _destination, lambda d: d.send('{"a": 1}'), lambda d: d.aclose(), rig
+        )
+        assert rig.log.index("commit") < rig.log.index("conn.close"), rig.log
+    else:
+        _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _MARK)
+        await _close_beside_an_ordinary_call(
+            _source, lambda s: s._mark({"code": "A", "value": "1"}), lambda s: s.stop(), rig
+        )
+
+
+async def test_a_close_already_waiting_stops_once_a_borrow_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The count is read again while the close waits: a send cancelled after the close began holds
+    its connection back from then on, and the close stops waiting within a tick. Red with the count
+    read only once, before the wait: the close waits for the statement."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.2)
+    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
+    destination = _destination()
+    sending = asyncio.create_task(destination.send('{"a": 1}'))
+    assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
+    closing = asyncio.create_task(destination.aclose())
+    done, _pending = await asyncio.wait({closing}, timeout=0.5)
+    assert not done, "the arm is vacuous: the close did not wait for the ordinary send"
+
+    sending.cancel()
+    done, _pending = await asyncio.wait({closing}, timeout=1.0)
+    assert done, "the close kept waiting after the send was cancelled"
+    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    _assert_closed_and_rolled_back_after_the_statement(rig)
+
+
+async def test_after_a_cancelled_send_a_new_pool_opens_beside_the_closing_one(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The trade the bound makes. After a cancelled send, the destination's close stops waiting
+    and drops its pool, so the next send opens a second pool while the first is still closing
+    around the held connection. The first close then finishes once the cancelled statement
+    returns: its connection goes back, is closed, and is off the count, so a later close of that
+    pool would wait as before. Red with the decrement dropped: the count stays at one."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.2)
+    _aioodbc_serving(monkeypatch, rig, blocks=_block_first(_INSERT))
+    destination = _destination()
+    task = await cancel_once_started(rig.started, destination.send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done and task.cancelled(), task
+    old = rig.pools[0]
+    assert database._holds_back(old) == 1
+
+    await asyncio.wait_for(destination.aclose(), 1.0)
+    assert destination._pool is None and old.closed
+
+    assert await asyncio.wait_for(destination.send('{"a": 2}'), WAIT) is None
+    assert len(rig.pools) == 2, "the second send did not open a new pool"
+    new = rig.pools[1]
+    assert new.free == [new._conn] and not new._conn.closed
+    assert not old.returned and not old._conn.closed, "the old pool's connection went back early"
+
+    rig.release.set()
+    assert await wait_until(lambda: old._conn.closed), "the old close never finished"
+    assert old.returned and database._holds_back(old) == 0
+    assert USE_AFTER_FREE not in rig.log, rig.log
