@@ -470,21 +470,9 @@ def test_loading_settings_logs_no_renew_bound_warning(
     assert not [r for r in caplog.records if _TWICE_THE_CLAMP in r.getMessage()]
 
 
-def test_serve_logs_the_renew_bound_warning_once_logging_is_configured() -> None:
-    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
-    or it would reach the filtered lastResort only. Read from the source, as the breaker-budget seam
-    test in tests/test_ad_user_account_control.py does, because running ``serve`` that far starts an
-    engine."""
-    import inspect
-
-    from messagefoundry import __main__ as cli
-
-    source = inspect.getsource(cli._serve)
-    checked = source.index("if _logging_refused is not None:")
-    warned = source.index("settings.sqlserver_renew_bound_warning()")
-    assert source.index("_load_service_settings(") < checked < warned
-    assert source.count("sqlserver_renew_bound_warning") == 1
-    assert "sqlserver_renew_bound_warning" not in inspect.getsource(load_settings)
+# Where ``serve`` logs the warning is pinned in tests/test_b1497_serve_warning_order.py. It reads
+# ``messagefoundry.__main__``, which this server-gated file must not import: the ``serverdb`` regex
+# does not admit ``messagefoundry/__init__.py`` (tests/test_serverdb_ci_coverage.py).
 
 
 # --- against a real server -----------------------------------------------------
