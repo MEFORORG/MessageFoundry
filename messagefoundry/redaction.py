@@ -2616,11 +2616,14 @@ def safe_traceback(ei: ExcInfo) -> str:
     # The stdlib builds one TracebackException per exception it will print, so the two trees walk in
     # step, and a link it chose not to print (a suppressed context, a repeat) is None on its side.
     pending: list[tuple[Any, Any]] = [(te, value)]
+    # One budget for what the scans add to origin/main's reading, so a long chain is read about
+    # once, not once per link (vault BACKLOG #3340): each link's own code may print the rest.
+    share = _ScanShare()
     while pending:
         node, exc = pending.pop()
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
-        line = _codec_line(exc)
+        line = _codec_line(exc, share)
         if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
@@ -2684,12 +2687,12 @@ def _kept_notes(notes: list[Any]) -> list[str]:
     return kept
 
 
-def _codec_line(exc: BaseException) -> str | None:
+def _codec_line(exc: BaseException, share: _ScanShare | None = None) -> str | None:
     """What a traceback prints after the class name, when ``exc`` is a ``UnicodeError`` or holds
     one, or None when its own ``str()`` is safe to print."""
     if isinstance(exc, UnicodeError):
         return _unicode_error_detail(exc)
-    return _HOLDER_TEXT if prints_a_codec_error(exc) else None
+    return _HOLDER_TEXT if prints_a_codec_error(exc, share=share) else None
 
 
 def codec_safe_str(exc: BaseException) -> str:
@@ -2787,7 +2790,9 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
 
 
 #: :func:`_reader_record`'s answer for one class.
-type _ReaderRecord = tuple[tuple[Any, ...] | None, tuple[Any, ...] | None, bool]
+type _ReaderRecord = tuple[
+    tuple[Any, ...] | None, tuple[Any, ...] | None, tuple[Any, ...] | None, bool
+]
 
 #: ``id(class)`` -> (a weak reference to the class, its :func:`_reader_record`). Keyed by id
 #: because hashing a class runs its metaclass. The reference's callback drops the entry when the
@@ -2845,12 +2850,13 @@ def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
 
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
     class changed after an instance of it was first logged keeps its first answer."""
-    return _reader_record(kind)[0]
+    return _reader_record(kind)[1]
 
 
 def _reader_record(kind: type[Any]) -> _ReaderRecord:
-    """:func:`_readers`' answer for ``kind``, then the readers to use beneath an object whose own
-    code renders it, then whether ``kind`` is such an object. Kept per class."""
+    """The readers origin/main used for ``kind``, then :func:`_readers`' answer, then the readers
+    to use beneath an object whose own code renders it, then whether ``kind`` is such an object.
+    Kept per class."""
     key = id(kind)
     cached = _READERS.get(key)
     if cached is not None and cached[0]() is kind:
@@ -2884,7 +2890,7 @@ def _find_readers(kind: type[Any]) -> _ReaderRecord:
             is_exception = True
     plain = _resolve_readers(kind, names, ())
     if not is_exception:
-        return plain, plain, False
+        return plain, plain, plain, False
     slots = (
         *(names or ()),
         *(
@@ -2900,10 +2906,17 @@ def _find_readers(kind: type[Any]) -> _ReaderRecord:
     everything = _resolve_readers(kind, slots, _CHAIN_LINKS)
     renders = (_class_attribute(kind, "__str__"), _class_attribute(kind, "__repr__"))
     if renders[0] is _EXC_STR and renders[1] is _EXC_REPR:  # prints .args alone
-        return plain, everything, False
+        return plain, plain, everything, False
+    # What origin/main read: the instance __dict__ and each slot not named as a dunder. The scan
+    # reads this first, so nothing read beyond it can spend the budget it needs (:class:`_Scan`).
+    main = _resolve_readers(
+        kind,
+        tuple(name for name in slots if name in (names or ()) or not name.startswith("__")),
+        (),
+    )
     if all(id(method) in _BUILTIN_EXC_RENDERS for method in renders):  # its own slots at most
-        return _resolve_readers(kind, slots, ()), everything, False
-    return everything, everything, True  # code of its own, which may print anything it reaches
+        return main, _resolve_readers(kind, slots, ()), everything, False
+    return main, everything, everything, True  # code of its own: it may print anything it reaches
 
 
 def _resolve_readers(
@@ -2937,6 +2950,16 @@ def _added_readers(shallow: tuple[Any, ...], beneath: tuple[Any, ...]) -> tuple[
     return (own_dict, *rest)
 
 
+def _adds(had: tuple[Any, ...] | None, target: tuple[Any, ...] | None) -> bool:
+    """Whether reading through ``target`` reads anything that reading through ``had`` did not."""
+    if target is None or target is had:
+        return False
+    if had is None:
+        return True
+    added = _added_readers(had, target)
+    return added[0] is not None or len(added) > 1
+
+
 def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
     """What the attributes of ``arg`` hold: every value in its instance ``__dict__``, and each
     slot, ``limit`` of them at most. Both are read through the builtin descriptors
@@ -2947,10 +2970,12 @@ def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[An
 
     A slot or chain link that holds None is left out, so it is not charged: an exception with no
     cause or context costs what it did before its chain links were read (vault BACKLOG #3340). The
-    slots are the class's, a number its code fixes, so skipping them keeps the work bounded."""
+    slots are the class's, a number its code fixes, so skipping them keeps the work bounded.
+
+    The slots and chain links are read before the instance ``__dict__``, so a large ``__dict__``
+    cannot use up ``limit`` before a ``__cause__`` its own ``__str__`` prints (vault BACKLOG
+    #3340)."""
     values: list[Any] = []
-    if readers[0] is not None:
-        values.extend(islice(dict.values(readers[0].__get__(arg)), limit))
     for slot in readers[1:]:
         if len(values) >= limit:
             break
@@ -2960,6 +2985,8 @@ def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[An
             continue
         if value is not None:
             values.append(value)
+    if readers[0] is not None and len(values) < limit:
+        values.extend(islice(dict.values(readers[0].__get__(arg)), limit - len(values)))
     return values
 
 
@@ -3085,7 +3112,7 @@ def _some(elements: Any, limit: int | None) -> list[Any]:
     return list(elements) if limit is None else list(islice(elements, limit))
 
 
-def prints_a_codec_error(exc: BaseException) -> bool:
+def prints_a_codec_error(exc: BaseException, *, share: _ScanShare | None = None) -> bool:
     """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
     BACKLOG #3295). It looks in at least: its ``.args``; its fields, when it is a dataclass; and,
     when a class of its own defines ``__str__`` or ``__repr__``, the attributes in its instance
@@ -3106,7 +3133,8 @@ def prints_a_codec_error(exc: BaseException) -> bool:
 
     An exception group whose ``str()`` is the builtin one prints only its message and a count, so
     it is False however its members read; a traceback prints each member on its own line. It never
-    raises, and it answers True when the arguments cannot be read."""
+    raises, and it answers True when the arguments cannot be read. ``share`` is
+    :func:`safe_traceback`'s, for the scans of one traceback (:class:`_ScanShare`)."""
     kind = type(exc)
     if issubclass(kind, UnicodeError):
         return False
@@ -3114,9 +3142,27 @@ def prints_a_codec_error(exc: BaseException) -> bool:
         own_str: Any = kind.__str__
         if issubclass(kind, BaseExceptionGroup) and own_str is BaseExceptionGroup.__str__:
             return False
-        return id(exc) in _Scan(exc, charged_root=True).holds
+        if share is not None and id(exc) in share.held:
+            return True
+        return id(exc) in _Scan(exc, charged_root=True, share=share).holds
     except Exception:  # noqa: BLE001 -- fail closed: it might
         return True
+
+
+class _ScanShare:
+    """What the scans of one traceback share (:func:`safe_traceback`), so each exception in a long
+    chain does not read the rest of it again (vault BACKLOG #3340).
+
+    ``budget`` is what all of their second phases may spend together (:class:`_Scan`): their first
+    phases each still have a whole :data:`_ATTRIBUTE_BUDGET`, as on origin/main. ``held`` keeps
+    each exception whose own code renders it that one of them, reading it the deep way, found
+    holds a Unicode error; that answer is the one its own scan would give."""
+
+    __slots__ = ("budget", "held")
+
+    def __init__(self) -> None:
+        self.budget = _ATTRIBUTE_BUDGET
+        self.held: dict[int, BaseException] = {}  # the object too, so its id is not reused
 
 
 class _Scan:
@@ -3147,11 +3193,19 @@ class _Scan:
     object the second walk reads plainly and then reaches more deeply through an attribute is read
     a second time, for what the deep way adds alone, and charged again, at most one unit, its
     non-scalar elements unless the first walk followed them the deep way, and each value read from
-    the readers the plain read lacked. So an object is read, and charged, at most twice. A plain
-    exception, whose ``__str__`` and ``__repr__`` are ``BaseException``'s, is charged only for the
-    values read from it, never the unit, as origin/main never read it at all. An object met both
-    ways is read the deep way, so a plain exception shared with such a holder can print as a note
-    where it is met plainly too.
+    the readers the plain read lacked. So an object is read, and charged, at most twice. Beneath
+    such an exception, a plain exception, whose ``__str__`` and ``__repr__`` are
+    ``BaseException``'s, is charged only for the values read from it, never the unit, as origin/main
+    never read it there; read plainly it costs one unit and its ``.args``, as on origin/main. An
+    object met both ways is read the deep way, so a plain exception shared with such a holder can
+    print as a note where it is met plainly too.
+
+    THE SECOND WALK READS WHAT ORIGIN/MAIN READ FIRST. Its first phase reads each object through
+    origin/main's readers and follows what they reach as origin/main did; its second reads what
+    this adds, only from the budget the first left, and in a traceback only from the budget the
+    scans of that traceback share (:class:`_ScanShare`). So nothing added can keep the walk from
+    an object origin/main reached. One exception: an object whose ``__dict__`` alone would end the
+    budget has its slots and chain links read first, in place of values the limit would cut.
 
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
     So an error past the budget prints raw, as it did before any object was read by attribute. A
@@ -3160,7 +3214,9 @@ class _Scan:
 
     __slots__ = ("holds", "nodes")
 
-    def __init__(self, root: Any, *, charged_root: bool = False) -> None:
+    def __init__(
+        self, root: Any, *, charged_root: bool = False, share: _ScanShare | None = None
+    ) -> None:
         # id -> (the object, its elements or None when unreadable, why it was unreadable). Holding
         # the object keeps its id from being reused while the walk runs.
         nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
@@ -3173,9 +3229,6 @@ class _Scan:
         # holds is too, and the second walk starts it at the depth it ends with: starting it once
         # per depth spent the budget twice on the same elements (vault BACKLOG #3340).
         met: dict[int, bool] = {}
-        # The ids whose elements were already followed the deep way, so the second walk does not
-        # follow them again.
-        deepened: set[int] = set()
         pending: list[tuple[Any, bool]] = [] if charged_root else [(root, False)]
         while pending:
             arg, deep = pending.pop()
@@ -3183,23 +3236,25 @@ class _Scan:
             key = id(arg)
             if kind in _ARG_SCALARS:
                 continue
-            before = met.get(key)
-            if before is not None and before >= deep:  # met already, at least as deep
+            met_before = met.get(key)
+            if met_before is not None and met_before >= deep:  # met already, at least as deep
                 continue
             met[key] = deep
             if issubclass(kind, UnicodeError):
-                if before is None:
+                if met_before is None:
                     nodes[key] = (arg, [], "")
                     seeds.append(key)
                 continue
-            shallow, beneath, opens = _reader_record(kind)
+            _main, shallow, beneath, opens = _reader_record(kind)
             # Charged the first time it has readers at the depth met: a plain exception has none
             # until it is met beneath one whose own code renders it.
-            if (beneath if deep else shallow) is not None and (before is None or shallow is None):
+            if (beneath if deep else shallow) is not None and (
+                met_before is None or shallow is None
+            ):
                 first.append(arg)
             if not issubclass(kind, _ARG_WALKED):
                 continue
-            if before is None:  # its elements are read when it is first met, and never again
+            if met_before is None:  # its elements are read when it is first met, and never again
                 try:
                     nodes[key] = (arg, _children(arg, kind), "")
                 except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
@@ -3210,100 +3265,129 @@ class _Scan:
             if elements is None:  # unreadable, and it already counts as an error
                 continue
             inner = deep or opens
-            if inner:
-                deepened.add(key)
             pending.extend((child, inner) for child in elements if type(child) not in _ARG_SCALARS)
-        charged: list[tuple[Any, bool]] = (
-            [(root, False)] if charged_root else [(arg, met[id(arg)]) for arg in first]
+        # THE SECOND WALK RUNS IN TWO PHASES, AND THE ORDER IS THE GUARANTEE (vault BACKLOG #3340).
+        # The first reads what origin/main read, the way it read it. The second reads what this
+        # adds, the chain links, dunder slots and exceptions beneath one whose own code renders it,
+        # and only from the budget the first left, and from ``share``'s when one is given. So
+        # nothing the second reads can keep the first from an object origin/main reached.
+        # Each entry: the object, whether it is beneath an exception whose own code renders it,
+        # and whether the first walk met it, rather than an attribute read reaching it.
+        charged: list[tuple[Any, bool, bool]] = (
+            [(root, False, False)] if charged_root else [(arg, met[id(arg)], True) for arg in first]
         )
+        later: list[tuple[Any, bool, bool]] = []  # the second phase's, in the order the first met
         budget = _ATTRIBUTE_BUDGET
-        # id -> whether it was read beneath an object whose own code renders it, which reads
-        # more (:func:`_reader_record`). One read the other way first is read again that way.
-        read: dict[int, bool] = {}
-        while charged and budget > 0:
-            arg, deep = charged.pop()
-            kind = type(arg)
-            key = id(arg)
-            if kind in _ARG_SCALARS:
-                continue
-            before = read.get(key)
-            if before is not None and before >= deep:  # read already, at least as deep
-                continue
-            read[key] = deep
-            if issubclass(kind, UnicodeError):
-                if key not in nodes:
-                    nodes[key] = (arg, [], "")
-                    seeds.append(key)
-                continue
-            known = nodes.get(key)
-            if known is not None and known[1] is None:
-                continue  # the first walk could not read it, and it already counts as an error
-            shallow, beneath, opens = _reader_record(kind)
-            slots = beneath if deep else shallow
-            if (
-                before is not None
-                and shallow is not None
-                and slots is not None
-                and slots is not shallow
-            ):
-                # Read once through shallow: read only what the deep way adds, so a large
-                # __dict__ read again cannot use up the limit before the chain links after it.
-                slots = _added_readers(shallow, slots)
-            if known is None and slots is None and not issubclass(kind, _ARG_WALKED):
-                budget -= 1  # an object that is not read at all: nothing beneath it to follow
-                continue
-            # Everything an object's own code renders from, at any depth, is read the deep way:
-            # that code may print any attribute of what it reaches (vault BACKLOG #3340, item 2).
-            inner = deep or opens
-            read[key] = inner  # its own code reads it as deep as a holder above it would
-            try:
-                if known is not None:
-                    children = known[1] or []
-                    # Its elements were followed when it was met; again only to read them deeper,
-                    # and a scalar has nothing deeper, so it is not charged a second time.
-                    found = (
-                        [c for c in children if type(c) not in _ARG_SCALARS][:budget]
-                        if inner and key not in deepened
-                        else []
-                    )
-                elif issubclass(kind, _ARG_WALKED):
-                    children = found = _children(arg, kind, budget)
-                else:
-                    children, found = [], []
-                # A plain exception, which origin/main never read, pays only for what it holds,
-                # so a crowd of them beneath a holder cannot spend the budget a sibling needs.
-                # Each one is a first-walk object or a charged element, so the work stays bounded.
-                plain = shallow is None and slots is not None
-                budget -= (0 if plain else 1) + len(found)
-                # Read once already through the same slots: nothing new to read by attribute.
-                if slots is not None and budget > 0 and (before is None or slots is not shallow):
-                    held = _attribute_values(arg, slots, budget)
-                    # Charged for every value read, before a repeat is dropped: a limit filled by
-                    # repeats then shows as a spent budget, never as a reader silently left unread.
-                    budget -= len(held)
-                    if before is not None and held:  # read once already: add only what is new
-                        have = {id(child) for child in children}
-                        held = [value for value in held if id(value) not in have]
-                    children, found = children + held, found + held
-            except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
-                nodes[key] = (arg, None, type(exc).__name__)
-                seeds.append(key)
-                continue
-            nodes[key] = (arg, children, "")
-            if inner:
-                deepened.add(key)
-            follow: list[Any] = []
-            for child in found:
-                child_kind = type(child)
-                if child_kind in _ARG_SCALARS:
+        # id -> how it was read: 0 as origin/main read it, 1 through :func:`_readers`, 2 the deep
+        # way. One read a lesser way and met again a deeper one is read for what that adds alone.
+        read: dict[int, int] = {}
+        start = budget
+        for second in (False, True):
+            if second:
+                charged = later[::-1]
+                if share is not None:
+                    budget = min(budget, share.budget)
+                start = budget
+            while charged and budget > 0:
+                arg, deep, met_first = charged.pop()
+                kind = type(arg)
+                key = id(arg)
+                if kind in _ARG_SCALARS:
                     continue
-                if not issubclass(child_kind, UnicodeError):
-                    follow.append(child)
-                elif id(child) not in nodes:  # counted where it is read, whatever budget is left
-                    nodes[id(child)] = (child, [], "")
-                    seeds.append(id(child))
-            # Popped in the order read: .args before attributes.
-            charged.extend((child, inner) for child in reversed(follow))
+                if issubclass(kind, UnicodeError):
+                    if key not in nodes:
+                        nodes[key] = (arg, [], "")
+                        seeds.append(key)
+                    continue
+                main, shallow, beneath, opens = _reader_record(kind)
+                # Everything an object's own code renders from, at any depth, is read the deep
+                # way: that code may print any attribute of what it reaches (#3340, item 2).
+                inner = second and (deep or opens)
+                level = (2 if inner else 1) if second else 0
+                before = read.get(key)
+                if before is not None and before >= level:  # read already, at least as deep
+                    continue
+                known = nodes.get(key)
+                if known is not None and known[1] is None:
+                    continue  # the first walk could not read it, and it already counts as an error
+                target = (beneath if deep else shallow) if second else main
+                if not second and met_first and main is None:
+                    later.append((arg, deep, met_first))  # origin/main never read it: nor here
+                    continue
+                if before is not None and target is not None:
+                    had = main if before == 0 else shallow
+                    if had is not None:
+                        target = _added_readers(had, target)  # only what the deeper way adds
+                elif not second and target is not None and target[0] is not None:
+                    # A __dict__ that ends the budget here ends it on origin/main too, so the
+                    # slots and chain links the second phase would read are read first, in place
+                    # of the values past the limit: a large __dict__ cannot hide a __cause__ the
+                    # object's own __str__ prints (vault BACKLOG #3340, item 3).
+                    storage = target[0].__get__(arg)
+                    deeper = beneath if deep else shallow
+                    if deeper is not None and type(storage) is dict and len(storage) >= budget - 1:
+                        target = (*target, *_added_readers(target, deeper)[1:])
+                read[key] = level
+                if known is None and target is None and not issubclass(kind, _ARG_WALKED):
+                    budget -= 1  # an object that is not read at all: nothing beneath it to follow
+                    continue
+                try:
+                    if known is not None:
+                        children = known[1] or []
+                        # Its elements were followed when it was met; again only to read them
+                        # deeper, and not one the first walk met that way, or this one read so:
+                        # a scalar has nothing deeper, so it is not charged again.
+                        found = (
+                            [
+                                c
+                                for c in children
+                                if type(c) not in _ARG_SCALARS
+                                and met.get(id(c)) is not True
+                                and read.get(id(c), 0) < 2
+                            ][:budget]
+                            if inner
+                            else []
+                        )
+                    elif issubclass(kind, _ARG_WALKED):
+                        children = found = _children(arg, kind, budget)
+                    else:
+                        children, found = [], []
+                    # Beneath an exception whose own code renders it, a plain exception, which
+                    # origin/main never read, pays only for the values read from it, so a crowd
+                    # of them cannot spend the budget a sibling there needs. Read plainly, it
+                    # costs one unit and its elements, as on origin/main.
+                    plain = shallow is None and target is not None
+                    budget -= (0 if plain else 1) + len(found)
+                    if target is not None and budget > 0 and (target[0] is not None or target[1:]):
+                        held = _attribute_values(arg, target, budget)
+                        # Charged for every value read, before a repeat is dropped: a limit filled
+                        # by repeats shows as a spent budget, never as a reader left unread.
+                        budget -= len(held)
+                        if before is not None and held:  # read once already: add what is new
+                            have = {id(child) for child in children}
+                            held = [value for value in held if id(value) not in have]
+                        children, found = children + held, found + held
+                except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
+                    nodes[key] = (arg, None, type(exc).__name__)
+                    seeds.append(key)
+                    continue
+                nodes[key] = (arg, children, "")
+                follow: list[Any] = []
+                for child in found:
+                    child_kind = type(child)
+                    if child_kind in _ARG_SCALARS:
+                        continue
+                    if not issubclass(child_kind, UnicodeError):
+                        follow.append(child)
+                    elif id(child) not in nodes:  # counted where it is read, whatever is left
+                        nodes[id(child)] = (child, [], "")
+                        seeds.append(id(child))
+                # Popped in the order read: .args before attributes.
+                charged.extend((child, inner, False) for child in reversed(follow))
+                if not second and (deep or opens or _adds(main, beneath if deep else shallow)):
+                    later.append((arg, deep, met_first))
+            if second and share is not None:
+                share.budget -= start - max(budget, 0)
         self.nodes = nodes
         self.holds: set[int] = set()
         if not seeds:
@@ -3319,6 +3403,12 @@ class _Scan:
                 if parent not in self.holds:
                     self.holds.add(parent)
                     seeds.append(parent)
+        if share is not None:
+            # Read the deep way, an exception whose own code renders it is read here as a scan
+            # of its own would read it, so what this found holds is that scan's answer too.
+            for key in self.holds:
+                if read.get(key) == 2 and _reader_record(type(nodes[key][0]))[3]:
+                    share.held[key] = nodes[key][0]
 
 
 def _joined(items: list[Any]) -> str:

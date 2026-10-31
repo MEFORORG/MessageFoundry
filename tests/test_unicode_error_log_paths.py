@@ -2014,6 +2014,91 @@ def test_an_exception_printing_a_unicode_error_by_its_own_code_is_a_note(
     assert record.getMessage() == f"got {note} and [{note}]"
 
 
+class _PayloadError(Exception):
+    """Prints an attribute it holds, which origin/main read by attribute."""
+
+    def __init__(self, payload: object) -> None:
+        super().__init__("bad frame")
+        self.payload = payload
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.payload}"
+
+
+class _LinkError(Exception):
+    """Has a ``__str__`` of its own, so the scan reads its chain."""
+
+    def __str__(self) -> str:
+        return "failed"
+
+
+def test_a_large_chain_cannot_starve_what_origin_main_read() -> None:
+    # Review of vault BACKLOG #3340: reading a sibling's chain spent the budget first, so a holder
+    # origin/main found by attribute printed raw. What origin/main read is read before any of it.
+    first = _LinkError("failed")
+    first.__context__ = ExceptionGroup("many", [ValueError(str(n)) for n in range(5000)])
+    held = _PayloadError(_encode_error())
+    note = "[_PayloadError holding a codec error, not rendered]"
+    record = _record("got %r", ([first, held],))
+    _chain_filter("engine").filter(record)
+    assert record.getMessage() == f"got [_LinkError('failed'), {note}]"
+
+
+class _BigDictCauseError(Exception):
+    """Prints its own ``__cause__``, and carries more attributes than the scan's budget."""
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.__cause__}"
+
+
+def test_a_large_dict_does_not_hide_the_cause_its_str_prints() -> None:
+    error = _BigDictCauseError("bad frame")
+    for n in range(redaction._ATTRIBUTE_BUDGET + 10):
+        setattr(error, f"field{n}", n)
+    error.__cause__ = _encode_error()
+    assert "\\xe9" in str(error)  # control: its own __str__ prints the character
+    assert redaction.prints_a_codec_error(error)
+    out = safe_traceback((type(error), error, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_a_long_chain_is_read_about_once_per_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review of vault BACKLOG #3340: each link's scan read the rest of the chain, so a 900-link
+    # chain read about 400,000 objects. Counted, not timed, so a slow runner cannot flake it.
+    links = 900
+    error: BaseException = _LinkError("failed")
+    for _ in range(links - 1):
+        outer = _LinkError("failed")
+        outer.__cause__ = error
+        error = outer
+    calls = 0
+    real = redaction._attribute_values
+
+    def counted(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return real(arg, readers, limit)
+
+    monkeypatch.setattr(redaction, "_attribute_values", counted)
+    out = safe_traceback((type(error), error, None))
+    assert out.count("_LinkError: failed") == links
+    assert calls <= 4 * links, calls
+
+
+def test_a_long_chain_ending_in_a_unicode_error_is_a_note_on_every_link() -> None:
+    error: BaseException = _CauseError("bad frame")
+    error.__cause__ = _encode_error()
+    for _ in range(899):
+        outer = _CauseError("bad frame")
+        outer.__cause__ = error
+        error = outer
+    out = safe_traceback((type(error), error, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out.count(f"_CauseError: {_HOLDER}") == 900
+
+
 def test_a_plain_exception_holding_an_error_by_attribute_keeps_its_message_on_its_own() -> None:
     # Its own __str__ prints .args alone, so it is read deeply only beneath one that may print more.
     inner = RuntimeError("failed")

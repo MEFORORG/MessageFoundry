@@ -1714,9 +1714,15 @@ codec error keeps its notes as they are, so a codec error placed among them stil
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-A slot or chain link that holds None is not counted, and an exception whose `__str__` and
-`__repr__` are `BaseException`'s own pays only for the values read from it, not for being read.
-An object the unlimited first pass reaches both plainly and beneath an exception whose own code
+A slot or chain link that holds None is not counted. Beneath an exception whose own code renders
+it, an exception whose `__str__` and `__repr__` are `BaseException`'s own pays only for the values
+read from it, not for being read; read plainly, as origin/main read it, it costs one unit and its
+`.args`. **What origin/main read is read first, the way it read it, and the reads added since (the
+chain links, the dunder-named slots and the exceptions beneath one whose own code renders it)
+spend only the budget that leaves**, so they cannot starve a sibling origin/main reached. In one
+traceback, all of those added reads share a single budget, so a long chain is read about once
+rather than once per link. An object whose `__dict__` alone would end the budget has its slots and
+chain links read before the values the limit would cut. An object the unlimited first pass reaches both plainly and beneath an exception whose own code
 renders it is read once, the deeper way. One read plainly and then reached more deeply through an
 attribute is read and charged a second time, at most: one unit, the elements that are not plain
 values when the first pass did not already follow them the deeper way, and each value the deeper
