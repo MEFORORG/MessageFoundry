@@ -4286,8 +4286,22 @@ def DatabasePoll(
     ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
     in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
-    ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``)."""
+    ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
+
+    A ``poll_statement`` that could write is refused: a literal one here, when declared, and every
+    one, an ``env()`` value included, when the source is built (BACKLOG #2178;
+    ``transports.database._read_only_poll_refusal`` says what and why)."""
     _reject_envref_odbc_params(odbc_params)
+    # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
+    # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
+    # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
+    # this module at its top level.
+    if isinstance(poll_statement, str) and poll_statement:
+        from messagefoundry.transports.database import _read_only_poll_refusal
+
+        poll_refusal = _read_only_poll_refusal(poll_statement)
+        if poll_refusal is not None:
+            raise WiringError(poll_refusal)
     return ConnectionSpec(
         ConnectorType.DATABASE,
         {
