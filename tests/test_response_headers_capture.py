@@ -3,7 +3,8 @@
 """HTTP response-header capture on a captured DeliveryResponse (BACKLOG #154, ADR 0013 amendment).
 
 Covers the four contract points: (1) the connector captures ONLY the per-connection allow-listed
-response headers (a non-allow-listed header is never captured — the PHI gate); (2) with no allow-list
+response headers (a non-allow-listed header is never captured; the allow-list bounds header NAMES,
+not their values, and docs/PHI.md section 3 says what covers a captured value); (2) with no allow-list
 the reply is byte-identical (``headers == {}``); (3) the headers round-trip through the store
 (``complete_with_response`` → ``correlate_response``, encrypted at rest); (4) a re-ingressed answer's
 Handler reads them via ``response_get(dest).headers``.
@@ -113,7 +114,7 @@ async def test_rest_captures_only_allowlisted_response_header() -> None:
     assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
     assert dict(resp.headers) == {"Location": "/Patient/9", "ETag": 'W/"3"'}
-    assert "X-Trace" not in resp.headers  # not allow-listed → never captured (PHI gate)
+    assert "X-Trace" not in resp.headers  # not allow-listed → never captured (the name bound)
 
 
 async def test_rest_no_allowlist_is_byte_identical_empty_headers() -> None:
