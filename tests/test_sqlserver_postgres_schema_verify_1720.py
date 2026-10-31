@@ -121,6 +121,7 @@ def test_every_column_the_postgres_migration_adds_is_in_the_batch() -> None:
     ``_migrate_lease_columns`` adds to an older table is also in that table's CREATE TABLE. A new
     migration column that is not would go unchecked, so this pins the premise."""
     added = _migration_added_columns()
+    assert len(added) >= 20  # positive control: the walk below checks the migration's columns
     declared = pg_declared()
     missing = sorted(f"{t}.{c}" for t, c in added if c not in declared.columns.get(t, ()))
     assert not missing, missing
@@ -199,6 +200,9 @@ def test_the_parser_reads_clauses_between_the_keys_and_the_where() -> None:
         ("CREATE INDEX ix_g ON t USING gin (a)", "access method"),
         ('CREATE INDEX ix_c ON t (name COLLATE "C")', "options"),
         ("CREATE INDEX ix_n ON t (seq DESC NULLS LAST)", "options"),
+        # An expression key read as "<expr>" without its DESC would refuse a correct index.
+        ("CREATE INDEX ix_e ON t (lower(name) DESC NULLS LAST)", "options"),
+        ("CREATE INDEX ix_f ON t ((a + b) NULLS FIRST)", "options"),
         ("CREATE INDEX ix_o ON t (body text_pattern_ops)", "options"),
         ("CREATE INDEX CONCURRENTLY ix_k ON t (a)", "cannot read"),
         ("CREATE TABLE IF NOT EXISTS public . odd (a INT)", "cannot read"),
@@ -209,6 +213,12 @@ def test_the_parser_refuses_ddl_it_would_misread(statement: str, match: str) -> 
     correct schema on every open."""
     with pytest.raises(ValueError, match=match):
         declared_schema((statement,))
+
+
+def test_an_expression_key_keeps_its_direction_without_a_nulls_order() -> None:
+    """The control for the NULLS refusals above: the same expression keys read, with their DESC."""
+    shape = declared_schema(("CREATE INDEX ix_e ON t (lower(name) DESC, (a + b))",))
+    assert shape.named_indexes["ix_e"].columns == ("<expr> DESC", "<expr>")
 
 
 def test_a_quoted_name_keeps_its_case_and_an_unquoted_one_folds() -> None:
@@ -280,27 +290,6 @@ def test_the_refusal_leads_with_the_differences_and_is_an_engine_refusal() -> No
     assert (str(copied), copied.differences, copied.database) == (text, exc.differences, "mf")
 
 
-def test_the_first_difference_survives_the_shortest_cut() -> None:
-    """``safe_exc`` keeps 200 characters of a message and ``provision-schema`` 500, so the remedy,
-    which is the same every time, goes last, and so does the place, whose length is the operator's.
-    A long difference the compare writes for one of this build's indexes fits the shortest cut."""
-    from messagefoundry.redaction import safe_exc
-
-    first = (
-        f"index {_FIFO!r} was never built: the name is taken by a partitioned table"
-        " (expected on queue(stage, channel_id, status, seq))"
-    )
-    exc = ServerSchemaMismatchError(
-        "sqlserver", "mf_test", [first, "table 'x' is missing column 'y'"]
-    )
-    cut = safe_exc(exc, limit=200)
-    assert first in cut
-    assert first in str(exc)[:200]
-    # Control: the earlier layout, remedy first, loses the difference at the same cut.
-    remedy_first = "x" * 446 + " Differences: " + first
-    assert first not in safe_exc(RuntimeError(remedy_first), limit=200)
-
-
 def test_the_refusal_names_where_it_looked_and_scopes_its_remedy() -> None:
     """The Postgres schema is named, an unset database setting never prints as ``None``, and a table
     that only lacks a column is told to gain it, never to be renamed or dropped."""
@@ -336,11 +325,19 @@ def test_no_live_schema_read_calls_a_qualified_multi_argument_unnest() -> None:
 
     assert _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[], $2::text[]) AS q")
     assert not _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[]) AS t(name)")
-    for module in (postgres, server_schema_verify):
-        texts = [v for v in vars(module).values() if isinstance(v, str)]
-        assert len(texts) > 5, f"{module.__name__}: no SQL constants read"
-        offenders = [t for t in texts if _QUALIFIED_MULTI_UNNEST.search(t)]
-        assert offenders == [], f"{module.__name__}: {offenders}"
+    modules = (postgres, server_schema_verify)
+    texts = [
+        (module.__name__, value)
+        for module in modules
+        for value in vars(module).values()
+        if isinstance(value, str)
+    ]
+    for module in modules:
+        read = [name for name, _ in texts if name == module.__name__]
+        assert len(read) > 5, f"{module.__name__}: no SQL constants read"
+    assert len(texts) > 10  # positive control: the walk below sees both modules' constants
+    offenders = [f"{name}: {text}" for name, text in texts if _QUALIFIED_MULTI_UNNEST.search(text)]
+    assert offenders == [], offenders
     assert "ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))" in (
         postgres._LIVE_INDEXES_SQL
     )

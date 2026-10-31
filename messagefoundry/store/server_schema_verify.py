@@ -106,6 +106,8 @@ _COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
 #: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
 _EXPR_KEY = re.compile(r'^(?:"?\w+"?\s*)?\(')
+#: A key's trailing ``NULLS FIRST`` or ``NULLS LAST``, with or without a direction before it.
+_NULLS_ORDER = re.compile(r"\bNULLS\s+(?:FIRST|LAST)$", re.I)
 
 
 def _ident(name: str) -> str:
@@ -180,8 +182,12 @@ def key_column(text: str) -> str:
 def _declared_key(text: str) -> str:
     """:func:`key_column` for a key in the DDL, refusing one whose live spelling would differ: a
     column with a collation, an operator class or a ``NULLS`` order prints as its bare name in the
-    PostgreSQL catalog read, so it could never compare equal."""
-    if _PLAIN_KEY.match(text.strip()) is None and _EXPR_KEY.match(text.strip()) is None:
+    PostgreSQL catalog read, so it could never compare equal. An expression key with a ``NULLS``
+    order is refused too: :func:`key_column` would drop a ``DESC`` written before it, and the
+    catalog read never prints the ``NULLS`` order. No shipped index uses one; refusing it here makes
+    a future one fail the unit test that reads each shipped batch, not every open."""
+    key = text.strip()
+    if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     return key_column(text)
 
@@ -345,10 +351,11 @@ class ServerSchemaMismatchError(RuntimeError):
         )
         if schema is not None:
             where = f"schema {schema!r} of {where}"
-        # The differences lead and the remedy follows. Every path that prints this cuts it short:
-        # provision-schema at 500 characters and safe_exc at 200. The remedy is the same every time,
-        # so it is what a cut may lose. It is split by kind of difference, so a table that only
-        # lacks a column is not told to give up its rows.
+        # The differences lead and the remedy follows. At least two paths that print this cut it
+        # short, provision-schema at 500 characters and safe_exc at 200, while others, the CLI and
+        # log.error among them, print it whole. The remedy is the same every time, so it is what a
+        # cut may lose. It is split by kind of difference, so a table that only lacks a column is
+        # not told to give up its rows.
         super().__init__(
             f"{backend} schema differs: " + "; ".join(self.differences) + f". In {where}; the"
             " open refused and marked nothing current. Rename or drop an object that takes a name,"
