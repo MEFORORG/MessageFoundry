@@ -1700,13 +1700,14 @@ read as any dataclass's are, so it prints as the fixed note; and except where th
 beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
-fixed note even where its own `__str__` would not print it. An exception raised from a codec
-error, or while one was being handled, keeps its message only when both its `__str__` and its
-`__repr__` are, by identity, C methods that an exception class in the `builtins` namespace defined
-when `redaction.py` was imported (`_BUILTIN_EXC_RENDERS`); anything else counts as own code. So
-`ssl.SSLError`, whose `__str__` is its own, gets the fixed note, and a class that borrows a trusted
-method object is trusted. Where the same exception is also reached beneath one whose own code
-renders it, as above, it prints as the fixed note in that argument even when it is trusted.
+fixed note even where its own `__str__` would not print it. The walk counts an exception's
+`__str__` and `__repr__` as a builtin exception's only when both have the `id()` of a C method that
+an exception class in the `builtins` namespace defined when `redaction.py` was imported
+(`_BUILTIN_EXC_RENDERS`); anything else counts as own code. So `ssl.SSLError`, whose `__str__` is
+its own, gets the fixed note when raised from a codec error or while one was being handled, and a
+class whose two methods are both borrowed trusted method objects is trusted. Within one log
+argument, where the same exception is also reached beneath one whose own code renders it, as
+above, it prints as the fixed note even when it is trusted.
 The rule applies
 in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
@@ -1744,8 +1745,8 @@ through that getset: where the exception is not an instance of that class the re
 the walk fails closed on that exception. It does not read everything such code can
 reach: an object the walk does not read by attribute, as listed below, is not read there either.
 It runs on what the first pass left and, in a
-traceback, also within a budget that the added passes of every link share, approximately, see the
-`_ScanShare` docstring for the exact accounting.
+traceback, also within a budget that the added passes of every link share, approximately; the
+`_ScanShare` docstring gives the exact accounting.
 **It only adds: it
 can turn a "holds no error" verdict into "holds an error", never the other way.** What each read
 costs, and when one link's scan hands its verdict on to a later link, is in the `_ScanShare`
@@ -1755,11 +1756,15 @@ an exception group in its chain, can spend the shared budget. A slot whose name 
 for something else is not read. A link whose verdict an earlier link's scan handed on is not
 scanned again: a True can make it print the note where its own scan would not, which errs toward
 the note, and a False is handed on only when that scan judged that none of its reads was cut
-short. An exception class that a C extension or a site hook put into `builtins` before
-`redaction.py` was imported has its C `__str__` and `__repr__` trusted, so if either prints the
-chain, a codec error in that chain would print raw. Trust is keyed on each method's identity, so if
-a class whose method was trusted is freed and another method object later gets that method's id,
-that method would be trusted too.
+short. An exception class that any code run before `redaction.py` was imported put into
+`builtins`, such as a C extension, a site hook or an application module, has its C `__str__` and
+`__repr__` trusted, so if either prints something the walk then leaves unread, such as the chain
+or an attribute of an exception it holds, a codec error there would print raw. Trust is keyed on
+each method's `id()`, an address, so a method object that later takes the address of a freed
+trusted one would be trusted too. Some of a class's answers are kept from the first time an
+instance of it is scanned, so a `__str__` or `__repr__` assigned to the class later can be judged
+as the one it replaced. An exception group whose `__str__` is the builtin one is not walked in a
+traceback, in `safe_exc()` or in `codec_safe_str()`, whatever its `__repr__`.
 When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read

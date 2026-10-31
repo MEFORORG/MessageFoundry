@@ -3238,8 +3238,8 @@ class _ScanShare:
     the one place the added pass's budgets and costs are written down; :class:`_Scan`,
     :func:`_added_pass` and :func:`safe_traceback` point here.
 
-    BUDGETS. A link is each exception :func:`safe_traceback` scans, group members included. Each
-    link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan
+    BUDGETS. A link is each exception in the chain :func:`safe_traceback` walks, group members
+    included; the passes below are those of a link it scans. Each link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan
     with no share runs its added pass on what its first pass left. In a traceback, a link's added
     pass runs on the smaller of that and what is left of ``added``, one more budget the added
     passes of every link share, so a long chain whose scans each run out is not read once per link.
