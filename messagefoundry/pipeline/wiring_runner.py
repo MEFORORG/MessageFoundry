@@ -237,6 +237,7 @@ from messagefoundry.transports.base import (
     IntakeGate,
     IntakeRateLimiter,
     ProcessedArchive,
+    ReceiptRefusedRetryable,
     ReplyBodyDropped,
     SyncReplyResolver,
     check_file_key,
@@ -7763,7 +7764,10 @@ class RegistryRunner:
         the guards below refused it and recorded an ``ERROR`` (count-and-log: still persisted, never
         accepted-and-dropped). What the source answers for each is the source's own logic
         (``HttpSource._serve_one`` for HTTP). A pre-ingress oversize/malformed/allowlist refusal is the
-        source's own synchronous ``4xx`` BEFORE this runs.
+        source's own synchronous ``4xx`` BEFORE this runs. One refusal raises
+        :class:`~messagefoundry.transports.base.ReceiptRefusedRetryable` instead of returning ``None``,
+        after recording the same ``ERROR``: a codec NAME that sets up no decode, which is the
+        configuration's fault and not the body's (BACKLOG #2431).
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
@@ -7803,6 +7807,7 @@ class RegistryRunner:
             return mid
 
         # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
+        unusable: str | None = None
         try:
             text = decode_body(raw, ic)
         except IngressGuardError as exc:
@@ -7813,7 +7818,14 @@ class RegistryRunner:
                 error=exc.reason,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
-            return None
+            if not isinstance(exc, IngressCodecUnusable):
+                return None
+            unusable = exc.reason
+        if unusable is not None:
+            # The codec NAME is at fault, not the body, so the sender should resend later: the
+            # receipt form of the MLLP listener's AE (BACKLOG #2431). Raised after the handler has
+            # ended, so it chains no decode error.
+            raise ReceiptRefusedRetryable(unusable)
 
         try:
             check_decoded(text, ic)

@@ -403,6 +403,17 @@ def poll_interval(settings: Mapping[str, Any], *, default: float, transport: str
 # fire-and-forget transports (e.g. file) that have no reply channel.
 InboundHandler = Callable[[bytes], Awaitable[str | None]]
 
+
+class ReceiptRefusedRetryable(Exception):
+    """Raised by a RECEIPT handler (:attr:`SourceConnector.wants_receipt`) in place of returning
+    ``None``, when it refused the body after recording it as ``ERROR`` and the fault is the
+    receiving side's configuration rather than the body: an inbound whose codec NAME is unusable
+    (BACKLOG #2431). Every body fails alike until the configuration changes, so the sender should
+    resend later, where ``None`` tells it the body itself was refused. The HTTP listener answers it
+    ``503`` rather than ``422``, as the MLLP listener answers ``AE`` rather than ``AR``. The message
+    is the content-free refusal reason, never a byte of the body."""
+
+
 # A source emits connection-lifecycle / transport events (Corepoint-style log, #46) to this OPTIONAL,
 # store-agnostic sink: ``(kind, peer_host, reason)``. The runner injects it after build and binds the
 # connection name + transport + direction; the source only knows the wire-level facts. ``None`` (the

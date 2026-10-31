@@ -10,7 +10,9 @@ ingress stage — mirroring MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A p
 routing/transform/delivery failure happens *after* the ``202`` and is **not** reflected in the HTTP
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
 as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
-no ingress row) is answered ``422``, never ``202`` (ADR 0154 amendment 2026-09-26).
+no ingress row) is answered ``422``, never ``202`` (ADR 0154 amendment 2026-09-26), except a
+refusal the inbound's own configuration caused, an unusable codec name, which is answered ``503``
+(BACKLOG #2431).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -54,6 +56,7 @@ from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
     InboundHandler,
     InboundReply,
+    ReceiptRefusedRetryable,
     ReplyOutcome,
     SourceConnector,
     positive_cap,
@@ -1222,7 +1225,15 @@ class HttpSource(SourceConnector):
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
         # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
         # the handler refuses it and returns None.
-        message_id = await self._handler(request.body)
+        try:
+            message_id = await self._handler(request.body)
+            config_fault = False
+        except ReceiptRefusedRetryable:
+            # Recorded ERROR like a None, but the inbound's own configuration is at fault, so every
+            # body fails alike until it changes: a 503 the sender may retry, never the 422 that says
+            # this body is unacceptable (BACKLOG #2431; MLLP answers the same case AE, not AR).
+            message_id = None
+            config_fault = True
         # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
         # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
         # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer
@@ -1241,7 +1252,9 @@ class HttpSource(SourceConnector):
             # The drain gets the receipt-sized budget in both modes: this is a fixed few dozen bytes,
             # never the partner-sized body reply_write_timeout exists for.
             await self._respond(
-                writer, build_response(422, _NOT_ACCEPTED_BODY), budget=_CLIENT_SHUTDOWN_GRACE
+                writer,
+                build_response(503 if config_fault else 422, _NOT_ACCEPTED_BODY),
+                budget=_CLIENT_SHUTDOWN_GRACE,
             )
             return False
 

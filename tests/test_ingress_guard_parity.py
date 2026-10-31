@@ -14,6 +14,7 @@ listener carries its own copy of the sequence.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import textwrap
@@ -38,6 +39,7 @@ from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.base import ReceiptRefusedRetryable
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -331,7 +333,10 @@ async def _live_rows(
         wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)),
         listener,
     )
-    await handler(reg.inbound[ic.name], body)
+    # The HTTP receipt handler raises, after recording the row, for a codec name that sets up no
+    # decode; the row is what this compares, so the raise is the listener's answer and not a fault.
+    with contextlib.suppress(ReceiptRefusedRetryable):
+        await handler(reg.inbound[ic.name], body)
     cur = await store._db.execute("SELECT status, error FROM messages")
     return [dict(r) for r in await cur.fetchall()]
 
