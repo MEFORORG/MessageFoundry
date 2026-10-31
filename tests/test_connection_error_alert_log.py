@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #3210: the default alert sink's ``connection_error`` line names the connection and the
-exception class, never the transport's error text.
+"""BACKLOG #3210: the default alert sink's ``connection_error`` line withholds the transport's error
+text. What it logs instead, and why, is stated in ``LoggingAlertSink.connection_error``.
 
-Why the detail is withheld is in ``LoggingAlertSink.connection_error``. The runner still queues the
-full ``safe_exc`` text as the ``connection_lost`` event's reason, which the runner test pins on the
-queued event. The planted token stands in for payload content that no redaction pattern matches.
+The runner test writes the ``connection_lost`` event through the real store and reads its reason
+back. The planted token stands in for payload content that no redaction pattern matches.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import DeliveryError
 from tests._refusal_log_capture import TOKEN, assert_no_token
@@ -62,11 +61,16 @@ def test_a_head_that_is_no_class_name_is_not_logged(
     assert_no_token(caplog.records)
 
 
-async def test_the_runner_keeps_the_stored_reason_and_logs_none_of_it(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "transport_text",
+    [_TRANSPORT_TEXT, f"{_TRANSPORT_TEXT}{' x' * 200}"],
+    ids=["short", "long"],
+)
+async def test_the_stored_event_reason_is_the_detail_bounded_again_and_no_log_has_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, transport_text: str
 ) -> None:
-    # The real emit site with the real default sink. Engine loggers at DEBUG, so every record they
-    # write is scanned, with no message skipped.
+    # The real emit site with the real default sink, and the event written through the real store.
+    # Engine loggers at DEBUG, so every record they write is scanned, with no message skipped.
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
@@ -83,13 +87,18 @@ async def test_the_runner_keeps_the_stored_reason_and_logs_none_of_it(
             egress=EgressSettings(deny_by_default=False),
         )
         runner._conn_event_q = asyncio.Queue(maxsize=10)  # normally created in start()
-        exc = DeliveryError(_TRANSPORT_TEXT)
+        exc = DeliveryError(transport_text)
         runner._note_lane_unhealthy(OUT, "m1", exc)
-        event = runner._conn_event_q.get_nowait()
+        await store.record_connection_events([runner._conn_event_q.get_nowait()])
+        (event,) = await store.list_connection_events(connection=OUT, allowed_channels=None)
     finally:
         await store.close()
-    # The stored reason is unchanged: the full safe_exc text, masked later by the read routes.
-    assert event["kind"] == "connection_lost" and event["reason"] == safe_exc(exc)
+    detail = safe_exc(exc)
+    # The store keeps the detail the sink withheld, bounded again by its own safe_text chokepoint:
+    # whole when short, cut further when long.
+    assert event.kind == "connection_lost" and event.reason == safe_text(detail, limit=200)
+    assert TOKEN in event.reason
+    assert (event.reason == detail) is (transport_text == _TRANSPORT_TEXT)
     (line,) = [r for r in _warnings(caplog) if "ALERT connection_error" in r.getMessage()]
     assert "(DeliveryError)" in line.getMessage()
     assert_no_token(caplog.records)
