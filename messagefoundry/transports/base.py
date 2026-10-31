@@ -1159,10 +1159,10 @@ class SourceConnector(abc.ABC):
 
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
-    answer. A sender that waits for none cannot be told to resend: there the MLLP listener records
-    ``handler_error`` and keeps the connection, and a message that was not committed is lost. That
-    is a gap in the
-    shipped listener, not a pattern to copy."""
+    answer. A sender that waits for none cannot be told to resend, and at least one shipped
+    listener loses a message that was not committed in that case: the MLLP listener records
+    ``handler_error`` and keeps the connection. It may not be the only one. That is a gap in the
+    shipped code, not a pattern to copy."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False

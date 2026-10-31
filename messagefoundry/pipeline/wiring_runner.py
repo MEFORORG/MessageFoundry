@@ -111,6 +111,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
@@ -796,6 +797,10 @@ _CONN_EVENT_BURST_MAX = 256
 # never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
 # acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
 _CONN_EVENT_SALVAGE_GIVE_UP = 3
+# Distinct (connection, kind) pairs whose undeclared-kind refusal is logged (BACKLOG #1624). Each pair
+# warns once, so an emitter firing the same bad kind per accept cannot flood the log; past this many
+# pairs the refusals are still counted but no longer logged.
+_CONN_EVENT_REFUSAL_LOG_MAX = 64
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -1751,6 +1756,8 @@ class RegistryRunner:
         self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
+        # (connection, bounded kind) pairs already warned about as undeclared (BACKLOG #1624).
+        self._conn_event_refusals_logged: set[tuple[str, str]] = set()
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
@@ -2203,9 +2210,19 @@ class RegistryRunner:
         reason: str | None,
     ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
-        connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
+        connection-event flood must never block a listener/delivery lane or grow memory unbounded.
+
+        **An undeclared kind is refused here, before it can join a burst** (BACKLOG #1624). The store
+        refuses one too, but there a single bad row fails the whole burst, and a run of them trips the
+        drainer's store-is-refusing cutoff and loses the declared rows behind them. Refused here it
+        is counted with the overflow drops and warned about once per connection and kind; the
+        store's check stays as the backstop for any other writer."""
         q = self._conn_event_q
         if q is None:
+            return
+        if kind not in CONNECTION_EVENT_KINDS:
+            self._conn_events_dropped += 1
+            self._warn_undeclared_connection_event(connection, kind)
             return
         try:
             q.put_nowait(
@@ -2221,6 +2238,23 @@ class RegistryRunner:
             )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
+
+    def _warn_undeclared_connection_event(self, connection: str, kind: str) -> None:
+        """Log a refused undeclared kind once per (connection, kind), up to
+        ``_CONN_EVENT_REFUSAL_LOG_MAX`` pairs. The kind is a code identifier, but it reached here
+        through a variable, so it is bounded and scrubbed like any other free text."""
+        shown = safe_text(kind, limit=64)
+        key = (connection, shown)
+        logged = self._conn_event_refusals_logged
+        if key in logged or len(logged) >= _CONN_EVENT_REFUSAL_LOG_MAX:
+            return
+        logged.add(key)
+        log.warning(
+            "connection %r emitted an undeclared connection_event kind %r; the event was dropped. "
+            "Declare it in messagefoundry.connection_events (later repeats are counted, not logged)",
+            connection,
+            shown,
+        )
 
     async def _connection_event_drainer(self) -> None:
         """Write queued connection events to the store OFF the listener/delivery hot path (#46), one

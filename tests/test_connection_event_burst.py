@@ -193,28 +193,51 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
     ]
 
 
-async def test_an_undeclared_kind_costs_only_its_own_row(
+_UNDECLARED = "not_a_connection_event_kind"
+
+
+async def test_undeclared_kinds_are_refused_at_enqueue_and_the_burst_keeps_every_declared_row(
     store: MessageStore, runner: RegistryRunner, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #1624: the store refuses a kind outside ``CONNECTION_EVENT_KINDS``. The refusal is a
-    ``ValueError`` from the parameter builder, before any row is stepped, and the salvage still
-    keeps the neighbours."""
-    _enqueue(runner, _event(0))
-    _enqueue(runner, _event(1, kind="not_a_connection_event_kind"))
-    _enqueue(runner, _event(2))
+    """BACKLOG #1624: the runner refuses a kind outside ``CONNECTION_EVENT_KINDS`` before it is
+    queued. In the store, a run of three such rows used to trip the salvage's store-is-refusing
+    cutoff and lose the declared rows behind them; refused at enqueue, they never reach a burst."""
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0))
+        for i in (1, 2, 3):
+            _enqueue(runner, _event(i, kind=_UNDECLARED))
+        _enqueue(runner, _event(4))
+        _enqueue(runner, _event(5))
+    assert runner._conn_events_dropped == 3
+    assert runner._conn_event_q is not None and runner._conn_event_q.qsize() == 3
+
+    before = store.committed_txns
     _start_drainer(runner)
     with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
         await _join(runner)
-
-    assert [
-        r.getMessage()
-        for r in caplog.records
-        if "connection-event burst write failed" in r.getMessage()
-    ] == [
-        "connection-event burst write failed (ValueError); salvaged 2 of 3 event(s) singly, dropped 1"
-    ]
+    assert store.committed_txns - before == 1, "the burst stays one commit, with no salvage"
     kept = await store.list_connection_events(allowed_channels=None)
-    assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.2"]
+    assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.4", "10.0.0.5"]
+
+    refusals = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    # One warning per (connection, kind), naming both. Events 1 and 3 share IB_T1; event 2 is IB_T0.
+    assert len(refusals) == 2, refusals
+    assert all(_UNDECLARED in m for m in refusals)
+    assert {"'IB_T0'", "'IB_T1'"} == {m.split()[1] for m in refusals}
+    assert not [r for r in caplog.records if "burst write failed" in r.getMessage()]
+
+
+def test_the_refusal_warning_bounds_the_kind_and_stops_at_the_cap(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(wiring_runner, "_CONN_EVENT_REFUSAL_LOG_MAX", 2)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        for i in range(4):
+            _enqueue(runner, _event(i, kind=f"undeclared_{i}_" + "x" * 500))
+    refusals = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    assert len(refusals) == 2, "past the cap, refusals are counted and not logged"
+    assert all(len(m) < 400 for m in refusals), "the kind is bounded in the log line"
+    assert runner._conn_events_dropped == 4
 
 
 async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(
