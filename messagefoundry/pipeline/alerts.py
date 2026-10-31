@@ -322,12 +322,21 @@ class AlertSink(Protocol):
         host name or an exception text."""
         ...
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self,
+        name: str,
+        *,
+        kind: str,
+        detail: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
-        event kind (``connection_lost``); ``detail`` is a ``safe_exc``-scrubbed reason (no PHI). A
-        partner *rejection* (``NegativeAckError``) is NOT a connection error and never fires this."""
+        event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
+        transport text, so an implementation must not assume it is free of message content.
+        ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
+        (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
@@ -986,8 +995,23 @@ class LoggingAlertSink:
             growth_per_second,
         )
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
-        log.warning("ALERT connection_error: outbound %r %s: %s", name, kind, detail or "")
+    def connection_error(
+        self,
+        name: str,
+        *,
+        kind: str,
+        detail: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
+        """This line is general-log text, so it names the caller's exception class and never reads
+        ``detail``, which can echo transport text (BACKLOG #3210)."""
+        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
+        log.warning(
+            "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
+            name,
+            kind,
+            error_class if plain else "unnamed error",
+        )
 
     def log_write_failed(
         self, name: str, *, stage: str, reason: str, stopped: int | None = None
