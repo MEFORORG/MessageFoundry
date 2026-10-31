@@ -14,7 +14,9 @@ dispatch; these legs verify what only a real server can:
 - **AC-12**: a fenced ex-leader (stale epoch vs the leader_lease row) claims ZERO rows on BOTH
   dispatch paths (the fixed-nullable proc fence == the spliced batch guard);
 - **AC-11**: an oversized requested lane whose 256-unit prefix equals a REAL lane claims zero on
-  both paths (no-match parity — the truncating-CAST shard-safety hazard stays closed).
+  both paths (no-match parity — the truncating-CAST shard-safety hazard stays closed);
+- **BACKLOG #1270**: a locked lane head makes the ``_v2`` proc CALL return the lane EMPTY and NAME it
+  in ``head_skipped``, never ``[N+1, N+2]``, and after release N is claimed first.
 
 The §8 bench-gate battery (G-A0 plan shape, describe-traffic traces, forced 1222/cancellation
 storms, the pool assay) runs on the bench box per WO-0114-GATES — not here.
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import warnings
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -32,7 +35,13 @@ import pytest
 from messagefoundry.config.settings import load_settings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import Stage
+from messagefoundry.store.store import OutboxStatus, Stage
+from tests._claim_lock_helpers import (
+    assert_skip_named,
+    claim_heads_no_block,
+    ss_hold_row_lock,
+    ss_lane_pending,
+)
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -262,3 +271,51 @@ async def test_ac11_no_match_parity_oversized_lane_lives(proc_store: SqlServerSt
     # Control: the real lane itself claims its row on the proc path.
     control = await _claim_until(proc_store, Stage.INGRESS.value, [real_lane])
     assert sum(len(v) for v in control.by_lane.values()) == 1
+
+
+async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
+    proc_store: SqlServerStore,
+) -> None:
+    """BACKLOG #1270, on the proc path. Engine PR 1782 taught the ``_v2`` procs to emit a head-skip
+    marker row, and ``tests/test_batch_claim_locking.py`` proves the marker on the ad-hoc batch only.
+    This is the proc-path twin of ``test_pooled_1a_ss_locked_head_lane_empty_never_blocks``: commit
+    N, N+1, N+2, hold N's lock, and the CALL must return the lane EMPTY and name it, never
+    ``[N+1, N+2]`` and never silently. After release, N leads.
+
+    ``abort_ok=True`` admits the one other legal answer, a whole-claim 1222 abort, which names the
+    route through ``lock_timeout`` and no lane. The lock is taken on the fifo index key, the shape
+    every real contender holds, so the READPAST probe skips it rather than waiting on it."""
+    lane = "IB_V2_HEADSKIP"
+    mids = [
+        await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|SKIP|{t}", now=t)
+        for t in (100.0, 101.0, 102.0)
+    ]
+    assert proc_store.claim_proc_effective is True, (
+        "positive control: the proc gate must be green, or the claims below ran the ad-hoc batch"
+        " and this test proves nothing about the _v2 CALL"
+    )
+    conn, cur = await ss_hold_row_lock(proc_store, mids[0], Stage.INGRESS.value)
+    try:
+        res = await claim_heads_no_block(
+            proc_store, Stage.INGRESS.value, [lane], now=200.0, per_lane_limit=8
+        )
+        assert res.by_lane == {} and res.rearm == frozenset()
+        assert_skip_named(res, lane, abort_ok=True)
+        if res.lock_timeout is not None:
+            # Legal, and it still names a route, but it did not exercise the _v2 marker: say so in
+            # the warnings summary rather than let a green run read as proof of the marker path.
+            warnings.warn(
+                "the _v2 head-skip test passed on the 1222 abort route; the marker was not read",
+                stacklevel=1,
+            )
+        rows = await ss_lane_pending(proc_store, lane)
+        assert len(rows) == 3
+        assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
+    finally:
+        await cur.execute("ROLLBACK TRAN")
+        await cur.close()
+        await proc_store._pool.release(conn)
+    assert proc_store.claim_proc_effective is True  # still the CALL path for the release half
+    after = await _claim_until(proc_store, Stage.INGRESS.value, [lane], now=201.0, per_lane_limit=8)
+    assert [it.message_id for it in after.by_lane[lane]] == mids  # N first, whole prefix
+    assert after.head_skipped == frozenset()  # the lock is gone, so nothing is named skipped

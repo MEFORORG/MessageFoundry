@@ -273,9 +273,20 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # advisory stream is WebAuthn-relevant supply chain; never let this floor drift down), and
 # pyasn1-modules>=0.4.2. pyasn1 rides in via ldap3 (0.6.3 was the CVE-2026-30922 decoder-DoS fix); the
 # lock moved to pyasn1 0.6.4 for CVE-2026-59885/59886 (BER OID quadratic-decode + univ.Real float DoS,
-# both fixed in 0.6.4) — treat 0.6.4 as the floor, never let a re-lock regress it. Reachable here only
-# via WebAuthn attestation parsing (optional [webauthn] extra, auth + password re-proof gated); ldap3
-# and pyspnego do NOT route untrusted DER through pyasn1's vulnerable decoders.
+# both fixed in 0.6.4), then to 0.6.5 for CVE-2026-119194/119195/119196/119197 (quadratic CPU in BER/CER/
+# DER decoding of schema-less containers, constructed OCTET STRING/character strings/indefinite ANY,
+# constructed BIT STRING, and binary REAL; all fixed in 0.6.5) — treat 0.6.5 as the floor, never let a
+# re-lock regress it. Callers read at the pins of 2026-10-30, by reading the wheels, not by running an
+# attack. webauthn 3.0.1 BER-decodes x5c[0] with a Certificate schema (android_key.py), which holds at
+# least BIT STRING, OCTET STRING and ANY. The client picks the attestation format, so attestation=NONE does not rule
+# this out, but the decode comes after the chain reaches a known root and the signature verifies.
+# Whether a constructed string survives the OpenSSL parse before it was NOT measured, so treat this
+# path as reachable (optional [webauthn] extra; the 2026-07 reading gated it behind auth + password
+# re-proof, not re-read here). ldap3 2.9.1 has pyasn1 decoder calls, but its default fast_decoder=True
+# parses LDAP responses and the paged-search control with its own decoder. messagefoundry/auth/ldap.py
+# never sets fast_decoder, and the one extended operation it calls, who_am_i, keeps the base class's
+# asn1_spec=None, so none of those calls is on the path read here. pyspnego does not depend on pyasn1. sigstore DER-decodes
+# a certificate extension as UTF8String (verify/policy.py), but it is only in the release-tools group.
 # OSV sweep 2026-07-03: all five pins CLEAR (webauthn/pyopenssl/pyasn1/pyasn1-modules/cbor2).
 webauthn = ["webauthn>=3.0.0,<4"]
 # HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault
