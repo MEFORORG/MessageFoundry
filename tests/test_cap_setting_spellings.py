@@ -448,8 +448,10 @@ _INT_CAPS = [
     pytest.param(_SCU, "max_object_bytes", "_max_object_bytes", id="scu-max_object_bytes"),
 ]
 
-#: Integer settings read by ``count_setting`` alone. Each was a bare ``int()`` before #3431. None has a
-#: range check, so a negative is not refused here; that is a separate question for each setting.
+#: Integer settings read by ``count_setting`` alone. Each was a bare ``int()`` before #3431. A
+#: negative is not refused here; that is a separate question for each setting. The SCP's
+#: ``max_pdu_size`` answers it with a range check of its own, pinned in
+#: ``tests/test_dicom_scp_receipt_bounds.py`` (vault BACKLOG #2712).
 _COUNT_ONLY = [
     pytest.param(_SCP, "max_associations", "_max_associations", id="scp-max_associations"),
     pytest.param(_SCP, "max_pdu_size", "_max_pdu_size", id="scp-max_pdu_size"),

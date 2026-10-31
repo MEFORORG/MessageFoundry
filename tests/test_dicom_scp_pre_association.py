@@ -381,9 +381,9 @@ async def test_a_request_past_the_size_limit_is_closed_before_its_body_is_read(
 
 @pytest.mark.parametrize("seconds", [0, 0.0, -1.0])
 def test_a_timeout_that_would_close_every_peer_is_refused_at_build(seconds: float) -> None:
-    with pytest.raises(ValueError, match="timeout_seconds must be above zero"):
+    with pytest.raises(ValueError, match="timeout_seconds must be at least 1 second"):
         _build_scp([], timeout_seconds=seconds)
-    assert _build_scp([], timeout_seconds=0.1)._timeout == 0.1  # CONTROL
+    assert _build_scp([], timeout_seconds=1.0)._timeout == 1.0  # CONTROL
 
 
 def _wrong_protocol(request: bytes) -> bytes:
@@ -865,7 +865,7 @@ async def test_a_wait_that_runs_out_during_ae_6_leaves_no_association_counted(
     request = await asyncio.to_thread(_a_real_association_request)
     held = _held_on_the_dul_thread_until_the_wait_runs_out()
     monkeypatch.setattr(A_ASSOCIATE_RQ, "to_primitive", held)
-    async with _running_scp({"max_associations": 2, "timeout_seconds": 0.2}) as scp:
+    async with _running_scp({"max_associations": 2, "timeout_seconds": 1.0}) as scp:
         baseline = await _thread_baseline()
         sock = _stall(scp.sockport, request)
         await _ends_with_no_thread(scp, sock, baseline, peer_closes=peer_closes)

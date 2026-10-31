@@ -53,7 +53,8 @@ server **off the asyncio event loop**, bridges each received object back onto th
 DIMSE analog of MLLP's commit-before-ACK; nothing is accepted-and-dropped). Security: calling-AE allowlist +
 peer-IP allowlist + `require_called_ae_title` + a `max_object_bytes` cap (charged against the raw received
 Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before any decode, re-encode or
-commit; never above the engine's 16 MiB binary ingress ceiling) + DICOM-over-TLS. An object the engine's
+commit; never above the engine's 16 MiB binary ingress ceiling, and an object past twice it ends the
+association before it is held) + DICOM-over-TLS. An object the engine's
 ingress refuses is recorded `ERROR` and answered with a DIMSE failure, never Success (BACKLOG #1910). A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
 **The SCP checks the peer address before it reads anything.** The address is known as soon as the
@@ -68,6 +69,8 @@ in the order the SCP applies them.
 | the TLS handshake (`tls=true`), with the client certificate when `tls_ca_file` is set | after the address check, on the connection's own thread, and within 10 seconds | the connection is closed. A handshake that is slow, or never starts, does not delay another sender's |
 | the deadline on the association request | on the connection's own thread, for the whole of the first PDU, within `timeout_seconds` | the connection is closed, and the refusal is logged. No association was started for it |
 | `calling_ae_allowlist` and `require_called_ae_title` | when the association request is read | the association is rejected. No object is sent |
+| `max_pdu_size` | for each PDU after the association request, on the length the PDU declares, before its body is read | an A-ABORT, and the association ends |
+| twice the effective `max_object_bytes` | for each object, as its fragments arrive, before pynetdicom holds them | an A-ABORT, and the association ends. No status is sent for that object |
 | `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
 
 The 10 second handshake bound is a deadline for the whole handshake. It is the same constant the
@@ -89,8 +92,8 @@ not need one. Anything else is closed at once. A first PDU that is not an associ
 a request over that size, get no answer: the rest of what the peer sent is left unread, and a close
 over unread data resets the connection, so an answer could not be relied on. A whole request the SCP
 decodes and refuses gets an A-ASSOCIATE-RJ, rejected-permanent, before the close, so a sender can
-tell it will be refused again. At least these are refused that way: one with the wrong protocol
-version, and one the association could not negotiate, such as a presentation context that names no
+tell it will be refused again. At least these are refused that way: one whose protocol version
+field does not set bit 0, which names version 1, and one the association could not negotiate, such as a presentation context that names no
 transfer syntax or no abstract syntax. A whole request that does not decode is an invalid PDU, and
 gets the A-ABORT the standard's state table gives one. The SCP runs pynetdicom's own presentation
 context negotiation on the request before it starts the association, so a request that would fail
@@ -101,9 +104,35 @@ each read has `timeout_seconds`, however slowly the bytes arrive. A peer that st
 a PDU is ended there. This is a deadline per read, not per object, so at the default 30 seconds a
 sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second.
 Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer that keeps finishing
-PDUs is not ended by this. A send to a peer that stops
-reading has a `timeout_seconds` bound too. `timeout_seconds` has to be above zero; the connection
-is refused when it is built otherwise.
+PDUs is not ended by this. Each send has a `timeout_seconds` deadline for the whole send too, so a
+peer that stops reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
+at most 1 second more, so that the status for an object committed as the stop began still goes out.
+`timeout_seconds` has to be at least 1 second, and `max_pdu_size` has to be above zero; the
+connection is refused when it is built otherwise. Both are deadlines on every read, so a tiny one
+would end nearly every peer, and a `max_pdu_size` of `0` would offer a peer no limit at all.
+
+**A PDU longer than the SCP takes, and an object past twice its cap, end the association.** The SCP
+reads each PDU's header and checks the length it declares before it reads the body (owner ruling
+B462-R3). A P-DATA-TF, the PDU that carries an object, may be as long as the `max_pdu_size` the SCP
+offered: a pynetdicom sender fragments to exactly that, and PS3.8 Annex D.1 bounds that field. Any
+other PDU may be as long as an association request, 256 KiB. A longer one gets an A-ABORT, and its
+body is not read, so a peer cannot have the SCP read the 4 GiB a PDU can declare.
+
+The SCP then counts each object's fragments as they arrive, before pynetdicom holds them, which it
+does until the object's last fragment arrives. An object over `max_object_bytes` but not past twice
+the effective `max_object_bytes` is held, and then refused with the final status `0xC010`. One past
+twice that gets an A-ABORT instead, so what the SCP holds of one object stays bounded: 32 MiB at the
+shipped default, where the effective cap is 16 MiB. The count starts again at each object's last
+fragment, so a long association of objects under the cap is never charged as one. A command set past
+64 KiB is ended the same way; a real one is a few hundred bytes. The SCP never sets pynetdicom's
+`STORE_RECV_CHUNKED_DATASET`, which would write each object being received to a temporary file in
+plaintext, outside the store.
+
+The abort changes what a sender of a large object sees. `0xC010` is a final refusal, which a sender
+does not retry. A failed association reads as transient, and this engine's own C-STORE client
+retries one at the head of its lane, so a sender whose own cap is above twice this SCP's would
+retry such an object for as long as it is sent. The engine's client defaults to 128 MiB. Clamping
+the client to a peer's limit is separate work, not built here.
 
 **A peer that stalls before its request is complete does not use up `max_associations`.** It never
 gets an association, so with `max_associations=2` and three stalled peers held, a real sender is
@@ -124,10 +153,10 @@ served. At least these limits apply:
   once it is decoded, whatever follows it. Before the SCP closes a connection it has answered, it
   reads off what the peer has already sent behind the request, up to 64 KiB and without waiting for
   more, so the close does not reset the connection and lose the answer. A peer that has sent more
-  than that can still get a reset in place of the answer.
-- The SCP does not refuse a PDU longer than the `max_pdu_size` it offered. pynetdicom reads the
-  length the peer announces, into memory, for as long as the deadline allows, on an association the
-  SCP accepted.
+  than that can still get a reset in place of the answer. The same holds for the A-ABORT that ends
+  an association whose PDU is too long, since its body is left unread.
+- An object up to twice the effective `max_object_bytes` is held whole before it is refused, on
+  each association at once: `max_associations` of them at the default 32 MiB each.
 
 **A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
 no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a
@@ -139,8 +168,8 @@ address to `source_ip_allowlist` to admit it.
 **A refused address is logged once a minute, not once per connection.** The SCP writes one
 `WARNING` per refused address per 60 seconds, and at most 20 such lines per 60 seconds over every
 address together. Each line carries the SCP's running count of refusals, logged or not. An
-association the SCP ends because a read ran out `timeout_seconds` is not a refusal, since the SCP had
-accepted it. It gets a `WARNING` that says the SCP ended an association, under the same throttle,
+association the SCP ends, because a read or a send ran out `timeout_seconds` or for one of the limits
+above, is not a refusal, since the SCP had accepted it. It gets a `WARNING` that says the SCP ended an association, under the same throttle,
 with its own count, so it never uses up an address's refusal line.
 
 **A failed TLS handshake is counted and logged as a throttled `WARNING`** (vault BACKLOG
@@ -160,7 +189,7 @@ The SCP answers at least these statuses:
 | Status | Class | When the SCP answers it |
 |---|---|---|
 | `0x0000` | Success | the object is durably committed to the ingress stage |
-| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
+| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, but not past twice it, where the association is aborted instead; or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
 | `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect, including running out of memory |
 | `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; or the engine's loop is not running |
 | `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist`. This is a second check behind the one at accept, which closes such a peer's connection before any association forms, so a sender should not see this status. Each one is logged |
