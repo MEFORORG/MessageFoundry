@@ -35,6 +35,7 @@ from messagefoundry import netaddr  # noqa: E402
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource  # noqa: E402
 from messagefoundry.transports.mllp import _TLS_HANDSHAKE_TIMEOUT  # noqa: E402
+from messagefoundry.transports.receipt import IngressReceipt  # noqa: E402
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import (  # noqa: E402
     _SCP_AE,
@@ -62,9 +63,9 @@ async def _running_scp(
     """A started SCP whose handler commits into ``captured``. Stopped on the way out."""
     sink: list[bytes] = [] if captured is None else captured
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         sink.append(data)
-        return f"mid-{len(sink)}"
+        return IngressReceipt.accepted(f"mid-{len(sink)}")
 
     scp = _build_scp(sink, **settings)
     await scp.start(handler)
@@ -575,12 +576,12 @@ async def test_a_tls_association_still_stores_an_object(tmp_path: Path) -> None:
     settings = _tls_settings(tmp_path)
     scp = _build_scp(captured, **settings)
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         # Runs while the association is live: read the timeout on the socket it was handed.
         for assoc in scp._server.active_associations:
             timeouts.append(assoc.dul.socket.socket.gettimeout())
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     await scp.start(handler)
     try:
@@ -633,9 +634,9 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
         await scp.start(handler)
@@ -681,9 +682,9 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     await scp.start(handler)
     await scp.stop()
@@ -703,9 +704,9 @@ async def test_a_failing_shutdown_is_retried_and_still_logs_what_was_held(
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
         await scp.start(handler)

@@ -29,6 +29,7 @@ from messagefoundry.config.models import ConnectorType, Source  # noqa: E402
 from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import DicomPeek  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource, _server_ssl_context  # noqa: E402
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind  # noqa: E402
 from tests._dicom_sample import make_deflated_bomb_stream, make_sr_part10  # noqa: E402
 
 _SCP_AE = "MEFOR_SCP"
@@ -72,11 +73,11 @@ def _scu_cstore(
 
 
 async def _capture_handler_factory(captured: list[bytes]):
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         # Mimics the runner's RECEIPT handler the SCP is bound to (BACKLOG #1910): durably "commit",
-        # then return the committed message id. None would mean "refused, recorded ERROR".
+        # then return the committed message id. A refusal would mean "recorded ERROR" (#2105).
         captured.append(data)
-        return f"mid-{len(captured)}"
+        return IngressReceipt.accepted(f"mid-{len(captured)}")
 
     return handler
 
@@ -284,8 +285,8 @@ def test_scp_commit_on_a_loop_that_is_not_running_answers_out_of_resources(close
     # and a re-send after a restart would be, so the answer is Out of Resources, at once. A closed loop
     # used to raise out of _commit to the last-resort handler's final 0xC000. A stopped one used to
     # schedule a commit that never ran and hold the association for the whole timeout.
-    async def handler(data: bytes) -> str | None:
-        return "mid"
+    async def handler(data: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("mid")
 
     scp = _build_scp([])
     scp._timeout = 5.0
@@ -302,15 +303,26 @@ def test_scp_commit_on_a_loop_that_is_not_running_answers_out_of_resources(close
     assert time.monotonic() - started < 2.0, "the SCP must not wait out the commit timeout"
 
 
-async def test_scp_handler_refusal_returns_dimse_failure_not_success() -> None:
-    # BACKLOG #1910: the receipt handler returns None when it REFUSED the object (recorded ERROR, no
-    # ingress row). That is a hard DIMSE failure, never Success, and never the re-send status either:
-    # the same object would be refused again.
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (RefusalKind.PERMANENT, 0xC000),
+        (RefusalKind.OVERSIZE, 0xC000),
+        (RefusalKind.TEMPORARY, 0xA700),
+    ],
+)
+async def test_scp_handler_refusal_returns_dimse_failure_not_success(
+    kind: RefusalKind, expected: int
+) -> None:
+    # BACKLOG #1910: a receipt handler refusal (recorded ERROR, no ingress row) is a hard DIMSE
+    # failure, never Success. BACKLOG #2105 maps it in step with the HTTP listener: a permanent or
+    # over-size refusal is Cannot Understand, since the same object would be refused again, and a
+    # temporary one is Out of Resources, the class a sender re-sends, as HTTP answers 503.
     received: list[bytes] = []
 
-    async def refusing_handler(data: bytes) -> str | None:
+    async def refusing_handler(data: bytes) -> IngressReceipt:
         received.append(data)
-        return None
+        return IngressReceipt.refused(kind, "err-1")
 
     scp = _build_scp([])
     await scp.start(refusing_handler)
@@ -318,7 +330,7 @@ async def test_scp_handler_refusal_returns_dimse_failure_not_success() -> None:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
         assert len(received) == 1, "the handler must have been asked; the refusal is its answer"
-        assert status == 0xC000
+        assert status == expected
     finally:
         await scp.stop()
 
@@ -365,11 +377,11 @@ async def test_scp_stop_runs_off_loop_and_lets_in_flight_cstore_finish() -> None
     commit_begun = asyncio.Event()
     release_commit = asyncio.Event()
 
-    async def gated_handler(data: bytes) -> str | None:
+    async def gated_handler(data: bytes) -> IngressReceipt:
         captured.append(data)  # commit "begun" — the durable write is under way
         commit_begun.set()
         await release_commit.wait()  # park mid-commit until the test releases it
-        return "mid-gated"  # the receipt: committed
+        return IngressReceipt.accepted("mid-gated")  # the receipt: committed
 
     scp = _build_scp(captured)
     await scp.start(gated_handler)

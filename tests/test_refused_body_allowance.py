@@ -59,6 +59,7 @@ from messagefoundry.transports.database import DatabaseSource
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPSource
+from messagefoundry.transports.receipt import RefusalKind
 
 _MSH = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101||ADT^A01|MSG1|P|2.5.1\r"
 _STRICT_OK = _MSH + b"EVN|A01|20260101\rPID|1||MRN123^^^H^MR||DOE^JANE\rPV1|1|I\r"
@@ -205,7 +206,8 @@ async def test_the_http_receipt_path_is_bounded_too(store: MessageStore) -> None
     body = _parse_failure(3000)
 
     for _ in range(20):
-        assert await runner._handle_inbound_http(runner.registry.inbound["IB_A"], body) is None
+        receipt = await runner._handle_inbound_http(runner.registry.inbound["IB_A"], body)
+        assert receipt.refusal is RefusalKind.PERMANENT
 
     rows = await _rows(store)
     assert len(rows) == 20

@@ -24,6 +24,7 @@ from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.transports.base import InboundReply, ReplyOutcome
 from messagefoundry.transports.http_listener import HttpSource
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind
 
 
 def test_valid_configurations_build() -> None:
@@ -153,8 +154,13 @@ async def _serve(
     base.update(settings)
     src = HttpSource(Source(type=ConnectorType.HTTP, settings=base))
 
-    async def handler(raw: bytes) -> str | None:
-        return None if settings.get("_decline") else "msg-1"
+    declined = settings.get("_decline")
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        if not declined:
+            return IngressReceipt.accepted("msg-1")
+        kind = declined if isinstance(declined, RefusalKind) else RefusalKind.PERMANENT
+        return IngressReceipt.refused(kind, "err-1")
 
     if reply is not None:
 
@@ -284,8 +290,18 @@ async def test_a_declined_handler_gets_the_same_422_on_both_paths() -> None:
     receipt = await _serve(None, events=receipt_events, _decline=True)
     assert receipt == sync  # status, headers and body alike
     assert receipt[0] == 422
-    assert receipt[2] == b'{"error":"message was not accepted"}'
+    assert receipt[2] == b'{"error": "message was not accepted", "message_id": "err-1"}'
     assert sync_events == receipt_events == ["established", "closed"]
+
+
+async def test_a_temporary_refusal_is_the_same_503_on_both_paths() -> None:
+    # BACKLOG #2105: the one refusal branch answers both modes, so a temporary refusal is the 503 with
+    # Retry-After on the sync path too, never a wait for a reply to a message that was not committed.
+    sync = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=RefusalKind.TEMPORARY)
+    receipt = await _serve(None, _decline=RefusalKind.TEMPORARY)
+    assert receipt == sync
+    assert receipt[0] == 503
+    assert receipt[1]["retry-after"] == "5"
 
 
 async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> None:

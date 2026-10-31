@@ -195,26 +195,22 @@ async def test_respond_with_receipt_on_ingress(store: MessageStore) -> None:
     assert msg["status"] == MessageStatus.RECEIVED.value
 
 
-@pytest.mark.parametrize("cause", ["over_ingress_ceiling", "nul_in_body"])
+@pytest.mark.parametrize("cause", ["nul_in_body", "declared_type_mismatch"])
 async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, cause: str
+    store: MessageStore, cause: str
 ) -> None:
     """Owner ruling 2026-09-26 (BACKLOG #1960, the ADR 0154 amendment of that date).
 
     The listener reads the body, then the runner's receipt handler refuses it: it records one ERROR
-    row and returns None. The receipt path used to answer that with "202 without a message_id",
+    row and returns a refusal. The receipt path used to answer that with "202 without a message_id",
     telling the caller a refused body was accepted. It now answers the sync path's 422. Only the
-    answer changed: the ERROR row is still the count-and-log record, and no ingress row exists."""
-    from messagefoundry.pipeline import ingress_guards
+    answer changed: the ERROR row is still the count-and-log record, and no ingress row exists.
 
-    body = JSON_BODY.encode("utf-8")
-    if cause == "over_ingress_ceiling":
-        # Under the listener's max_body_bytes, so the listener reads it and hands it on; over the
-        # engine's ingress ceiling, so the handler refuses it after reading.
-        monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 8)
-        assert 8 < len(body) < DEFAULT_MAX_BODY_BYTES
-    else:
-        body = b'{"mrn": "1\x0000"}'
+    Amended 2026-10-30 (BACKLOG #2105): the body now names that ERROR row's message_id, and only a
+    PERMANENT refusal answers 422. A body over the engine's ingress ceiling, the other cause this
+    test used to carry, now answers 413; that case and the temporary 503 are pinned in
+    ``tests/test_ingress_refusal_kinds.py``."""
+    body = b'{"mrn": "1\x0000"}' if cause == "nul_in_body" else b"<not>json</not>"
     ic = build_inbound_connection(
         "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
     )
@@ -225,13 +221,16 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     finally:
         await src.stop()
     assert resp.status == 422
-    assert resp.body == b'{"error":"message was not accepted"}'
     # A post-record refusal has no connection-event kind of its own, so the connection still closes
     # normally in the log rather than being left open-ended.
     assert [e[0] for e in events] == ["established", "closed"]
-    cur = await store._db.execute("SELECT status FROM messages")
-    rows = await cur.fetchall()
+    cur = await store._db.execute("SELECT id, status FROM messages")
+    rows = list(await cur.fetchall())
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    row_id = rows[0]["id"]
+    assert (
+        resp.body == f'{{"error": "message was not accepted", "message_id": "{row_id}"}}'.encode()
+    )
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
     fetched_row = await cur.fetchone()
     assert fetched_row is not None

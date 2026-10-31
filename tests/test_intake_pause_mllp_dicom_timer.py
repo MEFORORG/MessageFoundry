@@ -37,6 +37,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.transports import timer as timer_mod
 from messagefoundry.transports.base import IntakeGate
 from messagefoundry.transports.mllp import CR, EB, MLLPSource, frame
+from messagefoundry.transports.receipt import IngressReceipt
 from messagefoundry.transports.timer import TimerSource
 
 #: Long enough that a source which ignored the gate would have read, fired or handled everything.
@@ -304,10 +305,10 @@ def _store_once(port: int, data: bytes, *, calling_ae: str = "MODALITY1") -> _Ou
 
 
 def _capture(captured: list[bytes]) -> Callable[[bytes], Any]:
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         # Mimics the runner's receipt handler: durably "commit", then return the message id.
         captured.append(data)
-        return f"mid-{len(captured)}"
+        return IngressReceipt.accepted(f"mid-{len(captured)}")
 
     return handler
 

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.transports import http_listener as http_module
+from messagefoundry.transports.receipt import IngressReceipt
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
 from tests.test_tls_handshake_failures import _client_hello, _pinned_client, _plaintext_peer
 from tests.test_tls_handshake_failures import _http_tls_source as _tls_source
@@ -34,9 +35,9 @@ class _Intake:
     def __init__(self) -> None:
         self.received: list[bytes] = []
 
-    async def __call__(self, raw: bytes) -> str:
+    async def __call__(self, raw: bytes) -> IngressReceipt:
         self.received.append(raw)
-        return f"m{len(self.received)}"
+        return IngressReceipt.accepted(f"m{len(self.received)}")
 
 
 async def _https_post(port: int, cert: str, *, client_key: Path | None = None) -> int | None:

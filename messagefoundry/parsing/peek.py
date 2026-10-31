@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "Peek",
     "HL7PeekError",
+    "HL7MessageTooLarge",
     "PEEK_READ_FAULTS",
     "normalize",
     "parse_path",
@@ -50,6 +51,12 @@ DEFAULT_MAX_SEGMENTS = 10_000  # generous for big batches/ORUs, bounds segment-c
 
 class HL7PeekError(ValueError):
     """Raised when bytes are not a parseable HL7 message, or a field path is malformed."""
+
+
+class HL7MessageTooLarge(HL7PeekError):
+    """The message is over the ``max_bytes`` cap. A subclass, so every ``HL7PeekError`` caller is
+    unchanged, while a receipt source can answer it as over-size rather than as bad content (BACKLOG
+    #2105). The segment cap stays a plain ``HL7PeekError``: it bounds structure, not size."""
 
 
 #: What a field read on an ACCEPTED :class:`Peek` could raise if a parser fault slipped past the
@@ -72,7 +79,7 @@ def enforce_size_limits(
     by :meth:`Peek.parse`, :func:`~messagefoundry.parsing.validate.validate` and
     :func:`~messagefoundry.parsing.tree.parse_tree`."""
     if max_bytes is not None and len(norm) > max_bytes:
-        raise HL7PeekError(f"message exceeds max size ({len(norm)} > {max_bytes} bytes)")
+        raise HL7MessageTooLarge(f"message exceeds max size ({len(norm)} > {max_bytes} bytes)")
     if max_segments is not None:
         segment_count = norm.count("\r") + 1
         if segment_count > max_segments:
