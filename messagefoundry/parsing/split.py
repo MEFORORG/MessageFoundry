@@ -53,10 +53,11 @@ _MSH_BYTES = _MSH.encode("ascii")
 _CR_MSH_BYTES = _CR_MSH.encode("ascii")
 _LF_MSH_BYTES = _LF_MSH.encode("ascii")
 
-# Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. The
-# lookahead spells ``_CR_MSH`` as a literal rather than composing it, so the static ReDoS scanner in
-# tests/test_security_static.py can read it; tests/test_msh_boundary_parity.py holds the two equal.
-_MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
+# Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment.
+# ``_CR_MSH`` holds no regex metacharacter, so it goes in unescaped: the static ReDoS scanner in
+# tests/test_security_static.py resolves a pattern composed from constants, but not one passed
+# through ``re.escape``.
+_MSH_BOUNDARY = re.compile("(?=" + _CR_MSH + ")")
 
 #: The first character the parser keeps: it strips the whitespace around a body before it reads it.
 _FIRST_KEPT = re.compile(r"\S")
