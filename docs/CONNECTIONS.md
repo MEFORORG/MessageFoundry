@@ -673,7 +673,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
-| `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606). **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
+| `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606); a `tls = true` listener on the stdlib loop closes the socket unanswered instead, as the pre-ingress refusals below say. **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe waits behind an outstanding debt but **charges nothing**, and neither does a request refused before its body reaches the engine. Only a body the engine reads and records spends budget, including one it then refuses with a `422`, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
@@ -730,6 +730,9 @@ synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
 `max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, a missing `Host` on any version but HTTP/1.0, more than one `Host`, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
+On a `tls = true` listener on the standard asyncio loop, the `source_ip_allowlist` and connection-cap
+refusals come before the TLS handshake, so the socket is closed with no answer instead of a `403` or
+`503`: a TLS client cannot read a plaintext one (BACKLOG #2479).
 `GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`. A probe is held to the same head rules as any request, so an HTTP/1.1 probe must send one `Host` header. Methods are case-sensitive (RFC 9110), so a lowercase `get` or `post` is not a probe or an intake request.
 
 **Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
@@ -1662,7 +1665,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
-| `port` | `1433` | server port |
+| `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
 | `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on the **SQL Server preset only**, where it reaches ODBC Driver 18 as pyodbc's `timeout=` (the driver ignores a DSN keyword for it). `generic` gets no login timeout from the engine and uses its driver's default |
@@ -1713,8 +1716,9 @@ outbound(
 `dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
-`odbc_driver`. The parameterized-`:name` binding, error classification, pooling and `[egress].allowed_db`
-gate are identical to the SQL Server preset.
+`odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
+the SQL Server preset. The `[egress].allowed_db` gate checks the same host, but reads the port
+differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1724,6 +1728,48 @@ gate are identical to the SQL Server preset.
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
 The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+
+##### The port an `allowed_db` entry binds
+
+An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
+`server` text, in any case, and a host no entry names is refused. An entry with a port admits only
+the port the connection string sends, compared as a number (`db:05432` names port 5432). The two
+dialects send it differently (vault BACKLOG #2704):
+
+| Dialect | Port the entry is compared with |
+|---|---|
+| `sqlserver` | The `port` setting, default `1433`. The connection string is `SERVER=<server>,<port>`. |
+| `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
+
+**The check compares the port the connection string sends, not the port the driver opens.** A
+driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
+to its own default port, and the check cannot see that. Check that your driver reads the keyword.
+
+An entry with no port admits its host at any port. On the generic dialect the egress check
+**refuses** at least these cases for a listed host, at load like every other miss:
+
+- `server` holds a comma anywhere: `db,6432`, `[db],6432`, `db,` or `db,replica`, whatever the
+  entry says. psqlODBC passes `SERVER` to libpq as a host, and libpq reads a comma there as a list
+  of hosts. Name one host in `server` and put the port in `PORT`.
+- `PORT` is given more than once, in any case, or with a leading zero (`05432`), which a driver
+  could read as octal. A pin in an entry may keep a leading zero: the engine alone reads it.
+- No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
+  from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
+- The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
+  The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
+  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
+  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
+  host-only entry still admits any driver.
+
+The check reads the driver **name** as written, an odbcinst alias or a library path included, and
+cannot see which library that name loads. A name that misdescribes its driver, such as a path
+holding `mysql` to a library that ignores `PORT`, is outside what the check can catch.
+
+A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
+so no entry can name it, and it is refused as unlisted.
+
+`db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
+port compared.
 
 ##### Accepted `odbc_params` keywords
 
@@ -4062,7 +4108,7 @@ reading this page already applies to a file the scan never opened.
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address (vault BACKLOG #2606) | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
 | X12 listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address (vault BACKLOG #2606) | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log, throttled to one per address per 60 s | as MLLP |
 | Raw TCP / X12 destination | as MLLP destination — one delivery per outbound lane | a lane waits for a processing slot; a fresh connection is dialled per delivery | transient failure re-queues into the retry path |
-| HTTP web-service listener (inbound) | `max_connections` default 256; `max_connections_per_host` available but **off** by default (vault BACKLOG #2606); `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout` |
+| HTTP web-service listener (inbound) | `max_connections` default 256; `max_connections_per_host` available but **off** by default (vault BACKLOG #2606); `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout`, and with `tls = true` on the stdlib loop also when a handshake fails or runs past its 10 s bound (BACKLOG #2479) |
 | File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bounds are the poll interval `poll_seconds` (default 1.0), `max_file_bytes` (16 MiB) and `poll_max_files` (500 files per scan, [deferring the rest to the next scan](#per-tick-poll-ceilings)) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
 | File endpoint — UNC / SMB share | as local File, plus one dedicated impersonation worker thread per endpoint | the OS redirector queues; no engine-side cap | an SMB failure surfaces as a transient delivery/poll error and re-queues |
 | SFTP (remote-file) | one session per poll or per delivery — no session pool | sessions are serialized by the lane budget; there is no server-side connection cap the engine enforces; one poll takes at most `poll_max_files` (500) files and [defers the rest](#per-tick-poll-ceilings) | a refused/limited server surfaces as a transient error and re-queues per `RetryPolicy` |
@@ -4113,7 +4159,7 @@ reading this page already applies to a file the scan never opened.
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
-| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
+| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, and so does its admission order on each event loop (BACKLOG #2479): on the stdlib loop `source_ip_allowlist`, `max_connections` and `max_connections_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |

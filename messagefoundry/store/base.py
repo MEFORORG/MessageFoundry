@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.redaction import codec_safe_str, prints_a_codec_error
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -3288,16 +3289,42 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
     build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
     (vault BACKLOG #2983). ``None`` counts as enforcing there, so a caller with no posture gets
-    the strict answer."""
+    the strict answer.
+
+    **A codec error is not chained (BACKLOG #3471).** Its own text names a byte of what it decoded,
+    and its ``.object`` holds all of it, so a key source that yields bytes that are not text would
+    put key material in the refusal and in any traceback of it. A ``ValueError`` from the build
+    that is one, holds one, or has one on the links :func:`_carries_a_codec_error` follows, is
+    rendered with :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the handler.
+    Every other ``ValueError`` keeps its text and its chain. An error of another class, such as a
+    ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
     except ValueError as exc:
-        raise StoreCipherConfigError(str(exc)) from exc
+        if not _carries_a_codec_error(exc):
+            raise StoreCipherConfigError(str(exc)) from exc
+        refusal = codec_safe_str(exc)
+    raise StoreCipherConfigError(refusal)
+
+
+def _carries_a_codec_error(exc: BaseException) -> bool:
+    """Whether ``exc``, or an error on its chain, is a codec error or prints one (BACKLOG #3471).
+    Each link is followed by its ``__cause__``, else its ``__context__``, as a traceback prints it;
+    a ``__context__`` beside a ``__cause__`` is not read."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, UnicodeError) or prints_a_codec_error(link):
+            return True
+        link = link.__cause__ or link.__context__
+    return False
 
 
 class StoreCipherConfigError(ValueError):
     """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key."""
+    text is the build error's, which names settings and variables, never a key. A codec error's
+    is rendered without the bytes it names (BACKLOG #3471)."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
