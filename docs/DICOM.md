@@ -85,10 +85,15 @@ starts when the SCP starts to read, after any TLS handshake and any
 `max_associations_per_second` wait. An SCU sends its request as soon as it connects, so a working
 sender does not meet this. The first PDU has to be a well-formed association request of at most 256 KiB.
 PS3.8 sets no limit on that PDU, so a larger request is legal in the format, but a modality would
-not need one. Anything else is closed at once: a first PDU that is not an association request, a
-request over that size, one that does not decode, and one with a presentation context that names no
-transfer syntax. A wrong protocol version gets the association rejection the standard gives it. The
-others get no rejection and no A-ABORT.
+not need one. Anything else is closed at once. A first PDU that is not an association request, and
+a request over that size, get no answer: the rest of what the peer sent is left unread, and a close
+over unread data resets the connection, so an answer could not be relied on. A whole request the SCP
+refuses gets an A-ASSOCIATE-RJ, rejected-permanent, before the close, so a sender can tell it will be
+refused again. At least these are refused that way: a request that does not decode, one with the
+wrong protocol version, and one the association could not negotiate, such as a presentation context
+that names no transfer syntax or no abstract syntax. The SCP runs pynetdicom's own presentation
+context negotiation on the request before it starts the association, so a request that would fail
+there never starts one.
 
 **After that, each PDU has a deadline too.** The SCP reads a PDU's header and then its body, and
 each read has `timeout_seconds`, however slowly the bytes arrive. A peer that stops part way through
@@ -115,7 +120,10 @@ served. At least these limits apply:
   `max_associations`. The idle timer, the header read and the body read each have `timeout_seconds`,
   so one peer could hold that slot for about three times `timeout_seconds`, 90 seconds at the default.
   Only an association the SCP accepted can do this. Over `max_associations` the request is rejected
-  once it is decoded, whatever follows it.
+  once it is decoded, whatever follows it. Before the SCP closes a connection it has answered, it
+  reads off what the peer has already sent behind the request, up to 64 KiB and without waiting for
+  more, so the close does not reset the connection and lose the answer. A peer that has sent more
+  than that can still get a reset in place of the answer.
 - The SCP does not refuse a PDU longer than the `max_pdu_size` it offered. pynetdicom reads the
   length the peer announces, into memory, for as long as the deadline allows, on an association the
   SCP accepted.
@@ -129,7 +137,10 @@ address to `source_ip_allowlist` to admit it.
 
 **A refused address is logged once a minute, not once per connection.** The SCP writes one
 `WARNING` per refused address per 60 seconds, and at most 20 such lines per 60 seconds over every
-address together. Each line carries the SCP's running count of refusals, logged or not.
+address together. Each line carries the SCP's running count of refusals, logged or not. An
+association the SCP ends because a read ran out `timeout_seconds` is not a refusal, since the SCP had
+accepted it. It gets a `WARNING` that says the SCP ended an association, under the same throttle,
+with its own count, so it never uses up an address's refusal line.
 
 **A failed TLS handshake is counted and logged as a throttled `WARNING`** (vault BACKLOG
 #3784). [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states what is counted,

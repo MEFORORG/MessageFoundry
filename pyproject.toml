@@ -234,8 +234,11 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # in RequestHandler.handle, Association.dul.socket, Association._kill, DULServiceProvider._is_transport_event
 # testing AssociationSocket.ready, DULServiceProvider._read_pdu_data reading through AssociationSocket.recv,
 # and the state machine: dul.state_machine.current_state, the names Sta1, Sta2, Sta3 and Sta13, and what
-# Evt17 does in each. _require_association_seams refuses to start without some of those names, and a test
-# in tests/test_dicom_scp_pre_association.py pins the rest at the locked version.
+# Evt17 does in each. Its pre-check also runs the association's own presentation-context negotiation:
+# presentation.negotiate_as_acceptor and negotiate_unrestricted, _config.UNRESTRICTED_STORAGE_SERVICE,
+# the request's SCP_SCU_RoleSelectionNegotiation items, and AssociationServer.contexts, as
+# ACSE._negotiate_as_acceptor passes them. _require_association_seams refuses to start without some of
+# those names, and a test in tests/test_dicom_scp_pre_association.py pins the rest at the locked version.
 # THAT IS WHY THIS PIN IS EXACT, AS CLAUDE.md SECTION 7 ASKS WHERE A MEASURED GUARANTEE DEPENDS ON THE
 # VERSION: the read and send bounds rest on behaviour that was measured at 3.0.4, and that a name check
 # cannot see.

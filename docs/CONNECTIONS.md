@@ -3830,14 +3830,14 @@ Facts that are easy to get wrong, stated plainly first:
   (**default 10**), enforced inside pynetdicom, which **rejects the
   association** rather than accepting it and closing at the application layer. Before that, fixed
   caps hold the connections with no association yet, and a deadline bounds each one.
-  [DICOM.md](DICOM.md) section 3 states the numbers and what they leave open. Its idle/response bound
-  is `timeout_seconds` (**30 s**) applied to the ACSE/DIMSE/network timers, not `receive_timeout`. A
-  peer failing the per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a
-  `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP peer-control
-  note](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025))
-  is refused with a DIMSE **not-authorized status on an
-  already-established association** (`dicom.py:254-262`) and logged. `transports/dicom.py` has zero
-  `_emit_event` call sites, so no ADR 0021 `connection_event` is written for either refusal.
+  [DICOM.md](DICOM.md) section 3 states the numbers and what they leave open, and what a peer
+  failing the per-connection `source_ip_allowlist` gets. That allowlist is an `inbound(...)`
+  keyword, **not** a `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP
+  peer-control
+  note](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025).
+  The SCP's bound is `timeout_seconds` (**30 s**), not `receive_timeout`; the same section says
+  where it applies. `transports/dicom.py` has zero `_emit_event` call sites, so no ADR 0021
+  `connection_event` is written for any of its refusals.
 - **The DATABASE connector's pool acquire is bounded.** `acquire_timeout` (default 30 s, per
   connection on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`) wraps the driver's
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the

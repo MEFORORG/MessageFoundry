@@ -390,12 +390,18 @@ def _wrong_protocol(request: bytes) -> bytes:
     return request[:6] + b"\x00\x02" + request[8:]
 
 
+def _rj(result: int, source: int, diagnostic: int) -> bytes:
+    """The A-ASSOCIATE-RJ PDU (PS3.8 section 9.3.4) carrying these three fields."""
+    return b"\x03\x00" + (4).to_bytes(4, "big") + bytes((0, result, source, diagnostic))
+
+
 @pytest.mark.parametrize(
     ("build", "reason", "answer"),
     [
-        (lambda _request: b"\x01\x00\x00\x00\x00\x00", "does not decode", b""),
+        # Rejected-permanent, service provider (ACSE), no reason given.
+        (lambda _request: b"\x01\x00\x00\x00\x00\x00", "does not decode", _rj(0x01, 0x02, 0x01)),
         # Rejected-permanent, service provider (ACSE), protocol version not supported.
-        (_wrong_protocol, "wrong protocol", b"\x03\x00\x00\x00\x00\x04\x00\x01\x02\x02"),
+        (_wrong_protocol, "wrong protocol", _rj(0x01, 0x02, 0x02)),
     ],
     ids=["no-body", "wrong-protocol"],
 )
@@ -420,6 +426,16 @@ async def test_a_request_the_dul_would_not_pass_on_starts_no_association(
             sock.close()
 
 
+async def _a_held_association(port: int, *, tls: bool = False) -> socket.socket:
+    """A peer that has its association, and keeps it."""
+    request = await asyncio.to_thread(_a_real_association_request)
+    sock = await asyncio.to_thread(_open, port, tls=tls)
+    sock.sendall(request)
+    assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+    await asyncio.to_thread(lambda: sock.recv(4096))
+    return sock
+
+
 def _p_data_header() -> bytes:
     """The head of a P-DATA-TF that announces 4096 bytes."""
     return b"\x04\x00\x00\x00\x10\x00"
@@ -437,16 +453,12 @@ async def test_a_stall_mid_pdu_on_an_established_association_is_ended(
     # Measured on the first build of this row, which read only the first PDU: still open 10 s later
     # at timeout_seconds 2, holding a max_associations slot until the peer closed. The DUL was
     # blocked in recv, so its timers could not run, and kill() would not return.
-    request = await asyncio.to_thread(_a_real_association_request)
     extra = _tls_settings(tmp_path) if tls else {}
     settings = {"max_associations": 2, "timeout_seconds": 1.0, **extra}
     async with _running_scp(settings) as scp:
         baseline = await _thread_baseline()
-        sock = await asyncio.to_thread(_open, scp.sockport, tls=tls)
+        sock = await _a_held_association(scp.sockport, tls=tls)
         try:
-            sock.sendall(request)
-            assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
-            await asyncio.to_thread(lambda: sock.recv(4096))
             sock.sendall(stray)
             assert await asyncio.to_thread(_closed_within, sock, 5.0), (
                 "the stalled peer was not ended"
@@ -459,12 +471,8 @@ async def test_a_stall_mid_pdu_on_an_established_association_is_ended(
 
 async def test_a_dribble_mid_pdu_on_an_established_association_is_ended_on_time() -> None:
     # A deadline, not an idle timer: every gap here is far shorter than timeout_seconds.
-    request = await asyncio.to_thread(_a_real_association_request)
     async with _running_scp({"timeout_seconds": 1.0}) as scp:
-        sock = await asyncio.to_thread(_open, scp.sockport)
-        sock.sendall(request)
-        assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
-        await asyncio.to_thread(lambda: sock.recv(4096))
+        sock = await _a_held_association(scp.sockport)
         sock.settimeout(0.1)
         pending = _p_data_header() + b"\x00" * 4096
         took = await asyncio.to_thread(_send_slowly, sock, pending, give_up=6.0)
@@ -588,21 +596,31 @@ async def test_stop_ends_a_reader_stalled_mid_pdu() -> None:
             sock.close()
 
 
-def _without_transfer_syntaxes(request: bytes) -> bytes:
-    """``request`` with every transfer syntax sub-item taken out of its presentation contexts."""
-    from pynetdicom.pdu import A_ASSOCIATE_RQ
-    from pynetdicom.pdu_items import TransferSyntaxSubItem
+def _without_sub_items(kind: str) -> Callable[[bytes], bytes]:
+    """A builder that takes every ``kind`` sub-item, a class name in ``pynetdicom.pdu_items``, out
+    of each presentation context of a request."""
 
-    pdu = A_ASSOCIATE_RQ()
-    pdu.decode(request)
-    for context in pdu.presentation_context:
-        context.abstract_transfer_syntax_sub_items = [
-            item
-            for item in context.abstract_transfer_syntax_sub_items
-            if not isinstance(item, TransferSyntaxSubItem)
-        ]
-    encoded: bytes = pdu.encode()
-    return encoded
+    def build(request: bytes) -> bytes:
+        from pynetdicom import pdu_items
+        from pynetdicom.pdu import A_ASSOCIATE_RQ
+
+        dropped = getattr(pdu_items, kind)
+        pdu = A_ASSOCIATE_RQ()
+        pdu.decode(request)
+        for context in pdu.presentation_context:
+            context.abstract_transfer_syntax_sub_items = [
+                item
+                for item in context.abstract_transfer_syntax_sub_items
+                if not isinstance(item, dropped)
+            ]
+        encoded: bytes = pdu.encode()
+        return encoded
+
+    return build
+
+
+_without_transfer_syntaxes = _without_sub_items("TransferSyntaxSubItem")
+_without_abstract_syntaxes = _without_sub_items("AbstractSyntaxSubItem")
 
 
 async def _ends_with_no_thread(
@@ -635,9 +653,119 @@ async def test_fifty_requests_with_a_context_of_no_transfer_syntax_leave_no_thre
                 await asyncio.to_thread(lambda: _stall(scp.sockport, opening).close())
             await _until(lambda: len(_threads_outside_the_test()) <= baseline)
         assert scp._server.active_associations == []
-        assert any("no transfer syntax" in m for m in _warnings(caplog)), _warnings(caplog)
+        assert any("does not negotiate" in m for m in _warnings(caplog)), _warnings(caplog)
         await scp.stop()
         await _until(lambda: len(_threads_outside_the_test()) < baseline)
+
+
+async def test_fifty_requests_with_a_context_of_no_abstract_syntax_are_refused_and_answered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Review round f695486699 measured this shape on the previous head: it got past the transfer
+    # syntax check, and its Association thread died in negotiation with a TypeError, 20 times in 20.
+    # The peer saw a bare close and nothing was counted, and under serve each death would write one
+    # unthrottled CRITICAL line. The pre-check now runs the negotiation itself.
+    opening = _without_abstract_syntaxes(await asyncio.to_thread(_a_real_association_request))
+    deaths: list[threading.ExceptHookArgs] = []
+    previous_hook = threading.excepthook
+    threading.excepthook = deaths.append
+    try:
+        async with _running_scp({"timeout_seconds": 30.0}) as scp:
+            baseline = await _thread_baseline()
+
+            def one_peer() -> bytes:
+                sock = _stall(scp.sockport, opening)
+                try:
+                    sock.settimeout(3.0)
+                    return sock.recv(64)
+                finally:
+                    sock.close()
+
+            with caplog.at_level(logging.WARNING, logger=_LOG):
+                answers = [await asyncio.to_thread(one_peer) for _ in range(50)]
+                await _until(lambda: len(_threads_outside_the_test()) <= baseline)
+            assert scp._refusal_log.refusals == 50, (
+                "a request that cannot negotiate was not refused"
+            )
+            assert answers == [_rj(0x01, 0x01, 0x01)] * 50
+            assert scp._server.active_associations == []
+            assert any("does not negotiate" in m for m in _warnings(caplog)), _warnings(caplog)
+    finally:
+        threading.excepthook = previous_hook
+    assert deaths == [], [str(d.exc_value) for d in deaths]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [lambda request: request, _without_abstract_syntaxes],
+    ids=["over-max-associations", "does-not-negotiate"],
+)
+async def test_a_refused_request_with_a_stray_byte_behind_it_still_gets_its_rejection(
+    build: Callable[[bytes], bytes],
+) -> None:
+    # Review round f695486699 measured the first case on the previous head, on Windows loopback:
+    # a request alone got its A-ASSOCIATE-RJ 25 times in 25, and the same request with one stray
+    # byte behind it got a reset and no rejection 25 times in 25. The DUL closed in Sta13 over the
+    # unread byte. The second case is the same close on the connection's own thread. The peer reads
+    # only after the SCP has closed, as a busy sender may: a reset that arrives first discards the
+    # answer on Windows. Whether it does on Linux was not measured, so there this may pass either way.
+    opening = build(await asyncio.to_thread(_a_real_association_request)) + b"\x07"
+    async with _running_scp({"max_associations": 1, "timeout_seconds": 30.0}) as scp:
+        held = await _a_held_association(scp.sockport)
+        try:
+            for _ in range(10):
+                sock = await asyncio.to_thread(_stall, scp.sockport, opening)
+                try:
+                    await asyncio.sleep(0.3)
+                    sock.settimeout(3.0)
+                    assert await asyncio.to_thread(sock.recv, 1) == b"\x03"
+                    assert await asyncio.to_thread(_closed_within, sock, 3.0)
+                finally:
+                    sock.close()
+        finally:
+            held.close()
+
+
+async def test_a_read_deadline_on_an_accepted_association_is_logged_as_an_end_not_a_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # On the previous head this logged "refused a connection" and spent the address's refusal line,
+    # though the SCP had accepted the association.
+    async with _running_scp({"timeout_seconds": 1.0}) as scp:
+        sock = await _a_held_association(scp.sockport)
+        try:
+            with caplog.at_level(logging.WARNING, logger=_LOG):
+                sock.sendall(_p_data_header())
+                assert await asyncio.to_thread(_closed_within, sock, 5.0)
+                await _until(lambda: scp._ended_log.refusals == 1)
+        finally:
+            sock.close()
+        assert scp._refusal_log.refusals == 0, "an accepted association was counted as refused"
+    ended = [m for m in _warnings(caplog) if "ended an association with 127.0.0.1" in m]
+    assert len(ended) == 1, _warnings(caplog)
+    assert "no complete PDU within 1s" in ended[0]
+    assert not any("refused" in m for m in _warnings(caplog)), _warnings(caplog)
+
+
+async def test_a_connection_refused_before_its_association_fires_conn_close() -> None:
+    # pynetdicom pairs every EVT_CONN_OPEN with an EVT_CONN_CLOSE when its DUL closes the connection.
+    # On the previous head a connection that ended in the first read fired only the open.
+    from pynetdicom import evt
+
+    opened: list[Any] = []
+    closed: list[Any] = []
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        scp._server.bind(evt.EVT_CONN_OPEN, opened.append)
+        scp._server.bind(evt.EVT_CONN_CLOSE, closed.append)
+        for opening in (b"\x04\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x00\x00"):
+            sock = _stall(scp.sockport, opening)
+            try:
+                assert await asyncio.to_thread(_closed_within, sock, 3.0)
+            finally:
+                sock.close()
+        await _until(lambda: len(closed) == 2)
+        assert len(opened) == 2
+        assert [e.address for e in closed] == [e.address for e in opened]
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
@@ -845,7 +973,7 @@ def test_a_pynetdicom_without_the_association_seams_is_refused() -> None:
 def test_the_pynetdicom_seams_the_first_request_read_relies_on_are_still_there() -> None:
     """What ``_admitting_server_class`` assumes about pynetdicom, past the server hooks that
     ``test_the_scp_runs_its_own_server_class_over_the_pinned_hooks`` pins. Read against 3.0.4; the
-    ``[dicom]`` comment in ``pyproject.toml`` says to re-read these before raising the cap.
+    ``[dicom]`` comment in ``pyproject.toml`` says to re-read these before moving the pin.
     """
     from pynetdicom.acse import ACSE
     from pynetdicom.association import Association
@@ -910,6 +1038,22 @@ def test_the_pynetdicom_seams_the_first_request_read_relies_on_are_still_there()
     # a stalled peer must not have one.
     negotiate = inspect.getsource(ACSE._negotiate_as_acceptor)
     assert "active_associations" in negotiate and "maximum_associations" in negotiate
+    # The pre-check runs the presentation-context negotiation on what the association passes it:
+    # the request's contexts, the server's contexts and the request's role selection items.
+    assert "UNRESTRICTED_STORAGE_SERVICE" in negotiate and "negotiate_unrestricted(" in negotiate
+    assert "negotiate_as_acceptor(" in negotiate
+    assert "assoc_rq.presentation_context_definition_list" in negotiate
+    assert "self.acceptor.supported_contexts" in negotiate and "role_selection" in negotiate
+    assert "supported_contexts = deepcopy(self.server.contexts)" in inspect.getsource(
+        RequestHandler._create_association
+    )
+    # In Sta13 the DUL reads while ready is True and closes once it is False, which is why ready
+    # says False there and close reads off what has arrived first.
+    transport_event = inspect.getsource(DULServiceProvider._is_transport_event)
+    sta13 = transport_event.index('"Sta13"')
+    assert transport_event.index("self.socket.close()", sta13) > transport_event.index(
+        "self.socket.ready", sta13
+    )
 
 
 def test_the_doc_states_the_bounds_of_the_first_request_read() -> None:
