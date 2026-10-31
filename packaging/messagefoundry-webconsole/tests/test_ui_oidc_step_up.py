@@ -13,7 +13,9 @@ the step-up able to fail if the engine looked for the session anywhere but the s
 
 from __future__ import annotations
 
+import logging
 import time
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
@@ -422,7 +424,12 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
     """BACKLOG #3374. RED when: the step-up return draws no budget at all once it left the sign-in
     window. It draws a per-user key of the ceremony limiter, and a spent key refuses it with a 429
     that writes no audit row and consumes nothing. That key is the return's own, so the user's
-    other ceremonies keep their budget."""
+    other ceremonies keep their budget. The retry refills the key by moving the limiter's clock
+    past the window, so the limiter stays in place for it (vault BACKLOG #3913, finding 4)."""
+    clock = [time.monotonic()]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         token = await _federated_sign_in(service, c, monkeypatch)
@@ -455,7 +462,9 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         staged = service.oidc_step_up_flow(flow_id)
         assert staged is not None and staged.user_id == identity.user_id
         assert _flow_id(c) == flow_id
-        monkeypatch.setattr(service, "_reauth_limiter", None)  # the budget refilled
+        clock[0] += _settings().login_rate_limit_window_seconds + 1  # the key refilled
+        assert service._reauth_limiter is not None, "the retry must meet the limiter, not skip it"
+        assert _ceremony_budget_left(service, return_key)
         retry = await _callback(c, start.headers["location"])
         assert retry.status_code == 200, retry.text
         new = c.cookies.get("mf_session")
@@ -485,3 +494,118 @@ async def test_a_return_naming_no_live_step_up_flow_still_draws_the_sign_in_wind
         )
     assert r.status_code == 303, r.text
     assert r.headers["location"] == "/ui/login?e=rate_limited"
+
+
+def _drain_step_up_return_audit_budget(service: AuthService) -> None:
+    """Spend the step-up return audit budget's all-callers BACKSTOP across many users, as K
+    accounts' forged returns would. Past it each of those users has also spent its first row."""
+    per_user = _settings().login_rate_limit_per_ip
+    for i in range(_settings().login_rate_limit_global // per_user + 1):
+        for _ in range(per_user):
+            service.allow_step_up_return_audit(
+                f"another-user-{i}", client="198.51.100.200", reason="state_mismatch"
+            )
+    backstop = service._step_up_return_audit_backstop
+    assert backstop is not None and not backstop.would_allow("<all>"), "fixture: not spent"
+
+
+def _drain_own_step_up_return_audit_budget(service: AuthService, user_id: str) -> None:
+    """Spend ``user_id``'s own step-up return audit budget, leaving the backstop far from spent."""
+    for _ in range(_settings().login_rate_limit_per_ip):
+        assert service.allow_step_up_return_audit(
+            user_id, client="198.51.100.201", reason="state_mismatch"
+        ), "fixture: refused before the user's budget was spent"
+    assert not service.allow_step_up_return_audit(
+        user_id, client="198.51.100.201", reason="state_mismatch"
+    ), "fixture: not spent"
+
+
+async def _fetch_return(c: httpx.AsyncClient, location: str) -> httpx.Response:
+    """The IdP's return replayed as a same-origin script's fetch rather than a navigation. The
+    fetch-metadata middleware refuses a cross-site one before the route, with no row."""
+    state = dict(parse_qsl(urlsplit(location).query))["state"]
+    c.cookies.delete("mf_session")
+    return await c.get(
+        "/ui/oidc/callback",
+        params={"code": "authcode", "state": state},
+        headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+        follow_redirects=False,
+    )
+
+
+@pytest.mark.parametrize("spent", ["none", "own", "others"])
+async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_budget(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, spent: str
+) -> None:
+    """BACKLOG #3965. RED when: the step-up return's ``non_navigation_fetch`` row is not bounded
+    per user, or other users spending the all-callers backstop stop this user's row. Within the
+    user's budget the row is written. With the user's own budget spent it is not. With the
+    backstop spent by other users the user's first row is still written, and a second is stopped
+    and pages. The refusal is otherwise the same: a 303 that consumes nothing and keeps the
+    cookie."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole")
+    service = await _service(engine, _FakeLdap())
+    pages: list[str] = []
+    service._step_up_return_audit_alert = pages.append
+    async with _client(engine, service) as c:
+        identity = await service.identity_for_token(
+            await _federated_sign_in(service, c, monkeypatch), activity=False
+        )
+        assert identity is not None
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        flow_id = _flow_id(c)
+        if spent == "own":
+            _drain_own_step_up_return_audit_budget(service, identity.user_id)
+        elif spent == "others":
+            _drain_step_up_return_audit_budget(service)
+            pages.clear()  # the drain itself paged; only the return's own calls count below
+            service._step_up_return_audit_paged_at.clear()
+        rows_before = await service.store.count_audit(limit=None, action="auth.login_failed")
+
+        r = await _fetch_return(c, start.headers["location"])
+
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
+        rows = await service.store.count_audit(limit=None, action="auth.login_failed")
+        assert rows - rows_before == (0 if spent == "own" else 1)
+        # Past the budget the refusal still leaves a trace: the line, in place of the row.
+        logged = "refused (non_navigation_fetch)" in caplog.text
+        assert logged is (spent == "own"), caplog.text
+        # A row the per-account floor wrote pages nothing.
+        assert pages == [], pages
+        if spent == "others":
+            # The second is stopped: no row, the line, and the backstop pages with its action.
+            again = await _fetch_return(c, start.headers["location"])
+            assert again.status_code == 303
+            after = await service.store.count_audit(limit=None, action="auth.login_failed")
+            assert after == rows
+            assert "refused (non_navigation_fetch)" in caplog.text
+            assert pages == ["auth.login_failed"], pages
+        # The row was charged under the staged user, the key the service's state_mismatch draws.
+        limiter = service._step_up_return_audit_limiter
+        assert limiter is not None
+        assert f"user:{identity.user_id}" in limiter._hits
+        assert service.oidc_step_up_flow(flow_id) is not None and _flow_id(c) == flow_id
+
+
+async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_return(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3965. RED when: the step-up return audit budget gates the RETURN rather than its
+    row. A flood across many users that spends its all-callers backstop, and the sign-in window, must
+    still not refuse an operator's real IdP step-up return."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        old = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _NEXT)
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+        _drain_sign_in_window(service)
+        _drain_step_up_return_audit_budget(service)
+        _forbid_sign_in_charge(service, monkeypatch)
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 200, r.text
+        new = c.cookies.get("mf_session")
+        assert new and new != old and await service.has_recent_step_up(new)

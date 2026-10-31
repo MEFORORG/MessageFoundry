@@ -56,7 +56,7 @@ from harness.load.connscale.report import ConnScaleRecord
 from harness.load.connscale.runner import (
     _empty_claim_rates,
     _empty_claims_per_msg,
-    _run_one_step,
+    _run_started_step,
     _throughput_rates,
 )
 from harness.load.enginepoll import EnginePoller, EngineSample
@@ -399,10 +399,12 @@ def test_the_final_sample_is_appended_after_the_sampler_stops() -> None:
     post-drain final is appended, so `samples[:in_hold_samples]` excludes that final. If this reds,
     the code moved and the descriptions below need re-reading -- the fix is not to loosen this
     test."""
-    source = inspect.getsource(_run_one_step)
+    # The step body lives in `_run_started_step` since BACKLOG #3132 moved the config-dir
+    # cleanup around it in `_run_one_step`; the ordering is the same code.
+    source = inspect.getsource(_run_started_step)
     offender = first_out_of_order(source, _ORDERING)
     assert offender is None, (
-        f"`_run_one_step` no longer runs {_ORDERING} in that order -- {offender!r} moved. "
+        f"`_run_started_step` no longer runs {_ORDERING} in that order -- {offender!r} moved. "
         "The rate window's description assumes `in_hold_samples` is counted after the sampler stops "
         "and before the post-drain final is appended (BACKLOG #1420); re-read `_empty_claim_rates` "
         "before changing this."

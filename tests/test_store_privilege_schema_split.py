@@ -35,6 +35,7 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -166,6 +167,7 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

@@ -182,14 +182,20 @@ def _why(exc: BaseException) -> str:
     """A problem text that cannot carry a secret or a server's error body."""
     from messagefoundry.auth.ldap import LdapError
     from messagefoundry.config.secretprovider import SecretProviderError
-    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.config.tls_policy import is_vault_hop_refusal
     from messagefoundry.store.keyprovider import KeyProviderError
 
     # The engine's own fail-closed types carry fixed, secret-free text by contract; the cleartext
     # refusal (BACKLOG #2317) arrives wrapped in one of them. An LdapError from a failed bind
     # names the result code or ldap3's error type (BACKLOG #3017), never a password. Control
     # characters are stripped from every one of these texts all the same.
-    if isinstance(exc, (KeyProviderError, SecretProviderError, LdapError, InsecureHopRefused)):
+    #
+    # A hop refusal keeps its text only when it is exactly the Vault hop's marked one, built from
+    # fixed text (BACKLOG #3471), as `vault_failure_text` reads it. Any other `InsecureHopRefused`
+    # falls through to its type name: the base type promises no fixed text. `_ad_why` keeps the
+    # LDAPS guard's for the AD probe.
+    fail_closed = (KeyProviderError, SecretProviderError, LdapError)
+    if isinstance(exc, fail_closed) or is_vault_hop_refusal(exc):
         return strip_control_chars(str(exc))
     name = type(exc).__name__
     if _is_forbidden(exc):
@@ -204,6 +210,20 @@ def _why(exc: BaseException) -> str:
     if type(exc) is ValueError and _raised_by_the_engine(exc):
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
+
+
+def _ad_why(exc: BaseException) -> str:
+    """:func:`_why` for the AD bind probe, which keeps an ``InsecureHopRefused``'s text whole.
+
+    On that probe one comes from building the LDAPS bind: the revocation guard of BACKLOG #2193,
+    whose text names the hop, the domain controller's host and the setting that clears it, and
+    reads no password. ``provision-admin`` and ``serve`` print the same refusal whole. The Vault
+    probe does not take this rule (BACKLOG #3471)."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    if isinstance(exc, InsecureHopRefused):
+        return strip_control_chars(str(exc))
+    return _why(exc)
 
 
 def _raised_by_the_engine(exc: BaseException) -> bool:
@@ -469,11 +489,11 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
         )
     except Exception as exc:  # no extra, no CA file, an unset token: reported, never raised
         return BindAccountReading(
-            None, problem=_problem(f"AD bind probe not run: {_why(exc)}"), bound=False
+            None, problem=_problem(f"AD bind probe not run: {_ad_why(exc)}"), bound=False
         )
     try:
         return authenticator.read_bind_account()
     except Exception as exc:  # the bind itself failed: reported, never raised
         return BindAccountReading(
-            None, problem=_problem(f"AD bind probe: {_why(exc)}"), bound=False
+            None, problem=_problem(f"AD bind probe: {_ad_why(exc)}"), bound=False
         )
