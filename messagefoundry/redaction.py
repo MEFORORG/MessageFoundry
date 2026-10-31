@@ -3157,14 +3157,19 @@ class _ScanShare:
 
     ``verdicts`` maps the id of an exception whose own code renders it to that exception and its
     answer. A scan whose added pass read such an exception the deep way records True when it holds
-    a Unicode error. It records False only when the scan ended with budget left, since then it read
-    everything that exception's own scan could read, and found no error in it."""
+    a Unicode error, and False only when no read in that scan can have been cut short.
 
-    __slots__ = ("verdicts",)
+    ``added`` is what the added passes of one traceback's scans may spend together, so a long chain
+    whose scans each run out is not read once per link. The first passes never draw on it: each
+    still has a whole budget, so what one link adds cannot keep another link's first pass from an
+    object."""
+
+    __slots__ = ("added", "verdicts")
 
     def __init__(self) -> None:
         # The exception too, so its id is not reused while the traceback is rendered.
         self.verdicts: dict[int, tuple[BaseException, bool]] = {}
+        self.added = _ATTRIBUTE_BUDGET
 
 
 class _Scan:
@@ -3292,7 +3297,17 @@ class _Scan:
                     seeds.append(id(child))
             charged.extend(reversed(follow))  # popped in the order read: .args before attributes
         # The first pass ends above; it can end one unit past the limit, which leaves none here.
-        budget, opened = _added_pass(nodes, seeds, read, order, max(budget, 0))
+        room = max(budget, 0) if share is None else min(max(budget, 0), share.added)
+        budget, opened, widest = _added_pass(nodes, seeds, read, order, room)
+        if share is not None:
+            share.added -= room - max(budget, 0)
+        # A read through readers with n slots can stop before a slot it never tried and still
+        # leave fewer than n units, so only a remainder above every reader count shows that no
+        # read was cut short.
+        for arg in order:
+            readers = _readers(type(arg))
+            if readers is not None:
+                widest = max(widest, len(readers) - 1)
         self.nodes = nodes
         self.holds: set[int] = set()
         if seeds:
@@ -3311,7 +3326,7 @@ class _Scan:
             for opened_exc in opened:
                 if id(opened_exc) in self.holds:
                     share.verdicts[id(opened_exc)] = (opened_exc, True)
-                elif budget > 0:  # nothing was cut short, so its own scan reads no more
+                elif budget > widest:  # nothing was cut short: its own scan reads no more
                     share.verdicts[id(opened_exc)] = (opened_exc, False)
 
 
@@ -3321,7 +3336,7 @@ def _added_pass(
     first_read: set[int],
     order: list[Any],
     budget: int,
-) -> tuple[int, list[Any]]:
+) -> tuple[int, list[Any], int]:
     """:class:`_Scan`'s added pass: what an exception's own code may print beyond :func:`_readers`
     (:func:`_reader_record`), read on ``budget``, the first pass's remainder (vault BACKLOG #3340).
 
@@ -3334,12 +3349,15 @@ def _added_pass(
     An object is read once the plain way, through its own render's readers, and once the deep way,
     beneath an exception whose own code renders it; each read takes only the readers the reads
     before it lacked. Each costs one unit, its elements followed again, and each value read.
-    Returns what is left of ``budget``, and each exception whose own code renders it that was read
-    the deep way."""
+    Returns what is left of ``budget``, each exception whose own code renders it that was read the
+    deep way, and the most slots any read here went through."""
     # id -> 1 when read the plain way here, 2 when read the deep way.
     done: dict[int, int] = {}
     opened: list[Any] = []
     pending: list[tuple[Any, bool]] = []
+    widest = 0
+    if budget <= 0:
+        return budget, opened, widest
     for arg in reversed(order):  # popped from the end, so in the order the first pass read them
         kind = type(arg)
         if kind in _ARG_SCALARS or issubclass(kind, UnicodeError):
@@ -3387,9 +3405,16 @@ def _added_pass(
                 children = known[1] or []
                 # Followed again only to read them the deep way, so not one read that way already.
                 found = (
-                    [c for c in children if type(c) not in _ARG_SCALARS and done.get(id(c), 0) < 2][
-                        :budget
-                    ]
+                    list(
+                        islice(
+                            (
+                                c
+                                for c in children
+                                if type(c) not in _ARG_SCALARS and done.get(id(c), 0) < 2
+                            ),
+                            budget,
+                        )
+                    )
                     if inner
                     else []
                 )
@@ -3400,13 +3425,15 @@ def _added_pass(
             budget -= 1 + len(found)
             held: list[Any] = []
             if target is not None and reads and budget > 0:
+                widest = max(widest, len(target) - 1)
                 held = _attribute_values(arg, target, budget)
                 budget -= len(held)
         except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
             nodes[key] = (arg, None, type(exc).__name__)
             seeds.append(key)
             continue
-        nodes[key] = (arg, children + held, "")
+        if known is None or held:
+            nodes[key] = (arg, children + held, "")
         follow: list[Any] = []
         for child in found + held:
             child_kind = type(child)
@@ -3418,7 +3445,7 @@ def _added_pass(
                 nodes[id(child)] = (child, [], "")
                 seeds.append(id(child))
         pending.extend((child, inner) for child in reversed(follow))
-    return budget, opened
+    return budget, opened, widest
 
 
 def _joined(items: list[Any]) -> str:

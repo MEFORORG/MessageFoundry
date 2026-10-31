@@ -2411,7 +2411,57 @@ def test_the_added_pass_holds_wherever_the_first_pass_alone_holds(name: str) -> 
 def test_the_added_pass_reaches_what_only_it_reads() -> None:
     # A control for the test above: the added pass does find what the first pass never reads.
     assert {"own", "arg"} <= _verdicts(_DIFFERENTIAL["shared-plain-exception-holding-by-attribute"])
-    assert "prints" in _verdicts(_DIFFERENTIAL["outer-link-starves-a-later-one"])
+
+
+class _Slotted(Exception):
+    """Prints its last slot; the slots before it are never assigned."""
+
+    __slots__ = ("a", "b", "c", "d", "payload")
+    payload: object
+
+    def __str__(self) -> str:
+        return f"slotted: {self.payload}"
+
+
+@pytest.mark.parametrize("pad", [4085, 4086, 4087, 4088])
+def test_a_verdict_is_not_handed_on_from_a_read_cut_short_by_unassigned_slots(pad: int) -> None:
+    # Review of vault BACKLOG #3340: the outer link's scan tried the four unassigned slots, ran
+    # out of limit before .payload, still had budget left, and handed on "holds none" to the
+    # inner link, whose own first pass reads .payload and finds the error.
+    inner = _Slotted("x")
+    inner.payload = _encode_error()
+    outer = _with_attributes(_LinkError("failed"), pad)
+    outer.__cause__ = inner
+    out = safe_traceback((type(outer), outer, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert f"_Slotted: {_HOLDER}" in out
+
+
+def test_a_long_chain_with_a_large_payload_is_not_read_once_per_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review of vault BACKLOG #3340: each link's scan ran out on the payload and handed nothing on,
+    # so 900 links each read the rest of the chain. Counted, not timed.
+    links = 900
+    error: BaseException = _LinkError("failed")
+    error.payload = list(range(5000))  # type: ignore[attr-defined]
+    for _ in range(links - 1):
+        outer = _LinkError("failed")
+        outer.__cause__ = error
+        error = outer
+    calls = 0
+    real = redaction._children
+
+    def counted(arg: Any, kind: type[Any], limit: int | None = None) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return real(arg, kind, limit)
+
+    monkeypatch.setattr(redaction, "_children", counted)
+    out = safe_traceback((type(error), error, None))
+    assert out.count("_LinkError: failed") == links
+    assert calls <= 8 * links, calls
 
 
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(
