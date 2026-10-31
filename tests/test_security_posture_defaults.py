@@ -3014,6 +3014,10 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
     assert "OB_PG_RESULTS" in risk and "inbound:IB_PG_ORDERS" in risk
     # The DSN credential rides the same hop as the rows; an operator weighing the risk needs both.
     assert "credential" in risk and "plaintext" in risk
+    # Since BACKLOG #1178 these hops are gated. The text must say an enforcing instance refuses them,
+    # or an operator reading it would add an attestation to "fix" a hop the engine already blocks.
+    assert "An enforcing instance refuses each one" in risk
+    assert "the weakened-TLS refusal does not apply" not in risk
 
 
 def test_revocation_attestation_is_a_named_loosening() -> None:

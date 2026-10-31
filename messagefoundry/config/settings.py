@@ -9985,7 +9985,11 @@ def security_loosenings(
     ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
-    connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
+    connection whose ``odbc_params`` set no usable TLS mode, or set one to a no-TLS value, as
+    ``transports.database.generic_odbc_tls_unenforced`` judges it (#66 / ADR 0092's amendment).
+    Since BACKLOG #1178 an enforcing instance refuses such a hop off-loopback unless it declares
+    ``tls_hop_attested`` or, outbound only, ``cleartext_accepted``; a non-enforcing instance builds
+    it with a WARNING. And
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
@@ -10584,10 +10588,14 @@ def security_loosenings(
         out.append(
             (
                 "generic_odbc_tls_unenforced",
-                f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
-                f"driver with no TLS mode enforced ({named}) — MessageFoundry cannot introspect an "
-                "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
-                "rows, and the DSN credential, may cross in plaintext",
+                f"{len(unverified_db_hops)} generic-ODBC database connection(s) set no usable TLS "
+                f"mode in odbc_params, or set one to a no-TLS value ({named}) — MessageFoundry cannot "
+                "introspect an arbitrary driver's TLS, so these hops are judged by the cleartext-hop "
+                "gate, not the SQL Server weakened-TLS refusal. An enforcing instance refuses each "
+                "one at construction unless it is on-box, declares tls_hop_attested, or (outbound "
+                "only) declares cleartext_accepted; a non-enforcing instance builds it with a "
+                "WARNING. A hop that is built may carry the rows, and the DSN credential, in "
+                "plaintext",
             )
         )
     # Owner ruling 2026-09-24: the one per-hop declaration that ALLOWs rather than WARNs, so it is the
