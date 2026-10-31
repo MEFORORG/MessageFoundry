@@ -37,7 +37,6 @@ import json
 import logging
 import math
 import queue
-import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -76,6 +75,11 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
+from messagefoundry.odbc_call_gate import call_gate as _call_gate
+from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
+from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
+from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -427,121 +431,6 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
             " transaction and locks until the session ends: %s",
             fut.exception(),
         )
-
-
-class _CallGate:
-    """Runs one connection's pyodbc calls one at a time, and frees its handles only between calls.
-
-    BACKLOG #2049. aioodbc runs every call on an executor thread, and cancelling the awaiting task
-    does not stop that thread. Before this gate, the cancellation path closed the cursor and the
-    connection on OTHER threads while the statement was still running. When it returned, pyodbc
-    read the result's column metadata from freed handles, and a deploying SQL Server site would
-    have lost the whole engine process to a native crash (``SQLDescribeColW``,
-    ``SQLColAttributeW``). pyodbc declares DB-API ``threadsafety = 1``: threads may share the module
-    but not connections. aioodbc already moves each connection across executor threads, one call at
-    a time, and that is only sound while the calls really are one at a time. ``_lock`` restores
-    that after a cancellation; it does not make the store conform to level 1.
-
-    On the normal path each call waits for the previous one anyway, so the lock is never contended.
-    A quarantine that arrives while a call runs is handed to that call, which closes the connection
-    on its own thread as it returns: no extra thread waits, and the event loop never does.
-    """
-
-    __slots__ = ("_abandoned", "_deferred", "_lock", "_running", "_state")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()  # held for the whole of each pyodbc call
-        # Guards the two fields below. Held only for a few bytecodes, so the event loop may take it.
-        self._state = threading.Lock()
-        self._running = False
-        self._deferred: Any = None  # a raw connection to close when the running call returns
-        # Cursors whose owner was cancelled. The quarantine closes them before the connection, in
-        # the same locked step, so a later garbage collection never frees a statement beside it.
-        self._abandoned: list[Any] = []
-
-    def run(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        with self._lock:
-            with self._state:
-                self._running = True
-            try:
-                return func(*args, **kwargs)
-            finally:
-                with self._state:
-                    self._running = False
-                    deferred, self._deferred = self._deferred, None
-                if deferred is not None:
-                    self._close_locked(deferred, reraise=False)
-
-    def abandon(self, raw_cursor: Any) -> None:
-        """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop."""
-        self._abandoned.append(raw_cursor)
-
-    def close_after_running_call(self, raw_conn: Any) -> bool:
-        """If a call is running, have it close ``raw_conn`` as it returns, and say so. Never waits."""
-        with self._state:
-            if self._running:
-                self._deferred = raw_conn
-            return self._running
-
-    def close(self, raw_conn: Any) -> None:
-        """Close the abandoned cursors, then the connection, once no call is running on it."""
-        with self._lock:
-            self._close_locked(raw_conn, reraise=True)
-
-    def _close_locked(self, raw_conn: Any, *, reraise: bool) -> None:
-        while self._abandoned:
-            try:
-                self._abandoned.pop().close()
-            except Exception:  # noqa: BLE001 - the connection close below still has to run
-                log.debug("sqlserver: closing an abandoned cursor failed", exc_info=True)
-        try:
-            raw_conn.close()
-        except Exception as exc:  # noqa: BLE001 - inside a call, never replace that call's outcome
-            if reraise:  # a caller awaiting this close logs it in its own words
-                raise
-            log.warning(
-                "sqlserver: close of a quarantined connection failed; the server may hold its"
-                " transaction until the session ends: %s",
-                exc,
-            )
-
-
-def _install_call_gate(conn: Any) -> None:
-    """Route every pyodbc call an aioodbc connection makes through a :class:`_CallGate`. Idempotent.
-
-    aioodbc 0.5.0 sends every call through ``Connection._execute(func, *args, **kwargs)``: cursor
-    operations reach it through ``Cursor._run_operation``, and the connection's own ``cursor``,
-    ``commit``, ``rollback`` and ``close`` call it directly. Wrapping that one method covers them
-    those. A connection without a bound ``_execute`` (a test double) is left alone and keeps the
-    pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
-    it brings the native crash back; the live suite also pins that a pooled connection is gated.
-    """
-    if _call_gate(conn) is not None:
-        return
-    execute = getattr(conn, "_execute", None)
-    if not inspect.ismethod(execute):
-        if type(conn).__module__.startswith("aioodbc"):
-            log.error(
-                "sqlserver: aioodbc %s has no bound _execute to gate; a cancelled store call can"
-                " free ODBC handles under a running statement (BACKLOG #2049)",
-                type(conn).__qualname__,
-            )
-        return
-    gate = _CallGate()
-    conn._execute = partial(execute, gate.run)
-    conn._mefor_call_gate = gate
-
-
-def _call_gate(conn: Any) -> _CallGate | None:
-    gate = getattr(conn, "_mefor_call_gate", None)
-    return gate if isinstance(gate, _CallGate) else None
-
-
-def _raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
-    """The blocking close for a discarded connection's raw handle: through its gate when it has one,
-    so the close runs only between pyodbc calls (BACKLOG #2049)."""
-    gate = _call_gate(conn)
-    return raw.close if gate is None else partial(gate.close, raw)
 
 
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
@@ -2964,9 +2853,16 @@ async def _assert_autocommit(conn: Any) -> None:
     transaction right after a store on the same DSN closed, and a ``CREATE LOGIN`` sent on such a
     connection held its locks until the process died, which failed every logon on the server. The
     pooling mechanism is inferred, not reproduced; the explicit set is correct either way. The
-    setter goes through the ODBC driver, so it runs off the event loop."""
+    setter goes through the ODBC driver, so it runs off the event loop, through the connection's
+    own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
+    cancellation during the set cannot let the connection's close free the handle under it
+    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread."""
     raw = getattr(conn, "_conn", None)
-    if raw is not None:
+    if raw is None:
+        return
+    if _call_gate(conn) is not None:
+        await conn._execute(setattr, raw, "autocommit", True)
+    else:
         await asyncio.to_thread(setattr, raw, "autocommit", True)
 
 
@@ -4280,15 +4176,23 @@ class SqlServerStore:
                     probe = await aioodbc.connect(
                         dsn=dsn, autocommit=True, timeout=settings.connect_timeout
                     )
+                    pcur: Any = None
+                    abandoned = False
                     try:
+                        _install_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
                             " WHERE name = DB_NAME()"
                         )
                         prow = await pcur.fetchone()
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            abandoned = _abandon_one_shot(probe, pcur)
+                        raise
                     finally:
-                        await probe.close()
+                        if not abandoned:
+                            await _close_one_shot(probe, pcur)
                 except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
                     log.debug("RCSI re-read on %r failed", db, exc_info=True)
                     continue
@@ -4298,7 +4202,7 @@ class SqlServerStore:
 
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture),
+                dsn=dsn,
                 autocommit=True,
                 timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )
@@ -4306,11 +4210,16 @@ class SqlServerStore:
             raise RuntimeError(
                 f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
             ) from exc
+        cur: Any = None
+        abandoned = False
         try:
+            # BACKLOG #2394: a cancellation exits through `_abandon_one_shot`, so no handle is freed
+            # under a statement still running on its executor thread. The probe connections of
+            # `_rcsi_on_after_a_peer` exit the same way.
+            _install_call_gate(conn)
             await _assert_autocommit(conn)
-            # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
-            # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
-            # guards against on the pooled paths.
+            # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
+            # guards against cannot arise; `_close_one_shot` still closes the cursor first.
             cur = await conn.cursor()
             await cur.execute(
                 "SELECT is_read_committed_snapshot_on, snapshot_isolation_state "
@@ -4373,11 +4282,13 @@ class SqlServerStore:
                         exc,
                         _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
                     )
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                abandoned = _abandon_one_shot(conn, cur)
+            raise
         finally:
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
-                log.debug("RCSI probe connection close failed", exc_info=True)
+            if not abandoned:
+                await _close_one_shot(conn, cur)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
@@ -5243,8 +5154,9 @@ class SqlServerStore:
         cancelled call — paid only on a path that was previously corrupting the pool.
 
         **The close never frees a handle under a running statement (BACKLOG #2049).** The abandoned
-        statement may still be running on an executor thread. The :class:`_CallGate` makes the
-        close, and the close of any cursor :meth:`_cursor` abandoned, wait for that call to return.
+        statement may still be running on an executor thread. The call gate
+        (:class:`~messagefoundry.odbc_call_gate.CallGate`) makes the close, and the close of any
+        cursor :meth:`_cursor` abandoned, wait for that call to return.
         When a call is running, this method hands it the close and does not wait at all: the close
         could only land when the statement returns, and waiting here would stall a shutdown or
         demotion for as long as the statement runs, which ADR 0159 rejected.
