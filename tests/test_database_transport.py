@@ -338,10 +338,13 @@ def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
     — psqlODBC's explicit *no TLS* spelling — was read as "the operator has taken TLS ownership" and the
     reminder dropped to DEBUG. That is the worst real case reported as the quiet one, and every surface
     built on top of it inherits the false negative."""
+    # MySQL's upper case modes need a MySQL driver name: any other driver takes libpq's spellings
+    # only (BACKLOG #2705).
+    mysql = value in ("DISABLED", "PREFERRED")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
         _build_odbc_dsn(
             {
-                "odbc_driver": "PostgreSQL Unicode",
+                "odbc_driver": "MySQL ODBC 8.0 Unicode Driver" if mysql else "PostgreSQL Unicode",
                 "server": "db.example",
                 "odbc_params": {key: value},
             }

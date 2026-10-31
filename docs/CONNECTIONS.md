@@ -1678,7 +1678,7 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 `NegativeAckError` → **dead-letter** (a retry can't fix it).
 
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
-string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect sends them plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a
+string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect braces the driver name, and the password for the drivers it lists, and sends the rest plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a
 weakened posture (`encrypt=false` / `trust_server_certificate=true`, `dialect="sqlserver"` only) is
 **refused at construction** — `MEFOR_ALLOW_INSECURE_TLS` is **clamped** and cannot relax it while
 `[security].enforcement = enforce`, which is the shipped default, so on a stock instance there is **no
@@ -1872,9 +1872,10 @@ built, and the error names the setting and never the value:
 
 | Setting | Sent as | Rule |
 |---|---|---|
-| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An unset `database` or `username` is left out of the string |
+| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
+| `SSLmode`, in any case of the keyword | plain | for every driver but MySQL Connector/ODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`; `None` is refused |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
 | `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
@@ -1882,17 +1883,34 @@ psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each con
 at all, with no CA file, with an untrusted CA, with a hostname mismatch, and against a server with
 TLS off. psqlODBC also kept the braces as part of `UID` and `DATABASE`, and both psqlODBC and MySQL
 Connector/ODBC refused a braced port. The same values sent plain behaved correctly. A plain value
-cannot be quoted, so the characters that would end it or start another keyword are refused
-instead. An empty value is refused because the driver would read it as its default, and libpq's
-default `prefer` falls back to plaintext. A padded value is refused because one driver may trim it
-and another may not.
+cannot be quoted, so at least the characters the table above lists are refused instead: the ones
+that would end the value or start another keyword, and the two quote characters, which sat inside
+braces before and whose plain reading by a driver has not been measured. An empty value is refused
+because the driver would read it as its default, and libpq's default `prefer` falls back to
+plaintext. A padded value is refused because one driver may trim it and another may not.
+
+###### The `SSLmode` spelling
+
+psqlODBC's source reads an `SSLmode` value by its first character, and only a lower-case one
+names a mode, so `Require`, `VERIFY-FULL`, `REQUIRED`, `on`, `1` and `True` mean `disable` to it.
+This was read in the source, not measured against a server. The engine's no-TLS check would count
+each of those as TLS addressed. So on the generic dialect an `SSLmode` value must be
+exactly one of libpq's six modes, in lower case, or the connection is refused when it is built,
+with an error that lists the six.
+
+The rule depends on the driver, read from the `odbc_driver` name. MySQL Connector/ODBC takes the
+same keyword with its own upper-case values (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`,
+`VERIFY_IDENTITY`). So when `odbc_driver` is a whole MySQL Connector/ODBC registered name, `MySQL
+ODBC <version> Unicode Driver` or `... ANSI Driver` in any case, its value is left to MySQL as
+before. Every other driver name takes the libpq spellings, including psqlODBC under any name and
+MySQL's driver under a library path or an alias.
 
 **The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
 registered name of one of these drivers, the password is **always** sent braced, with the ODBC
 `}}` escape, whatever it holds:
 
 - psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
-  `(x64)`;
+  `(x64)`, or the bare `PostgreSQL`, the section name RHEL registers it under;
 - MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
   `... ANSI Driver`;
 - Microsoft's `ODBC Driver <n> for SQL Server`, not probed for this item but relied on for the
@@ -1903,8 +1921,8 @@ so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (
 `dlg_specific.c`, where `copyConnAttributes` calls `decode_or_remove_braces`). The braced form is
 the only one that sends such a password as written.
 
-For any other driver name, the password is sent plain when it holds none of `;`, `{` or `}` and
-has no leading or trailing space. Any other password is refused when the connection is built,
+For any other driver name, the password is sent plain when it holds none of `;`, `{`, `}`, `"`
+or `'` and has no leading or trailing space. Any other password is refused when the connection is built,
 with an error that says only that this driver cannot carry it, so change the password. This
 covers a library path, another vendor's driver for the same database, and the legacy name
 `SQL Server`, which is not on the list: on Linux it is commonly a FreeTDS alias, which has not been

@@ -513,7 +513,8 @@ def _refuse_unsafe_text(text: str, *, what: str, connection: str | None, refused
     """A ValueError when ``text`` is not printable ASCII or holds a ``refused`` character
     (vault BACKLOG #2577). The refusal names the setting and never the value."""
     if _odbc_unsafe_text(text, refused):
-        listed = ", ".join(f"'{ch}'" for ch in refused)
+        # repr, so a quote character prints readably: ';' stays ';', and ' prints as "'".
+        listed = ", ".join(repr(ch) for ch in refused)
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
@@ -529,25 +530,27 @@ def _refuse_none(value: object, *, what: str, connection: str | None) -> None:
         raise ValueError(f"{hop_name_prefix(connection)}DATABASE {what} must not be None")
 
 
+# The characters a value sent WITHOUT braces must not hold (BACKLOG #2705): the three that end a
+# value or open a braced one, ``=``, and both quote characters. The quotes sat inside braces on
+# main, and how a driver reads one in a plain value has not been measured.
+_ODBC_UNBRACED_REFUSED = ";{}=\"'"
+
+
 def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
     #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
 
-    Braced values were measured to be misread (psqlODBC ran ``SSLmode={verify-full}`` with no TLS);
-    docs/CONNECTIONS.md, *Values on the generic dialect*, holds the measurements. A plain value
-    cannot be quoted, so what could change how a driver reads it is refused instead: ``;``, ``{``,
-    ``}`` and ``=``; a value that is not printable ASCII (:func:`_odbc_unsafe_text` says why); an
-    empty or blank value, which a driver reads as its default (libpq's ``prefer`` falls back to
-    plaintext); and a leading or trailing space, which one driver may trim and another keep.
-
-    ``None`` is refused here, before ``str()`` would turn it into the text ``None`` and send that
-    as the value (:func:`_refuse_none`).
+    Braced values were measured to be misread (psqlODBC ran ``SSLmode={verify-full}`` with no TLS).
+    A plain value cannot be quoted, so at least these are refused instead: the characters in
+    :data:`_ODBC_UNBRACED_REFUSED`, a value that is not printable ASCII, ``None``, and an empty,
+    blank or padded value. docs/CONNECTIONS.md, *Values on the generic dialect*, holds the rules,
+    the reasons and the measurements; this docstring does not restate them.
 
     The refusal names the setting and never the value. A password follows its own rule
     (:func:`_odbc_password`), and the driver name stays braced."""
     _refuse_none(value, what=what, connection=connection)
     text = str(value)
-    _refuse_unsafe_text(text, what=what, connection=connection, refused=";{}=")
+    _refuse_unsafe_text(text, what=what, connection=connection, refused=_ODBC_UNBRACED_REFUSED)
     if not text or text != text.strip():
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {what} must not be empty, blank, "
@@ -556,19 +559,49 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
+# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
+# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
+_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
+_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
+
 # The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
 # with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
 # names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
 # Server``, not probed then but relied on for the same escape by the SQL Server preset and the
-# store. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
+# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
+# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
 # has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
 # merely mentions a database, a library path, or another registered name that only folds to one of
 # these is unmeasured and does not match.
 _ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
-    r"postgresql (?:unicode|ansi)(?:\(x64\))?"
-    r"|mysql odbc [0-9.]+ (?:unicode|ansi) driver"
+    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
+    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
     r"|odbc driver [0-9]+ for sql server"
 )
+
+# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
+# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
+# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
+# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
+# counts each as TLS addressed. Only these spellings mean the same thing to both.
+_LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+
+def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
+    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
+
+    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
+    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
+    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
+    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
+    lists the accepted values and never the value given."""
+    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+        return
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
+        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
 
 
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
@@ -579,11 +612,11 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
 
-    For any other driver it is sent plain, and only when it holds none of ``;``, ``{`` or ``}`` and
-    has no leading or trailing space: a driver that reads no braces (the Access driver) takes it
-    only that way, and one that does not read the escape would end a braced value at the first
-    ``}`` and read the rest as further keywords. Any other password is refused for such a driver.
-    A driver missing from the list is unmeasured, not known to be unsafe.
+    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
+    quote character and has no leading or trailing space: a driver that reads no braces (the Access
+    driver) takes it only that way, and one that does not read the escape would end a braced value
+    at the first ``}`` and read the rest as further keywords. Any other password is refused for
+    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
 
     A password must be printable ASCII whatever the driver. A refusal names the setting and never
     describes the value beyond saying the driver cannot carry it."""
@@ -591,7 +624,7 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
     if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
         return odbc_brace(text)
-    if not any(ch in ";{}" for ch in text) and text == text.strip():
+    if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
     raise ValueError(
         f"{hop_name_prefix(connection)}DATABASE password cannot be carried by this odbc_driver; "
@@ -912,8 +945,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
-    they refuse ``;``, ``{``, ``}``, ``=``, an empty or blank value and a leading or trailing space.
-    ``server`` and every ``odbc_params`` value also refuse ``None``. ``odbc_driver`` is braced and
+    they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
+    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
+    ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
+    :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
     on the escape list, and otherwise sent plain when it can be and refused when it cannot
     (:func:`_odbc_password`).
@@ -939,10 +974,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # suffix in SERVER can resolve the host — mirrors the SQL Server preset's rationale.
     _refuse_none(s["server"], what="server", connection=connection)
     server = str(s["server"])
-    if _odbc_unsafe_text(server, ";{}="):
+    if _odbc_unsafe_text(server, _ODBC_UNBRACED_REFUSED):
         raise ValueError(
-            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a control character "
-            "or a non-ASCII character (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a quote, a control "
+            "character or a non-ASCII character (ODBC injection risk)"
         )
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
@@ -991,12 +1026,21 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             )
         # Before anything reads the value: the remote-path screen reads its str() too.
         _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
+        if isinstance(value, bool):
+            # str() would send True or False, which no driver is known to spell its own way
+            # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
+            raise ValueError(
+                f"{where}DATABASE odbc_params value for '{name}' must not be a boolean; write the "
+                "driver's own spelling as a string"
+            )
         named[name] = value
         if name in _ODBC_PATH_KEYS:
             _refuse_remote_path(value, name=name, connection=connection)
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
+        if name == "sslmode":
+            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
