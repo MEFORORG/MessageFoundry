@@ -10378,6 +10378,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
     ``store.close()`` settles the remainder exactly. The key-age stamp below stays keyed on the DEK's
     own fingerprint (``active_key_id``, stored scheme-tagged, BACKLOG #3421), never the sub-key (ADR
     0196 AC-7).
+
+    **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
+    either data pass, the audit range rolls after both, and the stamp and the record's close come
+    last, on a run with no skip and a good roll. A skip does not stop the roll (owner ruling
+    2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
+    that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
+    key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
+    the close follow. A run that stops
+    short leaves the record open, so no ``serve`` start stamps its key, unless one already did before
+    this run: that start's stamp stands and no record opens.
     """
     from pathlib import Path
 
@@ -10464,13 +10474,24 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
-        from messagefoundry.pipeline.secret_rotation import dek_fingerprint, fingerprint_changed
+        from messagefoundry.pipeline.secret_rotation import (
+            close_rotation_record,
+            dek_changed,
+            dek_fingerprint,
+            open_rotation_record,
+        )
         from messagefoundry.store.store import SecretRotationMetaStore
 
         # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
         # at resolve_active_key above, so its refusal needs the same clean exit 2.
         store = await _open_store_or_refuse_the_key(open_store(settings.store))
         try:
+            today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
+            key_id = store.cipher_info().active_key_id
+            # BACKLOG #3737: before either data pass, so a kill or an abort in one leaves it open too.
+            # The store open above can already have written under this key.
+            if isinstance(store, SecretRotationMetaStore) and key_id:
+                await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
@@ -10491,7 +10512,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
             # the old range stays provable once the retired key is dropped. Verified first, and after
-            # both data passes, so a refusal leaves the data rotation above intact and resumable.
+            # both data passes, so a refusal leaves their work in place for a re-run to go on from.
+            # A skip rolls too (owner ruling 2026-10-30, BACKLOG #3737): new rows land under the key
+            # the engine will run with, so a start on that key alone keeps a chain that verifies.
+            # It is one-way; docs/PHI.md says what that costs. A re-run finds the range already
+            # under this key, and the roll is a verified no-op.
             rolled = await store.roll_audit_key_epoch()
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
@@ -10499,12 +10524,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # Only once the whole rotation is done, so after the audit step (BACKLOG #3181). After a
             # skipped upload, part of that file may still be under the prior key, and after a failed
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
-            # The re-run that completes still sees the old fingerprint here and stamps then, unless
-            # an engine start came first: `reconcile_rotation_meta` stamps a changed DEK on its own.
+            # The run that completes still sees the old fingerprint here and stamps then, because the
+            # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
             if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.skipped:
-                key_id = store.cipher_info().active_key_id
                 if key_id:
-                    today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
                     # Stamp only a key that CHANGED. BACKLOG #1169 made rotate-key the fix for
@@ -10513,11 +10536,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
                     # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
                     fingerprint = dek_fingerprint(key_id)
-                    changed = (
-                        True
-                        if prior is None
-                        else fingerprint_changed(prior.fingerprint, fingerprint)
-                    )
+                    changed = dek_changed(prior, fingerprint)
                     if changed is None and prior is not None:
                         # BACKLOG #3421: refused. Nothing says whether this run changed the key, so
                         # it is re-stamped with its dates kept, as the watcher does: never a reset.
@@ -10541,6 +10560,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             tracked_since=prior.tracked_since if prior is not None else today,
                             last_rotated=today,
                         )
+                await close_rotation_record(store, today)
             return count, uploads, rolled
         finally:
             await store.close()
@@ -10563,9 +10583,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # key supplied finishes the job. This arm is the store's pass, and an ENCRYPT refusal in the
         # uploaded-file pass, such as the AES-GCM invocation ceiling. That pass counts a value no key
         # opens as a skip and moves on (BACKLOG #3181), and the skip fails the command below. Either
-        # way the ASVS 13.3.4 rotation stamp is unwritten, since it is written last. That is safe
-        # precisely because both passes skip what is already under the active key -- it is a
-        # resumable rotation, not a rollback.
+        # way the ASVS 13.3.4 rotation stamp is unwritten, since it is written last, and the rotation
+        # record stays open. That is safe precisely because both passes skip what is already under
+        # the active key: a re-run with the key supplied goes on from here, and nothing rolls back.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
         # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
@@ -10616,21 +10636,31 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"note: {uploads.body_lost} uploaded file(s) have a body that is missing or is not text. "
             "No key can read it, and nothing of them is left under the prior key. Delete them, or "
             "the retention prune removes them once they expire. If a missing body may come back, "
-            "from a restore or a quarantine, keep the prior key until it does and re-run."
+            "from a restore or a quarantine, keep the prior key until it does and re-run: a body "
+            "that returns under a key you have retired can never be read."
+        )
+    if uploads.not_regular:
+        # BACKLOG #3737: anything that is neither a regular file nor a symlink holds no value, so
+        # like a missing body it is not a skip. A symlink can reach one, so it is a skip, counted there.
+        print(
+            f"note: {uploads.not_regular} uploaded file(s) have a body or sidecar that is not a "
+            "file, such as a FIFO or a directory. rotate-key did not open it, and it holds nothing "
+            "under the prior key. Remove it by hand."
         )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file may STILL be under the old key, so retiring
         # that key now destroys it. So the command fails, and the rotation stamp was not written.
         print(
             f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
-            "may still be under the prior key. It could not be read, written or decrypted. The "
-            "causes include at least a prior key that was not supplied, a damaged file, and a value "
-            "sealed by another cipher. The log names each file and its cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
+            "may still be under the prior key. It could not be read, written or decrypted, or it "
+            "is a symlink, which rotate-key does not follow. The causes include at least a prior "
+            "key that was not supplied, a damaged file, a value sealed by another cipher, and a "
+            "file larger than [store].max_upload_bytes allows. The log names each file and its "
+            "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
             "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a damaged file, so restore "
             "that upload, or remove its two files from the uploads directory, before the re-run. "
-            "This run did not stamp the key's rotation date; "
-            "note that serve stamps a changed key when it next starts, whether or not a run "
-            "completed.",
+            "This run did not stamp the key's rotation date, and no serve start does while the "
+            "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
         )
     if not rolled_ok:
@@ -10645,6 +10675,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
+    if uploads.skipped:
+        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
+        # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
+        # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
+        # here, because the file skips the same way under it.
+        print(
+            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
+            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
+            "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
+            "range, so you cannot go back to the prior key: keep it in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."
+        )
     return 0 if complete else 1
 
 

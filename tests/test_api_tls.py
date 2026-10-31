@@ -2431,12 +2431,20 @@ def _dn(*attrs: tuple[Any, str]) -> x509.Name:
 
 
 def _signed(
-    subject: x509.Name, key: ec.EllipticCurvePrivateKey, by: _CaPair | None
+    subject: x509.Name,
+    key: ec.EllipticCurvePrivateKey,
+    by: _CaPair | None,
+    *,
+    key_usage: bool = False,
 ) -> x509.Certificate:
     """A cert for ``subject`` signed by ``by`` (self-signed CA when ``None``). Key identifiers are
-    set so OpenSSL picks the issuer by key, not only by name, as real CAs do."""
+    set so OpenSSL picks the issuer by key, not only by name, as real CAs do.
+
+    ``key_usage`` adds a ``keyUsage`` extension, which a verifier under ``VERIFY_X509_STRICT``
+    requires on a CA, as the inbound HTTP listener is (``tests/test_inbound_http_intake_issuer.py``).
+    The cases here build their own context without that flag, so they need none."""
     issuer_name, signer = (subject, key) if by is None else (by[0].subject, by[1])
-    return (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer_name)
@@ -2449,32 +2457,46 @@ def _signed(
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False
         )
-        .sign(signer, hashes.SHA256())
     )
+    if key_usage:
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+    return builder.sign(signer, hashes.SHA256())
 
 
-def _new_ca(dn: x509.Name, by: _CaPair | None = None) -> _CaPair:
+def _new_ca(dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False) -> _CaPair:
     key = ec.generate_private_key(ec.SECP256R1())
-    return _signed(dn, key, by), key
+    return _signed(dn, key, by, key_usage=key_usage), key
 
 
 def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
-def _shim_view(
+def _client_bundle(
     tmp_path: Path,
     signer: _CaPair,
-    trusted: list[x509.Certificate],
     *,
     cn: str = "svc.internal",
     leaf_issuer: x509.Name | None = None,
     sent: tuple[x509.Certificate, ...] = (),
-) -> dict[str, Any]:
-    """What the mTLS shim records for a leaf ``cn`` signed by ``signer``, verified against ``trusted``.
+) -> Path:
+    """A client cert + key PEM in ``tmp_path``: a leaf ``cn`` signed by ``signer``, then ``sent``.
 
     ``leaf_issuer`` overrides the leaf's issuer FIELD (the signer still signs it); ``sent`` are
-    intermediates the client presents. Fails the test if the handshake itself does not verify."""
+    intermediates the client presents. Shared with ``tests/test_inbound_http_intake_issuer.py``."""
     leaf_key = ec.generate_private_key(ec.SECP256R1())
     leaf = (
         x509.CertificateBuilder()
@@ -2500,6 +2522,23 @@ def _shim_view(
             serialization.NoEncryption(),
         )
     )
+    return bundle
+
+
+def _shim_view(
+    tmp_path: Path,
+    signer: _CaPair,
+    trusted: list[x509.Certificate],
+    *,
+    cn: str = "svc.internal",
+    leaf_issuer: x509.Name | None = None,
+    sent: tuple[x509.Certificate, ...] = (),
+) -> dict[str, Any]:
+    """What the mTLS shim records for a leaf ``cn`` signed by ``signer``, verified against ``trusted``.
+
+    The leaf and its arguments are :func:`_client_bundle`'s. Fails the test if the handshake itself
+    does not verify."""
+    bundle = _client_bundle(tmp_path, signer, cn=cn, leaf_issuer=leaf_issuer, sent=sent)
     client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client.check_hostname = False
     client.verify_mode = ssl.CERT_NONE  # the ENGINE side is the verifier under test

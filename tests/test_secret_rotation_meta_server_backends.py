@@ -21,6 +21,12 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.pipeline.secret_rotation import (
+    ROTATION_RECORD_ID,
+    close_rotation_record,
+    dek_fingerprint,
+    open_rotation_record,
+)
 from messagefoundry.store.crypto import (
     ROTATION_FP_SEALED_SCHEME,
     AesGcmCipher,
@@ -156,6 +162,25 @@ async def _roundtrip(store: Any, retired_key: str) -> None:
     assert got2[row.secret_key].fingerprint == "kmac:v1:" + "cd" * 16
     assert got2[row.secret_key].tracked_since == row.tracked_since  # unchanged floor
     assert got2[row.secret_key].last_rotated == "2026-07-01"
+
+    # BACKLOG #3737: the rotation record rides this same row shape on every backend, and its closed
+    # state is a blank fingerprint, which each backend must store and return as a blank.
+    try:
+        await open_rotation_record(store, "ab" * 8, "2026-10-30")
+        opened = (await store.get_secret_rotation_meta())[ROTATION_RECORD_ID]
+        assert opened.fingerprint == dek_fingerprint("ab" * 8)
+        await close_rotation_record(store, "2026-10-31")
+        closed = (await store.get_secret_rotation_meta())[ROTATION_RECORD_ID]
+        assert (closed.fingerprint, closed.last_rotated) == ("", "2026-10-31")
+    finally:
+        if type(store).__name__ == "PostgresStore":
+            await store._execute(
+                "DELETE FROM secret_rotation_meta WHERE secret_key = $1", ROTATION_RECORD_ID
+            )
+        else:
+            await store._execute(
+                "DELETE FROM secret_rotation_meta WHERE secret_key = ?", (ROTATION_RECORD_ID,)
+            )
 
 
 @pytest.mark.skipif(

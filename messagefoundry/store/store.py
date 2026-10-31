@@ -8292,7 +8292,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets
 -- age FLOOR first observed (so a pre-existing year-old key gets a fresh clock on upgrade, never a
 -- retroactive alert); `last_rotated` is reset to today when the fingerprint changes (rotation is
 -- AUTO-DETECTED, never operator-attested). NEVER a secret value — the watcher reads a value only to MAC
--- it, and persists/logs the MAC + dates alone.
+-- it, and persists/logs the MAC + dates alone. One row tracks no secret: `rotate-key:incomplete`, the
+-- rotation record (BACKLOG #3737), whose `fingerprint` is an unsealed DEK key-id or blank.
 CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     secret_key    TEXT PRIMARY KEY,   -- registry class id: 'MEFOR_STORE_ENCRYPTION_KEY' (DEK) or an env/setting name
     fingerprint   TEXT NOT NULL,      -- sealed keyed-MAC cell (#3472) / DEK key-id — one-way, NOT the value
@@ -8334,7 +8335,12 @@ _PRESET_OWNER_MATCH = (
 class SecretRotationMetaRow:
     """One persisted secret-rotation watch record (ASVS 13.3.4, BACKLOG #282). All fields are
     NON-SECRET: ``fingerprint`` is a keyed MAC / DEK key-id (one-way), ``tracked_since`` the age-floor
-    ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value."""
+    ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value.
+
+    One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
+    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
+    finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
+    run closed it."""
 
     secret_key: str
     fingerprint: str
