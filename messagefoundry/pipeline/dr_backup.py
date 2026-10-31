@@ -537,10 +537,15 @@ class BackupRunner:
         # age, so a sibling engine shard's live run survives it, and only by this account's owner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
-        # owner a new directory of this process gets, so a volume a killed run filled is freed before
-        # this run needs room for its own directory, and a run whose open fails still sweeps. Where
-        # the staging root gives a directory another owner, the space check below sweeps by that one
-        # too before it refuses. Off the loop, like the rest.
+        # owner a new directory of this process gets, as `_process_owner` reads it. When that read
+        # answers, a volume a killed run filled is freed before this run needs room for its own
+        # directory, and a run whose open fails still sweeps. On Windows the read is itself a probe
+        # directory written in the OS temp dir: when that write fails, or a sibling's sweep removes
+        # the probe before its owner is read, it answers None, and both this sweep and the OS-temp
+        # sweep below are off for this run. The staging root is then swept only by the space check's
+        # probe below, when the run is short, and by this run's own directory's owner once it is
+        # open. Where the staging root gives a directory another owner, the space check below sweeps
+        # by that one too before it refuses. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
         early_owner = await asyncio.to_thread(_process_owner)
         if early_owner is not None:
@@ -550,9 +555,11 @@ class BackupRunner:
         # this account ran there made its directory with that owner, whatever owner a share's server
         # gives this run's staging directory.
         await asyncio.to_thread(_sweep_os_temp, early_owner)
-        # After those sweeps, which free what dead runs left, and before this run's directory is
-        # opened or anything is written: a run that cannot fit fails here with kind `space`, naming
-        # the volume, not half-way through a multi-GB write.
+        # After those sweeps, which free what dead runs left when they ran (both are off when the
+        # owner read above answered None), and before this run's directory is opened or any of its
+        # bytes is staged. It is not before every write: the owner probes, above on Windows and below
+        # on a short run, are bare directories written first. A run that cannot fit fails here with kind `space`, naming the volume, not half-way through
+        # a multi-GB write.
         swept_by: list[object] = [] if early_owner is None else [early_owner]
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
@@ -565,9 +572,9 @@ class BackupRunner:
             # On a share whose server sets the owner, or where the early read failed, the early sweep
             # missed what this account's killed run left, and it would refuse every later run until
             # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
-            # removed before this returns, sweep by it, and check once more whatever the sweep
-            # counted: a leftover it emptied but could not remove is not counted, yet frees the
-            # space. No run directory is open yet, so a refusal still leaves no lock or marker.
+            # removed before this returns. Only when that owner is not one a sweep above already went
+            # by, sweep by it and check once more whatever the sweep counted: a leftover it emptied
+            # but could not remove is not counted, yet frees the space. No run directory is open yet, so a refusal still leaves no lock or marker.
             # Residuals, at least: the probe is a write, so on a volume full to the last block
             # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
             # live probe before its owner is read, which answers None and skips this sweep.
@@ -1642,9 +1649,11 @@ def _fd_walk(
 ) -> Iterator[tuple[str, list[str], list[str], int]]:
     """``os.fwalk``'s shape, top down, for the POSIX fail-safe: each directory comes with a descriptor
     and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
-    reports EVERY failure to ``onerror`` and walks on: a directory that will not list or open, or one
-    swapped for a link after it was listed, is reported, never silently skipped and never the end of
-    the walk."""
+    reports every listing and open failure to ``onerror`` and walks on: a directory that will not list
+    or open, or one swapped for a link after it was listed, is reported and is never the end of the
+    walk. One case is skipped silently: an entry whose ``is_dir`` raises is listed as a file, so if it
+    is a directory it is never walked, and the fail-safe's ``lstat`` of it then finds no regular file
+    and reports nothing."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("the descriptor walk runs only on POSIX")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -2457,7 +2466,9 @@ def _process_owner() -> object | None:
     POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
     directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
     default owner wherever it is made. On a share whose server sets the owner this answer differs
-    from what a directory there gets, and the backup then sweeps by its own directory's owner too."""
+    from what a directory there gets, and the backup then sweeps by its own directory's owner too.
+    On Windows this is ``None`` when the probe cannot be made, or a sibling's sweep removes it before
+    its owner is read; the backup then skips its early staging-root sweep and its OS-temp sweep."""
     if sys.platform != "win32":
         return os.geteuid()
     return _probe_owner(None)
@@ -2470,7 +2481,8 @@ def _probe_owner(root: Path | None) -> object | None:
     nothing is created when ``root`` does not exist.
 
     The probe holds no file, no lock and no marker, so it is never a staging directory. One whose
-    removal fails is left empty, and the next sweep of that root removes it (:func:`_sweep_owned`).
+    removal fails is left empty, and the next sweep of that root by its owner removes it
+    (:func:`_sweep_owned`).
     A sibling shard's sweep can remove a probe before its owner is read here; that answers ``None``,
     and the caller only skips a sweep."""
     try:
@@ -2568,8 +2580,8 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         if not os.path.lexists(path / _LOCK_NAME):
             continue
         if _owner_of(path) != owner:
-            # Not this account's: another account's run, such as an administrator's interactive
-            # one, or a plant. Said, not skipped silently.
+            # Not this account's, or an owner that could not be read: another account's run, such as
+            # an administrator's interactive one, or a plant. Said, not skipped silently.
             log.warning(
                 "DR staging: staging directory %s has another owner, so the sweep leaves it", path
             )
@@ -2583,8 +2595,9 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         except FileNotFoundError:
             continue  # no lock file: no proof either way
         except OSError as exc:
-            # Most often a directory another account made -- an interactive `backup` run as an
-            # administrator -- which this account cannot open. Said, not skipped silently.
+            # A directory with this account's owner whose lock file this account still cannot open;
+            # another owner's directory never reaches here, since the owner is checked first. Said,
+            # not skipped silently.
             log.warning(
                 "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
                 path,
