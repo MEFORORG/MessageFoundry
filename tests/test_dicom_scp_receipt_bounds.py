@@ -21,6 +21,7 @@ import struct
 import time
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -109,7 +110,25 @@ def _p_data(control: int, payload: bytes, *, context_id: int = 1) -> bytes:
     return b"\x04\x00" + struct.pack(">I", len(item)) + item
 
 
-def _c_store_command(*, message_id: int = 1) -> bytes:
+def _c_echo_rsp() -> bytes:
+    """A whole C-ECHO-RSP P-DATA-TF, as pynetdicom encodes one: a response the SCP never asked for."""
+    from pynetdicom.dimse_messages import C_ECHO_RSP
+    from pynetdicom.dimse_primitives import C_ECHO
+    from pynetdicom.pdu import P_DATA_TF
+
+    response = C_ECHO()
+    response.MessageIDBeingRespondedTo = 1
+    response.AffectedSOPClassUID = "1.2.840.10008.1.1"
+    response.Status = 0x0000
+    message = C_ECHO_RSP()
+    message.primitive_to_message(response)
+    (primitive,) = message.encode_msg(1, 16384)
+    pdu = P_DATA_TF()
+    pdu.from_primitive(primitive)
+    return pdu.encode()
+
+
+def _c_store_command(*, message_id: int = 1, priority: int = 0x0000) -> bytes:
     """A whole C-STORE-RQ command set, implicit VR little endian, that says a data set follows."""
 
     def element(tag: tuple[int, int], value: bytes) -> bytes:
@@ -119,7 +138,7 @@ def _c_store_command(*, message_id: int = 1) -> bytes:
         element((0x0000, 0x0002), b"1.2.840.10008.5.1.4.1.1.88.11\x00")
         + element((0x0000, 0x0100), struct.pack("<H", 0x0001))
         + element((0x0000, 0x0110), struct.pack("<H", message_id))
-        + element((0x0000, 0x0700), struct.pack("<H", 0x0000))
+        + element((0x0000, 0x0700), struct.pack("<H", priority))
         + element((0x0000, 0x0800), struct.pack("<H", 0x0000))
         + element((0x0000, 0x1000), b"1.2.826.0.1.3680043.2.1\x00")
     )
@@ -270,7 +289,9 @@ async def test_a_run_of_echoes_is_never_counted_together(monkeypatch: pytest.Mon
                 assoc.release()
 
         assert await asyncio.to_thread(echo_forty) == [0x0000] * 40
-    assert 40 * len(_c_echo_rq(1)) > 1024
+    # The command set alone, without the PDU and item headers, is what the count adds up.
+    command_set = len(_c_echo_rq(1)) - 12
+    assert command_set < 1024 < 40 * command_set
 
 
 async def test_data_fragments_after_a_command_are_counted_past_twice_the_cap() -> None:
@@ -299,6 +320,16 @@ _INVALID_MESSAGES = {
     "command-does-not-decode": _p_data(0x03, b"\xff" * 7),
     "item-with-no-control-byte": b"\x04\x00" + (5).to_bytes(4, "big") + b"\x00\x00\x00\x01\x01",
     "item-longer-than-the-pdu": b"\x04\x00" + (6).to_bytes(4, "big") + b"\x00\x00\x00\x09\x01\x03",
+    "more-after-the-last": (
+        b"\x04\x00"
+        + (2 * (len(_c_echo_rq(1)) - 6)).to_bytes(4, "big")
+        + _c_echo_rq(1)[6:]
+        + _c_echo_rq(2)[6:]
+    ),
+    "a-command-the-scp-does-not-serve": _c_echo_rsp(),
+    "a-value-pynetdicom-refuses": _p_data(0x03, _c_store_command(priority=5))
+    + _p_data(0x02, b"\x00" * 16),
+    "a-pdu-type-ps3-8-does-not-define": b"\x09\x00" + (4).to_bytes(4, "big") + bytes(4),
 }
 
 
@@ -323,6 +354,31 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
             sock.close()
     tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
     assert tracebacks == [], [r.getMessage() for r in tracebacks]
+    unthrottled = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name.startswith("pynetdicom")
+        and any(s in r.getMessage() for s in ("Unknown PDU", "invalid DIMSE", "unexpected"))
+    ]
+    assert unthrottled == []
+
+
+async def test_chunked_receipt_turned_on_mid_association_ends_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The flag is process-wide and pynetdicom reads it at each command, so the check at start and
+    # at each connection does not cover an association already open.
+    from pynetdicom import _config
+
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        sock = await _a_held_association(scp.sockport)
+        try:
+            monkeypatch.setattr(_config, "STORE_RECV_CHUNKED_DATASET", True)
+            sock.sendall(_p_data(0x03, _c_store_command()))
+            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OVER_LIMIT))
+            assert answer == _ABORT_OVER_LIMIT, answer
+        finally:
+            sock.close()
 
 
 async def test_a_peer_that_does_not_wait_for_its_statuses_is_held_back() -> None:
@@ -344,11 +400,13 @@ async def test_a_peer_that_does_not_wait_for_its_statuses_is_held_back() -> None
 
     scp = _build_scp(captured, timeout_seconds=30.0)
     await scp.start(held)
+    opened: list[Any] = []
     try:
         ds = dcmread(BytesIO(make_sr_part10()))
         ae = AE(ae_title="MODALITY1")
         ae.add_requested_context(ds.SOPClassUID, ds.file_meta.TransferSyntaxUID)
         assoc = await asyncio.to_thread(ae.associate, "127.0.0.1", scp.sockport, ae_title=_SCP_AE)
+        opened.append(assoc)
         assert assoc.is_established
         context = assoc.accepted_contexts[0]
         context_id = context.context_id
@@ -373,6 +431,9 @@ async def test_a_peer_that_does_not_wait_for_its_statuses_is_held_back() -> None
         await asyncio.to_thread(assoc.release)
     finally:
         release.set()
+        for assoc in opened:
+            if assoc.is_established:  # a failure above: do not leave its threads to later tests
+                await asyncio.to_thread(assoc.abort)
         await scp.stop()
 
 
@@ -599,7 +660,11 @@ def test_the_pynetdicom_seams_the_receipt_bounds_rely_on_are_still_there() -> No
     from pynetdicom.fsm import DT_2
 
     assert "dimse.receive_primitive" in inspect.getsource(DT_2)
-    assert "self.msg_queue.put(" in inspect.getsource(DIMSEServiceProvider.receive_primitive)
+    receive = inspect.getsource(DIMSEServiceProvider.receive_primitive)
+    assert "self.msg_queue.put(" in receive and "message_to_primitive()" in receive
+    from pynetdicom.dimse_messages import _MESSAGE_TYPES
+
+    assert _MESSAGE_TYPES[0x0001][0] == "C-STORE-RQ" and _MESSAGE_TYPES[0x0030][0] == "C-ECHO-RQ"
     assert "self.dimse.get_msg(block=False)" in inspect.getsource(Association._run_reactor)
     assert "cast(BytesIO, self.data_set).write(data[1:])" in decode
     assert "if control_header_byte & 2 != 0:" in decode

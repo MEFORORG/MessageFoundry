@@ -106,7 +106,8 @@ sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.
 Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer that keeps finishing
 PDUs is not ended by this. Each send has a `timeout_seconds` deadline for the whole send too, so a
 peer that stops reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
-at most 1 second more, so that the status for an object committed as the stop began still goes out.
+at most 1.5 seconds more, so that the status for an object committed as the stop began still goes
+out.
 `timeout_seconds` has to be at least 1 second, since it is a deadline on every read and send and a
 tiny one would end nearly every peer. `max_pdu_size` has to be from 4096 to 1 MiB: `0` would offer a
 peer no limit at all, a size of six bytes or less breaks a pynetdicom sender, and a larger one would
@@ -126,9 +127,11 @@ twice that gets an A-ABORT instead, so what the SCP holds of one object stays bo
 shipped default, where the effective cap is 16 MiB, plus the one PDU being read. The count starts
 again at each object's last fragment, so a long association of objects under the cap is never
 charged as one. A command set past 64 KiB is ended the same way; a real one is a few hundred bytes.
-So is a P-DATA-TF that pynetdicom would fail on, such as a second command set in one message or a
-data set fragment before its command; pynetdicom would log each with a traceback, or lose its
-thread to it.
+So is a P-DATA-TF that pynetdicom would fail on, at least a second command set in one message, a
+data set fragment before its command, a command set pynetdicom cannot read, and anything after the
+item that completes a message; pynetdicom would log each with a traceback, or lose its thread to
+it. So is any command but a C-STORE or C-ECHO request, the two the SCP serves, since pynetdicom
+serves some others on a thread of their own, outside the hold below.
 
 While a whole object waits for the SCP to serve the one before it, the SCP reads nothing more on
 that association, and TCP holds the peer back. A peer that sends objects without waiting for their
