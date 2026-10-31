@@ -304,7 +304,7 @@ def test_an_accepted_proxy_user_build_writes_the_cleartext_acceptance_audit(
     ],
 )
 def test_a_refused_accepted_proxy_user_build_writes_no_acceptance_audit(
-    caplog: pytest.LogCaptureFixture, extra: dict[str, object]
+    caplog: pytest.LogCaptureFixture, extra: dict[str, Any]
 ) -> None:
     """The acceptance record says a crossing was accepted, so a build refused for the proxy
     credential's type or for a static header beside it must not leave one (vault BACKLOG #3007)."""
