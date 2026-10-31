@@ -5387,7 +5387,7 @@ class PostgresStore:
 
         now = time.time() if now is None else now
         # ADR 0157 C1 — every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND finalizes
-        # the origin message, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # the origin message, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # *admits* a message, and fencing it would convert a permitted duplicate into a LOST re-ingress,
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
@@ -5412,7 +5412,8 @@ class PostgresStore:
                         # An unrecoverable token: dead-letter it + ERROR the origin in THIS
                         # transaction and CONSUME it (return True ⇒ the conn.transaction() commits)
                         # — never re-loop (NOT the _Noop rollback, which would leave the token live).
-                        # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                        # `erased` (the reply is gone, erased or missing) blanks the token too, so
+                        # `_REPLAYABLE_BODY` refuses it from then on rather than re-queue a dead end.
                         blank = ", payload=''" if erased else ""
                         await self._exec_terminal(
                             conn,
@@ -5453,12 +5454,14 @@ class PostgresStore:
                     )
                     # A missing row is a corrupt reference. A NULL body means retention erased the
                     # reply (BACKLOG #1560; the SQLite twin says how a token reaches here), and it
-                    # must never become a child message.
+                    # must never become a child message. Either way the reply is gone, so the token
+                    # is blanked.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
                             "re-ingress work-row reference is corrupt/unparseable",
                             "re-ingress ref corrupt",
+                            erased=True,
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -10563,7 +10566,8 @@ class PostgresStore:
                 purged = _rowcount(result)
                 await conn.execute(
                     f"UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=${nxt} AND status = ANY(${nxt + 1}::text[]) AND payload <> ''"
+                    f" WHERE stage=${nxt} AND status = ANY(${nxt + 1}::text[])"
+                    f" AND (payload <> '' OR last_error IS NOT NULL)"
                     f" AND message_id IN ({eligible})",
                     *lead,
                     Stage.OUTBOUND.value,
@@ -10571,6 +10575,10 @@ class PostgresStore:
                 )
                 # A dead RESPONSE work-row's reference goes with the artifact erased below, so
                 # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                # Under READ COMMITTED each statement re-reads `eligible`, so a resend committed
+                # between this one and the erase can leave the reply kept and its token blanked.
+                # That refuses a replay the reply would have served; the message is past its
+                # cutoff, so the next pass erases the reply anyway.
                 await conn.execute(
                     f"UPDATE queue SET payload=''"
                     f" WHERE stage=${nxt} AND status=${nxt + 1} AND payload <> ''"

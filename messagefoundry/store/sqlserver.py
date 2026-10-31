@@ -7878,7 +7878,8 @@ class SqlServerStore:
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
         would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
-        dead-lettered (and the token still consumed; an erased one is also blanked). The
+        dead-lettered (and the token still consumed; one whose reply is erased or missing is also
+        blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed."""
@@ -7916,7 +7917,7 @@ class SqlServerStore:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures`` for the caller to audit."""
         # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
-        # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
         output, guard, guard_params = self._resolve_guard()
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -7938,8 +7939,9 @@ class SqlServerStore:
                     label: str, error: str, event_detail: str, *, erased: bool = False
                 ) -> bool:
                     # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
-                    # and CONSUME it (status flipped), never re-loop. `erased` blanks the token too,
-                    # so `_REPLAYABLE_BODY` refuses it from then on.
+                    # and CONSUME it (status flipped), never re-loop. `erased` (the reply is gone,
+                    # erased or missing) blanks the token too, so `_REPLAYABLE_BODY` refuses it from
+                    # then on rather than re-queue a dead end.
                     blank = ", payload=''" if erased else ""
                     await self._exec_terminal(
                         cur,
@@ -7989,12 +7991,14 @@ class SqlServerStore:
                 # A missing row is a corrupt reference. A NULL body means retention erased the reply
                 # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
                 # materialized once, so a replay can commit between that read and the erasure. It
-                # must never become a child message.
+                # must never become a child message. Either way the reply is gone, so the token is
+                # blanked.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
                         "re-ingress work-row reference is corrupt/unparseable",
                         "re-ingress ref corrupt",
+                        erased=True,
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8978,7 +8982,8 @@ class SqlServerStore:
                 purged = cur.rowcount
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    " WHERE stage=? AND status IN (?, ?) AND payload <> ''"
+                    " WHERE stage=? AND status IN (?, ?)"
+                    " AND (payload <> '' OR last_error IS NOT NULL)"
                     " AND message_id IN (SELECT id FROM #eligible)",
                     (Stage.OUTBOUND.value, OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value),
                 )
@@ -9257,7 +9262,8 @@ class SqlServerStore:
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
-        dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
+        dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
+        idempotent, because a row left with neither no longer matches.
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its

@@ -20,6 +20,7 @@ is already keyed is what a plant looks like, so the second case keeps refusing i
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -191,6 +192,37 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
         await keyed.close()
 
 
+async def assert_a_blank_reingress_token_is_not_sealed(
+    keyless: Any, open_keyed: OpenKeyed, fetch: RawFetch, raw: RawSql
+) -> None:
+    """A ``response`` token's writer always stores a reference, so a blank one is damage. Sealing it
+    would turn it into a valid-looking cell; it stays blank, for the claim to refuse."""
+    mid = await outbound(keyless, "OB_KB_TOKEN", "")
+    await raw("UPDATE queue SET stage=? WHERE message_id=?", (Stage.RESPONSE.value, mid))
+    keyed = await open_keyed()
+    try:
+        assert await marked(fetch)
+        assert (await row_of(fetch, mid, Stage.RESPONSE.value))["payload"] == ""
+    finally:
+        await keyed.close()
+
+
+async def assert_retention_clears_the_error_of_a_blank_delivered_row(
+    keyless: Any, _open_keyed: OpenKeyed, fetch: RawFetch, raw: RawSql
+) -> None:
+    """A keyless empty delivery is blank from the start, so the body purge must still reach its
+    ``last_error``, or the partner's error text outlives the body window."""
+    mid = await terminal(keyless, "OB_KB_ERR", dead=False)
+    await raw("UPDATE queue SET last_error=? WHERE message_id=?", ("SYNTH-PARTNER-ERROR", mid))
+    errors = "SELECT last_error FROM queue WHERE message_id=?"
+    assert (await fetch(errors, (mid,)))[0]["last_error"] == "SYNTH-PARTNER-ERROR"  # the premise
+
+    later = time.time() + 86400.0  # ``older_than`` is an absolute cutoff
+    await keyless.purge_message_bodies(older_than=later, now=later)
+
+    assert (await fetch(errors, (mid,)))[0]["last_error"] is None
+
+
 #: Every case, for ``pytest.mark.parametrize``. Each takes ``(keyless, open_keyed, fetch, raw)`` and
 #: needs a database no keyed open has touched, so each runs on its own clean store.
 CASES = (
@@ -198,4 +230,6 @@ CASES = (
     assert_a_live_empty_ingress_row_is_sealed,
     assert_terminal_blanks_alone_seal_nothing,
     assert_a_blank_on_a_keyed_surface_stays_refused,
+    assert_a_blank_reingress_token_is_not_sealed,
+    assert_retention_clears_the_error_of_a_blank_delivered_row,
 )

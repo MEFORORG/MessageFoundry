@@ -198,11 +198,29 @@ async def assert_erased_after_replay_is_dead_lettered(
     assert message is not None and message["raw"] == REPLY
 
 
+#: How a server backend reports that it chose this statement as the loser of a lock race: a deadlock
+#: victim (SQL Server 1205, Postgres 40P01), a lock timeout (SQL Server 1222, Postgres 55P03) or a
+#: serialization failure (Postgres 40001). Matched on text, so the contract needs no driver import.
+_LOCK_RACE_MARKERS = (
+    "deadlock",
+    "lock request time out",
+    "could not obtain lock",
+    "lock timeout",
+    "could not serialize",
+)
+
+
+def _lost_a_lock_race(outcome: BaseException) -> bool:
+    text = repr(outcome).lower()
+    return any(marker in text for marker in _LOCK_RACE_MARKERS)
+
+
 async def assert_purge_concurrent_with_replay_keeps_the_invariant(
     store: Any, fetch: RawFetch, _raw: RawSql
 ) -> None:
     """Replay and purge raced, in both start orders. Either may win, and a server backend may also
-    pick one as a deadlock victim, because they take ``queue`` and ``messages`` in opposite orders.
+    pick one as the loser of a lock race, because they take ``queue`` and ``messages`` in opposite
+    orders.
     What may never happen is a child with an empty body, or a PROCESSED origin whose reply was erased."""
     for first in ("replay", "purge"):
         mid, token = await dead_token(store, now=0.0, control=f"ER-CONC-{first}")
@@ -210,7 +228,7 @@ async def assert_purge_concurrent_with_replay_keeps_the_invariant(
         purge = store.purge_message_bodies(older_than=10 * DAY, now=60 * DAY)
         ordered = (replay, purge) if first == "replay" else (purge, replay)
         for outcome in await asyncio.gather(*ordered, return_exceptions=True):
-            if isinstance(outcome, BaseException) and "deadlock" not in repr(outcome).lower():
+            if isinstance(outcome, BaseException) and not _lost_a_lock_race(outcome):
                 raise outcome
         await run_reingress(store, now=61 * DAY)
 
@@ -230,7 +248,8 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     store: Any, fetch: RawFetch, raw: RawSql
 ) -> None:
     """Retention keeps the ``response`` row and NULLs its body, so a row that is gone is damage, not
-    an erasure. It dead-letters as a corrupt reference and keeps the reference for whoever looks."""
+    an erasure. It dead-letters as a corrupt reference, and is blanked like an erased one, because a
+    replay could only re-queue a token that dead-letters again."""
     mid, token = await dead_token(store, now=0.0, control="ER-MISSING")
     assert await store.replay(mid, now=1.0) == 1
     await raw("DELETE FROM response WHERE message_id=?", (mid,))
@@ -238,11 +257,12 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     assert await run_reingress(store, now=2.0)
 
     row = await token_row(fetch, token)
-    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] != ""
+    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == ""
     assert await status_of(store, mid) == MessageStatus.ERROR.value
     events = await store.events_for(mid)
     assert [e for e in events if e["event"] == "dead" and "corrupt" in str(e["detail"])]
     assert await children(fetch) == []
+    assert await store.replay(mid, now=3.0) == 0  # no churn: nothing to re-queue
 
 
 async def assert_dead_letter_purge_clears_the_blanked_token(

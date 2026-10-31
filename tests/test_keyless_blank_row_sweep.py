@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from messagefoundry.store import MessageStore, OutboxStatus
+from messagefoundry.store import MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.queue_tag import LIVE_INLINE_ROW
 from tests import _keyless_blank_contract as contract
@@ -173,6 +173,8 @@ def test_the_live_row_literal_names_the_statuses_it_means() -> None:
     assert OutboxStatus.INFLIGHT.value in LIVE_INLINE_ROW
     for terminal in (OutboxStatus.DONE, OutboxStatus.DEAD, OutboxStatus.CANCELLED):
         assert f"'{terminal.value}'" not in LIVE_INLINE_ROW
+    # A re-ingress token always holds a reference, so a blank one is damage and is not sealed.
+    assert f"stage <> '{Stage.RESPONSE.value}'" in LIVE_INLINE_ROW
 
 
 @pytest.mark.parametrize(

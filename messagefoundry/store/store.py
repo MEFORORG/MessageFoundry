@@ -12577,8 +12577,8 @@ class MessageStore:
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
-        whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
-        produces no child and cannot be replayed."""
+        whose reply retention erased, or whose ``response`` row is missing, is dead-lettered, consumed
+        and blanked (BACKLOG #1560), so it produces no child and cannot be replayed."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12627,7 +12627,8 @@ class MessageStore:
             async def _consume_dead(error: str, event_detail: str, *, erased: bool = False) -> bool:
                 # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction and
                 # CONSUME it (return True) — never re-loop forever on a row that can't be used.
-                # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                # `erased` (the reply is gone, erased or missing) blanks the token too, so
+                # `_REPLAYABLE_BODY` refuses it from then on rather than re-queue a dead end.
                 blank = ", payload=''" if erased else ""
                 await self._db.execute(
                     f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
@@ -12662,7 +12663,8 @@ class MessageStore:
             #    backend the blank and the erasure read the eligible set apart, so a replay or a
             #    sibling's completion between them can leave a token naming an erased reply. It must
             #    never become a child message, so dead-letter the token. Retention keeps the
-            #    `response` row, so a row that is missing altogether is a corrupt reference.
+            #    `response` row, so a row that is missing altogether is a corrupt reference. Its reply
+            #    is gone all the same, so it is blanked too.
             cur = await self._db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
@@ -12671,7 +12673,9 @@ class MessageStore:
             art = await cur.fetchone()
             if art is None:
                 return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
+                    "re-ingress work-row reference is corrupt/unparseable",
+                    "re-ingress ref corrupt",
+                    erased=True,
                 )
             if art["body"] is None:
                 return await _consume_dead(
@@ -12834,7 +12838,8 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff), and ``""`` if the artifact is, which ``ingress_handoff`` then dead-letters. The
+        prior handoff) or its reference does not split, and ``""`` if the artifact is gone, which
+        ``ingress_handoff`` then dead-letters. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
         async with self._read() as db:

@@ -588,10 +588,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    restores the old behaviour and is a declared loosening. Unmarked values then read back as
    plaintext, and the open seals every one, recorded surface or not. A blank value is not sealed,
    with one exception: an open that finds `queue.payload` unsealed also seals a `pending` or
-   `inflight` inline row whose payload is `''`, because a keyless store writes an empty body that
-   way and a keyed claim refuses a blank (vault BACKLOG #3495). That row stays owed work and is
-   delivered as an empty body. On a surface that is already sealed, a blank live row stays refused
-   at the claim, and the switch does not change that.
+   `inflight` inline row whose payload is `''`, other than a `response` re-ingress token, because a
+   keyless store writes an empty body that way and a keyed claim refuses a blank (vault BACKLOG
+   #3495). That row stays owed work and is delivered as an empty body. On a surface that is already
+   sealed, a blank live row stays refused at the claim, and the switch does not change that.
    **At least these limits remain.** The DIRECT S/MIME enveloped body is not covered. A row planted
    before the open that first records its surface, on a surface with no ciphertext, looks exactly
    like legacy plaintext. So that open seals it. A surface that already holds ciphertext refuses it

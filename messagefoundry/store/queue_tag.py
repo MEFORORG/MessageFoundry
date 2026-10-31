@@ -64,13 +64,17 @@ BODY_INLINE: Final = "inline"
 #: The body kind of a store-once row: its ``payload`` holds the sealed ``shared_body`` key.
 BODY_REF: Final = "ref"
 
-#: A queue row a blank ``payload`` on a keyless store is a real, empty body for (BACKLOG #3495): an
-#: inline row that is still owed work. Retention blanks only ``done``, ``cancelled`` and ``dead`` rows,
-#: so a blank ``pending`` or ``inflight`` row can only be a keyless writer's ``encrypt('')``, while a
-#: blank terminal row may be an erasure and cannot be told from an empty body. A ``ref`` row is left out
-#: because its writer always stores the reference, so a blank there is damage. Literal status values,
-#: so each backend can splice this beside its own spelling of "blank".
-LIVE_INLINE_ROW: Final = "body_ref IS NULL AND status IN ('pending', 'inflight')"
+#: A queue row a blank ``payload`` on a keyless store is taken as a real, empty body for (BACKLOG
+#: #3495): an inline row that is still owed work. Retention blanks only ``done``, ``cancelled`` and
+#: ``dead`` rows, so a blank ``pending`` or ``inflight`` row is a keyless writer's ``encrypt('')`` or a
+#: plant. Nothing tells those apart on a surface with no ciphertext, where a planted plaintext value is
+#: sealed too (docs/PHI.md names that limit). A blank terminal row may be an erasure and cannot be told
+#: from an empty body. A ``ref`` row and a ``response`` re-ingress token are left out, because each
+#: writer always stores a reference, so a blank there is damage and stays refused. Literal values, so
+#: each backend can splice this beside its own spelling of "blank".
+LIVE_INLINE_ROW: Final = (
+    "body_ref IS NULL AND stage <> 'response' AND status IN ('pending', 'inflight')"
+)
 
 #: The ``seal_bytes`` kind the routing fields are encoded under. Its own kind, so a queue tag can
 #: never equal the encoding of an authority-row seal.
