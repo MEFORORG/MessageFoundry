@@ -720,11 +720,23 @@ and answered **`202 Accepted`** carrying the engine `message_id` the instant it 
 HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
 `202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A body the engine **refuses at
-ingress**, after reading it, answers **`422`** with `{"error":"message was not accepted"}` and no
-`message_id`. Examples are a body the engine cannot decode or one over its ingress ceiling. Others include
-a body that does not match the declared `content_type`, or an HL7 parse or strict-validation failure. The
-message is still recorded, with status `ERROR`, so it is counted and never silently dropped
-(owner ruling 2026-09-26, [ADR 0154 amendment](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths)).
+ingress**, after reading it, is never answered `202`. The message is still recorded, with status
+`ERROR`, so it is counted and never silently dropped, and the answer's body names that row:
+`{"error": "message was not accepted", "message_id": "<id>"}`. The status says whether to re-send:
+
+- **`503`** with `Retry-After` when the refusal is temporary, the engine's own and expected to clear.
+  Only the streaming detach's in-flight budget is classed so; re-send the same body later.
+- **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
+  covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
+  with `max_message_bytes`.
+- **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
+  body the engine cannot decode, one that does not match the declared `content_type`, or an HL7 parse
+  or strict-validation failure. A strict-validation timeout is one too, deliberately.
+
+The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
+`422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
+the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after)
+(owner rulings 2026-09-26 and 2026-09-30).
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
@@ -742,8 +754,8 @@ the sole authority** for the returned bytes: every in-process signal is only a l
 re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
 and any race between the capturing worker and the reader. A reply is therefore returned only once it is
 durable and replayable. An inbound **without** `reply_from` keeps the receipt path above: `202` for a
-committed body, `422` for a body refused at ingress. A `reply_from` inbound answers that same `422` for a
-refused body, before it would wait for any reply.
+committed body, and `503`, `413` or `422` for a body refused at ingress. A `reply_from` inbound answers
+that same refusal for a refused body, before it would wait for any reply.
 
 Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
