@@ -68,7 +68,9 @@ class _RecordingAlertSink(LoggingAlertSink):
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         self.buildups.append((name, depth, oldest_age_seconds))
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
         self.errors.append((name, kind))
 
 

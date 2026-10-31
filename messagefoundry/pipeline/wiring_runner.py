@@ -2383,7 +2383,9 @@ class RegistryRunner:
             reason=reason,
         )
         try:
-            self._alert_sink.connection_error(name, kind="connection_lost", detail=reason)
+            self._alert_sink.connection_error(
+                name, kind="connection_lost", detail=reason, error_class=type(exc).__name__
+            )
         except Exception:
             log.warning("alert sink raised on connection_error for %r", name)
 

@@ -492,6 +492,8 @@ class FileDestination(DestinationConnector):
         try:
             await self._run_fs(self._write, payload)
         except OSError as exc:
+            # Raised before a name was rendered, so the only path it can quote is the configured
+            # directory. A failure after it comes back from _write already as a DeliveryError.
             raise DeliveryError(f"file write failed: {exc}") from exc
 
     async def validate_startup(self) -> None:
@@ -577,6 +579,30 @@ class FileDestination(DestinationConnector):
             max_bytes=self._name_max_bytes,
         )
         target = self.directory / name
+        try:
+            self._write_as(name, target, payload)
+        except OSError as exc:
+            # An OS error quotes the path it failed on, and its last part is this name, rendered
+            # from message fields, or a bumped name-1.ext of it. The error text goes at least to
+            # last_error and to the alert detail a notifier sends off-box, so it keeps the type,
+            # errno and OS text only
+            # (BACKLOG #2814). An OSError with no errno keeps its type alone, unless it is one of
+            # this module's own, whose fixed message never names a file.
+            fixed_message = isinstance(exc, (_Unconfined, _Replaced))
+            reason = (
+                _describe_os_error(exc)
+                if exc.errno is not None or fixed_message
+                else type(exc).__name__
+            )
+        else:
+            return
+        # Raised outside the handler, so the OS error, which quotes the path, is on neither
+        # __cause__ nor __context__ for a traceback to print.
+        raise DeliveryError(f"file write failed: {reason}")
+
+    def _write_as(self, name: str, target: Path, payload: str) -> None:
+        """Write ``payload`` to ``target``, the destination directory joined with ``name``:
+        :meth:`_write`'s body once the name is rendered."""
         # Defence in depth atop the filename sanitization (FILE-1): never write outside the
         # configured directory even if a name somehow carried a path component. A name that itself
         # carries a separator or is a dot name came from the message, and a retry renders it again:
