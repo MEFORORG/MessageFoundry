@@ -51,7 +51,7 @@ import codecs
 import re
 
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.wiring import InboundConnection
+from messagefoundry.config.wiring import InboundConnection, _is_text_codec
 from messagefoundry.framing import MLLP_CODEC
 from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
@@ -274,7 +274,7 @@ def _encode_declared(raw: str, ic: InboundConnection) -> bytes:
     encoding = ingress_encoding(ic)
     try:
         return raw.encode(encoding)
-    except (UnicodeEncodeError, LookupError) as exc:
+    except (UnicodeError, LookupError) as exc:  # UnicodeError: ``undefined`` refuses every text
         reason = f"encode error ({encoding}): {safe_exc(exc)}"
     raise IngressGuardError(reason, phase="decode")
 
@@ -416,10 +416,10 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
     decode, so it passes through (HL7 still gets its line endings collapsed).
 
     Every failure to decode is the ``decode``-phase :class:`IngressGuardError` (BACKLOG #2431): bytes
-    invalid in the charset (``UnicodeDecodeError``), and as its :class:`IngressCodecUnusable`
-    subclass a registered codec that refuses the conversion (``undefined`` raises a bare
-    ``UnicodeError``) or a name naming no text codec (``LookupError``). So a listener records each
-    as an ``ERROR`` row and NAKs, rather than letting it escape into the transport with no row."""
+    the charset refuses, and, as its :class:`IngressCodecUnusable` subclass, a name naming no text
+    codec (``LookupError``) or one that refuses every conversion (``undefined``). So a listener
+    records each as an ``ERROR`` row and NAKs, rather than letting it escape into the transport with
+    no row."""
     if ic.content_type.is_binary:
         raise ValueError(
             f"inbound {ic.name!r} declares binary content_type {ic.content_type.value!r}; "
@@ -430,13 +430,13 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
         if ic.content_type is ContentType.HL7V2:
             return normalize(raw, encoding=encoding, errors="strict")
         return raw.decode(encoding) if isinstance(raw, bytes) else raw
-    except UnicodeDecodeError as exc:
-        refused, codec_unusable = _decode_refusal(encoding, exc), False
     except (UnicodeError, LookupError) as exc:
-        refused, codec_unusable = _decode_refusal(encoding, exc), True
-    if codec_unusable:
-        raise IngressCodecUnusable(refused)
-    raise IngressGuardError(refused, phase="decode")
+        refused = _decode_refusal(encoding, exc)
+    # Told apart by probing the NAME, not by the error's type: a usable codec such as ``idna`` can
+    # raise a bare UnicodeError for one body, which is that body's fault.
+    if _is_text_codec(encoding):
+        raise IngressGuardError(refused, phase="decode")
+    raise IngressCodecUnusable(refused)
 
 
 class IngressCodecUnusable(IngressGuardError):

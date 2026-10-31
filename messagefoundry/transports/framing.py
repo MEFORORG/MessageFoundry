@@ -115,8 +115,18 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
     as data). So the reply is neutralised rather than refused: the sender still gets exactly one
     frame, and an echoed control id that held a frame byte simply stops matching. A space is what
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
-    reason :func:`frame_for_delivery` checks bytes."""
-    body = reply.encode(encoding)
+    reason :func:`frame_for_delivery` checks bytes.
+
+    For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
+    that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
+    the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
+    cannot hold one reply's characters still raises, which the listener's last-resort arm owns."""
+    try:
+        body = reply.encode(encoding)
+    except UnicodeEncodeError:
+        raise
+    except (LookupError, UnicodeError):
+        body = reply.encode("utf-8")
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"

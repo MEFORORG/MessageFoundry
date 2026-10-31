@@ -571,6 +571,13 @@ def test_frame_reply_neutralises_a_frame_byte_instead_of_raising() -> None:
     assert frame_reply(MLLP_CODEC, CLEAN, "utf-8") == MLLP_CODEC.frame(CLEAN)
 
 
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "undefined", "base64"])
+def test_frame_reply_sends_utf8_when_the_inbound_charset_cannot_encode_it(encoding: str) -> None:
+    """BACKLOG #2431: the runner answers an unusable codec name with AE, and that AE must still
+    reach the sender rather than raise here after the ERROR row is written."""
+    assert frame_reply(MLLP_CODEC, CLEAN, encoding) == MLLP_CODEC.frame(CLEAN)
+
+
 async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_byte() -> None:
     reply = f"MSH|{ENC}|R|F|S|F|20260101||ACK|C{SB}1|P|2.5{CR}MSA|AA|C{SB}1{CR}"
 

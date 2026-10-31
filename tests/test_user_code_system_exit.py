@@ -214,9 +214,9 @@ async def test_a_config_module_calling_sys_exit_refuses_the_reload_and_keeps_the
     eng = await Engine.create(
         tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
     )
-    eng.add_registry(load_config(live))
-    await eng.start()
     try:
+        eng.add_registry(load_config(live))
+        await eng.start()
         bad = tmp_path / "bad"
         _write_config(bad, inbox=inbox, outdir=outdir, top_level="sys.exit(0)\n")
 

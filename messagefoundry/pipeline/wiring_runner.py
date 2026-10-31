@@ -28,6 +28,7 @@ import functools
 import json
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
@@ -886,6 +887,10 @@ class _StreamBudgetExceeded(Exception):
     backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
     ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
 
+
+#: The openings ``Message.parse`` accepts, after the whitespace it strips: a payload without one is
+#: not HL7, so it cannot carry a detached document (vault BACKLOG #2809).
+_HL7_LEAD = re.compile(r"\s*(?:MSH|FHS|BHS)")
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
@@ -7979,10 +7984,11 @@ class RegistryRunner:
             # and seal inside put_attachment. Measured 2026-10-06 on SQLite with the AES-GCM cipher,
             # the longest event-loop stall fell from about 0.3 s to 0.03 s at a 15 MiB body and from
             # 1.5-2.0 s to 0.1-0.2 s at 64 MiB. What is left is the longest single string operation,
-            # which holds the GIL in any thread. The scan copies one document at a time, as the budget
-            # assumes; its first hop also scans every OBX-5.5 for an escape, which copies nothing, so a
-            # refusal comes before any document is stored (vault BACKLOG #2809). Only one thread
-            # touches `message` at a time: each hop is awaited.
+            # which holds the GIL in any thread. The scan yields one document at a time, as the budget
+            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2 and OBX-5.4, each
+            # a split of the field) and scans every raw OBX-5.5 for an escape, so a refusal comes
+            # before any document is stored (vault BACKLOG #2809). Only one thread touches `message`
+            # at a time: each hop is awaited.
             message = await asyncio.to_thread(Message.parse, text)
             documents = iter_obx_documents(message)
 
@@ -8785,6 +8791,12 @@ class RegistryRunner:
         since no retry could clear it (vault BACKLOG #2809)."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
+        if _HL7_LEAD.match(payload) is None:
+            # Only an HL7 body is ever detached, so a JSON, XML or X12 payload that merely quotes the
+            # marker carries no handle: deliver it as written, never refuse it as a re-attach the
+            # permanent arm below would dead-letter (vault BACKLOG #2809). The lead is the one
+            # Message.parse accepts, so every body the re-attach could read still reaches it.
+            return payload
 
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces

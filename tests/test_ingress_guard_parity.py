@@ -585,3 +585,14 @@ def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:
 def test_ingress_encoding_falls_back_for_an_absent_or_null_declaration() -> None:
     assert ingress_guards.ingress_encoding(_inbound()) == "utf-8"
     assert ingress_guards.ingress_encoding(_inbound(encoding="latin-1")) == "latin-1"
+
+
+def test_only_a_codec_name_that_decodes_nothing_is_the_configurations_fault() -> None:
+    """BACKLOG #2431: the AE/AR split rests on the codec NAME, probed, not on the error's type, so a
+    usable codec refusing one body stays that body's fault (AR on MLLP)."""
+    with pytest.raises(ingress_guards.IngressGuardError) as body_fault:
+        ingress_guards.decode_body(ADT_LATIN1, _inbound(encoding="ascii"))
+    assert type(body_fault.value) is ingress_guards.IngressGuardError
+    for unusable in ("not-a-real-codec", "undefined", "base64"):
+        with pytest.raises(ingress_guards.IngressCodecUnusable):
+            ingress_guards.decode_body(ADT_UTF8, _inbound_declaring(unusable))
