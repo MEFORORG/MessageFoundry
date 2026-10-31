@@ -24,6 +24,7 @@ from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_NO_STRICT_ACK,
     KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -68,6 +69,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         cert_monitor=CertMonitorSettings(),
         backup=BackupSettings(),
         secrets=SecretsSettings(),
+        ai=AiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,

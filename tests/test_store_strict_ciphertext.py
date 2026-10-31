@@ -263,6 +263,7 @@ async def test_the_opt_out_restores_passthrough_and_the_seal_everything_sweep(
 
 def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
     from messagefoundry.config.settings import (
+        AiSettings,
         AlertsSettings,
         AuthSettings,
         SecretRotationSettings,
@@ -294,6 +295,7 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 cert_monitor=CertMonitorSettings(),
                 backup=BackupSettings(),
                 secrets=SecretsSettings(),
+                ai=AiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

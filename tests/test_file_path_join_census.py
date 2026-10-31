@@ -393,6 +393,11 @@ SITES: dict[str, Site] = {
     "harness/load/connscale/runner.py::_run_one_step": Site(
         1, INTERNAL, "A tag of fixed arms and integers in a temp directory the runner made."
     ),
+    "harness/load/connscale/stepconfig.py::write_step_config_dir": Site(
+        1,
+        INTERNAL,
+        "A fixed module name in the step's config directory, a temp dir the runner made.",
+    ),
     "harness/load/coord.py::FileDropCoord._path": Site(
         1,
         INTERNAL,

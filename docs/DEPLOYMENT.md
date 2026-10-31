@@ -371,7 +371,7 @@ are an owner act and remain **pending**.
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there. MEFOR authenticates against it, but counts its MFA only through a checked OIDC claim (see note below) | **a native second factor is built and required by default** (ADR 0002 WP-14) — RFC 6238 TOTP, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate. A WebAuthn passkey (WP-14b) is another factor, for the browser only, and it needs the optional `[webauthn]` extra. The factor reaches directory accounts too, on the rule [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
-| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, and so are the **inbound FTPS poll**, an inbound connection that dials out, and the **LDAPS AD bind** when `serve` builds the auth service (BACKLOG #2193; its CRL is `[auth].ad_tls_crl_file`). The API bind crosses when revocation is **proven in front** by an upstream TLS terminator, or is **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **An outbound hop has no proven-in-front lever, and that env no longer clears one on an enforcing instance.** There, an outbound hop crosses on loopback, on a CRL loaded on that hop, or, on a connection, with that connection's own `tls_revocation_attested`. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the `dialect='sqlserver'` DATABASE destination, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
+| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, and so are the **inbound FTPS poll**, an inbound connection that dials out, and the **LDAPS AD bind** when `serve` builds the auth service (BACKLOG #2193; its CRL is `[auth].ad_tls_crl_file`), and the **`[alerts]` SMTP relay when it carries a login** and the **https alert webhook** when `serve` builds the alert notifier, and the **AI-broker endpoint** at `POST /ai/chat`, which crosses only on loopback or on its `[ai].endpoint_revocation_attested` pair (BACKLOG #2193). The API bind crosses when revocation is **proven in front** by an upstream TLS terminator, or is **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **An outbound hop has no proven-in-front lever, and that env no longer clears one on an enforcing instance.** There, an outbound hop crosses on loopback, on a CRL loaded on that hop (not on a hop that sets `tls_allow_expired`, ADR 0173 §13), or, on a connection, with that connection's own `tls_revocation_attested`; the Vault hops, the alert webhook and the AI-broker endpoint take a settings pair instead, and the alert SMTP login takes `[tls].crl_file` or a settings pair (BACKLOG #2193). For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the `dialect='sqlserver'` DATABASE destination, and the `[alerts]` SMTP relay with no login. *(Until 2026-10-30 this listed the webhook and the AI-broker endpoint, which BACKLOG #2193 has since gated.)* "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction ([PHI.md §7](PHI.md#7-logging--phi-redaction)), to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` and `supervise` refuse to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
@@ -526,9 +526,10 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    Separately, **at least nine** verifying TLS outbounds have a revocation gate of their own — and the
    rest do **not**, including the SQL Server store hop: see
    [Revocation-guard behavior](#revocation-guard-behavior). And check every connection for
-   [`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-at-all), which no posture
+   [`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-on-the-setting-itself), which no posture
    gate or escape variable covers — it is **reported** (`security_loosenings()` /
-   `GET /security/posture` / `messagefoundry check`) but never refused, so the list is yours to act on.
+   `GET /security/posture` / `messagefoundry check`) but the setting is never refused, so the list is
+   yours to act on.
 6. **Lock down egress** — populate the relevant `[egress].allowed_*` allow-lists so **the engine's own
    outbound connectors** (and the sanctioned read-only `db_lookup` / `fhir_lookup`) can only reach
    approved destinations — **all eight**, plus the separate `[alerts]` allow-lists for the
@@ -628,13 +629,15 @@ REST obey the authority does not settle these:
   distinction is drawn. (SMTP AUTH credentials are refused over cleartext either way, and the Direct
   body is S/MIME-encrypted — but the SMTP envelope metadata is not.)
 
-### `tls_allow_expired` — the weakening with no posture gate at all
+### `tls_allow_expired` — the weakening with no posture gate on the setting itself
 
 The `verify_tls` / `use_tls` columns above, the cleartext-hop authority, and the escape-hatch list
 below are all about **turning verification off**. There is a **third, narrower weakening** that none of
-them covers, and it is one of at least two TLS relaxations with **no posture gate whatsoever** (the
-other is `tls_check_hostname = false`; CORRECTED 2026-10-01, this said "the only") — so
-an audit built from those columns alone has a hole:
+them covers, and it is one of at least two TLS relaxations whose **setting no posture gate refuses**
+(the other is `tls_check_hostname = false`; CORRECTED 2026-10-01, this said "the only") — so
+an audit built from those columns alone has a hole. CORRECTED 2026-10-30: the heading said "no posture
+gate at all", and this said "no posture gate whatsoever". The setting itself is still not refused, but
+in either posture it changes the revocation guard's answer, as the end of this section says:
 
 **`tls_allow_expired = true`** is a **per-connection** setting on **six** outbound connectors, and on
 the `Ftp` (FTPS) inbound poller, which dials out through the same context. The six are **MLLP,
@@ -655,11 +658,22 @@ It **is reported**: `security_loosenings()`, and therefore `GET /security/postur
 plus a `tls-allow-expired` line from `messagefoundry check` naming each connection and its peer,
 alongside the WARNING each construction logs. Like every connection-scoped declaration it is **not** in
 the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
-gated — nothing refuses it, and nothing takes it away again.
+gated — nothing refuses the setting, and nothing takes it away again. It does take one lever away: on a hop
+that sets it, a `[tls].crl_file` does not cross the revocation gate, so off the box on an enforcing
+instance that hop needs `tls_revocation_attested` with a reason (ADR 0173 §13). On an instance that
+does not enforce, that hop logs the revocation WARNING at each build, except at least when
+`MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own `tls_revocation_attested`,
+or on a loopback hop.
 
-Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in
-[Revocation-guard behavior](#revocation-guard-behavior), a PHI hop can be pinned to a certificate that
-is **both long-expired and revoked**, and nothing refuses it. **(2)** A two-week bridge set when a
+Two consequences worth stating plainly. **(1)** Every connector that takes `tls_allow_expired` today runs the
+revocation guard on its verifying hop ([Revocation-guard behavior](#revocation-guard-behavior)), and a CRL earns that hop no
+credit there. A PHI hop can still be pinned to a certificate that is **both long-expired and revoked**
+with nothing refusing it, at least when the connection combines `tls_allow_expired` with
+`tls_revocation_attested` and its reason, on a loopback hop, and on an instance that does not enforce,
+where the hop logs a WARNING and crosses. A CRL that reaches the hop still refuses a leaf certificate it
+lists, but a CA may drop an expired certificate from its CRL, which is the certificate this setting
+accepts. CORRECTED 2026-10-30: this said the combination arose with "the ungated revocation hops"; no
+connector that takes the setting is ungated (vault BACKLOG #2978). **(2)** A two-week bridge set when a
 partner's certificate lapses has **nothing that expires it** — it is listed for as long as it is set,
 and it stays set until someone removes it. So put the removal **date** in your own risk register; the
 engine will keep the list of *which connections* have it, but it has no notion of *until when*.
@@ -772,7 +786,7 @@ miss all of them: per-connection **`cleartext_accepted` + `cleartext_reason`** (
 declaration — warned, audited and reported); **`[security].enforcement = warn`** (instance-wide, and it
 downgrades the gates themselves — its retired companion `handles_real_patient_data = false` silenced
 them outright and is now refused at load, [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); and per-connection
-**[`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-at-all)**, which no
+**[`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-on-the-setting-itself)**, which no
 environment variable or posture clamp covers at all — the loosening register **does** report it, so the
 posture read-out is where to audit it.
 
@@ -965,7 +979,7 @@ bind-guard ladder above:
   half to act on.
 
   **Each gated hop's refusal names a lever that exists for that hop.** The non-connection hops
-  (the PostgreSQL store, the syslog forwarder, the OIDC legs and the LDAPS AD bind) carry their own remediation text,
+  (at least the PostgreSQL store, the syslog forwarder, the OIDC legs, the LDAPS AD bind and the two `[alerts]` hops) carry their own remediation text,
   because the connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be
   applied to something that is not a connection. The forwarder's refusal names
   `[logging].forward_tls_crl_file` and the loopback topology instead; the OIDC legs' refusal names
@@ -1000,6 +1014,35 @@ bind-guard ladder above:
     [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) names which callers hand their posture to
     the guard. Attest the hop rather than lowering the dial.
 
+  **Two `[alerts]` hops are gated too** (BACKLOG #2193, owner ruling 2026-10-27). When its host is
+  off the box, each is refused under `enforcement = enforce` as `serve` builds the alert notifier,
+  and builds with a WARNING under `warn`. `messagefoundry check` builds neither, so it does not
+  report them; the loosening report names a set attestation.
+
+  - **The SMTP relay, when `[alerts].email_username` is set.** The login password crosses that
+    hop, and the per-user security-event notifier sends over it with the same login, so both
+    builds are refused, and so is the alerts test send. The levers are a `[tls].crl_file`, which
+    reaches this hop's context, or `[alerts].email_tls_revocation_attested = true` with its
+    reason. A relay with no login stays ungated (the table below).
+  - **The https webhook.** The POST carries the webhook's path token. Its one lever is
+    `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
+    opener built at import, so no CRL reaches it, as on the Vault hops.
+  - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the
+    AI-broker endpoint, and unlike at least the LDAPS bind, the OIDC legs and the FTPS hops,
+    which do not refuse there.
+    `serve` always hands the posture down; an embedding that passes no `[ai]` hands none, and its
+    off-box hops above are then refused unless attested.
+
+  **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
+  off-box `[ai].endpoint` is refused under `enforce` unless
+  `[ai].endpoint_revocation_attested = true` is set with an
+  `[ai].endpoint_revocation_attested_reason`, the only lever. The refusal comes at
+  `POST /ai/chat`, not at start, and `messagefoundry check` neither reports it nor lists the
+  pair. Unlike a Vault hop, a loopback endpoint is on the box even with a proxy set, because
+  every opener dials a loopback host direct.
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) is the one place that says what the pair can
+  rest on and what does not cross this hop.
+
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine
 control**: confirming the refusal on MLLP and REST tells you nothing about these, which cross silently
@@ -1009,14 +1052,15 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, and an alert body carries no PHI, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and
 `MEFOR_TLS_REVOCATION_ATTESTED=1` is not consulted for them either. A deployment that runs the SQL
 Server store has **no** engine-enforced revocation on that hop. *(Until 2026-10-28 this also named
-the inbound FTPS poll, which BACKLOG #2193 has since gated.)*
+the inbound FTPS poll, which BACKLOG #2193 has since gated. Until 2026-10-30 it named the webhook
+alert sink, every `[alerts]` SMTP hop and the AI-broker endpoint, which the same item gated: the
+webhook, the SMTP hop when it carries a login, and the AI-broker endpoint.)*
 
 The two gates compose with — never duplicate — the cleartext gates: a cleartext or `verify_tls=false`
 hop is already refused by the [hop authority](#channel--tls-posture-matrix), so revocation only ever
@@ -1068,7 +1112,7 @@ attestation:
 4. **Check revocation in the engine — outbound gate and mTLS listeners.** Load a CRL with
    `[tls].crl_file` where it reaches the hop. The guard reads the CRL check off that hop's own TLS
    context and lets the hop through (BACKLOG #299). This is not a declaration: the engine checks the
-   CRL on the wire. An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
+   CRL on the wire. A hop that sets `tls_allow_expired` gets no credit from it (ADR 0173 §13). An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
    its own CRL setting (above). The Vault hops and the `[api]` listener gate have no CRL lever.
 5. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
@@ -1095,10 +1139,18 @@ covered by the "one authority" paragraph; **the same discipline applies to `Revo
 gated set is enumerable (grep the constructions, and also the calls to `revocation_hop_disposition`:
 the Vault guard in `transports/strict_requests.py` calls that function itself and builds no
 `RevocationHopGuard`) and every *other* verifying TLS hop must be named as
-ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
-(`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
-on it — **reported is not gated**, and the two must never be written as if either implied the other;
-and a field with no factory parameter and no `connections.toml`
+ungated, never covered by an "every verifying hop" sentence; a weakening whose setting no posture gate
+refuses (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no
+posture gate refuses the setting itself — **reported is not gated**, and the two must never be written as if
+either implied the other. `tls_allow_expired` is not inert to the revocation guard, though: it also
+skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
+hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
+context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
+site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
+setting and hands the guard its relaxed context lets a stale CRL admit the hop. CORRECTED 2026-10-30:
+this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
+true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
+credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:
 `tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it
 when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refusal_revocation.py` and

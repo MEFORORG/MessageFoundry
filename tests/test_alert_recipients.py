@@ -20,6 +20,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import AlertRule, AlertsSettings, EscalationTier
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import (
     ALERTS_SMTP_CELL,
     AlertRuleSet,
@@ -44,6 +45,10 @@ from tests.test_email_destination import (
     _WireCapture,
     assert_partial_refusal,
 )
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _RecordingTransport:
@@ -126,7 +131,7 @@ async def test_recipients_never_reach_the_webhook_payload(
         return _Resp()
 
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks._NO_REDIRECT_OPENER.open", fake_open)
-    web = WebhookTransport("https://hooks.example/x")
+    web = WebhookTransport("https://hooks.example/x", posture=_NOT_ENFORCING)
     rule = AlertRule(event_type="connection_stopped", recipients=["oncall@secret.example"])
     sink = NotifierAlertSink([web], rules=[rule])
     sink.connection_stopped("OB_X", detail="boom")
@@ -444,9 +449,9 @@ def test_a_rule_override_is_checked_only_where_it_reaches_the_email_send(
     )
     if reaches_email:
         with pytest.raises(ValueError, match="a recipient"):
-            notifier_from_settings(alerts)
+            notifier_from_settings(alerts, posture=_NOT_ENFORCING)
     else:
-        assert notifier_from_settings(alerts) is not None
+        assert notifier_from_settings(alerts, posture=_NOT_ENFORCING) is not None
 
 
 def test_the_security_notifier_refuses_a_sender_that_is_not_one_plain_mailbox() -> None:
