@@ -1605,7 +1605,9 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
 - **`proxy_url` plus `proxy_user` is the one declared route.** A `proxy_user` credential is checked
   when the connection is built, for a proxy written either way. It is refused there unless the
   proxy is on this machine or the connection declares `cleartext_accepted` with a
-  `cleartext_reason`. A build on that declaration writes the cleartext acceptance audit record.
+  `cleartext_reason`. For a proxy off this machine, the check that admits it on that declaration
+  writes the cleartext acceptance audit record. A check later in the same build that refuses the
+  connection does not withdraw that record, and a proxy on this machine gets none.
   `[security].enforcement = warn` does not lift the refusal: the HTTP family's no-loosen floor
   turns that WARN back into a refusal.
 - **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses. A connection

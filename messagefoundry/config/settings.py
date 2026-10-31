@@ -5407,7 +5407,9 @@ class EgressSettings(_Section):
         #2965), so the fault names this setting rather than surfacing on each connection that
         inherits it, and a value no connection inherits is still caught.
 
-        ``"default"`` (any case) and an empty value pass. The refusal is the parse's fixed text,
+        ``"default"`` (any case) passes, and a blank value reads as unset. ``"default"`` is written
+        out rather than read from ``transports.rest.PROXY_DEFAULT``, so this import stays off the
+        sentinel's path; a test pins that the two agree. The refusal is the parse's fixed text,
         which names no part of the value; the base model also hides the input. A ``user:password@``
         passes here, as the parse allows a userinfo: the build of each inheriting connection
         refuses it (vault BACKLOG #3007), and the static-credential report still lists it."""

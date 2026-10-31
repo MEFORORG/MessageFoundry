@@ -2268,10 +2268,10 @@ def proxy_auth_handler_from_settings(
         raise ValueError(
             f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
         )
-    if result[0] or result[1] is not None:
-        # Keyed on what this returns, which is what the proxy handler admits a caller-set header
-        # on, and run before the guard for the same reason as the type (vault BACKLOG #3443, #3007).
-        _refuse_a_static_proxy_header(s.get("headers"))
+    # Every arm that reaches here built the header or digest recipe the proxy handler admits a
+    # caller-set header on. Run before the guard for the same reason as the type (vault BACKLOG
+    # #3443, #3007).
+    _refuse_a_static_proxy_header(s.get("headers"))
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"

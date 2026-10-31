@@ -34,7 +34,7 @@ from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.bounded_read import build_strict_opener
 from messagefoundry.transports.egress import check_egress_allowed, check_fhir_lookup_allowed
 from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
-from messagefoundry.transports.rest import proxy_config_from_settings
+from messagefoundry.transports.rest import PROXY_DEFAULT, proxy_config_from_settings
 
 LISTED = "proxy.listed.invalid"
 UNLISTED = "other.unlisted.invalid"
@@ -155,8 +155,10 @@ def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> 
 )
 def test_control_a_site_proxy_url_the_parse_accepts_loads(proxy_url: str) -> None:
     """A userinfo is the parse's to accept: each inheriting connection's build refuses a user and
-    password (vault BACKLOG #3007), and the static-credential report still lists it."""
+    password (vault BACKLOG #3007), and the static-credential report still lists it. The
+    validator writes the sentinel out, so this pins that it is the transport's."""
     assert EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED]).proxy_url == proxy_url
+    assert PROXY_DEFAULT == "default"
 
 
 @pytest.mark.parametrize("proxy_url", ["", "   "])
