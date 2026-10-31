@@ -1846,10 +1846,12 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     #2394).** That call may still be running on its worker thread when this function is reached.
     The close runs inside the connection's call gate (:func:`_thread_settled`), handed to the
     running call, so it runs only once that call has returned, and the connection goes back only
-    after the close. The cancelled task does not wait for either: while a cancellation is in
-    flight, the return is handed to :func:`_return_when_settled` at once. Until the running call
-    returns, the connection keeps its pool slot. Nothing in the engine bounds that time, because
-    this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
+    after the close. On that path the same job then rolls back what the cancelled statement may
+    have left open (:func:`_close_after_a_cancel`), since the caller's own ``except Exception``
+    rollback never ran. The cancelled task waits for none of it: while a cancellation is in flight,
+    the return is handed to :func:`_return_when_settled` at once. Until the running call returns,
+    the connection keeps its pool slot. Nothing in the engine bounds that time, because this
+    connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
 
     **What this does not cover.** A cancellation during ``conn.cursor()`` reaches this function with
     no cursor, so the connection goes back while that call may still be running. The gate holds the
@@ -1862,10 +1864,16 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
         await pool.release(conn)
         return
     raw_cur = getattr(cur, "_impl", None)
+    cancelled = _unwinding_a_cancel()
     work: asyncio.Future[Any]
     if raw_cur is not None:
+        close = (
+            partial(_close_after_a_cancel, conn, raw_cur)
+            if cancelled
+            else partial(_close_raw_cursor, raw_cur)
+        )
         try:
-            work = _thread_settled(partial(_close_raw_cursor, raw_cur), gate=call_gate(conn))
+            work = _thread_settled(close, gate=call_gate(conn))
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
@@ -1877,7 +1885,7 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
-    if _unwinding_a_cancel():
+    if cancelled:
         # The close may be waiting for a cancelled statement; the cancellation must not.
         _return_when_settled(pool, conn, work, "a cursor close")
         return
@@ -1896,6 +1904,68 @@ def _close_raw_cursor(raw_cur: Any) -> None:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
         logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+
+
+def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
+    """On a worker thread, inside ``conn``'s call gate: close the cursor a cancelled borrow left,
+    then roll back what its statement may have left open (BACKLOG #2394, ADR 0159).
+
+    A cancellation skips every caller's ``except Exception: rollback``. On the destination's
+    manual-commit pool the connection would otherwise go back holding the cancelled INSERT
+    uncommitted, with its locks, for the next send's commit or rollback to settle. On an autocommit
+    connection the rollback has nothing to undo. Never raises. A connection whose rollback fails
+    is closed and its handle dropped, so its pool cannot lend it with that transaction open; aioodbc
+    then wakes no waiting borrower for it, which costs that borrower at most its acquire limit."""
+    _close_raw_cursor(raw_cur)
+    raw = getattr(conn, "_conn", None)
+    if raw is None:
+        return
+    try:
+        raw.rollback()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; the connection is discarded below
+        logger.warning(
+            "DATABASE: rollback after a cancelled statement failed; discarding the connection: %s",
+            _safe_db_error(exc),
+        )
+        conn._conn = None  # aioodbc's pool lends only a connection that is not closed
+        try:
+            raw.close()
+        except Exception as close_exc:  # noqa: BLE001 - it is out of the pool either way
+            logger.debug("DATABASE: closing a discarded connection failed: %s", close_exc)
+
+
+async def _close_pool_bounded(pool: Any, what: str) -> None:
+    """Close ``pool``, waiting at most :data:`_POOL_CLOSE_TIMEOUT_S` for its connections in use.
+
+    BACKLOG #2394: a connection whose cancelled statement still runs goes back only once that
+    statement returns, and this connector has no statement timeout, so an unbounded
+    ``wait_closed`` would hold a stop or a reload for as long as the server runs the statement. On
+    the bound this stops waiting and logs it, and the close goes on by itself: it is waited on
+    through :func:`asyncio.wait`, which never cancels it, so a close cut halfway never leaves a
+    connection's handle for aioodbc's ``__del__`` to free. The held connection is still released
+    only once its statement has returned, to a pool already closing. A close that fails within the
+    bound raises, as before; one that fails after it is logged."""
+    pool.close()
+    closing = asyncio.ensure_future(pool.wait_closed())
+    _DETACHED_SETTLES.add(closing)
+    closing.add_done_callback(_DETACHED_SETTLES.discard)
+    done, _pending = await asyncio.wait({closing}, timeout=_POOL_CLOSE_TIMEOUT_S)
+    if done:
+        closing.result()
+        return
+    closing.add_done_callback(partial(_log_late_pool_close, what))
+    logger.warning(
+        "%s pool did not close within %.1fs; a connection still in use is released when its "
+        "statement returns",
+        what,
+        _POOL_CLOSE_TIMEOUT_S,
+    )
+
+
+def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
+    error = None if closing.cancelled() else closing.exception()
+    if error is not None:
+        logger.warning("%s pool close failed after its bound: %s", what, _safe_db_error(error))
 
 
 async def _probe_db(
@@ -2190,10 +2260,11 @@ class DatabaseDestination(DestinationConnector):
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
 
     async def aclose(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-            await self._pool.wait_closed()
-            self._pool = None
+        """Close the pool, bounded (BACKLOG #2394): a cancelled send's statement can hold its
+        connection with no time limit, and a stop must not wait on it."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await _close_pool_bounded(pool, "DATABASE destination")
 
 
 #: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
@@ -3019,8 +3090,8 @@ class DatabaseLookupExecutor:
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:
-        """Close every opened pool (idempotent; safe if no pool was ever opened)."""
-        for pool in self._pools.values():
-            pool.close()
-            await pool.wait_closed()
+        """Close every opened pool (idempotent; safe if no pool was ever opened). Each close is
+        bounded, as the destination's is (BACKLOG #2394)."""
+        for connection, pool in self._pools.items():
+            await _close_pool_bounded(pool, f"DatabaseLookup {connection!r}")
         self._pools.clear()

@@ -12,6 +12,6 @@
   cancellation waits for the driver call. The cluster coordinator's table setup now uses the store's cursor helper. Its cursor
   closes before the connection returns to the pool, and goes to the gate on a cancellation. The gate
   moved to the leaf module `messagefoundry.odbc_call_gate`, and the one-shot connection exits live
-  there too. At least these are not covered: the DATABASE connector, and a cancellation while a
-  cursor is still being created, which leaves that cursor for the collector, on pooled and open-time
-  connections alike. (`BACKLOG #2394`)
+  there too. The DATABASE connector's entry for `BACKLOG #2394` covers that connector. At least
+  this is not covered: a cancellation while a cursor is still being created, which leaves that
+  cursor for the collector, on pooled and open-time connections alike. (`BACKLOG #2394`)

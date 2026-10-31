@@ -542,11 +542,21 @@ the next reader does not re-derive the wrong precedent from the same comment.
     on the call's own thread as the call returns, and no second thread waits for it. The
     connection goes back to its pool only after the close, as engine PR 2593 already required. The
     cancelled task does not wait either: while a cancellation is in flight, `_close_and_release`
-    hands the return to `_return_when_settled` and returns.
-  - **It returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc wakes no
-    waiting borrower when a closed connection is released, so a detached connection could leave
-    that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for returning
-    an unconfirmed connection open.
+    hands the return to `_return_when_settled` and returns. That holds for a cursor with its raw
+    handle. A cursor without one is closed through aioodbc, whose gated call parks a worker thread
+    on the gate until the statement returns.
+  - **The same job then rolls back what the cancelled statement left open**
+    (`_close_after_a_cancel`), since no caller's `except Exception` rollback ran. On the
+    destination's manual-commit pool, the connection would otherwise go back with the cancelled
+    INSERT uncommitted and its locks held, for the next send's commit or rollback to settle. This is
+    not the rollback rejected in *Why not a rollback in the same place* above: nothing awaits it,
+    and it runs on the statement's own thread after the statement, not on the loop's executor
+    beside it. A connection whose rollback fails is closed and its handle dropped, so its pool
+    cannot lend it.
+  - **Otherwise it returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc
+    wakes no waiting borrower when a closed connection is released, so a detached connection could
+    leave that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for
+    returning an unconfirmed connection open.
 
   **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
   The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
@@ -560,16 +570,19 @@ the next reader does not re-derive the wrong precedent from the same comment.
 
   - Another borrower of that pool waits at most its `acquire_timeout`, then fails transiently and
     retries, so a held slot delays work but does not wedge it.
-  - A pool close waits for the held connection. After a cancel, `DatabaseSource.stop()` bounds that
-    wait at `_POOL_CLOSE_TIMEOUT_S`. The destination's and the lookup executor's `aclose()`, and a
-    `DatabaseRef` sync's own pool teardown, do not bound it.
+  - A pool close waits for the held connection, at most `_POOL_CLOSE_TIMEOUT_S` (2 s) in at least
+    the destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool
+    teardown (`_close_pool_bounded`), and `DatabaseSource.stop()` after a cancel. The close goes on
+    past the bound, and the held connection is released only once its statement returns.
 
-  **What it leaves open.** A cancellation during `conn.cursor()` reaches the close with no cursor,
-  so the connection goes back while that call may still run; the gate holds the next borrower's
-  calls behind it, and the new cursor is left for the collector. **The manual-commit destination
-  pool also takes back a connection whose cancelled statement may have left its transaction open,
-  the hazard this ADR was written for.** The next send on that connection would commit or roll back
-  the stranger's statement with its own. That residual is unfiled and named here by subject.
+  **What it leaves open.** At least these:
+
+  - A cancellation during `conn.cursor()` reaches the close with no cursor, so the connection goes
+    back while that call may still run. The gate holds the next borrower's calls behind it, and the
+    new cursor is left for the collector.
+  - `DatabaseSource.stop()` with no cancel closes its pool without a bound, so the connection test
+    in `api/app.py`, which stops a source it probed, can wait past its own timeout for a probe its
+    timeout cancelled.
 
   Pinned offline by `tests/test_backlog2394_database_gate.py`.
 

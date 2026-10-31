@@ -52,18 +52,35 @@ _REF = "SELECT code, value FROM ref"
 
 
 class _ClosingPool(Pool):
-    """The shared fake pool, plus aioodbc's ``close`` and ``wait_closed``. Like aioodbc's,
-    ``wait_closed`` waits for the connection in use to come back."""
+    """The shared fake pool, plus aioodbc's ``close`` and ``wait_closed``. Like aioodbc's, a
+    connection released into a closing pool is closed rather than kept, and ``wait_closed`` waits
+    for the connection in use to come back."""
 
     def __init__(self, conn: AioConn) -> None:
         super().__init__(conn)
         self.closed = False
+        self.returned = False
 
     def close(self) -> None:
         self.closed = True
 
+    async def release(self, conn: AioConn) -> None:
+        self.returned = True
+        if self.closed and not conn.closed:
+            await conn.close()  # a gated call, through aioodbc's _execute
+            return
+        await super().release(conn)
+
     async def wait_closed(self) -> None:
-        assert await wait_until(lambda: bool(self.free)), "the borrowed connection never came back"
+        assert await wait_until(lambda: self.returned), "the borrowed connection never came back"
+
+
+class _RollbackRefused(RawConn):
+    """A connection whose rollback the stand-in server refuses."""
+
+    def rollback(self) -> None:
+        self.note("rollback:refused")
+        raise RuntimeError("refused by the stand-in server")
 
 
 @dataclass
@@ -74,8 +91,8 @@ class _Rig:
     started: threading.Event = field(default_factory=threading.Event)
     pools: list[_ClosingPool] = field(default_factory=list)
 
-    def raw(self, **kw: Any) -> RawConn:
-        return RawConn(self.log, self.release, self.started, **kw)
+    def raw(self, raw_type: type[RawConn] = RawConn, **kw: Any) -> RawConn:
+        return raw_type(self.log, self.release, self.started, **kw)
 
     @property
     def conn(self) -> AioConn:
@@ -133,10 +150,12 @@ def _source() -> DatabaseSource:
     )
 
 
-def _assert_closed_after_the_statement(rig: _Rig) -> None:
+def _assert_closed_and_rolled_back_after_the_statement(rig: _Rig) -> None:
+    """The cursor closes once the statement has returned, then the cancelled statement's
+    transaction is rolled back in the same gated job, and no handle was used after it was freed."""
     assert USE_AFTER_FREE not in rig.log, rig.log
-    assert rig.log.index("execute:end") < rig.log.index("cursor.close"), rig.log
-    assert "conn.close" not in rig.log, rig.log
+    end = rig.log.index("execute:end")
+    assert end < rig.log.index("cursor.close") < rig.log.index("rollback"), rig.log
 
 
 async def _cancel_mid_statement(monkeypatch: pytest.MonkeyPatch, rig: _Rig, coro: Any) -> None:
@@ -165,7 +184,8 @@ async def _cancel_mid_statement(monkeypatch: pytest.MonkeyPatch, rig: _Rig, coro
     await wait_for_entry(rig.log, "cursor.close")
     assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
 
-    _assert_closed_after_the_statement(rig)
+    _assert_closed_and_rolled_back_after_the_statement(rig)
+    assert "conn.close" not in rig.log, rig.log
     assert call_gate(rig.conn) is not None
     assert len(close_threads) == 1 and close_threads[0].startswith("test-2394b"), close_threads
 
@@ -174,7 +194,8 @@ async def test_a_cancelled_destination_send_frees_nothing_until_its_statement_re
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """The manual-commit pool, borrowed through ``_acquire``. Red before #2394 part b: the cursor
-    closed on another thread while the INSERT still ran, and the connection went back at once."""
+    closed on another thread while the INSERT still ran, and the connection went back at once,
+    with the INSERT's transaction still open for the next send to commit."""
     _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
     await _cancel_mid_statement(monkeypatch, rig, _destination().send('{"a": 1}'))
 
@@ -189,13 +210,32 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
 
 
+async def test_a_cancelled_send_whose_rollback_fails_discards_its_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A refused rollback leaves the transaction open, so the connection must not go back to be
+    lent: it is closed, inside the gate, after the cursor."""
+    _aioodbc_serving(monkeypatch, rig, raw_type=_RollbackRefused, blocks=lambda s: s == _INSERT)
+    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running statement"
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    assert await wait_until(lambda: rig.pools[0].in_release.is_set()), "it was never released"
+
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    end = rig.log.index("execute:end")
+    assert end < rig.log.index("rollback:refused") < rig.log.index("conn.close"), rig.log
+    assert rig.conn.closed and rig.pools[0].free == [], "a connection with an open txn went back"
+
+
 async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_returns(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """A ``DatabaseRef`` sync borrows through ``acquire_pooled``, not ``_acquire``, so this pins
-    the gate the autocommit pool installs itself. The sync then closes its throwaway pool, and
-    that close waits for the borrowed connection, so the cancelled sync ends only once the
-    statement has returned: the wait ``_AutocommitPool`` already documents."""
+    the gate the autocommit pool installs itself. The sync then closes its throwaway pool, which
+    closes the connection once it comes back, after its statement and cursor."""
     _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _REF)
     settings = {**_SQLSERVER, "statement": _REF, "key_column": "code", "value_column": "value"}
     task = await cancel_once_started(
@@ -209,9 +249,34 @@ async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_retu
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, WAIT)
 
-    _assert_closed_after_the_statement(rig)
-    assert rig.pools[0].free == [rig.conn] and rig.pools[0].closed
+    _assert_closed_and_rolled_back_after_the_statement(rig)
+    assert rig.log.index("rollback") < rig.log.index("conn.close"), rig.log
+    assert rig.pools[0].closed and rig.pools[0].returned
     assert call_gate(rig.conn) is not None
+
+
+async def test_a_destination_close_does_not_wait_out_a_cancelled_statement(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A stop cancels the delivery worker, then closes the connector. The cancelled send's
+    statement still holds its connection, with no time limit, so an unbounded ``wait_closed`` would
+    hold the stop for as long as it runs. The close is bounded, and the connection is still
+    released, and closed, only once its statement has returned."""
+    monkeypatch.setattr(database, "_POOL_CLOSE_TIMEOUT_S", 0.2)
+    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
+    destination = _destination()
+    task = await cancel_once_started(rig.started, destination.send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running statement"
+
+    await asyncio.wait_for(destination.aclose(), 1.0)
+    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
+    assert "conn.close" not in rig.log, rig.log
+
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    _assert_closed_and_rolled_back_after_the_statement(rig)
+    assert rig.log.index("rollback") < rig.log.index("conn.close"), rig.log
 
 
 async def test_the_autocommit_set_runs_inside_the_call_gate(
@@ -230,7 +295,7 @@ async def test_the_autocommit_set_runs_inside_the_call_gate(
 
     rig.release.set()
     await asyncio.wait_for(closing, WAIT)
-    await asyncio.wait_for(acquiring, WAIT)
+    await pool.release(await asyncio.wait_for(acquiring, WAIT))
 
     assert USE_AFTER_FREE not in rig.log, rig.log
     assert rig.log.index("autocommit:end") < rig.log.index("conn.close"), rig.log
@@ -241,7 +306,7 @@ async def test_an_ordinary_send_gates_its_connection_and_returns_it_before_send_
 ) -> None:
     """The control. With no cancellation the connection is gated, the INSERT commits, the
     cursor closes, and the connection is back in the pool by the time ``send`` returns: the
-    hand-off a cancellation takes is not taken on the ordinary path."""
+    hand-off and the rollback a cancellation takes are not taken on the ordinary path."""
     rig.release.set()
     _aioodbc_serving(monkeypatch, rig, blocks=never)
 
@@ -250,4 +315,5 @@ async def test_an_ordinary_send_gates_its_connection_and_returns_it_before_send_
     assert call_gate(rig.conn) is not None
     assert rig.pools[0].free == [rig.conn]
     assert rig.log.index("execute:end") < rig.log.index("commit") < rig.log.index("cursor.close")
+    assert "rollback" not in rig.log, rig.log
     assert USE_AFTER_FREE not in rig.log, rig.log

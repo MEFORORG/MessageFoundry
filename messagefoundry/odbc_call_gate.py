@@ -85,7 +85,9 @@ class CallGate:
             finally:
                 with self._state:
                     self._running = False
-                    after, self._after = self._after, []
+                    after = self._after
+                    if after:  # a new list only after a hand-off, not on every call
+                        self._after = []
                     deferred, self._deferred = self._deferred, None
                 for job in after:  # still under the lock, so before the next call and the close
                     try:
