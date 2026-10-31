@@ -49,8 +49,8 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.controlchars import scrub_log_argument
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
-# the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
-# (BACKLOG #2237); the intake plane does not yet.
+# the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. Both planes key by issuer first
+# (BACKLOG #2237 here, #2287 for the intake plane's intake_client_subjects).
 from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
