@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #3210: ``LoggingAlertSink.connection_error`` logs a stand-in, not the detail. The planted
-token stands in for payload content that no redaction pattern matches.
+"""BACKLOG #3210: ``LoggingAlertSink.connection_error`` logs the passed exception class, or a fixed
+token, and never the detail. The planted token stands in for payload content that no redaction
+pattern matches.
 """
 
 from __future__ import annotations
@@ -30,39 +31,51 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_the_sink_logs_the_class_and_not_the_detail(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG, logger="messagefoundry")
-    detail = safe_exc(DeliveryError(_TRANSPORT_TEXT))
-    assert TOKEN in detail  # the premise: safe_exc keeps this text, so the sink must drop it
-    LoggingAlertSink().connection_error(OUT, kind="connection_lost", detail=detail)
-    (line,) = _warnings(caplog)
-    assert line.getMessage() == (
-        f"ALERT connection_error: outbound {OUT!r} connection_lost (DeliveryError); "
+def _line(named: str) -> str:
+    return (
+        f"ALERT connection_error: outbound {OUT!r} connection_lost ({named}); "
         "the reason is not logged"
     )
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        safe_exc(DeliveryError(_TRANSPORT_TEXT)),
+        TOKEN,
+        f"{TOKEN}: refused",
+        "SYN900002",
+        "MRN123456: refused",
+        "DeliveryError",
+    ],
+    ids=["safe-exc", "bare-token", "token-head", "bare-mrn", "mrn-head", "bare-class"],
+)
+def test_the_line_names_the_passed_class_and_never_the_detail(
+    caplog: pytest.LogCaptureFixture, detail: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    LoggingAlertSink().connection_error(
+        OUT, kind="connection_lost", detail=detail, error_class="TimeoutError"
+    )
+    (line,) = _warnings(caplog)
+    assert line.getMessage() == _line("TimeoutError")
     assert_no_token(caplog.records)
 
 
 @pytest.mark.parametrize(
-    ("detail", "stand_in"),
-    [
-        (f"{TOKEN} refused", "unnamed error"),
-        (f"not a class: {TOKEN}", "unnamed error"),
-        (f"Ünïcode{TOKEN}: x", "unnamed error"),
-        ("", "unnamed error"),
-        (None, "unnamed error"),
-        ("DeliveryError", "DeliveryError"),
-        ("SYN900002", "SYN900002"),
-    ],
-    ids=["spaced", "spaced-head", "non-ascii-head", "empty", "none", "bare-class", "bare-token"],
+    "error_class",
+    [None, "", "Ünïcode", "not a class", f"{TOKEN} refused", f"{TOKEN}: x"],
+    ids=["none", "empty", "non-ascii", "spaced", "token-spaced", "token-colon"],
 )
-def test_the_stand_in_for_each_detail_shape(
-    caplog: pytest.LogCaptureFixture, detail: str | None, stand_in: str
+def test_a_missing_or_odd_class_logs_the_fixed_token(
+    caplog: pytest.LogCaptureFixture, error_class: str | None
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
-    LoggingAlertSink().connection_error(OUT, kind="connection_lost", detail=detail)
+    LoggingAlertSink().connection_error(
+        OUT, kind="connection_lost", detail=_TRANSPORT_TEXT, error_class=error_class
+    )
     (line,) = _warnings(caplog)
-    assert f"({stand_in})" in line.getMessage()
+    assert line.getMessage() == _line("unnamed error")
     assert_no_token(caplog.records)
 
 
@@ -101,5 +114,5 @@ async def test_the_stored_event_reason_is_the_detail_bounded_again_and_no_log_ha
     assert TOKEN in event.reason
     assert (event.reason == detail) is stored_whole
     (line,) = [r for r in _warnings(caplog) if "ALERT connection_error" in r.getMessage()]
-    assert "(DeliveryError)" in line.getMessage()
+    assert line.getMessage() == _line("DeliveryError")  # the real class, passed by the runner
     assert_no_token(caplog.records)

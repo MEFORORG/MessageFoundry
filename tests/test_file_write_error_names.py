@@ -61,9 +61,11 @@ class _Sink(LoggingAlertSink):
     def __init__(self) -> None:
         self.details: list[str | None] = []
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
         self.details.append(detail)
-        super().connection_error(name, kind=kind, detail=detail)
+        super().connection_error(name, kind=kind, detail=detail, error_class=error_class)
 
 
 def _file_destination(directory: Path) -> FileDestination:
