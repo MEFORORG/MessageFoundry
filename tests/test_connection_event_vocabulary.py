@@ -86,18 +86,33 @@ def test_the_console_filter_offers_the_shared_vocabulary_in_order() -> None:
     assert offered == list(CONNECTION_EVENT_KIND_ORDER)
 
 
-def _spelled_kinds(source: str) -> set[str]:
-    return set(code_strings(parse_source(source))) & CONNECTION_EVENT_KINDS
+def _kind_collections(source: str) -> list[int]:
+    """Line numbers of literal tuples, lists and sets in CODE holding two or more kinds."""
+    hits = []
+    for node in ast.walk(parse_source(source)):
+        if isinstance(node, ast.Tuple | ast.List | ast.Set):
+            kinds = set(code_strings(node)) & CONNECTION_EVENT_KINDS
+            if len(kinds) >= 2:
+                hits.append(node.lineno)
+    return hits
 
 
 def test_the_console_holds_no_copy_of_its_own() -> None:
-    # Equality above would also pass for a hand-kept copy that happens to match today. The console
-    # must not spell any kind in code, so the only way a kind reaches its filter is the shared set.
+    # Equality above would also pass for a hand-kept copy that happens to match today. No console
+    # module may hold a literal collection of kinds, so the only way a kind list reaches the console
+    # is the shared vocabulary. One word such as "closed" alone is not a copy, so it is not flagged.
     # The control shows the probe fires on a planted copy, so an empty answer is a reading.
-    assert _spelled_kinds('_EVENT_KINDS = ("established", "closed")\n') == {"established", "closed"}
-    path = _ROOT / "messagefoundry_webconsole" / "pages" / "monitoring.py"
-    spelled = _spelled_kinds(path.read_text(encoding="utf-8"))
-    assert not spelled, sorted(spelled)
+    assert _kind_collections('_EVENT_KINDS = (\n    "established",\n    "closed",\n)\n') == [1]
+    assert _kind_collections('state = "closed"\n') == []
+    console = _ROOT / "messagefoundry_webconsole"
+    paths = sorted(console.rglob("*.py"))
+    assert len(paths) > 20, "the console walk found too few files to mean anything"
+    copies = {
+        str(path.relative_to(_ROOT)): lines
+        for path in paths
+        if (lines := _kind_collections(path.read_text(encoding="utf-8")))
+    }
+    assert not copies, copies
 
 
 # --- the store refuses an undeclared kind -------------------------------------------------------

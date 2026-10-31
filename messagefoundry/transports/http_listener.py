@@ -918,8 +918,8 @@ class HttpSource(SourceConnector):
         Takes an already-built refusal rather than its parts so every ``kind=`` stays a literal at a
         visible ``HttpRequestError(...)`` call site. CI derives the whole ``connection_event``
         vocabulary by AST-walking for exactly that shape, so a kind hidden behind a helper's parameter
-        would silently drop out of ``docs/PHI.md`` §7 and the console's filter — the drift this
-        codebase spends real effort preventing.
+        would escape the check that it is declared in ``CONNECTION_EVENT_KINDS`` and ``docs/PHI.md``
+        §7. An undeclared kind is then refused by the store at write time, and the event is lost.
         """
         if self.intake_rate_limiter is not None:
             self.intake_rate_limiter.charge_failure(peer)

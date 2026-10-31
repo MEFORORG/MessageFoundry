@@ -64,8 +64,8 @@ CONNECTION_EVENT_KINDS: Final[frozenset[str]] = frozenset(CONNECTION_EVENT_KIND_
 def check_connection_event_kind(kind: str) -> None:
     """Raise :class:`ValueError` for a ``kind`` outside :data:`CONNECTION_EVENT_KINDS`.
 
-    A row with an undeclared kind would be stored but unreachable from the console's filter and
-    undocumented in ``docs/PHI.md``, so the store refuses it rather than write it.
+    A row with an undeclared kind would be stored, but the console's kind filter could not select
+    it and ``docs/PHI.md`` would not say what it means, so the store refuses it rather than write it.
 
     What the refusal costs is the caller's affair. The runner's connection-event drainer re-writes a
     refused burst row by row, so a lone undeclared row costs that row alone. Its salvage gives up

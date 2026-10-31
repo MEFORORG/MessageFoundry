@@ -1139,9 +1139,9 @@ class SourceConnector(abc.ABC):
     * a **deferral** (a per-poll ceiling, an intake pause, a file not yet settled) leaves the item
       unread where it is, with the sender or in its directory or table, for a later read.
 
-    A source that emits connection events reports such outcomes through :attr:`on_connection_event`
-    too, where capture is on. Not every source emits them. Each kind passed there must be a member
-    of :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
+    Some sources also report some refusals and quarantines through :attr:`on_connection_event`,
+    where capture is on; no source reports a deferral there. Each kind passed there must be a
+    member of :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
 
     **When the inbound handler raises.** The inbound handler records every message-level outcome
     itself (a parse or validation failure is an ``ERROR`` row, and it returns). An exception
@@ -1157,8 +1157,12 @@ class SourceConnector(abc.ABC):
        cannot stop intake while the connection still reports running. ``CancelledError`` is not an
        inbound-handler failure and propagates.
 
-    The MLLP listener's ``handler_error`` arm, the FILE source's handler-failure arm and the
-    DATABASE source's ``_ingest_row`` are worked examples."""
+    The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
+    examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
+    answer. A sender that waits for none cannot be told to resend: there the MLLP listener records
+    ``handler_error`` and keeps the connection, and a message that was not committed is lost. That
+    is a gap in the
+    shipped listener, not a pattern to copy."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
