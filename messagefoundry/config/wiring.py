@@ -2814,9 +2814,10 @@ def Http(
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
-    (for example one it cannot decode, or one over the ingress ceiling) is recorded with status
-    ``ERROR`` and answered ``422`` with no ``message_id``, in either mode (ADR 0154 amendment
-    2026-09-26). ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
+    is recorded with status ``ERROR`` and answered, in either mode, ``503`` with ``Retry-After`` for a
+    temporary refusal, ``413`` over a size ceiling, and ``422`` otherwise; the body names that
+    ``ERROR`` row's ``message_id``. Which refusal gets which code is in ADR 0154's amendment of
+    2026-10-30. ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
     an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
     reply described below.
 
@@ -2837,7 +2838,7 @@ def Http(
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
     nothing. A request refused before its body reaches the engine charges nothing either. Only a body
-    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
+    the engine reads and records spends the budget, including one it then refuses. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
@@ -2895,7 +2896,7 @@ def Http(
     ``connection_event.reason`` or a ``message_events.detail``.
 
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
-    body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
+    body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {

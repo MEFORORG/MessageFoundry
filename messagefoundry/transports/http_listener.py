@@ -230,9 +230,10 @@ _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 #: (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
 _NOT_ACCEPTED = "message was not accepted"
 
-#: The ``Retry-After`` seconds on the ``503`` answering a TEMPORARY ingress refusal (owner ruling
-#: 2026-09-30, BACKLOG #2105), as ADR 0154's 2026-10-30 amendment states it. The sync path's
-#: shutting-down ``503`` in ``_reply_to_wire`` is a different answer and sets its own.
+#: The ``Retry-After`` seconds on the ``503`` answering a TEMPORARY ingress refusal, as ADR 0154's
+#: 2026-10-30 amendment states it (BACKLOG #2105). The ``503`` with ``Retry-After`` is the owner
+#: ruling of 2026-09-30. The sync path's shutting-down ``503`` in ``_reply_to_wire`` is a different
+#: answer and sets its own.
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
 
@@ -1502,8 +1503,10 @@ class HttpSource(SourceConnector):
             # count-and-log record and only the answer changes here. A 202 would tell the caller its
             # body was accepted when it was not, and a reply_from caller would wait for a reply to a
             # message that never entered the pipeline. One branch answers both modes, so they cannot
-            # drift (owner ruling 2026-09-26, BACKLOG #1960). The status says whether to re-send, and
-            # the body names the ERROR row (owner ruling 2026-09-30, BACKLOG #2105). Returns False:
+            # drift (owner ruling 2026-09-26, BACKLOG #1960). The status says whether to re-send: the
+            # owner ruling of 2026-09-30 answers a temporary refusal 503 with Retry-After and keeps a
+            # permanent one at 422. Which refusals are temporary, the one 413 for over-size and the
+            # ERROR row's id in the body are Manager decision d20261030T155119571-255c98 (BACKLOG #2105). Returns False:
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.

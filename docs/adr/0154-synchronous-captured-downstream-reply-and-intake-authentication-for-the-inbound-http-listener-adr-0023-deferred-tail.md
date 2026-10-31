@@ -15,8 +15,10 @@
   is keyed by the issuing CA's DN, and a subject is admitted only under the loaded CA whose key signed
   the leaf. D6 and **AC-14** keep their original text. See
   [Amendment 2026-10-30](#amendment-2026-10-30-intake_client_subjects-is-keyed-by-the-issuing-ca).
-- **Amended 2026-10-30 (BACKLOG #2105, owner ruling of 2026-09-30):** a body refused at ingress is
-  answered by kind. A **temporary** refusal is **`503`** with `Retry-After`, an **over-size** one
+- **Amended 2026-10-30 (BACKLOG #2105):** a body refused at ingress is answered by kind. The owner
+  ruling of 2026-09-30 answers a temporary refusal `503` with `Retry-After` and keeps a permanent one
+  at `422`; which refusals are temporary, the one `413` for over-size, and the id in the body are
+  Manager decision d20261030T155119571-255c98. A **temporary** refusal is **`503`** with `Retry-After`, an **over-size** one
   **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row's
   `message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
   [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
