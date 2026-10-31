@@ -596,3 +596,171 @@ def test_only_a_codec_name_that_decodes_nothing_is_the_configurations_fault() ->
     for unusable in ("not-a-real-codec", "undefined", "base64"):
         with pytest.raises(ingress_guards.IngressCodecUnusable):
             ingress_guards.decode_body(ADT_UTF8, _inbound_declaring(unusable))
+
+
+# --- the strict-validation timeout (BACKLOG #1689 remainder) -----------------------------------
+
+
+def _strict_inbound(timeout: float | None, **kwargs: Any) -> InboundConnection:
+    return InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=True, hl7_version="2.5.1", strict_timeout_s=timeout),
+        **kwargs,
+    )
+
+
+def _slow_validate(monkeypatch: pytest.MonkeyPatch, seconds: float) -> list[int]:
+    """Make hl7apy's validate take ``seconds`` longer, in BOTH callers' namespaces; the returned list
+    counts the calls. On the unfixed dry-run, which validated un-timed, the call then goes on to
+    hl7apy, and the test fails on the ERROR hl7apy previews ("Missing required child
+    ADT_A01.PV1", since the fixture has no PV1) rather than on the timeout's text."""
+    import time
+
+    from messagefoundry.parsing import validate as real
+    from messagefoundry.pipeline import dryrun
+
+    calls: list[int] = []
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        time.sleep(seconds)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dryrun, "validate", slow)
+    monkeypatch.setattr(wiring_runner, "validate", slow)
+    return calls
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_sides(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, listener: str
+) -> None:
+    """The listener refuses a validate that outruns ``validation.strict_timeout_s`` (#89); a dry-run
+    that validated un-timed waited it out and previewed hl7apy's own refusal of the body instead
+    ("Missing required child ADT_A01.PV1"). Both must now say the same words."""
+    _slow_validate(monkeypatch, 0.3)
+    ic = _strict_inbound(0.05)
+
+    preview = dry_run(_registry(ic), ADT_UTF8)
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert preview.disposition is MessageStatus.ERROR, preview.error
+    assert preview.error == "strict-validation timed out after 0.05s"
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert rows[0]["error"] == preview.error
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, step: float) -> None:
+    """Advance the dry-run's monotonic clock by ``step`` on every read, so a validate measures as
+    ``step`` seconds long without the test sleeping."""
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dryrun
+
+    ticks = iter(range(1_000_000))
+    # The module's own `time` name only, so the patched clock reaches nothing outside dryrun.
+    fake = SimpleNamespace(time=time.time, monotonic=lambda: next(ticks) * step)
+    monkeypatch.setattr(dryrun, "time", fake)
+
+
+def test_a_validate_measured_past_the_timeout_gives_the_listener_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inline, the preview cannot abandon a validate; it measures it, and a finished validate that
+    took longer than the timeout is refused with the listener's text, not with what it returned."""
+    _clock(monkeypatch, 31.0)
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == "strict-validation timed out after 30.0s"
+
+
+def test_a_fault_raised_after_the_timeout_gives_the_timeout_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The listener has given up by the time a late validate raises, so its row says timed out; the
+    preview checks the elapsed time before re-raising, and says the same."""
+    from messagefoundry.pipeline import dryrun
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("validator fault")
+
+    monkeypatch.setattr(dryrun, "validate", boom)
+    _clock(monkeypatch, 31.0)
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.error == "strict-validation timed out after 30.0s"
+
+
+def test_a_disabled_timeout_validates_un_timed_as_the_listener_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``strict_timeout_s <= 0`` turns the backstop off on the listener, so the preview never times
+    the validate out, however long it measures."""
+    _clock(monkeypatch, 1e6)
+
+    result = dry_run(_registry(_strict_inbound(0)), ADT_UTF8)
+
+    # The fixture has no PV1, so hl7apy refuses it; what matters is that it was not a timeout.
+    assert result.error == "Missing required child ADT_A01.PV1"
+
+
+def test_an_invalid_result_with_empty_error_text_is_still_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``validate`` reports a fault as ``ok=False`` with the exception's text, which can be empty; the
+    listener refuses on ``ok`` alone, so the preview must not read the empty text as valid."""
+    from messagefoundry.parsing import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(
+        dryrun, "validate", lambda *a, **k: ValidationResult(ok=False, version=None, errors=[""])
+    )
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+
+
+def test_a_fast_validate_inside_the_timeout_still_reports_its_errors() -> None:
+    """The bound changes nothing for a validate that finishes in time: hl7apy's own errors come back."""
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == "Missing required child ADT_A01.PV1"
+
+
+def test_a_validate_that_raises_inside_the_timeout_still_raises_out_of_the_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault inside the timeout is the validator's, not a timeout, and leaves ``dry_run`` as before."""
+    from messagefoundry.pipeline import dryrun
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("validator fault")
+
+    monkeypatch.setattr(dryrun, "validate", boom)
+
+    with pytest.raises(RuntimeError, match="validator fault"):
+        dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+
+def test_a_streaming_body_over_its_threshold_is_not_whole_body_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The listener validates only the header of such a body, so a whole-body validate the preview
+    timed out on would refuse a message the engine takes."""
+    calls = _slow_validate(monkeypatch, 0.0)
+    _clock(monkeypatch, 1e6)
+    ic = _strict_inbound(0.05, stream_threshold_bytes=16)
+
+    result = dry_run(_registry(ic), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.RECEIVED, result.error
+    assert calls == []

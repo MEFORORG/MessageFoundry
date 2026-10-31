@@ -167,6 +167,19 @@ def test_the_exit_code_is_named_only_when_it_is_an_integer() -> None:
     assert "PID" not in str(UserCodeCalledSysExit.from_exit(SystemExit("PID-5 was DOE^JANE")))
 
 
+@pytest.mark.parametrize("code", [None, 0, 3, -1, True, "PID-5 was DOE^JANE", 2.5])
+def test_the_dry_run_names_a_sys_exit_in_the_live_runners_words(code: object) -> None:
+    """The dry-run converts a ``sys.exit()`` in Router or Handler code with its own class, because
+    ``wiring_runner`` imports ``dryrun`` and the reverse import would be a cycle. A preview must still
+    read as the engine's dead-letter reason does, for every kind of exit code."""
+    from messagefoundry.pipeline import dryrun
+
+    exc = SystemExit(code)
+    assert str(dryrun.UserCodeCalledSysExit.from_exit(exc)) == str(
+        UserCodeCalledSysExit.from_exit(exc)
+    )
+
+
 def _write_config(cfg: Path, *, inbox: Path, outdir: Path, top_level: str = "") -> None:
     cfg.mkdir(parents=True, exist_ok=True)
     inbox.mkdir(parents=True, exist_ok=True)

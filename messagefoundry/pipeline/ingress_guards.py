@@ -30,19 +30,22 @@ choice is not this module's to make. The HL7 parse step, which each caller runs 
 ``parse error`` text differs, and the dry-run catches only ``HL7PeekError`` where the listener
 catches every peek-read fault. The detach's refusal of an escaped ``OBX-5.5`` document
 (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`, ``ERROR`` + ``AR`` on a streaming
-inbound), which the dry-run never raises because it never detaches. And the live guards below.
+inbound), which the dry-run never raises because it never detaches. How a slow strict validate is
+cut off, in the next paragraph. And the live guards after it. The codec NAME is not among them: both
+callers resolve it through :func:`ingress_encoding`, which defers to
+:func:`~messagefoundry.transports.framing.declared_encoding` (BACKLOG #2431).
+
+**The strict-validation timeout is mirrored by measurement.** The listener runs ``hl7apy`` off the
+event loop under :func:`strict_validate_timeout` and records ``ERROR`` + ``AE`` on expiry. The
+dry-run stays synchronous: it runs the same validate inline, measures its elapsed time against the
+same timeout, and reports a validate that took longer as an ``ERROR`` preview carrying the
+listener's text (BACKLOG #1689). Unlike the listener it does not abandon the validate at the
+timeout, so a slow fixture still takes its full validate time. The operator resend
+(:func:`admit_resubmission`) honours the timeout too.
 
 **At least these live guards are deliberately NOT mirrored for the dry-run, each by design:**
 
 * **the declared-type magic-byte sniff** (:func:`check_declared_type`), for the reason given above.
-
-* **the strict-validation timeout.** The listener runs ``hl7apy`` off the event loop under
-  ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it in the
-  dry-run would force :func:`~messagefoundry.pipeline.dryrun.dry_run` to become ``async``, which
-  ripples into ``checks.py``, ``verify/smoke.py`` and ``dryrun_trace.py``. A dry-run therefore
-  validates **un-timed**: it can report ``RECEIVED``/``ERROR`` for a pathological body the engine
-  would ``AE``-NAK on a timeout instead. The operator resend (:func:`admit_resubmitted_body`) is
-  already off the loop, so it does honour the timeout.
 * **document detach** (``_detach_documents``, #149 / ADR 0105). It is ``async`` and it *writes*
   attachment rows, so there is no honest pure mirror of it. A dry-run consequently previews the
   whole body where a streaming inbound would have detached its documents.
