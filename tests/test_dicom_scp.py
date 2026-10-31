@@ -29,7 +29,11 @@ from messagefoundry.config.models import ConnectorType, Source  # noqa: E402
 from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import DicomPeek  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource, _server_ssl_context  # noqa: E402
-from messagefoundry.transports.receipt import IngressReceipt, RefusalKind  # noqa: E402
+from messagefoundry.transports.receipt import (  # noqa: E402
+    IngressReceipt,
+    RefusalKind,
+    receipt_handler,  # noqa: E402
+)
 from tests._dicom_sample import make_deflated_bomb_stream, make_sr_part10  # noqa: E402
 
 _SCP_AE = "MEFOR_SCP"
@@ -86,7 +90,7 @@ async def test_scp_receives_and_commits_before_success() -> None:
     captured: list[bytes] = []
     scp = _build_scp(captured)
     handler = await _capture_handler_factory(captured)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         port = scp.sockport
         data = make_sr_part10()
@@ -107,7 +111,7 @@ async def test_scp_rejects_unlisted_calling_ae() -> None:
     captured: list[bytes] = []
     scp = _build_scp(captured, calling_ae_allowlist=["MODALITY1"])
     handler = await _capture_handler_factory(captured)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         established, _ = await asyncio.to_thread(
             _scu_cstore, scp.sockport, make_sr_part10(), calling_ae="EVIL_AE"
@@ -126,7 +130,7 @@ async def test_scp_rejects_unlisted_peer_ip() -> None:
     # accept-time tests, with their controls, are in tests/test_dicom_scp_admission.py.
     scp = _build_scp(captured, source_ip_allowlist=["10.0.0.0/8"])
     handler = await _capture_handler_factory(captured)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is False
@@ -140,7 +144,7 @@ async def test_scp_rejects_oversized_object() -> None:
     captured: list[bytes] = []
     scp = _build_scp(captured, max_object_bytes=64)  # any real SR exceeds this
     handler = await _capture_handler_factory(captured)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
@@ -269,7 +273,7 @@ async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
         raise RuntimeError("store down")
 
     scp = _build_scp([])
-    await scp.start(failing_handler)
+    await scp.start(receipt_handler(failing_handler))
     try:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
@@ -325,7 +329,7 @@ async def test_scp_handler_refusal_returns_dimse_failure_not_success(
         return IngressReceipt.refused(kind, "err-1")
 
     scp = _build_scp([])
-    await scp.start(refusing_handler)
+    await scp.start(receipt_handler(refusing_handler))
     try:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
@@ -335,11 +339,31 @@ async def test_scp_handler_refusal_returns_dimse_failure_not_success(
         await scp.stop()
 
 
+async def test_scp_refuses_a_handler_that_is_not_a_receipt_handler() -> None:
+    # BACKLOG #2105: a generic handler would commit an object and return a reply or None, and the SCP
+    # would fail reading a receipt from it after the commit, answering a failure for a stored object.
+    # It is refused at start, before the SCP binds or accepts an association.
+    scp = _build_scp([])
+
+    async def generic(data: bytes) -> str | None:
+        raise AssertionError("a refused handler must never be called")
+
+    with pytest.raises(TypeError, match="receipt handler"):
+        await scp.start(generic)
+    assert scp._server is None, "the SCP bound a socket for a refused handler"
+    # Control: the same SCP starts once given a marked receipt handler.
+    await scp.start(receipt_handler(await _capture_handler_factory([])))
+    try:
+        assert scp._server is not None
+    finally:
+        await scp.stop()
+
+
 async def test_scp_does_not_log_phi(caplog: pytest.LogCaptureFixture) -> None:
     captured: list[bytes] = []
     scp = _build_scp(captured)
     handler = await _capture_handler_factory(captured)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         phi_name = "Secretpatient^Phicanary^DoNotLog"
         data = make_sr_part10(patient_name=phi_name)
@@ -355,7 +379,7 @@ async def test_scp_does_not_log_phi(caplog: pytest.LogCaptureFixture) -> None:
 async def test_scp_stop_is_idempotent() -> None:
     scp = _build_scp([])
     handler = await _capture_handler_factory([])
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     await scp.stop()
     await scp.stop()  # second stop must not raise
 
@@ -384,7 +408,7 @@ async def test_scp_stop_runs_off_loop_and_lets_in_flight_cstore_finish() -> None
         return IngressReceipt.accepted("mid-gated")  # the receipt: committed
 
     scp = _build_scp(captured)
-    await scp.start(gated_handler)
+    await scp.start(receipt_handler(gated_handler))
     try:
         # Fire the SCU C-STORE off-thread; it parks inside send_c_store awaiting the reply.
         cstore = asyncio.create_task(asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()))
@@ -426,7 +450,7 @@ async def test_scp_is_restartable_across_stop_start_cycles() -> None:
     scp = _build_scp(captured)
     handler = await _capture_handler_factory(captured)
     for cycle in range(2):
-        await scp.start(handler)
+        await scp.start(receipt_handler(handler))
         try:
             established, status = await asyncio.to_thread(
                 _scu_cstore, scp.sockport, make_sr_part10()
@@ -524,7 +548,7 @@ async def test_scp_commit_timeout_returns_out_of_resources_not_success(
         await asyncio.sleep(2)  # outlasts the monkeypatched 0.05s commit timeout
 
     scp = _build_scp([])
-    await scp.start(slow_handler)
+    await scp.start(receipt_handler(slow_handler))
     try:
         scp._timeout = 0.05  # only future.result(); AE transport timeouts already bound at start
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())

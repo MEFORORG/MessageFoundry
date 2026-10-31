@@ -20,8 +20,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import cast
 
-__all__ = ["IngressReceipt", "ReceiptHandler", "RefusalKind"]
+__all__ = ["IngressReceipt", "ReceiptHandler", "RefusalKind", "receipt_handler", "require_receipt"]
 
 
 class RefusalKind(StrEnum):
@@ -60,3 +61,30 @@ class IngressReceipt:
 
 #: The handler the runner starts a ``wants_receipt`` source with.
 ReceiptHandler = Callable[[bytes], Awaitable[IngressReceipt]]
+
+#: The attribute :func:`receipt_handler` sets, which :func:`require_receipt` reads.
+_RECEIPT_MARK = "__messagefoundry_receipt_handler__"
+
+
+def receipt_handler[H: Callable[[bytes], Awaitable[object]]](handler: H) -> H:
+    """Mark ``handler`` as a receipt handler, so a ``wants_receipt`` source accepts it at start.
+
+    A return annotation cannot be read reliably at run time, and the generic handler and the receipt
+    handler are both ``bytes -> Awaitable``, so the declaration is this explicit mark."""
+    setattr(handler, _RECEIPT_MARK, True)
+    return handler
+
+
+def require_receipt(handler: object, *, source: str) -> ReceiptHandler:
+    """Return ``handler`` if :func:`receipt_handler` marked it, else raise ``TypeError``.
+
+    A receipt source calls this in ``start()``, before it accepts anything. A generic handler would
+    commit a body and return a reply or ``None``, and the source would then fail reading a receipt
+    from it AFTER the commit: an HTTP ``500`` the sender re-sends, a duplicate, or a DIMSE failure
+    for an object that was stored (BACKLOG #2105). Refusing at start keeps that from ever running."""
+    if getattr(handler, _RECEIPT_MARK, False) is not True:
+        raise TypeError(
+            f"{source} declares wants_receipt and must be started with a receipt handler "
+            "(transports.receipt.receipt_handler); it was given another handler"
+        )
+    return cast("ReceiptHandler", handler)  # the mark is the check the type system cannot make

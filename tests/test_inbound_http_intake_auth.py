@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter, check_http_intake_auth
 from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpRequestError, HttpSource
-from messagefoundry.transports.receipt import IngressReceipt
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from tests.test_api_tls import _NOW, _CaPair, _dn, _new_ca, _pem
 
 KEY = "acme-intake-key"
@@ -218,7 +218,7 @@ async def _start(**settings: Any) -> HttpSource:
     async def handler(raw: bytes) -> IngressReceipt:
         return IngressReceipt.accepted("msg-1")  # stands in for the committed ingress message_id
 
-    await source.start(handler)
+    await source.start(receipt_handler(handler))
     return source
 
 

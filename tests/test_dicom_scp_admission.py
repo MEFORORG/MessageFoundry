@@ -35,7 +35,10 @@ from messagefoundry import netaddr  # noqa: E402
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource  # noqa: E402
 from messagefoundry.transports.mllp import _TLS_HANDSHAKE_TIMEOUT  # noqa: E402
-from messagefoundry.transports.receipt import IngressReceipt  # noqa: E402
+from messagefoundry.transports.receipt import (
+    IngressReceipt,  # noqa: E402
+    receipt_handler,  # noqa: E402
+)
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import (  # noqa: E402
     _SCP_AE,
@@ -68,7 +71,7 @@ async def _running_scp(
         return IngressReceipt.accepted(f"mid-{len(sink)}")
 
     scp = _build_scp(sink, **settings)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         yield scp
     finally:
@@ -583,7 +586,7 @@ async def test_a_tls_association_still_stores_an_object(tmp_path: Path) -> None:
         captured.append(data)
         return IngressReceipt.accepted("mid-1")
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         established, status = await asyncio.to_thread(
             _scu_cstore_tls, scp.sockport, make_sr_part10(), ca_file=str(settings["tls_cert_file"])
@@ -639,7 +642,7 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
         return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
-        await scp.start(handler)
+        await scp.start(receipt_handler(handler))
         try:
             port = scp.sockport
             # The control: a completed handshake is no failure.
@@ -686,9 +689,9 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
         captured.append(data)
         return IngressReceipt.accepted("mid-1")
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     await scp.stop()
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         await _plaintext_peer(scp.sockport)
         await _until(lambda: scp.tls_handshake_failures == 1)
@@ -709,7 +712,7 @@ async def test_a_failing_shutdown_is_retried_and_still_logs_what_was_held(
         return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
-        await scp.start(handler)
+        await scp.start(receipt_handler(handler))
         server = scp._server
         assert server is not None
         real_shutdown = server.shutdown

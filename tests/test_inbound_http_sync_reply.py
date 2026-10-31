@@ -24,7 +24,7 @@ from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.transports.base import InboundReply, ReplyOutcome
 from messagefoundry.transports.http_listener import HttpSource
-from messagefoundry.transports.receipt import IngressReceipt, RefusalKind
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
 
 def test_valid_configurations_build() -> None:
@@ -175,7 +175,7 @@ async def _serve(
             sink_events.append(kind)
 
         src.on_connection_event = sink
-    await src.start(handler)
+    await src.start(receipt_handler(handler))
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
         try:

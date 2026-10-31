@@ -137,11 +137,7 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import (
-    DEFAULT_MAX_MESSAGE_BYTES,
-    PEEK_READ_FAULTS,
-    HL7MessageTooLarge,
-)
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
@@ -252,7 +248,7 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
-from messagefoundry.transports.receipt import IngressReceipt, RefusalKind
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
 __all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
@@ -7713,7 +7709,7 @@ class RegistryRunner:
         async def on_request(raw: bytes) -> IngressReceipt:
             return await self._handle_inbound_http(ic, raw)
 
-        return on_request
+        return receipt_handler(on_request)
 
     async def _declared_content_mismatch(
         self, ic: InboundConnection, raw: bytes, *, text: str | None = None
@@ -7901,12 +7897,9 @@ class RegistryRunner:
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
                 # validate() keeps its own size cap, the engine default, even where the inbound's
-                # max_message_bytes admitted the body to the peek, so a body over it failed for size.
-                kind = (
-                    RefusalKind.OVERSIZE
-                    if len(text) > DEFAULT_MAX_MESSAGE_BYTES
-                    else RefusalKind.PERMANENT
-                )
+                # max_message_bytes admitted the body to the peek. It says itself when that cap
+                # refused the body, measured on the text it normalized, so nothing here re-derives it.
+                kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns a refusal — never accepted-and-dropped.

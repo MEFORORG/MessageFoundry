@@ -133,7 +133,12 @@ from messagefoundry.transports.mllp import (
     InsecureHopGuard,
     _MessagePacer,
 )
-from messagefoundry.transports.receipt import IngressReceipt, ReceiptHandler, RefusalKind
+from messagefoundry.transports.receipt import (
+    IngressReceipt,
+    ReceiptHandler,
+    RefusalKind,
+    require_receipt,
+)
 
 __all__ = [
     "DicomScpSource",
@@ -743,8 +748,9 @@ class DicomScpSource(SourceConnector):
         # leader_gate is ignored: a listen source binds its own per-node endpoint, so there is no
         # shared-resource double-read to gate (accepted only so the runner's call is uniform).
         # wants_receipt makes the runner pass its receipt handler here (BACKLOG #2105). The parameter
-        # keeps the base class's InboundHandler beside it only so the override stays substitutable.
-        self._handler = cast("ReceiptHandler", handler)
+        # keeps the base class's InboundHandler beside it only so the override stays substitutable;
+        # require_receipt refuses any other handler here, before a single message is accepted.
+        self._handler = require_receipt(handler, source="DICOM SCP source")
         self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
         self._tls_failures.open()
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work

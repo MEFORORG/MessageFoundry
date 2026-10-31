@@ -29,7 +29,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
-from messagefoundry.transports.receipt import IngressReceipt
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from tests.test_api_tls import _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
 
 SUBJECT = "CN:partner.example"
@@ -72,7 +72,7 @@ async def _started(source: HttpSource) -> HttpSource:
     async def handler(raw: bytes) -> IngressReceipt:
         return IngressReceipt.accepted("msg-1")  # stands in for the committed ingress message_id
 
-    await source.start(handler)
+    await source.start(receipt_handler(handler))
     return source
 
 

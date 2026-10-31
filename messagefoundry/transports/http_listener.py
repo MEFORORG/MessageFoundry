@@ -79,7 +79,7 @@ from messagefoundry.transports.mllp import (
     _set_tcp_nodelay,
     _upgrades_tls_itself,
 )
-from messagefoundry.transports.receipt import ReceiptHandler, RefusalKind
+from messagefoundry.transports.receipt import ReceiptHandler, RefusalKind, require_receipt
 
 if TYPE_CHECKING:
     from messagefoundry.pki import IssuerIndex
@@ -909,8 +909,9 @@ class HttpSource(SourceConnector):
         # leader_gate is ignored: a listen source runs on every node (each binds its own endpoint), so
         # there is no shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         # wants_receipt makes the runner pass its receipt handler here (BACKLOG #2105). The parameter
-        # keeps the base class's InboundHandler beside it only so the override stays substitutable.
-        self._handler = cast("ReceiptHandler", handler)
+        # keeps the base class's InboundHandler beside it only so the override stays substitutable;
+        # require_receipt refuses any other handler here, before a single message is accepted.
+        self._handler = require_receipt(handler, source="HTTP source")
         self._admission.stopping = False  # a restart of this same instance serves again
         self._tls_failures.open()
         # BACKLOG #2479, the shape BACKLOG #1606 fixed on MLLP. On the stdlib loop a TLS listener

@@ -42,7 +42,7 @@ from messagefoundry.transports.http_listener import (
     TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS,
     HttpSource,
 )
-from messagefoundry.transports.receipt import IngressReceipt, RefusalKind
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 from messagefoundry.transports.rest import RestDestination
 from tests.test_inbound_http_source import _http, _Response
 from tests.test_ingress_document_detach import _big_b64
@@ -234,26 +234,82 @@ async def test_an_hl7_body_over_the_peek_ceiling_is_413_and_names_its_row(
     _assert_names_the_row(resp, row)
 
 
-@pytest.mark.parametrize(("oversize", "status"), [(True, 413), (False, 422)])
-async def test_a_strict_validation_failure_over_its_size_cap_is_413(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, oversize: bool, status: int
-) -> None:
-    # validate() keeps the engine-default size cap even where max_message_bytes admitted the body to
-    # the peek. A failure on a body over that cap is a size refusal; the control, the same failure on
-    # a body under it, is about content.
-    from messagefoundry.parsing.validate import ValidationResult
+#: validate()'s own size cap, the engine default, which strict validation keeps even where an
+#: inbound's max_message_bytes admits a larger body to the peek.
+_STRICT_CAP = 16 * 1024 * 1024
 
-    monkeypatch.setattr(
-        wiring_runner,
-        "validate",
-        lambda text, **_: ValidationResult(False, "2.5.1", ["message exceeds max size"]),
+
+def _hl7_of_length(n: int) -> str:
+    """An HL7 body whose text, less trailing CRs, is exactly ``n`` characters."""
+    head = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||"
+    return head + "A" * (n - len(head))
+
+
+def _big_strict_ic() -> InboundConnection:
+    # The peek and the listener both admit the body, so only validate() can refuse it for size.
+    return _ic(
+        validation=Validation(strict=True),
+        max_message_bytes=2 * _STRICT_CAP,
+        settings={"max_body_bytes": 2 * _STRICT_CAP},
     )
-    monkeypatch.setattr(wiring_runner, "DEFAULT_MAX_MESSAGE_BYTES", 10 if oversize else 10_000)
-    resp = await _post_through_runner(store, _ic(validation=Validation(strict=True)), HL7.encode())
-    assert resp.status == status
+
+
+async def test_a_content_failure_at_exactly_the_strict_cap_plus_a_trailing_cr_is_422(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # validate() measures the normalized text less its trailing CRs. This body is exactly the cap by
+    # that measure and one character over it as received, so a caller re-deriving the length would
+    # call a content failure over-size. Only validate()'s own report may decide (BACKLOG #2105).
+    import hl7apy.parser
+    from hl7apy.exceptions import HL7apyException
+
+    def _content_failure(*_: Any, **__: Any) -> Any:
+        raise HL7apyException("a content failure, not size")
+
+    monkeypatch.setattr(hl7apy.parser, "parse_message", _content_failure)
+    body = _hl7_of_length(_STRICT_CAP) + "\r"
+    assert len(body) == _STRICT_CAP + 1
+    resp = await _post_through_runner(store, _big_strict_ic(), body.encode("ascii"))
+    assert resp.status == 422
     row = await _the_one_error_row(store)
-    assert "strict-validation failed" in row["error"]
+    assert "a content failure, not size" in row["error"]
     _assert_names_the_row(resp, row)
+
+
+async def test_a_body_one_past_the_strict_cap_is_413(store: MessageStore) -> None:
+    # Control for the case above: one character over validate()'s own cap, by its own measure, is
+    # refused by its size check before any parse, and validate() reports that as over-size.
+    body = _hl7_of_length(_STRICT_CAP + 1) + "\r"
+    resp = await _post_through_runner(store, _big_strict_ic(), body.encode("ascii"))
+    assert resp.status == 413
+    row = await _the_one_error_row(store)
+    assert "exceeds max size" in row["error"]
+    _assert_names_the_row(resp, row)
+
+
+async def test_the_http_listener_refuses_a_handler_that_is_not_a_receipt_handler() -> None:
+    # A generic handler would commit a body and return a reply or None, and the listener would fail
+    # reading a receipt from it only after the commit. It is refused at start, before any bind.
+    listener = HttpSource(
+        Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0})
+    )
+
+    async def generic(raw: bytes) -> str | None:
+        raise AssertionError("a refused handler must never be called")
+
+    with pytest.raises(TypeError, match="receipt handler"):
+        await listener.start(generic)
+    assert listener._server is None, "the listener bound a socket for a refused handler"
+
+    # Control: the same listener starts once given a marked receipt handler.
+    async def receipt(raw: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("m1")
+
+    await listener.start(receipt_handler(receipt))
+    try:
+        assert listener._server is not None
+    finally:
+        await listener.stop()
 
 
 async def test_an_hl7_parse_failure_that_is_not_size_stays_422(store: MessageStore) -> None:
@@ -318,7 +374,7 @@ async def _send_from_rest_to_a_listener_that_refuses(kind: RefusalKind) -> None:
     async def handler(raw: bytes) -> IngressReceipt:
         return IngressReceipt.refused(kind, "err-1")
 
-    await listener.start(handler)
+    await listener.start(receipt_handler(handler))
     try:
         url = f"http://127.0.0.1:{listener.sockport}/ingest"
         dest = build_destination(

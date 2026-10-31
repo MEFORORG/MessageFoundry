@@ -1442,7 +1442,7 @@ sources answer it in step.
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers |
 | --- | --- | --- | --- |
 | the streaming detach's in-flight budget, held by other detaches | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
-| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
+| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap as `validate()` itself measures and reports it, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
 | every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
 
 A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
