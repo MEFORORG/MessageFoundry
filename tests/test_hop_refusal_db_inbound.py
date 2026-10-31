@@ -592,16 +592,21 @@ _GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _g
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_generic_lone_tls_keyword_refused_when_enforcing(
-    keyword: str, connector: Callable[[Any], object], config: Callable[..., Any], tmp_path: Path
+    keyword: str,
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # BACKLOG #2483: a key or certificate path does not count as a mode. The path cannot exist, so a
-    # file in the working directory cannot turn this into a key or certificate refusal.
-    absent = str(tmp_path / "absent")
+    # BACKLOG #2483: a key or certificate path does not count as a mode. The name is relative to an
+    # empty directory, so no file can turn this into a key or certificate refusal, and it stays
+    # printable ASCII whatever the host's temp path holds.
+    monkeypatch.chdir(tmp_path)
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
     ):
-        connector(config(odbc_params={keyword: absent}))
+        connector(config(odbc_params={keyword: "absent"}))
 
 
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
@@ -613,11 +618,12 @@ def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
     connector: Callable[[Any], object],
     config: Callable[..., Any],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The control for the test above: the same keyword crosses once a mode is set beside it.
-    absent = str(tmp_path / "absent")
+    monkeypatch.chdir(tmp_path)
     with active_hop_posture(PROD_PHI):
-        built = connector(config(odbc_params={keyword: absent, "sslmode": mode}))
+        built = connector(config(odbc_params={keyword: "absent", "sslmode": mode}))
     assert built._cleartext_guard is None  # type: ignore[attr-defined]
 
 

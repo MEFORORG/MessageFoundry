@@ -32,6 +32,7 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
+    _ODBC_NO_TLS_VALUES,
     _ODBC_PARAM_ALLOWLIST,
     _ODBC_TLS_MODE_KEYWORDS,
     DatabaseDestination,
@@ -463,6 +464,12 @@ _NO_TLS_WORDS = (
 )
 
 
+def test_the_no_tls_word_copy_matches_the_deny_list() -> None:
+    # The copy above pins the deny-list's content, and the sslpassword test below runs over it, so a
+    # word added to or dropped from either one must fail here rather than leave a word untested.
+    assert set(_NO_TLS_WORDS) == set(_ODBC_NO_TLS_VALUES)
+
+
 def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
     settings = {
         "dialect": "generic",
@@ -616,10 +623,11 @@ def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) ->
 
 
 def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
-    caplog: pytest.LogCaptureFixture, tmp_path: Path
+    caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A path that cannot exist, so a file in the working directory cannot change the outcome.
-    logged = _generic_dsn_logs({"sslcert": str(tmp_path / "absent.pem")}, caplog)
+    # A relative name in an empty directory: no file can change the outcome, and it stays ASCII.
+    monkeypatch.chdir(tmp_path)
+    logged = _generic_dsn_logs({"sslcert": "absent.pem"}, caplog)
     assert "TLS verification is NOT enforced" in logged and _NO_MODE_REASON in logged
     assert "SSLmode=verify-full" in logged
 
