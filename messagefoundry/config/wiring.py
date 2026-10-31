@@ -4757,19 +4757,28 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        if not isinstance(self.namespace, str) or not self.namespace:
-            raise WiringError("SetState namespace must be a non-empty string")
-        if not isinstance(self.key, str) or not self.key:
-            raise WiringError("SetState key must be a non-empty string")
-        try:
-            import json
+        # Every message names the field only: namespace, key and value may be PHI.
+        for name, text in (("namespace", self.namespace), ("key", self.key)):
+            if not isinstance(text, str) or not text:
+                raise WiringError(f"SetState {name} must be a non-empty string")
+            # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
+            # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
+            # entries. Refused on every backend so a feed behaves the same wherever it runs.
+            if text.endswith(" "):
+                raise WiringError(f"SetState {name} must not end with a space")
+        import json
 
+        try:
             json.dumps(self.value)
         except (TypeError, ValueError) as exc:
-            raise WiringError(
-                f"SetState({self.namespace!r}, {self.key!r}, ...): value must be JSON-serializable "
-                f"(str/int/float/bool/None/list/dict) — {exc}"
-            ) from exc
+            reason = str(exc)
+        else:
+            return
+        # Raised outside the handler, so no __context__ is chained: on 3.14 json adds __notes__ such
+        # as "when serializing dict item '<key>'", and a traceback would print the value's own keys.
+        raise WiringError(
+            f"SetState value must be JSON-serializable (str/int/float/bool/None/list/dict) — {reason}"
+        )
 
 
 #: Per-message metadata cap (BACKLOG #150, ADR 0081): a handler's `SetMeta` contribution is bounded so

@@ -32,6 +32,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from tests._claim_lock_helpers import (
+    assert_skip_named,
+    claim_heads_no_block,
+    ss_hold_row_lock,
+    ss_lane_pending,
+)
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
@@ -237,45 +243,6 @@ async def _pg_hold_row_lock(pg_store: Any, message_id: str, stage: str) -> tuple
     return conn, tx
 
 
-async def _ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[Any, Any]:
-    """SQL Server twin of :func:`_pg_hold_row_lock` — an open ``BEGIN TRAN`` holding a
-    ``(UPDLOCK, ROWLOCK)`` U-lock on exactly one queue row until rollback.
-
-    The U-lock is taken via the row's ``ix_queue_fifo_in_seq`` key (predicate on
-    ``stage, channel_id, status, seq`` — a covered INGRESS-lane seek), NOT via ``message_id``.
-    This matches how EVERY real contender touches a queue head (a producer INSERT locks all
-    indexes; a sibling claimer's STEP-3 fifo-scan UPDLOCKs the fifo key; a finalizer / delivery
-    worker / reset_stale_inflight UPDATEs status/next_attempt_at — all in the fifo index). A
-    ``message_id=?`` UPDLOCK instead pins only the clustered key + ix_queue_message — a lock shape
-    no production writer holds, and one the store's STEP-3 READPAST fifo-scan CANNOT skip: it reads
-    the (unlocked) fifo-index leaf, then WAITS on the clustered-key bookmark lock -> LOCK_TIMEOUT 0
-    -> spurious 1222 -> EMPTY-all (the 1c/1e failure). Locking the fifo key makes the store's scan
-    READPAST-skip this row via the PROVEN path (the uncommitted-INSERT fan-in test already exercises
-    that skip on CI). All callers are INGRESS (channel_id lane)."""
-    conn = await ss_store._pool.acquire()
-    cur = await conn.cursor()
-    # Resolve the row's fifo-index coordinates first (a plain read via ix_queue_message); seq is
-    # globally unique (IDENTITY), so (stage, channel_id, status, seq) pins exactly one row. Fully
-    # drained before BEGIN TRAN (no-MARS).
-    await cur.execute(
-        "SELECT channel_id, status, seq FROM queue WHERE message_id=? AND stage=?",
-        (message_id, stage),
-    )
-    coords = await cur.fetchall()
-    assert len(coords) == 1  # the target row must exist, or the test proves nothing
-    channel_id, status, seq = coords[0]
-    await cur.execute("BEGIN TRAN")
-    await cur.execute(
-        # INDEX hint pins the seek to ix_queue_fifo_in_seq so the U-lock lands on that NC key
-        # (the scan site the store's STEP-3 READPAST probe skips), not the clustered key.
-        "SELECT id FROM queue WITH (INDEX(ix_queue_fifo_in_seq), UPDLOCK, ROWLOCK)"
-        " WHERE stage=? AND channel_id=? AND status=? AND seq=?",
-        (stage, channel_id, status, seq),
-    )
-    assert len(await cur.fetchall()) == 1  # the U-lock MUST land on the intended row
-    return conn, cur
-
-
 async def _pg_lane_pending(pg_store: Any, channel: str) -> list[dict[str, Any]]:
     rows = await pg_store._fetchall(
         "SELECT status, attempts FROM queue WHERE channel_id=$1 AND stage=$2 ORDER BY seq",
@@ -285,93 +252,31 @@ async def _pg_lane_pending(pg_store: Any, channel: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-async def _ss_lane_pending(ss_store: Any, channel: str) -> list[dict[str, Any]]:
-    return await ss_store._fetchall(
-        "SELECT status, attempts FROM queue WHERE channel_id=? AND stage=? ORDER BY seq",
-        (channel, Stage.INGRESS.value),
-    )
-
-
-async def _claim_heads_no_block(
-    store: Any, *args: Any, timeout: float = 10.0, **kwargs: Any
-) -> Any:
-    """Run ``claim_fifo_heads`` under a bounded timeout WITHOUT the cancel-corrupts-the-connection
-    hazard, then return its result. Mirrors the proven shield pattern of
-    :func:`test_t6_sqlserver_locked_head_blocks_not_skips`: the claim runs as a real task wrapped in
-    ``asyncio.wait_for(asyncio.shield(task), ...)`` so the timeout's cancellation lands on the SHIELD,
-    never on the underlying task.
-
-    Why this matters here: several of these tests hold a lock/uncommitted txn while claiming, and the
-    claim MUST return EMPTY promptly (the never-block guarantee — SET LOCK_TIMEOUT 0 → 1222 → EMPTY).
-    If a regression ever makes it BLOCK, a bare ``wait_for(store.claim_fifo_heads(...))`` would cancel
-    the coroutine mid-``pyodbc.execute`` and tear down the ``async with self._acquire()`` connection
-    while the aioodbc worker thread is still executing on it — at command_timeout pyodbc then segfaults
-    raising the timeout on a released connection (the exit-139 CI crash this test file guards).
-
-    CRITICAL — we NEVER cancel the task on timeout. Cancelling is itself the segfault vector: it
-    delivers ``CancelledError`` into the in-flight ``await cur.execute``, unwinding ``_cursor.__aexit__``
-    (``cur.close()``) and ``_acquire.__aexit__`` (releases the pooled connection) while the aioodbc
-    executor thread may still be running the blocked ``pyodbc`` statement on that same connection — the
-    exact torn-down-connection crash. The reference
-    :func:`test_t6_sqlserver_locked_head_blocks_not_skips` does the opposite: it shields, detects the
-    block, asserts ``not task.done()`` for a LOUD failure, and lets the task run to completion after the
-    caller's ``finally`` releases the lock — precisely what keeps pyodbc from being torn down
-    mid-execute. So on a block we surface a clean ``TimeoutError`` (a loud test failure) and leave the
-    shielded task pending on its live connection; the caller's ``finally`` then releases the external
-    lock, after which the abandoned task's ``execute`` completes and unwinds cleanly on its own. Every
-    call site here holds the external lock in a ``try``/``finally``, so this contract holds. This only
-    ever runs on a regression — in green CI the claim returns EMPTY promptly and no timeout fires."""
-    task = asyncio.ensure_future(store.claim_fifo_heads(*args, **kwargs))
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-    except (TimeoutError, asyncio.CancelledError):
-        # A real block (or an outer cancel). Do NOT cancel `task`: delivering CancelledError into the
-        # in-flight `cur.execute` is exactly the torn-down-connection segfault this helper guards
-        # against (see the docstring). Assert the block LOUDLY, then re-raise; the shielded task stays
-        # pending on its live connection and unwinds after the caller's `finally` releases the lock.
-        assert not task.done(), "claim_fifo_heads finished within the timeout — no block to guard"
-        raise
-
-
 # claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0 (ADR 0066 §9 never-block), so a
 # transient lock can fail-close the WHOLE batch to EMPTY-all — by_lane AND rearm both empty, the claim
 # rolled back, nothing consumed. That yield is contract-legal (the pooled caller self-heals on retry)
 # but flakes a single-shot assertion. _claim_heads_until re-issues past a transient EMPTY-all while
-# keeping _claim_heads_no_block's segfault-safe shield, for the sites here that assert a NON-empty
+# keeping claim_heads_no_block's segfault-safe shield, for the sites here that assert a NON-empty
 # outcome — an after-release head, or a sibling/committed-successor lane claimed while ANOTHER row is
 # locked. Masks nothing: EMPTY-all is a full roll-back (a retry cannot double-claim; a successful claim
 # never retries), and a GENUINELY unclaimable head stays EMPTY-all every pass and still fails after the
 # cap. A real BLOCK still raises TimeoutError through the shield (not a return), so it is never retried.
 # Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
-# _claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield.
+# claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield.
 _CLAIM_YIELD_RETRIES = 16
 _CLAIM_YIELD_BACKOFF = 0.01
 
 
 async def _claim_heads_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    """_claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield; see
+    """claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield; see
     the note above. Returns as soon as the claim did ANYTHING (a non-empty by_lane or rearm)."""
-    res = await _claim_heads_no_block(store, *args, **kwargs)
+    res = await claim_heads_no_block(store, *args, **kwargs)
     for _ in range(_CLAIM_YIELD_RETRIES):
         if res.by_lane or res.rearm:
             break
         await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
-        res = await _claim_heads_no_block(store, *args, **kwargs)
+        res = await claim_heads_no_block(store, *args, **kwargs)
     return res
-
-
-def _assert_skip_named(res: Any, lane: str, *, abort_ok: bool) -> None:
-    """BACKLOG #1270: a lane EMPTY behind a held head must NAME its route, never read as "no work".
-
-    The completed claim names the lane in ``head_skipped``. On SQL Server alone the whole attempt may
-    instead abort on 1222 (``lock_timeout``) and read no row, which names the route without the lane;
-    ``abort_ok`` admits that, and only that. Either way a silent EMPTY fails here."""
-    if abort_ok and res.lock_timeout is not None:
-        assert res.head_skipped == frozenset()  # an aborted claim read no row, so it names none
-        return
-    assert res.head_skipped == frozenset({lane}), (
-        f"the locked head's lane came back EMPTY without being named: {res.head_skipped!r}"
-    )
 
 
 # --- 1a: true T6 — locked head => lane EMPTY, no lock-wait, N claimed first after
@@ -386,12 +291,12 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
     conn, tx = await _pg_hold_row_lock(pg_store, mids[0], Stage.INGRESS.value)
     try:
         # EMPTY-on-locked-head must not block (cf. the per-lane T6 above); the shield keeps a
-        # regression's block from segfaulting the process (see _claim_heads_no_block).
-        res = await _claim_heads_no_block(
+        # regression's block from segfaulting the process (see claim_heads_no_block).
+        res = await claim_heads_no_block(
             pg_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        _assert_skip_named(res, channel, abort_ok=False)
+        assert_skip_named(res, channel, abort_ok=False)
         rows = await _pg_lane_pending(pg_store, channel)
         assert all(
             r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows
@@ -411,17 +316,17 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
     probe drops it; the head-pin empties the lane — never [N+1, N+2], never a lock-wait."""
     channel = "IB_P1ASS"
     mids = await _seed_ingress(ss_store, channel, [100.0, 101.0, 102.0])
-    conn, cur = await _ss_hold_row_lock(ss_store, mids[0], Stage.INGRESS.value)
+    conn, cur = await ss_hold_row_lock(ss_store, mids[0], Stage.INGRESS.value)
     try:
         # The SET LOCK_TIMEOUT 0 never-block guarantee must yield EMPTY promptly here; the shield
         # turns any regression's ~command_timeout block into a clean failure, not the exit-139 pyodbc
-        # segfault this file guards (see _claim_heads_no_block).
-        res = await _claim_heads_no_block(
+        # segfault this file guards (see claim_heads_no_block).
+        res = await claim_heads_no_block(
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        _assert_skip_named(res, channel, abort_ok=True)
-        rows = await _ss_lane_pending(ss_store, channel)
+        assert_skip_named(res, channel, abort_ok=True)
+        rows = await ss_lane_pending(ss_store, channel)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
         await cur.execute("ROLLBACK TRAN")
@@ -458,7 +363,7 @@ async def test_pooled_1b_pg_uncommitted_head_invisible_then_claimed(pg_store: An
         100.0,
     )
     try:
-        res = await _claim_heads_no_block(pg_store, Stage.INGRESS.value, [channel], now=200.0)
+        res = await claim_heads_no_block(pg_store, Stage.INGRESS.value, [channel], now=200.0)
         assert res.by_lane == {}  # invisible head — EMPTY, no block
         assert res.head_skipped == frozenset()  # #1270: never discovered, so never named skipped
         await tx.commit()
@@ -491,7 +396,7 @@ async def test_pooled_1b_ss_uncommitted_head_invisible_then_claimed(ss_store: An
         ),
     )
     try:
-        res = await _claim_heads_no_block(ss_store, Stage.INGRESS.value, [channel], now=200.0)
+        res = await claim_heads_no_block(ss_store, Stage.INGRESS.value, [channel], now=200.0)
         assert res.by_lane == {}
         assert res.head_skipped == frozenset()  # #1270: never discovered, so never named skipped
         # Driver-level commit (autocommit=False pool): a SQL `COMMIT TRAN` only decrements the
@@ -613,7 +518,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
     channel_a, channel_b = "IB_P1CSSA", "IB_P1CSSB"
     a = await _seed_ingress(ss_store, channel_a, [100.0, 101.0])
     b = await _seed_ingress(ss_store, channel_b, [100.0])
-    conn, cur = await _ss_hold_row_lock(ss_store, a[0], Stage.INGRESS.value)
+    conn, cur = await ss_hold_row_lock(ss_store, a[0], Stage.INGRESS.value)
     try:
         res = await _claim_heads_until(
             ss_store, Stage.INGRESS.value, [channel_a, channel_b], now=200.0, per_lane_limit=8
@@ -621,7 +526,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
         assert set(res.by_lane) == {channel_b}
         assert [it.message_id for it in res.by_lane[channel_b]] == b
         assert res.head_skipped == frozenset({channel_a})  # #1270: A named, B (claimed) not
-        rows = await _ss_lane_pending(ss_store, channel_a)
+        rows = await ss_lane_pending(ss_store, channel_a)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
         await cur.execute("ROLLBACK TRAN")
@@ -662,7 +567,7 @@ async def test_pooled_1e_pg_midprefix_gap_truncates_tail_untouched(pg_store: Any
 async def test_pooled_1e_ss_midprefix_gap_truncates_tail_untouched(ss_store: Any) -> None:
     channel = "IB_P1ESS"
     mids = await _seed_ingress(ss_store, channel, [100.0, 101.0, 102.0])
-    conn, cur = await _ss_hold_row_lock(ss_store, mids[1], Stage.INGRESS.value)
+    conn, cur = await ss_hold_row_lock(ss_store, mids[1], Stage.INGRESS.value)
     try:
         res = await _claim_heads_until(
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
@@ -693,11 +598,11 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
     conn, tx = await _pg_hold_row_lock(pg_store, mids[0], Stage.INGRESS.value)
     try:
         for i in range(5):
-            res = await _claim_heads_no_block(
+            res = await claim_heads_no_block(
                 pg_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            _assert_skip_named(res, channel, abort_ok=False)  # #1270: every pass, not just one
+            assert_skip_named(res, channel, abort_ok=False)  # #1270: every pass, not just one
         rows = await _pg_lane_pending(pg_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [
             (OutboxStatus.PENDING.value, 0)
@@ -715,15 +620,15 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
 async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
     channel = "IB_P1FSS"
     mids = await _seed_ingress(ss_store, channel, [100.0, 101.0, 102.0])
-    conn, cur = await _ss_hold_row_lock(ss_store, mids[0], Stage.INGRESS.value)
+    conn, cur = await ss_hold_row_lock(ss_store, mids[0], Stage.INGRESS.value)
     try:
         for i in range(5):
-            res = await _claim_heads_no_block(
+            res = await claim_heads_no_block(
                 ss_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            _assert_skip_named(res, channel, abort_ok=True)  # #1270: every pass, not just one
-        rows = await _ss_lane_pending(ss_store, channel)
+            assert_skip_named(res, channel, abort_ok=True)  # #1270: every pass, not just one
+        rows = await ss_lane_pending(ss_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [(OutboxStatus.PENDING.value, 0)] * 3
     finally:
         await cur.execute("ROLLBACK TRAN")
