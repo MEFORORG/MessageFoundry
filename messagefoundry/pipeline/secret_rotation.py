@@ -247,8 +247,8 @@ def dek_fingerprint(key_id: str) -> str:
 #: The ``secret_rotation_meta`` row that is the rotation record (BACKLOG #3737): which store key
 #: ``rotate-key`` started on and has not finished. It tracks no secret and holds none. Its
 #: ``fingerprint`` is that key's :func:`dek_fingerprint`, or :data:`_ROTATION_RECORD_CLOSED` once a
-#: run completes, and its dates are when that last happened. A ``:`` keeps it apart from every
-#: environment-variable name. An ``env()`` key is free text, so the reconcile drops one with this
+#: run completes. Its dates are when it first opened, or when a run closed it. A ``:`` keeps it
+#: apart from every environment-variable name. An ``env()`` key is free text, so the reconcile drops one with this
 #: exact name rather than write a cell over the record. The row is unsealed, so the rotation pass
 #: leaves it alone and it reads the same under any key.
 ROTATION_RECORD_ID = "rotate-key:incomplete"
@@ -274,8 +274,11 @@ async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str,
     ``serve`` start reached first, and that start's stamp stands. A stamp under a scheme this release
     does not know cannot say so, and opens the record.
 
-    A record already open on this key keeps its dates, because a store with no stamp reads the key's
-    age from them, and a re-run must not make that age young again."""
+    An open record keeps its dates, whatever key it names and even when it cannot be read, because
+    a store with no stamp reads the key's age from them, and a run that only starts must not make
+    that age young again. They are copied as text, so a date that does not parse stays one, and
+    :func:`_kept_dates` reads it as an undetermined age. Only a closed or absent record takes
+    ``day``."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
@@ -283,8 +286,12 @@ async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str,
         record is not None and record.fingerprint == fingerprint
     ):
         return
+    held = None if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED else record
     await meta_store.upsert_secret_rotation_meta(
-        ROTATION_RECORD_ID, fingerprint=fingerprint, tracked_since=day, last_rotated=day
+        ROTATION_RECORD_ID,
+        fingerprint=fingerprint,
+        tracked_since=day if held is None else held.tracked_since,
+        last_rotated=day if held is None else held.last_rotated,
     )
 
 
@@ -321,8 +328,8 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
     ):
         return (
             "secret rotation: the rotation record could not be read, so the store key's rotation "
-            "date was not stamped and its age was not reset. A `messagefoundry rotate-key` run "
-            "that exits 0 replaces the record."
+            "date was not stamped and its age was not reset. `messagefoundry rotate-key` replaces "
+            "the record and keeps its dates, and a run that exits 0 closes it."
         )
     if fingerprints_equal(record.fingerprint, fingerprint):
         return (

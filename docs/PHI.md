@@ -626,9 +626,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    step did not complete (BACKLOG #3181). **A `serve` start does not stamp that key either (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
-   so a run killed or failed after that point leaves it open. While
-   it names the key in use, or cannot be read, `serve` logs a WARNING and reads the key's age from
-   the prior date, or from the date the record opened where there is none, and under
+   so a run killed or failed after that point leaves it open. When a start finds that the key in
+   use differs from its stamp, or has none, and the record names that key or cannot be read, `serve`
+   logs a WARNING and reads the key's age from the prior date, or from the date the record opened
+   where there is none. On a key that matches its stamp it says nothing about the record. Under
    `[security].enforcement = enforce` that date can refuse the start
    ([`[secret_rotation]`](CONFIGURATION.md)). A key changed with no record still stamps at the
    next start, including a start between setting the new key and the first run, so a stamp proves

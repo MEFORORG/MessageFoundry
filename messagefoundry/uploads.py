@@ -2934,9 +2934,9 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
 
 def _unopened_cause(cipher: AesGcmCipher, stored: str) -> str:
     """Why no key opened ``stored``, for the log, telling a key to supply from a damaged file
-    (BACKLOG #3737). It reads only the marker, and :meth:`AesGcmCipher.named_key_id` passes on
-    nothing but a well-formed id, so no text cut from a damaged or planted file reaches the log.
-    Only the head of ``stored`` is passed, because parsing a marker copies what follows it, and that
+    (BACKLOG #3737). It reads only the marker. :meth:`AesGcmCipher.named_key_id` passes only the
+    shape of a whole key id, so a planted value of that shape does reach the log, and any other
+    text does not. Only the head of ``stored`` is passed, because parsing a marker copies what follows it, and that
     can be a whole upload."""
     head = stored[:_MARKER_READ_LIMIT]
     key_id = cipher.named_key_id(head)

@@ -1490,9 +1490,10 @@ class AesGcmCipher(_UnmarkedPolicy):
 
     def named_key_id(self, stored: str) -> str | None:
         """The key id the marker of ``stored`` names, or ``None`` when it is unmarked, malformed, or
-        names anything but an id of the shape this cipher writes (BACKLOG #3737). Safe to log: a
-        malformed marker's id is cut from the stored text, so only an exact id passes. Reads only
-        the marker, never the ciphertext."""
+        names anything but an id of the shape this cipher writes (BACKLOG #3737). A marker's id is
+        cut from the stored text, so this passes only the shape of a whole key id. A planted value
+        of that shape does pass, and may name no real key. Reads only the marker, never the
+        ciphertext."""
         if not stored.startswith(MARKER_PREFIX):
             return None
         try:

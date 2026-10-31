@@ -26,8 +26,11 @@ from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import SecretRotationSettings
 from messagefoundry.pipeline.secret_rotation import (
     ROTATION_RECORD_ID,
+    SecretStamp,
+    StoreKeyRotationOverdueError,
     close_rotation_record,
     dek_fingerprint,
+    enforce_store_key_expiry,
     open_rotation_record,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
@@ -387,6 +390,133 @@ def test_a_store_with_no_stamp_yet_ages_from_the_record_and_persists_nothing(
     assert not persisted
     assert tracked == dek_fingerprint(_key_id(key))
     assert since == rotated == datetime.date(2020, 2, 2)
+
+
+async def _plant_record(db: Path, key: str, fingerprint: str, day: str) -> None:
+    store = await _open(db, key)
+    try:
+        await store.upsert_secret_rotation_meta(
+            ROTATION_RECORD_ID, fingerprint=fingerprint, tracked_since=day, last_rotated=day
+        )
+    finally:
+        await store.close()
+
+
+async def _age(db: Path, key: str) -> datetime.date:
+    """The date a start reads the DEK's age from, through the real reconcile."""
+    store = await _open(db, key)
+    try:
+        stamps = await reconcile_rotation_meta(
+            store,
+            SecretRotationSettings(),
+            dek_key_id=_key_id(key),
+            enforcement=SecurityEnforcement.WARN,
+            env_values={},
+        )
+        return stamps[_DEK].last_rotated
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", ["garbage", "sha256-16:" + "ab" * 8])
+def test_opening_over_an_open_record_keeps_its_dates(tmp_path: Path, stored: str) -> None:
+    """A damaged record, and one naming another key. With no stamp the key's age runs from these
+    dates, so a run that only starts must not make it young: that would lift an overdue refusal."""
+    db, key = tmp_path / "keep.db", generate_key()
+
+    async def run() -> SecretRotationMetaRow:
+        await _plant_record(db, key, stored, "2020-02-02")
+        store = await _open(db, key)
+        try:
+            await open_rotation_record(store, _key_id(key), "2026-10-30")
+            return (await store.get_secret_rotation_meta())[ROTATION_RECORD_ID]
+        finally:
+            await store.close()
+
+    row = asyncio.run(run())
+    assert row.fingerprint == dek_fingerprint(_key_id(key))  # replaced, so a later close finds it
+    assert (row.tracked_since, row.last_rotated) == ("2020-02-02", "2020-02-02")
+    assert asyncio.run(_age(db, key)) == datetime.date(2020, 2, 2)
+
+
+def test_opening_over_a_closed_record_dates_it_from_today(tmp_path: Path) -> None:
+    """The control: a blank is no rotation in progress, so its dates say nothing about this one."""
+    db, key = tmp_path / "fresh.db", generate_key()
+
+    async def run() -> str:
+        await _plant_record(db, key, "", "2020-02-02")
+        store = await _open(db, key)
+        try:
+            await open_rotation_record(store, _key_id(key), "2026-10-30")
+            return (await store.get_secret_rotation_meta())[ROTATION_RECORD_ID].last_rotated
+        finally:
+            await store.close()
+
+    assert asyncio.run(run()) == "2026-10-30"
+
+
+@pytest.mark.parametrize("day", ["not a date", ""])
+def test_a_record_whose_dates_do_not_parse_reads_as_an_undetermined_age(
+    tmp_path: Path, day: str
+) -> None:
+    """Written out of band. They are copied as text, and must crash neither the open nor the
+    reader. An undetermined age is not a young one, so it refuses under enforce."""
+    db, key = tmp_path / "dates.db", generate_key()
+
+    async def run() -> datetime.date:
+        await _plant_record(db, key, "garbage", day)
+        store = await _open(db, key)
+        try:
+            await open_rotation_record(store, _key_id(key), "2026-10-30")
+        finally:
+            await store.close()
+        return await _age(db, key)
+
+    last_rotated = asyncio.run(run())
+    assert last_rotated == datetime.date.min
+    with pytest.raises(StoreKeyRotationOverdueError):
+        enforce_store_key_expiry(
+            SecretRotationSettings(),
+            {_DEK: _held_stamp(key, last_rotated)},
+            enforcement=SecurityEnforcement.ENFORCE,
+            dek_key_id=_key_id(key),
+        )
+
+
+def test_an_overdue_refusal_stands_after_a_partial_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole path, through the command. A damaged record dated long ago, no stamp, one run that
+    stops short. The age must still read as overdue, so the start is refused under enforce."""
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "overdue.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    asyncio.run(_plant_record(db, key_a, "garbage", "2020-02-02"))
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+
+    last_rotated = asyncio.run(_age(db, key_b))
+    assert last_rotated == datetime.date(2020, 2, 2)
+    with pytest.raises(StoreKeyRotationOverdueError):
+        enforce_store_key_expiry(
+            SecretRotationSettings(),
+            {_DEK: _held_stamp(key_b, last_rotated)},
+            enforcement=SecurityEnforcement.ENFORCE,
+            dek_key_id=_key_id(key_b),
+        )
+
+
+def _held_stamp(key: str, day: datetime.date) -> SecretStamp:
+    return SecretStamp(
+        class_id=_DEK,
+        label="store data-encryption key",
+        fingerprint=dek_fingerprint(_key_id(key)),
+        tracked_since=day,
+        last_rotated=day,
+        max_age_days=SecretRotationSettings().store_key_max_age_days,
+    )
 
 
 def test_an_unreadable_record_logs_only_that_it_is_unreadable(

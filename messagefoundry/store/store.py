@@ -8248,7 +8248,8 @@ class SecretRotationMetaRow:
 
     One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
     #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
-    finished, unsealed, or blank once one finished. Its dates are when that last happened."""
+    finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
+    run closed it."""
 
     secret_key: str
     fingerprint: str
