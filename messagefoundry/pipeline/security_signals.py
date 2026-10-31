@@ -53,7 +53,6 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
-from messagefoundry.log_backoff import FailureRun
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
@@ -103,6 +102,8 @@ _SWITCH_LIST_LIMIT: Final = 200
 #: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
 #: longer window, which counts more strictly, must not also hold a second attack back for as long.
 _REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
+#: The least time between two log lines for failed sink calls of one event type.
+_SINK_FAILURE_LOG_SECONDS: Final = 60.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -304,9 +305,10 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
         self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
-        #: One failure run per event type whose sink call is failing; see :meth:`_notify`.
-        #: Keyed on the type alone, so its size is bounded by the fixed set of event types.
-        self._sink_failures: dict[str, FailureRun] = {}
+        #: Per event type whose sink call failed: when its next failure line may be written, and
+        #: how many failures were held back since its last line; see :meth:`_notify`. Keyed on the
+        #: type alone, so its size is bounded by the fixed set of event types.
+        self._sink_failures: dict[str, tuple[float, int]] = {}
         self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
@@ -453,16 +455,15 @@ class SecuritySignalDetector:
         )
 
     def release(self) -> None:
-        """Resolve the ``posture_loosened`` this detector raised. When it runs, and when it does
-        not, is stated once on :func:`install_security_signals`'s ``resolve_on_stop``."""
+        """Raise ``posture_restored`` for the ``posture_loosened`` this detector raised. Called
+        once, by the remover :func:`install_security_signals` returns; its ``resolve_on_stop``
+        says when that resolves the alert and when the alert stays open."""
         if self._posture_raised is not None:
             self._restore(self._posture_raised)
 
     def _restore(self, subject: str) -> None:
-        # Cleared only once the sink took the inverse, so a release whose call failed can be
-        # tried again rather than reporting the alert resolved.
-        if self._notify("posture_restored", lambda: self._sink.posture_restored(subject)):
-            self._posture_raised = None
+        self._posture_raised = None
+        self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
 
     def _raise(self, signal: str, subject: str, count: int, detail: str) -> bool:
         return self._notify(
@@ -473,38 +474,34 @@ class SecuritySignalDetector:
     def _notify(self, event: str, call: Callable[[], None]) -> bool:
         """Run one sink call; False when the sink raised.
 
-        A sink that keeps raising no longer starts the refusal quiet period, so a refused peer,
-        which costs itself nothing, could otherwise write a line per ``peer_refusals`` refusals.
-        So each event type keeps one :class:`~messagefoundry.log_backoff.FailureRun`: one type's
-        failures never silence another's line, each line carries the run's count, and the first
-        success of that type after a run writes one recovery line. It is keyed on the type alone,
-        never the subject, because a caller can choose subjects (a client address, a username):
-        keyed on them, a spread of subjects would write a line each. So the count is of every
-        failed call of that type, over all its subjects, and a line does not say which subject
-        failed. The record carries the sink exception's type name only, never its message, which a
-        sink may build from the alert's subject or detail."""
+        A failure is logged at WARNING at most once per :data:`_SINK_FAILURE_LOG_SECONDS` per
+        event type, whatever the subject, the exception type, or any success in between. The next
+        line carries how many failures of that type were held back since the last one. So the
+        lines written are bounded by the number of event types times the minutes elapsed. A
+        sink that keeps raising no longer starts the refusal quiet period, and a caller can choose
+        subjects (a client address, a username), so a key on the subject would let a refused
+        peer, or a spread of subjects, write a line each. A line does not say which subject
+        failed, and no line marks a recovery. It carries the sink exception's qualified type name
+        only, never its message, which a sink may build from the alert's subject or detail."""
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            self._sink_failures[event] = self._sink_failures.get(event, FailureRun()).record(
-                log,
-                _SinkFault(f"{type(exc).__module__}.{type(exc).__qualname__}"),
-                "security-signal alert %s could not be raised",
+            now = self._clock()
+            next_at, held = self._sink_failures.get(event, (float("-inf"), 0))
+            if now < next_at:
+                self._sink_failures[event] = (next_at, held + 1)
+                return False
+            self._sink_failures[event] = (now + _SINK_FAILURE_LOG_SECONDS, 0)
+            log.warning(
+                "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
+                "alert type held back since the last such line; at most one line every %gs)",
                 event,
-                level=logging.WARNING,
+                f"{type(exc).__module__}.{type(exc).__qualname__}",
+                held,
+                _SINK_FAILURE_LOG_SECONDS,
             )
             return False
-        if event in self._sink_failures:
-            self._sink_failures.pop(event).clear(
-                log, "security-signal alert %s", event, level=logging.WARNING
-            )
         return True
-
-
-class _SinkFault(Exception):
-    """Stands in for a sink's exception in a :class:`~messagefoundry.log_backoff.FailureRun`
-    record. Its message is the original's qualified type name, so the run keys on the type and
-    the record carries no text the sink built from an alert."""
 
 
 def install_security_signals(
@@ -519,15 +516,19 @@ def install_security_signals(
     observers while it counts refusals; returns the function that removes it.
 
     ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
-    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. The
-    function this returns then resolves it, as
+    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. A lone
+    engine or a pinned node needs no such step: its next start that records no loosening resolves
+    the alert under the same subject. With ``resolve_on_stop``, the function this returns raises
+    ``posture_restored`` once, as
     :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts. The
-    managed lifespan calls that function from the ``finally`` block around its whole span, so the
-    alert is resolved on any shutdown that reaches that block, a failed startup or a cancelled
-    lifespan among them. A process killed outright never reaches it, and its alert stays open
-    under the dead node's id until an operator resolves it. This is the one statement of that
-    boundary; the docs point here. The removal must run on ``loop``'s thread, before the store
-    closes.
+    managed lifespan calls it from the ``finally`` block around its whole span, so it runs on any
+    shutdown that reaches that block, a failed startup or a cancelled lifespan among them. The
+    unpinned node's alert stays open under the dead node's id at least after a hard kill, which
+    never reaches the block, and when that ``posture_restored`` call fails or its write does not
+    land before the store closes: nothing retries it. An operator then resolves it with
+    ``POST /alerts/{alert_id}/resolve``, which needs ``monitoring:diagnose``, or from the web
+    console's alert list. The docs point here for this boundary. The removal must run on
+    ``loop``'s thread, before the store closes.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
     onto ``loop``, so the detector's state and the sink are only touched from one thread."""

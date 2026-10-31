@@ -901,7 +901,7 @@ class AlertSink(Protocol):
         engine processes share the store, so one process's clean start never clears another's. An
         unpinned cluster node's id changes on every start, so it raises this for its own alert as
         it shuts down; ``install_security_signals`` in ``pipeline/security_signals.py`` says when
-        that runs. A start that could not read its list raises neither. No PHI."""
+        the alert still stays open. A start that could not read its list raises neither. No PHI."""
         ...
 
     # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------

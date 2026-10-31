@@ -1554,8 +1554,8 @@ def _managed_teardown_steps(
                 "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
-    # Before engine.stop(): on an unpinned cluster node the removal resolves its posture alert,
-    # and engine.stop() drains that write before the store closes.
+    # Before engine.stop(): on an unpinned cluster node the removal raises its posture alert's
+    # inverse, and engine.stop() gives that write a bounded chance before the store closes.
     steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
     steps.append(
         _TeardownStep(
@@ -3107,8 +3107,8 @@ def _install_security_signals(
     return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
     itself a loosening, and the posture detector, the one it leaves running, is what reports it.
     The posture subject names this engine process, and an unpinned cluster node, whose id changes
-    on every start, resolves its own posture alert as it shuts down; ``install_security_signals``'s
-    ``resolve_on_stop`` says when that runs and when it does not."""
+    on every start, raises the inverse for its own posture alert as it shuts down;
+    ``install_security_signals``'s ``resolve_on_stop`` says when that alert still stays open."""
     return install_security_signals(
         sink,
         SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
