@@ -584,11 +584,20 @@ def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
     """CLAUDE.md section 6: the fallback is never silent. The setting is configuration that may hold
     anything, so the warning names the connection and leaves the value out."""
     with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
-        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_ACME_ADT")
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
+        # Every message on that inbound fails alike, so a second reply adds no line.
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
-    assert "IB_ACME_ADT" in warnings[0] and "utf-8" in warnings[0]
+    assert "IB_FALLBACK_LOG_ADT" in warnings[0] and "utf-8" in warnings[0]
     assert "zz-secretish-codec" not in warnings[0]
+
+
+def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() -> None:
+    """``idna`` is a usable codec that raises for one reply. That is the reply's fault, so it is not
+    sent in utf-8 under an "unusable charset" warning, as ``decode_body`` decides it by the name."""
+    with pytest.raises(UnicodeError):
+        frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
 
 
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])

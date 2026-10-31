@@ -8932,7 +8932,8 @@ class RegistryRunner:
                 # member with rewrite=False and never rewrites the envelope. A hydration failure is
                 # not a refusal, so it stays what shadow made it before, a completed delivery, unless
                 # the payload itself caused it: that one is a permanent refusal and dead-letters, as
-                # live (vault #2809). A store read fault is not a hydration failure: it re-pends, as
+                # live (vault #2809). Only on a framing connector: a shadow outbound that does not
+                # frame never hydrates, so it completes a row live would dead-letter. A store read fault is not a hydration failure: it re-pends, as
                 # live (vault #2756).
                 if _frames(connector):
                     try:
@@ -11325,8 +11326,9 @@ class _RedactedFault(Exception):
 
 class UserCodeCalledSysExit(_RedactedFault):
     """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
-    #3134). Converted at each place that code runs, so the message takes the internal-error policy
-    as for any other raise.
+    #3134). Converted at least where the engine runs that code in-process, so the message takes the
+    internal-error policy as for any other raise. Not under ``[sandbox].mode`` subprocess or
+    isolated, where the child's handler arm catches only ``Exception``.
 
     **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
     to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code

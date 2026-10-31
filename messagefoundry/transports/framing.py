@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 #: ``MSH`` segment (ADR 0209).
 MULTIPLE_MESSAGES_CODE = "multiple-messages"
 
+#: The listeners whose reply-charset fallback has been logged. One line per connection, not per
+#: reply: an unusable name fails every message alike, and each one already has its ERROR row.
+#: Bounded by the configured inbounds, since the key is a connection name.
+_reply_fallback_logged: set[str] = set()
+
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
     """Frame one outbound ``payload`` for the wire, or refuse it permanently (ADR 0205 rule 1).
@@ -119,6 +124,15 @@ def declared_encoding(declared: object) -> str:
     return str(declared) if declared else "utf-8"
 
 
+def _charset_encodes(encoding: str) -> bool:
+    """Whether ``encoding`` names a text codec that encodes at all, probed on one ASCII letter."""
+    try:
+        "a".encode(encoding)
+    except (LookupError, UnicodeError):
+        return False
+    return True
+
+
 def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str = "") -> bytes:
     """Frame a listener's reply, with each of the codec's start and end bytes replaced by a space.
 
@@ -134,17 +148,24 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
     the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
     cannot hold one reply's characters still raises, which the listener's last-resort arm owns.
-    ``connection`` names the listener in the warning the fallback logs. The charset setting itself
-    is not logged, since it is configuration that may hold anything."""
+    Usable is decided by probing the NAME, as ``decode_body`` decides it: a usable codec such as
+    ``idna`` can raise a bare ``UnicodeError`` for one reply, which still raises here.
+    ``connection`` names the listener in the warning the fallback logs, once per connection. The
+    charset setting itself is not logged, since it is configuration that may hold anything."""
     try:
         body = reply.encode(encoding)
     except UnicodeEncodeError:
         raise
     except (LookupError, UnicodeError):
-        logger.warning(
-            "inbound %r: the reply charset is unusable, so the reply was encoded in utf-8 instead",
-            connection,
-        )
+        if _charset_encodes(encoding):
+            raise
+        if connection not in _reply_fallback_logged:
+            _reply_fallback_logged.add(connection)
+            logger.warning(
+                "inbound %r: the reply charset is unusable, so its replies are encoded in utf-8 "
+                "instead (logged once per connection)",
+                connection,
+            )
         body = reply.encode("utf-8")
     if codec.start in body or codec.end in body:
         logger.warning(
