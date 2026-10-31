@@ -528,6 +528,7 @@ def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
 # Only the WARNING is dropped on the rebuild: every refusal still runs there (vault BACKLOG #2605).
 
 _KEYED = "https://p.example.invalid/x?key=PLACEHOLDER&v={v}"
+_LOOKUP_URL = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
 
 
 def _warned(caplog: pytest.LogCaptureFixture, label: str) -> int:
@@ -551,8 +552,7 @@ def _reload_graph(
             build_outbound_connection(name, spec, priority=priority, schedule=schedule)
         )
     if fhir:
-        lookup_url = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
-        reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": lookup_url}))
+        reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": _LOOKUP_URL}))
     return reg
 
 
@@ -694,29 +694,86 @@ async def test_a_start_and_an_operator_start_still_warn_once(
         await runner.stop()
 
 
-async def test_a_failed_fhir_lookup_leaves_each_survivor_one_warning_at_start(
-    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("warn", [True, False])
+async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_start(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture, warn: bool
 ) -> None:
     """The whole-graph build fails at ``LK_BAD``, then each lookup builds alone, then the survivors
     build again. Each build used to warn for every lookup it was given: three lines for a survivor
-    and two for ``LK_BAD``. A lookup that did not build logs nothing, and
-    docs/SECURITY-LOOSENING.md states what that costs."""
+    and two for ``LK_BAD``. Now each lookup whose settings resolved logs one line.
+
+    The control this pins is the ASVS 14.2.1 record for a lookup that is down: ``LK_BAD``'s
+    settings resolved and its build failed, and it keeps its one WARNING, so an ``env()`` URL with a
+    query credential is named while the lookup is isolated. Warning only for the survivors fails
+    the ``LK_BAD`` count. ``LK_UNSET``'s ``env()`` URL never resolved, so there is no URL to read
+    and it logs none. The ``warn=False`` case is the start ``Engine.reload_detail`` makes after its
+    build check: every count is zero there, on the isolation path as on the healthy one."""
     reg = Registry()
-    urls = {
-        "LK_A": "https://fhir.example.invalid/R4?api_key=PLACEHOLDER",
+    urls: dict[str, str | EnvRef] = {
+        "LK_A": _LOOKUP_URL,
         "LK_BAD": "ftp://fhir.example.invalid/R4?api_key=PLACEHOLDER",  # not http or https
-        "LK_Z": "https://fhir.example.invalid/R4?api_key=PLACEHOLDER",
+        "LK_UNSET": EnvRef("MEFOR_UNSET_LOOKUP_URL"),
+        "LK_Z": _LOOKUP_URL,
     }
     for name, url in urls.items():
         reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": url}))
     runner = _reload_runner(reload_store, reg)
     try:
         with caplog.at_level(logging.WARNING):
+            await runner.start(warn_query_credentials=warn)
+        assert sorted(runner.degraded_fhir_lookups()) == ["LK_BAD", "LK_UNSET"]
+        assert _warned(caplog, "FhirLookup 'LK_A'") == int(warn)
+        assert _warned(caplog, "FhirLookup 'LK_Z'") == int(warn)
+        assert _warned(caplog, "FhirLookup 'LK_BAD'") == int(warn)
+        assert _warned(caplog, "FhirLookup 'LK_UNSET'") == 0
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_of_an_unstarted_runner_warns_and_its_later_start_warns_again(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """docs/SECURITY-LOOSENING.md states it: a reload of a runner that exists but is not started
+    runs its build check and makes no builds, so the later start, which has no build check before
+    it, logs the WARNING again."""
+    runner = _reload_runner(reload_store, _reload_graph(v=1))
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.reload(_reload_graph(v=2, fhir=True))
+        assert "OB_KEYED" not in runner._destinations  # no build
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
             await runner.start()
-        assert list(runner.degraded_fhir_lookups()) == ["LK_BAD"]
-        assert _warned(caplog, "FhirLookup 'LK_A'") == 1
-        assert _warned(caplog, "FhirLookup 'LK_Z'") == 1
-        assert _warned(caplog, "FhirLookup 'LK_BAD'") == 0
+        assert "OB_KEYED" in runner._destinations
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
+    finally:
+        await runner.stop()
+
+
+async def test_an_unlisted_forward_proxy_logs_none_for_an_outbound_and_one_for_a_lookup(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """docs/SECURITY-LOOSENING.md states both halves. An outbound's egress check refuses the proxy
+    before it reaches the warning, so a lane that fails there logs none. A ``FhirLookup`` with the
+    same proxy has resolved settings, so its start still logs one line while it is isolated."""
+    proxy = {"proxy_url": "http://proxy.example.invalid:3128"}
+    reg = Registry()
+    spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1), **proxy})
+    reg.add_outbound(build_outbound_connection("OB_KEYED", spec))
+    reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": _LOOKUP_URL, **proxy}))
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
+        assert "OB_KEYED" not in runner._destinations
+        assert list(runner.degraded_fhir_lookups()) == ["LK"]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("forward proxy set with an empty" in m for m in messages)
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 0
+        assert _warned(caplog, "FhirLookup 'LK'") == 1
     finally:
         await runner.stop()
 
@@ -794,8 +851,9 @@ async def test_a_reload_that_drops_the_schedule_warns_once_for_a_lane_with_its_c
 async def test_a_window_open_that_builds_the_lane_warns(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The default ``_start_outbound_unsafe`` keeps: no build check runs before a window open, so
-    this build is the only one to warn. It is why the resume path above passes no flag."""
+    """The warning default of ``_ensure_destination_built``, which a window open builds through: no
+    build check runs before a window open, so this build is the only one to warn. It is why the
+    resume path above passes no flag."""
     now = [_OUTSIDE]
     runner = _reload_runner(
         reload_store,

@@ -1817,25 +1817,27 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
 > outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
-> parameter named like a credential: `key`, `sig`, `signature`, a name ending in `token`, `secret`,
-> `password` or `credential` (as `access_token` or `accessToken`), and the rest of the engine's
-> credential vocabulary. ASVS 14.2.1.
+> parameter named like a credential: `key`, `sig`, `signature`, most names ending in `token`,
+> `secret`, `password` or `credential` (as `access_token` or `accessToken`), and the rest of the
+> engine's credential vocabulary. A few such names are known not to be credentials and are left
+> alone, at least `page_token` and `next_token`; `secretscrub.py` `_QUERY_NOT_CREDENTIAL_TAILS` is the
+> list. ASVS 14.2.1.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole
   URL. The rule that decides which URL settings are withheld, and what a withheld one shows, is
   stated once, in `config/wiring.py` `_url_may_carry_a_credential`; it withholds more than this
   entry's URLs, and it does not reach a secret that is a bare path segment.
-- **Where it is refused, and why it is only reported elsewhere:** on the HTTP rows of
-  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer),
-  it is refused with no escape: at least `verify_tls = false` on an `https` URL, and a plain `http`
-  URL to a host off this machine. There, a name that only looks like a credential is refused too.
-  Where those rows do not apply, it is reported. A credential in the URL's user part,
-  `user:password@`, is refused at construction,
-  because that shape never authenticated anything and its error text carried the password. A query
-  credential does authenticate, and some partner APIs take it nowhere else, such as a shared-access
-  `sig` or an API `key`. The detection is also a guess from the parameter name, and a wrong refusal
-  would have no override.
+- **Where it is refused, and why it is only reported elsewhere:** the HTTP rows of
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer)
+  refuse it with no escape, and that section says which hops they cover. There, a name that only
+  looks like a credential is refused too: the peer is unverified, so a false refusal is the cost
+  that rule accepts. Where those rows do not apply, it is reported. A credential in the URL's user
+  part, `user:password@`, is refused at construction, because that shape never authenticated
+  anything and its error text carried the password. A query credential does authenticate, and some
+  partner APIs take it nowhere else, such as a shared-access `sig` or an API `key`. The detection is
+  also a guess from the parameter name, so on a verified peer a refusal would remove a working hop,
+  with no override, for a name that may not be a credential.
 - **When acceptable:** the partner accepts the credential only in the query. If it takes a header, use
   `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
@@ -1848,8 +1850,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
-  again. A `FhirLookup` that fails to build at a start logs no WARNING, because no read can go
-  through it; its failure is recorded and alerted, and each lookup that did build logs it once. An
+  again. At a start, each `FhirLookup` whose settings resolved logs it once, one that then fails to
+  build included, so the URL is named while the lookup is down; its failure is recorded and
+  alerted. A lookup whose `env()` value did not resolve has no URL to read and logs none. An
   outbound that fails to build may have logged it first. One that fails earlier, as on an unresolved
   `env()` value or an unlisted forward proxy, logs none. An `env()` URL on a connection that logged
   none appears nowhere until a later build or check logs it. There is also a

@@ -2487,24 +2487,28 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup that built,
-        after the build that kept it. A caller whose build check has already warned passes False
-        (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
+        settings resolved, a lookup whose build then failed included, so an ``env()`` URL carrying a
+        query credential is recorded while its lookup is down (ASVS 14.2.1). A lookup whose
+        settings did not resolve has no URL to read and logs none. A caller whose build check has
+        already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
 
-        def build(
-            names: Iterable[str],
-            failed: Mapping[str, str] | None = None,
-            *,
-            warn: bool,
-        ) -> FhirLookupExecutor:
+        def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved = {
-                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-                for name in names
-            }
+            return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+
+        def warn(resolved: Mapping[str, Mapping[str, Any]]) -> None:
+            if warn_query_credentials:
+                for name, lookup_settings in resolved.items():
+                    warn_url_query_credentials(f"FhirLookup {name!r}", lookup_settings)
+
+        def build(
+            resolved: Mapping[str, Mapping[str, Any]],
+            failed: Mapping[str, str] | None = None,
+        ) -> FhirLookupExecutor:
             # #200 (ADR 0092): stamp the derived posture around the live executor build so each
             # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
             # captures THIS instance's posture rather than the unstamped fail-closed default.
@@ -2515,41 +2519,48 @@ class RegistryRunner:
                 # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
                 # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
                 # against an internal FHIR server could otherwise never name an internal CA.
-                executor = FhirLookupExecutor(
+                return FhirLookupExecutor(
                     resolved,
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    # The executor warns before it knows which lookups build.
+                    # warn() logs it once per lookup; this method may build one three times.
                     warn_query_credentials=False,
                 )
-            if warn:
-                for name, lookup_settings in resolved.items():
-                    warn_url_query_credentials(f"FhirLookup {name!r}", lookup_settings)
-            return executor
 
-        try:
-            # A healthy graph builds once, as it always did.
-            return build(specs, warn=warn_query_credentials)
-        except Exception:
-            if isolated is None:
-                raise
+        # Settings resolve once, with no I/O, so the warning has one call site and comes before any
+        # build: a lookup that then fails to build keeps its record.
+        settled: dict[str, dict[str, Any]] = {}
+        errors: dict[str, Exception] = {}
+        for name in specs:
+            try:
+                settled[name] = resolve(name)
+            except Exception as exc:
+                errors[name] = exc
+        warn(settled)
+        if not errors:
+            try:
+                return build(settled)  # a healthy graph builds once, as it always did
+            except Exception:
+                if isolated is None:
+                    raise
+        if isolated is None:
+            raise next(iter(errors.values()))
         # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
         # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
         # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its TLS
         # warning and attestation lines, so on this path each surviving lookup logs those again per
-        # build, and they are kept at every construction (ADR 0153). That cost falls only on a start
-        # that already failed, and keeps the healthy start to one build. The query-credential WARNING
-        # is not among them: only the last build below logs it, for the lookups that survive.
-        errors: dict[str, Exception] = {}
-        for name in specs:
+        # build. That cost falls only on a start that already failed, and keeps the healthy start to
+        # one build.
+        for name, lookup_settings in settled.items():
             try:
-                build([name], warn=False)
+                build({name: lookup_settings})
             except Exception as exc:
                 errors[name] = exc
+        errors = {name: errors[name] for name in specs if name in errors}  # in graph order
         failed = {name: safe_exc(err) for name, err in errors.items()}
-        survivors = [name for name in specs if name not in errors]
-        executor = build(survivors, failed, warn=warn_query_credentials)
+        survivors = {name: s for name, s in settled.items() if name not in errors}
+        executor = build(survivors, failed)
         isolated.update(errors)
         return executor
 

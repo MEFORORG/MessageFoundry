@@ -318,7 +318,8 @@ def check_fhir_lookup_allowed(
     ``[egress].allowed_proxy`` here too — outside the ``allowed_http`` guard below, because that list
     being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep).
 
-    ``warn_query_credentials`` is as on :func:`check_egress_allowed`."""
+    ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
+    refusal. The runner's live builds pass it and log the line themselves (vault BACKLOG #2910)."""
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if warn_query_credentials:
         warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
@@ -352,26 +353,27 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
     the parameter NAMES, never a value or the URL.
 
-    This warns and does not refuse. Other code refuses the same names with no escape, at least
-    ``transports.rest.refuse_verify_off`` on a ``verify_tls = false`` https hop (vault BACKLOG
-    #3230) and ``transports.rest.refuse_cleartext_credentials`` over plain http off this machine
-    (vault BACKLOG #3533). Elsewhere the warning is all there is, and the reason is the
-    difference from the userinfo precedent. ``transports.rest.refuse_url_credentials`` REFUSES
-    ``user:password@`` because that shape never authenticated anything: urllib reads it as part of
-    the host, and the error text carried the password into ``queue.last_error``. A query credential
-    does authenticate, and some partner APIs take it nowhere else (a shared-access ``sig``, an API
-    ``key``), so a refusal would remove the hop with no header to move it to. The detection is also
-    a heuristic over names, and a false refusal has no override. What the warning records is the
-    cost: the request line, query and all, lands in the partner's and every proxy's access log. The
-    engine's own log lines already drop the query (``_peer_label``, ``rest._redact_url``).
+    This warns and does not refuse. On the hops docs/SECURITY-LOOSENING.md *No escape sends a
+    credential to an unverified peer* covers, ``transports.rest.refuse_verify_off`` and
+    ``transports.rest.refuse_cleartext_credentials`` refuse the same names with no escape, and
+    accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533). Elsewhere
+    the warning is all there is, and the reason is the difference from the userinfo precedent.
+    ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
+    authenticated anything: urllib reads it as part of the host, and the error text carried the
+    password into ``queue.last_error``. A query credential does authenticate, and some partner APIs
+    take it nowhere else (a shared-access ``sig``, an API ``key``), so a refusal would remove the hop
+    with no header to move it to. The detection is also a heuristic over names, so on a verified
+    peer a false refusal would remove a working hop with no override. What the warning records is
+    the cost: the request line, query and all, lands in the partner's and every proxy's access log.
+    The engine's own log lines already drop the query (``_peer_label``, ``rest._redact_url``).
 
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
     least check, start, operator start and test), from :func:`check_fhir_lookup_allowed`, its
-    FhirLookup twin, and from the runner's ``_build_fhir_lookup_executor``, which holds the warning
-    back until it knows which lookups built. All run on env-resolved settings, so this sees a URL
-    that ``env()`` supplied. A reload skips it on the builds that follow its build check, which has
-    already warned; :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the source
-    of record for where it fires.
+    FhirLookup twin, and from the runner's ``_build_fhir_lookup_executor``, which logs it once per
+    lookup whose settings resolved, however many builds it makes. All run on env-resolved
+    settings, so this sees a URL that ``env()`` supplied. A reload skips it on the builds that
+    follow its build check, which has already warned; :func:`check_egress_allowed` says how.
+    docs/SECURITY-LOOSENING.md is the source of record for where it fires.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")
