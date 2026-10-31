@@ -187,7 +187,7 @@ def abandon_one_shot(conn: Any, cur: Any) -> bool:
     raw = getattr(conn, "_conn", None)
     if gate is None or raw is None:
         return False
-    _hand_off(conn, raw, getattr(cur, "_impl", None), gate, logging.WARNING)
+    _hand_off(conn, raw, _raw_cursor(cur), gate, logging.WARNING)
     return True
 
 
@@ -204,26 +204,36 @@ async def close_one_shot(conn: Any, cur: Any) -> None:
     :func:`asyncio.wait`, which never cancels what it waits on: the cancellation propagates at
     once, and the job still closes the cursor once, then the connection once, whether it was
     waiting for a worker or running. Its outcome is logged by the job's own callback. An ungated
-    connection gets a gate of its own for the job, whose lock nothing else contends.
+    connection gets a gate of its own for the job. That gate only keeps the job's two closes in
+    order: it does not serialize them against a call already running on the connection, which is
+    why :func:`abandon_one_shot` does not take an ungated connection's close as safe.
 
     A connection or cursor with no raw handle (a stand-in) is closed through its own ``close``
     methods instead, best effort, and a cancellation can cut that short. A real aioodbc cursor
     with no ``_impl`` takes that path too, which is logged at ERROR, as an ungateable connection
     is: aioodbc renamed what this reads."""
     raw = getattr(conn, "_conn", None)
-    raw_cur = getattr(cur, "_impl", None)
+    raw_cur = _raw_cursor(cur)
     if raw is None or (cur is not None and raw_cur is None):
-        if raw is not None and type(cur).__module__.startswith("aioodbc"):
-            log.error(
-                "odbc: aioodbc %s has no _impl; a one-shot close is not run as one job through"
-                " the call gate (BACKLOG #2394)",
-                type(cur).__qualname__,
-            )
         await _close_through_methods(conn, cur)
         return
     closing = _hand_off(conn, raw, raw_cur, call_gate(conn) or CallGate(), logging.DEBUG)
     if closing is not None:
         await asyncio.wait((closing,))
+
+
+def _raw_cursor(cur: Any) -> Any:
+    """``cur``'s pyodbc cursor, or ``None``. A real aioodbc cursor without one is logged at ERROR,
+    as an ungateable connection is: aioodbc renamed what this reads, and the cursor is then left
+    for the collector or closed outside the one-shot job."""
+    raw_cur = getattr(cur, "_impl", None)
+    if raw_cur is None and cur is not None and type(cur).__module__.startswith("aioodbc"):
+        log.error(
+            "odbc: aioodbc %s has no _impl; a one-shot exit cannot hand its cursor to the call"
+            " gate (BACKLOG #2394)",
+            type(cur).__qualname__,
+        )
+    return raw_cur
 
 
 def _hand_off(

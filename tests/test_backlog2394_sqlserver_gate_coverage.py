@@ -392,3 +392,42 @@ async def test_an_ordinary_cluster_table_setup_closes_its_cursor_before_release(
     assert rig.log.index("commit") < rig.log.index("cursor.close"), rig.log
     assert "conn.close" not in rig.log
     assert pool.free == [pool._conn]
+
+
+class _RenamedCursor:
+    """An aioodbc-shaped cursor whose pyodbc handle is not at ``_impl``, as after a rename."""
+
+    __module__ = "aioodbc.cursor"
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_a_real_cursor_with_no_raw_handle_is_logged_at_error(
+    rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one-shot exits read aioodbc's ``_impl``. A real cursor without it cannot be handed to
+    the gate, and that must not pass silently; a stand-in's missing ``_impl`` is not logged."""
+    rig.release.set()
+    conn = AioConn(rig.raw(blocks=never), rig.executor)
+    install_call_gate(conn)
+    cur = _RenamedCursor()
+    with caplog.at_level("ERROR", logger="messagefoundry.odbc_call_gate"):
+        await close_one_shot(conn, cur)
+    assert cur.closed and conn.closed
+    assert [r.levelname for r in caplog.records] == ["ERROR"], caplog.text
+    assert "_RenamedCursor has no _impl" in caplog.text
+
+    caplog.clear()
+    stand_in = _StandInCursor()
+    with caplog.at_level("ERROR", logger="messagefoundry.odbc_call_gate"):
+        await close_one_shot(AioConn(rig.raw(blocks=never), rig.executor), stand_in)
+    assert stand_in.closed
+    assert not caplog.records, caplog.text
+
+
+class _StandInCursor(_RenamedCursor):
+    __module__ = __name__
