@@ -1488,13 +1488,23 @@ class AesGcmCipher(_UnmarkedPolicy):
         Lets a caller tell a cell whose AEAD tag fails under a key it holds (the cell does not
         belong where it is) from one sealed under a key that is not configured. False for an
         unmarked or malformed value. Reads only the marker, never the ciphertext."""
+        return self.named_key_id(stored) in self._keyring
+
+    def named_key_id(self, stored: str) -> str | None:
+        """The key id the marker of ``stored`` names, or ``None`` when it is unmarked, malformed, or
+        names anything but an id of the shape this cipher writes (BACKLOG #3737). A marker's id is
+        cut from the stored text, so this passes only the shape of a whole key id. A planted value
+        of that shape does pass, and may name no real key. Reads only the marker, never the
+        ciphertext."""
         if not stored.startswith(MARKER_PREFIX):
-            return False
+            return None
         try:
             key_id, _salt, _blob = self._parse(stored)
         except CipherError:
-            return False
-        return key_id in self._keyring
+            return None
+        return (
+            key_id if len(key_id) == _KEY_ID_LEN and not key_id.strip("0123456789abcdef") else None
+        )
 
     def audit_mac_key(self) -> bytes:
         """The HKDF-derived HMAC key for the tamper-evident audit chain (#190-B). Keys the

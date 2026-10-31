@@ -669,7 +669,8 @@ async def test_the_batch_envelope_still_goes_out_through_the_real_send(
     )
     monkeypatch.setattr(dest, "_send_once", record)
     mids = await _enqueue(store, 3)
-    await _run_one_batch(store, simulate=False, dest=dest)
+    async with contextlib.aclosing(dest):
+        await _run_one_batch(store, simulate=False, dest=dest)
     (wire,) = sent
     (frame,) = list(MLLP_CODEC.decoder().feed(wire))
     envelope = frame.decode("utf-8")
