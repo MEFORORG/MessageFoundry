@@ -3186,21 +3186,37 @@ def prints_a_codec_error(exc: BaseException, *, share: _ScanShare | None = None)
 
 
 class _ScanShare:
-    """Verdicts the scans of one traceback hand on (:func:`safe_traceback`), so each exception in a
-    long chain does not read the rest of it again (vault BACKLOG #3340). Each link's first pass has
-    a whole :data:`_ATTRIBUTE_BUDGET`. The added passes of every link share one more, ``added``. One
+    """What the scans of one traceback share (:func:`safe_traceback`, vault BACKLOG #3340). This is
+    the one place the added pass's budgets and costs are written down; :class:`_Scan`,
+    :func:`_added_pass` and :func:`safe_traceback` point here.
+
+    BUDGETS. Each link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's
+    scan does, and can end one unit past it. A scan with no share runs its added pass on what its
+    first pass left. In a traceback, a link's added pass runs on the smaller of that and what is
+    left of ``added``, one more budget the added passes of every link share, so a long chain whose
+    scans each run out is not read once per link. The first passes never draw on ``added``. One
     link's added reads of a single large object, such as an exception group in its chain, can spend
-    all of it, even on a two-link chain. A later link's added read is then left unmade, and that
-    link prints as origin/main would: an error only an added read reaches prints raw.
+    all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
+    error only they would reach prints raw. That link prints as it did before this change, with two
+    exceptions: a True verdict handed on to it below still prints the note, and its first pass reads
+    an exception's instance ``__dict__`` through :data:`_EXC_DICT`, even where the class puts
+    something else under that name, where before this change it read none.
 
-    ``verdicts`` maps the id of an exception whose own code renders it to that exception and its
-    answer. A scan whose added pass read such an exception the deep way records True when it holds
-    a Unicode error, and False only when no read in that scan can have been cut short.
+    COSTS IN THE ADDED PASS (:func:`_added_pass`). It reads an object at most twice: once the plain
+    way, and once the deep way, beneath or as an exception whose own code renders it. Each read
+    takes only the readers the reads before it lacked. A read of an object no earlier read met costs
+    one unit, one for each element read when it is a container, scalars included, and one for each
+    value read through its readers. Of an object an earlier read met, a plain read with no reader
+    left to add costs nothing; any other plain read costs one unit and each value read, and follows
+    none of its elements again; a deep read costs one unit, each value read, and one for each
+    non-scalar element not yet read the deep way, which it follows again.
 
-    ``added`` is what the added passes of one traceback's scans may spend together, so a long chain
-    whose scans each run out is not read once per link. The first passes never draw on it: each
-    still has a whole budget, so what one link adds cannot keep another link's first pass from an
-    object."""
+    VERDICTS. ``verdicts`` maps an exception's id to that exception and its answer, so a later
+    link's scan returns the answer without reading. A scan records one only for an exception whose
+    own ``__str__`` or ``__repr__`` is not a builtin exception's, and only when its added pass read
+    that exception the deep way: True when it holds a Unicode error, and False only when the scan's
+    remainder is larger than the most slots and chain links any one of its reads went through, which
+    it takes as the sign that no read was cut short."""
 
     __slots__ = ("added", "verdicts")
 
@@ -3224,8 +3240,8 @@ class _Scan:
 
     The second walk reads by attribute (:func:`_readers`) each object the first one met, and
     adds what its attributes hold to its elements. A dataclass that is also an exception or a
-    container has both. What it reaches, at any depth, is read with a limit, and the whole second
-    walk spends at most :data:`_ATTRIBUTE_BUDGET`. A container it reads may be cut short. No
+    container has both. What it reaches, at any depth, is read with a limit, on the budgets
+    :class:`_ScanShare` sets out. A container it reads may be cut short. No
     message text is built from such a list, since an object read by attribute prints as a fixed
     note; a rebuilt ``ChainMap`` root's storage, which a later handler may read, can be short of
     keys for that reason. ``charged_root`` skips the first walk, so everything beneath the root is
@@ -3233,16 +3249,16 @@ class _Scan:
 
     THE SECOND WALK HAS TWO PASSES, AND THE ORDER IS THE GUARANTEE AGAIN (vault BACKLOG #3340). The
     first pass is the whole of the walk above, through :func:`_readers` alone. The added pass
-    (:func:`_added_pass`) runs after it, only on the budget the first pass left, and reads what an
-    exception's own code may print beyond those readers: its dunder-named slots; and, when that
-    code is not a builtin exception's, its ``__cause__`` and ``__context__`` and, beneath it, every
-    exception it reaches through its instance ``__dict__``, slots and chain links, whatever its own
-    ``__str__`` prints. The added pass adds elements and errors to what the first pass recorded,
-    and never reorders any. The one removal is its failure path: an object whose added read raises
-    has its recorded elements replaced by None, which marks it unreadable, so it counts as holding
-    an error and renders as a withheld note (fails closed). So every object the first pass found
-    holds an error still does, and the added pass can only turn "holds no error" into "holds an
-    error".
+    (:func:`_added_pass`) runs after it, on what budget is left (:class:`_ScanShare`), and reads
+    what an exception's own code may print beyond those readers: at least its dunder-named slots;
+    and, when that code is not a builtin exception's, its ``__cause__`` and ``__context__`` and,
+    beneath it, the instance ``__dict__``, slots and chain links of each exception it reaches,
+    whatever that exception's own ``__str__`` prints. The added pass adds elements and errors to
+    what the first pass recorded, and never reorders any. The one removal is its failure path: an
+    object whose added read raises has its recorded elements replaced by None, which marks it
+    unreadable, so it counts as holding an error (fails closed). So every object the first pass
+    found holding an error still holds one, and the added pass can only turn "holds no error" into
+    "holds an error".
 
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
     So an error past the budget prints raw, as it did before any object was read by attribute. A
@@ -3388,14 +3404,7 @@ def _added_pass(
     unreadable, which counts as holding an error. So it can turn "holds no error" into "holds an
     error", and never the other way.
 
-    An object is read once the plain way, through its own render's readers, and once the deep way,
-    beneath an exception whose own code renders it; each read takes only the readers the reads
-    before it lacked. A plain read of an object already in ``nodes`` with no reader left to add
-    costs nothing. Any other plain read of such an object costs one unit and each value read, and
-    follows none of its elements again. A read beneath such an exception, or of one itself, is
-    deep; a deep read costs one unit, each value read, and one unit for each of its non-scalar
-    elements not yet read the deep way, which it follows again. An object first met here costs one
-    unit, each element read if it is a container, and each value read.
+    What each read costs is written once, in :class:`_ScanShare`.
 
     Returns what is left of ``budget``, each exception whose own code renders it that was read the
     deep way, and the most slots any read here went through."""

@@ -2237,6 +2237,29 @@ def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -
         assert spelling not in out
 
 
+@dataclasses.dataclass
+class _ForeignDictData:
+    """A dataclass whose ``__dict__`` reader is another class's, so reading it raises."""
+
+    value: int = 0
+    __dict__ = _NoDictOwner.__dict__["__dict__"]
+
+
+def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed() -> None:
+    # Review of vault BACKLOG #3340: an exception's __dict__ is read through _EXC_DICT, so
+    # _ForeignDictError above no longer raises, and nothing reached the added pass's own fail-closed
+    # arm. The dataclass sits behind a __cause__ link, which only the added pass reads.
+    data = _ForeignDictData()
+    inner = RuntimeError("inner")
+    inner.payload = data  # type: ignore[attr-defined]
+    holder = _PrintsInnerCause("bad")
+    holder.__cause__ = inner
+    scan = redaction._Scan(holder, charged_root=True)
+    assert scan.nodes[id(data)][1:] == (None, "TypeError")  # marked unreadable by the added pass
+    assert id(holder) in scan.holds
+    assert redaction.prints_a_codec_error(holder)
+
+
 # --- the added pass never undoes the first (vault BACKLOG #3340) -------------------------------
 # Five review rounds each found an ordering of the scan's reads under which a codec error the first
 # pass found printed raw. The added pass now runs after the first pass, on what it left, and only
