@@ -93,8 +93,8 @@ class HttpScenario(Scenario):
     An HL7 run is verified by control id, through the same per-id queries every family uses. A
     DICOM body has no control id, so a DICOM run follows each ``202`` receipt's ``message_id``.
 
-    A POST the inbound ANSWERED with a non-2xx status (a ``422`` for a body it recorded as
-    ``ERROR`` and refused) reached the engine, so it is not a failure to send: an ``error``
+    A POST the inbound ANSWERED with a non-2xx status (a ``503``, ``413`` or ``422`` for a body it
+    recorded as ``ERROR`` and refused) reached the engine, so it is not a failure to send: an ``error``
     expectation can be verified over HTTP as it can over MLLP."""
 
     driver: str = "http"

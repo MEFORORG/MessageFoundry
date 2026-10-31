@@ -1121,10 +1121,12 @@ class SourceConnector(abc.ABC):
 
     #: Which handler contract this source is started with. ``False`` (the default): the handler's
     #: ``str`` return is a wire reply (an HL7 ACK) the source sends back, and ``None`` means "no reply".
-    #: ``True``: a RECEIPT handler -- it returns the committed message id, or ``None`` when it REFUSED
-    #: the body (recorded ``ERROR``, committed no ingress row). A source whose answer to the sender is
-    #: its own protocol status (an HTTP ``202``, a DIMSE C-STORE status) needs the receipt form, because
-    #: under the default form ``None`` means both "committed" and "refused" (BACKLOG #1910).
+    #: ``True``: a RECEIPT handler (``transports/receipt.py``) -- it returns an ``IngressReceipt``
+    #: holding the committed message id, or, when it REFUSED the body (recorded ``ERROR``, committed no
+    #: ingress row), the refusal's kind and that row's id (BACKLOG #2105). A source whose answer to the
+    #: sender is its own protocol status (an HTTP ``202``, a DIMSE C-STORE status) needs the receipt
+    #: form, because under the default form ``None`` means both "committed" and "refused" (BACKLOG
+    #: #1910).
     wants_receipt: ClassVar[bool] = False
 
     #: Optional connection-event sink (Corepoint-style log, #46), **injected by the runner after build**
