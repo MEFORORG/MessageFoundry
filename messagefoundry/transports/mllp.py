@@ -1910,6 +1910,7 @@ class MLLPSource(SourceConnector):
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
+            name=config.name or "",
         )
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()

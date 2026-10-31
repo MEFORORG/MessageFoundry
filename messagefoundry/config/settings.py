@@ -5549,13 +5549,15 @@ _ALERT_EVENT_TYPES = frozenset(
         "crl_reload_refused",
         # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
         # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
-        # a test pins that each is here. None is connection-scoped.
+        # a test pins that each is here. None is connection-scoped: peer_refused_burst is keyed
+        # `inbound:<name>`, whose colon keeps it outside the connection-name grammar.
         "signin_failure_burst",
         "access_denied_burst",
         "body_view_burst",
         "bulk_export",
         "log_level_debug",
         "posture_loosened",
+        "peer_refused_burst",
         # vault BACKLOG #2742: the remote-debugging guard refused scripts another process
         # injected into the engine. Keyed `remote_debug:refused`, with a process suffix where
         # several engine processes share the store, which no connection can be named. It has no
@@ -5567,7 +5569,7 @@ _ALERT_EVENT_TYPES = frozenset(
         # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
         "sandbox_worker_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
-        # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
+        # ad_reconcile_breaker_cleared / ad_reconcile_hold_released / posture_restored) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
         # a resumed intake or a cleared reconcile alert needs no page.
     }
@@ -5913,9 +5915,10 @@ class AlertsSettings(_Section):
     # --- security signals (vault BACKLOG #2613) ------------------------------------------------
     # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count
     # below is reached inside security_window_seconds. On by default. A count of 0 switches that one
-    # detector off; security_signals=false switches the whole layer off, the DEBUG and posture
-    # detectors included. The defaults are set high on purpose: a page nobody acts on teaches an
-    # operator to ignore the channel. docs/CONFIGURATION.md [alerts] lists each one.
+    # detector off; security_signals=false switches every detector off but the posture one, which
+    # still reports the start's loosenings, this switch among them. Each, and a count above its
+    # default or a window below it, is a LOOSENING security_loosenings() names. The defaults are set high on purpose: a page nobody acts on
+    # teaches an operator to ignore the channel. docs/CONFIGURATION.md [alerts] lists each one.
     security_signals: bool = True
     security_window_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     # Refused sign-ins from ONE client address. Keyed on the address, never the typed username.
@@ -5927,6 +5930,10 @@ class AlertsSettings(_Section):
     security_body_views: int = Field(default=100, ge=0)
     # Messages selected by ONE account's messages_export calls, summed over the window.
     security_export_messages: int = Field(default=5000, ge=0)
+    # Connections ONE inbound listener refused at its source allowlist or a connection cap. Keyed on
+    # the inbound's name, never the peer's address. Capped: the window holds one entry per refusal
+    # until the count is reached, and a refusal costs the peer nothing.
+    security_peer_refusals: int = Field(default=100, ge=0, le=100_000)
 
     # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
     # by default. `serve` refuses to start under [security].enforcement=enforce (warns under
@@ -9822,6 +9829,75 @@ def _reminder_loosenings(
     return out
 
 
+#: The security-signal counts ``security_loosenings`` names at 0, each with the detector it turns off.
+_SECURITY_SIGNAL_COUNTS: Final = (
+    ("security_signin_failures", "signin_failure_burst", "refused sign-ins from one address"),
+    ("security_denials", "access_denied_burst", "refused requests by one account"),
+    ("security_body_views", "body_view_burst", "stored-body reads by one account"),
+    ("security_export_messages", "bulk_export", "messages exported by one account"),
+    ("security_peer_refusals", "peer_refused_burst", "connections one listener refused"),
+)
+
+
+def _security_signal_loosenings(alerts: AlertsSettings) -> list[tuple[str, str]]:
+    """The security-signal layer switched off, or with it on a detector looser than its shipped
+    default, as :func:`security_loosenings` entries (vault BACKLOG #2613). Read as
+    :func:`_auth_limit_loosenings` reads the ``[auth]`` limits (BACKLOG #1131): a count at 0 is
+    off, a count above its default needs a larger burst, and a window shorter than its default
+    holds fewer rows. With the layer off, its settings are not named one by one: the layer entry
+    already says no detector but the posture one runs."""
+    if not alerts.security_signals:
+        return [
+            (
+                "alerts.security_signals",
+                "[alerts].security_signals = false switches the security-signal layer off -- a "
+                "burst of refused sign-ins, refused requests, stored-body reads, exported "
+                "messages or refused connections, and a DEBUG log level, raise no alert. The "
+                "first four leave audit rows. A refused connection leaves no audit row, and on "
+                "some paths no log line or connection_event row either, so nothing else may "
+                "record it. The posture_loosened alert still fires at each start that records "
+                "its loosenings",
+            )
+        ]
+    fields = AlertsSettings.model_fields
+    out: list[tuple[str, str]] = []
+    for field, signal, what in _SECURITY_SIGNAL_COUNTS:
+        value, default = getattr(alerts, field), fields[field].default
+        if value == 0:
+            out.append(
+                (
+                    f"alerts.{field}",
+                    f"[alerts].{field} = 0 switches the {signal} detector off -- a burst of "
+                    f"{what} raises no alert",
+                )
+            )
+        elif value > default:
+            out.append(
+                (
+                    f"alerts.{field}",
+                    f"[alerts].{field} = {value}, above the default of {default} -- the "
+                    f"{signal} detector needs a larger burst of {what} before it raises",
+                )
+            )
+    window, default_window = (
+        alerts.security_window_seconds,
+        fields["security_window_seconds"].default,
+    )
+    # Only while some counting detector runs, since none other reads the window.
+    if window < default_window and any(
+        getattr(alerts, field) > 0 for field, _signal, _what in _SECURITY_SIGNAL_COUNTS
+    ):
+        out.append(
+            (
+                "alerts.security_window_seconds",
+                f"[alerts].security_window_seconds = {window:g}, shorter than the default of "
+                f"{default_window:g} -- each counting detector sees fewer rows at once, so a "
+                "burst spread past the window raises no alert",
+            )
+        )
+    return out
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -9924,6 +10000,11 @@ def security_loosenings(
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
     ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). ``ai`` joins them for
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)).
+
+    **The security-signal layer (vault BACKLOG #2613).** ``[alerts].security_signals = false``, or
+    with it on a count at ``0`` or above its default, or a window below its default while
+    some count is above ``0``
+    (:func:`_security_signal_loosenings`).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
@@ -10255,6 +10336,8 @@ def security_loosenings(
     # #2006 (a): a silent weakening keeps the cell at partial. _reminder_loosenings says what each
     # entry covers.
     out.extend(_reminder_loosenings(cert_monitor, secret_rotation, alerts))
+    # Vault BACKLOG #2613: the security-signal layer off, or a detector at 0, is a loosening too.
+    out.extend(_security_signal_loosenings(alerts))
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
     # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.
     if auth.ad_enabled and not auth.ad_session_recheck_seconds:

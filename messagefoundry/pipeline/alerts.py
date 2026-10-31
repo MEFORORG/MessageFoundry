@@ -881,12 +881,27 @@ class AlertSink(Protocol):
         :mod:`messagefoundry.pipeline.security_signals`). ``signal`` is the alert event type, one of
         ``SECURITY_SIGNAL_TYPES``, so each detector routes on its own. ``name`` is the subject that
         stands in for "connection": ``signin:<client address>``, ``account:<username>``,
-        ``logging:debug`` or ``posture:start``. ``count`` is how many rows tripped it. ``detail`` is
-        a fixed sentence built from counts, a level name or switch names.
+        ``inbound:<name>``, ``logging:debug`` or ``posture:start``, the last with ``@node:<id>``
+        or ``@shard:<id>`` appended where several engine processes share the store. ``count`` is
+        how many rows or refusals tripped it. ``detail`` is a fixed sentence built from counts, a
+        level name or switch names.
 
-        Never a message body, a message id, a typed username or an audit row's detail. None is
-        connection-scoped, so no rule's ``control_action`` fires on one, and nothing resolves
-        one."""
+        Never a message body, a message id, a typed username, a peer's address for
+        ``peer_refused_burst``, or an audit row's detail. None is connection-scoped, so no rule's
+        ``control_action`` fires on one. Only ``posture_loosened`` resolves itself, through
+        :meth:`posture_restored`; an operator resolves the others."""
+        ...
+
+    def posture_restored(self, name: str) -> None:
+        """The INVERSE of the ``posture_loosened`` security signal: a start recorded an empty
+        loosenings list in its ``config_loaded`` row (vault BACKLOG #2613). Emits **no**
+        notification (a recovery needs no page); it exists so durable alert-state (ADR 0044)
+        **auto-resolves** the open ``posture_loosened`` instance for the same ``name``, which is
+        ``posture:start`` with this process's ``@node:<id>`` or ``@shard:<id>`` suffix where several
+        engine processes share the store, so one process's clean start never clears another's. An
+        unpinned cluster node's id changes on every start, so it raises this for its own alert as
+        it shuts down; docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. A
+        start that could not read its list raises neither. No PHI."""
         ...
 
     # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------
@@ -1394,6 +1409,12 @@ class LoggingAlertSink:
 
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
+
+    def posture_restored(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the start logged its posture.
+        # Raised by a clean start, or by an unpinned cluster node as it shuts down: either way the
+        # loosened posture no longer runs under this subject.
+        log.debug("ALERT posture_restored: %r no loosened posture runs under this subject", name)
 
     def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
         # The guard usually logs one WARNING for each refusal, with the script's file name, but

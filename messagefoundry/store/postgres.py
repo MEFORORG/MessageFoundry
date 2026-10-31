@@ -92,6 +92,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     narrow_to_approved_suites,
 )
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -5790,6 +5791,7 @@ class PostgresStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(

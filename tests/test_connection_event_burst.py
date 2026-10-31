@@ -193,6 +193,30 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
     ]
 
 
+async def test_an_undeclared_kind_costs_only_its_own_row(
+    store: MessageStore, runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1624: the store refuses a kind outside ``CONNECTION_EVENT_KINDS``. The refusal is a
+    ``ValueError`` from the parameter builder, before any row is stepped, and the salvage still
+    keeps the neighbours."""
+    _enqueue(runner, _event(0))
+    _enqueue(runner, _event(1, kind="not_a_connection_event_kind"))
+    _enqueue(runner, _event(2))
+    _start_drainer(runner)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        await _join(runner)
+
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if "connection-event burst write failed" in r.getMessage()
+    ] == [
+        "connection-event burst write failed (ValueError); salvaged 2 of 3 event(s) singly, dropped 1"
+    ]
+    kept = await store.list_connection_events(allowed_channels=None)
+    assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.2"]
+
+
 async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(
     store: MessageStore, runner: RegistryRunner, caplog: pytest.LogCaptureFixture
 ) -> None:

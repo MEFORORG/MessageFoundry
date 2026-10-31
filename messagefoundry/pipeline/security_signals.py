@@ -26,6 +26,15 @@ directory (Kerberos or OIDC) lock refusal writes ``auth.directory_login_locked``
 lock rows themselves are not read, and so an account lock raises no alert: that would show lock
 state to a reader the 2026-09-28 owner ruling withholds it from.
 
+**Refused peers are the one input that is not an audit row.** A listener refusing a peer at its
+source allowlist or a connection cap writes a ``connection_event`` row only while the operator's
+capture is on, and no audit row, so :func:`~messagefoundry.transports.admission.notify_refusal`
+tells this layer directly. It passes the inbound's name and never the peer's address.
+
+**Switched off, the layer still reports its own posture.** ``[alerts].security_signals = false`` is
+a loosening :func:`~messagefoundry.config.settings.security_loosenings` names, so the posture
+detector keeps running to raise it: every other detector stops.
+
 **Bounded where the caller chooses the key.** A windowed detector tracks at most
 :data:`MAX_SUBJECTS` subjects. Past :data:`MAX_SUBJECT_ALERTS` alerts in one window it raises under
 one shared ``<prefix>:*`` subject instead, so a spread of addresses cannot open an alert instance,
@@ -45,7 +54,9 @@ from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
+from messagefoundry.transports.admission import add_refusal_observer, remove_refusal_observer
 
 __all__ = [
     "MAX_SUBJECTS",
@@ -64,9 +75,11 @@ BODY_VIEW_BURST: Final = "body_view_burst"
 BULK_EXPORT: Final = "bulk_export"
 LOG_LEVEL_DEBUG: Final = "log_level_debug"
 POSTURE_LOOSENED: Final = "posture_loosened"
+PEER_REFUSED_BURST: Final = "peer_refused_burst"
 
 #: Every event type this layer raises. ``config/settings.py`` ``_ALERT_EVENT_TYPES`` lists the same
-#: six by hand, because ``config/`` may not import ``pipeline/``; a test pins that each is there.
+#: seven by hand, because ``config/`` may not import ``pipeline/``; a test pins that each is there.
+#: The ``posture_restored`` inverse is not one: it pages nobody, so no rule can route it.
 SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
     {
         SIGNIN_FAILURE_BURST,
@@ -75,6 +88,7 @@ SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
         BULK_EXPORT,
         LOG_LEVEL_DEBUG,
         POSTURE_LOOSENED,
+        PEER_REFUSED_BURST,
     }
 )
 
@@ -85,6 +99,11 @@ MAX_SUBJECT_ALERTS: Final = 5
 #: Characters of a subject. SQL Server holds ``alert_instance.connection`` in 256.
 _SUBJECT_LIMIT: Final = 200
 _SWITCH_LIST_LIMIT: Final = 200
+#: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
+#: longer window, which counts more strictly, must not also hold a second attack back for as long.
+_REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
+#: The least time between two log lines for failed sink calls of one event type.
+_SINK_FAILURE_LOG_SECONDS: Final = 60.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -100,7 +119,8 @@ _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locke
 
 @dataclass(frozen=True, slots=True)
 class SecuritySignalThresholds:
-    """The ``[alerts]`` security-signal settings. A count of 0 switches that detector off.
+    """The ``[alerts]`` security-signal settings. A count of 0 switches that detector off, and
+    ``enabled`` False switches off every detector but the posture one.
     ``AlertsSettings`` owns the defaults; build one with :meth:`from_settings`."""
 
     window_seconds: float
@@ -108,6 +128,8 @@ class SecuritySignalThresholds:
     denials: int
     body_views: int
     export_messages: int
+    peer_refusals: int
+    enabled: bool = True
 
     @classmethod
     def from_settings(cls, alerts: AlertsSettings) -> SecuritySignalThresholds:
@@ -117,6 +139,8 @@ class SecuritySignalThresholds:
             denials=alerts.security_denials,
             body_views=alerts.security_body_views,
             export_messages=alerts.security_export_messages,
+            peer_refusals=alerts.security_peer_refusals,
+            enabled=alerts.security_signals,
         )
 
 
@@ -159,17 +183,20 @@ class _Window:
         del self._seen[subject]
         return total[0]
 
-    def named(self, subject: str, now: float) -> bool:
+    def may_name(self, subject: str, now: float) -> bool:
         """Whether ``subject`` may raise under its own name: it already did this window, or fewer
-        than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. Records it when it may."""
+        than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. Records nothing; a caller records a
+        name with :meth:`record_name` once the sink took the alert, so a refused raise, or a retry
+        of one, spends no slot."""
         cutoff = now - self.window_seconds
         while self._named and next(iter(self._named.values())) <= cutoff:
             self._named.popitem(last=False)
-        if subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS:
-            self._named.pop(subject, None)
-            self._named[subject] = now
-            return True
-        return False
+        return subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS
+
+    def record_name(self, subject: str, now: float) -> None:
+        """Record that ``subject`` raised under its own name at ``now``."""
+        self._named.pop(subject, None)
+        self._named[subject] = now
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +205,7 @@ class _Burst:
 
     signal: str
     prefix: str
-    sentence: str  # formatted with {total} and {window}
+    sentence: str  # formatted with {total}, {window} and {quiet}, the refusal quiet period
     by_address: bool = False
 
 
@@ -196,6 +223,14 @@ _BODIES = _Burst(
 )
 _EXPORT = _Burst(
     BULK_EXPORT, "account", "{total} messages exported by this account within {window}"
+)
+#: Prefixed ``inbound``, so the subject is spelled as ``connection_names.inbound_record_name``
+#: spells an inbound; a test pins the two together.
+_REFUSED = _Burst(
+    PEER_REFUSED_BURST,
+    "inbound",
+    "{total} connections refused by this inbound's source allowlist or connection caps "
+    "within {window}; this inbound's refusals are not counted for {quiet} after this alert",
 )
 
 
@@ -250,6 +285,11 @@ class SecuritySignalDetector:
     """The fixed detectors. :meth:`observe` is an :data:`~messagefoundry.store.audit_tee.AuditObserver`.
 
     It runs inline on the audit writer's path, so it does only in-memory work and never raises.
+    :meth:`observe_refusal` runs inline on a listener's accept path the same way.
+
+    ``identity`` returns which engine process this is (``Engine.instance_identity``), or ``None``
+    for a lone engine. It is read when a start's row arrives, and suffixes the posture subject, so
+    a clean start resolves only its own process's ``posture_loosened``.
     """
 
     def __init__(
@@ -258,11 +298,27 @@ class SecuritySignalDetector:
         thresholds: SecuritySignalThresholds,
         *,
         clock: Callable[[], float] = time.monotonic,
+        identity: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._sink = sink
         t = thresholds
         self._window_label = f"{t.window_seconds:g} s"
+        #: How long a listener stays quiet after its refusal burst raised.
+        self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
+        #: Per event type whose sink call failed: when its next failure line may be written, and
+        #: how many failures were held back since its last line; see :meth:`_notify`. Keyed on the
+        #: type alone, so its size is bounded by the fixed set of event types.
+        self._sink_failures: dict[str, tuple[float, int]] = {}
+        self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
+        self._identity = identity
+        #: The posture_loosened subject this detector last raised and has not seen resolved.
+        self._posture_raised: str | None = None
+        #: Listeners whose refusal burst raised, mapped to when their quiet ends. A refused
+        #: connection costs the peer nothing, so without it a flood would raise, and write an alert
+        #: row, every ``peer_refusals`` refusals. Keyed by inbound name, so bounded by the graph,
+        #: and trimmed past :data:`MAX_SUBJECTS` all the same.
+        self._refusals_quiet: OrderedDict[str, float] = OrderedDict()
         windows = {
             _SIGNIN: _Window(t.signin_failures, t.window_seconds),
             _DENIED: _Window(t.denials, t.window_seconds),
@@ -276,9 +332,23 @@ class SecuritySignalDetector:
             "messages_export": (_EXPORT, windows[_EXPORT], _export_size),
         }
         self._signin = windows[_SIGNIN]  # read by a test of the subject bound
-        #: The audit actions some detector reads.
-        self.actions: frozenset[str] = frozenset(
-            {*self._bursts, "logging_level_change", "logging_level_change_denied", "config_loaded"}
+        # The layer switched off is decided here, once per input: the audit actions narrow to the
+        # posture row, and the refusal window gets a zero threshold, which counts nothing.
+        self._refused = _Window(t.peer_refusals if t.enabled else 0, t.window_seconds)
+        #: Whether :meth:`observe_refusal` can ever raise, so the installer can skip the observer.
+        self.counts_refusals = self._refused.threshold > 0
+        #: The audit actions some running detector reads; :meth:`observe` ignores every other.
+        self.actions: frozenset[str] = (
+            frozenset(
+                {
+                    *self._bursts,
+                    "logging_level_change",
+                    "logging_level_change_denied",
+                    "config_loaded",
+                }
+            )
+            if t.enabled
+            else frozenset({"config_loaded"})
         )
 
     def observe(
@@ -289,10 +359,14 @@ class SecuritySignalDetector:
         client: str | None,
         detail: str | None,
     ) -> None:
+        if action not in self.actions:
+            return
         try:
             burst = self._bursts.get(action)
             if burst is not None:
-                self._on_burst(*burst, actor=actor, client=client, detail=detail)
+                kind, window, weight_of = burst
+                key = client if kind.by_address else actor
+                self._on_burst(kind, window, key, weight_of(detail))
             elif action == "logging_level_change":
                 self._on_level(actor, detail, "to", "the live log level was raised to DEBUG by")
             elif action == "logging_level_change_denied":
@@ -307,27 +381,51 @@ class SecuritySignalDetector:
         except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the audit writer
             log.warning("security-signal detector failed: %s", type(exc).__name__)
 
-    def _on_burst(
-        self,
-        burst: _Burst,
-        window: _Window,
-        weight_of: Callable[[str | None], int],
-        *,
-        actor: str | None,
-        client: str | None,
-        detail: str | None,
-    ) -> None:
-        key = (client if burst.by_address else actor) or "unknown"
+    def observe_refusal(self, connection: str) -> None:
+        """A :data:`~messagefoundry.transports.admission.RefusalObserver`: the inbound
+        ``connection`` refused a peer at its source allowlist or a connection cap."""
+        try:
+            now = self._clock()
+            if self.refusal_quiet(connection, now):
+                return  # raised lately: not even counted, which is the cheap path
+            self._refusals_quiet.pop(connection, None)
+            if self._on_burst(_REFUSED, self._refused, connection, 1):
+                self._refusals_quiet[connection] = now + self._refusal_quiet_seconds
+                if len(self._refusals_quiet) > MAX_SUBJECTS:
+                    self._refusals_quiet.popitem(last=False)
+        except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the listener
+            log.warning("security-signal detector failed: %s", type(exc).__name__)
+
+    def refusal_quiet(self, connection: str, now: float | None = None) -> bool:
+        """Whether ``connection``'s refusals are held quiet after a raise. A read only, so the
+        installer may ask it from a listener's own thread before it hops a refusal onto the loop."""
+        until = self._refusals_quiet.get(connection)
+        return until is not None and until > (self._clock() if now is None else now)
+
+    def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
+        """Count ``weight`` for ``key``; True when that raised an alert and the sink call
+        returned. False when the sink call raised, so a caller that goes quiet after a raise does
+        not go quiet on that alert. A sink that takes the alert and then loses part of it still
+        returns, so the caller goes quiet: the notifier's full queue drops only the page, after the
+        ``alert_instance`` row is already scheduled, and a store fault loses that row."""
+        key = key or "unknown"
         now = self._clock()
-        total = window.hit(key, now, weight_of(detail))
+        total = window.hit(key, now, weight)
         if total is None:
-            return
-        subject = _bounded(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
-        sentence = burst.sentence.format(total=total, window=self._window_label)
-        if not window.named(subject, now):
+            return False
+        # A checksum keeps two long keys with one head apart, where a plain cut would merge them.
+        subject = shorten_with_checksum(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
+        sentence = burst.sentence.format(
+            total=total, window=self._window_label, quiet=self._quiet_label
+        )
+        own_name = window.may_name(subject, now)
+        if not own_name:
             subject = f"{burst.prefix}:*"
             sentence += f"; {MAX_SUBJECT_ALERTS} other subjects already raised this window"
-        self._raise(burst.signal, subject, total, sentence)
+        raised = self._raise(burst.signal, subject, total, sentence)
+        if raised and own_name:
+            window.record_name(subject, now)
+        return raised
 
     def _on_level(self, actor: str | None, detail: str | None, key: str, sentence: str) -> None:
         if str(_detail_of(detail).get(key, "")).upper() == "DEBUG":
@@ -336,36 +434,132 @@ class SecuritySignalDetector:
     def _on_config_loaded(self, detail: str | None) -> None:
         switches = _detail_of(detail).get("loosenings")
         # None means the start could not read its list; that is no finding either way.
-        if not isinstance(switches, list) or not switches:
+        if not isinstance(switches, list):
+            return
+        try:
+            identity = self._identity()
+        except Exception as exc:  # noqa: BLE001 - fail toward raising: the bare subject still pages
+            log.warning("the engine identity could not be read: %s", type(exc).__name__)
+            identity = None
+        subject = process_alert_subject("posture:start", identity)
+        if not switches:
+            self._restore(subject)
             return
         names = _bounded(", ".join(str(s) for s in switches), _SWITCH_LIST_LIMIT)
+        self._posture_raised = subject
         self._raise(
             POSTURE_LOOSENED,
-            "posture:start",
+            subject,
             len(switches),
             f"the engine started with {len(switches)} security loosening(s): {names}",
         )
 
-    def _raise(self, signal: str, subject: str, count: int, detail: str) -> None:
+    def release(self) -> None:
+        """Raise ``posture_restored`` for the ``posture_loosened`` this detector raised, from the
+        remover :func:`install_security_signals` returns. docs/SECURITY.md, *Audit*, says when the
+        alert can stay open anyway."""
+        if self._posture_raised is not None:
+            self._restore(self._posture_raised)
+
+    def _restore(self, subject: str) -> None:
+        self._posture_raised = None
+        self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
+
+    def _raise(self, signal: str, subject: str, count: int, detail: str) -> bool:
+        return self._notify(
+            signal,
+            lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
+        )
+
+    def _notify(self, event: str, call: Callable[[], None]) -> bool:
+        """Run one sink call; False when the sink raised.
+
+        A failure is logged at WARNING at most once per :data:`_SINK_FAILURE_LOG_SECONDS` per
+        event type, whatever the subject, the exception type, or any success in between. The next
+        line carries how many failures of that type were held since the last such line, and
+        :meth:`flush_held` logs what is still held at release. So each event type writes at most
+        one failure line a minute, plus at most one flush line at release. A
+        sink that keeps raising no longer starts the refusal quiet period, and a caller can choose
+        subjects (a client address, a username), so a key on the subject would let a refused
+        peer, or a spread of subjects, write a line each. A line does not say which subject
+        failed, and no line marks a recovery. It carries the sink exception's qualified type name
+        only, never its message, which a sink may build from the alert's subject or detail."""
         try:
-            self._sink.security_signal(subject, signal=signal, count=count, detail=detail)
+            call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            log.warning(
-                "security-signal alert %s could not be raised: %s", signal, type(exc).__name__
-            )
+            now = self._clock()
+            next_at, held = self._sink_failures.get(event, (float("-inf"), 0))
+            if now < next_at:
+                self._sink_failures[event] = (next_at, held + 1)
+                return False
+            self._sink_failures[event] = (now + _SINK_FAILURE_LOG_SECONDS, 0)
+            kind = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            if held:
+                log.warning(
+                    "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
+                    "alert type held since the last such line; at most one line every %gs)",
+                    event,
+                    kind,
+                    held,
+                    _SINK_FAILURE_LOG_SECONDS,
+                )
+            else:
+                log.warning(
+                    "security-signal alert %s could not be raised: %s (at most one line every %gs)",
+                    event,
+                    kind,
+                    _SINK_FAILURE_LOG_SECONDS,
+                )
+            return False
+        return True
+
+    def flush_held(self) -> None:
+        """Log, at most once per event type, the sink failures held since that type's last
+        failure line, so failures that no later line reported reach the log at release. Failures
+        that arrive after this runs, from calls already queued onto the loop, are not flushed."""
+        for event, (_next_at, held) in self._sink_failures.items():
+            if held:
+                log.warning(
+                    "security-signal alert %s: %d failure(s) held since the last such line were "
+                    "not logged before the detector was released",
+                    event,
+                    held,
+                )
+        self._sink_failures.clear()
 
 
 def install_security_signals(
     sink: AlertSink,
     thresholds: SecuritySignalThresholds,
     loop: asyncio.AbstractEventLoop,
+    *,
+    identity: Callable[[], str | None] = lambda: None,
+    resolve_on_stop: bool = False,
 ) -> Callable[[], None]:
-    """Register a :class:`SecuritySignalDetector` on the audit tee; returns the function that
-    removes it.
+    """Register a :class:`SecuritySignalDetector` on the audit tee, and on the listeners' refusal
+    observers while it counts refusals; returns the function that removes it.
 
-    A row committed on ``loop``'s own thread is judged at once. One committed on another thread is
-    hopped onto ``loop``, so the detector's state and the sink are only touched from one thread."""
-    detector = SecuritySignalDetector(sink, thresholds)
+    ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
+    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. With it,
+    the function this returns raises ``posture_restored`` for that alert, as
+    :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts.
+    docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. The function also logs
+    the sink failures still held back (:meth:`SecuritySignalDetector.flush_held`). It must run on
+    ``loop``'s thread, before the store closes.
+
+    A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
+    onto ``loop``, so the detector's state and the sink are only touched from one thread."""
+    detector = SecuritySignalDetector(sink, thresholds, identity=identity)
+
+    def _on_loop(judge: Callable[..., None], *args: str | None) -> None:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            judge(*args)
+        elif not loop.is_closed():
+            loop.call_soon_threadsafe(judge, *args)
 
     def _observe(
         action: str,
@@ -376,14 +570,23 @@ def install_security_signals(
     ) -> None:
         if action not in detector.actions:
             return  # the common case: one set lookup per row, and no thread hop
-        try:
-            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            detector.observe(action, actor, channel_id, client, detail)
-        elif not loop.is_closed():
-            loop.call_soon_threadsafe(detector.observe, action, actor, channel_id, client, detail)
+        _on_loop(detector.observe, action, actor, channel_id, client, detail)
+
+    def _refused(connection: str) -> None:
+        # Asked before the hop, so a refusal flood from the DICOM server's threads costs the loop
+        # nothing while the listener is quiet. A stale read only lets one refusal through.
+        if not detector.refusal_quiet(connection):
+            _on_loop(detector.observe_refusal, connection)
 
     add_audit_observer(_observe)
-    return lambda: remove_audit_observer(_observe)
+    if detector.counts_refusals:
+        add_refusal_observer(_refused)
+
+    def _remove() -> None:
+        remove_audit_observer(_observe)
+        remove_refusal_observer(_refused)
+        if resolve_on_stop:
+            detector.release()
+        detector.flush_held()
+
+    return _remove

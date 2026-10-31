@@ -96,6 +96,7 @@ from messagefoundry.config.settings import (
     AlertSeverity,
     StoreBackend,
 )
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -14563,6 +14564,7 @@ class MessageStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the row's insert-time-known identity; connection_event.id is
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (

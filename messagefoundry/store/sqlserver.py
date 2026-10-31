@@ -76,6 +76,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -7361,6 +7362,7 @@ class SqlServerStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the id is IDENTITY, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
