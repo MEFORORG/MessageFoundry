@@ -1698,7 +1698,9 @@ beneath one whose own code renders it: the walk then reads it the deep way, and 
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
 fixed note even where its own `__str__` would not print it. A builtin's `__str__` never prints
-the chain, so a builtin exception raised from a codec error keeps its message. The rule applies
+the chain, so a builtin exception raised from a codec error keeps its message, except where the
+same exception is also reached beneath one whose own code renders it, as above: in that argument
+it prints as the fixed note too. The rule applies
 in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
 `codec_safe_str()` returns the note alone, with no class.
@@ -1725,12 +1727,13 @@ the added pass would reach prints raw. A slot or chain link that holds None cost
 value read does. The added pass reads an object at most twice, once the plain way and once beneath
 an exception whose own code renders it, each time through only the readers the reads before it
 lacked. A plain read of an object the walk already holds follows none of its elements again: it
-costs one unit and each value read, and nothing at all when no reader is left to add. A read
-beneath an exception whose own code renders it costs one unit, each value read, and one unit for
-each element it follows again. In one traceback each link's first pass has a whole budget of its
-own, and the added passes of every link share one more budget between them. So on a very long
-chain an earlier link's added reads can spend it, and a later link's codec error that only the
-added reads would reach then prints raw, as it did before this change. A scan that read a later
+costs one unit and each value read, and nothing at all when no reader is left to add. A read of
+an exception whose own code renders it, or beneath one, costs one unit, each value read, and one
+unit for each element it follows again. In one traceback each link's first pass has a whole
+budget of its own, and the added passes of every link share one more budget between them. One
+link's added reads of a single large object, such as an exception group in its chain, can spend
+all of it, even on a two-link chain. A later link's codec error that only the added reads would
+reach then prints raw, as it did before this change. A scan that read a later
 link the deep way hands that link's answer on when it found an error there, or when it ran to the
 end with more budget left than the most slots any one of its reads went through, which it takes as
 the sign that none of its reads was cut short. So a long chain is read about once rather than once

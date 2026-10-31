@@ -2499,7 +2499,29 @@ def test_the_added_readers_are_worked_out_once_per_class_not_once_per_object(
     scan = redaction._Scan([crowd, held])
     assert id(held) in scan.holds  # the verdict the cache must not change
     assert not any(id(one) in scan.holds for one in crowd)
-    assert calls <= 4, calls  # the four a class's record holds, whatever the instance count
+    assert calls <= 3, calls  # the three a class's record holds, whatever the instance count
+
+
+class _ShadowedDict(Exception):
+    """A class attribute named ``__dict__`` hides the descriptor, not the instance dict."""
+
+    __dict__ = None  # type: ignore[assignment]
+    payload: object
+
+    def __str__(self) -> str:
+        return f"bad: {self.payload}"
+
+
+def test_a_class_attribute_named_dict_does_not_hide_an_exceptions_attributes() -> None:
+    # Review of vault BACKLOG #3340: the instance dict's reader was looked up by name on the
+    # class, so `__dict__ = None` made the walk skip every instance attribute.
+    exc = _ShadowedDict("x")
+    exc.payload = _encode_error()
+    assert "payload" in redaction._EXC_DICT.__get__(exc)  # the control: it really holds it
+    out = redaction.safe_exc(exc)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out == f"_ShadowedDict: {_HOLDER}"
 
 
 class _UnreadableClass:

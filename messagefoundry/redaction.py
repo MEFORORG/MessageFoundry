@@ -2618,8 +2618,7 @@ def safe_traceback(ei: ExcInfo) -> str:
     pending: list[tuple[Any, Any]] = [(te, value)]
     # Verdicts one link's scan reached for a later link, so a long chain is read about once, not
     # once per link (vault BACKLOG #3340): each link's own code may print the rest. Each link's
-    # first pass has a whole budget; the added passes of every link share one, so on a very long
-    # chain a later link's added read can be left unmade, and that link prints as origin/main would.
+    # first pass has a whole budget; the added passes share one, which _ScanShare says leaves open.
     share = _ScanShare()
     while pending:
         node, exc = pending.pop()
@@ -2792,9 +2791,10 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
 
 
 type _Readers = tuple[Any, ...] | None
-#: Beyond ``first``: ``plain``'s readers, then ``beneath``'s; beyond ``plain``: ``beneath``'s,
-#: then ``plain``'s own (none). Each is ``target`` itself where :func:`_less` says so.
-type _ReaderGains = tuple[_Readers, _Readers, _Readers, _Readers]
+#: Beyond ``first``: ``plain``'s readers, then ``beneath``'s; then ``beneath``'s beyond ``plain``.
+#: Each is ``target`` itself where :func:`_less` says so. A read after a plain one is always deep
+#: (:func:`_added_pass`), so no entry is needed for a plain read after a plain one.
+type _ReaderGains = tuple[_Readers, _Readers, _Readers]
 #: :func:`_reader_record`'s answer for one class: the three reader sets, whether it opens, and
 #: the readers each of the added pass's reads takes beyond the reads before it
 #: (:func:`_added_pass`), worked out once per class rather than once per object.
@@ -2895,7 +2895,6 @@ def _find_readers(kind: type[Any]) -> _ReaderRecord:
         _less(first, plain),
         _less(first, beneath),
         _less(plain, beneath),
-        _less(plain, plain),
     )
     return first, plain, beneath, opens, gains
 
@@ -2974,7 +2973,9 @@ def _resolve_readers(
     ``kind``, then ``extra``; or None when ``names`` is None."""
     if names is None:
         return None
-    own_dict = _class_attribute(kind, "__dict__")
+    # Every exception has an instance dict, and BaseException's own descriptor reads it whatever a
+    # subclass puts under that name: a class attribute `__dict__ = None` must not hide it.
+    own_dict = _EXC_DICT if issubclass(kind, BaseException) else _class_attribute(kind, "__dict__")
     # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
     found: list[Any] = [
         own_dict
@@ -3187,10 +3188,10 @@ def prints_a_codec_error(exc: BaseException, *, share: _ScanShare | None = None)
 class _ScanShare:
     """Verdicts the scans of one traceback hand on (:func:`safe_traceback`), so each exception in a
     long chain does not read the rest of it again (vault BACKLOG #3340). Each link's first pass has
-    a whole :data:`_ATTRIBUTE_BUDGET`. The added passes of every link share one more, ``added``, so
-    on a very long chain a later link's added read can be left unmade once an earlier link has spent
-    it, and that link then prints as origin/main would: an error only an added read reaches prints
-    raw.
+    a whole :data:`_ATTRIBUTE_BUDGET`. The added passes of every link share one more, ``added``. One
+    link's added reads of a single large object, such as an exception group in its chain, can spend
+    all of it, even on a two-link chain. A later link's added read is then left unmade, and that
+    link prints as origin/main would: an error only an added read reaches prints raw.
 
     ``verdicts`` maps the id of an exception whose own code renders it to that exception and its
     answer. A scan whose added pass read such an exception the deep way records True when it holds
@@ -3434,7 +3435,9 @@ def _added_pass(
             continue
         # Only what the reads before it lacked, worked out once for the class.
         if before:
-            target = gains[2] if deep else gains[3]
+            # A plain read sets level 1 only when ``opens`` is False, so a later read that gets
+            # past ``before >= level`` is deep.
+            target = gains[2]
         elif key in first_read:
             target = gains[1] if deep else gains[0]
         else:
