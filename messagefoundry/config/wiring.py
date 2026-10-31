@@ -5494,7 +5494,12 @@ def inbound_with_resolved_encoding(
     declared = ic.spec.settings.get("encoding")
     if not isinstance(declared, EnvRef) or not ic.deployed:
         return ic
-    resolved = _resolve_one_env_value(declared, env_values)
+    try:
+        resolved = _resolve_one_env_value(declared, env_values)
+    except Exception:  # noqa: BLE001 - a user cast; its text can quote the value (BACKLOG #1656)
+        # Not logged: the exception can carry the environment value. The decode then refuses the
+        # reference, which records an ERROR row rather than escaping into the transport.
+        return ic
     if resolved is _UNSET:
         return ic
     if resolved and not (isinstance(resolved, str) and _is_text_codec(resolved)):

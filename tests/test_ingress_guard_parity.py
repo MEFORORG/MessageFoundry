@@ -620,6 +620,10 @@ def test_an_env_encoding_resolving_to_no_usable_codec_is_not_substituted() -> No
     ic = _inbound_declaring(EnvRef("charset"))
     for value in ("hunter2", 8, True):
         assert inbound_with_resolved_encoding(ic, {"charset": value}) is ic
+    # A user cast raising anything is no escape either: the exception can quote the value.
+    table: dict[str, str] = {}
+    casting = _inbound_declaring(EnvRef("charset", cast=lambda v: table[v]))
+    assert inbound_with_resolved_encoding(casting, {"charset": "hunter2"}) is casting
     resolved = inbound_with_resolved_encoding(ic, {"charset": "latin-1"})
     assert ingress_guards.ingress_encoding(resolved) == "latin-1"
     not_deployed = InboundConnection(
