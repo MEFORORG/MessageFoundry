@@ -114,7 +114,6 @@ from messagefoundry.transports.db_endpoint import (
     generic_hop_endpoint,
     odbc_keyword_name,
     odbc_param,
-    reads_brace_escape,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
@@ -525,19 +524,12 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
     #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
 
-    **Why no braces.** Braces are the ODBC quoting rule, and drivers read them differently. Measured
-    on 2026-10-30: psqlODBC keeps them as part of ``UID`` and ``DATABASE``, and does not honour a
-    braced ``SSLmode``, so ``SSLmode={verify-full}`` connected with no TLS at all; psqlODBC and
-    MySQL both refuse a braced ``port``. A plain value behaved correctly on both. So the value is
-    sent plain, and everything that could change how a driver reads a plain value is refused instead:
-
-    * ``;``, ``{`` and ``}``, which end or quote a value, and ``=``, which a driver may read as a
-      second keyword's separator;
-    * a value that is not printable ASCII (:func:`_odbc_unsafe_text` says why);
-    * an empty or blank value, since an empty ``sslmode`` is the driver's default, and libpq's
-      default ``prefer`` falls back to plaintext;
-    * a leading or trailing space, which one driver may trim and another may keep, so the engine
-      would judge a value the driver does not read.
+    Braced values were measured to be misread (psqlODBC ran ``SSLmode={verify-full}`` with no TLS);
+    docs/CONNECTIONS.md, *Values on the generic dialect*, holds the measurements. A plain value
+    cannot be quoted, so what could change how a driver reads it is refused instead: ``;``, ``{``,
+    ``}`` and ``=``; a value that is not printable ASCII (:func:`_odbc_unsafe_text` says why); an
+    empty or blank value, which a driver reads as its default (libpq's ``prefer`` falls back to
+    plaintext); and a leading or trailing space, which one driver may trim and another keep.
 
     The refusal names the setting and never the value. A password follows its own rule
     (:func:`_odbc_password`), and the driver name stays braced."""
@@ -551,27 +543,38 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
+# The ``odbc_driver`` names, folded by ``odbc_keyword_name``, of the drivers measured to read the
+# ODBC ``}}`` escape in a braced password (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's
+# registered names, and Microsoft's SQL Server drivers, whose escape the SQL Server preset and the
+# store rely on. Whole names on purpose: a vendor driver whose name merely mentions a database, or
+# a library path, is unmeasured and does not match.
+_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
+    r"postgresql (?:unicode|ansi)(?:\(x64\))?"
+    r"|mysql odbc [0-9.]+ (?:unicode|ansi) driver"
+    r"|sql server"
+    r"|odbc driver [0-9]+ for sql server"
+)
+
+
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
     Sent plain when it holds none of ``;``, ``{`` or ``}`` and has no leading or trailing space,
-    because a driver that reads no braces (ACE) takes it only that way. Otherwise it needs the
-    braces and the ``}}`` escape, which only a driver :func:`reads_brace_escape` names is
-    measured to read: psqlODBC and MySQL (2026-10-30 probes), and Microsoft's SQL Server drivers,
-    whose escape the SQL Server preset and the store rely on. A driver that does not read it would
-    end the value at the first ``}`` and read the rest as further keywords; the Access driver (ACE)
-    did, and refused even a braced password with no brace in it. So for any other driver the build
-    is refused. A driver missing from the list is unmeasured, not known to be unsafe. A password must be
-    printable ASCII whatever the driver. The refusal names the setting and never the value."""
+    since a driver that reads no braces (the Access driver) takes it only that way. Otherwise it
+    needs the braces and the ``}}`` escape. A driver that does not read the escape ends the value
+    at the first ``}`` and reads the rest as further keywords, so the build is refused unless
+    ``driver`` is one :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names. A driver missing there is
+    unmeasured, not known to be unsafe. A password must be printable ASCII whatever the driver.
+    The refusal names the setting and never the value."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
     if not any(ch in ";{}" for ch in text) and text == text.strip():
         return text
-    if not reads_brace_escape(driver):
+    if not _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(odbc_keyword_name(driver)):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE password holds ';', '{{', '}}' or a leading or "
             "trailing space, which needs the ODBC '}}' escape, and odbc_driver does not name a "
-            "driver measured to read it (PostgreSQL, MySQL, SQL Server); change the password"
+            "driver measured to read it (see docs/CONNECTIONS.md); change the password"
         )
     return odbc_brace(text)
 
@@ -1515,10 +1518,8 @@ def _login_timeout(s: Mapping[str, Any], label: str) -> int:
     measurement. The driver reads pyodbc's ``timeout=`` argument instead, and :func:`_make_pool`
     passes the value there.
 
-    The ``generic`` dialect gets the same value since BACKLOG #2705. Measured on 2026-10-30,
-    ``timeout=5`` bounded a connect to an unreachable host at about 5 s on psqlODBC and on MySQL
-    Connector/ODBC, against about 21 s without it. A driver that ignores the attribute keeps its own
-    default, as every generic connection did before.
+    The ``generic`` dialect gets the same value since BACKLOG #2705; the ``connect_timeout`` row in
+    docs/CONNECTIONS.md says which drivers were measured to honour it.
 
     ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
     ``label`` names the declaration in its refusal. The destination, poll source and lookup executor

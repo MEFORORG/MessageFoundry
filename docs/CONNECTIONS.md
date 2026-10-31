@@ -1668,7 +1668,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
-| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on both dialects as pyodbc's `timeout=`, never as a DSN keyword (ODBC Driver 18 ignores one). On `generic` since BACKLOG #2705: measured on 2026-10-30, `timeout=5` bounded a psqlODBC and a MySQL connect to an unreachable host at about 5 s, against about 21 s without it. A driver that ignores the attribute keeps its own default |
+| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on both dialects as pyodbc's `timeout=`, never as a DSN keyword (ODBC Driver 18 ignores one). On `generic` since BACKLOG #2705: measured on 2026-10-30, `timeout=5` bounded a psqlODBC and a MySQL connect to an unreachable host at about 5 s, against about 21 s without it. Other drivers are unmeasured: one that ignores the attribute keeps its own default, and one that refuses it would fail the connect |
 | `app_name` | `messagefoundry` | ODBC `APP` name |
 | `pool_max` | `5` | max pooled connections |
 
@@ -1828,10 +1828,10 @@ An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-w
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
 with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
 `Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
-DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read; a blank `SSLKEY`
-counts as unset, since a driver may trim it. Each file is read
-the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
-driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read. A blank or padded
+value is refused when the connection is built, before any file is read (see
+[*Values*](#values-on-the-generic-dialect)). Each file is read the way an `SSLCA` file is: a
+missing file is left to the driver, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
 the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
 
 - **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
@@ -1889,16 +1889,17 @@ and another may not.
 
 **The password.** A password holding none of `;`, `{` or `}`, with no leading or trailing space,
 is sent plain to any driver. Any other password needs braces and the ODBC `}}` escape, and is
-accepted only when `odbc_driver` names a driver measured to read that escape. The name is read by
-its words, in any case and spacing, the way [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds) reads it:
+accepted only when `odbc_driver` is the whole registered name of a driver measured to read that
+escape, in any case and spacing:
 
-- psqlODBC: a name holding `postgres` or `psqlodbc`, such as `PostgreSQL Unicode`;
-- MySQL Connector/ODBC: a name holding `mysql`;
-- Microsoft's SQL Server drivers: a name holding `sql server` or `msodbcsql`.
+- psqlODBC: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`;
+- MySQL Connector/ODBC: `MySQL ODBC <version> Unicode Driver` or `... ANSI Driver`;
+- Microsoft's SQL Server drivers: `SQL Server` or `ODBC Driver <n> for SQL Server`.
 
-For any other driver name, MariaDB's included, such a password is refused when the connection is
-built, so change the password. The engine reads the driver name as written, never the library it
-loads. The Microsoft Access
+For any other name, a library path or another vendor's driver for the same database included,
+such a password is refused when the connection is built, so change the password. The engine reads
+the driver name as written, never the library it loads, so a driver manager alias that reuses one
+of these names is taken at its word. The Microsoft Access
 driver (ACE) is one that does not read the escape: it refused even a braced password with no brace
 in it, and a `}` let password text set another keyword.
 

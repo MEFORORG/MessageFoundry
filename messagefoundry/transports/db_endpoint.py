@@ -169,20 +169,6 @@ def _reads_port_keyword(name: object) -> bool:
     )
 
 
-#: Words in an ``odbc_driver`` name that mark a driver measured to read the ODBC ``}}`` escape in a
-#: braced password: psqlODBC and MySQL Connector/ODBC, probed 2026-10-30 (BACKLOG #2705). MariaDB's
-#: driver is unmeasured, so absent. A SQL Server driver (:data:`_SQLSERVER_DRIVER_WORDS`) reads it too.
-_BRACE_ESCAPE_DRIVERS = ("postgres", "psqlodbc", "mysql")
-
-
-def reads_brace_escape(name: object) -> bool:
-    """Whether ``odbc_driver``, as written, names a driver measured to read the ODBC ``}}`` escape,
-    in any case and spacing: :data:`_BRACE_ESCAPE_DRIVERS` or a SQL Server driver. Read by its words
-    as :func:`_reads_port_keyword` reads it, so the same limit applies: the NAME, not the library."""
-    folded = odbc_keyword_name(str(name or ""))
-    return _sqlserver_driver_name(name) or any(word in folded for word in _BRACE_ESCAPE_DRIVERS)
-
-
 def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> DialEndpoint:
     """The host and port the connection string of a DATABASE connection built with ``dialect``
     names (vault BACKLOG #2704).

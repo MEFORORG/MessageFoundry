@@ -306,17 +306,20 @@ _ESCAPE_DRIVERS = [
     "PostgreSQL ANSI(x64)",
     "postgresql unicode",
     "MySQL ODBC 9.1 Unicode Driver",
-    "PostgreSQL35W",
-    "psqlODBC",
+    "PostgreSQL Unicode(x64)",
     "SQL Server",
     "ODBC  Driver 18 for SQL Server",
-    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
 ]
 _OTHER_DRIVERS = [
     "Microsoft Access Driver (*.mdb, *.accdb)",
     "SQLite3 ODBC Driver",
     "Oracle in OraClient19Home1",
     "MariaDB ODBC 3.2 Driver",
+    # A vendor driver for a measured database, and a library path, are unmeasured.
+    "Devart ODBC Driver for PostgreSQL",
+    "CData ODBC Driver for MySQL",
+    "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
 ]
 _NEEDS_BRACES = ["p}w", "p;w", "p{w", " pw", "pw ", "a};DBQ=C:\\x.accdb;X=}"]
 
@@ -367,10 +370,11 @@ def test_a_password_must_be_printable_ascii(character: str) -> None:
     assert "none of" not in message
 
 
-def test_a_password_may_hold_any_printable_ascii_character() -> None:
-    # A password cannot be restricted the way the other values are, so it keeps the ODBC escape:
-    # a closing brace is doubled, and the other delimiters sit inside the braces.
-    assert "PWD={p;w{d=1 x}}y}" in _build(username="svc", password="p;w{d=1 x}y")
+def test_a_password_may_hold_any_printable_ascii_character_for_a_measured_driver() -> None:
+    # For a driver measured to read the ODBC escape, a closing brace is doubled and the other
+    # delimiters sit inside the braces.
+    dsn = _build(odbc_driver="PostgreSQL Unicode", username="svc", password="p;w{d=1 x}y")
+    assert "PWD={p;w{d=1 x}}y}" in dsn
 
 
 @pytest.mark.parametrize("character", [";", "{", "}", "=", "\n", "\t", *_NON_ASCII])
