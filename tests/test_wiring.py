@@ -536,6 +536,28 @@ def test_check_validate_fails_on_invalid_encoding(tmp_path: Path) -> None:
     assert "not a Python text codec" in result.detail
 
 
+@pytest.mark.parametrize("literal", ["8", "True"])
+def test_check_validate_fails_on_a_non_str_encoding_naming_the_connection(
+    tmp_path: Path, literal: str
+) -> None:
+    # BACKLOG #2431: the run-time rule stringifies a non-str value into a name no codec has, so every
+    # message would be refused and a DATABASE poll would fail outright. Refused at load instead.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(tmp_path, f"inbound('i', MLLP(port=2575, encoding={literal}), router='r')")
+    result = _check_validate(tmp_path)
+    assert result.ok is False and result.required is True
+    assert "inbound connection 'i'" in result.detail
+    assert "not a codec name" in result.detail
+
+
+def test_a_null_literal_encoding_is_not_refused(tmp_path: Path) -> None:
+    # None is the declared "not declared", which decodes as utf-8; refusing it would fail a config
+    # that runs correctly.
+    _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding=None), router='r')")
+    assert load_config(tmp_path).encoding_problems() == []
+
+
 # "UTF_8" is the load-bearing row: Python normalizes case and underscores, so a probe stricter than
 # str.encode would false-positive on it. The other two are the ordinary spellings.
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "UTF_8"])
@@ -647,6 +669,22 @@ def test_env_supplied_encoding_naming_no_codec_is_refused_at_build_check(tmp_pat
     assert "outbound connection 'o'" in str(exc.value)
     assert "'charset'" in str(exc.value)  # names the env key, so the operator knows where to fix it
     assert "not a Python text codec" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", [87654, True])
+def test_a_non_str_inbound_encoding_from_the_environment_is_refused_without_its_value(
+    tmp_path: Path, value: object
+) -> None:
+    # BACKLOG #2431: an inbound env() encoding is now decoded by its resolved value, so this pass is
+    # what stands between a non-str value and the listener. The message names the connection and the
+    # key, and never the value.
+    _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": value})
+    assert "inbound connection 'i'" in str(ei.value)
+    assert "'charset'" in str(ei.value)
+    assert f"type {type(value).__name__}, value withheld" in str(ei.value)
+    assert repr(value) not in str(ei.value)
 
 
 def test_a_non_text_codec_from_the_environment_is_refused_too(tmp_path: Path) -> None:

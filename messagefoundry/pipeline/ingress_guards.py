@@ -177,9 +177,15 @@ def ingress_encoding(ic: InboundConnection) -> str:
 
     The one rule for the codec name, read by both live listeners and the dry-run alike (BACKLOG
     #2431), and the rule the MLLP and TCP listeners encode their replies by, which is why it lives in
-    :func:`~messagefoundry.transports.framing.declared_encoding`. A value naming no codec fails as a
-    ``LookupError`` that :func:`decode_body` refuses, never as a ``TypeError`` out of
-    ``bytes.decode``."""
+    :func:`~messagefoundry.transports.framing.declared_encoding`.
+
+    It reads ``ic``'s own settings, so an ``env()`` encoding must already be resolved: the listeners
+    and the dry-run pass ``ic`` through
+    :func:`~messagefoundry.config.wiring.inbound_with_resolved_encoding` first, against the values
+    the source was built with. Config load refuses a non-``str`` value or a name naming no text codec
+    (``Registry.encoding_problems``, ``resolved_encoding_problems``). The run-time refusal stays as a
+    backstop: a value that got past load fails as a ``LookupError`` that :func:`decode_body` refuses,
+    never as a ``TypeError`` out of ``bytes.decode``."""
     return declared_encoding(ic.spec.settings.get("encoding"))
 
 

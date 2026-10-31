@@ -34,6 +34,7 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     Registry,
     Send,
+    inbound_with_resolved_encoding,
 )
 from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
@@ -542,8 +543,8 @@ async def test_a_null_encoding_decodes_as_utf8_on_the_listener_as_in_the_dry_run
         pytest.param("not-a-real-codec", id="unknown_name"),
         pytest.param("base64", id="not_a_text_codec"),
         pytest.param("undefined", id="refusing_codec"),
-        # What an inbound env() encoding is at the listener: the ref itself, never resolved (see
-        # resolved_encoding_problems in config/wiring.py).
+        # An env() encoding with no value in this environment: the backstop refuses the reference.
+        # One WITH a value decodes by it (test_an_env_encoding_decodes_by_its_resolved_value...).
         pytest.param(EnvRef("charset"), id="unresolved_env_ref"),
     ],
 )
@@ -561,6 +562,70 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
     assert preview.disposition is MessageStatus.ERROR
     assert preview.error is not None and preview.error.startswith("decode error (")
     assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_an_env_encoding_decodes_by_its_resolved_value_on_both_callers(
+    store: MessageStore, listener: str
+) -> None:
+    """BACKLOG #2431: the source is built from the resolved ``env()`` value, and the decode now reads
+    the same value. Before, the decode read the reference itself and refused every message."""
+    ic = _inbound_declaring(EnvRef("charset"))
+    values = {"charset": "latin-1"}
+    reg = _registry(ic)
+    assert dry_run(reg, ADT_LATIN1, env_values=values).disposition is MessageStatus.RECEIVED
+
+    runner = wiring_runner.RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False), env_values=values
+    )
+    await getattr(runner, listener)(reg.inbound["in"], ADT_LATIN1)
+
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    assert [dict(r) for r in await cur.fetchall()] == [
+        {"status": MessageStatus.RECEIVED.value, "error": None}
+    ]
+
+
+async def test_a_database_inbound_with_an_env_encoding_records_no_error_row(
+    store: MessageStore,
+) -> None:
+    """The DATABASE source hands each row's bytes, encoded with the resolved name, to this handler and
+    marks the row once it returns. An ERROR row here was a partner row consumed (BACKLOG #2431)."""
+    ic = InboundConnection(
+        "in",
+        ConnectionSpec(
+            ConnectorType.DATABASE,
+            {
+                "server": "sql.example.com",
+                "database": "MFDB",
+                "poll_statement": "SELECT id, payload FROM t",
+                "encoding": EnvRef("charset"),
+            },
+        ),
+        router="r",
+    )
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False), env_values={"charset": "latin-1"}
+    )
+    await runner._handle_inbound(reg.inbound["in"], ADT_LATIN1)
+
+    cur = await store._db.execute("SELECT status FROM messages")
+    assert [r["status"] for r in await cur.fetchall()] == [MessageStatus.RECEIVED.value]
+
+
+def test_an_env_encoding_resolving_to_no_usable_codec_is_not_substituted() -> None:
+    """The run-time view leaves such a ref unresolved, so the backstop refusal names the reference
+    and never the environment value (config load refuses the value first)."""
+    ic = _inbound_declaring(EnvRef("charset"))
+    for value in ("hunter2", 8, True):
+        assert inbound_with_resolved_encoding(ic, {"charset": value}) is ic
+    resolved = inbound_with_resolved_encoding(ic, {"charset": "latin-1"})
+    assert ingress_guards.ingress_encoding(resolved) == "latin-1"
+    not_deployed = InboundConnection(
+        "in", ic.spec, router="r", content_type=ContentType.HL7V2, deployed=False
+    )
+    assert inbound_with_resolved_encoding(not_deployed, {"charset": "latin-1"}) is not_deployed
 
 
 async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:

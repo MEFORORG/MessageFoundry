@@ -105,6 +105,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    inbound_with_resolved_encoding,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -7776,6 +7777,8 @@ class RegistryRunner:
         It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
         DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
         ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
+        # An env() encoding is decoded by its resolved value, the one the source got (BACKLOG #2431).
+        ic = inbound_with_resolved_encoding(ic, self._env_values)
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
@@ -8029,6 +8032,8 @@ class RegistryRunner:
             self._stream_inflight_bytes -= size
 
     async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
+        # An env() encoding is decoded by its resolved value, the one the source got (BACKLOG #2431).
+        ic = inbound_with_resolved_encoding(ic, self._env_values)
         ack_mode = ic.ack_mode
         reply = ack_mode is not AckMode.NONE
         src = ic.spec.type.value
@@ -8073,9 +8078,9 @@ class RegistryRunner:
         # raw and the delivered copy (review H-3). HL7 also normalizes line endings to \r; a non-HL7
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
         # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
-        # the dry-run makes, and decode_body resolves the codec name by the dry-run's rule, so a bad
-        # name is this same ERROR row, with an AE, rather than an escape into the transport (BACKLOG
-        # #2431).
+        # the dry-run makes, and decode_body resolves the codec name by the dry-run's rule. Config load
+        # refuses a bad name; one that got past it is this same ERROR row, with an AE, rather than an
+        # escape into the transport (BACKLOG #2431).
         try:
             text = decode_body(raw, ic)
         except IngressGuardError as exc:

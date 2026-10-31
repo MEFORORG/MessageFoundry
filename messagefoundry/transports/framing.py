@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.framing import (
     MLLP_CODEC,
     PRESETS,
@@ -120,19 +121,12 @@ def declared_encoding(declared: object) -> str:
     and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
     for the decode (BACKLOG #2431).
     An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
-    Any other value is stringified, so the name is always a ``str``: a value naming no codec, such
-    as ``bytes``, then fails as a ``LookupError`` the decode refuses and :func:`frame_reply` falls
-    back from, never as a ``TypeError`` out of ``encode`` or ``decode``."""
+    Config load refuses any other non-``str`` value and any name naming no text codec, an ``env()``
+    value included once resolved (``Registry.encoding_problems`` and ``resolved_encoding_problems``,
+    BACKLOG #2431), so at run time this sees a ``str`` or ``None``. The ``str()`` stays as a
+    backstop: a value that got past load anyway fails as a ``LookupError`` the decode refuses and
+    :func:`frame_reply` falls back from, never as a ``TypeError`` out of ``encode`` or ``decode``."""
     return str(declared) if declared else "utf-8"
-
-
-def _charset_encodes(encoding: str) -> bool:
-    """Whether ``encoding`` names a text codec that encodes at all, probed on one ASCII letter."""
-    try:
-        "a".encode(encoding)
-    except (LookupError, UnicodeError):
-        return False
-    return True
 
 
 def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str = "") -> bytes:
@@ -159,7 +153,7 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     except UnicodeEncodeError:
         raise
     except (LookupError, UnicodeError):
-        if _charset_encodes(encoding):
+        if _is_text_codec(encoding):
             raise
         if connection not in _reply_fallback_logged:
             _reply_fallback_logged.add(connection)
