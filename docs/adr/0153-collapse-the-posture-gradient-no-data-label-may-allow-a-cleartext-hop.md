@@ -379,8 +379,10 @@ with `cleartext=True`): every auth setting, a static header the redaction screen
 name or by value, and a credential-looking query parameter. A header a Handler stamps per message
 under `dynamic_headers` is judged the same way when the message is sent. One exception: when the
 request goes to a web proxy, a static `Proxy-Authorization`, in any spelling, is left to the
-send-time proxy rule. A `proxy_url` the hop bypasses does not count: that request goes direct, so
-the header counts as a credential and refuses the hop at build.
+send-time proxy rule. A `proxy_url` the hop bypasses does not count: the connection gives that
+host no proxy handler, so the header counts as a credential and refuses the hop at build. The
+request is not proven direct, since the opener still follows a proxy from the environment or the
+system settings, and under `proxy_url = "default"` the system proxy itself still applies.
 
 **What did not change.** `cleartext_accepted` still carries a body with no credential across, with
 the WARN and the audit record decision 2 describes. That was the case decision 2 was written for.
