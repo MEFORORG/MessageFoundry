@@ -4808,7 +4808,8 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
-    # The CLI derives its own posture (BACKLOG #2532), and this leg's container speaks plaintext.
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
@@ -4951,7 +4952,8 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
-    # The CLI derives its own posture (BACKLOG #2532), and this leg's container speaks plaintext.
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
     assert rc == 0

@@ -1048,3 +1048,49 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
     monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
     assert _state(db) == before
     assert _audit_rows(db) == []
+
+
+def test_a_hop_refusal_after_the_open_is_not_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2532: only a hop refusal the OPEN raises is "could not start", exit 2. One a later
+    Transit call raises (here, opening the seed), after rows were read, is not reported as a store
+    that did not open; it reaches the dispatch floor, as ``store withdraw-transit-bound`` lets it.
+
+    Mutation: put ``InsecureHopRefused`` back in ``could_not_start``; this exits 2."""
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "late-hop.db"
+    _seed(db)
+    before = _state(db)
+    _refused_before_the_key(monkeypatch)
+
+    def refused(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        raise InsecureHopRefused("synthetic: the Transit hop was refused")
+
+    real_open = MessageStore.open_totp_secret
+    monkeypatch.setattr(MessageStore, "open_totp_secret", refused)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
+    assert _state(db) == before
+
+
+def test_a_hop_refusal_at_the_open_is_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: the same refusal raised by the open itself exits 2, with nothing written."""
+    import messagefoundry.store.base as store_base
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "open-hop.db"
+    _seed(db)
+    _refused_before_the_key(monkeypatch)
+
+    async def refused(*_a: object, **_k: object) -> object:
+        raise InsecureHopRefused("synthetic: the store hop was refused")
+
+    monkeypatch.setattr(store_base, "open_store", refused)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    assert "Nothing was written" in _error(capsys)

@@ -15,9 +15,14 @@ driver module is a stand-in, so what is proved is whether the guard let the comm
 * :func:`test_a_hop_serve_refuses_is_refused` refuses, exit 2, and dials nothing;
 * :func:`test_a_loopback_hop_is_accepted` is the control at the hop ``serve`` accepts;
 * :func:`test_warn_crosses_the_same_hop` is the control on the dial: the same hop crosses at
-  ``warn``, so the refusal above is the instance's posture and not a constant;
-* :func:`test_a_weakened_hop_is_refused` and :func:`test_warn_honours_the_escape` are the same pair
-  for the weakened-TLS check, which is the only posture check a SQL Server store has.
+  ``warn`` with ``serve``'s WARNING, so the refusal above is the instance's posture and not a
+  constant;
+* :func:`test_a_weakened_hop_is_refused` is the weakened-TLS check, which is the only posture check
+  a SQL Server store has;
+* :func:`test_warn_keeps_refusing_a_weakened_hop_with_the_escape` and
+  :func:`test_warn_keeps_refusing_an_unattested_off_box_vault` hold the no-loosening rule (Manager
+  decision d20261031T021248404-699a64): at ``warn`` each command still refuses what it refused with
+  no posture, where ``serve`` would cross.
 
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 would have inherited.
@@ -34,6 +39,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 from messagefoundry.store.crypto import generate_key
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests.test_store_ssl import _FakeAsyncpg
 
 _REMOTE = "db.example.invalid"
@@ -182,14 +188,78 @@ def test_a_weakened_hop_is_refused(
 
 
 @pytest.mark.parametrize("command", _COMMANDS)
-def test_warn_honours_the_escape(
-    command: str, shell: Path, asyncpg: _RefusingAsyncpg, monkeypatch: pytest.MonkeyPatch
+def test_warn_keeps_refusing_a_weakened_hop_with_the_escape(
+    command: str,
+    shell: Path,
+    asyncpg: _RefusingAsyncpg,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The control: at ``warn`` the escape works as it does for ``serve``. With no posture it was
-    refused whatever the dial said, so this is what passing the posture relaxes."""
+    """No command loosens (Manager decision 2026-10-31). With no posture these commands refused a
+    weakened store whatever the dial said, so at ``warn`` they still refuse it with the escape set,
+    where ``serve`` would cross.
+
+    Mutation: return the ``warn`` posture from ``_command_hop_posture``; the command then dials."""
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    main(_argv(command, shell, server=_REMOTE, enforcement="warn", weakened=True))
-    assert asyncpg.pool_kwargs["host"] == _REMOTE
+    code = main(_argv(command, shell, server=_REMOTE, enforcement="warn", weakened=True))
+    captured = capsys.readouterr()
+    assert not asyncpg.pool_kwargs, "the command crossed a weakened hop it refused before"
+    assert code != 0
+    assert "weakened" in (captured.out + captured.err + caplog.text).lower(), (
+        captured.out,
+        captured.err,
+    )
+
+
+@pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_warn_keeps_refusing_an_unattested_off_box_vault(
+    command: str,
+    shell: Path,
+    asyncpg: _RefusingAsyncpg,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no posture the Vault store-key hop counted as enforcing, so an unattested off-box
+    Vault was refused. At ``warn`` it still is, where ``serve`` would cross it with a WARNING. The
+    refusal is decided before the client dials, so the proof is that nothing was dialled.
+
+    Mutation: return the ``warn`` posture from ``_command_hop_posture``; the client then dials."""
+    import urllib.request
+
+    import urllib3.util.connection
+
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
+    monkeypatch.setattr(urllib.request, "proxy_bypass_registry", lambda host: False, raising=False)
+    dialled: list[object] = []
+
+    def record(address: object, *args: object, **kwargs: object) -> object:
+        dialled.append(address)
+        raise OSError("synthetic: this test dials nothing")
+
+    monkeypatch.setattr(urllib3.util.connection, "create_connection", record)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", "https://vault.synthetic.test:8200")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", "s.synthetic-token")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    code = main(_argv(command, shell, server=_LOOPBACK, enforcement="warn"))
+    assert not dialled, "the command dialled an unattested off-box Vault it refused before"
+    assert not asyncpg.pool_kwargs, "the store opened without its key"
+    assert code != 0
 
 
 def test_the_open_refusal_quotes_no_key_byte() -> None:

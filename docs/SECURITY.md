@@ -1161,7 +1161,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which each pass the instance's posture (BACKLOG #2532); `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve`, for a command that passes its posture. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run | a command that passes its posture refuses as the two store rows above. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532); at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard once themselves, which warns | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -1200,17 +1200,19 @@ named it as still open, waiting on engine PR 1877.
 
 - CORRECTED 2026-10-01: this list named the three Vault hops' missing scheme gate, vault BACKLOG
   #2317. Engine PR 1880 closed it; see the Vault rows above.
-- `support-bundle` and `verify` refuse a weakened store even at `enforcement = warn`, because they
-  pass no posture. The other commands in the third row, and at least `provision-admin`,
-  `store provision-schema` and `check-privileges`, pass one and keep the escape at `warn`. A site
-  that needs `support-bundle` or `verify` on a dev store gives it a verifying certificate, or the
-  command is changed to pass its posture.
-- `support-bundle` and `verify` would also cross an off-loopback PostgreSQL store hop with no
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`. At
+  least `provision-admin`, `store provision-schema` and `check-privileges` pass the posture and
+  keep the escape at `warn`. A site that needs the others on a dev store gives it a verifying
+  certificate. That refusal at `warn` began as a side effect of passing no posture (vault BACKLOG
+  #2354), never as a ruling. BACKLOG #2532 keeps it on purpose (Manager decision
+  d20261031T021248404-699a64: no command loosens). Whether the CLI should honour the escape at
+  `warn` is the owner question in BACKLOG #1886, still open.
+- At least `support-bundle` and `verify` would cross an off-loopback PostgreSQL store hop with no
   revocation check on a first deployment, at `enforcement = enforce` too, because they pass no
   posture, no CLI process stamps one, and `RevocationHopGuard` does nothing with neither. `serve`
-  and the commands that pass
-  their posture refuse that hop. BACKLOG #2532 left this open: the fix is a guard that fails
-  closed with no posture, in the store files, rather than another call site.
+  and the commands BACKLOG #2532 covers refuse that hop at `enforce`. #2532 left this open: the
+  fix is a guard that fails closed with no posture, in the store files, rather than another call
+  site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 

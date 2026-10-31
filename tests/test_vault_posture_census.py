@@ -268,6 +268,9 @@ def _found() -> tuple[Row, ...]:
 #: calls in one function are two rows and neither can hide behind the other.
 _CENSUS: list[Row] = sorted(
     [
+        # The store-opening commands' ``posture`` is ``_command_hop_posture``'s value: the
+        # instance's posture at enforce and None at warn (BACKLOG #2532), so on the Vault hops each
+        # is judged as enforcing, as it was when it passed none.
         ("__main__.py", "_admin_reset_totp.opened", "open_store", "posture"),
         ("__main__.py", "_admin_set_notify_email.run", "open_store", "posture"),
         ("__main__.py", "_admin_unlock.run", "open_store", "posture"),
@@ -508,7 +511,7 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
-        ("__main__.py", "_instance_hop_posture", "settings.security.enforcement"),
+        ("__main__.py", "_command_hop_posture", "settings.security.enforcement"),
         # The offline alert notifier's revocation guards and the offline security notifier's SMTP
         # login guard, each for a caller with no posture (BACKLOG #2193).
         ("__main__.py", "_offline_alert_notifier", "settings.security.enforcement"),
