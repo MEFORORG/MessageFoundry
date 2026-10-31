@@ -2061,9 +2061,10 @@ class ProxyConfig:
         request to it carries what a connection with no ``proxy_url`` would send. The build still
         judges the proxy credential, whatever the targets.
 
-        ``None`` is not proof of a direct hop. The opener's own default then applies, which reads
-        the environment and the system proxy settings, so a proxy from either can still take a
-        ``proxy_no_proxy`` match, ``proxy_url = "default"`` included.
+        ``None`` is not proof of a direct hop. The opener the connection then sends on applies its
+        own default, read from the environment and the system proxy settings when that opener was
+        built, so a proxy from either can still take a ``proxy_no_proxy`` match,
+        ``proxy_url = "default"`` included.
 
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
@@ -2157,7 +2158,7 @@ def hop_reaches_a_proxy(
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
     what its ``opener_handlers()`` built. A ``None`` ``proxy_dest``, or an uncredentialed one,
     which is a host urllib's own bypass list names, answers ``False``. That is not proof of a
-    direct hop: that method says what each does to the route.
+    direct hop: :meth:`ProxyConfig.for_host` says what each does to the route.
     Otherwise the proxy for ``url``'s scheme is read off the built handler, so
     ``proxy_url = "default"`` with no system proxy for the scheme goes direct. The handler took
     the system map when it was built, so this reads the map the opener holds, not a later one. An

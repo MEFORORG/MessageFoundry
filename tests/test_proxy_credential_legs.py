@@ -22,8 +22,9 @@ It also pins #3442: a connection whose target urllib's own bypass list names att
 so that send goes direct and is not refused. And #3443: a static ``Proxy-Authorization`` beside the
 connection's own proxy credential is refused at build, so it cannot ride that admission.
 
-Each refusal is read at a loopback socket that records what reaches it, or at a recorder in place of
-the dial, as well as in the result. Each has a control in the other polarity.
+Each send-time refusal is read at a loopback socket that records what reaches it, or at a recorder
+in place of the dial, as well as in the result; a build-time refusal is read in the result. Each
+has a control in the other polarity.
 
 Synthetic data only: the credentials are made up and every off-box host name is reserved.
 """

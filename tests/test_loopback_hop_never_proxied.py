@@ -440,8 +440,10 @@ def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target()
     ],
 )
 def test_the_three_predicates_agree_on_each_spelling(host: str, on_box: bool) -> None:
-    """Read as written, because ``urlsplit`` would lowercase the host. The guard and the opener
-    are held to the same answer for the URLs in ``_OFF_BOX_URLS`` (vault BACKLOG #2706)."""
+    """Read as written, because ``urlsplit`` would lowercase the host. The two transport readers
+    delegate to the guard's predicate, so this pins the answer, not an agreement; the openers' own
+    reading of the URLs in ``_OFF_BOX_URLS`` is held by
+    ``test_an_off_box_hop_still_goes_through_the_environment_proxy`` (vault BACKLOG #2706)."""
     assert is_loopback_hop_host(host) is on_box
     assert is_never_proxied_host(host) is on_box
     assert rest._is_loopback_target(host) is on_box
@@ -466,7 +468,7 @@ def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
 
 
 def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
-    environment_proxy: None,
+    environment_proxy: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_proxy_bypasses`` strips the dot and the predicate does not, so the two disagree on
     ``localhost.``. The match takes the connection's own proxy off the hop, a proxy from the
@@ -480,8 +482,12 @@ def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
     config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
     assert config is not None
     assert config.for_host("https://localhost./x") is None
-    # A connection with no resolved proxy sends on the shared opener; this is that opener's builder.
-    assert _dialled(rest._no_redirect_opener(), "https://localhost./x") == _PROXY_HOST
+    # The connection sends on the shared opener, rebuilt here because the one built at import read
+    # whatever the environment held then.
+    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    dest = _rest("https://localhost./x", **settings)
+    assert dest._opener is rest._NO_REDIRECT_OPENER
+    assert _dialled(dest._opener, "https://localhost./x") == _PROXY_HOST
     with active_hop_posture(HopPosture(enforcing=True)):
         with pytest.raises(InsecureHopRefused, match="HTTP cleartext egress"):
             _rest("http://localhost./x", **settings)

@@ -14,7 +14,7 @@
   own proxy setting takes the request. A hop can bypass a configured `proxy_url` through at least
   `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system proxy for the
   request's scheme. The refusal above then judges the header too. A header key that holds
-  whitespace or is shaped like a credential is withheld from the refusal text. Owner ruling
+  whitespace or is shaped like a credential is not shown as written in the refusal text. Owner ruling
   2026-10-26, recorded as a dated amendment to
   [ADR 0153](../docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
   The forward-proxy login stays under the declarations, by the owner's 2026-10-05 ruling on that
