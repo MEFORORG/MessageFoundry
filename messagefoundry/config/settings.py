@@ -7691,8 +7691,8 @@ class ServiceSettings(_InputHidingModel):
         if self.cluster._renew_clamp_derived:
             cause = (
                 "lease_renew_timeout_seconds is not set, and the value derived from"
-                " leader_fence_timeout_seconds and leader_lease_ttl_seconds leaves the renew no"
-                f" headroom there: twice it (2 x {clamp:g} = {2 * clamp:g} s)"
+                " leader_fence_timeout_seconds and leader_lease_ttl_seconds leaves the renew little"
+                f" or no headroom on SQL Server: twice it (2 x {clamp:g} = {2 * clamp:g} s)"
             )
             other = f"set lease_renew_timeout_seconds explicitly, below {half:g} s"
             first = f"Widen {gap}"

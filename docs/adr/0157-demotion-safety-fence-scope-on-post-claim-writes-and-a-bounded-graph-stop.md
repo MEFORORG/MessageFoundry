@@ -726,9 +726,11 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 - Consequence 1(c): a promote, demote and re-promote in one process passes every guard, on both
   backends. Only a per-claim token closes it.
 - The SQL Server renew inherited `[store].command_timeout` until 2026-10-30 (Inc 0, deviation 3,
-  now BUILT). Its claim's borrow and statement are clamped. The claim's COMMIT, and the ROLLBACK
-  after a failed claim, are bounded by nothing: they are calls on the connection, which neither the
-  clamp nor `[store].command_timeout` bounds. At least these are not clamped either: the start-up
+  now BUILT). Its claim's borrow and statement are clamped. Neither the clamp nor
+  `[store].command_timeout` is known to bound the claim's COMMIT, or the ROLLBACK after a failed
+  claim, by a reading of pyodbc's documentation, not a measurement;
+  [`docs/CONFIGURATION.md`](../CONFIGURATION.md), the `lease_renew_timeout_seconds` row, says why.
+  At least these are not clamped either: the start-up
   `_register` and `_ensure_tables`, and the heartbeat, config-version and release statements. The
   claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
   leader whose pool is busy but healthy can self-fence sooner.

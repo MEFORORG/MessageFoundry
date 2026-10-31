@@ -5518,9 +5518,9 @@ class SqlServerStore:
         it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
         leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are not
-        statements, so the clamp does not bound them either; they run under whatever bounds every
-        other store call."""
+        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are calls on the
+        connection, not statements, so neither the clamp nor ``[store].command_timeout`` is known to
+        bound them, by a reading of pyodbc's documentation, not a measurement."""
         rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 

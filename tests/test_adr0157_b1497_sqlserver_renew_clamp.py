@@ -390,6 +390,7 @@ def test_sqlserver_warns_at_the_shipped_timings(tmp_path: Path) -> None:
     assert note is not None
     # Derived, so the note names the fence/TTL pair and never a value the operator did not set.
     assert "lease_renew_timeout_seconds is not set" in note
+    assert "leaves the renew little or no headroom on SQL Server" in note
     assert "(2 x 4.5 = 9 s)" in note
     assert "set lease_renew_timeout_seconds explicitly, below 4.5 s" in note
     assert "Lower lease_renew_timeout_seconds" not in note
