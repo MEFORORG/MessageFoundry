@@ -64,8 +64,9 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
   reference, whose value is resolved only when the connector is built, and ``proxy_url='default'``,
-  where the operating system's proxy settings carry any credential. Userinfo in either is sent and
-  not listed. A ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
+  where the operating system's proxy settings carry any credential. Userinfo in either is not
+  listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
+  ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
 arguments and touches nothing else.
@@ -309,8 +310,8 @@ def _proxy_hop(
     if targets and all(_proxy_bypasses(target, no_proxy) for target in targets):
         return None  # every address bypasses the proxy: the credential is never sent
     # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
-    # always Basic: the handler sends it pre-emptively and it replaces the engine's own header,
-    # whatever proxy_auth_type says. Otherwise the type is read the way the transport reads it.
+    # reported as Basic, which is what urllib makes of it, whatever proxy_auth_type says; the
+    # connector then refuses it at build. Otherwise the type is read the way the transport reads it.
     kind = "basic" if in_url else str(settings.get("proxy_auth_type") or "basic").strip().lower()
     if kind not in ("basic", "digest"):
         kind = "static"

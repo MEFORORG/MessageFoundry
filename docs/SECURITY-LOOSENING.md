@@ -116,11 +116,12 @@ engine has not verified, when the lever named beside each is set:
 - a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
   `[security].enforcement = warn`.
 
-**The forward-proxy login is judged by a different owner ruling.** A `proxy_user` login rides the
+**The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
-#3416). The owner's ruling of 2026-10-05 (vault BACKLOG #3007) refuses it there unless the
-connection declares `cleartext_accepted` with a reason. The engine also lets it cross under
-`tls_hop_attested`, or to a proxy on this machine.
+#3416). It is refused there unless the connection declares `cleartext_accepted` with a reason, or
+the proxy is on this machine. `tls_hop_attested` does not admit it. No declaration lifts a
+credential written in a proxy URL or the environment. [CONNECTIONS.md](CONNECTIONS.md) states the
+rulings (vault BACKLOG #3007).
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.
@@ -1640,7 +1641,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
-  credential the refusal recognizes, other than a forward-proxy login, over cleartext `http` to a
+  credential the refusal recognizes over cleartext `http` to a
   host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
   that is not credential-shaped, under a neutral header name, rests on the attestation alone: an
   [accepted limit](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine).

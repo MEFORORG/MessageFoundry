@@ -22,8 +22,9 @@ It also pins #3442: a connection whose target urllib's own bypass list names att
 so that send goes direct and is not refused. And #3443: a static ``Proxy-Authorization`` beside the
 connection's own proxy credential is refused at build, so it cannot ride that admission.
 
-Each refusal is read on the wire, at a loopback socket that records what reaches it, as well as in
-the result. Each has a control in the other polarity.
+Each send-time refusal is read at a loopback socket that records what reaches it, or at a recorder
+in place of the dial, as well as in the result; a build-time refusal is read in the result. Each
+has a control in the other polarity.
 
 Synthetic data only: the credentials are made up and every off-box host name is reserved.
 """
@@ -62,6 +63,7 @@ from messagefoundry.transports.bounded_read import (
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
     ProxyCredentialsRefusedError,
+    _proxies_of,
     build_strict_opener,
 )
 from messagefoundry.transports.rest import RestDestination
@@ -228,6 +230,11 @@ def test_admission_never_covers_a_credential_from_a_proxy_url() -> None:
 
 
 _OFF_BOX_HTTPS_PROXY = "https://proxy.example.com:3128"
+_PROXY_LOGIN: dict[str, Any] = {
+    "proxy_url": _OFF_BOX_HTTPS_PROXY,
+    "proxy_user": "u5er",
+    "proxy_password": "pa55w0rd",
+}
 
 
 def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is_built() -> None:
@@ -242,22 +249,79 @@ def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is
         )
 
 
-@pytest.mark.parametrize("declaration", ["accepted", "attested"])
-def test_control_a_declared_connection_builds_and_its_handler_admits_the_header(
-    declaration: str,
-) -> None:
-    """``cleartext_accepted`` with ``cleartext_reason``, or ``tls_hop_attested`` with
-    ``tls_hop_attested_reason``: the guard admits the credential, and the proxy handler carries that
-    admission to send time."""
-    dest = _rest(
-        _HTTPS_TARGET,
-        proxy_url=_OFF_BOX_HTTPS_PROXY,
-        proxy_user="u5er",
-        proxy_password="pa55w0rd",
-        **{declaration: True},  # type: ignore[arg-type]
-    )
+def test_control_a_declared_connection_builds_and_its_handler_admits_the_header() -> None:
+    """``cleartext_accepted`` with ``cleartext_reason``: the guard admits the credential, and the
+    proxy handler carries that admission to send time."""
+    dest = _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
     assert dest._headers["Proxy-Authorization"] == _HEADER
     assert _proxy_handler(dest).caller_header_admitted is True
+
+
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforce", "warn"])
+def test_tls_hop_attested_does_not_admit_a_proxy_credential(
+    caplog: pytest.LogCaptureFixture, enforcing: bool
+) -> None:
+    """B462-R1 of the 2026-10-30 rulings, for this cell only (vault BACKLOG #3007)."""
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(InsecureHopRefused, match="tls_hop_attested does not admit it"),
+    ):
+        _rest(_HTTPS_TARGET, posture=HopPosture(enforcing=enforcing), attested=True, **_PROXY_LOGIN)
+    assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
+
+
+def test_control_tls_hop_attested_still_carries_the_body_hop_past_a_credential_free_proxy() -> None:
+    """The attestation's other work is untouched: the cleartext body hop is what it declares."""
+    assert _rest(_HTTP_TARGET, attested=True, proxy_url=_OFF_BOX_HTTPS_PROXY)._hop_guard is not None
+
+
+def test_an_accepted_proxy_user_build_writes_the_cleartext_acceptance_audit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The destination is ``https``, so the only cleartext crossing on this connection is the leg
+    to the proxy, and the control with no ``proxy_user`` writes no record (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, proxy_url=_OFF_BOX_HTTPS_PROXY)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
+    audit = [r.getMessage() for r in caplog.records if marker in r.getMessage()]
+    assert len(audit) == 1
+    assert "'OB_REST'" in audit[0]
+    assert "web-proxy cleartext credentials" in audit[0]
+    assert "legacy partner listener has no TLS" in audit[0]
+    for part in ("u5er", "pa55w0rd", _HEADER):
+        assert part not in audit[0], part
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({"proxy_auth_type": "ntlm"}, id="deferred-type"),
+        pytest.param({"proxy_auth_type": "kerberos"}, id="unknown-type"),
+        pytest.param({"headers": {"Proxy-Authorization": "Basic eA=="}}, id="static-header"),
+    ],
+)
+def test_a_refused_accepted_proxy_user_build_writes_no_acceptance_audit(
+    caplog: pytest.LogCaptureFixture, extra: dict[str, Any]
+) -> None:
+    """The acceptance record says a crossing was accepted, so a build refused for the proxy
+    credential's type or for a static header beside it must not leave one (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"), pytest.raises(ValueError):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN, **extra)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+
+
+def test_enforcement_warn_with_no_declaration_refuses_a_proxy_credential() -> None:
+    """``_shipped_strict_disposition`` floors the dial's WARN back to REFUSE. The control is the same
+    connection, with the acceptance, on the same dial."""
+    warn = HopPosture(enforcing=False)
+    with pytest.raises(InsecureHopRefused, match="before any TLS"):
+        _rest(_HTTPS_TARGET, posture=warn, **_PROXY_LOGIN)
+    accepted = _rest(_HTTPS_TARGET, posture=warn, accepted=True, **_PROXY_LOGIN)
+    assert _proxy_handler(accepted).caller_header_admitted is True
 
 
 def test_control_a_proxy_written_https_with_no_proxy_user_builds_as_before() -> None:
@@ -423,6 +487,88 @@ def test_control_a_host_on_no_bypass_list_still_reaches_the_proxy_with_its_heade
     assert len(proxy.cleartext) == 1
     assert proxy.cleartext[0].startswith(b"POST http://partner.example.test/x ")
     assert f"Proxy-Authorization: {_HEADER}\r\n".encode() in proxy.cleartext[0]
+
+
+_STATIC_PROXY_HEADER = {"Proxy-Authorization": _HEADER}
+
+
+def test_a_rest_send_with_a_static_proxy_header_to_a_loopback_host_is_refused() -> None:
+    """A connection's static ``headers`` with no ``proxy_user``: no guard admitted the header and
+    no bypass rule leaves it off. A loopback host is never proxied, so it would reach the
+    destination, and the destination is not dialled (vault BACKLOG #3417). Measured 2026-10-30:
+    with ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the send
+    delivered the header to this socket and this test failed. Control: with no header the same
+    send is delivered."""
+    with _WireProxy() as destination:
+        url = f"http://{destination.address}/x"
+        _send_refused(_rest(url, headers=_STATIC_PROXY_HEADER), "#3417")
+        assert destination.connections == 0
+        asyncio.run(_rest(url).send('{"a": 1}'))
+    assert len(destination.cleartext) == 1
+
+
+def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_for_its_scheme_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``proxy_url = "default"`` reads the environment when the connection is built; the shared
+    opener read it at import. ``HTTP_PROXY`` gives that connection no proxy for ``https``, so the
+    send goes direct, and the static header is refused before the dial (vault BACKLOG #3417).
+    Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a
+    no-op, the dial was reached with the header on the request and this test failed. Control: with
+    no header the same send reaches the dial."""
+    monkeypatch.setenv("HTTP_PROXY", f"http://{_MARKER}")
+    dest = _rest(_HTTPS_TARGET, proxy_url="default", headers=_STATIC_PROXY_HEADER)
+    assert "https" not in _proxies_of(_proxy_handler(dest))
+    _send_refused(dest, "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, proxy_url="default").send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
+    assert dialled.value.proxy_header is None
+
+
+@pytest.mark.parametrize(
+    "proxy_url", ["default", f"http://{_MARKER}"], ids=["default-proxy", "configured-proxy"]
+)
+def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch, proxy_url: str
+) -> None:
+    """A static header, so #3442 has no credential of the connection's own to leave off, and
+    ``NO_PROXY`` names the destination, so urllib sends the request direct. Each connection has a
+    proxy for ``https``, because with none the request goes direct whatever ``NO_PROXY``
+    says. The header is refused before the dial (vault BACKLOG #3417). Measured 2026-10-30: with
+    ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the dial was
+    reached with the header on the request and this test failed. Controls: with no header the same
+    send reaches the dial, and with no ``NO_PROXY`` the request goes to the proxy, where the header
+    is refused as a cleartext proxy credential (#2572, a number only that text cites)."""
+    monkeypatch.setenv("HTTPS_PROXY", f"http://{_MARKER}")
+    monkeypatch.setenv("NO_PROXY", "partner.example.test")
+    dest = _rest(_HTTPS_TARGET, proxy_url=proxy_url, headers=_STATIC_PROXY_HEADER)
+    _send_refused(dest, "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, proxy_url=proxy_url).send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
+    monkeypatch.delenv("NO_PROXY")  # urllib reads its list on every request
+    _send_refused(dest, "#2572")
+
+
+def test_a_rest_send_its_own_bypass_list_sends_direct_is_refused(
+    recorded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``proxy_no_proxy`` match, where ``for_host`` drops the proxy and the connection sends on
+    the shared opener. That opener is built again here, because the one built at import read
+    whatever the environment held then. The static header is refused before the dial (vault
+    BACKLOG #3417). Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg``
+    replaced by a no-op, the dial was reached with the header on the request and this test failed.
+    Control: with no header the same send reaches the dial."""
+    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    settings: dict[str, Any] = {
+        "proxy_url": f"http://{_MARKER}",
+        "proxy_no_proxy": "partner.example.test",
+    }
+    _send_refused(_rest(_HTTPS_TARGET, headers=_STATIC_PROXY_HEADER, **settings), "#3417")
+    with pytest.raises(_Dialled) as dialled:
+        asyncio.run(_rest(_HTTPS_TARGET, **settings).send('{"a": 1}'))
+    assert dialled.value.host == "partner.example.test"
 
 
 # --- #3443: a static Proxy-Authorization beside the connection's own proxy credential -----------

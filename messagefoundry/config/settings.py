@@ -5325,9 +5325,10 @@ class EgressSettings(_Section):
     # the environment proxy urllib reads on its own). "default" = the OS default web
     # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
     # proxied, whichever of these named the proxy (vault BACKLOG #2579). Put proxy credentials on each
-    # connection (secrets via env()). This field has no validator, so a user:password@ written in it
-    # is inherited with the URL; docs/CONFIGURATION.md [egress] says what then applies.
-    # Env: MEFOR_EGRESS_PROXY_URL.
+    # connection (secrets via env()). Its shape is checked at load by _proxy_url_shape below. A
+    # user:password@ written in it passes that check and is inherited with the URL; each connection
+    # that inherits it then fails to build (vault BACKLOG #3007), and docs/CONFIGURATION.md [egress]
+    # says what else applies. Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
@@ -5398,6 +5399,36 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("proxy_url", mode="after")
+    @classmethod
+    def _proxy_url_shape(cls, value: str | None) -> str | None:
+        """Refuse at load a site proxy URL the transport's one proxy parse refuses (vault BACKLOG
+        #2965), so the fault names this setting rather than surfacing on each connection that
+        inherits it, and a value no connection inherits is still caught.
+
+        ``"default"`` (any case) passes, and a blank value reads as unset. ``"default"`` is written
+        out rather than read from ``transports.rest.PROXY_DEFAULT``, so this import stays off the
+        sentinel's path; a test pins that the two agree. The refusal is the parse's fixed text,
+        which names no part of the value; the base model also hides the input. A ``user:password@``
+        passes here, as the parse allows a userinfo: the build of each inheriting connection
+        refuses it (vault BACKLOG #3007), and the static-credential report still lists it."""
+        if value is None:
+            return None
+        proxy = value.strip()
+        if not proxy:
+            # Blank reads as unset. Kept as written it would be truthy, so each connection would
+            # inherit it and fail its build for a scheme it does not have.
+            return None
+        if proxy.lower() == "default":
+            return value
+        # Lazy, as config/static_credentials.py does: the transport owns how a proxy URL is read,
+        # and importing the transports package when this module loads would tie the two together.
+        # It is imported only when a site proxy URL is set.
+        from messagefoundry.transports.proxy_address import parse_proxy_url
+
+        parse_proxy_url(proxy)
+        return value
 
     @field_validator("allowed_recipient_domains", mode="after")
     @classmethod
@@ -10600,9 +10631,8 @@ def security_loosenings(
                 f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
-                "and any credential cross in the clear, except an HTTP-family credential other than "
-                "a forward-proxy login, which is still refused over cleartext http off this machine "
-                "or with verification off",
+                "and any credential cross in the clear, except an HTTP-family credential, which is "
+                "still refused over cleartext http off this machine or with verification off",
             )
         )
     if revocation_attested_hops:

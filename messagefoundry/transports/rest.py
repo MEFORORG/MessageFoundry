@@ -618,8 +618,8 @@ def refuse_url_credentials(
     reads it as no port and ``http.client`` as the default. Not every shape is caught: an ``@`` with
     no port is ordinary path text, and the comment on the third check names another.
 
-    ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
-    credentials, and #1207 masks them for display.
+    ``proxy_url`` is deliberately NOT screened here: :func:`proxy_config_from_settings` has its own
+    refusal, which reads the URL as urllib does, and #1207 masks a credential for display.
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
@@ -1035,6 +1035,16 @@ _CLEARTEXT_CREDENTIAL_CELL = "HTTP cleartext credentials"
 #: because a declaration can still lift this one.
 _PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
 
+#: The refusal of a credential written in a connection's ``proxy_url`` (vault BACKLOG #3007). Fixed
+#: text, naming no part of the URL, because the part it is about is a password.
+_PROXY_URL_CREDENTIAL_REFUSED = (
+    "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
+    "[egress], holds a user and a password; refused, with no escape. No declaration lifts a "
+    "credential written in a proxy URL. Take it out of the URL. To log in to the proxy, set "
+    "proxy_user and proxy_password: a proxy off this machine then also takes cleartext_accepted "
+    "with a cleartext_reason"
+)
+
 
 def _off_box_cleartext_host(scheme: str, url: str) -> str | None:
     """The host ``url`` names when it is cleartext ``http`` to a host off this machine, else ``None``.
@@ -1107,9 +1117,9 @@ def refuse_cleartext_credentials(
     so does a secret in it that is not credential-shaped. That is an accepted limit (owner ruling
     2026-10-28); ``docs/SECURITY-LOOSENING.md``, *Accepted limit: a neutral header crosses plain
     http off this machine*, says why and defines which values are credential-shaped. A static
-    ``Proxy-Authorization``, in any spelling, is left out when the request goes to a proxy
-    (:func:`hop_reaches_a_proxy`), since the send-time proxy rule judges it then; on a hop that
-    goes direct it counts. An ``Authorization`` header in the built ``headers``,
+    ``Proxy-Authorization``, in any spelling, is left out when :func:`hop_reaches_a_proxy` answers
+    ``True``, since the send-time proxy rule judges it then; otherwise it is judged like any other
+    header. An ``Authorization`` header in the built ``headers``,
     in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
@@ -1287,11 +1297,9 @@ def http_credentials_sent(
     proxy rule judges it: it refuses every spelling but the one it admitted for the connection's
     own proxy login (vault BACKLOG #3416, #3457). The caller reads ``proxied`` with
     :func:`hop_reaches_a_proxy`, from the proxy destination and handlers its opener is built
-    with. A ``proxy_url`` alone does not make a hop proxied: ``proxy_no_proxy``, urllib's own
-    bypass list, or ``proxy_url = "default"`` with no system proxy for the scheme sends it
-    direct. On a direct hop the header would go to the destination, and the send-time rule
-    refuses it there on each send, retryably, until the message dead-letters. So it counts as
-    the credential it is and refuses the hop at build.
+    with, so a ``proxy_url`` alone does not set it. With ``proxied`` false the header is judged
+    like any other, so :func:`refuse_cleartext_credentials` can refuse an off-box cleartext http
+    hop at build, where the send-time rule would refuse a header on a direct request on each send.
 
     Each header key is shown by :func:`_shown_header_key`, never as written, since a credential
     may be typed into a key.
@@ -2018,7 +2026,7 @@ class _ProxyDigestRecipe:
     """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
     opener (a urllib handler binds to its opener, so it is never shared across openers)."""
 
-    proxy_url: str = field(repr=False)  # may carry user:password@ (#1182)
+    proxy_url: str = field(repr=False)  # may carry a user; a password there fails the build (#3007)
     user: str
     password: str = field(repr=False)
 
@@ -2036,7 +2044,8 @@ class ProxyConfig:
     target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
     or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
-    # Kept out of the repr, as the digest recipe's fields are: the URL may carry user:password@.
+    # Kept out of the repr, as the digest recipe's fields are: the URL may carry a user. A user and
+    # password in an explicit proxy_url fail the build (vault BACKLOG #3007); the repr stays hidden.
     proxies: tuple[tuple[str, str], ...] = field(repr=False)  # () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
     bypass: tuple[str, ...]
@@ -2059,8 +2068,14 @@ class ProxyConfig:
 
     def for_host(self, url: str) -> _HostProxy | None:
         """The proxy resolved for the host of the target ``url``, or ``None`` if that host is bypassed
-        (#128) — a bypassed host gets NO proxy handler and NO proxy credential (byte-identical to no
-        proxy).
+        (#128) — a bypassed host gets NO handler from this config and NO proxy credential, so a
+        request to it carries what a connection with no ``proxy_url`` would send. The build still
+        judges the proxy credential, whatever the targets.
+
+        ``None`` is not proof of a direct hop. The opener the connection then sends on applies its
+        own default, read from the environment and the system proxy settings when that opener was
+        built, so a proxy from either can still take a ``proxy_no_proxy`` match,
+        ``proxy_url = "default"`` included.
 
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
@@ -2148,16 +2163,17 @@ def hop_reaches_a_proxy(
     handlers: Sequence[urllib.request.BaseHandler],
     url: str,
 ) -> bool:
-    """Whether a request to ``url`` goes to a web proxy, not direct, on an opener built with
-    ``proxy_dest`` and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
+    """Whether a request to ``url`` goes to the proxy ``proxy_dest`` resolved, on an opener built
+    with it and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
 
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
-    what its ``opener_handlers()`` built. ``None`` is no proxy, a ``proxy_no_proxy`` match or a
-    loopback host; an uncredentialed one is a host urllib's own bypass list names. All of those
-    go direct. Otherwise the proxy for ``url``'s scheme is read off the built handler, so
-    ``proxy_url = "default"`` with no system proxy for the scheme goes direct too. The handler
-    took the system map when it was built, so this reads the map the opener holds, not a later
-    one. An explicit ``proxy_url`` serves both schemes."""
+    what its ``opener_handlers()`` built. A ``None`` ``proxy_dest``, or an uncredentialed one,
+    which is a host urllib's own bypass list names, answers ``False``. That is not proof of a
+    direct hop: :meth:`ProxyConfig.for_host` says what each does to the route.
+    Otherwise the proxy for ``url``'s scheme is read off the built handler, so
+    ``proxy_url = "default"`` with no system proxy for the scheme goes direct. The handler took
+    the system map when it was built, so this reads the map the opener holds, not a later one. An
+    explicit ``proxy_url`` serves both schemes."""
     if proxy_dest is None or not proxy_dest.credentialed:
         return False
     scheme = urllib.parse.urlsplit(url).scheme.lower()
@@ -2174,7 +2190,6 @@ def proxy_auth_handler_from_settings(
     proxy_url: str,
     proxy_scheme: str,
     dest_scheme: str,
-    attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2196,8 +2211,8 @@ def proxy_auth_handler_from_settings(
     scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
     send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
-    item 4), this leg still honours ``tls_hop_attested`` and ``cleartext_accepted``, under the
-    owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007)."""
+    item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
+    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -2216,16 +2231,47 @@ def proxy_auth_handler_from_settings(
     # A proxy credential over a cleartext http proxy hop crosses in the clear on the CONNECT/request —
     # refuse it REGARDLESS of destination scheme, posture-keyed (ADR 0092). Names only the proxy host.
     # ADR 0153: the proxy hop is a distinct crossing from the destination hop, but it belongs to the
-    # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly (like
-    # `attested` beside it) rather than read off the settings mapping — one declaration, one source.
+    # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly
+    # rather than read off the settings mapping — one declaration, one source.
     # Judged as http whatever proxy_scheme says (vault BACKLOG #3416). A proxy_url serves both schemes,
     # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
     # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
     # relied on. `proxy_scheme` now only words the refusal.
     # Not refuse_cleartext_credential_hop, which no declaration lifts (vault BACKLOG #3533 item 4).
-    # The owner's 2026-10-05 ruling on the proxy credential (vault BACKLOG #3007) refuses it over
-    # cleartext unless the connection declares the cleartext acceptance with a reason, so this leg
-    # is still judged by the declarations; ADR 0153's 2026-10-27 amendment records the split.
+    # The owner's rulings leave this leg one declaration, the cleartext acceptance with a reason, so
+    # attested is False here for every connection (vault BACKLOG #3007). ADR 0153's 2026-10-27
+    # amendment records the split from the destination's credentials.
+    # The type is settled before the guard runs, because an accepted crossing writes its audit
+    # record there: a build refused for its type must leave no record of a crossing (vault BACKLOG
+    # #3007).
+    kind = str(auth_type or "basic").strip().lower()
+    result: tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]
+    if kind == "basic":
+        raw = f"{user}:{password}".encode()
+        header = ("Proxy-Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
+        result = (header,), None
+    elif kind == "digest":
+        if dest_scheme == "https":
+            raise ValueError(
+                "proxy_auth_type='digest' is not supported for an https destination — the proxy's 407 "
+                "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
+                "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
+            )
+        result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
+    elif kind in ("ntlm", "windows"):
+        raise ValueError(
+            f"proxy_auth_type={kind!r} is deferred (NTLM/Negotiate is connection-bound; urllib opens a "
+            "new connection per request) — use 'basic'/'digest' or a local authenticating proxy such as "
+            "cntlm (ADR 0126)"
+        )
+    else:
+        raise ValueError(
+            f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
+        )
+    # Every arm that reaches here built the header or digest recipe the proxy handler admits a
+    # caller-set header on. Run before the guard for the same reason as the type (vault BACKLOG
+    # #3443, #3007).
+    _refuse_a_static_proxy_header(s.get("headers"))
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"
@@ -2237,36 +2283,15 @@ def proxy_auth_handler_from_settings(
         cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL,
         message=(
             f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
-            "destination's own credentials, this leg can be declared with tls_hop_attested or "
-            "cleartext_accepted"
+            "destination's own credentials, this leg can be declared with cleartext_accepted and "
+            "a cleartext_reason; tls_hop_attested does not admit it"
         ),
-        attested=attested,
+        attested=False,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
     )
-    kind = str(auth_type or "basic").strip().lower()
-    if kind == "basic":
-        raw = f"{user}:{password}".encode()
-        header = ("Proxy-Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
-        return (header,), None
-    if kind == "digest":
-        if dest_scheme == "https":
-            raise ValueError(
-                "proxy_auth_type='digest' is not supported for an https destination — the proxy's 407 "
-                "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
-                "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
-            )
-        return (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
-    if kind in ("ntlm", "windows"):
-        raise ValueError(
-            f"proxy_auth_type={kind!r} is deferred (NTLM/Negotiate is connection-bound; urllib opens a "
-            "new connection per request) — use 'basic'/'digest' or a local authenticating proxy such as "
-            "cntlm (ADR 0126)"
-        )
-    raise ValueError(
-        f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
-    )
+    return result
 
 
 def _refuse_a_static_proxy_header(headers: object) -> None:
@@ -2312,7 +2337,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     Since vault BACKLOG #2965 the transport also refuses at build a value with a path, query or
     fragment, which is how an unencoded ``/``, ``?`` or ``#`` in the password reads. This still
     answers ``True`` for such a value, as ``_parse_proxy`` reads it: it may report a hop the build
-    refuses, and it never hides one the build accepts."""
+    refuses, and it never hides one the build accepts. :func:`proxy_config_from_settings` asks this
+    first, so such a value is refused for its credential (vault BACKLOG #3007)."""
     if not isinstance(proxy_url, str):
         return False
     proxy = proxy_url.strip()
@@ -2329,14 +2355,16 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
 
 
 def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
-    """Does a ``proxy_no_proxy`` value send ``host`` direct, past the proxy (BACKLOG #1989)?
+    """Does :meth:`ProxyConfig.for_host` bypass ``host`` under a ``proxy_no_proxy`` value
+    (BACKLOG #1989)?
 
     The config half of :meth:`ProxyConfig.for_host`, the loopback rule and the ``proxy_no_proxy``
     match, public so the static-credential hop reader decides a bypass the way the transport does
-    rather than restating it. So a loopback host goes direct whatever the list says (vault BACKLOG
-    #2579). The other half, urllib's own bypass list (vault BACKLOG #3442), is not read here: that
-    list lives in the environment of the process that sends, not in the config this reader sees.
-    So this can call a host proxied that ``for_host`` sends direct, never the reverse. ``host=None`` is a target
+    rather than restating it. So a loopback host is bypassed whatever the list says (vault BACKLOG
+    #2579). That method says what a bypass does to the route. The other half, urllib's own bypass
+    list (vault BACKLOG #3442), is not read here: that list lives in the environment of the process
+    that sends, not in the config this reader sees. So this can call a host proxied that
+    ``for_host`` gives no credential, never the reverse. ``host=None`` is a target
     whose host cannot be read before the connector is built (an ``env()`` reference): only a
     bypass-everything ``*`` entry is certain to cover it, so nothing else does."""
     bypass = _normalize_no_proxy(no_proxy)
@@ -2350,7 +2378,6 @@ def proxy_config_from_settings(
     s: Mapping[str, Any],
     *,
     dest_scheme: str,
-    attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2358,15 +2385,21 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal); ``attested`` keys the cleartext-proxy-hop guard.
+    target's scheme (for the digest-over-https refusal).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
 
-    An explicit URL is parsed once, by :func:`~messagefoundry.transports.proxy_address.parse_proxy_url`,
+    A user and a password in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`, in
+    every posture and under every declaration, including one inherited from
+    ``[egress].proxy_url`` (vault BACKLOG #3007). At send they would meet a refusal that retries,
+    so a known fault is reported here rather than on each message.
+
+    An explicit URL is then parsed once, by :func:`~messagefoundry.transports.proxy_address.parse_proxy_url`,
     which refuses a path, a query, a fragment and any value urllib's proxy parser would read as
-    naming another host (vault BACKLOG #2965). The connector dials the URL rebuilt from those parts,
-    so it dials the host ``[egress].allowed_proxy`` judged."""
+    naming another host (vault BACKLOG #2965), with or without a credential. The connector dials
+    the URL rebuilt from those parts, so it dials the host ``[egress].allowed_proxy`` judged, and
+    the ``proxy_user`` guard below judges that host too."""
     raw = s.get("proxy_url")
     if not raw:
         return None
@@ -2394,21 +2427,23 @@ def proxy_config_from_settings(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
             "(ADR 0126)"
         )
+    # The credential first, so a URL that holds one is refused for it, with the advice that fits,
+    # even where the parse below would refuse its shape too.
+    if proxy_url_sends_userinfo(proxy_url):
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_CREDENTIAL_REFUSED}")
     # Rebuilt from the one parse the allow-list gate also reads, so what is dialled is what was
-    # judged (vault BACKLOG #2965).
+    # judged (vault BACKLOG #2965). It refuses every value on which urlsplit and urllib read another
+    # host, so the loopback test in the proxy_user guard below judges the host urllib dials.
     proxy_url = parse_proxy_url(proxy_url).url
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,
         proxy_scheme=proxy_scheme,
         dest_scheme=dest_scheme,
-        attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
     )
-    if auth_header or digest is not None:
-        _refuse_a_static_proxy_header(s.get("headers"))
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
         use_default=False,
@@ -2508,7 +2543,6 @@ def egress_route_from_settings(
     s: Mapping[str, Any],
     *,
     dest_scheme: str,
-    attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
@@ -2531,7 +2565,6 @@ def egress_route_from_settings(
     return proxy_config_from_settings(
         s,
         dest_scheme=dest_scheme,
-        attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
@@ -2595,7 +2628,6 @@ class RestDestination(DestinationConnector):
             else egress_route_from_settings(
                 s,
                 dest_scheme=scheme,
-                attested=attested,
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
                 connection=config.name,

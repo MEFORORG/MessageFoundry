@@ -10,16 +10,15 @@
   ruled on 2026-10-28 to accept that limit, and
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine)
   says why and defines which values are credential-shaped.
-  A static `Proxy-Authorization` is left to the
-  send-time proxy rule only when the request goes to a proxy. A hop can bypass a configured
-  `proxy_url` through `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system
-  proxy. That hop goes direct, so the header counts as a credential and refuses it at build. A
-  header key that holds whitespace or is shaped like a credential is withheld from the refusal
-  text. Owner ruling 2026-10-26, recorded as
-  a dated amendment to
+  A static `Proxy-Authorization` is left to the send-time proxy rule only when the connection's
+  own proxy setting takes the request. A hop can bypass a configured `proxy_url` through at least
+  `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system proxy for the
+  request's scheme. The refusal above then judges the header too. A header key that holds
+  whitespace or is shaped like a credential is not shown as written in the refusal text. Owner ruling
+  2026-10-26, recorded as a dated amendment to
   [ADR 0153](../docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
-  The forward-proxy login stays under the declarations, by the owner's 2026-10-05 ruling on that
-  credential. (`BACKLOG #3533`)
+  The forward-proxy login stays under one declaration, `cleartext_accepted` with a reason, by the
+  owner's rulings on that credential; `docs/CONNECTIONS.md` states them. (`BACKLOG #3533`)
 - **A Handler's per-message headers meet the hop's header rule at send.** On a
   `verify_tls = false` hop, a header stamped under `dynamic_headers` must be `Accept`,
   `Content-Type`, `User-Agent` or `X-Request-ID` with no credential in it. Over plain `http` off

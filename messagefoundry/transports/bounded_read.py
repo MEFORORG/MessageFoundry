@@ -847,10 +847,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     connection's ``proxy_url``. The opener holds no posture, and a proxy from the environment has
     no acceptance field. So a credential from a proxy URL has no acceptance and no exception for a
     proxy on a loopback address, like the Vault hop's twin,
-    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Building a connection
-    does not refuse a credential in its own ``proxy_url``, so its sends meet the rule below. With
-    ``[security].require_nonstatic_credentials`` on, ``serve`` refuses a credential written into
-    ``proxy_url`` at start unless ``static_credential_accepted`` names the hop (BACKLOG #1182).
+    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). A credential in a
+    connection's own ``proxy_url`` fails its build, in
+    ``transports.rest.proxy_config_from_settings`` (vault BACKLOG #3007), so this send-time rule
+    is what meets one from the environment or the system proxy settings.
 
     **The rule.** A web-proxy credential is refused on any leg where it could be read on the way:
     in cleartext to any proxy, a second, different proxy included; on a request that goes direct,
@@ -863,8 +863,8 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     admitted when it was built is sent on the cleartext leg to the proxy that connection's
     ``transports.rest.ProxyConfig`` names. The admitting check is the connection's posture-keyed
     guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a ``proxy_user``
-    credential when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``, or the
-    proxy is on this machine. The
+    credential when the connection declares ``cleartext_accepted``, or the proxy is on this
+    machine. The
     connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
     header in its plain spelling only, under a name that is a ``str`` and no subclass of one.
     Every other spelling :func:`is_proxy_credential_header_name` reads is never admitted, and
