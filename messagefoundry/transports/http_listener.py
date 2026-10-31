@@ -46,7 +46,7 @@ import re
 import ssl
 import time
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import (
@@ -235,13 +235,22 @@ _NOT_ACCEPTED = "message was not accepted"
 #: shutting-down ``503`` in ``_reply_to_wire`` is a different answer and sets its own.
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
-#: The status each refusal kind is answered with (ADR 0154 amendment 2026-10-30). Only a temporary
-#: refusal invites a re-send; an over-size body answers the same ``413`` as one over ``max_body_bytes``.
-_REFUSAL_STATUS: Mapping[RefusalKind, int] = {
-    RefusalKind.TEMPORARY: 503,
-    RefusalKind.PERMANENT: 422,
-    RefusalKind.OVERSIZE: 413,
-}
+
+def _refusal_status(kind: RefusalKind) -> int:
+    """The status a refusal of ``kind`` is answered with (ADR 0154 amendment 2026-10-30). Only a
+    temporary refusal invites a re-send; an over-size body answers the same ``413`` as one over
+    ``max_body_bytes``. A ``match`` with ``assert_never``, so mypy refuses a new kind left unmapped
+    rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written."""
+    match kind:
+        case RefusalKind.TEMPORARY:
+            return 503
+        case RefusalKind.OVERSIZE:
+            return 413
+        case RefusalKind.PERMANENT:
+            return 422
+        case _:
+            assert_never(kind)
+
 
 #: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
 #: cap, and ``int()`` raises past 4300 digits (CPython's ``sys.int_info.default_max_str_digits``),
@@ -1505,7 +1514,7 @@ class HttpSource(SourceConnector):
             refused = json.dumps({"error": _NOT_ACCEPTED, "message_id": message_id})
             await self._respond(
                 writer,
-                build_response(_REFUSAL_STATUS[receipt.refusal], refused, extra_headers=retry),
+                build_response(_refusal_status(receipt.refusal), refused, extra_headers=retry),
                 budget=_CLIENT_SHUTDOWN_GRACE,
             )
             return False

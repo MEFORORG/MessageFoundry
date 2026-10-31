@@ -1438,21 +1438,33 @@ sources answer it in step.
 
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers |
 | --- | --- | --- | --- |
-| the streaming detach's in-flight budget | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
-| over the engine's ingress ceiling (a `size`-phase guard, text or binary), and an HL7 body over `Peek.parse`'s `max_bytes` | over-size | `413` | Cannot Understand (`0xC000`) |
+| the streaming detach's in-flight budget, held by other detaches | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
+| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes`, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
 | every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
+
+A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
+re-send would meet the same refusal. The budget is engine-wide and `max_message_bytes` is set per
+inbound, and nothing requires the first to be at least the second.
+
+No DICOM refusal is temporary today. A DICOM object takes the binary branch, which refuses only for
+size or a declared-type mismatch; the streaming detach is HL7 only. The SCP maps the kind in step so
+that a temporary refusal, should a binary path ever produce one, is answered as one.
 
 `Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
 [`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
 refused body is `{"error": "message was not accepted", "message_id": "<id>"}`, where the id is the
 `ERROR` row the runner wrote before it answered. An operator can match a refusal to its row by id
-rather than by time and peer.
+rather than by time and peer. The `HL7MessageTooLarge` type the parse raises for an over-size body is
+named in that row's stored reason, where `HL7PeekError` was before.
 
 **The strict-validation timeout stays permanent.** The 2026-09-26 amendment named it as possibly
-temporary. It is not classed so, because the same pathological body times out on every re-send, and
-each attempt leaves another `hl7apy` thread running that this path cannot stop. Inviting a retry would
-multiply the load the timeout exists to bound. It may be reclassified only if a discriminator is later
-measured that tells a body which would pass on a retry from one which would time out again.
+temporary. It is not classed so, because a body that times out for its own content times out on every
+re-send, and each attempt leaves another `hl7apy` thread running that this path cannot stop. Inviting a
+retry would multiply the load the timeout exists to bound. **The cost is real:** the timeout also
+counts time spent waiting for a worker thread, so under load a valid body can time out, and it is then
+answered `422`, which a sender and the engine's REST outbound treat as final. Nothing here tells the
+two causes apart. It may be reclassified only if a discriminator is later measured that tells a body
+which would pass on a retry from one which would time out again.
 
 **One code for over-size.** A body over the listener's `max_body_bytes` already answered `413`, before
 the body is read and with no row. A body the runner refuses for size now answers `413` too, naming its
@@ -1463,7 +1475,10 @@ the body is read and with no row. A body the runner refuses for size now answers
 its own `RetryPolicy` sets the delay, and a temporary refusal that never clears dead-letters after
 `max_attempts`.
 
-**What did not change.** Count-and-log: the `ERROR` row is still written before the answer. The
+**What did not change.** Count-and-log: the `ERROR` row is still written before the answer. Each
+refused attempt is its own row, so a temporary refusal re-sent until it is accepted leaves one `ERROR`
+row per refused attempt beside the accepted one. The kind is not stored on the row; its `error` text
+names the in-flight budget. The
 pre-ingress refusals, the `202` on a committed body, and the `closed` connection event after a refusal
 are unchanged. The refusal still emits no `connection_event` kind of its own.
 

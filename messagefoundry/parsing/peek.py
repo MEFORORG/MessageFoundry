@@ -54,9 +54,10 @@ class HL7PeekError(ValueError):
 
 
 class HL7MessageTooLarge(HL7PeekError):
-    """The message is over the ``max_bytes`` cap. A subclass, so every ``HL7PeekError`` caller is
-    unchanged, while a receipt source can answer it as over-size rather than as bad content (BACKLOG
-    #2105). The segment cap stays a plain ``HL7PeekError``: it bounds structure, not size."""
+    """The message is over the ``max_bytes`` cap. A subclass, so every ``except HL7PeekError`` still
+    catches it, while a receipt source can answer it as over-size rather than as bad content (BACKLOG
+    #2105). A stored reason that renders the exception's type now names this class. The segment cap
+    stays a plain ``HL7PeekError``: it bounds structure, not size."""
 
 
 #: What a field read on an ACCEPTED :class:`Peek` could raise if a parser fault slipped past the

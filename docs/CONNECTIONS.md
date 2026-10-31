@@ -725,7 +725,8 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `{"error": "message was not accepted", "message_id": "<id>"}`. The status says whether to re-send:
 
 - **`503`** with `Retry-After` when the refusal is temporary, the engine's own and expected to clear.
-  Only the streaming detach's in-flight budget is classed so; re-send the same body later.
+  Only the streaming detach's in-flight budget, while other detaches hold it, is classed so; re-send
+  the same body later. A body larger than that whole budget is over-size instead.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
   with `max_message_bytes`.

@@ -885,7 +885,15 @@ class _StreamBudgetExceeded(Exception):
     """A very-large-document detach was refused because it would push the aggregate in-flight streaming
     budget ([inbound].stream_inflight_budget_bytes) over its ceiling (#149, ADR 0105 Phase 1a) — the
     backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
-    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
+    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message.
+
+    ``alone`` is True when the body by itself is over the whole budget, so the refusal can never
+    clear however the concurrent detaches finish: a receipt source answers it as over-size rather
+    than inviting a re-send (BACKLOG #2105)."""
+
+    def __init__(self, message: str, *, alone: bool) -> None:
+        super().__init__(message)
+        self.alone = alone
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -7876,10 +7884,11 @@ class RegistryRunner:
                 # it instead of pinning intake. The message string is PHI-safe/value-free (only the
                 # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
                 #
-                # PERMANENT, not temporary (BACKLOG #2105): the same body times out on every re-send,
-                # and each attempt orphans another hl7apy thread this path cannot kill, so inviting a
-                # retry would multiply the very load this timeout bounds. ADR 0154's 2026-10-30
-                # amendment records when it may be reclassified.
+                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
+                # times out on every re-send, and each attempt orphans another hl7apy thread this path
+                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
+                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
+                # 2026-10-30 amendment records the cost and when it may be reclassified.
                 timed_out = f"strict-validation timed out after {timeout}s"
                 return await self._refuse(
                     ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
@@ -7898,13 +7907,13 @@ class RegistryRunner:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
                 # Only the in-flight budget is the engine's own and clears as concurrent detaches
-                # finish, so only it invites a re-send. An unsupported backend and a malformed handle
-                # refuse the same body every time.
-                kind = (
-                    RefusalKind.TEMPORARY
-                    if isinstance(exc, _StreamBudgetExceeded)
-                    else RefusalKind.PERMANENT
-                )
+                # finish, so only it invites a re-send, and only when the body would fit the budget
+                # once they have: one larger than the whole budget is over-size. An unsupported
+                # backend and a malformed handle refuse the same body every time.
+                if isinstance(exc, _StreamBudgetExceeded):
+                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+                else:
+                    kind = RefusalKind.PERMANENT
                 return await self._refuse(
                     ic,
                     raw,
@@ -7993,7 +8002,8 @@ class RegistryRunner:
         if budget and self._stream_inflight_bytes + size > budget:
             raise _StreamBudgetExceeded(
                 f"streaming in-flight budget exceeded ({self._stream_inflight_bytes} + {size} > "
-                f"{budget} bytes); refusing the detach (backpressure)"
+                f"{budget} bytes); refusing the detach (backpressure)",
+                alone=size > budget,
             )
         # Reserve the budget for the whole detach window (buffer + per-chunk seal); release in finally the
         # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.

@@ -76,13 +76,21 @@ def _ic(content_type: ContentType = ContentType.HL7V2, **over: Any) -> InboundCo
 
 
 async def _post_through_runner(
-    store: MessageStore, ic: InboundConnection, body: bytes, **runner_kw: Any
+    store: MessageStore,
+    ic: InboundConnection,
+    body: bytes,
+    *,
+    busy_bytes: int = 0,
+    **runner_kw: Any,
 ) -> _Response:
-    """POST ``body`` once to a real listener bound to the real runner's receipt handler."""
+    """POST ``body`` once to a real listener bound to the real runner's receipt handler.
+
+    ``busy_bytes`` stands in for detaches already in flight on the runner's stream budget."""
     reg = Registry()
     reg.add_inbound(ic)
     reg.add_router("r", lambda m: [])
     runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False), **runner_kw)
+    runner._stream_inflight_bytes = busy_bytes
     cfg = _source_config(ic, "127.0.0.1", {})
     cfg.settings["port"] = 0
     source = build_source(cfg, egress=EgressSettings(deny_by_default=False))
@@ -121,10 +129,28 @@ async def test_the_stream_budget_refusal_is_503_with_retry_after_and_names_its_r
     # engine's own REST outbound both treat as final.
     ic = _ic(stream_threshold_bytes=500)
     resp = await _post_through_runner(
-        store, ic, _hl7_with_doc(2000).encode("ascii"), stream_inflight_budget_bytes=10
+        store,
+        ic,
+        _hl7_with_doc(2000).encode("ascii"),
+        stream_inflight_budget_bytes=1_000_000,
+        busy_bytes=999_000,  # another detach holds the budget, as concurrent ones would
     )
     assert resp.status == 503
     assert resp.headers["retry-after"] == str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS) == "5"
+    row = await _the_one_error_row(store)
+    assert "in-flight budget exceeded" in row["error"]
+    _assert_names_the_row(resp, row)
+
+
+async def test_a_body_larger_than_the_whole_stream_budget_is_413(store: MessageStore) -> None:
+    # Control for the 503: with nothing else in flight, a body over the whole budget can never fit,
+    # so a re-send would only meet the same refusal. It is over-size, never an invitation to retry.
+    ic = _ic(stream_threshold_bytes=500)
+    resp = await _post_through_runner(
+        store, ic, _hl7_with_doc(2000).encode("ascii"), stream_inflight_budget_bytes=10
+    )
+    assert resp.status == 413
+    assert "retry-after" not in resp.headers
     row = await _the_one_error_row(store)
     assert "in-flight budget exceeded" in row["error"]
     _assert_names_the_row(resp, row)

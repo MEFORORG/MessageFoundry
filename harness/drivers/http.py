@@ -3,8 +3,8 @@
 """HTTP driver: POST each payload to an engine ``Http`` inbound, one request per connection.
 
 The ``Http`` inbound answers ``202 Accepted`` with a JSON receipt carrying the engine
-``message_id`` once the body is durably committed, and ``422`` for a body it read, recorded as
-``ERROR`` and refused. Any non-2xx answer is reported as a failed send (``error`` names the status,
+``message_id`` once the body is durably committed. A body it read, recorded as ``ERROR`` and refused
+is answered ``503``, ``413`` or ``422`` by kind (ADR 0154 amendment 2026-10-30). Any non-2xx answer is reported as a failed send (``error`` names the status,
 never the body), with the answer kept in ``reply``: unlike an MLLP NAK, which is an application
 answer on a delivered frame, a non-2xx HTTP status is the request itself failing.
 
