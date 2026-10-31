@@ -4,13 +4,14 @@
 
 Three SQLite writers stored ``safe_text(x)[:200]``: ``response.detail`` (``record_ack_sent``),
 ``connection_event.reason`` and ``alert_instance.reason``. A fourth, ``complete_with_response``'s
-``response.detail``, joined them under BACKLOG #2984 with the bound passed in from the start. While :func:`safe_text` cut at exactly its
-limit, the outer slice dropped the ``(+N chars)`` note whole. Since #1797 the cut goes back to a
-whole token, so the head can be shorter than the limit and the outer slice kept part of the note.
-On the fixture below it kept ``…(+`` and no digits at all, for a true count of 132; at other head
-lengths it keeps a truncated number. Each writer now passes the bound to :func:`safe_text` instead.
-Postgres and SQL Server carry the same four call sites in the same shape. Their suites skip without
-a server, so they are held here by reading their source, and only SQLite is exercised.
+``response.detail``, joined them under BACKLOG #2984 with the bound passed in from the start.
+While :func:`safe_text` cut at exactly its limit, the outer slice dropped the ``(+N chars)`` note
+whole. Since #1797 the cut goes back to a whole token, so the head can be shorter than the limit
+and the outer slice kept part of the note. On the fixture below it kept ``…(+`` and no digits at
+all, for a true count of 132; at other head lengths it keeps a truncated number. Each writer now
+passes the bound to :func:`safe_text` instead. Postgres and SQL Server carry the same four call
+sites in the same shape. Their suites skip without a server, so they are held here by reading their
+source, and only SQLite is exercised.
 
 The columns are ``TEXT`` on SQLite and Postgres and ``NVARCHAR(MAX)`` on SQL Server, so the note
 cannot overflow a declared width. The bound pinned here is the one :func:`safe_text` itself gives

@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #2984: the store scrubs a captured reply's ``detail``, and scrubs before it holds the writer.
+"""BACKLOG #2984: the store scrubs a captured reply's ``detail``, and scrubs before it holds the
+writer.
 
-``complete_with_response`` stored ``detail`` as the connector handed it, on all three backends, while
-``record_ack_sent`` ran it through ``safe_text(detail, limit=200)``. Most in-tree connectors build a
-reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, but X12's ``TA1*`` detail carried
-the partner's TA1-04 element verbatim, and the store was not the chokepoint ``docs/PHI.md`` names it
-as. The scrub does not know that shape either, so X12 now echoes only a code from TA1-04's closed set. Both methods now scrub before the writer lock (SQLite) or the pooled connection and its
+``complete_with_response`` stored ``detail`` as the connector handed it, on all three backends,
+while ``record_ack_sent`` ran it through ``safe_text(detail, limit=200)``. Most in-tree connectors
+build a reply ``detail`` from a fixed phrase, a status code, or ``safe_exc``, but X12's ``TA1*``
+detail carried the partner's TA1-04 element verbatim, and the store was not the chokepoint
+``docs/PHI.md`` names it as. The scrub does not know that shape either, so X12 now records
+``TA1*A`` only for a TA1-04 that upper-cases to ``A``, and a fixed phrase for any other TA1 it
+accepts. Both methods now scrub before the writer lock (SQLite) or the pooled connection and its
 transaction (Postgres, SQL Server) is taken.
 
 ``resp_headers`` is deliberately NOT scrubbed: a Handler reads the captured values back through
-``response_get(dest).headers``, and ``docs/PHI.md`` section 3 says what covers it. ``safe_text`` over
-the encoded JSON would rewrite an allow-listed value and, once cut, make the decode return ``{}`` with
-no error. One test pins that it round-trips unchanged.
+``response_get(dest).headers``, and ``docs/PHI.md`` section 3 says what covers it. ``safe_text``
+over the encoded JSON would rewrite an allow-listed value and, once cut, make the decode return
+``{}`` with no error. One test pins that it round-trips unchanged.
 
 The Postgres and SQL Server value arms live in ``tests/test_postgres_store.py`` and
 ``tests/test_sqlserver_store.py``, which the server CI legs run; this file pins only their ordering,

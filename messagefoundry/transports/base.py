@@ -1054,12 +1054,14 @@ class DeliveryResponse:
       frame **was received** but its content could not be parsed — **never** "no reply was received",
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
-    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest. The
-      store passes it through ``safe_text(detail, limit=200)`` before it is written (BACKLOG #2984):
-      that redacts the PHI shapes the scrubber knows, such as an HL7 segment fragment, and cuts a
-      longer reason to at most 200 characters, at a whole token, plus a ``(+N chars)`` note. It
-      does not catch every identifier: a bare name or resource id in free text reads back
-      unchanged through ``response_get(dest).detail``, so a connector keeps partner text out of
+    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest
+      only when a store key is configured. The store passes it through ``safe_text(detail,
+      limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
+      knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
+      every identifier: at least a lone surname such as ``Smith``, an identifier such as
+      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
+      ``response_get(dest).detail``, so a connector author keeps partner free text out of
       ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
