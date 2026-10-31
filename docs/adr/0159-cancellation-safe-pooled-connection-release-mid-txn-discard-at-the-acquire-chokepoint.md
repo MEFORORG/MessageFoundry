@@ -538,10 +538,11 @@ the next reader does not re-derive the wrong precedent from the same comment.
     through `acquire_pooled`, not `_acquire`. The autocommit set and the cursor close in
     `_close_and_release` use the raw pyodbc handles directly, so they run through `gate.run` too.
   - **A cancellation during `execute` or a fetch no longer frees the cursor under the running
-    call.** The close waits on the gate for that call to return, and the connection goes back to
-    its pool only after the close, as engine PR 2593 already required. The cancelled task does not
-    wait: while a cancellation is in flight, `_close_and_release` hands the return to
-    `_return_when_settled` and returns.
+    call.** The close is handed to that call through `CallGate.run_after_running_call`, so it runs
+    on the call's own thread as the call returns, and no second thread waits for it. The
+    connection goes back to its pool only after the close, as engine PR 2593 already required. The
+    cancelled task does not wait either: while a cancellation is in flight, `_close_and_release`
+    hands the return to `_return_when_settled` and returns.
   - **It returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc wakes no
     waiting borrower when a closed connection is released, so a detached connection could leave
     that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for returning
@@ -550,8 +551,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
   **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
   The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
   in that state. A cancelled borrow waits without bound for its running call before its cursor
-  closes, and holds its pool slot for all of that time. A worker thread of the loop's default
-  executor waits on the gate for the same time.
+  closes, and holds its pool slot for all of that time. The statement's own worker thread is held
+  for that time too, as it was before the gate; the close adds no thread to it.
 
   **What bounds it.** Nothing in the engine bounds the call itself. It ends when the statement
   ends, when the driver's or the network's own timeout fires, or when the server ends the session.

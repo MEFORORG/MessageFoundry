@@ -31,6 +31,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.odbc_call_gate import call_gate
 from messagefoundry.pipeline.reference_sync import _load_database_source
+from messagefoundry.transports import database
 from messagefoundry.transports.database import DatabaseDestination, DatabaseSource
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
@@ -132,29 +133,30 @@ def _source() -> DatabaseSource:
     )
 
 
-async def _cancel_promptly(rig: _Rig, coro: Any) -> None:
-    """Cancel ``coro`` once its statement is running, and require the cancellation to propagate
-    long before that statement returns: this connector sets no statement timeout, so a cancelled
-    send, mark or lookup that waited for the statement could wait without bound."""
-    task = await cancel_once_started(rig.started, coro)
-    done, _pending = await asyncio.wait({task}, timeout=1.0)
-    assert done, "the cancellation waited for the running statement"
-    assert task.cancelled(), task
-
-
 def _assert_closed_after_the_statement(rig: _Rig) -> None:
     assert USE_AFTER_FREE not in rig.log, rig.log
     assert rig.log.index("execute:end") < rig.log.index("cursor.close"), rig.log
     assert "conn.close" not in rig.log, rig.log
 
 
-async def test_a_cancelled_destination_send_frees_nothing_until_its_statement_returns(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig
-) -> None:
-    """The manual-commit pool, borrowed through ``_acquire``. Red before #2394 part b: the cursor
-    closed on another thread while the INSERT still ran, and the connection went back at once."""
-    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
-    await _cancel_promptly(rig, _destination().send('{"a": 1}'))
+async def _cancel_mid_statement(monkeypatch: pytest.MonkeyPatch, rig: _Rig, coro: Any) -> None:
+    """Cancel ``coro`` once its statement is running, then let the statement return, and pin the
+    exit: the cancellation propagates long before the statement returns, since this connector sets
+    no statement timeout and a task that waited for it could wait without bound; nothing is
+    closed or returned while the statement runs; and the cursor close then runs on the
+    statement's own thread, so no second thread was parked waiting for it."""
+    close_threads: list[str] = []
+    closer = database._close_raw_cursor
+
+    def _recording_close(raw_cur: Any) -> None:
+        close_threads.append(threading.current_thread().name)
+        closer(raw_cur)
+
+    monkeypatch.setattr(database, "_close_raw_cursor", _recording_close)
+    task = await cancel_once_started(rig.started, coro)
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running statement"
+    assert task.cancelled(), task
     assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
     assert "cursor.close" not in rig.log, rig.log
     assert rig.pools[0].free == [], "the connection went back while its statement ran"
@@ -165,6 +167,16 @@ async def test_a_cancelled_destination_send_frees_nothing_until_its_statement_re
 
     _assert_closed_after_the_statement(rig)
     assert call_gate(rig.conn) is not None
+    assert len(close_threads) == 1 and close_threads[0].startswith("test-2394b"), close_threads
+
+
+async def test_a_cancelled_destination_send_frees_nothing_until_its_statement_returns(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The manual-commit pool, borrowed through ``_acquire``. Red before #2394 part b: the cursor
+    closed on another thread while the INSERT still ran, and the connection went back at once."""
+    _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _INSERT)
+    await _cancel_mid_statement(monkeypatch, rig, _destination().send('{"a": 1}'))
 
 
 async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns(
@@ -173,17 +185,7 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     """The autocommit pool, borrowed through ``_acquire``. The connection is put in autocommit
     first, through the gate, and goes back to the pool only once the mark has returned."""
     _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _MARK)
-    await _cancel_promptly(rig, _source()._mark({"code": "A", "value": "1"}))
-    assert "autocommit:end" in rig.log, "the arm is vacuous: the borrow never set autocommit"
-    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
-    assert "cursor.close" not in rig.log, rig.log
-    assert rig.pools[0].free == [], "the connection went back while its statement ran"
-
-    rig.release.set()
-    await wait_for_entry(rig.log, "cursor.close")
-    assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
-
-    _assert_closed_after_the_statement(rig)
+    await _cancel_mid_statement(monkeypatch, rig, _source()._mark({"code": "A", "value": "1"}))
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
 
 

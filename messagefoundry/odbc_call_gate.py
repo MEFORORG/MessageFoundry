@@ -12,7 +12,8 @@ leaf beside :mod:`messagefoundry.odbc_env`, where the store and a transport can 
 without one importing the other.
 
 The SQL Server store installs it on every pooled connection, every claim holder and its open-time
-probe connections. The detach that quarantines a cancelled pooled connection stays in the store,
+probe connections. The DATABASE connector installs it on every pooled connection it borrows, and
+hands a cursor close to a running call with :meth:`CallGate.run_after_running_call`. The detach that quarantines a cancelled pooled connection stays in the store,
 because it is the pool's rule, not the gate's. The exits of an unpooled one-shot connection,
 :func:`close_one_shot` and :func:`abandon_one_shot`, live here: they need no pool, so a transport
 can use them without importing the store.
@@ -62,14 +63,15 @@ class CallGate:
     on its own thread as it returns: no extra thread waits, and the event loop never does.
     """
 
-    __slots__ = ("_abandoned", "_deferred", "_lock", "_running", "_state")
+    __slots__ = ("_abandoned", "_after", "_deferred", "_lock", "_running", "_state")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()  # held for the whole of each pyodbc call
-        # Guards the two fields below. Held only for a few bytecodes, so the event loop may take it.
+        # Guards the fields below. Held only for a few bytecodes, so the event loop may take it.
         self._state = threading.Lock()
         self._running = False
         self._deferred: Any = None  # a raw connection to close when the running call returns
+        self._after: list[Callable[[], None]] = []  # jobs to run as the running call returns
         # Cursors whose owner was cancelled. The quarantine closes them before the connection, in
         # the same locked step, so a later garbage collection never frees a statement beside it.
         self._abandoned: list[Any] = []
@@ -83,9 +85,24 @@ class CallGate:
             finally:
                 with self._state:
                     self._running = False
+                    after, self._after = self._after, []
                     deferred, self._deferred = self._deferred, None
+                for job in after:  # still under the lock, so before the next call and the close
+                    try:
+                        job()
+                    except Exception:  # noqa: BLE001 - never replace the running call's outcome
+                        log.warning("odbc: a job handed to a running call failed", exc_info=True)
                 if deferred is not None:
                     self._close_locked(deferred, reraise=False)
+
+    def run_after_running_call(self, job: Callable[[], None]) -> bool:
+        """If a call is running, have it run ``job`` on its own thread as it returns, still inside
+        the gate, and say so. Never waits. ``False`` means nothing is running, so the caller runs
+        ``job`` itself, through :meth:`run`."""
+        with self._state:
+            if self._running:
+                self._after.append(job)
+            return self._running
 
     def abandon(self, raw_cursor: Any) -> None:
         """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop.

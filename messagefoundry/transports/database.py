@@ -89,7 +89,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
-from messagefoundry.odbc_call_gate import call_gate, install_call_gate
+from messagefoundry.odbc_call_gate import CallGate, call_gate, install_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
@@ -1466,7 +1466,7 @@ class AutocommitNotConfirmed(RuntimeError):
     the DSN nor the server."""
 
 
-def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
+def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
     """Run ``fn`` on a worker thread and return a future that the THREAD resolves, once ``fn`` has
     returned or raised.
 
@@ -1474,7 +1474,13 @@ def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
     cancelled, it ends at once while ``fn`` runs on. This future is not a task, so no task cancel
     reaches it, loop teardown's cancel-every-task included. Its completion is therefore proof that
     ``fn`` is no longer running, which is what decides when a connection ``fn`` uses may go back to
-    its pool (PR 2593 review). If the loop is closed before ``fn`` ends, nothing is left to tell."""
+    its pool (PR 2593 review). If the loop is closed before ``fn`` ends, nothing is left to tell.
+
+    **With ``gate``, ``fn`` runs inside that connection's call gate** (BACKLOG #2394), so it never
+    runs beside another pyodbc call on the connection. When a call is running there, as after a
+    cancelled ``execute``, ``fn`` is handed to that call, which runs it on its own thread as it
+    returns. So no second thread waits for a statement that may have no timeout. Otherwise ``fn``
+    goes to a worker thread through the gate, as before."""
     loop = asyncio.get_running_loop()
     settled: asyncio.Future[T] = loop.create_future()
 
@@ -1504,7 +1510,10 @@ def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
                 "connection was not returned to its pool"
             )
 
-    loop.run_in_executor(None, _work)
+    if gate is None:
+        loop.run_in_executor(None, _work)
+    elif not gate.run_after_running_call(_work):
+        loop.run_in_executor(None, partial(gate.run, _work))
     return settled
 
 
@@ -1539,17 +1548,6 @@ def _set_and_read_autocommit(raw: Any) -> bool:
     support, for which ON is the only valid value (the ODBC ``SQLSetConnectAttr`` reference)."""
     raw.autocommit = True
     return bool(raw.autocommit)
-
-
-def _gated_call[T](conn: Any, fn: Callable[..., T], *args: Any) -> Callable[[], T]:
-    """``fn(*args)`` for a worker thread, run through ``conn``'s call gate when it has one (BACKLOG
-    #2394), so it never runs beside another pyodbc call on that connection.
-
-    :func:`_set_and_read_autocommit` and :func:`_close_raw_cursor` use ``conn``'s raw handles directly
-    rather than through aioodbc, so the gate on aioodbc's ``_execute`` does not see them. A
-    connection with no gate (a test double) runs ``fn`` bare, as before."""
-    gate = call_gate(conn)
-    return partial(fn, *args) if gate is None else partial(gate.run, fn, *args)
 
 
 def _unwinding_a_cancel() -> bool:
@@ -1687,7 +1685,9 @@ class _AutocommitPool:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
             # if the default executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
-            work = _thread_settled(_gated_call(conn, _set_and_read_autocommit, raw))
+            # Through the gate (BACKLOG #2394): the set uses the raw handle, which aioodbc's gated
+            # _execute never sees.
+            work = _thread_settled(partial(_set_and_read_autocommit, raw), gate=call_gate(conn))
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -1844,12 +1844,12 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
 
     **A cancellation during ``execute`` or a fetch does not free the cursor under it (BACKLOG
     #2394).** That call may still be running on its worker thread when this function is reached.
-    The close runs through the connection's call gate (:func:`_gated_call`), so it starts only once
-    that call has returned, and the connection goes back only after the close. The cancelled task
-    does not wait for either: while a cancellation is in flight, the return is handed to
-    :func:`_return_when_settled` at once. Until the running call returns, the connection keeps its
-    pool slot, and the close's thread waits on the gate. Nothing in the engine bounds that wait,
-    because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
+    The close runs inside the connection's call gate (:func:`_thread_settled`), handed to the
+    running call, so it runs only once that call has returned, and the connection goes back only
+    after the close. The cancelled task does not wait for either: while a cancellation is in
+    flight, the return is handed to :func:`_return_when_settled` at once. Until the running call
+    returns, the connection keeps its pool slot. Nothing in the engine bounds that time, because
+    this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
 
     **What this does not cover.** A cancellation during ``conn.cursor()`` reaches this function with
     no cursor, so the connection goes back while that call may still be running. The gate holds the
@@ -1865,7 +1865,7 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     work: asyncio.Future[Any]
     if raw_cur is not None:
         try:
-            work = _thread_settled(_gated_call(conn, _close_raw_cursor, raw_cur))
+            work = _thread_settled(partial(_close_raw_cursor, raw_cur), gate=call_gate(conn))
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
@@ -1878,7 +1878,7 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
     if _unwinding_a_cancel():
-        # The close may wait on the gate for a cancelled statement; the cancellation must not.
+        # The close may be waiting for a cancelled statement; the cancellation must not.
         _return_when_settled(pool, conn, work, "a cursor close")
         return
     try:
