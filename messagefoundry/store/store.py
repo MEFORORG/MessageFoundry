@@ -12664,8 +12664,11 @@ class MessageStore:
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
             #    message purge-ineligible, and a DEAD one is blanked with its reply. But on a server
-            #    backend the blank and the erasure read the eligible set apart, so a replay or a
-            #    sibling's completion between them can leave a token naming an erased reply. It must
+            #    backend a replay can re-pend the token after the purge read its eligible set and
+            #    before the reply is erased: SQL Server reads `#eligible`, materialized once, and on
+            #    Postgres the blank skips a row a concurrent replay committed as pending while the
+            #    same statement still erases the reply. That leaves a token naming an erased reply,
+            #    and this branch is the only control for it. It must
             #    never become a child message, so dead-letter the token. Retention keeps the
             #    `response` row, so a row that is missing altogether is damage, not an erasure. That
             #    token is dead-lettered and NOT blanked: its sealed reference is the evidence of which

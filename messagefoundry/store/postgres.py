@@ -5452,7 +5452,9 @@ class PostgresStore:
                         seq,
                     )
                     # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560; the SQLite twin says how a token reaches here), and it
+                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
+                    # snapshot made the purge's token blank skip it, while the same statement still
+                    # erased the reply. This branch is the only control for that, and the reply
                     # must never become a child message. A missing row is damage, not an erasure,
                     # so that token is not blanked: its sealed reference is the evidence.
                     if art is None:
