@@ -16,9 +16,9 @@ only entry that moved is minimatch, whose ``via`` gains the advisory and whose `
 The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
 deepmerge GHSA-gcqx-w48m-w2h4. Those two differ by exactly that one finding, plus seven
 ``vulnerabilities`` entries, deepmerge and six packages that reach it, with the low and total counts
-up by seven; every entry the 2026-10-24 reading held is unchanged. The 2026-10-24 reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2,
-after GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
-ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
+up by seven; every entry the 2026-10-24 reading held is unchanged. The 2026-10-24 reading had
+itself replaced the 2026-10-07 one, taken with npm 11.5.2, after GitHub withdrew two advisories.
+Those two readings' findings differed by exactly the two withdrawn ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
 ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
 were not traced to a cause. The live call is replaced by an injected runner, so nothing here needs
 npm.
@@ -418,6 +418,11 @@ _ABSENT_FROM_BUNDLE = (
 _PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
 
 
+def _probes_found_in(text: str) -> list[str]:
+    """Each probe in :data:`_ABSENT_FROM_BUNDLE` that matches *text*, by pattern."""
+    return [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(text)]
+
+
 def test_the_recorded_bundle_reading_still_holds() -> None:
     """The baseline's recorded bundle readings, of the braces and js-yaml chains, still hold.
 
@@ -433,28 +438,29 @@ def test_the_recorded_bundle_reading_still_holds() -> None:
 
     # One check per input the probe walk reads, so a zero below cannot come from walking nothing:
     # the control shows the probes can find code in this bundle text, and the probe list is
-    # non-empty. Which probes the list must hold is the recorded reading's call, in the baseline.
+    # non-empty. Which probes the list must hold is the recorded reading's call, in the baseline;
+    # the planted-source test below names the ones its own lines exercise, so update both together.
     assert len(_PRESENT_IN_BUNDLE.findall(bundle)) == 2, "the control no longer finds @actions/core"
     assert _ABSENT_FROM_BUNDLE, "no probes left, so the absence below would check nothing"
-    present = [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(bundle)]
+    present = _probes_found_in(bundle)
     assert not present, f"recorded as absent from the bundle, now present: {present}"
 
 
 @pytest.mark.parametrize(
-    ("pattern", "planted"),
+    ("planted", "pattern"),
     [
-        # Lines read 2026-10-31 at the upstream tags of the locked versions: minimatch v3.1.2's
-        # minimatch.js and glob v7.1.6's sync.js.
-        ("minimatch", "minimatch.Minimatch = Minimatch"),
-        ("twoStarNoDot", "var twoStarNoDot ="),
-        ("GlobSync", "globSync.GlobSync = GlobSync"),
+        # Lines read 2026-10-31 at upstream tags: minimatch v3.1.2 minimatch.js, glob v7.1.6
+        # sync.js, actions-toolkit v2.2.0 src/index.ts. The first has no lowercase "minimatch", so
+        # it holds the probe's IGNORECASE as well as the walk.
+        ("function Minimatch (pattern, options) {", "minimatch"),
+        ("var twoStarNoDot =", "twoStarNoDot"),
+        ("globSync.GlobSync = GlobSync", "GlobSync"),
+        ("export class Toolkit", "Toolkit"),
     ],
 )
-def test_the_minimatch_chain_probes_fire_on_the_locked_source(pattern: str, planted: str) -> None:
-    """A zero from a probe that could not fire is no reading, so plant real source and require a hit."""
-    probe = next(p for p in _ABSENT_FROM_BUNDLE if p.pattern == pattern)
-
-    assert probe.search(planted), f"{pattern} no longer finds the source it was measured against"
+def test_the_walk_names_a_chain_probe_on_planted_source(planted: str, pattern: str) -> None:
+    """The walk the bundle test relies on reds on a line of the chain's source, naming the probe."""
+    assert pattern in _probes_found_in(f"const bundled = 1;\n{planted}\n")
 
 
 def test_the_advice_matches_the_kind_of_failure(
