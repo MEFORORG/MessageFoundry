@@ -1888,8 +1888,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`optional`/`0`/`false`/`off`) —
 > dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **The engine
-> counts only those two as a mode** (BACKLOG #2483). `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and
-> `SSLCIPHER` do not count, so one of them alone, or a blank mode, reads as no mode. Name the mode as
+> counts only those two as a mode** (BACKLOG #2483). No other TLS keyword counts, at least
+> `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and `SSLCIPHER`, so one of them alone reads as no mode.
+> So does a blank mode, or one with a blank at either end, which the driver would be sent as written. Name the mode as
 > well as the files. libpq's default is `sslmode=prefer`, which can fall back to plaintext.
 > psqlODBC's own source sets `disable`, so no TLS would be attempted at all.
 >

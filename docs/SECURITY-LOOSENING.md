@@ -1872,7 +1872,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
 - **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
-  case, has a value and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
+  case, has a non-blank string value with no blank at either end, and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
   no-TLS spellings. The value check matters: matching the key alone read `SSLmode=disable` as TLS
   ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts
   as a mode (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not

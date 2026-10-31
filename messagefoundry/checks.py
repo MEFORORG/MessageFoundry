@@ -2993,7 +2993,7 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     So this stays ``required=False`` on purpose, and not because the arm is ungated. It has no posture
     to key on, so a refusal here would have to re-derive the gradient's loopback / attested / accepted
     arms from the graph — a second, silently different definition of a decision that already has one.
-    A hop with a mode set is not reported here at all: the engine cannot prove that value verifies
+    A hop with a mode outside the no-TLS deny-list is not reported here at all: the engine cannot prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops

@@ -17,6 +17,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, NoReturn
 
 import pytest
@@ -526,7 +527,7 @@ _TLS_KEYWORDS_WITH_NO_MODE = sorted(
     for keyword in _ODBC_PARAM_ALLOWLIST - _ODBC_TLS_MODE_KEYWORDS
     if _is_tls_keyword(keyword)
 )
-_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a value"
+_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
 
 
 def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
@@ -578,6 +579,30 @@ def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, 
     assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
 
 
+@pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "yes\n"])
+def test_a_padded_mode_value_sets_no_mode(value: str) -> None:
+    # The DSN carries the value as written, and psqlODBC switches on its first character, so a
+    # leading blank would select the driver's default. The unpadded spelling is the control.
+    for keyword in ("sslmode", "Encrypt"):
+        assert generic_odbc_tls_unenforced({keyword: value}) == _NO_MODE_REASON
+        assert generic_odbc_tls_unenforced({keyword: value.strip()}) is None
+
+
+def test_a_padded_no_tls_value_is_still_named() -> None:
+    # Padding never hides the deny-list: that check reads the value trimmed.
+    assert generic_odbc_tls_unenforced({"sslmode": " disable"}) == (
+        "TLS is explicitly not required: sslmode=disable"
+    )
+
+
+def test_a_mode_keyword_named_twice_reads_the_same_in_either_order() -> None:
+    # The build refuses the duplicate, but the posture readers classify specs never built.
+    first: dict[str, object] = {"sslmode": "verify-full", "SSLMODE": ""}
+    second: dict[str, object] = {"SSLMODE": "", "sslmode": "verify-full"}
+    assert generic_odbc_tls_unenforced(first) is None
+    assert generic_odbc_tls_unenforced(second) is None
+
+
 def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
     assert generic_odbc_tls_unenforced({"sslmode": "", "Encrypt": "yes"}) is None
     assert generic_odbc_tls_unenforced({"sslmode": "verify-full", "Encrypt": ""}) is None
@@ -591,9 +616,10 @@ def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) ->
 
 
 def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
-    logged = _generic_dsn_logs({"sslcert": "client.pem"}, caplog)
+    # A path that cannot exist, so a file in the working directory cannot change the outcome.
+    logged = _generic_dsn_logs({"sslcert": str(tmp_path / "absent.pem")}, caplog)
     assert "TLS verification is NOT enforced" in logged and _NO_MODE_REASON in logged
     assert "SSLmode=verify-full" in logged
 

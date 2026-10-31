@@ -410,12 +410,26 @@ def _is_tls_keyword(name: str) -> bool:
 
 
 def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value. Anything
-    else sets nothing: the engine has no evidence of how a driver reads it, and
-    :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good one is
-    :func:`generic_odbc_no_tls_params`'s question, not this one."""
-    modes = (odbc_param(params, keyword) for keyword in _ODBC_TLS_MODE_KEYWORDS)
-    return any(isinstance(mode, str) and mode.strip() for mode in modes)
+    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value with no
+    blank at either end. Anything else sets nothing: the engine has no evidence of how a driver reads
+    it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good
+    one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+
+    A padded value does not count because :func:`_build_odbc_dsn` sends it as written, and a driver
+    that does not trim reads something other than the word judged here: psqlODBC switches on the
+    first character, so ``" require"`` would select its default. :func:`_odbc_keyword` refuses a
+    padded keyword for the same reason.
+
+    Every key is read, not the first spelling of each, so the answer for a table that names a mode
+    keyword twice in different case does not depend on key order. The build refuses such a table;
+    the posture readers classify specs that were never built."""
+    return any(
+        odbc_keyword_name(str(key)) in _ODBC_TLS_MODE_KEYWORDS
+        and isinstance(value, str)
+        and value.strip()
+        and value == value.strip()
+        for key, value in params.items()
+    )
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -468,7 +482,7 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     if _sets_tls_mode(params):
         return None
     if any(_is_tls_keyword(str(k)) for k in params):
-        return "a TLS keyword is set in odbc_params, but no TLS mode has a value"
+        return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
     return "no TLS keyword is set in odbc_params"
 
 

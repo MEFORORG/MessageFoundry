@@ -346,7 +346,7 @@ fail-closed bind-guard exist. Enabling MLLP-over-TLS keeps **MLLP** feeds off th
 whole-plane property: **TCP/X12 have no `tls` option at all** (`check_tcp_tls_exposure` refuses the
 non-loopback bind and says so — they must be firewall-segmented or proxy-terminated); a
 `dialect='generic'` DATABASE hop's TLS is the ODBC **driver's** own keyword, which the engine never
-verifies and, once a mode is set, does not enforce; and a **Direct** destination with `use_tls=false` submits over cleartext SMTP.
+verifies and, once a mode outside the no-TLS deny-list is set, does not enforce; and a **Direct** destination with `use_tls=false` submits over cleartext SMTP.
 Those three are the exceptions, and they are enumerated under
 [No-TLS channels — hazards](#no-tls-channels--hazards) and the outbound matrix below.
 
@@ -521,7 +521,7 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `MEFOR_ALLOW_INSECURE_TLS` in production — it no longer influences a cleartext hop at all, and where it
    still applies it only weakens verification (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
    **Two outbounds can still cross outside that refusal** and need a deliberate decision from you: a
-   `dialect='generic'` DATABASE hop (driver-owned TLS: once a mode is set, the engine neither enforces nor verifies it) and a Direct destination
+   `dialect='generic'` DATABASE hop (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) and a Direct destination
    with `use_tls=false` — see the exceptions under the [matrix](#channel--tls-posture-matrix).
    Separately, **at least nine** verifying TLS outbounds have a revocation gate of their own — and the
    rest do **not**, including the SQL Server store hop: see
@@ -1136,7 +1136,7 @@ the Vault guard in `transports/strict_requests.py` calls that function itself an
 ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
 (`tls_allow_expired`) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other
-(a `dialect='generic'` DATABASE hop with a mode set is not gated and not on the `generic-db-tls` line, so name it as that);
+(a `dialect='generic'` DATABASE hop with a mode outside the no-TLS deny-list is not gated and not on the `generic-db-tls` line, so name it as that);
 and a field with no factory parameter and no `connections.toml`
 key must never be offered as an operator lever. No field is on that list today:
 `tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it

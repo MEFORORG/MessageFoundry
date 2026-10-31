@@ -592,37 +592,52 @@ _GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _g
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_generic_lone_tls_keyword_refused_when_enforcing(
-    keyword: str, connector: Callable[[Any], object], config: Callable[..., Any]
+    keyword: str, connector: Callable[[Any], object], config: Callable[..., Any], tmp_path: Path
 ) -> None:
-    # BACKLOG #2483: a key or certificate path does not count as a mode.
+    # BACKLOG #2483: a key or certificate path does not count as a mode. The path cannot exist, so a
+    # file in the working directory cannot turn this into a key or certificate refusal.
+    absent = str(tmp_path / "absent")
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
     ):
-        connector(config(odbc_params={keyword: "fixture"}))
+        connector(config(odbc_params={keyword: absent}))
 
 
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 @pytest.mark.parametrize("mode", ["require", "verify-full"])
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
-    keyword: str, mode: str, connector: Callable[[Any], object], config: Callable[..., Any]
+    keyword: str,
+    mode: str,
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    tmp_path: Path,
 ) -> None:
     # The control for the test above: the same keyword crosses once a mode is set beside it.
+    absent = str(tmp_path / "absent")
     with active_hop_posture(PROD_PHI):
-        built = connector(config(odbc_params={keyword: "fixture", "sslmode": mode}))
+        built = connector(config(odbc_params={keyword: absent, "sslmode": mode}))
     assert built._cleartext_guard is None  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(
     "params",
-    [{"sslmode": ""}, {"sslmode": "  "}, {"Encrypt": ""}, {"sslmode": ["disable"]}],
+    [
+        {"sslmode": ""},
+        {"sslmode": "  "},
+        {"Encrypt": ""},
+        {"sslmode": ["disable"]},
+        {"sslmode": " require"},
+        {"Encrypt": "yes "},
+    ],
 )
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
 def test_generic_blank_or_non_string_mode_refused_when_enforcing(
     params: dict[str, object], connector: Callable[[Any], object], config: Callable[..., Any]
 ) -> None:
-    # The DSN would carry the keyword with no usable mode in it, which is no evidence of one.
+    # The DSN would carry the keyword with no usable mode in it, which is no evidence of one. A
+    # padded value goes out padded, and a driver that does not trim reads another word.
     with (
         active_hop_posture(PROD_PHI),
         pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
