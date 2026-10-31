@@ -459,8 +459,8 @@ gets no id and costs only the two parses. Nothing recurses past the depth `json`
 (`_NodeIds` and `_KeepFirstKey` in `transports/fhir.py`).
 
 The work of judging is bounded in at least these ways. Every interning key hashes through a
-string or a byte string, whose hash Python seeds per process, except six with a fixed hash:
-`true`, `false`, `null`, and the empty string, object and list. So a reply cannot be built in
+string or a byte string, whose hash Python seeds per process, except at least these, whose hash is
+fixed: `true`, `false`, `null`, and the empty string, object and list. So a reply cannot be built in
 advance to make the keys collide. That holds only while `PYTHONHASHSEED` is unset or random, and
 it is not proof against a sender who learns the seed. An object's key is its sorted pairs of key
 and value ids, so the expected work is at most the size of what is interned times the log of its
@@ -515,8 +515,9 @@ beside one small repeated key, it delivers at a peak of 0.68 to 0.76 GiB in 5 to
 what holding both parsed trees costs, which the code before vault BACKLOG #3796 also did: two
 plain parses kept alive together took 0.68 to 0.76 GiB here. Where the items fill the two
 occurrences of the repeated key
-instead, the backstop refuses it at a peak of 0.51 to 0.57 GiB in 6 to 13 s, because the keep-first
-parse stops partway.
+instead, the backstop refuses it at a peak of 0.51 to 0.57 GiB in 6 to 13 s. The keep-first parse
+runs almost to the end there, since the object that repeats the key closes only after both
+occurrences are parsed; the peak is lower because the plain tree holds only the last occurrence.
 
 It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
 `read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the sections headed vault BACKLOG
