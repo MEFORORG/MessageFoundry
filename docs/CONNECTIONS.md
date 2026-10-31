@@ -2640,10 +2640,15 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
   and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
-  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
-  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  agree on what a delivery takes, no occurrence of a key repeated three or more times differs from
+  both its first and last value, and no occurrence of a repeated key reads two ways itself at any
+  depth below it (vault BACKLOG #3796), the reply is judged as above. Values are compared as JSON
+  values, so `1` differs from `true` and `1.0`. Otherwise the update is a permanent
   refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
-  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  as delivered, as with a reply over the byte bound below. A reply whose repeated occurrences and
+  compared values (the resource type, the judgment, `etag`, `location` and `lastModified`) are
+  too large to judge within the bound the ADR states is refused the same way; only those count
+  toward it. The full rule, with what counts as
   agreement and its costs, is in
   [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
   the 2026-10-17 entry.
