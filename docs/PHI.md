@@ -1688,8 +1688,9 @@ That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, and an `OSEr
 `strerror` or `filename` is the error. It also covers an exception that keeps the error on an
 attribute, when its class defines `__str__` or `__repr__`; such a class loses its own message
 even if it never prints the error. When that method is the class's own code rather than a builtin
-exception's, the walk also reads the exception's `__cause__` and `__context__`, and every
-attribute of an exception it holds (vault BACKLOG #3340). So such a class raised from a codec
+exception's, the walk also follows the exception's `__cause__` and `__context__`, link after link
+along the whole chain, and reads at least the instance `__dict__`, the slots and the chain links
+of each exception it reaches that way, within the budget below (vault BACKLOG #3340). So such a class raised from a codec
 error, or while one was being handled, loses its message the same way. An exception whose
 `__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
 stores an error on an attribute keeps its message. Some builtin exceptions define their own, at
@@ -1703,7 +1704,10 @@ in a traceback, as a log argument, in
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-When it runs out the filter leaves the rest as it is, and which objects those are is not defined.
+An object the unlimited first pass reaches is charged once, at the depth it ends with: one met
+plainly and also beneath an exception whose own code renders it is read that deeper way alone.
+One first reached through an attribute and then again more deeply is charged a second time, for
+its elements and for any attribute the second read adds. When it runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
 by attribute even when it is the single mapping argument, so a large map in it can use up the
