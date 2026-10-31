@@ -1707,7 +1707,9 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
     # problems. Three populations, never collapsed into two — a literal probed here; an env() ref
     # DEFERRED to the `build-check` line, which resolves it against this environment; and one left
     # UNCHECKED on every path because its connection is not deployed, whose env() values ADR 0111
-    # forbids resolving anywhere. A census that folded the last two would read as a clean pass over
+    # forbids resolving anywhere. An env() ref on an INBOUND connection is in neither of the last two:
+    # validate refuses it above (BACKLOG #2431), so a config reaching this line holds none.
+    # A census that folded the last two would read as a clean pass over
     # values nothing had looked at, which is the false-green this line exists to prevent.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.
@@ -1797,47 +1799,6 @@ def _resolve_snapshot_on_send(
         return PipelineSettings().snapshot_on_send
 
 
-def _resolve_dryrun_env_values(
-    config_dir: str | Path,
-    *,
-    service_config: str | Path | None,
-    suppress_search: bool,
-) -> dict[str, Any]:
-    """Best-effort ``env()`` values for the dry-run preview, loaded as the ``build-check`` leg loads
-    them, so an ``env()`` encoding is decoded by the value the engine would use (BACKLOG #2431).
-
-    Empty when no settings resolve or the values do not load: that leg FAILS on a malformed values
-    file itself, so this one does not report it twice. With no values an ``env()`` encoding resolves
-    to its default, or stays the reference the decode refuses."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.environments import (
-        load_environment_values,
-        resolve_values_base_dir,
-    )
-
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search
-    )
-    if toml is None and not env_only:
-        return {}
-    try:
-        settings = _load_check_settings(toml)
-        env_name = settings.ai.environment
-        if env_name is None:
-            return {}
-        return dict(
-            load_environment_values(
-                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-                dir_name=settings.environments.dir,
-                environment=env_name,
-                environ=os.environ,
-            )
-        )
-    except (FileNotFoundError, ValueError, ValidationError, OSError):
-        return {}
-
-
 def _check_dryrun(
     config_dir: str | Path,
     messages_dir: str | Path | None,
@@ -1917,9 +1878,6 @@ def _check_dryrun(
     snapshot_on_send = _resolve_snapshot_on_send(
         config_dir, service_config=service_config, suppress_search=suppress_search
     )
-    env_values = _resolve_dryrun_env_values(
-        config_dir, service_config=service_config, suppress_search=suppress_search
-    )
     errors: list[str] = []
     total = 0
     pinned = 0
@@ -1937,13 +1895,7 @@ def _check_dryrun(
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(
-                reg,
-                raw,
-                inbound=ic_name,
-                snapshot_on_send=snapshot_on_send,
-                env_values=env_values,
-            )
+            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
             # A Router/Handler's own `raise` can quote field values, so its text goes through
             # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
             # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in

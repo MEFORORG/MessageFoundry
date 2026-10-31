@@ -812,9 +812,25 @@ def test_env_ref_is_accepted_where_the_annotation_omits_envref(tmp_path: Path) -
     """Deliberately WIDER than the annotation: ``encoding`` is annotated plain ``str``, yet
     ``resolve_env_settings`` resolves every ref in the settings table regardless of annotation. The
     annotation is therefore not the authority on where a ref may be WRITTEN, and refusing one here
-    would reject a file that works today."""
-    reg = load_config(_inbound_settings(tmp_path, '  port = 2575\n  encoding = { env = "enc" }'))
-    assert isinstance(reg.inbound["IB"].spec.settings["encoding"], EnvRef)
+    would reject a file that works today.
+
+    An OUTBOUND encoding, because an inbound one is refused by the graph check instead (next test)."""
+    reg = load_config(_outbound_settings(tmp_path, '  encoding = { env = "enc" }'))
+    assert isinstance(reg.outbound["OB"].spec.settings["encoding"], EnvRef)
+
+
+def test_env_ref_as_an_inbound_encoding_is_refused_at_load(tmp_path: Path) -> None:
+    """BACKLOG #2431: the ingress decode reads the inbound's own settings, where an env() reference is
+    never resolved, so the graph check refuses one rather than let every message fail to decode.
+    Nothing is resolved to refuse it: the message names the key, and there is no value to render."""
+    path = _inbound_settings(tmp_path, '  port = 2575\n  encoding = { env = "enc" }')
+    with pytest.raises(WiringError) as excinfo:
+        load_config(path)
+    msg = str(excinfo.value)
+    assert "inbound connection 'IB'" in msg
+    assert "environment reference 'enc'" in msg
+    assert "an inbound encoding must be a literal codec name" in msg
+    assert "editing the connection" in msg
 
 
 def test_literal_choice_setting_takes_its_own_type(tmp_path: Path) -> None:

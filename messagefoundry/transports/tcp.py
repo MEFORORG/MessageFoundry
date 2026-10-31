@@ -477,11 +477,10 @@ class TcpSource(SourceConnector):
         self.port: int = int(s["port"])
         self.codec = _codec_from_settings(s)
         # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
-        # the runner decoded the body with. For an env() setting both read the resolved value: this
-        # source is built from the resolved settings, and the runner resolves the same ref for its
-        # decode (inbound_with_resolved_encoding in config/wiring.py, BACKLOG #2431). Config load
-        # refuses a non-str or unusable name; the str() rule is the backstop that hands one that got
-        # past it to frame_reply's fallback, rather than raising a TypeError that leaves the reply unsent.
+        # the runner decoded the body with. Config load refuses an env() inbound encoding, which the
+        # runner's decode would not resolve, and a non-str or unusable name (BACKLOG #2431); the str()
+        # rule is the backstop that hands one that got past it to frame_reply's fallback, rather than
+        # raising a TypeError that leaves the reply unsent.
         self.encoding: str = declared_encoding(s.get("encoding"))
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
