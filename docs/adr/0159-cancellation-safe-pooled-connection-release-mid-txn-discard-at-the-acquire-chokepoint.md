@@ -528,6 +528,49 @@ the next reader does not re-derive the wrong precedent from the same comment.
   statement's session must hold no lock and no open transaction. A manual-commit session at rest
   reads one open transaction and no locks (see *What was measured* above). So that check in effect
   requires the session to be gone.
+- **AMENDED 2026-10-30. The DATABASE connector's pooled borrows go through the same call gate
+  (BACKLOG #2394 part b), and they keep their connection rather than quarantine it.** The decision
+  above is the store's and stands. This records what the connector in
+  `messagefoundry/transports/database.py` does instead, and what that costs.
+
+  - `_acquire`, and the autocommit pool's own borrow, install `CallGate` on every aioodbc connection
+    they hand out. The autocommit pool installs it itself because a `DatabaseRef` sync borrows
+    through `acquire_pooled`, not `_acquire`. The autocommit set and the cursor close in
+    `_close_and_release` use the raw pyodbc handles directly, so they run through `gate.run` too.
+  - **A cancellation during `execute` or a fetch no longer frees the cursor under the running
+    call.** The close waits on the gate for that call to return, and the connection goes back to
+    its pool only after the close, as engine PR 2593 already required. The cancelled task does not
+    wait: while a cancellation is in flight, `_close_and_release` hands the return to
+    `_return_when_settled` and returns.
+  - **It returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc wakes no
+    waiting borrower when a closed connection is released, so a detached connection could leave
+    that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for returning
+    an unconfirmed connection open.
+
+  **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
+  The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
+  in that state. A cancelled borrow waits without bound for its running call before its cursor
+  closes, and holds its pool slot for all of that time. A worker thread of the loop's default
+  executor waits on the gate for the same time.
+
+  **What bounds it.** Nothing in the engine bounds the call itself. It ends when the statement
+  ends, when the driver's or the network's own timeout fires, or when the server ends the session.
+  At least these limits sit around it:
+
+  - Another borrower of that pool waits at most its `acquire_timeout`, then fails transiently and
+    retries, so a held slot delays work but does not wedge it.
+  - A pool close waits for the held connection. After a cancel, `DatabaseSource.stop()` bounds that
+    wait at `_POOL_CLOSE_TIMEOUT_S`. The destination's and the lookup executor's `aclose()`, and a
+    `DatabaseRef` sync's own pool teardown, do not bound it.
+
+  **What it leaves open.** A cancellation during `conn.cursor()` reaches the close with no cursor,
+  so the connection goes back while that call may still run; the gate holds the next borrower's
+  calls behind it, and the new cursor is left for the collector. **The manual-commit destination
+  pool also takes back a connection whose cancelled statement may have left its transaction open,
+  the hazard this ADR was written for.** The next send on that connection would commit or roll back
+  the stranger's statement with its own. That residual is unfiled and named here by subject.
+
+  Pinned offline by `tests/test_backlog2394_database_gate.py`.
 
 ## Acceptance Criteria
 
