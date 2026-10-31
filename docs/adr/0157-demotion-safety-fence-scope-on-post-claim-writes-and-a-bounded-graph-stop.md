@@ -399,7 +399,7 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    statement is not bounded by it, and the heartbeat, config-version refresh and stepdown release
 >    still run under `command_timeout`. The first difference is on purpose; the second is a kept
 >    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
->    `ServiceSettings._warn_sqlserver_renew_bound` logs a warning at load, without refusing, when
+>    `serve` logs `ServiceSettings.sqlserver_renew_bound_warning` at start-up, without refusing, when
 >    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
 >    ending a slow statement at the clamp.
@@ -726,8 +726,9 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 - Consequence 1(c): a promote, demote and re-promote in one process passes every guard, on both
   backends. Only a per-claim token closes it.
 - The SQL Server renew inherited `[store].command_timeout` until 2026-10-30 (Inc 0, deviation 3,
-  now BUILT). Its claim's borrow and statement are clamped; the claim's COMMIT and the heartbeat,
-  config-version and release statements are not.
+  now BUILT). Its claim's borrow and statement are clamped. At least these are not: the claim's
+  COMMIT, the ROLLBACK after a failed claim, the start-up `_register` and `_ensure_tables`, and the
+  heartbeat, config-version and release statements.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as

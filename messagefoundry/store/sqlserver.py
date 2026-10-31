@@ -5507,8 +5507,9 @@ class SqlServerStore:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew is its only caller.
 
-        Two windows, each at most the clamp. The wait for a pooled connection is the smaller of the
-        clamp and ``[store].acquire_timeout``: a renew that waited out a saturated pool past the
+        Two windows, each at most the clamp floored at 1 s. The wait for a pooled connection is the
+        smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
 

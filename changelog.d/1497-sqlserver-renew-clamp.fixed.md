@@ -6,6 +6,6 @@
   `command_timeout` still wins. A clamp under 1 s is refused on the SQL Server backend, because the
   driver cannot apply one. Unlike Postgres, the two bounds do not share one deadline, so a renew can
   land up to about twice the clamp after it is issued, while the config check compares the clamp
-  alone with the detection margin; the engine logs a warning at load when twice the clamp reaches
+  alone with the detection margin; `serve` logs a warning at start-up when twice the clamp reaches
   that margin, which the shipped 10/20/30 timings do. The COMMIT after the statement is not bounded
   by the clamp at all. ADR 0157 Inc 0, deviation 3. (`BACKLOG #1497`)

@@ -6100,11 +6100,14 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #: At the shipped 10/20/30 the clamp is 4.5, which runs as a 4.5 s borrow plus a 4 s statement: about
 #: 8.5 s of the 9.0 s margin. At the failover profile (fence 4.0 / TTL 6.0, margin 1.2 s) the floor
 #: makes the clamp 1.0, which runs as about 2 s, past the margin.
-#: ``ServiceSettings._warn_sqlserver_renew_bound`` warns at load when ``2 * clamp >= margin``.
+#: ``ServiceSettings.sqlserver_renew_bound_warning`` names, for ``serve`` to log at start-up, a config
+#: where ``2 * clamp >= margin``.
 _RENEW_CLAMP_MARGIN_FRACTION = 0.5
 
 #: FLOOR on the derived clamp, and the reason it exists is a LIVENESS bound the margin does not see.
-#: The clamp is asyncpg's per-statement timeout on the lease renew, so a renew slower than it RAISES
+#: The clamp is the lease renew's statement timeout: on Postgres asyncpg's per-call timeout, shared
+#: with the borrow; on SQL Server the ODBC statement timeout, in whole seconds rounded down
+#: (``store.sqlserver._clamped_statement_timeout``). Either way a renew slower than it RAISES
 #: and ``_last_renew_ok`` is not advanced; enough consecutive failures and the watchdog self-fences a
 #: leader whose database was merely slow. The margin bounds the clamp from ABOVE (correctness: a stray
 #: renew must not outlive the fence). Nothing in the margin bounds it from BELOW, and at a tight
@@ -6231,8 +6234,11 @@ class ClusterSettings(_Section):
     # `clamp < (ttl - fence - fence_tick)`, which is a function of the fence/TTL pair, so a constant is
     # wrong for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
     # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
-    # proportionally tight clamp instead of a refusal, and the default can never contradict the margin
-    # by construction. At the shipped 10/20/30 the margin is 9.0 s and this resolves to 4.5.
+    # proportionally tight clamp instead of a refusal. It is still not safe by construction: the 1.0 s
+    # floor can exceed half a small margin, or the margin itself, so the derived value is checked like
+    # an explicit one; and on SQL Server the renew can land up to about twice the clamp after it is
+    # issued (the comment on _RENEW_CLAMP_MARGIN_FRACTION says why). At the shipped 10/20/30 the
+    # margin is 9.0 s and this resolves to 4.5.
     #
     # Set it EXPLICITLY and it is checked, not clamped: a value that does not fit the margin is
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
@@ -6373,8 +6379,8 @@ class ClusterSettings(_Section):
         load does not prove the renew lands inside the margin:** there the borrow and the statement
         each get the full clamp, so a renew can land up to about twice the clamp after it is issued,
         plus a COMMIT the clamp does not bound (``SqlServerStore._fetchone_clamped``).
-        :meth:`ServiceSettings._warn_sqlserver_renew_bound` warns, without refusing, when twice the
-        clamp reaches this margin. The SQL Server rounding, and its refusal of a sub-second clamp, are
+        :meth:`ServiceSettings.sqlserver_renew_bound_warning` is the start-up warning, not a refusal,
+        when twice the clamp reaches this margin. The SQL Server rounding, and its refusal of a sub-second clamp, are
         :meth:`ServiceSettings._sqlserver_renew_clamp_whole_seconds`'s. Both live there because this
         section cannot see ``[store]``."""
         tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
@@ -7644,9 +7650,9 @@ class ServiceSettings(_InputHidingModel):
             )
         return self
 
-    @model_validator(mode="after")
-    def _warn_sqlserver_renew_bound(self) -> ServiceSettings:
-        """Warn, without refusing, when a SQL Server renew may land outside the detection margin.
+    def sqlserver_renew_bound_warning(self) -> str | None:
+        """The start-up warning for a SQL Server renew that may land outside the detection margin,
+        or ``None``.
 
         ``ClusterSettings._renew_fits_the_margin`` compares the clamp alone with the margin. On SQL
         Server the claim's borrow and its statement each get the full clamp, so a renew can land up
@@ -7654,30 +7660,31 @@ class ServiceSettings(_InputHidingModel):
         (``store.sqlserver.SqlServerStore._fetchone_clamped``). This names a configuration where
         twice the clamp reaches the same margin that check uses. A warning, not a refusal: the bound
         is approximate and the refusal rule is the margin check's (Manager decision
-        d20261030T213636115-0af931). Spans two sections, so it lives here."""
+        d20261030T213636115-0af931). Spans two sections, so it lives here.
+
+        Pure, and logged by ``serve`` once ``configure_logging`` has run, as
+        :meth:`AuthSettings.breaker_budget_warning` is: a validator would log while settings load,
+        which in ``serve`` is before logging reaches its handlers."""
         clamp = self.cluster.lease_renew_timeout_seconds
         if not (
             self.cluster.enabled
             and self.store.backend == StoreBackend.SQLSERVER
             and clamp is not None
         ):
-            return self
+            return None
         margin = _detection_margin_seconds(
             self.cluster.leader_fence_timeout_seconds, self.cluster.leader_lease_ttl_seconds
         )
-        if 2 * clamp >= margin:
-            _log.warning(
-                "[cluster] on SQL Server: twice lease_renew_timeout_seconds (2 x %s = %s s) reaches"
-                " the demotion detection margin (%s s). There the lease claim's pool wait and its"
-                " statement each get the full clamp, and its COMMIT is not bounded by it, so a renew"
-                " issued just before this node self-fences can still land and re-extend the lease."
-                " Lower lease_renew_timeout_seconds, or widen the gap between"
-                " leader_fence_timeout_seconds and leader_lease_ttl_seconds",
-                clamp,
-                2 * clamp,
-                margin,
-            )
-        return self
+        if not 2 * clamp >= margin:
+            return None
+        return (
+            f"[cluster] on SQL Server: twice lease_renew_timeout_seconds (2 x {clamp:g} ="
+            f" {2 * clamp:g} s) reaches the demotion detection margin ({margin:g} s). There the"
+            " lease claim's pool wait and its statement each get the full clamp, and its COMMIT is"
+            " not bounded by it, so a renew issued just before this node self-fences can still land"
+            " and re-extend the lease. Lower lease_renew_timeout_seconds, or widen the gap between"
+            " leader_fence_timeout_seconds and leader_lease_ttl_seconds"
+        )
 
     @model_validator(mode="after")
     def _dr_activate_not_clustered(self) -> ServiceSettings:

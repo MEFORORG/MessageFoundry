@@ -28,7 +28,12 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import ClusterSettings, StoreSettings, load_settings
+from messagefoundry.config.settings import (
+    ClusterSettings,
+    StoreSettings,
+    _detection_margin_seconds,
+    load_settings,
+)
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
@@ -357,61 +362,90 @@ def test_a_sub_second_clamp_still_loads_on_postgres(tmp_path: Path) -> None:
     assert s.cluster.lease_renew_timeout_seconds == 0.5
 
 
-# --- the load-time warning on the SQL Server bound --------------------------------
+# --- the start-up warning on the SQL Server bound --------------------------------
 
-_SETTINGS_LOGGER = "messagefoundry.config.settings"
 _TWICE_THE_CLAMP = "twice lease_renew_timeout_seconds"
 
 
-def _renew_bound_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [
-        r
-        for r in caplog.records
-        if r.name == _SETTINGS_LOGGER
-        and r.levelno == logging.WARNING
-        and _TWICE_THE_CLAMP in r.getMessage()
-    ]
-
-
-def test_sqlserver_warns_when_twice_the_clamp_reaches_the_margin(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_sqlserver_warns_when_twice_the_clamp_reaches_the_margin(tmp_path: Path) -> None:
     """Margin 9.0 at 10/20/30; a 4.6 clamp passes the margin check (4.6 < 9.0) but 9.2 >= 9.0."""
-    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
     s = _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 4.6\n")
     assert s.cluster.lease_renew_timeout_seconds == 4.6
-    (record,) = _renew_bound_warnings(caplog)
-    assert "9.0" in record.getMessage()
+    note = s.sqlserver_renew_bound_warning()
+    assert note is not None
+    assert _TWICE_THE_CLAMP in note
+    assert "(2 x 4.6 = 9.2 s)" in note
+    assert "margin (9 s)" in note
 
 
-def test_sqlserver_warns_at_the_shipped_timings(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_sqlserver_warns_at_the_shipped_timings(tmp_path: Path) -> None:
     """The derived 4.5 at 10/20/30 is exactly half the 9.0 margin, so twice it reaches the margin.
     Pinned because the changelog and CONFIGURATION.md say a stock SQL Server cluster warns."""
-    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
-    assert _load(tmp_path, _SQLSERVER).cluster.lease_renew_timeout_seconds == 4.5
-    assert len(_renew_bound_warnings(caplog)) == 1
+    s = _load(tmp_path, _SQLSERVER)
+    assert s.cluster.lease_renew_timeout_seconds == 4.5
+    note = s.sqlserver_renew_bound_warning()
+    assert note is not None
+    assert _TWICE_THE_CLAMP in note
 
 
-def test_postgres_does_not_warn_with_the_same_numbers(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_the_warning_prints_a_float_margin_short(tmp_path: Path) -> None:
+    """At fence 2.0 / TTL 4.7 the margin is 2.3000000000000003 as a float; the note says 2.3."""
+    s = _load(
+        tmp_path,
+        _SQLSERVER
+        + "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 2.0\n"
+        + "leader_lease_ttl_seconds = 4.7\n",
+    )
+    assert repr(_detection_margin_seconds(2.0, 4.7)) == "2.3000000000000003"
+    note = s.sqlserver_renew_bound_warning()
+    assert note is not None
+    assert "margin (2.3 s)" in note
+    assert "0000" not in note
+
+
+def test_postgres_does_not_warn_with_the_same_numbers(tmp_path: Path) -> None:
     """Control: on Postgres the borrow and statement share one deadline, so the clamp is the bound."""
-    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
-    _load(tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 4.6\n")
-    _load(tmp_path, _POSTGRES)
-    assert _renew_bound_warnings(caplog) == []
+    assert (
+        _load(
+            tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 4.6\n"
+        ).sqlserver_renew_bound_warning()
+        is None
+    )
+    assert _load(tmp_path, _POSTGRES).sqlserver_renew_bound_warning() is None
 
 
-def test_sqlserver_with_ample_margin_does_not_warn(
+def test_sqlserver_with_ample_margin_does_not_warn(tmp_path: Path) -> None:
+    """Control: 2 x 4.4 = 8.8 < 9.0, just inside; and 2 x 2.0 well inside."""
+    for clamp in ("4.4", "2.0"):
+        s = _load(tmp_path, _SQLSERVER + f"lease_renew_timeout_seconds = {clamp}\n")
+        assert s.sqlserver_renew_bound_warning() is None
+
+
+def test_loading_settings_logs_no_renew_bound_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Control: 2 x 4.4 = 8.8 < 9.0, just inside; and 2 x 2.0 well inside."""
-    caplog.set_level(logging.WARNING, logger=_SETTINGS_LOGGER)
-    _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 4.4\n")
-    _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 2.0\n")
-    assert _renew_bound_warnings(caplog) == []
+    """The load itself stays quiet even on a config that warns, so ``serve`` logs it exactly once."""
+    caplog.set_level(logging.WARNING)
+    s = _load(tmp_path, _SQLSERVER)
+    assert s.sqlserver_renew_bound_warning() is not None
+    assert not [r for r in caplog.records if _TWICE_THE_CLAMP in r.getMessage()]
+
+
+def test_serve_logs_the_renew_bound_warning_once_logging_is_configured() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
+    or it would reach the filtered lastResort only. Read from the source, as the breaker-budget seam
+    test in tests/test_ad_user_account_control.py does, because running ``serve`` that far starts an
+    engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    checked = source.index("if _logging_refused is not None:")
+    warned = source.index("settings.sqlserver_renew_bound_warning()")
+    assert source.index("_load_service_settings(") < checked < warned
+    assert source.count("sqlserver_renew_bound_warning") == 1
+    assert "sqlserver_renew_bound_warning" not in inspect.getsource(load_settings)
 
 
 # --- against a real server -----------------------------------------------------
