@@ -3310,9 +3310,8 @@ async def test_replay_resend_not_deduped_pg(store) -> None:
     assert item is not None
     await store.mark_done(item.id, now=300.0)
     assert len(await _pg_ledger(store)) == 1
-    assert (
-        await store.replay(mid, now=400.0, audit=no_operator_audit) == 1
-    )  # re-send drops the ledger entry
+    # re-send drops the ledger entry
+    assert await store.replay(mid, now=400.0, audit=no_operator_audit) == 1
     assert await _pg_ledger(store) == []
     again = await store.claim_next_fifo("OB1", now=500.0)
     assert again is not None and again.id == item.id  # claimed normally, NOT deduped
@@ -3554,9 +3553,8 @@ async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_pg(store) 
     assert await _pg_deliver(store, now=120.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
 
-    assert (
-        await store.replay(parent, now=200.0, audit=no_operator_audit) == 1
-    )  # the real delivery only
+    # the real delivery only
+    assert await store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _pg_deliver(store, now=210.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
     assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0

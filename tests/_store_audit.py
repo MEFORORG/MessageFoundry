@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Audit arguments for store tests that are not about the audit row (vault BACKLOG #3217, #2624).
 
-``cancel_queued``, the four operator alert mutations, and ``replay``, ``replay_dead``,
-``resend_to`` and ``reingress`` take a REQUIRED ``audit``, so a test of the mutation itself still
-has to pass one. These are the ones it passes. The row-and-change atomicity
+Store mutations that take a REQUIRED ``audit`` include at least ``cancel_queued``, the four
+operator alert mutations, ``replay``, ``replay_dead``, ``resend_to`` and ``reingress``;
+``tests/test_operator_audit_required.py`` walks the current set. A test of the mutation itself
+still has to pass one. These are the ones it passes. The row-and-change atomicity
 is the subject of ``tests/_operator_audit_atomic_contract.py``, not of these tests. Extra-free.
 """
 

@@ -981,9 +981,8 @@ async def test_dead_letter_missing_inbounds_ingress_orphan_replays(store: Messag
     assert await store.dead_letter_missing_inbounds(set()) == 1
     assert await _claim_ingress(store, "in_a") is None  # a dead row is not claimable
 
-    assert (
-        await store.replay(mid, audit=no_operator_audit) == 1
-    )  # the inbound is back; the operator replays
+    # the inbound is back; the operator replays
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     item = await _claim_ingress(store, "in_a")
     assert item is not None and item.message_id == mid and item.payload == RAW
     await store.route_handoff(
@@ -1041,9 +1040,8 @@ async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
 
-    assert (
-        await store.replay(mid, audit=no_operator_audit) == 1
-    )  # only the dead routed row re-pended
+    # only the dead routed row re-pended
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     # The delivered outbound row stays DONE (not re-pended → not re-delivered).
     ob = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid)}
     assert ob == {"OB_A": OutboxStatus.DONE.value}
@@ -1249,9 +1247,8 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
     assert (
         await store.count_dead(allowed_channels=None) == 0
     )  # the dead ingress row is not in the DLQ view
-    assert (
-        await store.replay_dead(audit=no_operator_audit) == 0
-    )  # ...and bulk replay leaves it alone
+    # ...and bulk replay leaves it alone
+    assert await store.replay_dead(audit=no_operator_audit) == 0
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value

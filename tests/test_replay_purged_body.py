@@ -452,9 +452,8 @@ class TestPostgresParity:
 
         assert await pg.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
         assert (await pg.get_message(purged_mid))["status"] == MessageStatus.PROCESSED.value
-        assert (
-            await pg.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
-        )  # unpurged control
+        # unpurged control
+        assert await pg.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
         assert (await pg.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value
         assert purged_row and kept_row  # ids are bound for symmetry with the SQLite arm
 
@@ -500,9 +499,8 @@ class TestSqlServerParity:
 
         assert await ss.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
         assert (await ss.get_message(purged_mid))["status"] == MessageStatus.PROCESSED.value
-        assert (
-            await ss.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
-        )  # unpurged control
+        # unpurged control
+        assert await ss.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
         assert (await ss.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value
 
     async def test_replay_dead_skips_erased_rows_and_leaves_their_message_in_error(

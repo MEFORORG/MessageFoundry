@@ -10,16 +10,21 @@ nor a test said so. With no default, leaving it out is a type error and a ``Type
 
 This reads signatures with :func:`inspect.signature`, on the Store protocol, on all three backends
 and on the :class:`Engine` wrappers, so a backend that restores a default fails here even where no
-Postgres or SQL Server is reachable. It does not keep a list of the methods to check: it walks every
-public method that takes an ``audit``, so a new operator mutation is held to the rule the day it is
-added. The methods that keep an optional ``audit`` on purpose are named in :data:`OPTIONAL`, each
-with its reason, and the walk must find exactly those.
+Postgres or SQL Server is reachable. It walks every public method that takes a parameter named
+``audit``, so a new method that does is held to the rule without being listed here. The store
+methods that keep an optional ``audit`` on purpose are named in :data:`OPTIONAL`, each with its
+reason, and the walk must find exactly those; on :class:`Engine` none is exempt.
+
+What it does not catch, at least: a new operator mutation that takes no ``audit`` at all, or names
+it something else; a ``None``-admitting annotation spelled through an alias; and a caller that
+passes an ``audit`` which never returns a row. None of these is a type the walk can see.
 """
 
 from __future__ import annotations
 
 import inspect
-from typing import Any
+import re
+from typing import Any, Optional
 
 import pytest
 
@@ -32,7 +37,8 @@ from messagefoundry.store.store import MessageStore, OperatorAudit
 #: The protocol, every backend that implements it, and the engine that wraps them.
 CLASSES: tuple[type[Any], ...] = (Store, MessageStore, PostgresStore, SqlServerStore, Engine)
 
-#: The methods whose ``audit`` stays optional, and why. Narrowing one is welcome: delete it here.
+#: The store methods whose ``audit`` stays optional, and why. Narrowing one is welcome: delete it
+#: here. It does not apply to :class:`Engine`.
 OPTIONAL: dict[str, str] = {
     "enqueue_ingress": (
         "the partner receipt path, which has no operator; the operator inject reaches it through"
@@ -42,8 +48,9 @@ OPTIONAL: dict[str, str] = {
     "decide_pending_approval": "the approval gate's own audit contract (vault BACKLOG #2255)",
 }
 
-#: The operator mutations this item made required. The walk must reach each, so it cannot pass by
-#: finding nothing.
+#: Operator mutations whose ``audit`` is required: the four this item made required, with
+#: ``cancel_queued`` (#3217) and the Engine wrappers, which were already. The walk must reach each,
+#: so it cannot pass by finding nothing.
 FLOOR: dict[type[Any], frozenset[str]] = {
     **{
         cls: frozenset({"replay", "replay_dead", "resend_to", "reingress", "cancel_queued"})
@@ -72,31 +79,27 @@ def audit_problem(cls: type[Any], method: str) -> str | None:
         return f"{cls.__name__}.{method} audit is {audit.kind.name}, not KEYWORD_ONLY"
     if audit.default is not inspect.Parameter.empty:
         return f"{cls.__name__}.{method} audit defaults to {audit.default!r}"
-    if "None" in str(audit.annotation):
+    if re.search(r"\b(None|Optional)\b", str(audit.annotation)):
         return f"{cls.__name__}.{method} audit admits None: {audit.annotation}"
     return None
 
 
 def audited_methods(cls: type[Any]) -> set[str]:
-    """Every public method of ``cls`` that takes an ``audit`` parameter."""
-    found = set()
-    for name, member in inspect.getmembers(cls, callable):
-        if name.startswith("_"):
-            continue
-        try:
-            params = inspect.signature(member).parameters
-        except (TypeError, ValueError):
-            continue
-        if "audit" in params:
-            found.add(name)
-    return found
+    """Every public method of ``cls`` that takes an ``audit`` parameter. A signature that cannot be
+    read raises rather than drop the method from the walk."""
+    return {
+        name
+        for name, member in inspect.getmembers(cls, callable)
+        if not name.startswith("_") and "audit" in inspect.signature(member).parameters
+    }
 
 
 @pytest.mark.parametrize("cls", CLASSES, ids=lambda c: c.__name__)
 def test_every_audited_operator_method_requires_its_audit(cls: type[Any]) -> None:
     methods = audited_methods(cls)
     assert FLOOR[cls] <= methods, f"the walk missed {sorted(FLOOR[cls] - methods)}"
-    problems = [audit_problem(cls, m) for m in sorted(methods - OPTIONAL.keys())]
+    exempt = set() if cls is Engine else OPTIONAL.keys()
+    problems = [audit_problem(cls, m) for m in sorted(methods - exempt)]
     assert [p for p in problems if p is not None] == []
 
 
@@ -130,6 +133,16 @@ def test_control_a_restored_default_fails_the_check() -> None:
         ) -> int:
             return 0
 
+    class Spelled:
+        async def replay(
+            self,
+            message_id: str,
+            now: float | None = None,
+            *,
+            audit: Optional[OperatorAudit[int]],  # noqa: UP045
+        ) -> int:
+            return 0
+
     class Required:
         async def replay(
             self, message_id: str, now: float | None = None, *, audit: OperatorAudit[int]
@@ -139,5 +152,8 @@ def test_control_a_restored_default_fails_the_check() -> None:
     assert audit_problem(Restored, "replay") == "Restored.replay audit defaults to None"
     assert audit_problem(Nullable, "replay") == (
         "Nullable.replay audit admits None: OperatorAudit[int] | None"
+    )
+    assert audit_problem(Spelled, "replay") == (
+        "Spelled.replay audit admits None: Optional[OperatorAudit[int]]"
     )
     assert audit_problem(Required, "replay") is None
