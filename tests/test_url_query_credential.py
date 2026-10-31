@@ -65,7 +65,7 @@ _MARK = "carries a credential in its query string"
             "https://p.example.invalid/x?api_key=A&client_secret=B&password=C",
             ["api_key", "client_secret", "password"],
         ),
-        # The example docs/SECURITY-LOOSENING.md gives of a name that only looks like a credential.
+        # A token-named parameter is named: a CSRF token in a query can carry a session secret.
         ("https://p.example.invalid/x?csrf_token=AAA", ["csrf_token"]),
     ],
 )

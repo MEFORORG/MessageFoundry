@@ -1852,9 +1852,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
   again. At a start that logs it, each `FhirLookup` whose `url` resolved logs it once, before any
-  build, so the URL is named while the lookup is down, whatever failed; its failure is recorded and
-  alerted. A
-  lookup whose `url` did not resolve has no URL to read and logs none. The egress check logs it
+  build, so the URL is named while the lookup is down, whether its build or another setting failed;
+  its failure is recorded and alerted. The exception is a lookup whose warning step itself raises:
+  it is degraded, with an ERROR line and no WARNING. A lookup whose `url` did not resolve has no
+  URL to read and logs none. The egress check logs it
   before any of its refusals, so an outbound or a lookup that check refuses, for example over an
   unlisted forward proxy, has logged it. An outbound that fails before that check, at least on an
   unresolved `env()` value, logs none. An `env()` URL on a connection that logged none appears

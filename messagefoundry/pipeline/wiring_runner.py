@@ -2490,7 +2490,9 @@ class RegistryRunner:
         ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
         ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
         recorded while its lookup is down, whether its build or another setting failed (ASVS
-        14.2.1). A lookup whose ``url`` did not resolve has no URL to read and logs none. A caller
+        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
+        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
+        and logs none. A caller
         whose build check has already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
