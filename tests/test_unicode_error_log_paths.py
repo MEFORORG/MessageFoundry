@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import ast
+import codecs
 import collections
 import collections.abc
 import configparser
@@ -1746,6 +1747,45 @@ def test_a_bare_unicode_errors_text_notes_survive_its_traceback() -> None:
     assert out.endswith("invalid start byte\nwhile reading feed.csv")
 
 
+class _NotesRaise(UnicodeDecodeError):
+    """Its ``__notes__`` raises a Unicode error, whose ``repr()`` the stdlib puts in a note."""
+
+    @property
+    def __notes__(self) -> list[str]:  # type: ignore[override]
+        raise _encode_error()
+
+
+def test_the_stdlibs_note_for_unreadable_notes_is_not_kept() -> None:
+    # Review of vault BACKLOG #3340: "Ignored error getting __notes__: <repr>" is plain text the
+    # stdlib built, and the repr of the Unicode error it names prints the whole input.
+    error = _NotesRaise("utf-8", b"ok" + _BYTE, 2, 3, "invalid start byte")
+    ei = (type(error), error, None)
+    raw = logging.Formatter().formatException(ei)
+    assert "Ignored error getting __notes__" in raw  # control: the stdlib prints it
+    assert any(spelling in raw for spelling in _CHAR_SPELLINGS)
+    out = safe_traceback(ei)
+    assert "Ignored error getting __notes__" not in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_a_kept_codec_note_names_only_a_codec_safe_exc_would_name() -> None:
+    # Review of vault BACKLOG #3340: the stdlib's "decoding with '<name>' codec failed" quotes the
+    # name as the caller wrote it, which _names_a_codec declines to print.
+    for name, expected in (
+        ("utf-8", "decoding with 'utf-8' codec failed"),
+        ("UTF_8", "decoding with a codec failed"),
+    ):
+        try:
+            codecs.decode(b"ok" + _BYTE, name)
+        except UnicodeDecodeError as exc:
+            error = exc
+        assert error.__notes__ == [f"decoding with {name!r} codec failed"]  # control
+        out = safe_traceback((type(error), error, None))
+        assert out.endswith(f"invalid start byte\n{expected}"), out
+        assert ("'UTF_8'" in out) is False
+
+
 def _elements_read(scan: Any) -> int:
     """How many elements a scan copied out of containers and attributes: its own record of it."""
     return sum(len(elements or ()) for _arg, elements, _why in scan.nodes.values())
@@ -2017,6 +2057,22 @@ def test_an_object_read_twice_is_charged_only_for_what_the_second_read_adds() ->
     # every attribute again, so a codec error held after both printed raw.
     shared = types.SimpleNamespace(**{f"a{i}": i for i in range(1900)})
     record = _record("got %r", ([_Held(shared), _Batch("bad", shared), _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+@pytest.mark.parametrize(
+    "element", [types.SimpleNamespace, _Held], ids=["simple-namespace", "dataclass"]
+)
+def test_an_object_beneath_an_exceptions_own_code_is_charged_once(element: Any) -> None:
+    # Review of vault BACKLOG #3340: the first walk met each element plainly, and the second walk
+    # charged it again to read it the deep way, so the budget ran out before an error a sibling
+    # held was read, and it printed raw where origin/main printed the note.
+    batch = _Batch("bad", [element(err=i) for i in range(1400)])
+    record = _record("got %r", ([batch, _Held(_encode_error())],))
     RedactionFilter().filter(record)
     out = record.getMessage()
     assert "[_Held holding a codec error, not rendered]" in out

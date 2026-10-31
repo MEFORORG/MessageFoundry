@@ -2605,7 +2605,7 @@ def safe_traceback(ei: ExcInfo) -> str:
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
     a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
     exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
-    ``UnicodeError`` keeps the notes that are plain text. One whose message was built as text,
+    ``UnicodeError`` keeps the plain-text notes it holds itself (:func:`_kept_note`). One whose message was built as text,
     ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the third path, closed
     where the wrap is written."""
     value, tb = ei[1], ei[2]
@@ -2632,13 +2632,52 @@ def safe_traceback(ei: ExcInfo) -> str:
                 # A Unicode error's own keep each note that is exact text, as add_note writes it,
                 # which the stdlib printed (vault BACKLOG #3340, item 7). Any other note may be
                 # an error itself, and a holder's go whole, as its message did.
-                keep = isinstance(exc, UnicodeError) and type(notes) is list
-                node.__notes__ = [n for n in notes if type(n) is str] if keep else None
+                keep = isinstance(exc, UnicodeError) and _own_notes(exc) is notes
+                node.__notes__ = [_kept_note(n) for n in notes if type(n) is str] if keep else None
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
             pending.extend(zip(node.exceptions, exc.exceptions, strict=False))
     return "".join(te.format()).removesuffix("\n")
+
+
+_EXC_DICT: Any = BaseException.__dict__["__dict__"]
+
+
+def _own_notes(exc: BaseException) -> Any:
+    """The list ``add_note`` keeps on ``exc``, read from its instance dict, or None.
+
+    The stdlib's renderer reads ``__notes__`` with ``getattr``, and when that raises it puts a list
+    of its own in their place, holding ``Ignored error getting __notes__:`` and the ``repr()`` of
+    what was raised. That can be a Unicode error, and its ``repr()`` prints the whole input, so only
+    the list the exception itself holds is kept (vault BACKLOG #3340). Builtin methods, so none of
+    the caller's code runs; a list another object returned in its place is not this one."""
+    try:
+        storage = _EXC_DICT.__get__(exc)
+    except Exception:  # noqa: BLE001 -- a class with no instance dict keeps no notes there
+        return None
+    notes = dict.get(storage, "__notes__") if type(storage) is dict else None
+    return notes if type(notes) is list else None
+
+
+#: The note the stdlib adds to an error a codec raised, as ``decoding with 'utf-8' codec failed``.
+#: The name is the ``repr()`` of what the caller passed, so it is matched as a quoted string.
+_CODEC_NOTE = re.compile(
+    r"(?P<op>encoding|decoding) with (?P<name>'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\") "
+    r"codec failed"
+)
+#: Each name :func:`_names_a_codec` prints, as that note quotes it.
+_KNOWN_CODEC_REPRS = frozenset(repr(name) for name in _KNOWN_CODECS)
+
+
+def _kept_note(note: str) -> str:
+    """A Unicode error's text note as its traceback prints it. The stdlib's codec note names the
+    codec only when :func:`_names_a_codec` would, since the name is text the caller chose (vault
+    BACKLOG #3340); any other note is the caller's own text and is kept as written."""
+    match = _CODEC_NOTE.fullmatch(note)
+    if match is None or match["name"] in _KNOWN_CODEC_REPRS:
+        return note
+    return f"{match['op']} with a codec failed"
 
 
 def _codec_line(exc: BaseException) -> str | None:
@@ -3027,8 +3066,8 @@ def prints_a_codec_error(exc: BaseException) -> bool:
     BACKLOG #3295). It looks in at least: its ``.args``; its fields, when it is a dataclass; and,
     when a class of its own defines ``__str__`` or ``__repr__``, the attributes in its instance
     ``__dict__`` and its slots, which that method may print. When that method is not a builtin
-    exception's, also its ``__cause__`` and ``__context__``, and every attribute of an exception
-    it reaches (vault BACKLOG #3340).
+    exception's, also its ``__cause__`` and ``__context__`` along the whole chain, and at least the
+    instance ``__dict__``, slots and chain links of each exception it reaches (vault BACKLOG #3340).
 
     IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
     that is not read by attribute, text already built from the error, or anything past the
@@ -3078,8 +3117,9 @@ class _Scan:
     read with the limit.
 
     Beneath an exception whose own code renders it (:func:`_reader_record`), the second walk
-    reads every exception the deep way, its chain and every attribute included, since that code
-    may print any of them (vault BACKLOG #3340). An object met both ways is read the deep way, so
+    reads every exception the deep way, its chain, instance ``__dict__`` and slots included, since
+    that code may print any of them (vault BACKLOG #3340). The first walk carries that depth, so an
+    object it meets is charged once, at the depth it ends with. An object met both ways is read the deep way, so
     a plain exception shared with such a holder can print as a note where it is met plainly too.
 
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
@@ -3096,32 +3136,55 @@ class _Scan:
         seeds: list[int] = []
         # Objects to read by attribute, in the order met. Popped from the end, so the first
         # element of a list, which the first walk meets last, is read first.
-        charged: list[tuple[Any, bool]] = [(root, False)] if charged_root else []
-        pending: list[Any] = [] if charged_root else [root]
+        first: list[Any] = []
+        # id -> whether the first walk met it beneath an exception whose own code renders it
+        # (:func:`_reader_record`). One met plainly and then that way is met again, so what it
+        # holds is too, and each object is charged once, at the depth it ends with: charging it
+        # once per depth spent the budget twice on the same elements (vault BACKLOG #3340).
+        met: dict[int, bool] = {}
+        # The ids whose elements were already followed the deep way, so the second walk does not
+        # follow them again.
+        deepened: set[int] = set()
+        pending: list[tuple[Any, bool]] = [] if charged_root else [(root, False)]
         while pending:
-            arg = pending.pop()
+            arg, deep = pending.pop()
             kind = type(arg)
             key = id(arg)
-            if kind in _ARG_SCALARS or key in nodes:
+            if kind in _ARG_SCALARS:
                 continue
+            before = met.get(key)
+            if before is not None and before >= deep:  # met already, at least as deep
+                continue
+            met[key] = deep
             if issubclass(kind, UnicodeError):
-                nodes[key] = (arg, [], "")
-                seeds.append(key)
+                if before is None:
+                    nodes[key] = (arg, [], "")
+                    seeds.append(key)
                 continue
+            shallow, beneath, opens = _reader_record(kind)
+            # Charged the first time it has readers at the depth met: a plain exception has none
+            # until it is met beneath one whose own code renders it.
+            if (beneath if deep else shallow) is not None and (before is None or shallow is None):
+                first.append(arg)
             if not issubclass(kind, _ARG_WALKED):
-                if _readers(kind) is not None:
-                    charged.append((arg, False))
                 continue
-            try:
-                children = _children(arg, kind)
-            except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
-                nodes[key] = (arg, None, type(exc).__name__)
-                seeds.append(key)
+            if before is None:  # its elements are read when it is first met, and never again
+                try:
+                    nodes[key] = (arg, _children(arg, kind), "")
+                except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
+                    nodes[key] = (arg, None, type(exc).__name__)
+                    seeds.append(key)
+                    continue
+            elements = nodes[key][1]
+            if elements is None:  # unreadable, and it already counts as an error
                 continue
-            nodes[key] = (arg, children, "")
-            pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
-            if _readers(kind) is not None:
-                charged.append((arg, False))
+            inner = deep or opens
+            if inner:
+                deepened.add(key)
+            pending.extend((child, inner) for child in elements if type(child) not in _ARG_SCALARS)
+        charged: list[tuple[Any, bool]] = (
+            [(root, False)] if charged_root else [(arg, met[id(arg)]) for arg in first]
+        )
         budget = _ATTRIBUTE_BUDGET
         # id -> whether it was read beneath an object whose own code renders it, which reads
         # more (:func:`_reader_record`). One read the other way first is read again that way.
@@ -3160,7 +3223,7 @@ class _Scan:
                     # and a scalar has nothing deeper, so it is not charged a second time.
                     found = (
                         [c for c in children if type(c) not in _ARG_SCALARS][:budget]
-                        if inner
+                        if inner and key not in deepened
                         else []
                     )
                 elif issubclass(kind, _ARG_WALKED):
@@ -3181,6 +3244,8 @@ class _Scan:
                 seeds.append(key)
                 continue
             nodes[key] = (arg, children, "")
+            if inner:
+                deepened.add(key)
             follow: list[Any] = []
             for child in found:
                 child_kind = type(child)
