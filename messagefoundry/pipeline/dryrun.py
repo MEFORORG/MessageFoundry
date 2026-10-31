@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -595,6 +594,11 @@ def transform_one(
     return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
+#: The reference sets whose skip :func:`_dry_run_reference_view` has already logged in this process.
+#: A test resets it.
+_skipped_reference_sets_logged: set[str] = set()
+
+
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
     declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
@@ -603,7 +607,8 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     Each value goes through the same JSON encoding the store applies, so a preview reads what the live
     engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
     set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
-    a set whose file is missing or will not load (vault BACKLOG #3340); both log a warning naming it."""
+    a set whose file did not load (vault BACKLOG #3340); both log a warning naming it, the second once
+    per set per process."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -616,15 +621,15 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
                 k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
             }
         except CodeSetError:
-            # A missing or unreadable file. Say so, or a later read of the set reports it missing
-            # with nothing to say why. The set name and a fixed category only, never the loader's
-            # text: that can quote a KEY (a duplicate one), which may be PHI for a patient-keyed set,
-            # and `check` writes this line into a CI log.
-            log.warning(
-                "dry-run: reference set %r skipped, its file is %s",
-                spec.name,
-                "malformed or unreadable" if os.path.isfile(path) else "missing",
-            )
+            # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
+            # missing with nothing to say why. The set name only, never the loader's text: that can
+            # quote a KEY (a duplicate one), which may be PHI for a patient-keyed set, and `check`
+            # writes this line into a CI log. No cause either: a guess from the path (missing versus
+            # malformed) misnames a permission or a directory. Once per set per process, since
+            # `check` reloads the view for every fixture on every inbound.
+            if spec.name not in _skipped_reference_sets_logged:
+                _skipped_reference_sets_logged.add(spec.name)
+                log.warning("dry-run: reference set %r skipped, its file did not load", spec.name)
             continue
         except TypeError:
             # The live sync would refuse to commit this set, so the preview omits it too; say why, or
@@ -634,6 +639,23 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             )
             continue
     return view
+
+
+class UserCodeCalledSysExit(Exception):
+    """A Router, an ``accepts=`` predicate or a Handler called ``sys.exit()`` during a preview.
+
+    :func:`route_message` turns the ``SystemExit`` into this, so its callers' ``except Exception``
+    reports the message as ``ERROR`` rather than letting the exit leave ``dry_run`` and end
+    ``messagefoundry check`` with whatever code the script passed, 0 included, which reads as a pass.
+    The text matches the live runner's own conversion of the same exit (vault BACKLOG #3134) and
+    names an integer exit code and nothing else: ``sys.exit("...")`` carries the author's text,
+    which could quote a field. ``KeyboardInterrupt`` is not converted; it stops the preview."""
+
+    @classmethod
+    def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
+        code = exc.code
+        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
 
 
 def route_message(
@@ -656,7 +678,8 @@ def route_message(
     Bench / CLI preview, which want the whole routing outcome in one shot. The live **staged** engine
     instead runs the two halves at *separate* stages (router worker → transform worker), so it and the
     dry-run path route identically. Each handler still gets its own :class:`Message` (via
-    :func:`transform_one`). Router/Handler exceptions propagate to the caller.
+    :func:`transform_one`). Router/Handler exceptions propagate to the caller, a ``SystemExit`` as
+    :class:`UserCodeCalledSysExit`.
 
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
@@ -713,20 +736,26 @@ def route_message(
         # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
         # also cheaper than parse-once-then-deep-copy). Value-identical either way.
         shared = _shareable_payload(raw, ct)
-        names = route_only(
-            registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
-        )
-        for hname in names:
-            ds, ops, meta, skipped = transform_one(
-                registry,
-                hname,
-                raw,
-                ct,
-                payload=shared,
-                tracer=tracer,
-                sandbox=sandbox,
-                run_context=rc,
+        try:
+            names = route_only(
+                registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
             )
+        except SystemExit as exc:
+            raise UserCodeCalledSysExit.from_exit(exc) from None
+        for hname in names:
+            try:
+                ds, ops, meta, skipped = transform_one(
+                    registry,
+                    hname,
+                    raw,
+                    ct,
+                    payload=shared,
+                    tracer=tracer,
+                    sandbox=sandbox,
+                    run_context=rc,
+                )
+            except SystemExit as exc:
+                raise UserCodeCalledSysExit.from_exit(exc) from None
             deliveries.extend(ds)
             for op in ops:
                 # Visible to subsequent handlers, in the JSON form the live sealed cache returns
@@ -909,72 +938,35 @@ def _dry_run_raw(
     )
 
 
-#: At most this many dry-run strict validates run on worker threads at once, including ones whose
-#: caller already gave up on them at the timeout. An expired worker cannot be killed, and ``check``
-#: sends every fixture to every strict inbound, so without a bound K slow fixtures over M inbounds
-#: would leave K*M CPU-bound threads that slow later fixtures into timeouts of their own, or end in
-#: ``RuntimeError: can't start new thread``. The listener is bounded the same way, by the default
-#: executor's worker count behind ``asyncio.to_thread``.
-STRICT_VALIDATE_MAX_THREADS = 4
-_validate_slots = threading.BoundedSemaphore(STRICT_VALIDATE_MAX_THREADS)
-
-
 def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     """Strict-validate ``text`` under the listener's timeout; the refusal text, or ``None`` if valid.
 
-    The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread``; this
-    function is synchronous, so it waits on a thread for the timeout
-    :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves, and on expiry
-    returns the listener's text word for word (the parity test compares the two). With the backstop
-    disabled, or a timeout past ``threading.TIMEOUT_MAX`` (``inf`` among them, a wait the listener's
-    ``wait_for`` accepts and never ends), it validates inline, as the listener in effect does.
+    The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread`` and refuses
+    with ``strict-validation timed out after <N>s`` once the timeout
+    :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves passes. This
+    function is synchronous, so it validates **inline and measures**: when the validate took longer
+    than that timeout, the result is the listener's text word for word (the parity test compares the
+    two), whatever the validate returned or raised, since the listener had given up on it by then. A
+    validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
+    disabled (``strict_timeout_s <= 0``) nothing is measured.
 
-    The thread is a **daemon** and not pooled. An expired one cannot be killed and runs on until the
-    size and segment caps let it finish, as on the listener; a daemon is not joined at interpreter
-    exit, so it cannot hold ``messagefoundry check`` open, where a ``concurrent.futures`` pool's
-    worker would be. At most :data:`STRICT_VALIDATE_MAX_THREADS` run at once. The wait for a free one
-    counts against the same timeout, as the listener's executor queue does; when none frees in time,
-    or no thread can be started, the result is a refusal saying the validate did not run, never a pass.
-
-    The worker writes nothing itself: no log line, and nothing to stdout or stderr, because a daemon
-    still writing at interpreter exit can abort the process. What an expired one raises is dropped
-    unread, as the listener's orphan drops it; a raise inside the timeout is raised here, on the
-    caller's thread, as inline it raised. The caller blocks for up to the timeout, so a caller on an
-    event loop thread would stall that loop; at least the ``dryrun`` and ``check`` CLIs, ``verify``'s
-    self smoke and the traced dry-run run off any loop."""
+    **What inline loses against the listener, by design.** A slow fixture runs its full validate time
+    instead of being abandoned at the timeout, so a preview can take as long as hl7apy does, up to
+    the size and segment caps checked before the parse. And the listener's validates share the
+    default executor's workers with concurrent traffic, so a saturated executor can push a fast
+    validate past its timeout there; the preview validates one message at a time and does not model
+    that. The verdict matches; the wall clock and the concurrency do not."""
     timeout = strict_validate_timeout(ic)
-    version = ic.validation.hl7_version
-    if timeout is None or timeout > threading.TIMEOUT_MAX:
-        return _refusal(validate(text, expected_version=version))
-
-    deadline = time.monotonic() + timeout
-    if not _validate_slots.acquire(timeout=timeout):
-        return (
-            f"strict-validation not run: {STRICT_VALIDATE_MAX_THREADS} earlier validations were "
-            f"still running after {timeout}s"
-        )
-    outcome: list[ValidationResult | Exception] = []
-
-    def _run() -> None:
-        try:
-            outcome.append(validate(text, expected_version=version))
-        except Exception as exc:  # carried to the caller's thread; validate reports its own faults
-            outcome.append(exc)
-        finally:
-            _validate_slots.release()
-
-    worker = threading.Thread(target=_run, name="dryrun-strict-validate", daemon=True)
+    started = time.monotonic()
     try:
-        worker.start()
-    except RuntimeError:  # can't start new thread: the process is out of threads, not the message
-        _validate_slots.release()
-        return "strict-validation not run: no thread could be started"
-    worker.join(max(0.0, deadline - time.monotonic()))
-    if not outcome:
+        result = validate(text, expected_version=ic.validation.hl7_version)
+    except Exception:
+        if timeout is not None and time.monotonic() - started > timeout:
+            return f"strict-validation timed out after {timeout}s"
+        raise
+    if timeout is not None and time.monotonic() - started > timeout:
         return f"strict-validation timed out after {timeout}s"
-    if isinstance(outcome[0], Exception):
-        raise outcome[0]
-    return _refusal(outcome[0])
+    return _refusal(result)
 
 
 def _refusal(result: ValidationResult) -> str | None:

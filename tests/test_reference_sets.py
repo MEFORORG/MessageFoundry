@@ -658,24 +658,28 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "category"),
+    "body",
     [
-        pytest.param(None, "missing", id="missing"),
-        pytest.param("", "malformed or unreadable", id="malformed"),
-        pytest.param(
-            "code,npi\nMRN999SECRET,1\nMRN999SECRET,2\n",
-            "malformed or unreadable",
-            id="duplicate-key",
-        ),
+        pytest.param(None, id="missing"),
+        pytest.param("", id="malformed"),
+        pytest.param("code,npi\nMRN999SECRET,1\nMRN999SECRET,2\n", id="duplicate-key"),
     ],
 )
-def test_dryrun_logs_a_reference_file_it_skips(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str | None, category: str
+def test_dryrun_logs_a_reference_file_it_skips_once(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str | None,
 ) -> None:
     """A file that will not load is left out of the preview's view (vault BACKLOG #3340 item 5). It
     was left out with no log line, so a later read reported the set missing with no word on why. The
-    line names the set and a fixed category only, never the loader's text: a duplicate-key error
-    quotes the key, which may be PHI for a patient-keyed set."""
+    line names the set only, never the loader's text: a duplicate-key error quotes the key, which may
+    be PHI for a patient-keyed set. It names no cause either, since a guess from the path misnames
+    one. And it is logged once per set per process: `check` rebuilds the view for every fixture on
+    every inbound, and a line per rebuild buries the log."""
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(dryrun, "_skipped_reference_sets_logged", set())
     csv = tmp_path / "npi.csv"
     if body is not None:
         _csv(csv, body)
@@ -683,13 +687,14 @@ def test_dryrun_logs_a_reference_file_it_skips(
     raw = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
     with caplog.at_level("WARNING", logger="messagefoundry.pipeline.dryrun"):
-        outcome = route_message(reg, reg.inbound["IB_REF"], raw)
+        outcomes = [route_message(reg, reg.inbound["IB_REF"], raw) for _ in range(3)]
 
-    assert len(outcome.deliveries) == 1  # the skip is a preview note, not a refusal
+    assert [len(o.deliveries) for o in outcomes] == [1, 1, 1]  # a preview note, not a refusal
     [record] = [r for r in caplog.records if "skipped" in r.getMessage()]
     assert record.levelname == "WARNING"
-    assert "'provider_npi'" in record.getMessage()
-    assert record.getMessage().endswith(f"its file is {category}")
+    assert record.getMessage() == (
+        "dry-run: reference set 'provider_npi' skipped, its file did not load"
+    )
     assert "MRN999SECRET" not in caplog.text
 
 
