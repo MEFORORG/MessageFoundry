@@ -24,12 +24,16 @@ runs before any driver is loaded.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.auth.anchor_path import DIRECTORY, FILE, LINK
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -41,6 +45,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports import database
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.database import (
     _ODBC_PARAM_ALLOWLIST,
@@ -291,6 +296,338 @@ def test_a_file_keyword_must_be_a_plain_local_path(keyword: str, path: str) -> N
     message = str(refused.value)
     assert _CONNECTION in message
     assert "files.test" not in message
+
+
+@pytest.mark.parametrize("verdict", [True, None])
+def test_a_file_keyword_that_leads_off_the_host_or_cannot_be_cleared_is_refused(
+    monkeypatch: pytest.MonkeyPatch, verdict: bool | None
+) -> None:
+    """BACKLOG #2705, limb 4: a mapped drive or a link passes the spelling check, so where the path
+    leads is judged too, and a path the walk cannot clear is refused. No check opens it either. The
+    cases of that judgement are pinned against the walk below. Red with ``names_another_host``
+    back on the spelling alone."""
+    sent = r"Z:\certs\ca.pem"
+    monkeypatch.setattr(database, "_path_verdict", lambda p: verdict)
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"sslca": sent})
+    assert "Z:" not in str(refused.value)
+    assert database.driver_file_spellings(sent) == ()
+
+
+def test_a_padded_spelling_the_walk_cannot_clear_is_read_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A padded spelling whose verdict is ``None``, beside a trimmed spelling whose verdict is
+    ``False``, is kept by ``driver_file_spellings``, and the build reads it and refuses the value
+    when that read fails. With the padded spelling's verdict ``True``, the build refuses the value.
+    Red with ``driver_file_spellings`` keeping only the spellings whose verdict is ``False``."""
+    sent = r" C:\certs\ca.pem"
+    verdicts: dict[str, bool | None] = {sent: None, sent.strip(): False}
+    monkeypatch.setattr(database, "_path_verdict", lambda p: verdicts[p])
+    assert database.driver_file_spellings(sent) == (sent, sent.strip())
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        if path == sent:
+            raise PermissionError(5, "denied")  # what a walk stopped on, met again by the read
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    monkeypatch.setattr(os.path, "isdir", lambda _p: False)
+    with pytest.raises(ValueError, match="could not be read"):
+        _build(odbc_params={"sslca": sent})
+    assert read == [sent]
+    verdicts[sent] = True
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"sslca": sent})
+
+
+# The walk, against an injected file system, so every platform runs it. A drive answers its
+# GetDriveTypeW number: 3 is a fixed disk, 4 a mapped network drive, 1 no such volume, 0 unknown.
+_FIXED, _REMOTE, _NO_ROOT, _UNKNOWN = 3, 4, 1, 0
+
+
+def _walk(
+    path: str,
+    links: dict[str, str] | None = None,
+    *,
+    drives: dict[str, int] | None = None,
+    substs: dict[str, str] | None = None,
+    failing: Mapping[str, OSError] | None = None,
+) -> bool | None:
+    """``_windows_path_verdict`` over a file system where every name is a folder or a file, except
+    the ``links`` (path to stored target) and the ``failing`` paths (path to the error its probe
+    raises). ``substs`` maps a ``subst`` drive to the folder it stands for."""
+    links = {k.lower(): v for k, v in (links or {}).items()}
+    failing = {k.lower(): v for k, v in (failing or {}).items()}
+
+    def probe(part: str) -> tuple[str, str | None]:
+        key = part.lower()
+        if key in failing:
+            raise failing[key]
+        if key in links:
+            return LINK, links[key]
+        return (FILE if key.endswith(".pem") else DIRECTORY), None
+
+    return database._windows_path_verdict(
+        path,
+        probe=probe,
+        drive_type=lambda root: (drives or {}).get(root.upper(), _FIXED),
+        drive_target=lambda drive: (substs or {}).get(drive.upper()),
+        cwd=r"C:\work",
+    )
+
+
+def _winerror(winerror: int) -> FileNotFoundError:
+    exc = FileNotFoundError(2, "not reached")
+    exc.winerror = winerror  # type: ignore[attr-defined]
+    return exc
+
+
+def test_the_walk_clears_a_local_path() -> None:
+    """A missing folder, or a drive letter with no volume on this host, is left to the driver."""
+    assert _walk(r"C:\certs\ca.pem") is False
+    assert _walk("ca.pem") is False  # relative: joined to the working directory
+    missing = {r"C:\certs": FileNotFoundError(2, "not there")}
+    assert _walk(r"C:\certs\ca.pem", failing=missing) is False
+    assert _walk(r"Q:\certs\ca.pem", drives={"Q:\\": _NO_ROOT}) is False
+
+
+def test_the_walk_refuses_a_mapped_network_drive_up_or_down() -> None:
+    """The drive is judged by its type, read locally, so its server is never opened, and a server
+    that is down at the build changes nothing."""
+    assert _walk(r"Z:\certs\ca.pem", drives={"Z:\\": _REMOTE}) is True
+    assert _walk(r"Y:\certs\ca.pem", drives={"Y:\\": _UNKNOWN}) is None
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        r"\\files.test\share\ca.pem",
+        r"\\?\UNC\files.test\share\ca.pem",
+        r"\\?\Global\UNC\files.test\share\ca.pem",
+        r"Z:\ca.pem",  # a link onto a mapped drive
+    ],
+)
+def test_the_walk_refuses_a_link_that_leads_off_the_host(target: str) -> None:
+    links = {r"C:\certs\ca.pem": target}
+    assert _walk(r"C:\certs\ca.pem", links, drives={"Z:\\": _REMOTE}) is True
+
+
+def test_the_walk_follows_a_chain_of_links_and_a_subst_drive_to_its_end() -> None:
+    """Two hops, the first relative, a folder link above the file, and a ``subst`` drive whose
+    folder holds a link: each is spliced in, so the share at the end is reached. A one-hop reader
+    judges each of these local. Red with ``drive_target`` left out of the walk: the subst case."""
+    share = r"\\files.test\share"
+    assert _walk(r"C:\a\ca.pem", {r"C:\a\ca.pem": "hop.pem", r"C:\a\hop.pem": share}) is True
+    assert _walk(r"C:\d1\ca.pem", {r"C:\d1": r"C:\d2", r"C:\d2": share}) is True
+    assert _walk(r"S:\ca.pem", {r"C:\certlink": share}, substs={"S:": r"C:\certlink"}) is True
+    # The control: a chain that ends on the local disk is cleared.
+    assert _walk(r"C:\a\ca.pem", {r"C:\a\ca.pem": "hop.pem", r"C:\a\hop.pem": r"C:\b"}) is False
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+def test_the_walk_refuses_a_share_windows_could_not_reach(winerror: int) -> None:
+    """A probe that reaches a share whose server is down fails as a missing name, with winerror 53
+    or 67. That is not a missing folder: it leads off the host."""
+    failing = {r"C:\certs\ca.pem": _winerror(winerror)}
+    assert _walk(r"C:\certs\ca.pem", failing=failing) is True
+
+
+def test_the_walk_cannot_clear_a_path_it_cannot_read() -> None:
+    """The walk's verdict is ``None`` for a folder whose probe raises ``PermissionError``, and for a
+    link whose target is ``\\Device\\Mup\\...``."""
+    denied = {r"C:\locked": PermissionError(5, "denied")}
+    assert _walk(r"C:\locked\ca.pem", failing=denied) is None
+    nt = {r"C:\certs\ca.pem": r"\Device\Mup\files.test\share\ca.pem"}
+    assert _walk(r"C:\certs\ca.pem", nt) is None
+
+
+def test_the_walk_cannot_clear_a_drive_whose_subst_target_it_cannot_read() -> None:
+    """A failed ``QueryDosDeviceW`` other than "no such device" is not read as a real volume: a
+    subst drive the walk could not read would hide the links behind it."""
+
+    def unreadable(_drive: str) -> str | None:
+        raise OSError("the drive S: could not be read (winerror 122)")
+
+    verdict = database._windows_path_verdict(
+        r"S:\ca.pem",
+        probe=lambda _p: (FILE, None),
+        drive_type=lambda _r: _FIXED,
+        drive_target=unreadable,
+        cwd=r"C:\work",
+    )
+    assert verdict is None
+
+
+def test_each_file_keyword_is_walked_once_per_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #2705: the refusal and the checks that read the files share one judgement. A second
+    walk could disagree with the first, and an empty answer then skipped the key-wrap, certificate
+    and CA checks while the connection string kept the path. Here the second walk of each value
+    would say off-host: the build reads the files the first walk cleared, and the walk runs once
+    per spelling. Red with ``driver_file_spellings`` walking again inside the checks."""
+    walked: list[str] = []
+
+    def once(path: str) -> bool | None:
+        walked.append(path)
+        return walked.count(path) > 1  # a second look at the same path flips to off-host
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "_path_verdict", once)
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    params = {"sslca": r"C:\certs\ca.pem", "sslkey": r"C:\certs\k.pem", "sslpassword": "pw"}
+    _build(odbc_params=params)
+    assert sorted(walked) == [r"C:\certs\ca.pem", r"C:\certs\k.pem"]
+    assert sorted(set(read)) == [r"C:\certs\ca.pem", r"C:\certs\k.pem"]  # both checks ran
+
+
+def test_a_direct_check_refuses_a_set_value_its_own_walk_does_not_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check called without the build's verdicts walks the path itself, and refuses a set value
+    that walk does not clear, rather than reading nothing and passing."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
+    with pytest.raises(ValueError, match="not a plain local path"):
+        database._refuse_encrypted_driver_ca({"sslca": r"Z:\certs\ca.pem"}, connection=_CONNECTION)
+
+
+def test_a_direct_check_walks_each_spelling_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check called without the build's verdicts judges the path once and reads from that one
+    judgement, so a second walk cannot disagree with the first. Red with the refusal and the
+    spellings each walking the path on their own."""
+    walked: list[str] = []
+
+    def once(path: str) -> bool | None:
+        walked.append(path)
+        return walked.count(path) > 1  # a second look at the same path flips to off-host
+
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "_path_verdict", once)
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    database._refuse_encrypted_driver_ca({"sslca": r"C:\certs\ca.pem"}, connection=_CONNECTION)
+    assert walked == [r"C:\certs\ca.pem"]
+    assert read == [r"C:\certs\ca.pem"]
+
+
+def test_a_verdicts_map_without_the_keyword_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verdicts map that lacks a set keyword is a caller's bug. Read as no verdicts, it would
+    leave the file unread and unrefused, so it raises. Red with the lookup back on a default."""
+    monkeypatch.setattr(database, "read_if_regular", lambda *_a: b"")
+    with pytest.raises(KeyError):
+        database._refuse_encrypted_driver_ca(
+            {"sslca": r"C:\certs\ca.pem"}, connection=_CONNECTION, verdicts={}
+        )
+
+
+@pytest.mark.parametrize("mode", ["disable", "DISABLED", "verify-full"])
+@pytest.mark.parametrize(
+    ("keyword", "path"), [("sslca", r"Z:\certs\ca.pem"), ("sslcapath", r"Z:\certs")]
+)
+def test_a_ca_the_walk_finds_off_the_host_is_refused_in_every_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str, keyword: str, path: str
+) -> None:
+    """With TLS off the driver reads no CA, but an ``sslca`` or ``sslcapath`` on a mapped drive,
+    which only the walk finds off the host, is refused all the same, as with TLS on and as a client
+    key is: the build never hands the driver a path to another host, and nothing reads it. Red
+    with the TLS-off leniency back, which built it unread under ``disable``."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a path refused as off the host must not be read")
+
+    monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
+    monkeypatch.setattr(database, "read_if_regular", never)
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"SSLmode": mode, keyword: path})
+    assert "Z:" not in str(refused.value)
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
+
+
+def test_a_ca_on_the_local_disk_still_builds_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the refusal above: with TLS off a local CA still builds."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    monkeypatch.setattr(database, "read_if_regular", lambda *_a: b"-----BEGIN CERTIFICATE-----\n")
+    ca = r"C:\certs\ca.pem"
+    assert f"sslca={{{ca}}}" in _build(odbc_params={"SSLmode": "disable", "sslca": ca})
+
+
+@pytest.mark.parametrize("keyword", ["sslca", "sslcapath"])
+@pytest.mark.parametrize(
+    "path", [r"\\files.test\share\ca.pem", r"\\?\UNC\files.test\share\ca.pem", "//files.test/ca"]
+)
+def test_a_ca_share_spelling_is_refused_even_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, path: str
+) -> None:
+    """A share spelling was refused in every mode before the walk existed, and still is. Red with
+    the remote refusal skipped for a CA keyword under ``disable``."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a path refused as off the host must not be read")
+
+    monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
+    monkeypatch.setattr(database, "read_if_regular", never)
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
+        _build(odbc_params={"SSLmode": "disable", keyword: path})
+    assert "files.test" not in str(refused.value)
+
+
+def test_a_ca_the_walk_cannot_clear_is_refused_even_with_tls_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With TLS off the CA check reads nothing it is not given, so a trimmed path the walk could
+    not clear is refused rather than reaching the driver both unread and unrefused."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: None)
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"SSLmode": "disable", "sslca": r"C:\locked\ca.pem"})
+
+
+def _symlink_or_skip(target: str, link: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"cannot create a symbolic link here: {exc}")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a share path is a Windows spelling")
+@pytest.mark.parametrize("shape", ["file", "folder", "chain"])
+def test_a_real_link_to_a_share_is_refused(tmp_path: Path, shape: str) -> None:
+    """Real links on this host, read by the real probe. ``.invalid`` never resolves, so nothing
+    reaches a host whatever the walk does. Red with ``names_another_host`` back on the spelling
+    alone."""
+    share = r"\\files.invalid\share"
+    if shape == "file":
+        _symlink_or_skip(share + r"\ca.pem", tmp_path / "ca.pem")
+    elif shape == "folder":
+        _symlink_or_skip(share, tmp_path / "certs", directory=True)
+    else:
+        _symlink_or_skip(share + r"\ca.pem", tmp_path / "hop.pem")
+        _symlink_or_skip("hop.pem", tmp_path / "ca.pem")
+    sent = str(tmp_path / "certs" / "ca.pem") if shape == "folder" else str(tmp_path / "ca.pem")
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"sslca": sent})
+
+
+def test_a_link_to_a_local_file_still_builds(tmp_path: Path) -> None:
+    """The control: a link that resolves to a local file builds, with the link's own path sent."""
+    target = tmp_path / "real.pem"
+    target.write_text("x", encoding="ascii")
+    _symlink_or_skip(str(target), tmp_path / "ca.pem")
+    sent = str(tmp_path / "ca.pem")
+    assert f"sslca={{{sent}}}" in _build(odbc_params={"sslca": sent})
 
 
 @pytest.mark.parametrize(

@@ -252,6 +252,22 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "messagefoundry/transports/database.py::DatabaseSource._body::KeyError::ValueError",
         _SAFE + "KeyError carries the body_column name, which the new message also quotes",
     ),
+    _Allowed(
+        "messagefoundry/transports/database.py::_windows_path_verdict.probing::"
+        "(FileNotFoundError, NotADirectoryError)::_LeavesHost",
+        _SAFE
+        + "a control-flow signal, not a refusal: _windows_path_verdict catches it and returns "
+        "True, so it never leaves the module. The OSError names a file keyword path from the "
+        "operator's config, never message content or a secret",
+    ),
+    _Allowed(
+        "messagefoundry/transports/database.py::_windows_path_verdict.probing::"
+        "(FileNotFoundError, NotADirectoryError)::_PathEnds",
+        _SAFE
+        + "a control-flow signal, not a refusal: _windows_path_verdict catches it and returns "
+        "False, so it never leaves the module. The OSError names a file keyword path from the "
+        "operator's config, never message content or a secret",
+    ),
     # api/app.py: HTTP translations of the engine's own errors.
     _Allowed(
         f"{_APP}._dual_role_control::NotDeployedError" + _HTTP,
