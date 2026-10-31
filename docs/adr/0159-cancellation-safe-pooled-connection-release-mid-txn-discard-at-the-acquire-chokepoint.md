@@ -433,7 +433,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
   have lost the whole engine process on a cancel at shutdown or demotion.
 
   - `_acquire` now routes every pyodbc call on a pooled connection through a per-connection lock,
-    `_CallGate`, by wrapping aioodbc's `Connection._execute`. Two threads never use one connection
+    `_CallGate` (since BACKLOG #2394, `CallGate` in `messagefoundry/odbc_call_gate.py`), by
+    wrapping aioodbc's `Connection._execute`. Two threads never use one connection
     at once. pyodbc declares DB-API `threadsafety = 1`, under which threads may not share a
     connection at all; aioodbc already hands each connection across executor threads, and the gate
     keeps those hand-offs one call at a time. That wrap is a second private
@@ -527,6 +528,88 @@ the next reader does not re-derive the wrong precedent from the same comment.
   statement's session must hold no lock and no open transaction. A manual-commit session at rest
   reads one open transaction and no locks (see *What was measured* above). So that check in effect
   requires the session to be gone.
+- **AMENDED 2026-10-30. The DATABASE connector's pooled borrows go through the same call gate
+  (BACKLOG #2394 part b), and they keep their connection rather than quarantine it.** The decision
+  above is the store's and stands. This records what the connector in
+  `messagefoundry/transports/database.py` does instead, and what that costs.
+
+  - `_acquire`, and the autocommit pool's own borrow, install `CallGate` on every aioodbc connection
+    they hand out. The autocommit pool installs it itself because a `DatabaseRef` sync borrows
+    through `acquire_pooled`, not `_acquire`. The autocommit set and the cursor close in
+    `_close_and_release` use the raw pyodbc handles directly, so they run through `gate.run` too.
+  - **A cancellation during `execute` or a fetch no longer frees the cursor under the running
+    call.** The close is handed to that call through `CallGate.run_after_running_call`, so it runs
+    on the call's own thread as the call returns, and no second thread waits for it. The
+    connection goes back to its pool only after the close, as engine PR 2593 already required. The
+    cancelled task does not wait either: while a cancellation is in flight, `_close_and_release`
+    hands the return to `_return_when_settled` and returns. That holds for a cursor with its raw
+    handle. A cursor without one is closed through aioodbc, whose gated call parks a worker thread
+    on the gate until the statement returns.
+  - **The same job then rolls back what the cancelled statement left open**
+    (`_close_after_a_cancel`), since no caller's `except Exception` rollback ran. On the
+    destination's manual-commit pool, the connection would otherwise go back with the cancelled
+    INSERT uncommitted and its locks held, for the next send's commit or rollback to settle. This is
+    not the rollback rejected in *Why not a rollback in the same place* above: nothing awaits it,
+    and it runs on the statement's own thread after the statement, not on the loop's executor
+    beside it. A failed rollback is logged and the connection still goes back: dropping its handle
+    would leave a waiting borrower or `wait_closed` unwoken, since aioodbc wakes neither for a
+    closed connection. The rollback runs only on a gated connection; on an ungated one it would run
+    beside the statement.
+  - **Otherwise it returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc
+    wakes no waiting borrower when a closed connection is released, so a detached connection could
+    leave that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for
+    returning an unconfirmed connection open.
+
+  **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
+  The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
+  in that state. A cancelled borrow waits without bound for its running call before its cursor
+  closes, and holds its pool slot for all of that time. The statement's own worker thread is held
+  for that time too, as it was before the gate; the close adds no thread to it.
+
+  **What bounds it.** Nothing in the engine bounds the call itself. It ends when the statement
+  ends, when the driver's or the network's own timeout fires, or when the server ends the session.
+  At least these limits sit around it:
+
+  - Another borrower of that pool waits at most its `acquire_timeout`, then fails transiently and
+    retries, so a held slot delays work but does not wedge it.
+  - **A pool close stops waiting for a held connection after `_POOL_CLOSE_TIMEOUT_S` (2 s), and
+    only for one.** Each pool keeps a count of the connections held back behind a cancelled borrow:
+    one `_return_when_settled` is returning, or one an abandoned autocommit set still runs on. It
+    is keyed by the aioodbc pool under any `_AutocommitPool` wrapper, so a borrow and a close of one
+    pool read one count. Every close of a DATABASE pool goes through `_close_pool_bounded`: the
+    destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool teardown,
+    and `DatabaseSource.aclose()`, the ordinary `stop()` included. It stops waiting at the bound
+    only while that count is above zero. The count is read at the end of each tick of
+    `_POOL_CLOSE_TIMEOUT_S`, so a close that starts with a connection held back waits one tick, and
+    a borrow cancelled after the close began stops it at the end of the tick the cancel lands in,
+    at most one tick after the cancel. With the count at zero an in-flight call is an ordinary one, and the close waits
+    for it without a bound, as before this amendment. `DatabaseSource.stop()` after a cancel keeps
+    its BACKLOG #1620 bound whatever the count. The bound only stops the wait: the close goes on by
+    itself, never cancelled part-way, and the held connection is released only once its statement
+    returns. A retried close waits on the close already in flight rather than a second
+    `wait_closed`. So the connection test in `api/app.py`, which stops a source it probed, now
+    returns about `_POOL_CLOSE_TIMEOUT_S` after its own timeout for a `SELECT 1` its timeout
+    cancelled, rather than when that statement returns.
+  - **After the bound, a second pool can open beside the one still closing.** The destination and
+    the source drop their pool when the wait stops, and the next borrow opens a new one. Until the
+    cancelled statement returns the server can then see more connections than `pool_max`. That is
+    the trade `DatabaseSource.stop()` already accepts after a cancel (BACKLOG #1620), and it is now
+    taken only after a cancelled-and-held borrow. A source closed with no `timeout` still keeps its
+    pool reference while the close is waited on, so a close that fails is retried by the next
+    `stop()`.
+
+  **What it leaves open.** At least these:
+
+  - A cancellation during `conn.cursor()` reaches the close with no cursor, so the connection goes
+    back while that call may still run. The gate holds the next borrower's calls behind it, and the
+    new cursor is left for the collector. That connection is not counted as held back.
+  - A cancelled call whose worker thread has started but has not yet entered the gate is invisible
+    to `run_after_running_call`. The close job can then take the gate first, and the connection
+    can go back before that call runs on it. The store detaches its connection and so tolerates the
+    same race; this connector returns it.
+  - A cursor with no raw handle gets no rollback on a cancel.
+
+  Pinned offline by `tests/test_backlog2394_database_gate.py`.
 
 ## Acceptance Criteria
 

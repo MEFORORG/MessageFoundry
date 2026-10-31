@@ -37,7 +37,6 @@ import json
 import logging
 import math
 import queue
-import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -77,6 +76,11 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
+from messagefoundry.odbc_call_gate import call_gate as _call_gate
+from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
+from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
+from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -153,6 +157,7 @@ from messagefoundry.store.privilege import (
     sqlserver_excess,
 )
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -198,6 +203,7 @@ from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -428,121 +434,6 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
             " transaction and locks until the session ends: %s",
             fut.exception(),
         )
-
-
-class _CallGate:
-    """Runs one connection's pyodbc calls one at a time, and frees its handles only between calls.
-
-    BACKLOG #2049. aioodbc runs every call on an executor thread, and cancelling the awaiting task
-    does not stop that thread. Before this gate, the cancellation path closed the cursor and the
-    connection on OTHER threads while the statement was still running. When it returned, pyodbc
-    read the result's column metadata from freed handles, and a deploying SQL Server site would
-    have lost the whole engine process to a native crash (``SQLDescribeColW``,
-    ``SQLColAttributeW``). pyodbc declares DB-API ``threadsafety = 1``: threads may share the module
-    but not connections. aioodbc already moves each connection across executor threads, one call at
-    a time, and that is only sound while the calls really are one at a time. ``_lock`` restores
-    that after a cancellation; it does not make the store conform to level 1.
-
-    On the normal path each call waits for the previous one anyway, so the lock is never contended.
-    A quarantine that arrives while a call runs is handed to that call, which closes the connection
-    on its own thread as it returns: no extra thread waits, and the event loop never does.
-    """
-
-    __slots__ = ("_abandoned", "_deferred", "_lock", "_running", "_state")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()  # held for the whole of each pyodbc call
-        # Guards the two fields below. Held only for a few bytecodes, so the event loop may take it.
-        self._state = threading.Lock()
-        self._running = False
-        self._deferred: Any = None  # a raw connection to close when the running call returns
-        # Cursors whose owner was cancelled. The quarantine closes them before the connection, in
-        # the same locked step, so a later garbage collection never frees a statement beside it.
-        self._abandoned: list[Any] = []
-
-    def run(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        with self._lock:
-            with self._state:
-                self._running = True
-            try:
-                return func(*args, **kwargs)
-            finally:
-                with self._state:
-                    self._running = False
-                    deferred, self._deferred = self._deferred, None
-                if deferred is not None:
-                    self._close_locked(deferred, reraise=False)
-
-    def abandon(self, raw_cursor: Any) -> None:
-        """Hand a cancelled owner's cursor to the quarantine. Never waits: it runs on the loop."""
-        self._abandoned.append(raw_cursor)
-
-    def close_after_running_call(self, raw_conn: Any) -> bool:
-        """If a call is running, have it close ``raw_conn`` as it returns, and say so. Never waits."""
-        with self._state:
-            if self._running:
-                self._deferred = raw_conn
-            return self._running
-
-    def close(self, raw_conn: Any) -> None:
-        """Close the abandoned cursors, then the connection, once no call is running on it."""
-        with self._lock:
-            self._close_locked(raw_conn, reraise=True)
-
-    def _close_locked(self, raw_conn: Any, *, reraise: bool) -> None:
-        while self._abandoned:
-            try:
-                self._abandoned.pop().close()
-            except Exception:  # noqa: BLE001 - the connection close below still has to run
-                log.debug("sqlserver: closing an abandoned cursor failed", exc_info=True)
-        try:
-            raw_conn.close()
-        except Exception as exc:  # noqa: BLE001 - inside a call, never replace that call's outcome
-            if reraise:  # a caller awaiting this close logs it in its own words
-                raise
-            log.warning(
-                "sqlserver: close of a quarantined connection failed; the server may hold its"
-                " transaction until the session ends: %s",
-                exc,
-            )
-
-
-def _install_call_gate(conn: Any) -> None:
-    """Route every pyodbc call an aioodbc connection makes through a :class:`_CallGate`. Idempotent.
-
-    aioodbc 0.5.0 sends every call through ``Connection._execute(func, *args, **kwargs)``: cursor
-    operations reach it through ``Cursor._run_operation``, and the connection's own ``cursor``,
-    ``commit``, ``rollback`` and ``close`` call it directly. Wrapping that one method covers them
-    those. A connection without a bound ``_execute`` (a test double) is left alone and keeps the
-    pre-gate behaviour. A real aioodbc connection that cannot be gated is logged at ERROR, because
-    it brings the native crash back; the live suite also pins that a pooled connection is gated.
-    """
-    if _call_gate(conn) is not None:
-        return
-    execute = getattr(conn, "_execute", None)
-    if not inspect.ismethod(execute):
-        if type(conn).__module__.startswith("aioodbc"):
-            log.error(
-                "sqlserver: aioodbc %s has no bound _execute to gate; a cancelled store call can"
-                " free ODBC handles under a running statement (BACKLOG #2049)",
-                type(conn).__qualname__,
-            )
-        return
-    gate = _CallGate()
-    conn._execute = partial(execute, gate.run)
-    conn._mefor_call_gate = gate
-
-
-def _call_gate(conn: Any) -> _CallGate | None:
-    gate = getattr(conn, "_mefor_call_gate", None)
-    return gate if isinstance(gate, _CallGate) else None
-
-
-def _raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
-    """The blocking close for a discarded connection's raw handle: through its gate when it has one,
-    so the close runs only between pyodbc calls (BACKLOG #2049)."""
-    gate = _call_gate(conn)
-    return raw.close if gate is None else partial(gate.close, raw)
 
 
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
@@ -2972,9 +2863,16 @@ async def _assert_autocommit(conn: Any) -> None:
     transaction right after a store on the same DSN closed, and a ``CREATE LOGIN`` sent on such a
     connection held its locks until the process died, which failed every logon on the server. The
     pooling mechanism is inferred, not reproduced; the explicit set is correct either way. The
-    setter goes through the ODBC driver, so it runs off the event loop."""
+    setter goes through the ODBC driver, so it runs off the event loop, through the connection's
+    own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
+    cancellation during the set cannot let the connection's close free the handle under it
+    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread."""
     raw = getattr(conn, "_conn", None)
-    if raw is not None:
+    if raw is None:
+        return
+    if _call_gate(conn) is not None:
+        await conn._execute(setattr, raw, "autocommit", True)
+    else:
         await asyncio.to_thread(setattr, raw, "autocommit", True)
 
 
@@ -4000,6 +3898,7 @@ class SqlServerStore:
             aad_cols=QUEUE_TAG_COLUMNS,
             key_cols=("id",),
             aad_of=queue_row_aad,
+            blank_where=f"DATALENGTH([payload]) = 0 AND {LIVE_INLINE_ROW}",
         )
         # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
         # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
@@ -4070,6 +3969,7 @@ class SqlServerStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[dict[str, Any]], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -4079,8 +3979,10 @@ class SqlServerStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code constant and is
-        bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is a parameter.
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
+        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        Every identifier is a code constant and is bracket-quoted (``key`` is a T-SQL reserved word);
+        only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
         transaction opens, because a reservation must commit independently of the seal it covers.
@@ -4097,26 +3999,34 @@ class SqlServerStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(count_sql, like)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = await self._count_unmarked(
+                f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
+            )
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant.
+                # so count again rather than report its legitimate seal as a plant. A blank here
+                # stays refused.
+                blanks = 0
                 pending = await self._count_unmarked(count_sql, like)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._mark_surface_keyed(table, column)
             return 0
-        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending + blanks)
         select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"[{c}]=?" for c in keys)
         sealed = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                if not await self._claim_keyed_surface(conn, cur, table, column) and strict:
+                claimed = await self._claim_keyed_surface(conn, cur, table, column)
+                if not claimed and strict:
                     # A peer keyed this surface after the reads above, so it sealed the legacy
                     # rows. Count what it left unmarked, then end the transaction: the MERGE
                     # changed nothing.
@@ -4142,12 +4052,16 @@ class SqlServerStore:
                     if left:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
+                # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
+                seal_where = (
+                    f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                )
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
                     # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
                     await cur.execute(
                         f"SELECT TOP ({int(batch)}) {select_cols}, [{column}] AS v FROM {table}"
-                        f" WHERE {pending_where}",
+                        f" WHERE {seal_where}",
                         (like,),
                     )
                     names = [c[0] for c in cur.description]
@@ -4195,9 +4109,9 @@ class SqlServerStore:
         )
         return row is not None
 
-    async def _count_unmarked(self, count_sql: str, like: str) -> int:
-        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``like``."""
-        row = await self._fetchone(count_sql, (like,))
+    async def _count_unmarked(self, count_sql: str, *params: str) -> int:
+        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``params``."""
+        row = await self._fetchone(count_sql, params)
         return int(row["n"]) if row is not None else 0
 
     async def _mark_surface_keyed(self, table: str, column: str) -> None:
@@ -4288,15 +4202,23 @@ class SqlServerStore:
                     probe = await aioodbc.connect(
                         dsn=dsn, autocommit=True, timeout=settings.connect_timeout
                     )
+                    pcur: Any = None
+                    abandoned = False
                     try:
+                        _install_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
                             " WHERE name = DB_NAME()"
                         )
                         prow = await pcur.fetchone()
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            abandoned = _abandon_one_shot(probe, pcur)
+                        raise
                     finally:
-                        await probe.close()
+                        if not abandoned:
+                            await _close_one_shot(probe, pcur)
                 except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
                     log.debug("RCSI re-read on %r failed", db, exc_info=True)
                     continue
@@ -4306,7 +4228,7 @@ class SqlServerStore:
 
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture),
+                dsn=dsn,
                 autocommit=True,
                 timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )
@@ -4314,11 +4236,16 @@ class SqlServerStore:
             raise RuntimeError(
                 f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
             ) from exc
+        cur: Any = None
+        abandoned = False
         try:
+            # BACKLOG #2394: a cancellation exits through `_abandon_one_shot`, so no handle is freed
+            # under a statement still running on its executor thread. The probe connections of
+            # `_rcsi_on_after_a_peer` exit the same way.
+            _install_call_gate(conn)
             await _assert_autocommit(conn)
-            # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
-            # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
-            # guards against on the pooled paths.
+            # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
+            # guards against cannot arise; `_close_one_shot` still closes the cursor first.
             cur = await conn.cursor()
             await cur.execute(
                 "SELECT is_read_committed_snapshot_on, snapshot_isolation_state "
@@ -4381,11 +4308,13 @@ class SqlServerStore:
                         exc,
                         _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
                     )
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                abandoned = _abandon_one_shot(conn, cur)
+            raise
         finally:
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
-                log.debug("RCSI probe connection close failed", exc_info=True)
+            if not abandoned:
+                await _close_one_shot(conn, cur)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
@@ -5251,8 +5180,9 @@ class SqlServerStore:
         cancelled call — paid only on a path that was previously corrupting the pool.
 
         **The close never frees a handle under a running statement (BACKLOG #2049).** The abandoned
-        statement may still be running on an executor thread. The :class:`_CallGate` makes the
-        close, and the close of any cursor :meth:`_cursor` abandoned, wait for that call to return.
+        statement may still be running on an executor thread. The call gate
+        (:class:`~messagefoundry.odbc_call_gate.CallGate`) makes the close, and the close of any
+        cursor :meth:`_cursor` abandoned, wait for that call to return.
         When a call is running, this method hands it the close and does not wait at all: the close
         could only land when the statement returns, and waiting here would stall a shutdown or
         demotion for as long as the statement runs, which ADR 0159 rejected.
@@ -7867,8 +7797,9 @@ class SqlServerStore:
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
-        ``False`` if the work-row was already consumed. A corrupt/unparseable ref or a re-ingress that
-        would exceed ``correlation_depth_cap`` is dead-lettered (and the token still consumed). The
+        ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
+        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed."""
@@ -7905,8 +7836,8 @@ class SqlServerStore:
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures`` for the caller to audit."""
-        # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
-        # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
+        # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
         output, guard, guard_params = self._resolve_guard()
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -7924,14 +7855,18 @@ class SqlServerStore:
                 work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
                 origin_id = work_row["message_id"]
 
-                async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                async def _consume_dead(
+                    label: str, error: str, event_detail: str, *, erased: bool = False
+                ) -> bool:
                     # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
-                    # and CONSUME it (status flipped), never re-loop.
+                    # and CONSUME it (status flipped), never re-loop. `erased` blanks the token too,
+                    # so `_REPLAYABLE_BODY` refuses it from then on.
+                    blank = ", payload=''" if erased else ""
                     await self._exec_terminal(
                         cur,
                         label,
                         (response_row_id,),
-                        "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                        f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
                         + output
                         + " WHERE id=?"
                         + guard,
@@ -7972,13 +7907,30 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
+                # A missing row is a corrupt reference. A NULL body means retention erased the reply
+                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
+                # materialized once, so a replay can commit between that read and the erasure. It
+                # must never become a child message. A missing row is damage, not an erasure, so
+                # that token is not blanked: its sealed reference is the evidence.
+                if art is None:
+                    return await _consume_dead(
+                        "ingress_handoff(missing-artifact)",
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
+                if art[0] is None:
+                    return await _consume_dead(
+                        "ingress_handoff(erased)",
+                        REINGRESS_ARTIFACT_ERASED,
+                        "re-ingress reply erased",
+                        erased=True,
+                    )
                 body = (
                     self._cipher.decrypt(
                         art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
                     )
-                    if (art and art[0])
-                    else ""
-                ) or ""
+                    or ""
+                )
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -8180,16 +8132,15 @@ class SqlServerStore:
         ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
+            seq = int(seq_s)
         except ValueError:
-            return None
+            return None  # `ingress_handoff` dead-letters it as a corrupt reference
         art = await self._fetchone(
             "SELECT body FROM response WHERE message_id=? AND destination_name=? AND response_seq=?",
-            (mid, dest, int(seq_s)),
+            (mid, dest, seq),
         )
         return (
-            self._cipher.decrypt(
-                art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s))
-            )
+            self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"])
             else ""
         )
@@ -8911,8 +8862,11 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank message bodies (and terminal outbound payloads + event details) for messages received
-        before ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Bodies are
+        """Blank message bodies (and done/cancelled outbound payloads with their ``last_error``, a dead
+        ``Stage.RESPONSE`` work-row's reference to the reply erased here (BACKLOG #1560, the SQLite
+        twin says why), event details and captured replies) for messages received before
+        ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Other ``dead`` rows
+        are left to :meth:`purge_dead_letters`. Bodies are
         blanked to '' (not deleted) so the cipher re-encrypt scans skip them and the FK to messages
         stays intact. The eligible set is materialized ONCE so all three tables purge exactly the same
         messages. ``metadata`` is NULLed in the SAME statement as the body (ASVS 14.2.7) — NULL is
@@ -8948,9 +8902,18 @@ class SqlServerStore:
                 purged = cur.rowcount
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    " WHERE stage=? AND status IN (?, ?) AND payload <> ''"
+                    " WHERE stage=? AND status IN (?, ?)"
+                    " AND (payload <> '' OR last_error IS NOT NULL)"
                     " AND message_id IN (SELECT id FROM #eligible)",
                     (Stage.OUTBOUND.value, OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value),
+                )
+                # A dead RESPONSE work-row's reference goes with the artifact erased below, so
+                # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                await cur.execute(
+                    "UPDATE queue SET payload=''"
+                    " WHERE stage=? AND status=? AND payload <> ''"
+                    " AND message_id IN (SELECT id FROM #eligible)",
+                    (Stage.RESPONSE.value, OutboxStatus.DEAD.value),
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
                 # message holds — but ONLY once the message has NO queue row that could still be
@@ -9219,7 +9182,8 @@ class SqlServerStore:
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
-        dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
+        dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
+        idempotent, because a row left with neither no longer matches.
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9240,7 +9204,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
+                    f" AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount

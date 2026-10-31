@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 20 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -459,7 +459,7 @@ reach one:
 
 ## 5. Native library calls
 
-19 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+20 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -487,6 +487,13 @@ pure-Python equivalent:
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
   act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
   with `O_NOFOLLOW` and acts relative to the opened directory
+- Backup staging fail-safe: `pipeline/dr_backup.py`, which empties the files a failed backup left in
+  its staging directory. On Windows it opens each directory and file with `kernel32`'s `CreateFileW`
+  and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or junction is opened as itself,
+  `GetFileInformationByHandleEx` to refuse one, and `GetFinalPathNameByHandleW` to confirm the
+  object lies under the staging directory before it is truncated through that handle (BACKLOG
+  #2420). POSIX needs no `ctypes` for this; it opens each directory and file with `O_NOFOLLOW`
+  relative to its directory's descriptor
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
@@ -667,7 +674,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
-| It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials, for the ASVS 14.2.1 warning and loosening entry. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least wherever `check_egress_allowed` or `check_fhir_lookup_allowed` checks a connection's URL for the query-credential warning, on every build of a `verify_tls=false` HTTP-family or `FhirLookup` hop that reaches its TLS check, in `messagefoundry check`, on `GET /security/posture` and on each settings view (`GET /metadata`, `graph --json`). Nothing bounds the URL's length, because the operator wrote it. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
+| It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
 
 **Hand-written parsers the patterns cannot see.**
 
