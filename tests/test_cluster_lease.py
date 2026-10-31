@@ -1326,6 +1326,11 @@ class _FakeSqlLeaseStore:
         owner, delay, ttl = params[1], params[2], params[4]
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> dict[str, object] | None:
+        return await self._fetchone(sql, params)  # the claim; the clamp is not modelled here
+
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
