@@ -311,8 +311,10 @@ def _drain_readable(sock: socket.socket) -> None:
             if not chunk:
                 return
             left -= len(chunk)
-    except OSError:  # nothing more has arrived (BlockingIOError, SSLWantReadError), or a reset
+    except (BlockingIOError, ssl.SSLWantReadError):  # nothing more has arrived
         return
+    except OSError as exc:  # a reset or a TLS error: the close goes ahead regardless
+        logger.debug("Draining a closing DICOM connection ended: %s", safe_exc(exc))
 
 
 def _require_association_seams(handler: type[Any], association_socket: type[Any]) -> None:
@@ -739,8 +741,12 @@ def _admitting_server_class() -> type[Any]:
             self._answer(sock, A_ASSOCIATE_RJ(primitive).encode())
 
         def _answer(self, sock: socket.socket, pdu: bytes) -> None:
-            """Send ``pdu``, best effort. ``shutdown_request`` then closes the connection without
-            losing it to a reset.
+            """Send ``pdu``, best effort, and then read off what the peer sent behind its request,
+            so that the close that follows does not reset the connection and lose the answer.
+
+            The drain is here, after an answer, and not in ``shutdown_request``: socketserver
+            also calls that on the accept loop for a peer ``source_ip_allowlist`` refuses, and
+            such a peer is closed before a byte is read from it.
 
             This thread holds a slot, and shutdown() joins it, so its one send gets the same short
             bound as a slice of a read. A peer that does not take the answer in that time gets a
@@ -750,17 +756,8 @@ def _admitting_server_class() -> type[Any]:
                 sock.sendall(pdu)
             except OSError as exc:
                 logger.debug("DICOM association answer not sent: %s", safe_exc(exc))
-
-        def shutdown_request(self, request: Any) -> None:
-            """``socketserver``'s close of a connection, after reading off what the peer has
-            already sent, so that an answer just sent is not lost to a reset; see
-            :func:`_drain_readable`. At least a connection refused at accept or over a cap, one
-            refused at its first read, and the ``Association`` thread's own close at the end of
-            ``Association.run`` come through here; a failed TLS handshake does not. On the accept
-            loop it reads nothing it has to wait for."""
-            if isinstance(request, socket.socket):
-                _drain_readable(request)
-            super().shutdown_request(request)
+                return
+            _drain_readable(sock)
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -856,9 +853,9 @@ def _admitting_server_class() -> type[Any]:
             lose an answer just sent; see :func:`_drain_readable`.
 
             ``close()``, the DUL's closing actions AA-4, AA-5 and AR-5, and
-            ``Association._abort_blocking`` come through here. The ``Association`` thread's own
-            close, at the end of ``Association.run``, goes through the server's
-            ``shutdown_request``, which drains the same way."""
+            ``Association._abort_blocking`` come through here. Not every close does: at least the
+            ``Association`` thread's own close, at the end of ``Association.run``, hands the raw
+            socket to the server's ``shutdown_request``, which does not drain."""
             if self.socket is not None:
                 _drain_readable(self.socket)
             super()._shutdown_socket()
@@ -880,7 +877,10 @@ def _admitting_server_class() -> type[Any]:
                 return
             restore = sock.gettimeout()
             try:
-                sock.settimeout(self.assoc.network_timeout)
+                # On a socket already closed this raises; the stock send then reports the close
+                # as Evt17, as it would have without the timeout.
+                with contextlib.suppress(OSError):
+                    sock.settimeout(self.assoc.network_timeout)
                 super().send(bytestream)
             finally:
                 with contextlib.suppress(OSError):  # the association may have closed it

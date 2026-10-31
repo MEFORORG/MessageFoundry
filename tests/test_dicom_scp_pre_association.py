@@ -734,6 +734,30 @@ async def test_a_refused_request_with_a_stray_byte_behind_it_still_gets_its_reje
             held.close()
 
 
+async def test_a_peer_the_allowlist_refuses_is_closed_with_nothing_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review round b1622800ef: be3bc3e030 drained in the server's shutdown_request, which
+    # socketserver also calls on the accept loop for an allowlist refusal, so that peer's bytes were
+    # read. docs/DICOM.md says such a peer is closed before anything is read from it.
+    drained: list[object] = []
+    real = dicom_module._drain_readable
+
+    def recorded(sock: socket.socket) -> None:
+        drained.append(sock)
+        real(sock)
+
+    monkeypatch.setattr(dicom_module, "_drain_readable", recorded)
+    async with _running_scp({"source_ip_allowlist": ["127.0.0.1"]}) as scp:
+        sock = _stall(scp.sockport, _STALLS["header-and-body"], source="127.0.0.2")
+        try:
+            assert await asyncio.to_thread(_closed_within, sock, 3.0)
+        finally:
+            sock.close()
+        await _until(lambda: scp._refusal_log.refusals == 1)
+    assert drained == []
+
+
 async def test_a_read_deadline_on_an_accepted_association_is_logged_as_an_end_not_a_refusal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
