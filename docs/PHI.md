@@ -1687,15 +1687,82 @@ An exception that holds one prints as its class and a fixed note too, never its 
 That covers at least `RuntimeError(exc)`, `ValueError("bad", exc)`, and an `OSError` whose
 `strerror` or `filename` is the error. It also covers an exception that keeps the error on an
 attribute, when its class defines `__str__` or `__repr__`; such a class loses its own message
-even if it never prints the error. A builtin exception prints only its arguments, so one that
-merely stores an error keeps its message. The rule applies in a traceback, as a log argument, in
+even if it never prints the error. When that method is the class's own code rather than a builtin
+exception's, the walk also follows the exception's `__cause__` and `__context__`, link after link
+along the whole chain, and reads at least the instance `__dict__`, the slots and the chain links
+of each exception it reaches that way, within the budget below (vault BACKLOG #3340). So such a class raised from a codec
+error, or while one was being handled, loses its message the same way, raised `from None`
+included: that hides the context from the stdlib's traceback, not from the class's own code. An
+exception whose
+`__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
+stores an error on an attribute keeps its message, unless it is a dataclass, whose attributes are
+read as any dataclass's are, so it prints as the fixed note; and except where the same exception is also reached
+beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
+fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
+least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
+fixed note even where its own `__str__` would not print it. The walk counts an exception's
+`__str__` and `__repr__` as a builtin exception's only when both have the `id()` of a C method that
+an exception class in the `builtins` namespace defined when `redaction.py` was imported
+(`_BUILTIN_EXC_RENDERS`; such methods are called trusted below); anything else counts as own code.
+So `ssl.SSLError`, whose `__str__` is its own, gets the fixed note when raised from a codec error
+or while one was being handled.
+The rule applies
+in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
 `codec_safe_str()` returns the note alone, with no class.
+
+In a traceback the stdlib prints an exception's `__notes__` after its line. A holder's notes are
+all dropped. A `UnicodeError`'s own notes are dropped too, except the note a codec adds itself,
+such as `decoding with 'utf-8' codec failed`, which keeps the codec's name only when that name is
+one `safe_exc()` can print, and otherwise reads `decoding with a codec failed`. A note a caller
+added is dropped even when it is plain text, since it can be built from the failing input, as
+`add_note(f"segment {seg!r}")` (vault BACKLOG #3340); one that reads exactly like a codec's own
+note is kept the same way as that note. An exception that neither is nor holds a
+codec error keeps its notes as they are, so a codec error placed among them still prints raw.
 
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-When it runs out the filter leaves the rest as it is, and which objects those are is not defined.
+The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads what the
+walk read before that change, on the same budget per log argument and per traceback link, and it
+finishes before the added pass starts,** except on a link whose verdict an earlier link's scan
+handed on, as below. The added pass then reads, of an exception whose own `__str__` or
+`__repr__` is its own code, at least its dunder-named slots and its `__cause__` and `__context__`
+chain links; of one whose methods are a builtin exception's other than `BaseException`'s, such as
+an `OSError`'s, its dunder-named slots but not its chain links; and of one whose methods are
+`BaseException`'s own, nothing more. Beneath an exception whose own `__str__` or `__repr__` is its
+own code, it reads the instance `__dict__`, slots and chain links of each exception it reaches,
+whatever that exception's methods are. Where the class of an exception puts something other than a
+getset or member descriptor under `__dict__`, such as a property or `__dict__ = None`, the first
+pass skips the instance dict, as the walk did before that change, and the added pass reads it
+through the builtin `BaseException` descriptor: of an exception whose `__str__` or `__repr__` is
+not `BaseException`'s own, an `OSError` subclass's included, and of each exception beneath own
+code as above. So such a class loses its message where its instance dict holds a codec error, as
+it would if it did not hide that dict. A class that puts another class's getset there is read
+through that getset: where the exception is not an instance of that class the read raises, and
+the walk fails closed on that exception. It does not read everything such code can
+reach: an object the walk does not read by attribute, as listed below, is not read there either.
+It runs on what the first pass left and, in a
+traceback, also within a budget that the added passes of every link share, approximately; the
+`_ScanShare` docstring gives the exact accounting.
+**It only adds: it
+can turn a "holds no error" verdict into "holds an error", never the other way.** What each read
+costs, and when one link's scan hands its verdict on to a later link, is in the `_ScanShare`
+docstring in `redaction.py`. At least these stay open. A codec error that only the added reads
+reach can still print raw once those budgets are spent, and one large object in one link can
+spend most of the shared budget. A slot whose name a subclass uses
+for something else is not read. A link whose verdict an earlier link's scan handed on is not
+scanned again: a True can make it print the note where its own scan would not, which errs toward
+the note, and a False is handed on only when that scan judged that none of its reads was cut
+short. An exception class that any code run before `redaction.py` was imported put into
+`builtins`, such as a C extension, a site hook or an application module, has its C `__str__` and
+`__repr__` trusted, so if either prints something the walk then leaves unread, such as the chain
+or an attribute of an exception it holds, a codec error there would print raw. Trust is keyed on
+each method's `id()`, an address, so a method object that later takes the address of a freed
+trusted one would be trusted too. Some of a class's answers are kept from the first time an
+instance of it is scanned, so a `__str__` or `__repr__` assigned to the class later can be judged
+as the one it replaced.
+When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
 by attribute even when it is the single mapping argument, so a large map in it can use up the
@@ -1710,7 +1777,9 @@ budget before a smaller one is read.
   what it returns.
 - **Objects the filter does not read.** At least a `MappingProxyType`, a `slice`, and an object of
   your own class that is not a dataclass or an exception. An error held in one still prints raw,
-  and so does a dataclass or a list that holds such an object.
+  and so does a dataclass or a list that holds such an object. A dataclass or a `SimpleNamespace`
+  whose own `__str__` or `__repr__` prints an attribute of a plain exception it holds can print
+  an error too: only an exception's own code makes the walk read what it holds that deeply.
 - **An argument that renders differently the second time.** The three later filters render the
   message again, so an object whose `__repr__` changes or raises on a later call can still raise
   from the log call, or print what the first step did not see.
