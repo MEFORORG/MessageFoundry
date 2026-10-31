@@ -7026,6 +7026,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     async def run() -> tuple[str, dict[str, Any]]:
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
         # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(
             open_store(
                 settings.store,
@@ -7444,6 +7445,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[str, TransitBoundAttestation | None, str]:
         """``(outcome, the row recorded or withdrawn, the store path)``."""
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         try:
             store = await open_store(
                 settings.store,
@@ -7987,9 +7989,10 @@ def _offline_security_notifier(
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
     (BACKLOG #2193) reads ``posture`` too, and where it is ``None`` it reads the instance's own,
     derived from ``settings``. That guard would count no posture as enforcing, so on a ``warn``
-    instance the derived posture is what lets it warn rather than refuse. Every caller in this
-    module passes its posture (``admin-reset-totp`` since BACKLOG #2532), so at ``warn`` its Vault
-    read crosses an unattested off-box Vault with a WARNING, as ``serve``'s does.
+    instance the derived posture is what lets it warn rather than refuse. ``admin-reset-totp``
+    passes :func:`_command_hop_posture`'s value (BACKLOG #2532): the instance's posture at
+    ``enforce`` and ``None`` at ``warn``, so at ``warn`` its Vault read still refuses an unattested
+    off-box Vault, where ``serve``'s would cross with a WARNING.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -8036,11 +8039,11 @@ def _offline_security_notifier(
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
             # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
-            # every build failure here is: the notice is dropped and the recovery goes on. Every
-            # caller passes its posture (admin-reset-totp since BACKLOG #2532). A caller with none
-            # would get the instance's own, derived from these settings, so a warn instance warns
-            # rather than taking the guard's enforcing default for no posture. The Vault read above
-            # keeps the caller's posture, where None counts as enforcing.
+            # every build failure here is: the notice is dropped and the recovery goes on. A caller
+            # with no posture, such as admin-reset-totp at warn (BACKLOG #2532), gets the instance's
+            # own, derived from these settings, so a warn instance warns rather than taking the
+            # guard's enforcing default for no posture. The Vault read above keeps the caller's
+            # posture, where None counts as enforcing.
             posture=(
                 posture
                 if posture is not None
@@ -9268,6 +9271,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # BACKLOG #1916: this command appends an audit row, so on a fresh store with no key it
             # would start a keyless chain. The shared verdict decides; a refusal exits 2 below, as
             # does a key that does not resolve (vault BACKLOG #3054, item 11).
+            _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
             store = await _open_store_or_refuse(
                 open_store(
                     settings.store,
@@ -9280,8 +9284,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
             # open. So does a keyed open that meets a row it cannot read or that is not JSON once
-            # decrypted (BACKLOG #2308). Nothing has been read or written.
-            return ("open-refused", wanted, str(exc))
+            # decrypted (BACKLOG #2308). Nothing has been read or written. Through
+            # `codec_safe_str`, as the sibling commands print it (BACKLOG #2532).
+            from messagefoundry.redaction import codec_safe_str
+
+            return ("open-refused", wanted, codec_safe_str(exc))
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -9554,6 +9561,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return 2
 
     async def opened() -> Store:
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         try:
             return await open_store(
                 settings.store,
@@ -9562,8 +9570,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             )
         except InsecureHopRefused as exc:
             # Could not start, exit 2, only for a refusal the OPEN raised, as `store
-            # withdraw-transit-bound` scopes it. A hop refusal a later Transit call raises, after
-            # rows were read, is not reported as a store that did not open.
+            # withdraw-transit-bound` scopes it. A hop refusal raised after the open would not be
+            # reported as a store that did not open. None is known: the Transit cipher raises its
+            # failures as CipherError, which `open_refused` reports as a refusal, exit 1.
             raise _StoreOpenRefused(codec_safe_str(exc)) from exc
 
     async def refusal_for(store: Store, user: UserRecord) -> str | None:
@@ -10081,6 +10090,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     async def run() -> AuditVerdict:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         try:
             store = await _open_store_or_refuse(
                 open_store(
@@ -10290,6 +10300,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[int, str]:
         # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(
             open_store(
                 settings.store,
@@ -10514,6 +10525,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
         # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
         # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
             count = await store.reencrypt_to_active()
@@ -10735,6 +10747,7 @@ def _backup(args: argparse.Namespace) -> int:
     async def run() -> BackupResult | None:
         # #1916: a backup writes a `dr_backup` audit row, even on failure, so on a fresh store it
         # would start the chain.
+        _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(
             open_store(
                 settings.store,
@@ -12168,34 +12181,38 @@ def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
     reads a posture refuses there, as each did with none, and the PostgreSQL store's revocation
     guard, which does nothing with none, refuses an unrevoked off-box hop as ``serve`` does.
 
-    At ``warn`` it is ``None``, which every hop check but that guard counts as enforcing. So a
-    weakened store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an unattested off-box Vault
-    stays refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn``
-    posture would relax each of them, and no command may loosen (Manager decision 2026-10-31,
-    under the owner's delegation of 2026-10-22). The revocation guard would then do nothing, so
-    this runs it once at the ``warn`` posture, which logs ``serve``'s WARNING for that hop and
-    crosses. Imported here, not at module level, so the CLI's import cost stays where it is."""
+    At ``warn`` it is ``None``, as these commands passed before. At least these read ``None`` as
+    enforcing: the Vault hops, and the weakened-TLS check and the SQL Server pin's anchor checks,
+    which read the ambient posture for ``None`` and find none stamped on any CLI path. So a weakened
+    store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an unattested off-box Vault stays
+    refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn`` posture
+    would relax each of them, and no command may loosen (Manager decision 2026-10-31, under the
+    owner's delegation of 2026-10-22). The revocation guard then does nothing, so each command calls
+    :func:`_warn_on_an_unrevoked_store_hop` just before its open. Imported here, not at module
+    level, so the CLI's import cost stays where it is."""
     from messagefoundry.config.settings import hop_posture_from_ai
 
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-    if posture.enforcing:
-        return posture
-    _warn_on_an_unrevoked_store_hop(settings.store, posture)
-    return None
+    return posture if posture.enforcing else None
 
 
-def _warn_on_an_unrevoked_store_hop(store: StoreSettings, posture: HopPosture) -> None:
-    """Run the PostgreSQL store's revocation guard at a non-enforcing ``posture``, as the store's
-    open runs it for ``serve``, so a command at ``warn`` logs the same WARNING (BACKLOG #2532).
+def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
+    """At ``warn``, run the PostgreSQL store's revocation guard at the instance's posture, as the
+    store's open runs it for ``serve``, so the command logs the same WARNING (BACKLOG #2532). At
+    ``enforce`` it does nothing: the open's own guard refuses there.
 
-    Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the open before
-    the guard would run, so it is skipped here. A context that cannot be built is skipped too: the
-    open builds the same context and reports the error itself. At a non-enforcing posture the guard
-    warns or allows and does not refuse."""
-    from messagefoundry.config.settings import StoreBackend
+    Called just before the open, so a command that refuses earlier, on its input or its key, logs
+    no crossing. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
+    open before the guard would run, so it is skipped here. A context that cannot be built is
+    skipped too: the open builds the same context and reports the error itself. At a non-enforcing
+    posture the guard warns or allows and does not refuse."""
+    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
 
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    store = settings.store
     if (
-        store.backend != StoreBackend.POSTGRES
+        posture.enforcing
+        or store.backend != StoreBackend.POSTGRES
         or store.trust_server_certificate
         or not store.encrypt
     ):
@@ -12216,12 +12233,13 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
     code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11) and
     ``backup``, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the
-    OPEN is wrapped. ``open_store`` resolves the key and judges the store hop before the backend
-    reads a row. Under a ``vault_transit`` cipher the open also makes Transit calls after it has
-    read rows, at least its at-open sweep and the audit chain's genesis MAC, and a Vault hop refusal
-    raised by one of those is caught here too: it reads as "could not start" although rows were
-    read. That refusal turns on the Transit hop's own settings and connection, not on what a row
-    holds, so it is still not a finding about the chain. A malformed key is
+    OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
+    before the backend reads a row, and a Vault hop refused there arrives as a
+    ``KeyProviderError``. Under a ``vault_transit`` cipher the open also makes Transit calls after
+    it has read rows, at least its at-open sweep and the audit chain's genesis MAC. The Transit
+    cipher raises each of their failures as ``CipherError``, which this does not catch. Whether
+    one can raise a class caught here was not traced, so read "before a row" as the intent for at
+    least the key and the store hop. A malformed key is
     caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
     the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal is one of
     those bare ones, so it still reaches the dispatch floor.

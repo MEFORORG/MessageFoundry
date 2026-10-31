@@ -1053,9 +1053,10 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
 def test_a_hop_refusal_after_the_open_is_not_could_not_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #2532: only a hop refusal the OPEN raises is "could not start", exit 2. One a later
-    Transit call raises (here, opening the seed), after rows were read, is not reported as a store
-    that did not open; it reaches the dispatch floor, as ``store withdraw-transit-bound`` lets it.
+    """BACKLOG #2532: only a hop refusal the OPEN raises is "could not start", exit 2. One raised
+    after rows were read is not reported as a store that did not open; it reaches the dispatch
+    floor, as ``store withdraw-transit-bound`` lets it. Synthetic: no production path is known to
+    raise one there (the Transit cipher raises ``CipherError``), so this pins the scope only.
 
     Mutation: put ``InsecureHopRefused`` back in ``could_not_start``; this exits 2."""
     from messagefoundry.config.tls_policy import InsecureHopRefused

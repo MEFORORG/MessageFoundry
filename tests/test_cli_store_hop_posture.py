@@ -17,8 +17,8 @@ driver module is a stand-in, so what is proved is whether the guard let the comm
 * :func:`test_warn_crosses_the_same_hop` is the control on the dial: the same hop crosses at
   ``warn`` with ``serve``'s WARNING, so the refusal above is the instance's posture and not a
   constant;
-* :func:`test_a_weakened_hop_is_refused` is the weakened-TLS check, which is the only posture check
-  a SQL Server store has;
+* :func:`test_a_weakened_hop_is_refused` is the weakened-TLS check, which a SQL Server store has
+  too, beside the pin's anchor checks, which these tests do not drive;
 * :func:`test_warn_keeps_refusing_a_weakened_hop_with_the_escape` and
   :func:`test_warn_keeps_refusing_an_unattested_off_box_vault` hold the no-loosening rule (Manager
   decision d20261031T021248404-699a64): at ``warn`` each command still refuses what it refused with
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -87,16 +88,21 @@ def asyncpg(monkeypatch: pytest.MonkeyPatch) -> _RefusingAsyncpg:
 
 
 @pytest.fixture
-def shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A shell holding a store key and nothing else that decides these tests. The server-store legs
     set ``MEFOR_STORE_*`` and the TLS escape for their own container, and an environment value
-    outranks the settings file these tests write."""
+    outranks the settings file these tests write. They also stamp an ambient ``warn`` posture
+    (``tests/conftest.py``), which a ``None`` posture reads; no CLI path stamps one, so it is
+    cleared here, as a real shell has none."""
+    from messagefoundry.config.tls_policy import active_hop_posture
+
     monkeypatch.chdir(tmp_path)
     for name in list(os.environ):
         if name.startswith(("MEFOR_STORE_", "MEFOR_SECURITY_", "MEFOR_TLS_", "MEFOR_ALLOW_")):
             monkeypatch.delenv(name)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    return tmp_path
+    with active_hop_posture(None):
+        yield tmp_path
 
 
 def _argv(
