@@ -88,10 +88,11 @@ PS3.8 sets no limit on that PDU, so a larger request is legal in the format, but
 not need one. Anything else is closed at once. A first PDU that is not an association request, and
 a request over that size, get no answer: the rest of what the peer sent is left unread, and a close
 over unread data resets the connection, so an answer could not be relied on. A whole request the SCP
-refuses gets an A-ASSOCIATE-RJ, rejected-permanent, before the close, so a sender can tell it will be
-refused again. At least these are refused that way: a request that does not decode, one with the
-wrong protocol version, and one the association could not negotiate, such as a presentation context
-that names no transfer syntax or no abstract syntax. The SCP runs pynetdicom's own presentation
+decodes and refuses gets an A-ASSOCIATE-RJ, rejected-permanent, before the close, so a sender can
+tell it will be refused again. At least these are refused that way: one with the wrong protocol
+version, and one the association could not negotiate, such as a presentation context that names no
+transfer syntax or no abstract syntax. A whole request that does not decode is an invalid PDU, and
+gets the A-ABORT the standard's state table gives one. The SCP runs pynetdicom's own presentation
 context negotiation on the request before it starts the association, so a request that would fail
 there never starts one.
 

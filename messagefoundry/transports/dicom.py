@@ -242,13 +242,13 @@ _PROTOCOL_VERSION = 0x0001
 #: pynetdicom's decoder runs twice on a request that passes, and it logs for each UID it dislikes.
 _MAX_ASSOCIATE_RQ_BYTES = 256 * 1024
 
-#: The A-ASSOCIATE-RJ (result, source, diagnostic) the SCP answers a whole request it refuses before
-#: the association starts (PS3.8 section 9.3.4). All three are rejected-permanent, because the same
-#: request is refused again. A request that does not decode is the ACSE's, with no reason given. One
-#: with the wrong protocol version is the ACSE's "protocol version not supported", the answer
-#: pynetdicom's DUL gives it. One the association could not negotiate is the service user's, with no
-#: reason given, the answer pynetdicom gives a rejection of its own.
-_RJ_DOES_NOT_DECODE = (0x01, 0x02, 0x01)
+#: The A-ASSOCIATE-RJ (result, source, diagnostic) the SCP answers a whole request it decoded and
+#: refuses before the association starts (PS3.8 section 9.3.4). Both are rejected-permanent, because
+#: the same request is refused again. One with the wrong protocol version is the ACSE's "protocol
+#: version not supported", the answer pynetdicom's DUL gives it. One the association could not
+#: negotiate is the service user's, with no reason given, the answer pynetdicom gives a rejection of
+#: its own. A request that does not decode is an invalid PDU, so it gets the A-ABORT the DUL's state
+#: table gives one in Sta2 (Evt19, AA-1), with source and reason 0, as pynetdicom sends it.
 _RJ_WRONG_PROTOCOL = (0x01, 0x02, 0x02)
 _RJ_DOES_NOT_NEGOTIATE = (0x01, 0x01, 0x01)
 
@@ -320,10 +320,11 @@ def _require_association_seams(handler: type[Any], association_socket: type[Any]
 
     An install that got round the pin could bring another release. With these gone the SCP would
     start and then fail every connection, with nothing above stderr to say why, so it does not."""
+    own = vars(association_socket)
     present = (
         callable(getattr(handler, "_create_association", None))
-        and isinstance(vars(association_socket).get("ready"), property)
-        and callable(vars(association_socket).get("recv"))
+        and isinstance(own.get("ready"), property)
+        and all(callable(own.get(name)) for name in ("recv", "send", "close", "_shutdown_socket"))
     )
     if not present:
         raise RuntimeError(
@@ -410,7 +411,7 @@ def _admitting_server_class() -> type[Any]:
       keywords to its constructor, and ``start_serving`` here does the rest of what that branch does.
     """
     from pynetdicom import _config, evt
-    from pynetdicom.pdu import A_ASSOCIATE_RJ, A_ASSOCIATE_RQ
+    from pynetdicom.pdu import A_ABORT_RQ, A_ASSOCIATE_RJ, A_ASSOCIATE_RQ
     from pynetdicom.pdu_primitives import A_ASSOCIATE, SCP_SCU_RoleSelectionNegotiation
     from pynetdicom.presentation import negotiate_as_acceptor, negotiate_unrestricted
     from pynetdicom.transport import AssociationSocket, RequestHandler, ThreadedAssociationServer
@@ -690,16 +691,24 @@ def _admitting_server_class() -> type[Any]:
             ``Association`` thread dies some other way.
 
             Each of these refusals is a whole request read up to its end, so the peer is answered
-            with an A-ASSOCIATE-RJ, rejected-permanent, before the connection closes. A wrong
-            protocol version gets the answer the DUL gives it; :data:`_RJ_DOES_NOT_DECODE` says
-            what the others get."""
+            before the connection closes. The comment above :data:`_RJ_WRONG_PROTOCOL` says what
+            each gets.
+
+            These checks run before ``EVT_REQUESTED``, so a request that fails one gets its answer
+            here even where the AE-title checks, or a paused intake, would have refused it too.
+
+            Both ``except Exception`` clauses wrap a third-party step on a peer's bytes, so what
+            they catch is the peer's to cause and is logged at DEBUG only, since a peer can repeat
+            it as often as it can connect. The refusal itself is the throttled WARNING."""
             pdu = A_ASSOCIATE_RQ()
             try:
                 pdu.decode(first_pdu)
                 primitive = pdu.to_primitive()
             except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
                 logger.debug("DICOM association request did not decode: %s", safe_exc(exc))
-                self._reject(sock, _RJ_DOES_NOT_DECODE)
+                abort = A_ABORT_RQ()
+                abort.source, abort.reason_diagnostic = 0x00, 0x00
+                self._answer(sock, abort.encode())
                 raise _RefusedPeer("its association request does not decode") from exc
             if pdu.protocol_version != _PROTOCOL_VERSION:
                 self._reject(sock, _RJ_WRONG_PROTOCOL)
@@ -724,21 +733,34 @@ def _admitting_server_class() -> type[Any]:
                 raise _RefusedPeer("its association request does not negotiate") from exc
 
         def _reject(self, sock: socket.socket, answer: tuple[int, int, int]) -> None:
-            """Send an A-ASSOCIATE-RJ of (result, source, diagnostic) ``answer``, best effort, and
-            read off what the peer sent behind its request so that the close does not reset it.
+            """Answer with an A-ASSOCIATE-RJ of (result, source, diagnostic) ``answer``."""
+            primitive = A_ASSOCIATE()
+            primitive.result, primitive.result_source, primitive.diagnostic = answer
+            self._answer(sock, A_ASSOCIATE_RJ(primitive).encode())
+
+        def _answer(self, sock: socket.socket, pdu: bytes) -> None:
+            """Send ``pdu``, best effort. ``shutdown_request`` then closes the connection without
+            losing it to a reset.
 
             This thread holds a slot, and shutdown() joins it, so its one send gets the same short
             bound as a slice of a read. A peer that does not take the answer in that time gets a
             closed connection."""
-            primitive = A_ASSOCIATE()
-            primitive.result, primitive.result_source, primitive.diagnostic = answer
             try:
                 sock.settimeout(_STOP_POLL_SECONDS)
-                sock.sendall(A_ASSOCIATE_RJ(primitive).encode())
+                sock.sendall(pdu)
             except OSError as exc:
-                logger.debug("DICOM association rejection not sent: %s", safe_exc(exc))
-                return
-            _drain_readable(sock)
+                logger.debug("DICOM association answer not sent: %s", safe_exc(exc))
+
+        def shutdown_request(self, request: Any) -> None:
+            """``socketserver``'s close of a connection, after reading off what the peer has
+            already sent, so that an answer just sent is not lost to a reset; see
+            :func:`_drain_readable`. At least a connection refused at accept or over a cap, one
+            refused at its first read, and the ``Association`` thread's own close at the end of
+            ``Association.run`` come through here; a failed TLS handshake does not. On the accept
+            loop it reads nothing it has to wait for."""
+            if isinstance(request, socket.socket):
+                _drain_readable(request)
+            super().shutdown_request(request)
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -805,9 +827,9 @@ def _admitting_server_class() -> type[Any]:
 
             In Sta13 the DUL closes the connection as soon as this is ``False``, and reads a whole
             PDU while it is ``True``. A PDU read there is thrown away, and a stalled one would hold
-            the close for a deadline, so this says ``False`` at once. :meth:`close` reads off what
-            has already arrived, so that the A-ASSOCIATE-RJ or A-ABORT just sent is not lost to a
-            reset.
+            the close for a deadline, so this says ``False`` at once. :meth:`_shutdown_socket`
+            reads off what has already arrived, so that the A-ASSOCIATE-RJ or A-ABORT just sent is
+            not lost to a reset.
 
             Holding off relies on the ``Association`` thread to answer, and only that thread reads
             the idle timer, so this is also where a DUL finds it has nobody left. If that thread
@@ -828,14 +850,18 @@ def _admitting_server_class() -> type[Any]:
                 return False
             return not unanswered and super().ready
 
-        def close(self) -> None:
-            """``AssociationSocket.close``, after reading off what the peer has already sent.
-            Every close of an association's connection comes through here, so none of them is
-            over unread data that would reset it and lose an answer just sent; see
-            :func:`_drain_readable`."""
+        def _shutdown_socket(self) -> None:
+            """``AssociationSocket._shutdown_socket``, after reading off what the peer has already
+            sent, so that the close is not over unread data that would reset the connection and
+            lose an answer just sent; see :func:`_drain_readable`.
+
+            ``close()``, the DUL's closing actions AA-4, AA-5 and AR-5, and
+            ``Association._abort_blocking`` come through here. The ``Association`` thread's own
+            close, at the end of ``Association.run``, goes through the server's
+            ``shutdown_request``, which drains the same way."""
             if self.socket is not None:
                 _drain_readable(self.socket)
-            super().close()
+            super()._shutdown_socket()
 
         def recv(self, nr_bytes: int) -> bytearray:
             if self.replay:
@@ -1387,7 +1413,9 @@ class DicomScpSource(SourceConnector):
         handler, reading the same ``AE`` settings this does. So the pause neither tells such a peer to
         retry nor reveals to it that intake is paused. ``source_ip_allowlist`` needs no mirror here:
         the SCP applies it when the connection is accepted (:meth:`_admit_connection`), so a peer
-        outside it is closed before it can send an association request.
+        outside it is closed before it can send an association request. A request that does not
+        decode, has the wrong protocol version, or does not negotiate is answered before this runs,
+        on the connection's own thread, so it gets that answer whatever the pause or its AE titles.
 
         **An association already accepted is left alone.** It finishes normally, and every C-STORE on
         it is still committed before its Success status. The pause is checked only here, so it never

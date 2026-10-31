@@ -398,8 +398,12 @@ def _rj(result: int, source: int, diagnostic: int) -> bytes:
 @pytest.mark.parametrize(
     ("build", "reason", "answer"),
     [
-        # Rejected-permanent, service provider (ACSE), no reason given.
-        (lambda _request: b"\x01\x00\x00\x00\x00\x00", "does not decode", _rj(0x01, 0x02, 0x01)),
+        # An invalid PDU in Sta2 is Evt19, and AA-1 answers it with an A-ABORT, source and reason 0.
+        (
+            lambda _request: b"\x01\x00\x00\x00\x00\x00",
+            "does not decode",
+            b"\x07\x00" + (4).to_bytes(4, "big") + bytes(4),
+        ),
         # Rejected-permanent, service provider (ACSE), protocol version not supported.
         (_wrong_protocol, "wrong protocol", _rj(0x01, 0x02, 0x02)),
     ],
@@ -430,9 +434,13 @@ async def _a_held_association(port: int, *, tls: bool = False) -> socket.socket:
     """A peer that has its association, and keeps it."""
     request = await asyncio.to_thread(_a_real_association_request)
     sock = await asyncio.to_thread(_open, port, tls=tls)
-    sock.sendall(request)
-    assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
-    await asyncio.to_thread(lambda: sock.recv(4096))
+    try:
+        sock.sendall(request)
+        assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+        await asyncio.to_thread(lambda: sock.recv(4096))
+    except BaseException:
+        sock.close()  # the caller's own try has not started yet
+        raise
     return sock
 
 
