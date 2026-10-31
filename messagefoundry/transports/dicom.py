@@ -268,10 +268,13 @@ _RJ_DOES_NOT_NEGOTIATE = (0x01, 0x01, 0x01)
 
 #: The A-ABORT (source, reason) the SCP sends when it ends a started association itself (PS3.8
 #: section 9.3.8). A PDU longer than the SCP takes is the service provider's invalid PDU parameter
-#: value. An object past twice the object cap is the SCP's own limit, so the source is the service
-#: user, with no reason, as pynetdicom's own ``Association.abort()`` sends.
+#: value. A P-DATA-TF whose items or message pynetdicom would fail on gets what pynetdicom's own
+#: AA-8 sends an invalid PDU: the service provider, no reason. An object past twice the object cap,
+#: and a command set past its bound, are the SCP's own limits, so the source is the service user,
+#: with no reason, as pynetdicom's own ``Association.abort()`` sends.
 _ABORT_PDU_TOO_LONG = (0x02, 0x06)
-_ABORT_OBJECT_TOO_LARGE = (0x00, 0x00)
+_ABORT_INVALID_MESSAGE = (0x02, 0x00)
+_ABORT_OVER_LIMIT = (0x00, 0x00)
 
 #: The most of one DIMSE message's command set the SCP takes. pynetdicom holds a command set's
 #: fragments until the message is complete, as it holds a data set's. A real one is a few hundred
@@ -285,6 +288,23 @@ _MAX_COMMAND_SET_BYTES = 64 * 1024
 #: reading meets this. It is how long a stop can wait on such a send. ``timeout_seconds`` bounds the
 #: association's own sends instead.
 _ANSWER_SEND_SECONDS = 1.0
+
+#: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
+#: of six bytes less than the size a peer offers, so a size of six or less breaks its senders, and
+#: 4096 is DCMTK's own least. The most bounds what one read holds before the SCP has counted any of
+#: it, since a PDU's body is read whole: a 4 GiB size would let a single PDU carry far past twice the
+#: object cap. 1 MiB is 64 times the shipped 16 KiB.
+_MIN_PDU_SIZE = 4096
+_MAX_PDU_SIZE = 1024 * 1024
+
+#: Why the SCP refuses to run, and refuses each connection, while pynetdicom's process-wide
+#: ``STORE_RECV_CHUNKED_DATASET`` is set. With it set, pynetdicom writes each object it receives to
+#: a temporary file, in plaintext and outside the store and its encryption, and that file is not on
+#: any list of where PHI rests (docs/PHI.md).
+_CHUNKED_RECEIPT_REFUSAL = (
+    "pynetdicom's STORE_RECV_CHUNKED_DATASET is set, which would write each received object to a "
+    "plaintext temporary file"
+)
 
 #: The least ``timeout_seconds`` the SCP takes. It is a fixed deadline on every read and send, so a
 #: tiny one, such as a typo of 0.001, would end nearly every peer while looking like a working value.
@@ -357,20 +377,26 @@ def _drain_readable(sock: socket.socket) -> None:
         logger.debug("Draining a closing DICOM connection ended: %s", safe_exc(exc))
 
 
-def _command_set_has_no_data_set(command_set: bytes) -> bool:
-    """Whether a whole command set says no data set follows, which is when pynetdicom takes its
-    message as complete without one.
+def _command_set_completes(command_set: bytes) -> bool | None:
+    """What a whole command set says about its message, read as pynetdicom reads it: ``True`` when
+    no data set follows, so the message is complete, ``False`` when one follows, and ``None`` when
+    pynetdicom would fail on it.
 
-    It is read with the function pynetdicom reads it with, ``dsutils.decode``, implicit VR little
-    endian, and compared as pynetdicom compares it, so the two cannot disagree on a command set
-    either can read. One that does not decode is not complete here, and pynetdicom fails on it too."""
+    ``DIMSEMessage.decode_msg`` decodes the command set with ``dsutils.decode``, implicit VR little
+    endian, looks its ``CommandField`` up in ``_MESSAGE_TYPES`` and compares its
+    ``CommandDataSetType`` to 0x0101. These are the same three steps, so the two cannot disagree. A
+    raise in any of them happens on the DUL thread there, and kills it with a traceback, so here it
+    is a reason to end the association instead."""
+    from pynetdicom.dimse_messages import _MESSAGE_TYPES
     from pynetdicom.dsutils import decode
 
     try:
-        return bool(decode(BytesIO(command_set), True, True).CommandDataSetType == 0x0101)
+        command = decode(BytesIO(command_set), True, True)
+        _MESSAGE_TYPES[int(command.CommandField)]
+        return bool(command.CommandDataSetType == 0x0101)
     except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
         logger.debug("A DICOM command set did not decode: %s", safe_exc(exc))
-        return False
+        return None
 
 
 class _ReceiptTally:
@@ -380,18 +406,22 @@ class _ReceiptTally:
     pynetdicom holds every fragment of a message until the message is complete, with no ceiling of
     its own. Its ``max_object_bytes`` check runs only then, so without this a peer could send an
     object of any size, and the SCP would hold it all before refusing it. This counts from the same
-    PDUs, in the same order, so it sees what pynetdicom will hold, including fragments still on its
-    queue that its Association thread has not taken yet.
+    PDUs, in the same order, so it sees what pynetdicom will hold.
 
-    The count starts again where pynetdicom starts a new message: at a data set's last fragment,
-    and at a command set's last fragment when the command says no data set follows. So a run of
-    objects under the cap is never counted together, however long the association. A command set's
-    last fragment that says a data set follows does not start one again, because pynetdicom then
-    goes on adding to the same message.
+    A message is its command set's fragments, then, when the command says one follows, its data
+    set's fragments (PS3.8 Annex E.2). The count starts again where pynetdicom starts a new message:
+    at a data set's last fragment, and at a command set's last fragment when the command says no
+    data set follows. So a run of objects under the cap is never counted together, however long the
+    association.
 
-    The items are split as ``pdu.P_DATA_TF._generate_items`` splits them, and each fragment counts
-    what ``DIMSEMessage.decode_msg`` writes of it, all but its control byte. A PDU pynetdicom fails
-    to decode is counted all the same: that counts more than pynetdicom holds, never less."""
+    Each item is split where ``pdu.P_DATA_TF._generate_items`` splits it, and each fragment counts
+    what ``DIMSEMessage.decode_msg`` holds of it, all but its control byte. Any shape pynetdicom
+    would fail on, or would take out of that order, ends the association instead of reaching it. At
+    least these: an item too short for its length, context and control byte, or longer than the PDU
+    holds; a command set that does not decode; a second command set in one message; and a data set
+    fragment before its command set is whole. pynetdicom would log each at ERROR with a traceback,
+    or lose its DUL thread to it, or go on adding to a message whose count here had started again.
+    The fragments are read through a ``memoryview``, so counting one copies nothing."""
 
     def __init__(self, *, max_data_set_bytes: int) -> None:
         #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
@@ -401,39 +431,64 @@ class _ReceiptTally:
         #: The command set of the message in progress, kept whole so that its last fragment can be
         #: read. It is bounded by :data:`_MAX_COMMAND_SET_BYTES`.
         self.command_set = bytearray()
+        #: Whether the command set's last fragment has arrived, saying a data set follows.
+        self.command_whole = False
 
-    def take(self, body: bytes) -> str | None:
-        """Count one P-DATA-TF's variable field. Returns why the association must end, or ``None``."""
-        offset = 0
-        while body[offset : offset + 1]:
-            if len(body) - offset < 4:
-                return None  # no whole item length: pynetdicom refuses the PDU unread
-            item_length = int.from_bytes(body[offset : offset + 4], "big")
-            data = body[offset + 5 : offset + 4 + item_length]
-            offset += 4 + item_length
-            if not data:
-                continue  # no control byte: pynetdicom fails on it, and holds nothing of it
-            control, fragment = data[0], data[1:]
-            if control & 0x01:  # a command set fragment
-                self.command_set += fragment
-                if len(self.command_set) > _MAX_COMMAND_SET_BYTES:
-                    return f"a command set passed {_MAX_COMMAND_SET_BYTES} bytes"
-                if control & 0x02 and _command_set_has_no_data_set(bytes(self.command_set)):
-                    self._next_message()
+    def take(self, body: bytes | bytearray) -> tuple[tuple[int, int], str] | None:
+        """Count one P-DATA-TF's variable field. Returns the A-ABORT (source, reason) to end the
+        association with, and why, or ``None`` when the PDU may go to pynetdicom."""
+        view = memoryview(body)
+        offset, size = 0, len(view)
+        while offset < size:
+            start = offset + 5  # the item length and the context ID come first
+            end = offset + 4 + int.from_bytes(view[offset : offset + 4], "big")
+            if start >= end or end > size:
+                return _ABORT_INVALID_MESSAGE, "a P-DATA-TF item does not decode"
+            control, fragment = view[start], view[start + 1 : end]
+            offset = end
+            if control & 0x01:
+                over = self._take_command(fragment, last=bool(control & 0x02))
             else:
-                self.data_set_bytes += len(fragment)
-                if self.data_set_bytes > self.max_data_set_bytes:
-                    return (
-                        f"an object passed {self.max_data_set_bytes} bytes, twice the SCP's "
-                        "effective max_object_bytes"
-                    )
-                if control & 0x02:
-                    self._next_message()
+                over = self._take_data(fragment, last=bool(control & 0x02))
+            if over is not None:
+                return over
+        return None
+
+    def _take_command(
+        self, fragment: memoryview, *, last: bool
+    ) -> tuple[tuple[int, int], str] | None:
+        if self.command_whole:
+            return _ABORT_INVALID_MESSAGE, "a second command set in one message"
+        self.command_set += fragment
+        if len(self.command_set) > _MAX_COMMAND_SET_BYTES:
+            return _ABORT_OVER_LIMIT, f"a command set passed {_MAX_COMMAND_SET_BYTES} bytes"
+        if last:
+            completes = _command_set_completes(bytes(self.command_set))
+            if completes is None:
+                return _ABORT_INVALID_MESSAGE, "a command set does not decode"
+            if completes:
+                self._next_message()
+            else:
+                self.command_whole = True
+        return None
+
+    def _take_data(self, fragment: memoryview, *, last: bool) -> tuple[tuple[int, int], str] | None:
+        if not self.command_whole:
+            return _ABORT_INVALID_MESSAGE, "a data set fragment came before its command set"
+        self.data_set_bytes += len(fragment)
+        if self.data_set_bytes > self.max_data_set_bytes:
+            return _ABORT_OVER_LIMIT, (
+                f"an object passed {self.max_data_set_bytes} bytes, twice the SCP's effective "
+                "max_object_bytes"
+            )
+        if last:
+            self._next_message()
         return None
 
     def _next_message(self) -> None:
         self.data_set_bytes = 0
         self.command_set.clear()
+        self.command_whole = False
 
 
 def _require_association_seams(handler: type[Any], association_socket: type[Any]) -> None:
@@ -526,7 +581,8 @@ def _admitting_server_class() -> type[Any]:
     * The same socket bounds the DUL thread from there on, so it cannot block for good after the
       association has started either. A later read, and a whole send, each have a fixed deadline.
       It also reads each PDU's body with its header, so that a PDU longer than the SCP offered, and
-      an object past twice the object cap, end the association before pynetdicom holds them.
+      an object past twice the object cap, end the association before pynetdicom holds them, and it
+      reads nothing while a whole message waits on pynetdicom's queue.
       It also holds off reading while the request is unanswered, so a stray byte behind a whole
       request cannot delay the ``maximum_associations`` check.
     * ``AE.start_server`` cannot start this class: its non-blocking branch names
@@ -926,12 +982,14 @@ def _admitting_server_class() -> type[Any]:
 
         def send_for_association(self, sock: socket.socket, data: bytes, host: str) -> bool:
             """One send of a started association, whole within ``timeout_seconds`` however slowly
-            the peer reads, and cut short by a stop. Returns whether all of ``data`` went.
+            the peer reads, and within :data:`_ANSWER_SEND_SECONDS` once a stop has begun. Returns
+            whether all of ``data`` went.
 
             A deadline for the whole send, not a timeout per system call: a peer that reads a
             little at a time would let every call finish inside a per-call timeout, and hold the
             DUL thread, and a stop with it, for as long as it liked. The end of a send that ran out
-            is logged as an end, the same throttled line a read deadline gets."""
+            is logged as an end, the same throttled line a read deadline gets. Any other failure is
+            a closed connection, as the stock send takes every exception to be."""
             seconds = cast(float, self.ae.network_timeout)
             restore = sock.gettimeout()  # None: pynetdicom sends on a blocking socket
             try:
@@ -939,7 +997,7 @@ def _admitting_server_class() -> type[Any]:
                 return True
             except _RefusedPeer as exc:
                 self._ended(host, str(exc))
-            except OSError as exc:  # a stop, a reset and an ssl.SSLError are all OSError
+            except Exception as exc:  # noqa: BLE001 - the stock send's own catch; never into the DUL
                 logger.debug("A send to DICOM peer %s ended: %s", host, safe_exc(exc))
             finally:
                 with contextlib.suppress(OSError):  # the association may have closed it
@@ -1025,7 +1083,7 @@ def _admitting_server_class() -> type[Any]:
         #: What is left of a PDU already read: first the association request, then each later
         #: PDU's body, which :meth:`_read_pdu` reads with its header. The DUL reads a PDU's header
         #: and then its body, so a read never asks for more than is left.
-        replay: bytes
+        replay: bytearray
         server: _AdmittingAssociationServer
         host: str
         tally: _ReceiptTally
@@ -1033,12 +1091,20 @@ def _admitting_server_class() -> type[Any]:
         @property
         def ready(self) -> bool:
             """Whether the DUL should read. Not before the request is answered, whatever has
-            arrived, and not in Sta13.
+            arrived, not while a whole message waits for the ``Association`` thread, and not in
+            Sta13.
 
             The DUL reads before it takes its next event, so a byte behind the request would have
             it reading while the request itself waits, unanswered, on its queue. The association
             then counts for a whole deadline before ``maximum_associations`` is checked, with its
             slot already given back, so such peers would go round every cap.
+
+            The DUL hands each whole message to pynetdicom's ``dimse.msg_queue``, which has no
+            bound, and the ``Association`` thread takes one at a time and serves it, a C-STORE
+            for as long as its commit takes. A peer that sent objects without waiting for their
+            statuses would have them all held there. So while a whole message waits, the DUL
+            reads nothing more, and TCP holds the peer back. An association then holds at most
+            the message being served and the next one.
 
             In Sta13 the DUL closes the connection as soon as this is ``False``, and reads a whole
             PDU while it is ``True``. A PDU read there is thrown away, and a stalled one would hold
@@ -1063,7 +1129,9 @@ def _admitting_server_class() -> type[Any]:
             if killed_unanswered or not assoc.is_alive():
                 self.close()
                 return False
-            return not unanswered and super().ready
+            if unanswered or not assoc.dimse.msg_queue.empty():
+                return False
+            return super().ready
 
         def _shutdown_socket(self) -> None:
             """``AssociationSocket._shutdown_socket``, after reading off what the peer has already
@@ -1080,15 +1148,22 @@ def _admitting_server_class() -> type[Any]:
 
         def recv(self, nr_bytes: int) -> bytearray:
             if self.replay:
+                if nr_bytes >= len(self.replay):  # the whole of it: hand it over uncopied
+                    served, self.replay = self.replay, bytearray()
+                    return served
                 served, self.replay = self.replay[:nr_bytes], self.replay[nr_bytes:]
-                return bytearray(served)
+                return served
             if nr_bytes == _PDU_HEADER_BYTES:
                 return self._read_pdu()
             if nr_bytes == 0:
                 return bytearray()  # an empty body: nothing to read
-            # Not reached: every other body is read with its header and served from replay.
+            # Every other body is read with its header and served from replay, so a read of any
+            # other size is one this was not written for. It would pass both checks in _read_pdu,
+            # so the association ends instead.
             sock = cast(socket.socket, self.socket)
-            return self.server.read_for_association(sock, nr_bytes, self.host)
+            reason = "pynetdicom asked for a read the SCP does not check"
+            self.server.end_association(sock, _ABORT_INVALID_MESSAGE, self.host, reason)
+            return bytearray()
 
         def _read_pdu(self) -> bytearray:
             """The DUL's read of a PDU header. It reads the body too, keeps it for the DUL's next
@@ -1103,7 +1178,8 @@ def _admitting_server_class() -> type[Any]:
             A P-DATA-TF's fragments are then counted by :class:`_ReceiptTally` before the DUL sees
             them. An object up to twice ``max_object_bytes`` reaches the C-STORE handler, which
             answers ``0xC010``. One past that ends the association with an A-ABORT, so that what
-            the SCP holds of one object stays bounded (owner ruling B462-R3).
+            the SCP holds of one object stays bounded (owner ruling B462-R3). So does a P-DATA-TF
+            pynetdicom would fail on.
 
             Reading the body here also means a body cut short never reaches the DUL, which would
             log it at ERROR. An empty header read is its silent closed connection, and that is what
@@ -1123,22 +1199,22 @@ def _admitting_server_class() -> type[Any]:
                 reason = f"a PDU declared a length over the {limit} bytes the SCP takes"
                 server.end_association(sock, _ABORT_PDU_TOO_LONG, host, reason)
                 return bytearray()
-            body = bytes(server.read_for_association(sock, declared, host))
+            body = server.read_for_association(sock, declared, host)
             if len(body) < declared:
                 return bytearray()  # the peer closed, or the read ran out: already logged
             if header[0] == _PDU_TYPE_P_DATA_TF:
-                over = self.tally.take(body)
-                if over is not None:
-                    server.end_association(sock, _ABORT_OBJECT_TOO_LARGE, host, over)
+                ended = self.tally.take(body)
+                if ended is not None:
+                    server.end_association(sock, ended[0], host, ended[1])
                     return bytearray()
             self.replay = body
             return header
 
         def send(self, bytestream: bytes) -> None:
-            """``AssociationSocket.send``, whole within ``timeout_seconds`` and cut short by a stop.
-            A peer that never reads, or reads a little at a time, would otherwise hold the DUL
-            thread here, and a stop with it. A send that does not finish is a closed connection, as
-            the stock ``send`` reports one."""
+            """``AssociationSocket.send``, whole within ``timeout_seconds``, and within
+            :data:`_ANSWER_SEND_SECONDS` once a stop has begun. A peer that never reads, or reads a
+            little at a time, would otherwise hold the DUL thread here, and a stop with it. A send
+            that does not finish is a closed connection, as the stock ``send`` reports one."""
             sock = self.socket
             if sock is None:
                 super().send(bytestream)  # it reports the closed socket
@@ -1165,14 +1241,18 @@ def _admitting_server_class() -> type[Any]:
             evt.trigger(assoc, evt.EVT_CONN_OPEN, {"address": self.client_address})
             server = self.server
             host = _address_host(self.client_address)
-            first_pdu = server.read_association_request(self.request, host)
+            first_pdu: bytes | None = None
+            if _config.STORE_RECV_CHUNKED_DATASET:  # checked at start too; this is the backstop
+                server._refused(host, "a connection", _CHUNKED_RECEIPT_REFUSAL)
+            else:
+                first_pdu = server.read_association_request(self.request, host)
             if first_pdu is None:
                 server.shutdown_request(self.request)
                 evt.trigger(assoc, evt.EVT_CONN_CLOSE, {"address": self.client_address})
                 return
             sock = cast(_AdmittedSocket, assoc.dul.socket)
             sock.__class__ = _AdmittedSocket  # why not a new socket: _admitting_server_class
-            sock.replay = first_pdu
+            sock.replay = bytearray(first_pdu)
             sock.server = server
             sock.host = host
             sock.tally = _ReceiptTally(max_data_set_bytes=2 * server.max_object_bytes)
@@ -1288,10 +1368,11 @@ class DicomScpSource(SourceConnector):
         self._max_pdu_size = count_setting(
             s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCP source"
         )
-        if self._max_pdu_size <= 0:  # 0 would offer, and so take, a PDU of any length
+        if not _MIN_PDU_SIZE <= self._max_pdu_size <= _MAX_PDU_SIZE:
             raise ValueError(
-                "DICOM-SCP source: max_pdu_size must be above zero; 0 would offer a peer no limit "
-                "on a PDU's length, and the SCP takes what it offers"
+                f"DICOM-SCP source: max_pdu_size must be from {_MIN_PDU_SIZE} to {_MAX_PDU_SIZE}; "
+                "0 would offer a peer no limit on a PDU's length, a smaller size breaks a "
+                "pynetdicom sender, and a larger one is read whole before it is counted"
             )
         self._timeout = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOM-SCP source"
@@ -1453,10 +1534,13 @@ class DicomScpSource(SourceConnector):
     def _start_server(self) -> None:
         # Imported lazily (the [dicom] extra); a missing extra surfaces as an internal/connection error
         # at start, not a per-message data error — like the FHIR/SQL-Server backends.
-        from pynetdicom import AE, StoragePresentationContexts, evt
+        from pynetdicom import AE, StoragePresentationContexts, _config, evt
         from pynetdicom.sop_class import (  # type: ignore[attr-defined]
             Verification,  # generated SOP-class const
         )
+
+        if _config.STORE_RECV_CHUNKED_DATASET:
+            raise RuntimeError(f"DICOM server (SCP) not started: {_CHUNKED_RECEIPT_REFUSAL}")
 
         ae = AE(ae_title=self._ae_title)
         ae.maximum_associations = self._max_associations

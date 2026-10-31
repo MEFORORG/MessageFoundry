@@ -239,7 +239,9 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # and the state machine: dul.state_machine.current_state, the names Sta1, Sta2, Sta3 and Sta13, and what
 # Evt17 does in each. Its receipt count (_ReceiptTally) splits a P-DATA-TF as pdu.P_DATA_TF._generate_items
 # does, and starts again where dimse_messages.DIMSEMessage.decode_msg completes a message: a data set's last
-# fragment, or a command set's last fragment whose CommandDataSetType, read by dsutils.decode, is 0x0101.
+# fragment, or a command set's last fragment whose CommandDataSetType, read by dsutils.decode, is 0x0101,
+# after its CommandField is looked up in dimse_messages._MESSAGE_TYPES. Its ready holds off reading while
+# Association.dimse.msg_queue holds a whole message.
 # Its pre-check also runs the association's own presentation-context negotiation:
 # presentation.negotiate_as_acceptor and negotiate_unrestricted, _config.UNRESTRICTED_STORAGE_SERVICE,
 # the request's SCP_SCU_RoleSelectionNegotiation items, and AssociationServer.contexts, as

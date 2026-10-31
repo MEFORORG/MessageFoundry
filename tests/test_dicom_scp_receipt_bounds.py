@@ -44,8 +44,11 @@ from tests.test_dicom_scp_pre_association import (  # noqa: E402
 
 #: The A-ABORT a PDU longer than the SCP takes gets: service provider, invalid PDU parameter value.
 _ABORT_PDU_TOO_LONG = b"\x07\x00" + (4).to_bytes(4, "big") + bytes((0, 0, 0x02, 0x06))
-#: The A-ABORT an object past twice the cap gets: service user, no reason.
-_ABORT_OBJECT_TOO_LARGE = b"\x07\x00" + (4).to_bytes(4, "big") + bytes(4)
+#: The A-ABORT an object past twice the cap, or a command set past its bound, gets: service user,
+#: no reason.
+_ABORT_OVER_LIMIT = b"\x07\x00" + (4).to_bytes(4, "big") + bytes(4)
+#: The A-ABORT a P-DATA-TF pynetdicom would fail on gets: service provider, no reason.
+_ABORT_INVALID = b"\x07\x00" + (4).to_bytes(4, "big") + bytes((0, 0, 0x02, 0x00))
 
 _CAP = 4096
 _C_STORE_REFUSED_OVER_CAP = 0xC010
@@ -196,11 +199,14 @@ async def test_a_real_sender_at_exactly_max_pdu_size_is_served() -> None:
     assert len(captured) == 1
 
 
-@pytest.mark.parametrize("value", [0, -1])
-def test_a_max_pdu_size_that_offers_no_limit_is_refused_at_build(value: int) -> None:
-    with pytest.raises(ValueError, match="max_pdu_size must be above zero"):
+@pytest.mark.parametrize("value", [0, -1, 6, 4095, 1024 * 1024 + 1, 0xFFFFFFFF])
+def test_a_max_pdu_size_out_of_range_is_refused_at_build(value: int) -> None:
+    # 0 offers no limit, 6 or less breaks a pynetdicom sender, which fragments to six bytes less,
+    # and a larger size is read whole before any of it is counted.
+    with pytest.raises(ValueError, match="max_pdu_size must be from 4096 to 1048576"):
         _build_scp([], max_pdu_size=value)
-    assert _build_scp([], max_pdu_size=1)._max_pdu_size == 1  # CONTROL
+    for edge in (4096, 1024 * 1024):  # CONTROL
+        assert _build_scp([], max_pdu_size=edge)._max_pdu_size == edge
 
 
 # --- An object past twice the cap ------------------------------------------------------------------
@@ -267,22 +273,107 @@ async def test_a_run_of_echoes_is_never_counted_together(monkeypatch: pytest.Mon
     assert 40 * len(_c_echo_rq(1)) > 1024
 
 
-async def test_a_command_that_says_a_data_set_follows_does_not_start_the_count_again() -> None:
-    # pynetdicom goes on adding to the same message after such a command's last fragment, so a peer
-    # that slips one in between data fragments must not reset what the SCP counts.
-    command = _c_store_command()
+async def test_data_fragments_after_a_command_are_counted_past_twice_the_cap() -> None:
+    # The raw form of the object test above: a command that says a data set follows, then data
+    # fragments with no last one. pynetdicom would hold them all until a last fragment came.
     fragment = b"\x00" * 3000
     async with _running_scp({"timeout_seconds": 30.0, "max_object_bytes": _CAP}) as scp:
         sock = await _a_held_association(scp.sockport)
         try:
-            sock.sendall(_p_data(0x03, command))
+            sock.sendall(_p_data(0x03, _c_store_command()))
             for _ in range(3):
-                sock.sendall(_p_data(0x00, fragment) + _p_data(0x03, command))
-            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OBJECT_TOO_LARGE))
-            assert answer == _ABORT_OBJECT_TOO_LARGE, answer
+                sock.sendall(_p_data(0x00, fragment))
+            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OVER_LIMIT))
+            assert answer == _ABORT_OVER_LIMIT, answer
         finally:
             sock.close()
     assert 3 * len(fragment) > 2 * _CAP
+
+
+#: P-DATA-TF bodies pynetdicom would fail on, each after the message so far. A second command set
+#: in one message is the one that matters most: pynetdicom goes on adding to the same message, so a
+#: count that started again there would let a peer grow that message without end.
+_INVALID_MESSAGES = {
+    "second-command": _p_data(0x03, _c_store_command()) + _p_data(0x03, _c_store_command()),
+    "data-before-command": _p_data(0x00, b"\x00" * 16),
+    "command-does-not-decode": _p_data(0x03, b"\xff" * 7),
+    "item-with-no-control-byte": b"\x04\x00" + (5).to_bytes(4, "big") + b"\x00\x00\x00\x01\x01",
+    "item-longer-than-the-pdu": b"\x04\x00" + (6).to_bytes(4, "big") + b"\x00\x00\x00\x09\x01\x03",
+}
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+@pytest.mark.parametrize("sends", list(_INVALID_MESSAGES.values()), ids=list(_INVALID_MESSAGES))
+async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
+    sends: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Before, each of these reached pynetdicom: it logged an ERROR with a traceback, lost its DUL
+    # thread to an uncaught exception, or went on adding to a message whose count here had started
+    # again. A peer could repeat any of them once per association.
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        baseline = await _thread_baseline()
+        sock = await _a_held_association(scp.sockport)
+        try:
+            with caplog.at_level(logging.ERROR):
+                sock.sendall(sends)
+                answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
+                assert answer == _ABORT_INVALID, answer
+                await _until(lambda: len(_threads_outside_the_test()) <= baseline)
+        finally:
+            sock.close()
+    tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
+    assert tracebacks == [], [r.getMessage() for r in tracebacks]
+
+
+async def test_a_peer_that_does_not_wait_for_its_statuses_is_held_back() -> None:
+    # pynetdicom's queue of whole messages has no bound, and the Association thread serves one at a
+    # time. While the first commit is held, a peer sending objects back to back used to have every
+    # one read and queued; now the DUL stops reading while one waits.
+    from pydicom import dcmread
+    from pynetdicom import AE
+    from pynetdicom.dimse_primitives import C_STORE
+    from pynetdicom.dsutils import encode
+
+    release = asyncio.Event()
+    captured: list[bytes] = []
+
+    async def held(data: bytes) -> str | None:
+        captured.append(data)
+        await release.wait()
+        return f"mid-{len(captured)}"
+
+    scp = _build_scp(captured, timeout_seconds=30.0)
+    await scp.start(held)
+    try:
+        ds = dcmread(BytesIO(make_sr_part10()))
+        ae = AE(ae_title="MODALITY1")
+        ae.add_requested_context(ds.SOPClassUID, ds.file_meta.TransferSyntaxUID)
+        assoc = await asyncio.to_thread(ae.associate, "127.0.0.1", scp.sockport, ae_title=_SCP_AE)
+        assert assoc.is_established
+        context = assoc.accepted_contexts[0]
+        context_id = context.context_id
+        assert context_id is not None
+        data_set = encode(ds, context.transfer_syntax[0].is_implicit_VR, True)
+        assert data_set is not None
+        for message_id in range(1, 6):
+            request = C_STORE()
+            request.MessageID = message_id
+            request.AffectedSOPClassUID = ds.SOPClassUID
+            request.AffectedSOPInstanceUID = ds.SOPInstanceUID
+            request.Priority = 0x0002
+            request.DataSet = BytesIO(data_set)
+            assoc.dimse.send_msg(request, context_id)
+        await _until(lambda: len(captured) == 1)
+        await _until(lambda: len(scp._server.active_associations) == 1)
+        queue = scp._server.active_associations[0].dimse.msg_queue
+        await asyncio.sleep(1.0)  # time for the DUL to read everything the peer sent, were it to
+        assert queue.qsize() <= 1, f"{queue.qsize()} whole messages waiting behind the first"
+        release.set()
+        await _until(lambda: len(captured) == 5)
+        await asyncio.to_thread(assoc.release)
+    finally:
+        release.set()
+        await scp.stop()
 
 
 async def test_a_command_set_past_its_bound_ends_the_association() -> None:
@@ -293,8 +384,8 @@ async def test_a_command_set_past_its_bound_ends_the_association() -> None:
             piece = b"\x00" * 8000
             for _ in range(limit // len(piece) + 1):
                 sock.sendall(_p_data(0x01, piece))
-            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OBJECT_TOO_LARGE))
-            assert answer == _ABORT_OBJECT_TOO_LARGE, answer
+            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OVER_LIMIT))
+            assert answer == _ABORT_OVER_LIMIT, answer
         finally:
             sock.close()
 
@@ -304,6 +395,8 @@ def test_the_tally_splits_items_as_pynetdicom_does() -> None:
     bytes: every fragment but its control byte, in every item of the PDU."""
     from pynetdicom.pdu import P_DATA_TF
 
+    tally = dicom_module._ReceiptTally(max_data_set_bytes=1000)
+    assert tally.take(_p_data(0x03, _c_store_command())[6:]) is None  # a data set follows
     body = (
         struct.pack(">IBB", 12, 1, 0x00)
         + b"a" * 10
@@ -319,7 +412,6 @@ def test_the_tally_splits_items_as_pynetdicom_does() -> None:
         value = item.presentation_data_value
         assert value is not None
         held += len(value) - 1  # decode_msg holds all but the control byte
-    tally = dicom_module._ReceiptTally(max_data_set_bytes=1000)
     assert tally.take(body) is None
     assert tally.data_set_bytes == held == 15
     tally.take(struct.pack(">IBB", 3, 1, 0x02) + b"d")  # the last fragment
@@ -370,7 +462,6 @@ async def test_a_send_to_a_slow_reader_is_bounded_as_a_whole(
         assert took < 3.0, f"the send ran {took:.1f}s against a 1s bound"
         assert 0 < peer.taken < 1000
         assert peer.timeout is None, "the socket's own timeout was not restored"
-    assert any("a send did not finish within 1s" in m for m in _warnings(caplog)), _warnings(caplog)
     assert any("a send did not finish within 1s" in m for m in _warnings(caplog)), _warnings(caplog)
 
 
@@ -446,14 +537,29 @@ def test_the_doc_states_the_receipt_bounds() -> None:
     assert "`STORE_RECV_CHUNKED_DATASET`" in doc
 
 
-def test_the_scp_never_turns_on_chunked_receipt() -> None:
+async def test_the_scp_refuses_to_run_with_chunked_receipt_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # pynetdicom's STORE_RECV_CHUNKED_DATASET writes each received object to a temporary file in
-    # plaintext, outside the store and its encryption. The SCP must never set it.
-    source = Path(dicom_module.__file__).read_text(encoding="utf-8")
-    assert "STORE_RECV_CHUNKED_DATASET =" not in source
+    # plaintext, outside the store and its encryption. It is process-wide, so anything in the
+    # process could set it: the SCP will not start with it set, and refuses each connection while
+    # it is set.
     from pynetdicom import _config
 
-    assert _config.STORE_RECV_CHUNKED_DATASET is False
+    assert _config.STORE_RECV_CHUNKED_DATASET is False  # CONTROL: the shipped default
+    with monkeypatch.context() as patched:
+        patched.setattr(_config, "STORE_RECV_CHUNKED_DATASET", True)
+        scp = _build_scp([])
+        with pytest.raises(RuntimeError, match="STORE_RECV_CHUNKED_DATASET is set"):
+            await scp.start(_never_called)
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        monkeypatch.setattr(_config, "STORE_RECV_CHUNKED_DATASET", True)
+        assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (False, None)
+        await _until(lambda: scp._refusal_log.refusals == 1)
+
+
+async def _never_called(data: bytes) -> str | None:
+    raise AssertionError("no object should reach the handler")
 
 
 def test_the_pynetdicom_seams_the_receipt_bounds_rely_on_are_still_there() -> None:
@@ -486,6 +592,15 @@ def test_the_pynetdicom_seams_the_receipt_bounds_rely_on_are_still_there() -> No
     assert "self.encoded_command_set.write(data[1:])" in decode
     assert "decode(self.encoded_command_set, True, True)" in decode
     assert "CommandDataSetType == 0x0101" in decode
+    assert decode.index("_MESSAGE_TYPES[") < decode.index("CommandDataSetType == 0x0101")
+    # ready holds off while a whole message waits: DT-2 decodes on the DUL thread and queues it.
+    from pynetdicom.association import Association
+    from pynetdicom.dimse import DIMSEServiceProvider
+    from pynetdicom.fsm import DT_2
+
+    assert "dimse.receive_primitive" in inspect.getsource(DT_2)
+    assert "self.msg_queue.put(" in inspect.getsource(DIMSEServiceProvider.receive_primitive)
+    assert "self.dimse.get_msg(block=False)" in inspect.getsource(Association._run_reactor)
     assert "cast(BytesIO, self.data_set).write(data[1:])" in decode
     assert "if control_header_byte & 2 != 0:" in decode
     # The replaced send does what the stock one does on success and on failure.

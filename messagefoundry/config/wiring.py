@@ -3790,8 +3790,8 @@ def DICOM(
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
     # intakes' max_messages_per_second: this one makes a real modality wait.
     association_burst: float | None = None,  # SCP: tokens the bucket holds (default = the rate)
-    max_pdu_size: int = 16384,  # largest PDU offered to the peer; the SCP aborts a longer one (above 0)
-    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: per-read deadline, at least 1 s
+    max_pdu_size: int = 16384,  # largest PDU offered to the peer; the SCP aborts a longer one (4096 to 1 MiB)
+    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it

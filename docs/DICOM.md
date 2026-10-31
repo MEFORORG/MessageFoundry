@@ -107,9 +107,10 @@ Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer
 PDUs is not ended by this. Each send has a `timeout_seconds` deadline for the whole send too, so a
 peer that stops reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
 at most 1 second more, so that the status for an object committed as the stop began still goes out.
-`timeout_seconds` has to be at least 1 second, and `max_pdu_size` has to be above zero; the
-connection is refused when it is built otherwise. Both are deadlines on every read, so a tiny one
-would end nearly every peer, and a `max_pdu_size` of `0` would offer a peer no limit at all.
+`timeout_seconds` has to be at least 1 second, since it is a deadline on every read and send and a
+tiny one would end nearly every peer. `max_pdu_size` has to be from 4096 to 1 MiB: `0` would offer a
+peer no limit at all, a size of six bytes or less breaks a pynetdicom sender, and a larger one would
+be read whole before any of it is counted. The connection is refused when it is built otherwise.
 
 **A PDU longer than the SCP takes, and an object past twice its cap, end the association.** The SCP
 reads each PDU's header and checks the length it declares before it reads the body (owner ruling
@@ -122,11 +123,20 @@ The SCP then counts each object's fragments as they arrive, before pynetdicom ho
 does until the object's last fragment arrives. An object over `max_object_bytes` but not past twice
 the effective `max_object_bytes` is held, and then refused with the final status `0xC010`. One past
 twice that gets an A-ABORT instead, so what the SCP holds of one object stays bounded: 32 MiB at the
-shipped default, where the effective cap is 16 MiB. The count starts again at each object's last
-fragment, so a long association of objects under the cap is never charged as one. A command set past
-64 KiB is ended the same way; a real one is a few hundred bytes. The SCP never sets pynetdicom's
-`STORE_RECV_CHUNKED_DATASET`, which would write each object being received to a temporary file in
-plaintext, outside the store.
+shipped default, where the effective cap is 16 MiB, plus the one PDU being read. The count starts
+again at each object's last fragment, so a long association of objects under the cap is never
+charged as one. A command set past 64 KiB is ended the same way; a real one is a few hundred bytes.
+So is a P-DATA-TF that pynetdicom would fail on, such as a second command set in one message or a
+data set fragment before its command; pynetdicom would log each with a traceback, or lose its
+thread to it.
+
+While a whole object waits for the SCP to serve the one before it, the SCP reads nothing more on
+that association, and TCP holds the peer back. A peer that sends objects without waiting for their
+statuses therefore has at most two held at once: the one being served and the next.
+
+The SCP will not start, and refuses each connection, while pynetdicom's process-wide
+`STORE_RECV_CHUNKED_DATASET` is set. That setting would write each object being received to a
+temporary file in plaintext, outside the store.
 
 The abort changes what a sender of a large object sees. `0xC010` is a final refusal, which a sender
 does not retry. A failed association reads as transient, and this engine's own C-STORE client
@@ -155,8 +165,10 @@ served. At least these limits apply:
   more, so the close does not reset the connection and lose the answer. A peer that has sent more
   than that can still get a reset in place of the answer. The same holds for the A-ABORT that ends
   an association whose PDU is too long, since its body is left unread.
-- An object up to twice the effective `max_object_bytes` is held whole before it is refused, on
-  each association at once: `max_associations` of them at the default 32 MiB each.
+- An object up to twice the effective `max_object_bytes` is held whole before it is refused, and
+  an association holds up to two objects at once. So at the defaults the SCP can hold about 64 MiB
+  per association, `max_associations` times over, plus what the C-STORE handler makes of an object
+  under the cap when it decodes and re-encodes it.
 
 **A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
 no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a
