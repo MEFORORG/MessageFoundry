@@ -179,3 +179,27 @@ def test_warn_honours_the_escape(
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     main(_argv(command, shell, server=_REMOTE, enforcement="warn", weakened=True))
     assert asyncpg.pool_kwargs["host"] == _REMOTE
+
+
+def test_the_open_refusal_quotes_no_key_byte() -> None:
+    """Review R2-7: every caller prints the refusal's text, so it goes through ``codec_safe_str``.
+    A key source's codec error names the byte it could not decode; the wrapped text must not.
+
+    Mutation: ``raise _StoreOpenRefused(str(exc))`` in ``_open_store_or_refuse`` turns this red."""
+    import asyncio
+
+    from messagefoundry.__main__ import _open_store_or_refuse, _StoreOpenRefused
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    key_byte = b"\xe9"
+
+    async def opening() -> None:
+        try:
+            key_byte.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise KeyProviderError(exc) from exc
+
+    with pytest.raises(_StoreOpenRefused) as caught:
+        asyncio.run(_open_store_or_refuse(opening()))  # type: ignore[arg-type]
+    assert "xe9" not in str(caught.value).lower()
+    assert isinstance(caught.value.__cause__, KeyProviderError)

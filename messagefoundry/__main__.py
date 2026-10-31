@@ -10742,13 +10742,15 @@ def _backup(args: argparse.Namespace) -> int:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
     except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
         return _emit_key_unresolved(exc, as_json=args.json)
-    except (
-        StoreNotFoundError,
-        KeylessAuditChainRefused,
-        _UnauditableWrite,
-        _StoreOpenRefused,
-    ) as exc:
-        # #1780, #1916, #2532: could not start, so exit 2 like #1670 below
+    except _StoreOpenRefused as exc:
+        # The open's key error is wrapped (#2532); it prints as the runner's own key error above
+        # does (#3471), through `codec_safe_str`, so a key byte never reaches the line.
+        if isinstance(exc.__cause__, _key_unresolved()):
+            return _emit_key_unresolved(exc.__cause__, as_json=args.json)
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
+        # #1780, #1916: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
         return 2
     except SchemaMismatchError as exc:
@@ -12156,13 +12158,17 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
     the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal is one of
     those bare ones, so it still reaches the dispatch floor.
+
+    The text goes through ``codec_safe_str``, never ``str(exc)``: a key source's codec error quotes
+    a byte of what it decoded, and every caller prints this text.
     """
     from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.redaction import codec_safe_str
 
     try:
         return await opening
     except _key_unresolved() + (InsecureHopRefused,) as exc:
-        raise _StoreOpenRefused(str(exc)) from exc
+        raise _StoreOpenRefused(codec_safe_str(exc)) from exc
 
 
 async def _close_store_quietly(store: Store) -> None:
