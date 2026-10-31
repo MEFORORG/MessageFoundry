@@ -3191,8 +3191,9 @@ class DatabaseLookupExecutor:
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:
-        """Close every opened pool (idempotent; safe if no pool was ever opened). Each close is
-        bounded, as the destination's is (BACKLOG #2394)."""
+        """Close every opened pool (idempotent; safe if no pool was ever opened). Each close stops
+        waiting at a bound only while a cancelled lookup holds a connection back, as the
+        destination's does (BACKLOG #2394, :func:`_close_pool_bounded`)."""
         pools = list(self._pools.items())  # a snapshot: a lookup may open a pool meanwhile
         await asyncio.gather(
             *(_close_pool_bounded(pool, f"DatabaseLookup {name!r}") for name, pool in pools)

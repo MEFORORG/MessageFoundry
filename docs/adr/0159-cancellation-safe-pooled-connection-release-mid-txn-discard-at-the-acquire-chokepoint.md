@@ -572,21 +572,33 @@ the next reader does not re-derive the wrong precedent from the same comment.
 
   - Another borrower of that pool waits at most its `acquire_timeout`, then fails transiently and
     retries, so a held slot delays work but does not wedge it.
-  - A pool close waits for the held connection, at most `_POOL_CLOSE_TIMEOUT_S` (2 s) in at least
-    the destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool
-    teardown (`_close_pool_bounded`), and `DatabaseSource.stop()` after a cancel. Past the bound,
-    `_close_pool_bounded` lets the close go on by itself; the source's bound, from BACKLOG #1620,
-    cancels its close instead. Either way the held connection is released only once its statement
-    returns.
+  - **A pool close stops waiting for a held connection after `_POOL_CLOSE_TIMEOUT_S` (2 s), and
+    only for one.** Each pool keeps a count of the connections held back behind a cancelled borrow:
+    one `_return_when_settled` is returning, or one an abandoned autocommit set still runs on. It
+    is keyed by the aioodbc pool under any `_AutocommitPool` wrapper, so a borrow and a close of one
+    pool read one count. Every close of a DATABASE pool goes through `_close_pool_bounded`: the
+    destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool teardown,
+    and `DatabaseSource.aclose()`, the ordinary `stop()` included. It stops waiting at the bound
+    only while that count is above zero, read again at each tick, so a borrow cancelled after the
+    close began counts too. With the count at zero an in-flight call is an ordinary one, and the
+    close waits for it without a bound, as before this amendment. `DatabaseSource.stop()` after a
+    cancel keeps its BACKLOG #1620 bound whatever the count. The bound only stops the wait: the
+    close goes on by itself, never cancelled part-way, and the held connection is released only once
+    its statement returns. So the connection test in `api/app.py`, which stops a source it probed,
+    no longer waits past its own timeout for a `SELECT 1` its timeout cancelled.
+  - **After the bound, a second pool can open beside the one still closing.** The destination and
+    the source drop their pool when the wait stops, and the next borrow opens a new one. Until the
+    cancelled statement returns the server can then see more connections than `pool_max`. That is
+    the trade `DatabaseSource.stop()` already accepts after a cancel (BACKLOG #1620), and it is now
+    taken only after a cancelled-and-held borrow. A source closed with no `timeout` still keeps its
+    pool reference while the close is waited on, so a close that fails is retried by the next
+    `stop()`.
 
   **What it leaves open.** At least these:
 
   - A cancellation during `conn.cursor()` reaches the close with no cursor, so the connection goes
     back while that call may still run. The gate holds the next borrower's calls behind it, and the
-    new cursor is left for the collector.
-  - `DatabaseSource.stop()` with no cancel closes its pool without a bound, so the connection test
-    in `api/app.py`, which stops a source it probed, can wait past its own timeout for a probe its
-    timeout cancelled.
+    new cursor is left for the collector. That connection is not counted as held back.
   - A cancelled call whose worker thread has started but has not yet entered the gate is invisible
     to `run_after_running_call`. The close job can then take the gate first, and the connection
     can go back before that call runs on it. The store detaches its connection and so tolerates the

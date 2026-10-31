@@ -7,8 +7,10 @@
   same step rolls back what the cancelled statement left open, so a destination's connection no
   longer goes back holding a cancelled INSERT for the next send to commit. The connection then goes
   back to its pool. The cancelled task does not wait for the statement, but the connection keeps
-  its pool slot until the statement returns, which nothing in the engine bounds. The
-  destination's, the lookup's and a `DatabaseRef` sync's pool close now wait at most 2 s for it. At
-  least these are not covered: a cancellation while a cursor is still being created, a
-  cancellation before the cancelled call has entered the gate, and a source's ordinary stop, whose
-  pool close is still unbounded. (`BACKLOG #2394`)
+  its pool slot until the statement returns, which nothing in the engine bounds. While a pool holds
+  such a connection back, its close waits at most 2 s for it, then goes on by itself: the
+  destination's, the lookup's, a `DatabaseRef` sync's and a source's stop, so the connection test of
+  a source no longer hangs behind a `SELECT 1` its own timeout cancelled. With no connection held
+  back, a close waits for in-flight calls as before. After the 2 s a new pool can open beside the
+  one still closing. At least these are not covered: a cancellation while a cursor is still being
+  created, and a cancellation before the cancelled call has entered the gate. (`BACKLOG #2394`)
