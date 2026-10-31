@@ -2894,6 +2894,11 @@ RESTORED_ACCOUNTS_NOTICE = (
 )
 
 
+#: How far ahead of this host's clock an archive's date may be before it counts as undated: a
+#: backup host whose clock leads by a little is ordinary, one a day ahead is not (BACKLOG #2614).
+_ARCHIVE_CLOCK_SKEW_SECONDS = 3600.0
+
+
 def _refuse_an_old_archive(
     *,
     archive_created_at: float | None,
@@ -2907,18 +2912,27 @@ def _refuse_an_old_archive(
     time after which that is so. The caller words how to override it; the CLI's
     ``--allow-old-archive`` skips this check."""
     newest = utc_or_unknown(last_audit_at)
+    kind = "age"
     if archive_created_at is None:
         taken = "the archive does not say when it was taken"
+        kind = "age_undated"
+    elif archive_created_at > now + _ARCHIVE_CLOCK_SKEW_SECONDS:
+        # A date in the future says the backup host's clock was wrong, so the age is not known.
+        taken = (
+            f"the archive says it was taken {utc_or_unknown(archive_created_at)}, after now, so "
+            "its age is not known"
+        )
+        kind = "age_undated"
     else:
         age = now - archive_created_at
         if age <= max_age_seconds:
             return
         taken = (
-            f"the archive was taken {_utc_iso(archive_created_at)}, {age / 86400:.1f} days ago, "
-            f"past the {max_age_seconds / 86400:g}-day limit"
+            f"the archive was taken {utc_or_unknown(archive_created_at)}, "
+            f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
         )
     raise BackupError(
-        "age",
+        kind,
         f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
         f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
     )
@@ -3001,7 +3015,8 @@ def _restore_blocking(
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
     :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,
-    ``age`` for an archive past ``max_age_seconds`` (BACKLOG #2614), and ``cleanup`` for the one
+    ``age`` for an archive past ``max_age_seconds`` and ``age_undated`` for one whose age is not
+    known (BACKLOG #2614), and ``cleanup`` for the one
     failure that follows a whole restore -- see below).
 
     It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for

@@ -3102,8 +3102,11 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
     It is consumed HERE, at the engine's start, and not in the store's ``open``. Every other
     command that opens the store, such as ``provision-admin`` or ``admin-unlock`` run against the
     restored file first, would otherwise consume it, and the alert would be lost: only a serving
-    engine holds the alert sink. No session is honoured before this runs, because only this
-    process's API checks one, and the lifespan reaches its first request after it.
+    engine holds the alert sink. This process serves no request before this runs. Other engine
+    processes on the same store, such as ``serve --shard`` processes, check sessions too, and may
+    start before or after this one; what keeps the archive's sessions from them is the restore
+    itself, which ended every session in the file before placing it (``write_restore_marker``).
+    This revoke repeats that for anything minted since, and raises every account's epoch.
 
     A store write that fails here raises, so the start fails rather than serving the archive's
     sessions. The alert itself never raises: the record is already committed."""

@@ -116,7 +116,7 @@ def test_an_archive_that_does_not_say_when_it_was_taken_is_refused() -> None:
         _refuse_an_old_archive(
             archive_created_at=None, last_audit_at=None, max_age_seconds=7 * _DAY, now=time.time()
         )
-    assert info.value.kind == "age"
+    assert info.value.kind == "age_undated"
     assert "does not say when it was taken" in str(info.value)
     assert "newest audit row is unknown" in str(info.value)
 
@@ -159,3 +159,27 @@ def test_a_max_age_that_would_refuse_everything_is_rejected_at_parse(
         main(["restore", "a.mfbak", "--to", str(tmp_path / "x.db"), "--max-age-days", bad])
     assert info.value.code == 2
     assert "--max-age-days" in capsys.readouterr().err
+
+
+def test_an_archive_dated_in_the_future_or_before_1970_is_refused_cleanly() -> None:
+    now = 1_800_000_000.0
+    with pytest.raises(BackupError) as ahead:
+        _refuse_an_old_archive(
+            archive_created_at=now + 30 * _DAY,
+            last_audit_at=None,
+            max_age_seconds=7 * _DAY,
+            now=now,
+        )
+    assert ahead.value.kind == "age_undated" and "after now" in str(ahead.value)
+    # A little lead is an ordinary clock and passes.
+    _refuse_an_old_archive(
+        archive_created_at=now + 60, last_audit_at=None, max_age_seconds=7 * _DAY, now=now
+    )
+    with pytest.raises(BackupError) as early:  # a BackupError, never a platform OSError
+        _refuse_an_old_archive(
+            archive_created_at=-86_400.0 * 400,
+            last_audit_at=-5.0,
+            max_age_seconds=7 * _DAY,
+            now=now,
+        )
+    assert early.value.kind == "age"

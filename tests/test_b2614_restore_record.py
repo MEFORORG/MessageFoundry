@@ -248,3 +248,25 @@ def test_the_schema_carries_the_marker_table_verbatim() -> None:
 
     assert "CREATE TABLE IF NOT EXISTS restore_marker" in _RESTORE_MARKER_DDL
     assert _RESTORE_MARKER_DDL.strip() in _SCHEMA
+
+
+def test_an_earlier_builds_store_without_a_seal_column_is_still_marked(tmp_path: Path) -> None:
+    """An archive from before the session seal (BACKLOG #2592) has a sessions table with no
+    ``seal`` column, which the first open's migration adds. The marker write must not refuse it:
+    restoring an earlier build's archive is the ordinary case. Its sessions are left to the first
+    start, which revokes after that migration."""
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT, revoked_at REAL)"
+        )
+        conn.execute("INSERT INTO sessions VALUES ('h', 'u', NULL)")
+    conn.close()
+    ended = write_restore_marker(
+        db, archive_sha256="ef" * 32, archive_created_at=None, last_audit_at=None, restored_at=9.0
+    )
+    assert ended == 0
+    with sqlite3.connect(db) as check:
+        assert check.execute("SELECT sessions_revoked FROM restore_marker").fetchone() == (0,)
+        assert check.execute("SELECT revoked_at FROM sessions").fetchone() == (None,)
+    check.close()

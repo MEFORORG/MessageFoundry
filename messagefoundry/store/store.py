@@ -6297,9 +6297,12 @@ def write_restore_marker(
         # and a failure between them discards it whole, so no half-written file is ever placed.
         conn.executescript(_RESTORE_MARKER_DDL)
         revoked = 0
-        if conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
-        ).fetchone():
+        # An archive an earlier build wrote may have no sessions table, or one from before the
+        # seal column (BACKLOG #2592), which the first open's migration adds. Such a file is left
+        # to the first start's consume, which revokes after that migration: a revoke here must
+        # blank the seal, and that column is not there yet.
+        columns = {str(r[1]) for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "seal" in columns:
             revoked = conn.execute(
                 "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL",
                 (restored_at,),
@@ -17793,7 +17796,13 @@ class MessageStore:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
         Every account's epoch is raised first, as :meth:`revoke_user_sessions` raises one, then
-        one sweep ends the rows and the kept row is re-sealed under its own account's new epoch."""
+        one sweep ends the rows and the kept row is re-sealed under its own account's new epoch.
+
+        The first statement is a write, which takes SQLite's write lock even when it matches no
+        row, so the reads below run under it: another process (an engine shard, or the engine
+        beside ``admin-revoke-sessions``) committing between a read and the first update would
+        otherwise fail the upgrade from a stale snapshot, which the busy timeout does not retry."""
+        await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
         for row in await cur.fetchall():
             await self._bump_session_epoch(str(row[0]))
@@ -17843,7 +17852,7 @@ class MessageStore:
                 archive_sha256=str(row[0]),
                 archive_created_at=finite_or_none(row[1]),
                 last_audit_at=finite_or_none(row[2]),
-                restored_at=finite_or_none(row[3]) or now,
+                restored_at=now if (at := finite_or_none(row[3])) is None else at,
                 sessions_revoked=int(row[4] or 0)
                 + await self._revoke_all_sessions_in_txn(None, now),
             )

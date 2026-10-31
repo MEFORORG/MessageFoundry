@@ -11058,7 +11058,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
 
-    async def run() -> tuple[int, str | None]:
+    async def run() -> tuple[int | None, str | None]:
         store = await _open_store_or_refuse_the_key(
             open_store(
                 settings.store,
@@ -11067,7 +11067,14 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         )
         try:
             _refuse_an_unauditable_write(store)
-            revoked = await store.revoke_all_sessions()
+            try:
+                revoked = await store.revoke_all_sessions()
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
+            except store_call_errors() as exc:
+                # The store opened; the revoke itself was refused and rolled back. Not the open
+                # error the arm below words, which would read as a wrong --db path.
+                return None, f"nothing was revoked: {safe_exc(exc)}. Retry"
             # The revoke has committed. A failed audit append (a running engine holding the
             # write lock past the busy timeout, say) must not read as "nothing happened".
             try:
@@ -11085,7 +11092,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        revoked, unaudited = run_guarded(run())
+        revoked, problem = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -11096,9 +11103,11 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-    if unaudited is not None:
+    if revoked is None:
+        return _emit_error(problem or "nothing was revoked", as_json=args.json)
+    if problem is not None:
         return _emit_error(
-            f"revoked {revoked} session(s), but the audit row could not be written: {unaudited}. "
+            f"revoked {revoked} session(s), but the audit row could not be written: {problem}. "
             "The sessions are ended; record the act by hand",
             as_json=args.json,
         )
@@ -11142,9 +11151,9 @@ def _restore(args: argparse.Namespace) -> int:
     except BackupError as exc:
         # BACKLOG #2614: the primitive states the age; the override is this command's to name.
         hint = ""
-        if exc.kind == "age":
-            # An undated archive passes no limit, so only the flag restores it.
-            larger = "" if "does not say when" in str(exc) else " (or a larger --max-age-days)"
+        if exc.kind in ("age", "age_undated"):
+            # An archive of unknown age passes no limit, so only the flag restores it.
+            larger = " (or a larger --max-age-days)" if exc.kind == "age" else ""
             hint = (
                 f" Choose a newer archive, or pass --allow-old-archive{larger} to restore this one."
             )
