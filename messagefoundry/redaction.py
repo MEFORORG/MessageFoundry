@@ -2663,11 +2663,9 @@ def _own_notes(exc: BaseException) -> Any:
 
 
 #: The note the stdlib adds to an error a codec raised, as ``decoding with 'utf-8' codec failed``.
-#: The name is the ``repr()`` of what the caller passed, so it is matched as a quoted string.
-_CODEC_NOTE = re.compile(
-    r"(?P<op>encoding|decoding) with (?P<name>'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\") "
-    r"codec failed"
-)
+#: The name is what the caller passed, written as it is between single quotes, not its ``repr()``.
+#: A name holding a quote or a line break does not match, so its note is dropped.
+_CODEC_NOTE = re.compile(r"(?P<op>encoding|decoding) with (?P<name>'[^'\n]*') codec failed")
 #: Each name :func:`_names_a_codec` prints, as that note quotes it.
 _KNOWN_CODEC_REPRS = frozenset(repr(name) for name in _KNOWN_CODECS)
 
@@ -3147,8 +3145,11 @@ class _Scan:
     that code may print any of them (vault BACKLOG #3340). The first walk carries that depth, so an
     object it meets both plainly and beneath such an exception is read once, the deep way. An
     object the second walk reads plainly and then reaches more deeply through an attribute is read
-    a second time, for what the deep way adds alone, and charged again: one unit, its elements, and
-    each value that read adds. So an object is read, and charged, at most twice. An object met both
+    a second time, for what the deep way adds alone, and charged again, at most one unit, its
+    non-scalar elements unless the first walk followed them the deep way, and each value read from
+    the readers the plain read lacked. So an object is read, and charged, at most twice. A plain
+    exception, whose ``__str__`` and ``__repr__`` are ``BaseException``'s, is charged only for the
+    values read from it, never the unit, as origin/main never read it at all. An object met both
     ways is read the deep way, so a plain exception shared with such a holder can print as a note
     where it is met plainly too.
 
@@ -3269,14 +3270,20 @@ class _Scan:
                     children = found = _children(arg, kind, budget)
                 else:
                     children, found = [], []
-                budget -= 1 + len(found)
+                # A plain exception, which origin/main never read, pays only for what it holds,
+                # so a crowd of them beneath a holder cannot spend the budget a sibling needs.
+                # Each one is a first-walk object or a charged element, so the work stays bounded.
+                plain = shallow is None and slots is not None
+                budget -= (0 if plain else 1) + len(found)
                 # Read once already through the same slots: nothing new to read by attribute.
                 if slots is not None and budget > 0 and (before is None or slots is not shallow):
                     held = _attribute_values(arg, slots, budget)
+                    # Charged for every value read, before a repeat is dropped: a limit filled by
+                    # repeats then shows as a spent budget, never as a reader silently left unread.
+                    budget -= len(held)
                     if before is not None and held:  # read once already: add only what is new
                         have = {id(child) for child in children}
                         held = [value for value in held if id(value) not in have]
-                    budget -= len(held)
                     children, found = children + held, found + held
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)

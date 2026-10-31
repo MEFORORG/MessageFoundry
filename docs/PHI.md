@@ -1693,7 +1693,9 @@ along the whole chain, and reads at least the instance `__dict__`, the slots and
 of each exception it reaches that way, within the budget below (vault BACKLOG #3340). So such a class raised from a codec
 error, or while one was being handled, loses its message the same way. An exception whose
 `__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
-stores an error on an attribute keeps its message. Some builtin exceptions define their own, at
+stores an error on an attribute keeps its message, except where the same exception is also reached
+beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
+fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
 fixed note even where its own `__str__` would not print it. A builtin's `__str__` never prints
 the chain, so a builtin exception raised from a codec error keeps its message. The rule applies
@@ -1706,16 +1708,20 @@ all dropped. A `UnicodeError`'s own notes are dropped too, except the note a cod
 such as `decoding with 'utf-8' codec failed`, which keeps the codec's name only where
 `safe_exc()` would print it and otherwise reads `decoding with a codec failed`. A note a caller
 added is dropped even when it is plain text, since it can be built from the failing input, as
-`add_note(f"segment {seg!r}")` (vault BACKLOG #3340).
+`add_note(f"segment {seg!r}")` (vault BACKLOG #3340). An exception that neither is nor holds a
+codec error keeps its notes as they are, so a codec error placed among them still prints raw.
 
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-A slot or chain link that holds None is not counted. An object the unlimited first pass reaches
-both plainly and beneath an exception whose own code renders it is read once, the deeper way.
-One read plainly and then reached more deeply through an attribute is read and charged a second
-time: one unit, its elements, and each value the deeper read adds. So an object is charged at
-most twice. When it runs out the filter leaves the rest as it is, and which objects those are is
+A slot or chain link that holds None is not counted, and an exception whose `__str__` and
+`__repr__` are `BaseException`'s own pays only for the values read from it, not for being read.
+An object the unlimited first pass reaches both plainly and beneath an exception whose own code
+renders it is read once, the deeper way. One read plainly and then reached more deeply through an
+attribute is read and charged a second time, at most: one unit, the elements that are not plain
+values when the first pass did not already follow them the deeper way, and each value the deeper
+read takes from the readers the plain read lacked. So an object is charged at most twice. When it
+runs out the filter leaves the rest as it is, and which objects those are is
 not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read

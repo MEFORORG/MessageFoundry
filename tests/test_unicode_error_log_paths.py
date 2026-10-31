@@ -2095,8 +2095,8 @@ class _OwnStrError(Exception):
 def test_an_exception_with_no_chain_costs_what_it_did_before_the_chain_was_read() -> None:
     # Review of vault BACKLOG #3340: each read charged both chain links even when both were None,
     # so 1,500 such exceptions cost three units each where origin/main charged one, and an error a
-    # sibling held by attribute printed raw.
-    crowd = [_OwnStrError() for _ in range(1500)]
+    # sibling held by attribute printed raw. Sized from the budget: one unit each fits, three do not.
+    crowd = [_OwnStrError() for _ in range(redaction._ATTRIBUTE_BUDGET // 2)]
     record = _record("got %r", ([crowd, _Held(_encode_error())],))
     RedactionFilter().filter(record)
     out = record.getMessage()
@@ -2105,16 +2105,17 @@ def test_an_exception_with_no_chain_costs_what_it_did_before_the_chain_was_read(
         assert spelling not in out
 
 
-def test_plain_exceptions_beneath_an_exceptions_own_code_cost_one_unit_each() -> None:
-    # Review of vault BACKLOG #3340: beneath _Batch each RuntimeError is read the deep way, and its
-    # two empty chain links were charged, so 1,400 of them spent the budget.
-    batch = _Batch("bad", [RuntimeError(i) for i in range(1400)])
-    record = _record("got %r", ([batch, _Held(_encode_error())],))
-    RedactionFilter().filter(record)
-    out = record.getMessage()
-    assert "[_Held holding a codec error, not rendered]" in out
-    for spelling in _CHAR_SPELLINGS:
-        assert spelling not in out
+@pytest.mark.parametrize("extra", [-2000, 1000], ids=["under-budget", "over-budget"])
+def test_plain_exceptions_beneath_an_exceptions_own_code_cost_nothing_when_empty(
+    extra: int,
+) -> None:
+    # Review of vault BACKLOG #3340: beneath _Batch each RuntimeError is read the deep way. Its two
+    # empty chain links were charged, and then the read itself, so more of them than the budget
+    # spent it, where origin/main never read a plain exception and printed the note.
+    batch = _Batch("bad", [RuntimeError(i) for i in range(redaction._ATTRIBUTE_BUDGET + extra)])
+    held = _Held(_encode_error())
+    # The scan's own verdict: the rendered line is cut short by its length bound before _Held.
+    assert id(held) in redaction._Scan([batch, held]).holds
 
 
 class _PrintsInnerCause(Exception):
