@@ -49,6 +49,7 @@ import base64
 import concurrent.futures
 import functools
 import http.client
+import itertools
 import json
 import logging
 import re
@@ -56,6 +57,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from array import array
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, NamedTuple, overload
 
@@ -405,24 +407,178 @@ _REPLY_REPEATS_A_KEY_CODE = "reply-repeats-a-key"
 
 
 class _ThirdReading(ValueError):
-    """A key occurs with a value equal to neither its first nor its last. Carries no key or value."""
+    """An occurrence of a repeated key reads a third way: it is a node equal to neither the key's
+    first nor its last occurrence, or it reads two ways itself. Carries no key or value."""
 
 
-def _keep_first_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+class _TooManyNodes(ValueError):
+    """Judging a reply would take more than :data:`_NODE_BUDGET` interning steps. Carries no key or
+    value."""
+
+
+#: A backstop on the work one judgment of a repeated-key reply does: the most interning steps
+#: (:meth:`_NodeIds._intern`) it takes, across both readings, before it fails closed. A step is one
+#: string, number, ``true``, ``false``, ``null``, object or list, or one object key, repeats
+#: included. Only the occurrences of repeated keys (with everything below them) and the values the
+#: two readings are compared on are interned, so the rest of a reply costs nothing here, however
+#: large. Without the backstop, a reply at the 16 MiB read cap whose repeated occurrences held
+#: most of it would intern millions of values (vault BACKLOG #3796).
+_NODE_BUDGET = 250_000
+
+
+class _NodeIds:
+    """Canonical ids for JSON values, so two values compare by what they are as JSON (vault BACKLOG
+    #3796). Python equality would not do: ``1 == True``, ``1 == 1.0``, ``0.0 == -0.0``, and a NaN is
+    unequal even to itself. Here the type is part of the id, a float is keyed by the exact bits of
+    the double ``json`` parsed it to (so ``1.0`` and ``1.00`` are one value), and every NaN token is
+    one value. An object's id ignores key order.
+
+    Ids are interned bottom-up, each container once, by walking with a stack rather than by
+    recursion, so nothing recurses at any depth ``json`` parses (vault BACKLOG #3796 records a
+    compare, reverted in engine PR 2356, that recursed and was exponential). A value is interned
+    only when :meth:`node` is asked for it. Every interning key hashes through a ``str`` or
+    ``bytes`` value, whose hash Python seeds per process, except six whose hash is fixed:
+    ``true``, ``false``, ``null``, and the empty string, object and list. So while
+    ``PYTHONHASHSEED`` is unset or random a reply cannot be built offline to make the keys
+    collide. An object's pairs are sorted, so the expected work for a value is at most its size
+    times the log of its widest object. At most :data:`_NODE_BUDGET` interning steps run, else
+    :class:`_TooManyNodes`.
+
+    Each container interned is held (``_memo``) for as long as this lives, so the ``id()`` it is
+    looked up by cannot be reused by another object meanwhile. Whether a value reads two ways (some
+    object at or below it repeats a key whose first and last occurrences are different nodes) is
+    recorded per container in ``_memo``, not per id: two containers with one id can differ in it,
+    since an object's id is that of its keep-first reading. :class:`_KeepFirstKey` marks each
+    object whose own repeat reads two ways (:meth:`mark_two_ways`, also held); :meth:`node` carries
+    the flag up through the lists and objects above it."""
+
+    __slots__ = ("_interned", "_memo", "_table", "_two_ways")
+
+    def __init__(self) -> None:
+        self._table: dict[object, int] = {}
+        self._memo: dict[int, tuple[object, int, bool]] = {}
+        self._two_ways: dict[int, object] = {}
+        self._interned = 0
+
+    def _intern(self, key: object) -> int:
+        self._interned += 1
+        if self._interned > _NODE_BUDGET:
+            raise _TooManyNodes
+        return self._table.setdefault(key, len(self._table))
+
+    def leaf(self, value: object) -> int:
+        """The id of a string, number, ``true``, ``false`` or ``null``."""
+        # The type tag keeps bool, int, float, str and null apart; float.hex keeps -0.0 apart from
+        # 0.0 and gives every NaN one spelling. An int is keyed by its text, because an int's own
+        # hash is not seeded: a reply could fill the table with ints that collide.
+        if type(value) is float:
+            return self._intern((float, value.hex()))
+        if type(value) is int:
+            return self._intern((int, str(value)))
+        return self._intern((type(value), value))
+
+    def mark_two_ways(self, obj: dict[str, Any]) -> None:
+        """Mark an object that repeats a key whose first and last occurrences differ."""
+        self._two_ways[id(obj)] = obj
+
+    def node(self, value: object) -> tuple[int, bool]:
+        """``value``'s id, and whether it reads two ways. An object is keyed by the ids of its keys
+        and the values it keeps, sorted and packed into ``bytes``; a list by its items' ids in
+        order, packed the same way, for the reason the class gives."""
+        if not isinstance(value, (dict, list)):
+            return self.leaf(value), False
+        memo = self._memo
+        hit = memo.get(id(value))
+        if hit is None:
+            # Every container not yet seen, parents before children, so the reverse puts each
+            # container after everything below it.
+            order: list[Any] = []
+            stack: list[Any] = [value]
+            while stack:
+                container = stack.pop()
+                order.append(container)
+                items = container.values() if isinstance(container, dict) else container
+                # A plain loop, for the reason :meth:`_KeepFirstKey.__call__` gives.
+                for child in items:
+                    if isinstance(child, (dict, list)) and id(child) not in memo:
+                        stack.append(child)
+                        # Containers only, against the steps left: the leaves of a container
+                        # already collected are still iterated, and their interning trips the
+                        # budget later.
+                        if len(order) + len(stack) > _NODE_BUDGET - self._interned:
+                            raise _TooManyNodes
+            for container in reversed(order):
+                items = container.values() if isinstance(container, dict) else container
+                two_ways = id(container) in self._two_ways
+                ids: list[int] = []
+                for item in items:
+                    if isinstance(item, (dict, list)):
+                        _, item_id, item_two_ways = memo[id(item)]
+                        two_ways = two_ways or item_two_ways
+                    else:
+                        item_id = self.leaf(item)
+                    ids.append(item_id)
+                if isinstance(container, dict):
+                    kept = [(self.leaf(key), n) for key, n in zip(container, ids, strict=True)]
+                    kept.sort()
+                    intern_key: object = (
+                        dict,
+                        array("Q", itertools.chain.from_iterable(kept)).tobytes(),
+                    )
+                else:
+                    intern_key = (list, array("Q", ids).tobytes())
+                memo[id(container)] = (container, self._intern(intern_key), two_ways)
+            hit = memo[id(value)]
+        return hit[1], hit[2]
+
+
+class _KeepFirstKey:
     """An ``object_pairs_hook`` that keeps the FIRST of two equal keys, where ``json`` keeps the
-    last: the reading a server that keeps the first would make. Raises :class:`_ThirdReading` when
-    a key occurs three or more times and some occurrence equals neither its first nor its last
-    value, since comparing the first and last readings would never see it."""
-    first: dict[str, Any] = {}
-    last: dict[str, Any] = {}
-    for key, value in pairs:
-        first.setdefault(key, value)
-        last[key] = value
-    if len(first) != len(pairs) and any(
-        value != first[key] and value != last[key] for key, value in pairs
-    ):
-        raise _ThirdReading
-    return first
+    last: the reading a server that keeps the first would make. One instance serves one parse. An
+    object with no repeated key costs only its own dict; an object that repeats a key has every
+    occurrence of that key interned (:class:`_NodeIds`), with everything below it, and nothing else.
+
+    Raises :class:`_ThirdReading` when an occurrence of a repeated key reads two ways itself, at
+    any depth below it, or when a key occurs three or more times and some occurrence is a node
+    equal to neither its first nor its last occurrence, since comparing the first and last readings
+    would never see either. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule."""
+
+    __slots__ = ("ids",)
+
+    def __init__(self) -> None:
+        self.ids = _NodeIds()
+
+    def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        # Plain loops, not generator expressions: this runs at the innermost object, the deepest
+        # point on the stack, and a generator consumed by a C call re-enters the eval loop there,
+        # which lowers the depth this parse takes (measured 2026-10-30, vault BACKLOG #3796).
+        first: dict[str, Any] = {}
+        for key, value in pairs:
+            first.setdefault(key, value)
+        if len(first) == len(pairs):
+            return first
+        occurrences: dict[str, list[Any]] = {}
+        for key, value in pairs:
+            occurrences.setdefault(key, []).append(value)
+        node = self.ids.node
+        two_ways = False
+        for values in occurrences.values():
+            if len(values) == 1:
+                continue
+            seen: list[int] = []
+            for value in values:
+                node_id, value_two_ways = node(value)
+                if value_two_ways:
+                    raise _ThirdReading
+                seen.append(node_id)
+            first_node, last_node = seen[0], seen[-1]
+            for node_id in seen:
+                if node_id != first_node and node_id != last_node:
+                    raise _ThirdReading
+            two_ways = two_ways or first_node != last_node
+        if two_ways:
+            self.ids.mark_two_ways(first)
+        return first
 
 
 def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -457,9 +613,10 @@ def _entry_verdict(obj: dict[str, Any]) -> DeliveryError | str:
     return _capture_outcome_of(outcome) if outcome is not None else "accepted"
 
 
-def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
+def _reply_reading(obj: dict[str, Any], ids: _NodeIds) -> tuple[object, ...]:
     """The judgment :func:`_unwrap_transaction_reply` reaches on a parsed reply, plus the values a
-    delivery takes from it. Two readings that give equal tuples are judged identically; the rule is
+    delivery takes from it, each as its canonical id in ``ids`` (:class:`_NodeIds`), so ``1`` and
+    ``true`` differ there. Two readings that give equal tuples are judged identically; the rule is
     stated once, in ADR 0095 Amendment B.1 (the 2026-10-17 entry)."""
     verdict = _entry_verdict(obj)
     judged: tuple[object, ...] = (
@@ -475,31 +632,69 @@ def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
     consumed = (
         () if response is None else tuple(response.get(f) for f in _ENTRY_RESPONSE_HEADERS.values())
     )
-    return (obj.get("resourceType"), response is not None, judged, consumed)
+
+    def node_id(value: object) -> int:
+        return ids.node(value)[0]
+
+    return (
+        node_id(obj.get("resourceType")),
+        response is not None,
+        tuple(map(node_id, judged)),
+        tuple(map(node_id, consumed)),
+    )
+
+
+def _both_readings(text: str) -> dict[str, Any] | str | None:
+    """The plain reading of ``text`` when it and the keep-first reading agree, ``None`` when the
+    plain read is not a JSON object, else a content-free reason: a parse hint, ``disagree``, or the
+    class name of :class:`_TooManyNodes` or ``MemoryError``.
+
+    A helper so that both trees and the id tables go when it returns, before
+    :func:`_agreed_reading` logs or raises: a refusal raised here would hold this frame on its
+    traceback, and a log line written in the handler would allocate with all of them still held.
+
+    A ``MemoryError`` in the plain read escapes, as it did before vault BACKLOG #3796: that read
+    judges nothing, so running out of memory there is not this reply's to refuse."""
+    # The plain read first: a body that is not a JSON object stops here, after one more parse.
+    last, hint = json_loads_or_refusal(text)
+    if hint is not None or not isinstance(last, dict):
+        return None
+    try:
+        keep_first = _KeepFirstKey()
+        first, hint = json_loads_or_refusal(text, object_pairs_hook=keep_first)
+        if hint is not None:
+            return hint
+        # One id table for both readings, so their ids compare.
+        ids = keep_first.ids
+        return last if _reply_reading(first, ids) == _reply_reading(last, ids) else "disagree"
+    except (_TooManyNodes, MemoryError) as exc:
+        return type(exc).__name__
 
 
 def _agreed_reading(body: str) -> dict[str, Any] | None:
     """A reply :class:`FhirPeek` refused, read once keeping the first and once keeping the last
     value of each repeated key (vault BACKLOG #2812). Returns the reading when both are JSON objects
-    and :func:`_reply_reading` gives them equal tuples, or ``None`` when the plain read is not a
-    JSON object, which is judged ``unparseable`` as before. Otherwise, including a body only the
-    plain read can parse, raises the permanent ``reply-repeats-a-key`` refusal, which names neither
-    a key nor a value. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule and its
-    costs."""
-    text = body.lstrip(_BOM)
-    # The plain read first: a body that is not a JSON object stops here, after one more parse.
-    last, hint = json_loads_or_refusal(text)
-    if hint is not None or not isinstance(last, dict):
-        return None
-    first, hint = json_loads_or_refusal(text, object_pairs_hook=_keep_first_key)
-    if hint is not None or _reply_reading(first) != _reply_reading(last):
-        raise NegativeAckError(
-            f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
-            "and is needed here. Check the partner before a replay (FHIR destination)",
-            code=_REPLY_REPEATS_A_KEY_CODE,
-            permanent=True,
+    and :func:`_reply_reading` gives them equal tuples of canonical ids, or ``None`` when the plain
+    read is not a JSON object, which is judged ``unparseable`` as before. Otherwise raises the
+    permanent ``reply-repeats-a-key`` refusal, which names neither a key nor a value: also for a
+    body only the plain read can parse, and for an occurrence of a repeated key that reads a third
+    way (:class:`_KeepFirstKey` refuses that in the same pass, vault BACKLOG #3796). So does a
+    reply whose judgment would take more than :data:`_NODE_BUDGET` interning steps, or that the
+    process runs out of memory judging in the keep-first parse or the compare. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states
+    the rule and its costs."""
+    reading = _both_readings(body.lstrip(_BOM))
+    if reading is None or isinstance(reading, dict):
+        return reading
+    if reading in (_TooManyNodes.__name__, MemoryError.__name__):
+        logger.warning(
+            "a FHIR 2xx reply that repeats a JSON key is too large to judge (%s)", reading
         )
-    return last
+    raise NegativeAckError(
+        f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
+        "and is needed here. Check the partner before a replay (FHIR destination)",
+        code=_REPLY_REPEATS_A_KEY_CODE,
+        permanent=True,
+    )
 
 
 def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
@@ -753,8 +948,8 @@ def _unwrap_transaction_reply(
     ``status`` text or ``outcome``.
 
     A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
-    each key (vault BACKLOG #2812), and judged as any other only when the readings agree; see
-    :func:`_agreed_reading`.
+    each key (vault BACKLOG #2812), and judged as any other only when the readings agree and no
+    occurrence of a repeated key reads a third way (vault BACKLOG #3796); see :func:`_agreed_reading`.
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even

@@ -11,6 +11,7 @@ is built through the store's own transitions, the way ``tests/test_approvals.py`
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import time
@@ -138,6 +139,53 @@ async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: En
         r = await checker.post(f"/ui/approvals/{approval_id}/reject", headers=SAME_ORIGIN)
     assert r.status_code == 303
     assert await _status(engine, approval_id) == "rejected"
+
+
+async def test_a_listing_that_shows_a_lost_standing_writes_one_row(engine: Engine) -> None:
+    """Vault BACKLOG #3747, the console plane: this route calls the JSON handler directly, past its
+    ``require``, so the row must come from the handler. Reached through the real route and the
+    seam, and each listing writes its own."""
+    service, maker_id, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        # The control: the same queue, nothing withdrawn, no row.
+        assert (await checker.get("/ui/approvals")).status_code == 200
+        assert await engine.store.list_audit(action="approval.standing_shown") == []
+        await service.set_roles(maker_id, [Role.VIEWER.value], actor="test")
+        for _ in range(2):
+            r = await checker.get("/ui/approvals")
+            assert r.status_code == 200
+            assert f'action="/ui/approvals/{approval_id}/approve"' not in r.text
+    rows = await engine.store.list_audit(action="approval.standing_shown")
+    assert len(rows) == 2
+    for row in rows:
+        assert (row["actor"], row["client"]) == ("checker", "127.0.0.1")
+        # The text, not the parsed object, because the key order is the contract.
+        assert str(row["detail"]) == json.dumps({"count": 1, "approval_ids": [approval_id]})
+
+
+async def test_the_page_still_answers_when_the_store_refuses_every_audit_write(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3747: the console writes no grant row, so the standing row is the only audit
+    write on this page, and its loss must not cost the approver the Reject button."""
+    service, maker_id, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        await service.set_roles(maker_id, [Role.VIEWER.value], actor="test")
+
+        async def _refused(*_args: object, **_kwargs: object) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(engine.store, "record_audit", _refused)
+        r = await checker.get("/ui/approvals")
+    assert r.status_code == 200
+    assert f'action="/ui/approvals/{approval_id}/reject"' in r.text
+    assert await engine.store.list_audit(action="approval.standing_shown") == []
 
 
 def _row(aid: str, **update: object) -> PendingApprovalInfo:
@@ -640,8 +688,8 @@ def test_a_release_that_did_no_work_says_so() -> None:
         )
         return str(pages.approval_approved(outcome))
 
-    skipped = _page({"cancelled": 0, "skipped": "outbound running"})
-    assert "The operation skipped its work: outbound running." in skipped
+    skipped = _page({"cancelled": 0, "skipped": "no such outbound connection: OB"})
+    assert "The operation skipped its work: no such outbound connection: OB." in skipped
     degraded = _page({"inbound": 1, "outbound": 1, "degraded": True, "failures": ["audit"]})
     assert "at least one follow-on step failed: audit." in degraded
     # BACKLOG #3015: a released reload says a changed anchor takes a restart, as the inline does.

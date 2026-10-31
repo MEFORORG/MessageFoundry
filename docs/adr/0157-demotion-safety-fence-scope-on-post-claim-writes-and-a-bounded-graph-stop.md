@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was
@@ -1316,6 +1316,17 @@ At least these, read 2026-10-26:
   status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
   stop check between rows, leaves claimed rows that never reached the store. That was true of the
   serial loop too.
+
+  *Amended 2026-10-30 (BACKLOG #2178):* this case is now refused rather than left uncovered.
+  `DatabasePoll` when declared, and `DatabaseSource` when built, refuse any `poll_statement` that
+  fails the `db_lookup` read-only test, so at least an `UPDATE ... RETURNING` or status-flag claim
+  in the poll, and a stored-procedure poll, are refused. In the shipped code the same shape would
+  also have lost the rows past `poll_max_rows` on every full poll, and at least a row whose hand-off
+  failed. With a poll that does
+  not write, a row is marked only by `mark_statement`, after its hand-off, so a cut in the select or
+  at the stop check leaves the row unmarked, and the next poll reads it again. The test reads only
+  the statement's shape, so a poll it does not catch can still claim at the select;
+  `docs/CONNECTIONS.md`, *Database source*, names at least the shapes it misses.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.

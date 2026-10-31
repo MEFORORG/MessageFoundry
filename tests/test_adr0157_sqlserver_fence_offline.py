@@ -91,7 +91,8 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # both DEAD branches; the success path ADMITS and is not guarded. ingress_handoff wraps this
     # transaction so a tag failure is audited after it closes (BACKLOG #2593).
     "_ingress_handoff_txn": (2, 2),
-    # Its dead-and-consume helper, nested in it and shared by the corrupt-ref and origin-tag branches.
+    # Its dead-and-consume helper, nested in it and shared by every DEAD branch: the corrupt-ref,
+    # origin-tag, missing-artifact and erased-reply ones.
     "_consume_dead": (1, 1),
     # One statement each. The suffix is the epoch guard on the DEAD branch and, since ADR 0157
     # Amendment A, a status term (never an epoch guard) on the retry branch.

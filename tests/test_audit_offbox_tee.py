@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.api.approvals import ApprovalGate
+from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
@@ -202,6 +204,28 @@ async def test_a_teed_record_is_an_anchor_the_verifier_takes_unchanged(
     assert ok, "the walk alone cannot see a cut tail"
     ok, message = await store.verify_audit_chain(expected_prefix=anchor)
     assert not ok and "truncated or rewritten" in (message or "")
+
+
+async def test_a_long_listings_tee_line_keeps_the_count_the_cut_would_lose(
+    store, audit_capture
+) -> None:
+    """Vault BACKLOG #3747: the tee bounds ``detail``, so a long ``approval.standing_shown`` row
+    reaches the wire cut and is no longer JSON. Its ``count`` comes first so the cut copy still says
+    how many requests the listing showed; the on-box row keeps every id. The ids hold no digit
+    run, so nothing here depends on what the redaction chain does to one."""
+    ids = [f"{i:02x}" + "feedface" * 3 + "abcdef" for i in range(12)]
+    gate = ApprovalGate(store, ApprovalsSettings())
+    await gate.record_standing_shown(ids, actor="checker", client="10.4.2.9")
+
+    shipped = _only(audit_capture)["detail"]
+    assert shipped.startswith('{"count": 12, "approval_ids": ["')
+    assert "(+" in shipped  # the cut happened, or this test proves nothing
+    assert [i for i in ids if i in shipped] == ids[:4]
+
+    [row] = await store.list_audit(action="approval.standing_shown")
+    on_box = json.loads(str(row["detail"]))
+    assert list(on_box) == ["count", "approval_ids"]
+    assert on_box == {"count": 12, "approval_ids": ids}
 
 
 # --- the shared redaction path, tested directly (covers Postgres + SQL Server, which wire into the
