@@ -3,10 +3,9 @@
 """BACKLOG #3210: the default alert sink's ``connection_error`` line names the connection and the
 exception class, never the transport's error text.
 
-The runner hands the sink a ``safe_exc`` rendering, which keeps a transport's own words, and those
-can echo payload content. The stored copies, the ``connection_lost`` event's reason and the alert
-instance's reason, are masked until an audited reveal and keep the full text; only the general-log
-line loses it. The planted token stands in for payload content that no redaction pattern matches.
+Why the detail is withheld is stated once, in ``LoggingAlertSink.connection_error``. The stored
+``connection_lost`` reason keeps the full text, which the runner test pins. The planted token stands
+in for payload content that no redaction pattern matches.
 """
 
 from __future__ import annotations
