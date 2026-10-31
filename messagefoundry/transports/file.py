@@ -75,6 +75,7 @@ from messagefoundry.transports.base import (
     register_source,
     resolve_poll_ceiling,
 )
+from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
     "FileDestination",
@@ -731,7 +732,8 @@ class FileSource(SourceConnector):
         self.recursive: bool = bool(s.get("recursive", False))
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
         # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
-        self.encoding: str = s.get("encoding", "utf-8")
+        # The name rule is the one the runner decodes by (BACKLOG #2431).
+        self.encoding: str = declared_encoding(s.get("encoding"))
         self.max_file_bytes: int | None = positive_cap(
             s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
             int,

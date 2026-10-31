@@ -49,7 +49,7 @@ import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from types import CodeType, MappingProxyType, ModuleType
@@ -162,6 +162,7 @@ __all__ = [
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
     "resolved_encoding_problems",
+    "inbound_with_resolved_encoding",
     "resolve_listener_binding",
     "bindings_overlap",
     "Diagnostic",
@@ -5342,8 +5343,9 @@ def inbound_binding_conflicts(
 # --- declared text-encoding validation (BACKLOG #1613) -----------------------
 # A connection's `encoding` names a Python text codec. It is read once when the connector is built
 # and then used PER MESSAGE, so a name Python cannot resolve is invisible at load and at connection
-# start and would first fail on the first real message — where the ingress decode catches only
-# UnicodeDecodeError, so the LookupError escapes uncaught instead of dead-lettering that one message.
+# start and would first fail on the first real message. The ingress decode (`ingress_guards.
+# decode_body`) refuses that message as a `decode` ERROR row since BACKLOG #2431, so it is no longer
+# an escape, but every message on the connection would be refused the same way.
 # Registry.encoding_problems catches it statically; the probe below is how.
 
 
@@ -5423,17 +5425,12 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     other, so this is the missing-value gap and not an encoding gap — widening it belongs with the
     reference table's build-check resolution, unfiled and named rather than numbered.
 
-    **A clean pass here does NOT mean an ``env()``-supplied INBOUND encoding decodes.** Measured
-    2026-09-18: both listener decode sites read ``ic.spec.settings["encoding"]`` RAW, and
-    ``_source_config``'s :func:`resolve_env_settings` writes its result into a copy that is never read
-    back — so the value reaching ``bytes.decode`` is the ``EnvRef`` object itself (``TypeError``), and
-    ``ingress_guards.ingress_encoding`` stringifies the same ref into ``"EnvRef(key=...)"`` and fails
-    the preview with that as the codec name. The outbound half is fine: ``_dest_config`` resolves, so
-    an outbound ``env()`` encoding works and this pass guards it properly. Recorded here because a
-    validation pass that reads as certifying a config the runtime cannot execute is the
-    false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
-    nothing about whether the inbound path can use a good one. Resolving the listener's encoding is a
-    separate change to the ingress hot path — unfiled, and named rather than numbered."""
+    **The inbound decode reads the value this pass probes** (BACKLOG #2431). The sources resolve an
+    ``env()`` encoding when they are built, and the ingress decode, which reads the inbound's own
+    settings, resolves it through :func:`inbound_with_resolved_encoding` against the same values. So
+    a value this pass accepts is the name both the source and the decode use, and a value it refuses
+    never reaches either: a serving engine runs this pass inside ``build_check_registry`` before it
+    builds a connector."""
     problems: list[str] = []
     for kind, name, value, deployed in registry._declared_encodings():
         if not isinstance(value, EnvRef):
@@ -5445,8 +5442,9 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
             continue  # no value here — reported loud by resolve_env_settings at connector build
         if resolved is None or resolved == "":
             # `env("charset", default=None)` is a DECLARED opt-out, not a bad codec name: an explicit
-            # None means "not declared" and falls back to utf-8, which `ingress_guards.ingress_encoding`
-            # states as its own rule (`str(declared) if declared else "utf-8"`). Refusing it here would
+            # None means "not declared" and falls back to utf-8, the rule `transports.framing.
+            # declared_encoding` states (`str(declared) if declared else "utf-8"`) and the listeners,
+            # their replies and `ingress_guards.ingress_encoding` all read. Refusing it here would
             # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that
             # runs correctly — a per-environment override that this environment declines to set. Empty
             # string falls the same way, being the same falsy "unset" spelling out of a TOML value.
@@ -5475,6 +5473,39 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
             f"(environments/<env>.toml or MEFOR_VALUE_*)"
         )
     return problems
+
+
+def inbound_with_resolved_encoding(
+    ic: InboundConnection, env_values: Mapping[str, Any]
+) -> InboundConnection:
+    """``ic`` with an ``env()``-supplied ``encoding`` resolved against ``env_values``, for the decode.
+
+    The sources resolve every ``env()`` setting through :func:`resolve_env_settings` when they are
+    built, but the ingress decode (``ingress_guards.ingress_encoding``) reads the inbound's own
+    ``spec.settings``, where an ``env()`` encoding is still the reference. Without this the decode
+    read the reference as a codec name and refused every message (BACKLOG #2431). The listeners and
+    the dry-run both pass ``ic`` through here, so the name they decode by is the one the source got.
+
+    Returned unchanged when there is nothing to resolve: a literal encoding, a ``deployed=False``
+    connection (ADR 0111: its ``env()`` values are never resolved), or a ref with no value here.
+    Also unchanged when the value resolves to something that is not a usable text codec name, which
+    :func:`resolved_encoding_problems` refuses at load. The decode then refuses the reference as a
+    backstop, and the refusal text names the reference, never the environment value."""
+    declared = ic.spec.settings.get("encoding")
+    if not isinstance(declared, EnvRef) or not ic.deployed:
+        return ic
+    try:
+        resolved = _resolve_one_env_value(declared, env_values)
+    except Exception:  # noqa: BLE001 - a user cast; its text can quote the value (BACKLOG #1656)
+        # Not logged: the exception can carry the environment value. The decode then refuses the
+        # reference, which records an ERROR row rather than escaping into the transport.
+        return ic
+    if resolved is _UNSET:
+        return ic
+    if resolved and not (isinstance(resolved, str) and _is_text_codec(resolved)):
+        return ic
+    settings = {**ic.spec.settings, "encoding": resolved}
+    return replace(ic, spec=replace(ic.spec, settings=settings))
 
 
 def _outbound_record_name(name: str) -> str:
@@ -5810,8 +5841,19 @@ class Registry:
                 # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
                 # try/except wide enough to catch that could not tell it from a real failure.
                 continue
+            if value is None:
+                continue  # an explicit "not declared": the decode falls back to utf-8
             if not isinstance(value, str):
-                continue  # not a literal codec name — nothing this pass can probe
+                # A literal such as `encoding = 8` or `true`. The run-time rule would stringify it into
+                # a name no codec has and refuse every message, and a DATABASE source poll would fail
+                # outright, so it is refused here instead (BACKLOG #2431). The type is named so the
+                # operator is not sent hunting a misspelling.
+                problems.append(
+                    f"{kind} {name!r}: encoding is a {type(value).__name__}, not a codec name — "
+                    f"every message would fail at decode/encode; use a codec name such as 'utf-8', "
+                    f"'latin-1' or 'cp1252'"
+                )
+                continue
             if not _is_text_codec(value):
                 problems.append(
                     f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
@@ -5828,7 +5870,8 @@ class Registry:
         because they carry three different promises (BACKLOG #1767) and collapsing the last two is
         the exact false-green BACKLOG #1613 built this census against:
 
-        * ``checked`` — a literal codec name, probed right here by :meth:`encoding_problems`.
+        * ``checked`` — a literal value, judged right here by :meth:`encoding_problems`: a codec name
+          is probed, and any other literal but ``None`` is refused (BACKLOG #2431).
         * ``deferred`` — an :func:`env` ref on a DEPLOYED entry. Not probed here;
           :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, which has the
           environment values. The word is *deferred* and not *checked* because that pass can be
@@ -5839,15 +5882,13 @@ class Registry:
           :func:`resolved_encoding_problems` names.
         * ``unchecked`` — nothing probes it on any path. The population this bucket exists for is an
           :func:`env` ref on a ``deployed=False`` connection, whose values ADR 0111 forbids resolving.
-          A value that is neither a literal string nor an ``env()`` ref falls here too — unreachable
-          from the factories, which all declare ``encoding: str``, and nothing probes it either.
 
         The three are derived from the total, so no entry can fall into a silent fourth bucket. Only a
         connector type with no ``encoding`` argument at all is in none of them — every other factory
         writes its ``utf-8`` default into ``settings``, so leaving the argument off still counts as
         checked."""
         declared = list(self._declared_encodings())
-        checked = sum(1 for _k, _n, value, _d in declared if isinstance(value, str))
+        checked = sum(1 for _k, _n, value, _d in declared if not isinstance(value, EnvRef))
         deferred = sum(
             1 for _k, _n, value, deployed in declared if isinstance(value, EnvRef) and deployed
         )
@@ -9512,6 +9553,19 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
             cause = _textless_import_error(exc)
+    except SystemExit:
+        # A module that calls sys.exit() at import is a bad config, not a request to end the process
+        # (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module
+        # leave SystemExit alone because it is not their kind of failure; this runs the author's module:
+        # on a serving engine (a reload, a connection-flag write) the SystemExit would leave the
+        # event loop and stop every connection, and at `check` it would end the run as if it had
+        # passed. So it is refused like any failing module. KeyboardInterrupt still propagates. The
+        # exit code is not quoted, since it may be the author's text.
+        helpers.unregister(mod_name, module)
+        withheld = WiringError(
+            f"error loading config module {path.name}: it, or a helper it loads, called sys.exit() "
+            "at import, which config code may not do"
+        )
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.

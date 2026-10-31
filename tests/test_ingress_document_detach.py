@@ -613,3 +613,86 @@ async def test_binding_a_streaming_listener_emits_the_warning(store: MessageStor
     assert len(budget_lines) == 1  # exactly the streaming one, not its plain sibling
     assert "IB_STREAMS" in budget_lines[0]
     assert "IB_PLAIN" not in budget_lines[0]
+
+
+# --- an HL7 escape in a document's OBX-5.5 (vault BACKLOG #2809) ---------------------------------
+# Message.field decodes `\X0D\` to a real CR, so the detach would store a value that is not the
+# sender's bytes, and Message.set refuses a CR at every later re-attach. Base64 needs no escape, so the
+# detach refuses the message before the ACK instead.
+
+
+def _escaped_b64(escape: str = "\\X0D\\") -> str:
+    b64 = _big_b64(2000)
+    return b64[:100] + escape + b64[100:]
+
+
+@pytest.mark.parametrize("escape", ["\\X0D\\", "\\E\\"])
+async def test_an_escape_in_obx_5_5_is_refused_at_detach_with_an_error_row_and_ar(
+    store: MessageStore, escape: str
+) -> None:
+    raw = _hl7_with_doc(_escaped_b64(escape))
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "escaped document in OBX-5.5" in ack
+    msgs = await _messages(store)
+    assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    assert "streaming detach failed" in msgs[0]["error"]
+    assert "escape sequence" in msgs[0]["error"]
+    assert await _attachments(store) == []  # nothing was detached, so nothing can fail re-attach
+
+
+async def test_the_http_listener_refuses_an_escape_in_obx_5_5_too(store: MessageStore) -> None:
+    raw = _hl7_with_doc(_escaped_b64())
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+
+    assert await runner._handle_inbound_http(ic, raw.encode("utf-8")) is None
+
+    msgs = await _messages(store)
+    assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    assert "escape sequence" in msgs[0]["error"]
+    assert await _attachments(store) == []
+
+
+async def test_an_escape_in_a_later_document_stores_none_of_the_earlier_ones(
+    store: MessageStore,
+) -> None:
+    """Every document is checked before the first is stored, so a refusal leaves no orphaned
+    attachment behind for a clean document that came ahead of the escaped one."""
+    clean = f"OBX|1|ED|PDF^Report||^Application^PDF^Base64^{_big_b64(2000)}||||||F\r"
+    raw = _hl7_with_doc(_escaped_b64()).replace("OBX|1|", clean + "OBX|2|")
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+
+    assert _ack_code(await runner._handle_inbound(ic, raw.encode("utf-8"))) == "AR"
+
+    assert await _attachments(store) == []
+    cur = await store._db.execute("SELECT COUNT(*) FROM attachment_chunk")
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 0
+
+
+async def test_clean_base64_still_detaches_and_rehydrates_verbatim(store: MessageStore) -> None:
+    """The control for the refusal above: the same message with clean base64 round-trips."""
+    b64 = _big_b64(2000)
+    raw = _hl7_with_doc(b64)
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
+
+    assert _ack_code(await runner._handle_inbound(ic, raw.encode("utf-8"))) == "AA"
+
+    skeleton = (await _messages(store))[0]["raw"]
+    hydrated = await runner._hydrate_payload(skeleton)
+    assert Message.parse(hydrated).field("OBX-5.5") == b64
+
+
+def test_an_escape_outside_obx_5_5_does_not_refuse_the_document() -> None:
+    """The check reads OBX-5.5 alone: an escape in another component of OBX-5 is the sender's
+    ordinary HL7 and leaves the document detachable."""
+    b64 = _big_b64(300)
+    msg = Message.parse(_hl7_with_doc(b64, obx_type="App\\T\\lication"))
+    assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg)] == [(1, b64)]

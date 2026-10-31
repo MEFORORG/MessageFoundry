@@ -238,6 +238,40 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     assert fetched_row["n"] == 0, "a refused body reached the ingress stage"
 
 
+@pytest.mark.parametrize(
+    ("encoding", "body", "status"),
+    [
+        # The inbound's codec NAME is unusable: every body fails alike until the configuration
+        # changes, so the sender is told to retry, as MLLP answers AE.
+        pytest.param("not-a-real-codec", HL7.encode("utf-8"), 503, id="unusable_codec_name"),
+        # Bytes invalid in a usable charset are this body's fault: still 422, as MLLP answers AR.
+        pytest.param("utf-8", HL7.replace("JANE", "J\xc9NE").encode("latin-1"), 422, id="bad_body"),
+    ],
+)
+async def test_an_unusable_codec_name_is_503_and_a_bad_body_422_each_with_one_error_row(
+    store: MessageStore, encoding: str, body: bytes, status: int
+) -> None:
+    """BACKLOG #2431: a 422 tells a client the body is permanently unacceptable, which is false when
+    the inbound's own configuration refused it. Both keep the ERROR row as the count-and-log record."""
+    ic = build_inbound_connection("IB_HTTP", Http(port=0), router="r")
+    ic.spec.settings["encoding"] = encoding  # past the load-time name check, as a bad value lands
+    src = await _start_source(store, ic)
+    try:
+        resp = await _http(src.sockport, body=body)
+    finally:
+        await src.stop()
+    assert resp.status == status
+    assert resp.body == b'{"error":"message was not accepted"}'
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = list(await cur.fetchall())
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert str(rows[0]["error"]).startswith("decode error (")
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0, "a refused body reached the ingress stage"
+
+
 async def test_post_ingress_failure_does_not_change_http_status(store: MessageStore) -> None:
     """AC-3: the 202 is returned at ingress, BEFORE any routing/transform runs — no worker is draining
     here, so a downstream failure (which would happen later) cannot retroactively change the status."""

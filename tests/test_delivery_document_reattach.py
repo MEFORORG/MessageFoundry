@@ -32,7 +32,13 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
+from messagefoundry.config.models import (
+    BatchConfig,
+    ConnectorType,
+    ContentType,
+    InternalErrorPolicy,
+    RetryPolicy,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -50,9 +56,9 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 DEST = "OB_EPIC"
 DEST2 = "OB_EPIC_2"
@@ -305,6 +311,75 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     assert _obx5_5(col.deliveries[0]) == b64  # retry delivered the identical verbatim frame
 
 
+async def _store_doc_with_a_cr(store: MessageStore) -> str:
+    """A stored document holding a real CR, as a detach that decoded ``\\X0D\\`` would have left it
+    before vault BACKLOG #2809. ``Message.set`` refuses it at every re-attach."""
+    b64 = _big_b64(600)
+    return await _store_doc(store, b64[:100] + "\r" + b64[100:])
+
+
+async def test_hydrate_a_reattach_the_payload_breaks_is_a_permanent_refusal(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #2809 step 2: the same payload fails the same way on every attempt, so it must not
+    # be the retryable DeliveryError, nor escape as a bare ValueError to the internal-error arm.
+    ref = await _store_doc_with_a_cr(store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    with pytest.raises(NegativeAckError) as ei:
+        await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    assert ei.value.permanent is True
+    assert ei.value.code == "reattach"
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+async def test_a_non_hl7_payload_carrying_a_real_handle_is_never_delivered(
+    store: MessageStore,
+) -> None:
+    # ADR 0105: a handle never reaches the wire. A Handler can copy a real handle into a JSON body,
+    # which the re-attach cannot read, so the row must fail closed rather than deliver the handle
+    # unhydrated and be marked DONE (vault BACKLOG #2809).
+    ref = await _store_doc(store, _big_b64(600))
+    payload = '{"note": "' + make_doc_ref(ref, "application/pdf") + '"}'
+    await store.enqueue_message(
+        channel_id="c1", raw=payload, deliveries=[(DEST, payload)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+
+    with pytest.raises((NegativeAckError, DeliveryError)):
+        await runner._hydrate_payload(payload)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DONE.value, 0) == 0
+
+
+async def test_a_reattach_the_payload_breaks_dead_letters_the_row(store: MessageStore) -> None:
+    ref = await _store_doc_with_a_cr(store)
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    # Under STOP the internal-error arm would halt the whole lane on this one message, which is how
+    # the pre-fix code handled it. A permanent refusal never reaches that arm.
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is not _ItemOutcome.STOPPED
+    assert retry_until is None  # not re-pended for a retry that could never succeed
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 1
+
+
 # --- batch path -----------------------------------------------------------------------------------
 
 
@@ -332,6 +407,38 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
     assert len(col.deliveries) == 1  # one BHS…BTS envelope
     members = split_batch(col.deliveries[0])
     assert [Message.parse(m).field("OBX-5.5") for m in members] == [a, b]  # both hydrated verbatim
+
+
+async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #2809: the permanent re-attach refusal is the one member's, as a frame refusal
+    # is, so its healthy sibling still goes out in the envelope.
+    from messagefoundry.parsing.split import split_batch
+
+    a = _big_b64(600)
+    ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
+    sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
+    sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
+    await store.enqueue_message(channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0)
+    await store.enqueue_message(channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0)
+
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert len(col.deliveries) == 1
+    assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
+    stats = await store.stats()
+    assert stats.get(OutboxStatus.DEAD.value, 0) == 1
+    assert stats.get(OutboxStatus.DONE.value, 0) == 1
 
 
 # --- end-to-end Shape A: doc present at ingress → detach → pass-through → delivery hydrates --------

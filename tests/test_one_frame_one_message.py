@@ -54,6 +54,8 @@ from messagefoundry.transports.framing import (
 )
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
+from messagefoundry.transports.timer import TimerSource
+from messagefoundry.transports.x12 import X12Source
 
 SB, EB, CR, BS, NUL = "\x0b", "\x1c", "\r", chr(92), "\x00"
 ENC = "^~" + BS + "&"
@@ -569,6 +571,101 @@ def test_frame_reply_neutralises_a_frame_byte_instead_of_raising() -> None:
     assert wire.count(b"\x0b") == 1 and wire.count(b"\x1c") == 1
     assert _frames(MLLP_CODEC, wire) == [(MSH + CR + "MSA|AA|C 1 " + CR).encode("utf-8")]
     assert frame_reply(MLLP_CODEC, CLEAN, "utf-8") == MLLP_CODEC.frame(CLEAN)
+
+
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "undefined", "base64"])
+def test_frame_reply_sends_utf8_when_the_inbound_charset_cannot_encode_it(encoding: str) -> None:
+    """BACKLOG #2431: the runner answers an unusable codec name with AE, and that AE must still
+    reach the sender rather than raise here after the ERROR row is written."""
+    assert frame_reply(MLLP_CODEC, CLEAN, encoding) == MLLP_CODEC.frame(CLEAN)
+
+
+def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLAUDE.md section 6: the fallback is never silent. The setting is configuration that may hold
+    anything, so the warning names the connection and leaves the value out."""
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
+        # Every message on that inbound fails alike, so a second reply adds no line.
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "IB_FALLBACK_LOG_ADT" in warnings[0] and "utf-8" in warnings[0]
+    assert "zz-secretish-codec" not in warnings[0]
+
+
+def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() -> None:
+    """``idna`` is a usable codec that raises for one reply. That is the reply's fault, so it is not
+    sent in utf-8 under an "unusable charset" warning, as ``decode_body`` decides it by the name."""
+    with pytest.raises(UnicodeError):
+        frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
+
+
+@pytest.mark.parametrize("declared", [b"latin-1", 8859])
+def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
+    """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE
+    the runner built for it was never sent. Both listeners now hold the name the decode reads."""
+    mllp = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    tcp = TcpSource(
+        Source(
+            type=ConnectorType.TCP,
+            settings={"host": "127.0.0.1", "port": 0, "framing": "stx_etx", "encoding": declared},
+        )
+    )
+    assert mllp.encoding == tcp.encoding == str(declared)
+    assert frame_reply(MLLP_CODEC, CLEAN, mllp.encoding) == MLLP_CODEC.frame(CLEAN)
+    assert frame_reply(STX_ETX_CODEC, CLEAN, tcp.encoding) == STX_ETX_CODEC.frame(CLEAN)
+
+
+@pytest.mark.parametrize("declared", [None, ""])
+def test_the_timer_and_x12_sources_read_an_undeclared_encoding_as_utf8(declared: object) -> None:
+    """BACKLOG #2431: an explicit ``None`` or empty ``encoding`` is "not declared", as on the
+    listeners. These sources used ``str()`` of it, so a timer refused to build on a ``LookupError``
+    for a codec named ``None`` and an X12 source held that name for its replies."""
+    timer = TimerSource(
+        Source(
+            type=ConnectorType.TIMER,
+            settings={"body": "x", "run_once": True, "encoding": declared},
+        )
+    )
+    x12 = X12Source(
+        Source(
+            type=ConnectorType.X12,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    assert timer.encoding == x12.encoding == "utf-8"
+    assert timer._body_bytes == b"x"
+
+
+async def test_the_mllp_listener_sends_its_reply_when_its_encoding_is_not_a_str() -> None:
+    async def handler(raw: bytes) -> str:
+        return CLEAN
+
+    source = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": b"latin-1"},
+        )
+    )
+    await source.start(handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            writer.write(MLLP_CODEC.frame(CLEAN))
+            await writer.drain()
+            got = await asyncio.wait_for(reader.readuntil(b"\x1c"), 5)
+        finally:
+            writer.close()
+    finally:
+        await source.stop()
+    assert got == MLLP_CODEC.frame(CLEAN)[: len(got)]
 
 
 async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_byte() -> None:
