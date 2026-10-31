@@ -697,6 +697,13 @@ def test_dryrun_logs_a_reference_file_it_skips_once(
     )
     assert "MRN999SECRET" not in caplog.text
 
+    # Another config's set of the same name, at another path, is its own skip and logs too.
+    other = _ref_graph(tmp_path / "elsewhere.csv")
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.dryrun"):
+        route_message(other, other.inbound["IB_REF"], raw)
+    assert len([r for r in caplog.records if "skipped" in r.getMessage()]) == 1
+
 
 # --- backend capability gate (ADR 0006 "Backend support") --------------------
 #

@@ -154,6 +154,26 @@ def test_sys_exit_in_user_code_is_an_error_not_an_exit(
     )
 
 
+@pytest.mark.parametrize("where", ["router", "handler"])
+def test_a_converted_sys_exit_does_not_chain_the_authors_text(where: str) -> None:
+    """``raise ... from None`` still leaves the caught exit on ``__context__``, and with it the text
+    ``sys.exit("...")`` carried; the conversion must chain nothing a traceback printer could read."""
+    from messagefoundry.pipeline.dryrun import UserCodeCalledSysExit
+
+    def exits(msg: Message) -> Any:
+        raise SystemExit("bad MRN 12345")
+
+    registry = (
+        _registry(exits, {}) if where == "router" else _registry(lambda m: ["h"], {"h": exits})
+    )
+
+    with pytest.raises(UserCodeCalledSysExit) as caught:
+        route_message(registry, registry.inbound["in"], ADT_A01)
+
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert "12345" not in str(caught.value)
+
+
 def test_keyboard_interrupt_in_user_code_still_stops_the_dry_run() -> None:
     """An interrupt is the operator's, not a fault in the message, so it is not converted."""
 

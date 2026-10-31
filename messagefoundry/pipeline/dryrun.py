@@ -47,7 +47,6 @@ from messagefoundry.parsing import (
     Message,
     Peek,
     RawMessage,
-    ValidationResult,
     split_batch,
     summarize,
     validate,
@@ -594,9 +593,9 @@ def transform_one(
     return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
-#: The reference sets whose skip :func:`_dry_run_reference_view` has already logged in this process.
-#: A test resets it.
-_skipped_reference_sets_logged: set[str] = set()
+#: The ``(set name, file path)`` pairs whose skip :func:`_dry_run_reference_view` has already logged
+#: in this process; the path too, so another config's set of the same name still logs. A test resets it.
+_skipped_reference_sets_logged: set[tuple[str, str]] = set()
 
 
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
@@ -627,8 +626,8 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             # writes this line into a CI log. No cause either: a guess from the path (missing versus
             # malformed) misnames a permission or a directory. Once per set per process, since
             # `check` reloads the view for every fixture on every inbound.
-            if spec.name not in _skipped_reference_sets_logged:
-                _skipped_reference_sets_logged.add(spec.name)
+            if (spec.name, path) not in _skipped_reference_sets_logged:
+                _skipped_reference_sets_logged.add((spec.name, path))
                 log.warning("dry-run: reference set %r skipped, its file did not load", spec.name)
             continue
         except TypeError:
@@ -647,9 +646,11 @@ class UserCodeCalledSysExit(Exception):
     :func:`route_message` turns the ``SystemExit`` into this, so its callers' ``except Exception``
     reports the message as ``ERROR`` rather than letting the exit leave ``dry_run`` and end
     ``messagefoundry check`` with whatever code the script passed, 0 included, which reads as a pass.
-    The text matches the live runner's own conversion of the same exit (vault BACKLOG #3134) and
+    The text is the one vault BACKLOG #3134 gives the live runner's conversion of the same exit, and
     names an integer exit code and nothing else: ``sys.exit("...")`` carries the author's text,
-    which could quote a field. ``KeyboardInterrupt`` is not converted; it stops the preview."""
+    which could quote a field. It is raised outside the ``except`` that caught the exit, so the
+    ``SystemExit``, and that text, is not on its ``__context__`` either. ``KeyboardInterrupt`` is not
+    converted; it stops the preview."""
 
     @classmethod
     def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
@@ -736,12 +737,17 @@ def route_message(
         # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
         # also cheaper than parse-once-then-deep-copy). Value-identical either way.
         shared = _shareable_payload(raw, ct)
+        # A SystemExit is converted, then raised after its handler ends, so the exit and the
+        # author's text it carries are not chained onto the converted fault (UserCodeCalledSysExit).
+        exited: UserCodeCalledSysExit | None = None
         try:
             names = route_only(
                 registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
             )
         except SystemExit as exc:
-            raise UserCodeCalledSysExit.from_exit(exc) from None
+            exited = UserCodeCalledSysExit.from_exit(exc)
+        if exited is not None:
+            raise exited
         for hname in names:
             try:
                 ds, ops, meta, skipped = transform_one(
@@ -755,7 +761,9 @@ def route_message(
                     run_context=rc,
                 )
             except SystemExit as exc:
-                raise UserCodeCalledSysExit.from_exit(exc) from None
+                exited = UserCodeCalledSysExit.from_exit(exc)
+            if exited is not None:
+                raise exited
             deliveries.extend(ds)
             for op in ops:
                 # Visible to subsequent handlers, in the JSON form the live sealed cache returns
@@ -948,7 +956,7 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     than that timeout, the result is the listener's text word for word (the parity test compares the
     two), whatever the validate returned or raised, since the listener had given up on it by then. A
     validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
-    disabled (``strict_timeout_s <= 0``) nothing is measured.
+    disabled (``strict_timeout_s <= 0``) nothing times out.
 
     **What inline loses against the listener, by design.** A slow fixture runs its full validate time
     instead of being abandoned at the timeout, so a preview can take as long as hl7apy does, up to
@@ -958,20 +966,17 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     that. The verdict matches; the wall clock and the concurrency do not."""
     timeout = strict_validate_timeout(ic)
     started = time.monotonic()
+    fault: Exception | None = None
     try:
         result = validate(text, expected_version=ic.validation.hl7_version)
-    except Exception:
-        if timeout is not None and time.monotonic() - started > timeout:
-            return f"strict-validation timed out after {timeout}s"
-        raise
+    except Exception as exc:
+        fault = exc
+    # Measured before a fault is re-raised: the listener had given up by then, so it says timed out.
     if timeout is not None and time.monotonic() - started > timeout:
         return f"strict-validation timed out after {timeout}s"
-    return _refusal(result)
-
-
-def _refusal(result: ValidationResult) -> str | None:
-    """The refusal text for a strict validate's ``result``, or ``None``: on ``ok`` alone, as the
-    listener refuses, since a fault's text can be empty."""
+    if fault is not None:
+        raise fault
+    # On ``ok`` alone, as the listener refuses: a fault's text can be empty.
     return None if result.ok else "; ".join(result.errors)[:200]
 
 
@@ -995,8 +1000,9 @@ def dry_run(
     accepted — the Test Bench and a programmatic caller hold text — and simply skips the charset guard,
     since there is nothing left to decode.
 
-    Strict validation runs under the connection's **timeout**, as on the listener, and an expiry is an
-    ``ERROR`` result carrying the listener's text (:func:`_strict_validation_error`). **At least two
+    Strict validation is measured against the connection's **timeout**: a validate that took longer
+    is an ``ERROR`` result carrying the listener's text (:func:`_strict_validation_error`). It is not
+    abandoned at the timeout as on the listener, so a slow fixture still takes its full validate time. **At least two
     live guards are deliberately not mirrored**, so a preview can differ from the engine on them:
     **document detach** (``async`` and side-effecting, so there is no honest pure mirror) and the
     **declared-type magic-byte sniff** on a non-HL7 body (``check`` sends each fixture to every
