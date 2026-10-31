@@ -115,8 +115,10 @@ def _refuse_more_than_one_message(payload: str, transport: str) -> None:
 def declared_encoding(declared: object) -> str:
     """The charset name an inbound's ``encoding`` setting declares (default ``utf-8``).
 
-    The one rule for the name, read by both listeners for their replies and by
-    :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding` for the decode (BACKLOG #2431).
+    The one rule for the name, read by the MLLP and TCP listeners for their replies, by the sources
+    that encode or decode with the setting themselves (at least the file, remote-file, timer, X12
+    and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
+    for the decode (BACKLOG #2431).
     An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
     Any other value is stringified, so the name is always a ``str``: a value naming no codec, such
     as ``bytes``, then fails as a ``LookupError`` the decode refuses and :func:`frame_reply` falls

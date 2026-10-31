@@ -54,6 +54,8 @@ from messagefoundry.transports.framing import (
 )
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
+from messagefoundry.transports.timer import TimerSource
+from messagefoundry.transports.x12 import X12Source
 
 SB, EB, CR, BS, NUL = "\x0b", "\x1c", "\r", chr(92), "\x00"
 ENC = "^~" + BS + "&"
@@ -619,6 +621,27 @@ def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: obj
     assert mllp.encoding == tcp.encoding == str(declared)
     assert frame_reply(MLLP_CODEC, CLEAN, mllp.encoding) == MLLP_CODEC.frame(CLEAN)
     assert frame_reply(STX_ETX_CODEC, CLEAN, tcp.encoding) == STX_ETX_CODEC.frame(CLEAN)
+
+
+@pytest.mark.parametrize("declared", [None, ""])
+def test_the_timer_and_x12_sources_read_an_undeclared_encoding_as_utf8(declared: object) -> None:
+    """BACKLOG #2431: an explicit ``None`` or empty ``encoding`` is "not declared", as on the
+    listeners. These sources used ``str()`` of it, so a timer refused to build on a ``LookupError``
+    for a codec named ``None`` and an X12 source held that name for its replies."""
+    timer = TimerSource(
+        Source(
+            type=ConnectorType.TIMER,
+            settings={"body": "x", "run_once": True, "encoding": declared},
+        )
+    )
+    x12 = X12Source(
+        Source(
+            type=ConnectorType.X12,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    assert timer.encoding == x12.encoding == "utf-8"
+    assert timer._body_bytes == b"x"
 
 
 async def test_the_mllp_listener_sends_its_reply_when_its_encoding_is_not_a_str() -> None:

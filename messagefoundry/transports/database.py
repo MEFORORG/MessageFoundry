@@ -109,6 +109,7 @@ from messagefoundry.transports.base import (
     register_source,
     resolve_poll_ceiling,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = [
@@ -2274,7 +2275,7 @@ class DatabaseSource(SourceConnector):
             knob="poll_max_rows",
             transport="DATABASE source",
         )
-        self._encoding: str = s.get("encoding", "utf-8")
+        self._encoding: str = declared_encoding(s.get("encoding"))
         self._login_timeout = _login_timeout(
             s,
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
