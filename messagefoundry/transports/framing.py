@@ -43,6 +43,7 @@ __all__ = [
     "PRESETS",
     "check_frame_bytes",
     "codec_for",
+    "declared_encoding",
     "frame_for_delivery",
     "frame_reply",
 ]
@@ -106,7 +107,19 @@ def _refuse_more_than_one_message(payload: str, transport: str) -> None:
         )
 
 
-def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
+def declared_encoding(declared: object) -> str:
+    """The charset name an inbound's ``encoding`` setting declares (default ``utf-8``).
+
+    The one rule for the name, read by both listeners for their replies and by
+    :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding` for the decode (BACKLOG #2431).
+    An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
+    Any other value is stringified, so the name is always a ``str``: a value naming no codec, such
+    as ``bytes``, then fails as a ``LookupError`` the decode refuses and :func:`frame_reply` falls
+    back from, never as a ``TypeError`` out of ``encode`` or ``decode``."""
+    return str(declared) if declared else "utf-8"
+
+
+def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str = "") -> bytes:
     """Frame a listener's reply, with each of the codec's start and end bytes replaced by a space.
 
     A listener replies AFTER it has committed the message, so a raise here would leave the sender
@@ -120,12 +133,18 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
     For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
     the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
-    cannot hold one reply's characters still raises, which the listener's last-resort arm owns."""
+    cannot hold one reply's characters still raises, which the listener's last-resort arm owns.
+    ``connection`` names the listener in the warning the fallback logs. The charset setting itself
+    is not logged, since it is configuration that may hold anything."""
     try:
         body = reply.encode(encoding)
     except UnicodeEncodeError:
         raise
     except (LookupError, UnicodeError):
+        logger.warning(
+            "inbound %r: the reply charset is unusable, so the reply was encoded in utf-8 instead",
+            connection,
+        )
         body = reply.encode("utf-8")
     if codec.start in body or codec.end in body:
         logger.warning(

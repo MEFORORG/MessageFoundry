@@ -578,6 +578,64 @@ def test_frame_reply_sends_utf8_when_the_inbound_charset_cannot_encode_it(encodi
     assert frame_reply(MLLP_CODEC, CLEAN, encoding) == MLLP_CODEC.frame(CLEAN)
 
 
+def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLAUDE.md section 6: the fallback is never silent. The setting is configuration that may hold
+    anything, so the warning names the connection and leaves the value out."""
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_ACME_ADT")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "IB_ACME_ADT" in warnings[0] and "utf-8" in warnings[0]
+    assert "zz-secretish-codec" not in warnings[0]
+
+
+@pytest.mark.parametrize("declared", [b"latin-1", 8859])
+def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
+    """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE
+    the runner built for it was never sent. Both listeners now hold the name the decode reads."""
+    mllp = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    tcp = TcpSource(
+        Source(
+            type=ConnectorType.TCP,
+            settings={"host": "127.0.0.1", "port": 0, "framing": "stx_etx", "encoding": declared},
+        )
+    )
+    assert mllp.encoding == tcp.encoding == str(declared)
+    assert frame_reply(MLLP_CODEC, CLEAN, mllp.encoding) == MLLP_CODEC.frame(CLEAN)
+    assert frame_reply(STX_ETX_CODEC, CLEAN, tcp.encoding) == STX_ETX_CODEC.frame(CLEAN)
+
+
+async def test_the_mllp_listener_sends_its_reply_when_its_encoding_is_not_a_str() -> None:
+    async def handler(raw: bytes) -> str:
+        return CLEAN
+
+    source = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": b"latin-1"},
+        )
+    )
+    await source.start(handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            writer.write(MLLP_CODEC.frame(CLEAN))
+            await writer.drain()
+            got = await asyncio.wait_for(reader.readuntil(b"\x1c"), 5)
+        finally:
+            writer.close()
+    finally:
+        await source.stop()
+    assert got == MLLP_CODEC.frame(CLEAN)[: len(got)]
+
+
 async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_byte() -> None:
     reply = f"MSH|{ENC}|R|F|S|F|20260101||ACK|C{SB}1|P|2.5{CR}MSA|AA|C{SB}1{CR}"
 

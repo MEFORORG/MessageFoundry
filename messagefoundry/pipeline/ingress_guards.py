@@ -28,9 +28,13 @@ dry-run does not run: ``messagefoundry check`` sends each fixture to every inbou
 sniff there would fail an HL7 fixture on every X12 or FHIR inbound of a mixed config, and that
 choice is not this module's to make. The HL7 parse step, which each caller runs itself: the stored
 ``parse error`` text differs, and the dry-run catches only ``HL7PeekError`` where the listener
-catches every peek-read fault. And the two live guards below.
+catches every peek-read fault. The detach's refusal of an escaped ``OBX-5.5`` document
+(:class:`~messagefoundry.parsing.binary.EscapedDocumentError`, ``ERROR`` + ``AR`` on a streaming
+inbound), which the dry-run never raises because it never detaches. And the live guards below.
 
-**Two live guards are deliberately NOT mirrored for the dry-run, and both omissions are by design:**
+**At least these live guards are deliberately NOT mirrored for the dry-run, each by design:**
+
+* **the declared-type magic-byte sniff** (:func:`check_declared_type`), for the reason given above.
 
 * **the strict-validation timeout.** The listener runs ``hl7apy`` off the event loop under
   ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it in the
@@ -67,6 +71,7 @@ from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_h
 from messagefoundry.parsing.split import _holds_more_than_one_message
 from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
     "FRAME_BYTE_REJECTED_REASON",
@@ -166,12 +171,11 @@ def ingress_encoding(ic: InboundConnection) -> str:
     """The charset this inbound declares for decoding received bodies (default ``utf-8``).
 
     The one rule for the codec name, read by both live listeners and the dry-run alike (BACKLOG
-    #2431). An explicit ``None`` in the settings means "not declared", not "no encoding", so it falls
-    back the same way an absent key does. Any other value is stringified, so the name is always a
-    ``str``: a value naming no codec then fails as a ``LookupError`` that :func:`decode_body` refuses,
-    never as a ``TypeError`` out of ``bytes.decode``."""
-    declared = ic.spec.settings.get("encoding")
-    return str(declared) if declared else "utf-8"
+    #2431), and the rule the MLLP and TCP listeners encode their replies by, which is why it lives in
+    :func:`~messagefoundry.transports.framing.declared_encoding`. A value naming no codec fails as a
+    ``LookupError`` that :func:`decode_body` refuses, never as a ``TypeError`` out of
+    ``bytes.decode``."""
+    return declared_encoding(ic.spec.settings.get("encoding"))
 
 
 def peek_max_bytes(ic: InboundConnection) -> int:

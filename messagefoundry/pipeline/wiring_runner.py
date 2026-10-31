@@ -8062,7 +8062,8 @@ class RegistryRunner:
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
         # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
         # the dry-run makes, and decode_body resolves the codec name by the dry-run's rule, so a bad
-        # name is this same ERROR row and AR rather than an escape into the transport (BACKLOG #2431).
+        # name is this same ERROR row, with an AE, rather than an escape into the transport (BACKLOG
+        # #2431).
         try:
             text = decode_body(raw, ic)
         except IngressGuardError as exc:
