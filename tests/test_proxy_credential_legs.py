@@ -471,12 +471,12 @@ def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
 ) -> None:
     """A static header, so #3442 has no credential of the connection's own to leave off, and
     ``NO_PROXY`` names the destination, so urllib sends the request direct. Each connection has a
-    proxy for ``https``, because with none the shared opener goes direct whatever ``NO_PROXY``
+    proxy for ``https``, because with none the request goes direct whatever ``NO_PROXY``
     says. The header is refused before the dial (vault BACKLOG #3417). Measured 2026-10-30: with
     ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a no-op, the dial was
     reached with the header on the request and this test failed. Controls: with no header the same
     send reaches the dial, and with no ``NO_PROXY`` the request goes to the proxy, where the header
-    is refused on that leg."""
+    is refused as a cleartext proxy credential (#2572, a number only that text cites)."""
     monkeypatch.setenv("HTTPS_PROXY", f"http://{_MARKER}")
     monkeypatch.setenv("NO_PROXY", "partner.example.test")
     dest = _rest(_HTTPS_TARGET, proxy_url=proxy_url, headers=_STATIC_PROXY_HEADER)
@@ -485,7 +485,7 @@ def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
         asyncio.run(_rest(_HTTPS_TARGET, proxy_url=proxy_url).send('{"a": 1}'))
     assert dialled.value.host == "partner.example.test"
     monkeypatch.delenv("NO_PROXY")  # urllib reads its list on every request
-    _send_refused(dest, "#3416")
+    _send_refused(dest, "#2572")
 
 
 def test_a_rest_send_its_own_bypass_list_sends_direct_is_refused(

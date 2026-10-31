@@ -11,7 +11,7 @@
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine)
   says why and defines which values are credential-shaped.
   A static `Proxy-Authorization` is left to the send-time proxy rule only when the connection's
-  own proxy setting takes the request. A hop can bypass a configured `proxy_url` through
+  own proxy setting takes the request. A hop can bypass a configured `proxy_url` through at least
   `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system proxy for the
   request's scheme. The refusal above then judges the header too. A header key that holds
   whitespace or is shaped like a credential is withheld from the refusal text. Owner ruling

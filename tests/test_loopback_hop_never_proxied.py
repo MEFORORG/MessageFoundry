@@ -472,8 +472,9 @@ def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
     ``localhost.``. The match takes the connection's own proxy off the hop, a proxy from the
     environment still takes it, and the cleartext guard, which reads the predicate, still refuses
     it (vault BACKLOG #2706). CONTROLS: with no entry there is no match, and the plain spelling
-    builds."""
-    settings = {"proxy_url": _PROXY, "proxy_no_proxy": "localhost"}
+    builds. The connection's own proxy is a host apart from the environment's, so the dial shows
+    which proxy took the hop."""
+    settings = {"proxy_url": "http://own-proxy.invalid:9", "proxy_no_proxy": "localhost"}
     assert rest.proxy_bypasses_host("localhost.", ["localhost"])
     assert not rest.proxy_bypasses_host("localhost.", None)
     config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")

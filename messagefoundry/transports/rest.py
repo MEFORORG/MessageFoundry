@@ -2057,8 +2057,9 @@ class ProxyConfig:
 
     def for_host(self, url: str) -> _HostProxy | None:
         """The proxy resolved for the host of the target ``url``, or ``None`` if that host is bypassed
-        (#128) — a bypassed host gets NO handler from this config and NO proxy credential
-        (byte-identical to a connection with no ``proxy_url``).
+        (#128) — a bypassed host gets NO handler from this config and NO proxy credential, so a
+        request to it carries what a connection with no ``proxy_url`` would send. The build still
+        judges the proxy credential, whatever the targets.
 
         ``None`` is not proof of a direct hop. The opener's own default then applies, which reads
         the environment and the system proxy settings, so a proxy from either can still take a
@@ -2154,8 +2155,9 @@ def hop_reaches_a_proxy(
     with it and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
 
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
-    what its ``opener_handlers()`` built. A ``None`` or uncredentialed ``proxy_dest`` answers
-    ``False``, which is not proof of a direct hop: that method says what each does to the route.
+    what its ``opener_handlers()`` built. A ``None`` ``proxy_dest``, or an uncredentialed one,
+    which is a host urllib's own bypass list names, answers ``False``. That is not proof of a
+    direct hop: that method says what each does to the route.
     Otherwise the proxy for ``url``'s scheme is read off the built handler, so
     ``proxy_url = "default"`` with no system proxy for the scheme goes direct. The handler took
     the system map when it was built, so this reads the map the opener holds, not a later one. An
