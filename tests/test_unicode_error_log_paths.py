@@ -2044,25 +2044,6 @@ def test_a_large_chain_cannot_starve_what_origin_main_read() -> None:
     assert record.getMessage() == f"got [_LinkError('failed'), {note}]"
 
 
-class _BigDictCauseError(Exception):
-    """Prints its own ``__cause__``, and carries more attributes than the scan's budget."""
-
-    def __str__(self) -> str:
-        return f"bad frame: {self.__cause__}"
-
-
-def test_a_large_dict_does_not_hide_the_cause_its_str_prints() -> None:
-    error = _BigDictCauseError("bad frame")
-    for n in range(redaction._ATTRIBUTE_BUDGET + 10):
-        setattr(error, f"field{n}", n)
-    error.__cause__ = _encode_error()
-    assert "\\xe9" in str(error)  # control: its own __str__ prints the character
-    assert redaction.prints_a_codec_error(error)
-    out = safe_traceback((type(error), error, None))
-    for spelling in _CHAR_SPELLINGS:
-        assert spelling not in out
-
-
 def test_a_long_chain_is_read_about_once_per_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
     # Review of vault BACKLOG #3340: each link's scan read the rest of the chain, so a 900-link
     # chain read about 400,000 objects. Counted, not timed, so a slow runner cannot flake it.
@@ -2256,12 +2237,181 @@ def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -
         assert spelling not in out
 
 
-def test_a_first_phase_overshoot_does_not_grow_the_shared_budget() -> None:
-    # Review of vault BACKLOG #3340: a first phase ending at -1 paid the share back one unit.
-    share = redaction._ScanShare()
-    share.budget = 2
-    redaction.prints_a_codec_error(RuntimeError(list(range(10000))), share=share)
-    assert share.budget <= 2
+# --- the added pass never undoes the first (vault BACKLOG #3340) -------------------------------
+# Five review rounds each found an ordering of the scan's reads under which a codec error the first
+# pass found printed raw. The added pass now runs after the first pass, on what it left, and only
+# adds, so each scenario below must hold at least where the first pass alone holds. The expected
+# sets are the verdicts of the scan with no added pass, at engine commit 68820faf03 (origin/main
+# when this was written), computed once by running that commit's redaction.py on these builders.
+
+
+@dataclasses.dataclass
+class _Big:
+    data: object
+
+
+class _SlotThenAttribute(Exception):
+    """A slot read before the attribute its own ``__str__`` prints."""
+
+    __slots__ = ("payload",)
+    payload: object
+
+    def __str__(self) -> str:
+        return f"bad: {self.ctx}"  # type: ignore[attr-defined]
+
+
+class _PrintsTail(Exception):
+    """Prints one attribute that sits at the end of a large ``__dict__``."""
+
+    def __str__(self) -> str:
+        return f"bad: {self.z!r}"  # type: ignore[attr-defined]
+
+
+class _HoldsData(Exception):
+    """Prints its own ``__cause__``, and keeps a list of dataclasses on ``.data``."""
+
+    def __str__(self) -> str:
+        return f"bad: {self.__cause__}"
+
+
+type _Scenario = tuple[str, object, dict[str, object]]
+
+
+def _with_attributes(error: BaseException, count: int, prefix: str = "a") -> BaseException:
+    for n in range(count):
+        setattr(error, f"{prefix}{n}", n)
+    return error
+
+
+def _repeated_dataclass() -> _Scenario:
+    held = _Held(_encode_error())
+    arg = [held, _Big(list(range(3000))), _Big(list(range(3000))), held]
+    return "arg", arg, {"held": held, "arg": arg}
+
+
+def _slot_then_attribute(mode: str) -> _Scenario:
+    error = _SlotThenAttribute("x")
+    error.payload = list(range(5000))
+    error.ctx = [_encode_error()]  # type: ignore[attr-defined]
+    return mode, ([error] if mode == "arg" else error), {"error": error}
+
+
+def _dict_tail() -> _Scenario:
+    error = _with_attributes(_PrintsTail("x"), 4093)
+    error.z = _encode_error()  # type: ignore[attr-defined]
+    _with_attributes(error, 50, "b")
+    error.__context__ = ValueError("ctx")
+    error.__cause__ = ValueError("cause")
+    return "exc", error, {"error": error}
+
+
+def _args_and_large_dict() -> _Scenario:
+    error = _with_attributes(_CauseError(*range(10)), 4090)
+    error.__cause__ = _encode_error()
+    return "exc", error, {"error": error}
+
+
+def _large_dict_hides_cause() -> _Scenario:
+    error = _with_attributes(_CauseError("bad frame"), redaction._ATTRIBUTE_BUDGET + 10)
+    error.__cause__ = _encode_error()
+    return "exc", error, {"error": error}
+
+
+def _dataclass_crowd(then_error: bool) -> _Scenario:
+    error = _HoldsData("x")
+    data: list[object] = [_Held(i) for i in range(1300)]
+    if then_error:
+        data.append(_encode_error())
+    error.data = data  # type: ignore[attr-defined]
+    error.__cause__ = RuntimeError(_encode_error())
+    return "exc", error, {"error": error}
+
+
+def _group_context() -> _Scenario:
+    first = _LinkError("failed")
+    first.__context__ = ExceptionGroup("many", [ValueError(str(n)) for n in range(5000)])
+    held = _PayloadError(_encode_error())
+    arg = [first, held]
+    return "arg", arg, {"first": first, "held": held, "arg": arg}
+
+
+def _outer_link_starves() -> _Scenario:
+    inner = RuntimeError(_encode_error())
+    prints = _CauseError("x")
+    prints.__cause__ = inner
+    large = RuntimeError(list(range(10000)))
+    large.__cause__ = prints
+    outer = _LinkError("r")
+    outer.__cause__ = large
+    # In the order safe_traceback scans them: each link, then its cause.
+    return "chain", outer, {"outer": outer, "large": large, "prints": prints, "inner": inner}
+
+
+def _shared_beneath(payload: bool) -> _Scenario:
+    if payload:
+        shared: BaseException = _PayloadError(_encode_error())
+    else:
+        shared = RuntimeError("x")
+        shared.original = _encode_error()  # type: ignore[attr-defined]
+    plain, own = _Held(shared), _Batch(shared)
+    arg = [[plain, own]]
+    return "arg", arg, {"plain": plain, "own": own, "shared": shared, "arg": arg}
+
+
+_DIFFERENTIAL: dict[str, Any] = {
+    "repeated-dataclass": _repeated_dataclass,
+    "large-slot-before-dict-value": functools.partial(_slot_then_attribute, "exc"),
+    "large-slot-before-dict-value-logged": functools.partial(_slot_then_attribute, "arg"),
+    "dict-tail-the-first-pass-reads": _dict_tail,
+    "args-and-a-large-dict": _args_and_large_dict,
+    "large-dict-hides-cause": _large_dict_hides_cause,
+    "1300-dataclasses": functools.partial(_dataclass_crowd, False),
+    "1300-dataclasses-then-an-error": functools.partial(_dataclass_crowd, True),
+    "group-context-before-a-holder": _group_context,
+    "outer-link-starves-a-later-one": _outer_link_starves,
+    "shared-by-plain-and-own-code-holder": functools.partial(_shared_beneath, True),
+    "shared-plain-exception-holding-by-attribute": functools.partial(_shared_beneath, False),
+}
+
+#: Which targets the scan with no added pass found holding an error (engine commit 68820faf03).
+_FIRST_PASS_HOLDS: dict[str, frozenset[str]] = {
+    "repeated-dataclass": frozenset({"arg", "held"}),
+    "large-slot-before-dict-value": frozenset({"error"}),
+    "large-slot-before-dict-value-logged": frozenset({"error"}),
+    "dict-tail-the-first-pass-reads": frozenset({"error"}),
+    "args-and-a-large-dict": frozenset(),
+    "large-dict-hides-cause": frozenset(),
+    "1300-dataclasses": frozenset(),
+    "1300-dataclasses-then-an-error": frozenset({"error"}),
+    "group-context-before-a-holder": frozenset({"arg", "held"}),
+    "outer-link-starves-a-later-one": frozenset({"inner"}),
+    "shared-by-plain-and-own-code-holder": frozenset({"arg", "own", "plain", "shared"}),
+    "shared-plain-exception-holding-by-attribute": frozenset(),
+}
+
+
+def _verdicts(build: Any) -> set[str]:
+    mode, root, targets = build()
+    if mode == "chain":  # as safe_traceback asks, one share for the whole traceback
+        share = redaction._ScanShare()
+        return {
+            name
+            for name, exc in targets.items()
+            if redaction.prints_a_codec_error(exc, share=share)
+        }
+    holds = redaction._Scan(root, charged_root=mode == "exc").holds
+    return {name for name, obj in targets.items() if id(obj) in holds}
+
+
+@pytest.mark.parametrize("name", list(_DIFFERENTIAL))
+def test_the_added_pass_holds_wherever_the_first_pass_alone_holds(name: str) -> None:
+    assert _verdicts(_DIFFERENTIAL[name]) >= _FIRST_PASS_HOLDS[name]
+
+
+def test_the_added_pass_reaches_what_only_it_reads() -> None:
+    # A control for the test above: the added pass does find what the first pass never reads.
+    assert {"own", "arg"} <= _verdicts(_DIFFERENTIAL["shared-plain-exception-holding-by-attribute"])
+    assert "prints" in _verdicts(_DIFFERENTIAL["outer-link-starves-a-later-one"])
 
 
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(

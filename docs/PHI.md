@@ -1714,21 +1714,21 @@ codec error keeps its notes as they are, so a codec error placed among them stil
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-A slot or chain link that holds None is not counted. Beneath an exception whose own code renders
-it, an exception whose `__str__` and `__repr__` are `BaseException`'s own pays only for the values
-read from it, not for being read; read plainly, as origin/main read it, it costs one unit and its
-`.args`. **What origin/main read is read first, the way it read it, and the reads added since (the
-chain links, the dunder-named slots and the exceptions beneath one whose own code renders it)
-spend only the budget that leaves**, so they cannot starve a sibling origin/main reached. In one
-traceback, all of those added reads share a single budget, so a long chain is read about once
-rather than once per link. An object whose `__dict__` alone would end the budget has its slots and
-chain links read before the values the limit would cut. An object the unlimited first pass reaches both plainly and beneath an exception whose own code
-renders it is read once, the deeper way. One read plainly and then reached more deeply through an
-attribute is read and charged a second time, at most: one unit, the elements that are not plain
-values when the first pass did not already follow them the deeper way, and each value the deeper
-read takes from the readers the plain read lacked. So an object is charged at most twice. When it
-runs out the filter leaves the rest as it is, and which objects those are is
-not defined.
+The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads each
+object by attribute as described above, leaving out the dunder-named slots and the chain links
+and not reading beneath an exception's own code any deeper, and it finishes before the added pass starts. The added pass reads the dunder-named
+slots, the chain links and the exceptions beneath one whose own code renders it, on only the
+budget the first pass left, and it only adds: an object the first pass found holding an error
+still holds one.** So nothing the added pass reads can starve an object the first pass reaches. A
+large `__dict__` or a long list the first pass reads can leave it nothing, and then an error only
+the added pass would reach prints raw. A slot or chain link that holds None costs one unit, as any
+value read does. The added pass reads an object at most twice, once the plain way and once beneath
+an exception whose own code renders it, each time through only the readers the reads before it
+lacked; each read costs one unit, its elements followed again, and each value read. In one
+traceback each link's scan has a whole budget of its own. A scan that read a later link the deep
+way hands that link's answer on when it found an error there, or when it ran to the end with budget
+left, so a long chain is read about once rather than once per link. When the budget runs out the
+filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
 by attribute even when it is the single mapping argument, so a large map in it can use up the
