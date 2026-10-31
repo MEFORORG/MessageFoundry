@@ -1724,11 +1724,17 @@ large `__dict__` or a long list the first pass reads can leave it nothing, and t
 the added pass would reach prints raw. A slot or chain link that holds None costs one unit, as any
 value read does. The added pass reads an object at most twice, once the plain way and once beneath
 an exception whose own code renders it, each time through only the readers the reads before it
-lacked; each read costs one unit, its elements followed again, and each value read. In one
-traceback each link's scan has a whole budget of its own. A scan that read a later link the deep
-way hands that link's answer on when it found an error there, or when it ran to the end with budget
-left, so a long chain is read about once rather than once per link. When the budget runs out the
-filter leaves the rest as it is, and which objects those are is not defined.
+lacked. A plain read of an object the walk already holds follows none of its elements again: it
+costs one unit and each value read, and nothing at all when no reader is left to add. A read
+beneath an exception whose own code renders it costs one unit, each value read, and one unit for
+each element it follows again. In one traceback each link's first pass has a whole budget of its
+own, and the added passes of every link share one more budget between them. So on a very long
+chain an earlier link's added reads can spend it, and a later link's codec error that only the
+added reads would reach then prints raw, as it did before this change. A scan that read a later
+link the deep way hands that link's answer on when it found an error there, or when it ran to the
+end with more budget left than the most slots any one of its reads went through, which it takes as
+the sign that none of its reads was cut short. So a long chain is read about once rather than once
+per link. When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
 by attribute even when it is the single mapping argument, so a large map in it can use up the

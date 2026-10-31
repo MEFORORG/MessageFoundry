@@ -2158,7 +2158,7 @@ class _OwnStrError(Exception):
         return "own"
 
 
-def test_an_exception_with_no_chain_costs_what_it_did_before_the_chain_was_read() -> None:
+def test_a_crowd_of_own_str_exceptions_with_no_chain_leaves_a_siblings_held_error_found() -> None:
     # Review of vault BACKLOG #3340: each read charged both chain links even when both were None,
     # so 1,500 such exceptions cost three units each where origin/main charged one, and an error a
     # sibling held by attribute printed raw. Sized from the budget: one unit each fits, three do not.
@@ -2172,7 +2172,7 @@ def test_an_exception_with_no_chain_costs_what_it_did_before_the_chain_was_read(
 
 
 @pytest.mark.parametrize("extra", [-2000, 1000], ids=["under-budget", "over-budget"])
-def test_plain_exceptions_beneath_an_exceptions_own_code_cost_nothing_when_empty(
+def test_plain_exceptions_beneath_an_exceptions_own_code_leave_a_siblings_held_error_found(
     extra: int,
 ) -> None:
     # Review of vault BACKLOG #3340: beneath _Batch each RuntimeError is read the deep way. Its two
@@ -2462,6 +2462,62 @@ def test_a_long_chain_with_a_large_payload_is_not_read_once_per_link(
     out = safe_traceback((type(error), error, None))
     assert out.count("_LinkError: failed") == links
     assert calls <= 8 * links, calls
+
+
+class _ManySlots(Exception):
+    """Its own ``__str__`` and 200 slots it never assigns, beside the one it prints."""
+
+    __slots__ = (*(f"s{i}" for i in range(200)), "payload")
+    payload: object
+
+    def __str__(self) -> str:
+        return f"many: {self.payload}"
+
+
+def test_the_added_readers_are_worked_out_once_per_class_not_once_per_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review of vault BACKLOG #3340: the readers each added read takes beyond the reads before it
+    # were worked out twice for every object, in time quadratic in the slots, though they depend
+    # only on the class. Counted, not timed.
+    calls = 0
+    real = redaction._added_readers
+
+    def counted(had: tuple[Any, ...], target: tuple[Any, ...]) -> tuple[Any, ...]:
+        nonlocal calls
+        calls += 1
+        return real(had, target)
+
+    monkeypatch.setattr(redaction, "_added_readers", counted)
+    crowd = []
+    for i in range(500):
+        one = _ManySlots("x")
+        one.payload = i
+        crowd.append(one)
+    held = _ManySlots("y")
+    held.payload = _encode_error()
+    scan = redaction._Scan([crowd, held])
+    assert id(held) in scan.holds  # the verdict the cache must not change
+    assert not any(id(one) in scan.holds for one in crowd)
+    assert calls <= 4, calls  # the four a class's record holds, whatever the instance count
+
+
+class _UnreadableClass:
+    """Reading its ``__class__``, as ``isinstance`` does for an object that is not a class, raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type[Any]:
+        raise RuntimeError("no class")
+
+
+def test_a_builtins_value_whose_class_raises_is_skipped_not_raised() -> None:
+    # Review of vault BACKLOG #3340: built with isinstance(), a value put into builtins whose
+    # __class__ raises would have made `import messagefoundry.redaction` raise.
+    odd = _UnreadableClass()
+    with pytest.raises(RuntimeError):
+        isinstance(odd, type)  # the control: the old comprehension's test raises on it
+    found = redaction._builtin_exc_renders({"odd": odd, "KeyError": KeyError})
+    assert found == {id(KeyError.__dict__["__str__"])}
 
 
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(
