@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -1086,6 +1086,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #3756: the state-write tasks now waiting out a resolve's retry backoff, so
+        # drain_state can stop them at its deadline without cancelling a write in flight. Once
+        # drain_state has run, no write starts a retry: the store is about to close.
+        self._retrying: set[asyncio.Task[Any]] = set()
+        self._retries_closed = False
         # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
         # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
         # stay concurrent. An entry is dropped once no write holds or awaits it.
@@ -1963,6 +1968,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
+    # BACKLOG #3756: the waits between an inverse's resolve attempts, so it is tried one more time
+    # than there are waits before the sink gives up and logs an ERROR. Each wait runs while the
+    # retry holds the key's lock, so a later write for that key waits it out. Only the waits are
+    # bounded here: each attempt also takes as long as the store takes to fail, which on SQLite
+    # can be its whole busy timeout. Once drain_state runs, no further retry starts, and
+    # test_alert_state pins that the waits alone fit inside engine._ALERT_STATE_DRAIN_SECONDS.
+    _INVERSE_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+
     def _record_state(
         self,
         event: dict[str, Any],
@@ -1975,15 +1988,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
         store. A no-op when no store is wired (state tracking off). The store write never raises into the
         ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker.
-        ``on_settled`` is called once: True when the write lands, False when it fails, is cancelled, or
-        never runs (no loop, or cancelled before its first step)."""
+        An inverse's resolve is retried there a bounded number of times (BACKLOG #3756); an upsert is
+        tried once. ``on_settled`` is called once: True when the write lands, False when its last
+        attempt fails, it is cancelled, or it never runs (no loop, or cancelled before its first
+        step)."""
         store = self._store
         if store is None:
             return
         etype = str(event.get("type", ""))
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
-        coro: Coroutine[Any, Any, Any]
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
         # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
@@ -1997,21 +2011,29 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # escalation_tier were on the now-resolved row and never return via list_active).
             self._suspended.pop(key, None)
             self._occurrences.pop(key, None)
-            coro = store.resolve_alert_instances_for(
-                event_type=inverse_of, connection=connection, now=now
-            )
+
+            # A factory, not a built coroutine: a coroutine can be awaited only once, and a retry
+            # needs a fresh one. Nothing is built until the background task runs.
+            def write() -> Awaitable[Any]:
+                return store.resolve_alert_instances_for(
+                    event_type=inverse_of, connection=connection, now=now
+                )
+
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
-            coro = store.upsert_alert_instance(
-                event_type=etype,
-                connection=connection,
-                severity=severity,
-                reason=reason,
-                escalation_tier=escalation_tier,
-                now=now,
-            )
+
+            def write() -> Awaitable[Any]:
+                return store.upsert_alert_instance(
+                    event_type=etype,
+                    connection=connection,
+                    severity=severity,
+                    reason=reason,
+                    escalation_tier=escalation_tier,
+                    now=now,
+                )
+
         settle: Callable[[bool], None] | None = None
         if on_settled is not None:
             settled = False
@@ -2025,15 +2047,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     except Exception:
                         log.exception("alert-instance settle callback failed")
 
-        wrapper = self._run_state(coro, key, settle)
+        wrapper = self._run_state(write, key, settle, resolves=inverse_of, connection=connection)
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
-            # so drop it rather than raise into the caller. The notification path is unaffected.
-            # Close both coroutines so neither warns "never awaited".
+            # so drop it rather than raise into the caller. The notification path is unaffected, and
+            # no retry can help: there is no loop to run one on. Close the wrapper so it does not
+            # warn "never awaited"; the store coroutine was never built.
             wrapper.close()
-            coro.close()
             if settle is not None:
                 settle(False)
             return
@@ -2044,30 +2066,77 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if settle is not None:
                 # A no-op once _run_state settled; this covers a cancel before its first step.
                 settle(False)
-            # A task cancelled before its first step never reached the await; close the store
-            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
-            coro.close()
 
         task.add_done_callback(_done)
 
     async def _run_state(
         self,
-        coro: Coroutine[Any, Any, Any],
+        write: Callable[[], Awaitable[Any]],
         key: str,
         on_settled: Callable[[bool], None] | None = None,
+        *,
+        resolves: str | None = None,
+        connection: str = "",
     ) -> None:
+        """Run one alert-instance write under its key's lock. ``resolves`` names the alert type an
+        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not."""
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
         # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
+        # The retries and their waits run INSIDE the lock, so a write emitted later for the same key
+        # cannot land between a failed attempt and the retry that follows it.
+        delays = () if resolves is None else self._INVERSE_RETRY_DELAYS
+        attempts = len(delays) + 1
         landed = False
+        tried = 0
+        task = asyncio.current_task()
         try:
             async with hold_keyed_lock(self._state_locks, key):
-                await coro
-            landed = True
+                for tried in range(1, attempts + 1):
+                    try:
+                        await write()
+                    except Exception as exc:
+                        # The alert-instance write is a side observer: a store error must never wedge
+                        # a delivery worker or drop the notification. Log metadata only (no event body):
+                        # every attempt's exception type, and the traceback once, on the last attempt.
+                        last = tried == attempts or self._retries_closed
+                        log.warning(
+                            "alert-instance state write failed (%s)",
+                            type(exc).__name__,
+                            exc_info=last,
+                        )
+                        if last:
+                            break
+                        # Only the wait is cancellable by drain_state, never a write in flight.
+                        if task is not None:
+                            self._retrying.add(task)
+                        try:
+                            await asyncio.sleep(delays[tried - 1])
+                        finally:
+                            self._retrying.discard(task)
+                    else:
+                        landed = True
+                        break
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve gave up after %d attempt(s): any open %s alert for %r "
+                    "stays open",
+                    tried,
+                    resolves,
+                    connection,
+                )
+        except asyncio.CancelledError:
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve was cancelled before it landed: any open %s alert for "
+                    "%r stays open",
+                    resolves,
+                    connection,
+                )
+            raise
         except Exception:
-            # The alert-instance write is a side observer: a store error must never wedge a delivery
-            # worker or drop the notification. Log metadata only (no event body).
+            # Outside the write itself (the key lock's bookkeeping): still never raise.
             log.warning("alert-instance state write failed", exc_info=True)
         finally:
             # A cancel, too, is settled as not landed: the row is most likely still open.
@@ -2077,11 +2146,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     async def drain_state(self, timeout: float) -> None:
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
         calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
-        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
-        still running at the deadline is left to fail as before; this never raises."""
-        pending = set(self._state_tasks)
-        if pending:
-            await asyncio.wait(pending, timeout=timeout)
+        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write in
+        flight at the deadline is left to fail as before. When the wait ends, or is itself
+        cancelled, no write starts a retry any more (BACKLOG #3756), and a resolve then waiting
+        out its retry backoff is cancelled and logged at ERROR, so none goes on retrying against
+        the store being closed. This never raises and does not wait for the cancelled writes to
+        finish."""
+        try:
+            pending = set(self._state_tasks)
+            if pending:
+                await asyncio.wait(pending, timeout=timeout)
+        finally:
+            self._retries_closed = True
+            retrying = [t for t in self._retrying if not t.done()]
+            for task in retrying:
+                task.cancel()
+            if retrying:
+                log.error(
+                    "%d alert-instance resolve(s) waiting to retry when the alert-state drain "
+                    "ended were cancelled",
+                    len(retrying),
+                )
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
