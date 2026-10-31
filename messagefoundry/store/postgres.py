@@ -167,6 +167,7 @@ from messagefoundry.store.privilege import (
     postgres_excess,
 )
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -202,6 +203,7 @@ from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -3030,6 +3032,7 @@ class PostgresStore:
             aad_cols=QUEUE_TAG_COLUMNS,
             key_cols=("id",),
             aad_of=queue_row_aad,
+            blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
         )
         total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         total += await self._seal_surface(
@@ -3090,6 +3093,7 @@ class PostgresStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[Any], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -3099,8 +3103,9 @@ class PostgresStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593). Identifiers are code constants; only the
-        marker pattern is a parameter.
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
+        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        Identifiers are code constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
         transaction opens, because a reservation must commit independently of the seal it covers.
@@ -3113,20 +3118,27 @@ class PostgresStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = int(await self._fetchval(count_sql, like) or 0)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = int(
+                await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {blank_where}") or 0
+            )
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant.
+                # so count again rather than report its legitimate seal as a plant. A blank here
+                # stays refused.
+                blanks = 0
                 pending = int(await self._fetchval(count_sql, like) or 0)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._execute(_INSERT_KEYED_MARKER, table, column, time.time())
             return 0
-        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending + blanks)
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
         sealed = 0
@@ -3142,10 +3154,16 @@ class PostgresStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
+            # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
+            seal_where = (
+                f"({pending_where}) OR ({blank_where})"
+                if blanks and claimed is not None
+                else pending_where
+            )
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
-                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    f" WHERE {seal_where} LIMIT {int(batch)}",
                     like,
                 )
                 if not rows:
@@ -5368,8 +5386,8 @@ class PostgresStore:
             pass
 
         now = time.time() if now is None else now
-        # ADR 0157 C1 — both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND finalize
-        # the origin message, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # ADR 0157 C1 — every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND finalizes
+        # the origin message, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # *admits* a message, and fencing it would convert a permitted duplicate into a LOST re-ingress,
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
@@ -5388,16 +5406,20 @@ class PostgresStore:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
 
-                    async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                    async def _consume_dead(
+                        label: str, error: str, event_detail: str, *, erased: bool = False
+                    ) -> bool:
                         # An unrecoverable token: dead-letter it + ERROR the origin in THIS
                         # transaction and CONSUME it (return True ⇒ the conn.transaction() commits)
                         # — never re-loop (NOT the _Noop rollback, which would leave the token live).
+                        # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                        blank = ", payload=''" if erased else ""
                         await self._exec_terminal(
                             conn,
                             label,
                             (response_row_id,),
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
-                            " updated_at=$4 WHERE id=$5" + guard,
+                            f" updated_at=$4{blank} WHERE id=$5" + guard,
                             OutboxStatus.DEAD.value,
                             self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
                             now,
@@ -5429,15 +5451,32 @@ class PostgresStore:
                         dest,
                         seq,
                     )
+                    # A missing row is a corrupt reference. A NULL body means retention erased the
+                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
+                    # snapshot made the purge's token blank skip it, while the same statement still
+                    # erased the reply. This branch is the only control for that, and the reply
+                    # must never become a child message. A missing row is damage, not an erasure,
+                    # so that token is not blanked: its sealed reference is the evidence.
+                    if art is None:
+                        return await _consume_dead(
+                            "ingress_handoff(missing-artifact)",
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            "re-ingress ref corrupt",
+                        )
+                    if art["body"] is None:
+                        return await _consume_dead(
+                            "ingress_handoff(erased)",
+                            REINGRESS_ARTIFACT_ERASED,
+                            "re-ingress reply erased",
+                            erased=True,
+                        )
                     body = (
                         self._dec(
                             art["body"],
                             aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                         )
-                        if (art and art["body"] is not None)
-                        else ""
+                        or ""
                     )
-                    body = body or ""
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
@@ -5614,16 +5653,17 @@ class PostgresStore:
         ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
+            seq = int(seq_s)
         except ValueError:
-            return None
+            return None  # `ingress_handoff` dead-letters it as a corrupt reference
         art = await self._pool.fetchrow(
             "SELECT body FROM response WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
             mid,
             dest,
-            int(seq_s),
+            seq,
         )
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -10494,6 +10534,11 @@ class PostgresStore:
         ``raw <> '' OR metadata IS NOT NULL`` so rows purged by a pre-upgrade engine are swept — and
         counted — on the first pass after upgrade. Returns the number of messages purged.
 
+        In the same transaction it blanks the ``done``/``cancelled`` outbound payloads and their
+        ``last_error``, blanks a dead ``Stage.RESPONSE`` work-row's reference in the one statement
+        that erases the captured replies (BACKLOG #1560, the SQLite twin says why), and nulls event
+        details. Other ``dead`` rows are left to :meth:`purge_dead_letters`.
+
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
         the prior behaviour. AND-ed with the unchanged in-flight guard."""
@@ -10527,11 +10572,33 @@ class PostgresStore:
                 purged = _rowcount(result)
                 await conn.execute(
                     f"UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=${nxt} AND status = ANY(${nxt + 1}::text[]) AND payload <> ''"
+                    f" WHERE stage=${nxt} AND status = ANY(${nxt + 1}::text[])"
+                    f" AND (payload <> '' OR last_error IS NOT NULL)"
                     f" AND message_id IN ({eligible})",
                     *lead,
                     Stage.OUTBOUND.value,
                     [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value],
+                )
+                # A dead RESPONSE work-row's reference goes with the reply it names, so
+                # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
+                # (row kept, FK to messages(id) never violated — purge keeps the messages row).
+                # ONE statement, so the token blank and the reply erase read `eligible` once, from
+                # one snapshot. As two statements under READ COMMITTED each re-read it, and a
+                # resend or a sibling's completion committed between them could blank a token
+                # whose reply was kept, or keep a replayable token whose reply was erased. A
+                # data-modifying CTE runs to completion although the outer UPDATE never reads it.
+                await conn.execute(
+                    f"WITH elig AS ({eligible}),"
+                    f" tokens AS (UPDATE queue SET payload=''"
+                    f" WHERE stage=${nxt} AND status=${nxt + 1} AND payload <> ''"
+                    f" AND message_id IN (SELECT id FROM elig) RETURNING id)"
+                    f" UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
+                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
+                    f" AND message_id IN (SELECT id FROM elig)",
+                    *lead,
+                    Stage.RESPONSE.value,
+                    OutboxStatus.DEAD.value,
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
                 # message holds — but ONLY once it has NO queue row that could still be delivered/replayed
@@ -10547,14 +10614,6 @@ class PostgresStore:
                 await conn.execute(
                     f"UPDATE message_events SET detail=NULL"
                     f" WHERE detail IS NOT NULL AND message_id IN ({eligible})",
-                    *lead,
-                )
-                # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
-                # (row kept, FK to messages(id) never violated — purge keeps the messages row).
-                await conn.execute(
-                    f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
-                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
-                    f" AND message_id IN ({eligible})",
                     *lead,
                 )
         return purged
@@ -10763,7 +10822,8 @@ class PostgresStore:
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
+                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
+                    f" AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

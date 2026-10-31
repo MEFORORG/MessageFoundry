@@ -38,6 +38,8 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -5905,6 +5907,66 @@ async def test_queue_tag_contract(store) -> None:
         )
     finally:
         await keyed.close()
+
+
+def _raw_adapters(s) -> tuple[Any, Any]:
+    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+
+    async def raw(sql: str, params: tuple[Any, ...]) -> None:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute(sql, params)
+            await conn.commit()
+
+    async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute(sql, params)
+            names = [c[0] for c in cur.description]
+            rows = [dict(zip(names, r, strict=True)) for r in await cur.fetchall()]
+            await conn.commit()
+            return rows
+
+    return raw, fetch
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+@pytest.mark.parametrize("case", ERASED_REPLY_CASES)
+async def test_erased_reply_contract(store, case, keyed) -> None:
+    """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
+    SQLite suite runs, on both cipher shapes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    raw, fetch = _raw_adapters(store)
+    if not keyed:
+        await case(store, fetch, raw)
+        return
+    sealed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
+async def test_keyless_blank_contract(store, case) -> None:
+    """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
+    runs. The ``store`` fixture is the keyless handle, and it clears ``keyed_surface`` on entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    key = generate_key()
+
+    async def open_keyed() -> SqlServerStore:
+        return await SqlServerStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+        )
+
+    raw, fetch = _raw_adapters(store)
+    await case(store, open_keyed, fetch, raw)
 
 
 async def test_cell_tag_contract(store) -> None:

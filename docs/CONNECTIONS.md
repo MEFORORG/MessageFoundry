@@ -3530,7 +3530,7 @@ gate when `serve` loads the graph: see *Per-connection overrides* in
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
 | `messages_days` | in | int | inherit the global body window — set as **`[security].delete_message_bodies_after_days`** (`[retention].messages_days` moved there under ADR 0118 and is **rejected at config load**) | past N days, null this **inbound's** received message bodies (keyed on the receiving inbound), keeping the message row — its PHI columns, `metadata` included, are blanked. `0` = keep forever |
-| `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. `0` = keep forever |
+| `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. This override does not reach a dead re-ingress token (a captured reply owed to a loopback, ADR 0013), which has no outbound and always took the global `[retention].dead_letter_days` window. Its payload is blanked with its reply on the body window, so it is not replayable after that (BACKLOG #1560), and its `last_error` still waits for that global dead-letter purge. `0` = keep forever |
 
 ### Embedded-document pruning ([ADR 0042](adr/0042-embedded-document-pruning.md), #47)
 
