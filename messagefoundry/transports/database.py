@@ -89,6 +89,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
+from messagefoundry.odbc_call_gate import call_gate, install_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
@@ -1540,6 +1541,24 @@ def _set_and_read_autocommit(raw: Any) -> bool:
     return bool(raw.autocommit)
 
 
+def _gated_call[T](conn: Any, fn: Callable[..., T], *args: Any) -> Callable[[], T]:
+    """``fn(*args)`` for a worker thread, run through ``conn``'s call gate when it has one (BACKLOG
+    #2394), so it never runs beside another pyodbc call on that connection.
+
+    :func:`_set_and_read_autocommit` and :func:`_close_raw_cursor` use ``conn``'s raw handles directly
+    rather than through aioodbc, so the gate on aioodbc's ``_execute`` does not see them. A
+    connection with no gate (a test double) runs ``fn`` bare, as before."""
+    gate = call_gate(conn)
+    return partial(fn, *args) if gate is None else partial(gate.run, fn, *args)
+
+
+def _unwinding_a_cancel() -> bool:
+    """Whether the running task has a cancellation in flight, as when a ``finally`` runs because a
+    statement's await was cancelled. That statement may still be running on its worker thread."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 async def _return_to_pool(pool: Any, conn: Any) -> None:
     """Hand ``conn`` back to ``pool`` where no borrower holds it any more. Call it only once no
     worker thread can still be using ``conn`` (the rule :func:`_return_when_settled` enforces).
@@ -1636,7 +1655,9 @@ class _AutocommitPool:
     runs on :func:`_thread_settled`, whose future only the thread resolves, and is shielded: the
     borrower leaves at once, so ``acquire_timeout`` still bounds the borrow, and the connection goes
     back to the pool only once the call has returned. No task cancel can decide that early, loop
-    teardown's included (PR 2593 review).
+    teardown's included (PR 2593 review). The call also runs through the connection's call gate,
+    installed at the borrow (BACKLOG #2394), so no other pyodbc call on that connection, a close
+    included, runs beside it.
 
     **What that does not bound.** Until a hung call returns, its connection is still in use, so a
     ``pool.close(); await pool.wait_closed()`` on this pool waits for it: a ``DatabaseRef`` sync's
@@ -1657,13 +1678,16 @@ class _AutocommitPool:
 
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
+        # BACKLOG #2394: here, not only in _acquire, because a DatabaseRef sync borrows through
+        # acquire_pooled, and because the set below goes through the gate.
+        install_call_gate(conn)
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
             # if the default executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
-            work = _thread_settled(partial(_set_and_read_autocommit, raw))
+            work = _thread_settled(_gated_call(conn, _set_and_read_autocommit, raw))
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -1768,13 +1792,18 @@ _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 async def _acquire(pool: Any, timeout: float) -> Any:
     """Acquire a connection from ``pool`` within ``timeout`` seconds, or raise a transient
     :class:`DeliveryError` with a clear, PHI-free message. Wraps the driver's own ``acquire`` so a
-    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await."""
+    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
+
+    The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
+    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded."""
     try:
-        return await asyncio.wait_for(pool.acquire(), timeout)
+        conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
         raise DeliveryError(
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
+    install_call_gate(conn)
+    return conn
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -1813,12 +1842,22 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     teardown's included, so the connection always does go back, and a later ``wait_closed`` waits
     only for the close itself.
 
-    **What this does not cover.** A cancellation that lands during ``conn.cursor()``,
-    ``execute`` or a fetch, which also run on aioodbc's worker threads, reaches this function while
-    that call may still be running; this close then runs beside it. That is the same defect class,
-    wider than this function, and not closed here. A cursor with no ``_impl`` (a test double, or an
-    aioodbc that renamed it) is closed through its own ``close()`` as a task, and a teardown cancel
-    of that task keeps the connection out of the pool (:func:`_return_when_settled`)."""
+    **A cancellation during ``execute`` or a fetch does not free the cursor under it (BACKLOG
+    #2394).** That call may still be running on its worker thread when this function is reached.
+    The close runs through the connection's call gate (:func:`_gated_call`), so it starts only once
+    that call has returned, and the connection goes back only after the close. The cancelled task
+    does not wait for either: while a cancellation is in flight, the return is handed to
+    :func:`_return_when_settled` at once. Until the running call returns, the connection keeps its
+    pool slot, and the close's thread waits on the gate. Nothing in the engine bounds that wait,
+    because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
+
+    **What this does not cover.** A cancellation during ``conn.cursor()`` reaches this function with
+    no cursor, so the connection goes back while that call may still be running. The gate holds the
+    next borrower's calls behind it, and the cursor it makes is left for the collector. A connection
+    with no gate (a test double) closes its cursor beside a running call, as before. A cursor with
+    no ``_impl`` (a test double, or an aioodbc that renamed it) is closed through its own ``close()``
+    as a task, and a teardown cancel of that task keeps the connection out of the pool
+    (:func:`_return_when_settled`)."""
     if cur is None:
         await pool.release(conn)
         return
@@ -1826,7 +1865,7 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     work: asyncio.Future[Any]
     if raw_cur is not None:
         try:
-            work = _thread_settled(partial(_close_raw_cursor, raw_cur))
+            work = _thread_settled(_gated_call(conn, _close_raw_cursor, raw_cur))
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
@@ -1838,6 +1877,10 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
+    if _unwinding_a_cancel():
+        # The close may wait on the gate for a cancelled statement; the cancellation must not.
+        _return_when_settled(pool, conn, work, "a cursor close")
+        return
     try:
         await asyncio.shield(work)
     except BaseException:
