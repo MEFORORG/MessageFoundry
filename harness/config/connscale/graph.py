@@ -10,9 +10,12 @@ a representative whole-field ``edit``) → one outbound delivering to the harnes
 graph is a **flat list of inbound()/outbound() registrations wired by name** — no bundling "channel"
 object (CLAUDE.md §1) — and the router/handler logic stays code-first.
 
-The connection-scale harness sets ``MEFOR_CONNSCALE_COUNT=N`` (+ the matching base/sink env) in the
-engine subprocess environment before each sweep step, so this ONE graph file serves 500 / 1000 / 1500
-(and the CI smoke's 50 / 100) by env alone — no per-N file generation. The trivial route+handler keep
+Serving this directory reads the shape from ``MEFOR_CONNSCALE_COUNT=N`` (+ the matching base/sink
+env), so this ONE graph file serves any N by env alone. The connscale sweep runner no longer serves it:
+it writes each step's shape into a generated config directory instead
+(``harness.load.connscale.stepconfig``), because a ``[sandbox].mode = "subprocess"`` worker never
+receives a ``MEFOR_`` variable and would build the default 50 (BACKLOG #3132). Both build the graph
+through :func:`harness.config.connscale._wire.wire_graph`. The trivial route+handler keep
 the measured cost the engine's *per-connection machinery* (workers, wake events, pool, executor hops),
 not transform CPU. Serve it on its own::
 
@@ -25,69 +28,7 @@ Every value here is synthetic and generic — no real partner, site, host, or vo
 
 from __future__ import annotations
 
-from harness.config.connscale._shape import EDIT, ConnScaleShape, load_connscale_shape
-from messagefoundry import MLLP, Send, handler, inbound, outbound, router
-from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.wiring import HandlerFn, RouterFn
-from messagefoundry.parsing.message import Message, RawMessage
+from harness.config.connscale._shape import load_connscale_shape
+from harness.config.connscale._wire import wire_graph
 
-_SHAPE = load_connscale_shape()
-
-# A few attempts with brief backoff: the sink always AA's, so retries shouldn't fire — but a transient
-# hiccup under heavy connection count should ride out rather than dead-letter and dirty the no-loss check.
-_RETRY = RetryPolicy(
-    max_attempts=5, backoff_seconds=0.5, backoff_multiplier=2.0, max_backoff_seconds=5.0
-)
-
-
-def _apply_transform(
-    msg: Message | RawMessage, shape: ConnScaleShape, index: int
-) -> Message | RawMessage:
-    """Apply the configured transform cost. ``cheap`` returns the receipt unchanged (cheapest graph);
-    ``edit`` rewrites representative whole fields via the Message model (never string slicing). MSH-10
-    is left intact — the correlation sink matches on the control id, so the delivered copy must carry
-    the same one it arrived with."""
-    if shape.transform == EDIT and isinstance(msg, Message):
-        msg["MSH-4"] = "MEFOR_CONNSCALE"  # sending facility
-        msg["MSH-6"] = f"SINK_{index:05d}"  # receiving facility = this destination
-    return msg
-
-
-def _make_passthrough(dest: str, shape: ConnScaleShape, index: int) -> HandlerFn:
-    """A per-connection handler: apply the (trivial) transform, deliver to its own outbound. Each
-    handler runs on its own fresh parse of the raw (one routed row per handler), so mutation is
-    isolated."""
-
-    def handle(msg: Message | RawMessage) -> Send:
-        return Send(dest, _apply_transform(msg, shape, index))
-
-    return handle
-
-
-def _route_to(handler_name: str) -> RouterFn:
-    """A trivial router: every received message goes to the one handler bound to this inbound."""
-
-    def route(_msg: Message | RawMessage) -> list[str]:
-        return [handler_name]
-
-    return route
-
-
-# Wire N independent inbound→router→handler→outbound chains by name (a flat graph, no enclosing
-# "channel" element). Conn i: IB_CS_{i} on base_port+i → R_CS_{i} → H_CS_{i} → OB_CS_{i} → the sink.
-# Names run through ``ConnScaleShape.conn_name`` so a per-engine MEFOR_CONNSCALE_NAME_PREFIX gives each
-# engine DISTINCT names on a shared store (disjoint FIFO lanes); an empty prefix is byte-identical to
-# the historical IB_CS_{i}.. single-engine names.
-for _i in range(_SHAPE.count):
-    _dest = _SHAPE.conn_name("OB", _i)
-    _host, _port = _SHAPE.sink_endpoint(_i)
-    outbound(
-        _dest,
-        MLLP(host=_host, port=_port, connect_timeout=2.0, timeout_seconds=5.0),
-        retry=_RETRY,
-    )
-    _hname = _SHAPE.conn_name("H", _i)
-    handler(_hname)(_make_passthrough(_dest, _SHAPE, _i))
-    _rname = _SHAPE.conn_name("R", _i)
-    router(_rname)(_route_to(_hname))
-    inbound(_SHAPE.conn_name("IB", _i), MLLP(port=_SHAPE.base_port + _i), router=_rname)
+wire_graph(load_connscale_shape())

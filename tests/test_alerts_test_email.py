@@ -48,6 +48,10 @@ def _email_alerts(**overrides: object) -> AlertsSettings:
         "email_use_tls": True,
         "email_username": "smtp-user",
         "email_password": SMTP_PASSWORD_SECRET,
+        # The app here derives no posture, which the SMTP login's revocation guard counts as
+        # enforcing (ADR 0173 section 12, BACKLOG #2193), so the off-box relay is attested.
+        "email_tls_revocation_attested": True,
+        "email_tls_revocation_attested_reason": "synthetic test relay, never dialled",
     }
     base.update(overrides)
     return AlertsSettings(**base)  # type: ignore[arg-type]

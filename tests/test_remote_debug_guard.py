@@ -42,6 +42,7 @@ import messagefoundry
 from messagefoundry import remotedebug
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -1251,6 +1252,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=remote_debug,

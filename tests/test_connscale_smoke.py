@@ -90,6 +90,7 @@ from harness.load.connscale.runner import (
     herd_floor_armed,
     run_connscale,
 )
+from harness.load.connscale.stepconfig import STEP_CONFIG_DIR_PREFIX
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
     INBOUND_PORT_LO,
@@ -713,15 +714,20 @@ def test_the_run_reports_overall_success(smoke_report: ConnScaleReport) -> None:
     assert smoke_report.result_ok and smoke_report.exit_code == 0
 
 
+#: What a connscale engine's command line carries: the env-route graph, or the per-step directory
+#: the sweep runner generates (BACKLOG #3132). The sweep serves only the second now.
+_ENGINE_MARKS = ("harness/config/connscale", STEP_CONFIG_DIR_PREFIX)
+
+
 def _connscale_engines_under_this_process() -> list[str]:
-    """Command lines of every ``serve --config harness/config/connscale`` descended from pytest."""
+    """Command lines of every connscale ``serve`` descended from pytest (:data:`_ENGINE_MARKS`)."""
     lines = (cmdline_of(p) for p in tree_of(os.getpid())[1:])
     return [
         line
         for line in lines
         if line
         and " serve " in f" {line} "
-        and "harness/config/connscale" in line.replace("\\", "/")
+        and any(mark in line.replace("\\", "/") for mark in _ENGINE_MARKS)
     ]
 
 
@@ -740,7 +746,8 @@ def test_no_engine_OUTLIVES_the_sweep(smoke_report: ConnScaleReport) -> None:
             "-c",
             "import time; time.sleep(60)",
             "serve",
-            "harness/config/connscale",
+            # The mark a sweep engine carries now: its generated per-step config directory.
+            f"/tmp/{STEP_CONFIG_DIR_PREFIX}decoy",
             decoy_mark,
         ]
     )
