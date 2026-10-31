@@ -1599,26 +1599,30 @@ def _pool_key(pool: Any) -> Any:
     return pool._pool if isinstance(pool, _AutocommitPool) else pool
 
 
-def _hold_back(pool: Any) -> None:
-    """Count one more connection of ``pool`` held back behind a cancelled borrow."""
+def _adjust_held(pool: Any, delta: int) -> None:
+    """Move ``pool``'s held-back count by ``delta``, dropping its entry at zero."""
     key = _pool_key(pool)
     try:
-        _HELD_BACK[key] = _HELD_BACK.get(key, 0) + 1
-    except TypeError:
-        # A pool that cannot be weakly keyed is not counted, so its close waits unbounded, as
-        # before BACKLOG #2394. Logged, since that wait can then outlast a hung statement.
-        logger.warning("DATABASE: a held-back connection could not be counted against its pool")
-
-
-def _settle_held(pool: Any) -> None:
-    """Count one connection of ``pool`` no longer held back: it went back, or its return ended."""
-    key = _pool_key(pool)
-    with contextlib.suppress(TypeError):  # never counted: _hold_back logged it
-        left = _HELD_BACK.get(key, 0) - 1
+        left = _HELD_BACK.get(key, 0) + delta
         if left > 0:
             _HELD_BACK[key] = left
         else:
             _HELD_BACK.pop(key, None)
+    except TypeError:
+        # A pool that cannot be weakly keyed is not counted, so its close waits unbounded, as
+        # before BACKLOG #2394. Logged once per hold, since that wait can outlast a hung statement.
+        if delta > 0:
+            logger.warning("DATABASE: a held-back connection could not be counted against its pool")
+
+
+def _hold_back(pool: Any) -> None:
+    """Count one more connection of ``pool`` held back behind a cancelled borrow."""
+    _adjust_held(pool, 1)
+
+
+def _settle_held(pool: Any) -> None:
+    """Count one connection of ``pool`` no longer held back: it went back, or its return ended."""
+    _adjust_held(pool, -1)
 
 
 def _holds_back(pool: Any) -> int:
@@ -2002,10 +2006,9 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
         )
 
 
-async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = None) -> bool:
+async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = None) -> None:
     """Close ``pool``. Wait for its connections in use as an unbounded ``wait_closed`` would, but
     stop waiting once a connection of it is held back behind a cancelled borrow (BACKLOG #2394).
-    Returns whether the close finished; ``False`` means it stopped waiting and the close goes on.
 
     **The bound applies only while that count is above zero** (:func:`_holds_back`), whether it is
     when the close starts or becomes so while it waits. Such a connection goes back only once its
@@ -2030,17 +2033,16 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     try:
         while True:
             done, _pending = await asyncio.wait({closing}, timeout=tick)
-            if done:
-                closing.result()
-                return True
             # Re-read each tick: a cancelled borrow can be held back after the close began.
             held = _holds_back(pool)
-            if held or bound is not None:
+            if done or held or bound is not None:
                 break
     except BaseException:  # a cancelled caller: the close goes on, and a failure is still logged
-        if not closing.done():
-            closing.add_done_callback(partial(_log_late_pool_close, what))
+        closing.add_done_callback(partial(_log_late_pool_close, what))
         raise
+    if done:
+        closing.result()
+        return
     closing.add_done_callback(partial(_log_late_pool_close, what))
     if held:
         logger.warning(
@@ -2057,7 +2059,6 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
             what,
             tick,
         )
-    return False
 
 
 def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
