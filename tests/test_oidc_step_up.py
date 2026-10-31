@@ -14,8 +14,10 @@ cross-backend half of the field (persisted at mint, carried by rotation) is in
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import logging
 import time
 import urllib.parse
 from collections.abc import Callable, Coroutine
@@ -1403,3 +1405,288 @@ def test_a_step_up_flow_stages_its_session_and_user_together(
             step_up_session_hash=session_hash,
             step_up_user_id=user_id,
         )
+
+
+def _stage_step_up_flow(service: AuthService, user_id: str, client_ip: str) -> str:
+    """A live step-up flow naming ``user_id``, staged as ``begin_oidc_step_up`` stages one. A
+    ``state`` mismatch reads only the flow, so no session or account stands behind it."""
+    assert service._oidc_flows is not None
+    flow_id, _flow = oidc.start_flow(
+        service._oidc_flows,
+        return_to=NEXT,
+        client_ip=client_ip,
+        step_up_session_hash=f"session-of-{user_id}",
+        step_up_user_id=user_id,
+    )
+    return flow_id
+
+
+async def _forged_return(service: AuthService, flow_id: str, n: int) -> Any:
+    """One forged return to a live step-up flow, alternating the completion and the abandon leg,
+    each with a ``state`` that does not match."""
+    if n % 2:
+        return await service.abandon_oidc_step_up(
+            flow_id, state="forged", reason="idp_error", client="203.0.113.9"
+        )
+    return await service.complete_oidc_step_up(
+        flow_id=flow_id, state="forged", code=AUTH_CODE, client="203.0.113.9", public_origin=ORIGIN
+    )
+
+
+def _stage_sign_in_flow(service: AuthService) -> str:
+    """A live SIGN-IN flow, which names no user."""
+    assert service._oidc_flows is not None
+    flow_id, _flow = oidc.start_flow(service._oidc_flows, return_to=NEXT, client_ip="198.51.100.1")
+    return flow_id
+
+
+async def _forged_return_from(service: AuthService, flow_id: str, client: str) -> Any:
+    """One forged completion return to ``flow_id`` from ``client``, its ``state`` not matching."""
+    return await service.complete_oidc_step_up(
+        flow_id=flow_id, state="forged", code=AUTH_CODE, client=client, public_origin=ORIGIN
+    )
+
+
+async def test_one_account_spending_its_step_up_return_audit_budget_stops_only_its_own_rows(
+    rsa_key: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3965. RED when: the ``state_mismatch`` rows of step-up returns are bounded only per
+    user with no backstop, or by a ceiling one source can spend for everyone. Each account has a
+    budget of its own. Past it that account's return is refused exactly as before, consumes
+    nothing, and is logged instead of audited, while another account's row is still written."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        per_user = service._settings.login_rate_limit_per_ip
+        spender = _stage_step_up_flow(service, "user-a", "198.51.100.1")
+        other = _stage_step_up_flow(service, "user-b", "198.51.100.2")
+        rows_before = await store.count_audit(limit=None, action="auth.reauth")
+
+        for n in range(per_user + 2):
+            out = await _forged_return(service, spender, n)
+            assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user
+        assert "its audit budget is spent" in caplog.text
+
+        out = await _forged_return(service, other, 0)
+        assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert (
+            await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user + 1
+        ), "one account's spent budget stopped another account's row"
+        # Refused as before: no flow was consumed, so each still waits for its real IdP return.
+        assert service.oidc_step_up_flow(spender) is not None
+        assert service.oidc_step_up_flow(other) is not None
+        # The budget is its own: no ceremony key and no sign-in bucket recorded a single hit.
+        assert service._reauth_limiter is not None and service._login_limiter is not None
+        assert not service._reauth_limiter._hits, "a forged return drew the ceremony limiter"
+        assert not service._login_limiter._hits and not service._login_limiter._global_hits
+    finally:
+        await store.close()
+
+
+async def test_many_accounts_spending_the_backstop_still_leave_each_account_its_first_row(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3965. RED when: the step-up return audit budget's all-callers ceiling, once spent
+    by some accounts, silences every other account's ``state_mismatch`` row. Past the backstop each
+    account still writes one row a window, whatever it wrote before, and only that one."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        per_user = service._settings.login_rate_limit_per_ip
+        ceiling = service._settings.login_rate_limit_global
+        spenders = ceiling // per_user + 1  # enough accounts to pass the backstop
+        assert per_user * spenders > ceiling, "fixture: the per-user budgets alone pass it"
+        # An account that writes one row while the backstop has room, far below its own budget.
+        early = _stage_step_up_flow(service, "early-user", "203.0.113.40")
+        await _forged_return(service, early, 0)
+        for i in range(spenders):
+            flow_id = _stage_step_up_flow(service, f"user-{i}", f"198.51.100.{i}")
+            for n in range(per_user):
+                await _forged_return(service, flow_id, n)
+        rows_spent = await store.count_audit(limit=None, action="auth.reauth")
+
+        late = _stage_step_up_flow(service, "late-user", "203.0.113.50")
+        for n in range(3):
+            out = await _forged_return(service, late, n)
+            assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 1, (
+            "past the backstop, a fresh account must write exactly its first row"
+        )
+        # An account that wrote a row before the backstop filled gets its one row past it too,
+        # and no second.
+        for n in range(1, 4):
+            await _forged_return(service, early, n)
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_spent == 2, (
+            "past the backstop, an account must write exactly one row a window"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_client_address_with_no_user_cannot_spend_the_budget_for_anyone_else(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3965. RED when: a flow that names no user is charged under one shared key, so one
+    address spending it stops every other such address's rows, or a named user's. A flow with no
+    user is keyed by the callback's client address."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        per_user = service._settings.login_rate_limit_per_ip
+        sign_in = _stage_sign_in_flow(service)
+        rows_before = await store.count_audit(limit=None, action="auth.reauth")
+
+        for _ in range(per_user + 3):
+            out = await _forged_return_from(service, sign_in, "198.51.100.77")
+            assert not out.ok and out.reason == "state_mismatch" and not out.flow_consumed
+        assert await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user
+
+        # Another address with no user has its own budget.
+        await _forged_return_from(service, sign_in, "198.51.100.78")
+        assert (
+            await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user + 1
+        ), "one address's spent budget stopped another address's row"
+        # A named user is untouched by it.
+        named = _stage_step_up_flow(service, "user-n", "198.51.100.79")
+        await _forged_return(service, named, 0)
+        assert (
+            await store.count_audit(limit=None, action="auth.reauth") - rows_before == per_user + 2
+        ), "an address with no user stopped a named user's row"
+    finally:
+        await store.close()
+
+
+async def test_hitting_the_step_up_return_audit_backstop_pages_once_a_window(
+    rsa_key: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3965. RED when: the backstop across every key is spent and nothing is raised, so
+    the lost rows show only in the log. The first row it stops in a window pages through the alert
+    callable the API lifespan injects, naming that row's action. A row it admits under the
+    per-account floor pages nothing, and later stops of the same action in the window do not page
+    again, while a stop of the other action does."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        pages: list[str] = []
+        service._step_up_return_audit_alert = pages.append
+        per_user = service._settings.login_rate_limit_per_ip
+        ceiling = service._settings.login_rate_limit_global
+        for i in range(ceiling // per_user):
+            flow_id = _stage_step_up_flow(service, f"user-{i}", f"198.51.100.{i}")
+            for n in range(per_user):
+                await _forged_return(service, flow_id, n)
+        assert pages == [], "paged before the backstop was spent"
+
+        first = _stage_step_up_flow(service, "over-first", "203.0.113.99")
+        await _forged_return(service, first, 0)
+        assert pages == [], "paged for a row the per-account floor wrote"
+
+        for i in range(3):
+            flow_id = _stage_step_up_flow(service, f"over-{i}", f"203.0.113.{i}")
+            for n in range(2):
+                await _forged_return(service, flow_id, n)
+        assert pages == ["auth.reauth"], pages
+        assert "backstop" in caplog.text
+        # The other action, stopped in the same window, pages on its own.
+        assert not service.allow_step_up_return_audit(
+            "over-0", client="203.0.113.0", reason="non_navigation_fetch"
+        )
+        assert pages == ["auth.reauth", "auth.login_failed"], pages
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("window", [0.0, -1.0])
+async def test_a_window_of_zero_or_less_removes_the_whole_step_up_return_audit_budget(
+    window: float,
+) -> None:
+    """BACKLOG #3965. RED when: with a window of 0 or less a negative global still refuses rows
+    with no account behind them, and pages on every one, though the docs say that window removes
+    the whole budget."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(login_rate_limit_window_seconds=window, login_rate_limit_global=-1),
+        )
+        pages: list[str] = []
+        service._step_up_return_audit_alert = pages.append
+        assert all(
+            service.allow_step_up_return_audit(None, client="198.51.100.1", reason="state_mismatch")
+            for _ in range(100)
+        )
+        assert pages == []
+    finally:
+        await store.close()
+
+
+async def test_a_step_up_return_audit_reason_outside_the_closed_set_fails_on_every_call(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3965. RED when: an unknown ``reason`` passes until the backstop is spent and only
+    then raises, inside the flood the budget exists for."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        with pytest.raises(KeyError):
+            service.allow_step_up_return_audit(
+                "user-1",
+                client="198.51.100.1",
+                reason="non_navigation",  # type: ignore[arg-type]
+            )
+    finally:
+        await store.close()
+
+
+def test_the_backstop_page_is_the_audit_write_failed_alert_the_lifespan_injects() -> None:
+    """BACKLOG #3965. RED when: the backstop's page reaches no alert sink. The lifespan builds the
+    service with the factory, and the factory raises ``audit_write_failed`` under its own key with
+    the stopped row's action, and swallows a sink failure."""
+    from messagefoundry.pipeline.alerts import STEP_UP_RETURN_AUDIT_KEY, step_up_return_audit_alert
+
+    raised: list[tuple[str, str]] = []
+
+    class _Sink:
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            raised.append((name, action))
+
+    step_up_return_audit_alert(_Sink())("auth.login_failed")  # type: ignore[arg-type]
+    # The action is in the key, so the sink throttles each action apart.
+    assert raised == [(f"{STEP_UP_RETURN_AUDIT_KEY}:auth.login_failed", "auth.login_failed")]
+
+    class _Broken:
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            raise OSError("sink down")
+
+    step_up_return_audit_alert(_Broken())("auth.reauth")  # type: ignore[arg-type]
+
+    app_source = Path(messagefoundry.__file__).parent.joinpath("api", "app.py")
+    wired = [
+        keyword
+        for call in call_sites(parse_source(app_source.read_text(encoding="utf-8")), "AuthService")
+        for keyword in call.keywords
+        if keyword.arg == "step_up_return_audit_alert"
+    ]
+    assert len(wired) == 1, "the API lifespan no longer injects the backstop's page"
+    assert isinstance(wired[0].value, ast.Call)
+    assert wired[0].value.func.id == "step_up_return_audit_alert"  # type: ignore[attr-defined]
+
+
+async def test_the_step_up_return_audit_budget_goes_with_the_login_limiter_switch() -> None:
+    """BACKLOG #3965: one switch, as for every limiter on the login knobs. Off, every row is
+    written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(login_rate_limit_enabled=False))
+        assert service._step_up_return_audit_limiter is None
+        assert all(
+            service.allow_step_up_return_audit(
+                "user-1", client="198.51.100.1", reason="state_mismatch"
+            )
+            for _ in range(1000)
+        )
+    finally:
+        await store.close()
