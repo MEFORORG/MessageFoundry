@@ -698,9 +698,8 @@ async def test_a_start_and_an_operator_start_still_warn_once(
 async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_start(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture, warn: bool
 ) -> None:
-    """The whole-graph build fails at ``LK_BAD``, then each lookup builds alone, then the survivors
-    build again. Each build used to warn for every lookup it was given: three lines for a survivor
-    and two for ``LK_BAD``. Now each lookup whose ``url`` resolved logs one line.
+    """Two lookups fail to resolve, so the whole-graph build is skipped, each lookup that resolved
+    builds alone, and the survivors build again. Each lookup whose ``url`` resolved logs one line.
 
     The control this pins is the ASVS 14.2.1 record for a lookup that is down: ``LK_BAD``'s
     settings resolved and its build failed, and ``LK_TOKEN``'s URL resolved while another setting
@@ -728,6 +727,32 @@ async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_s
         for name in ("LK_A", "LK_Z", "LK_BAD", "LK_TOKEN"):
             assert _warned(caplog, f"FhirLookup {name!r}") == int(warn), name
         assert _warned(caplog, "FhirLookup 'LK_UNSET'") == 0
+    finally:
+        await runner.stop()
+
+
+async def test_a_failed_build_alone_leaves_each_lookup_one_warning_at_start(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every lookup resolves, so the whole-graph build runs and fails at ``LK_BAD``, then each
+    lookup builds alone, then the survivors build again. Each build used to warn for every lookup
+    it was given: three lines for a survivor and two for ``LK_BAD``. Warning inside any of those
+    builds fails these counts."""
+    reg = Registry()
+    lookups = {
+        "LK_A": _LOOKUP_URL,
+        "LK_BAD": "ftp://fhir.example.invalid/R4?api_key=PLACEHOLDER",  # not http or https
+        "LK_Z": _LOOKUP_URL,
+    }
+    for name, url in lookups.items():
+        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": url}))
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
+        assert list(runner.degraded_fhir_lookups()) == ["LK_BAD"]
+        for name in lookups:
+            assert _warned(caplog, f"FhirLookup {name!r}") == 1, name
     finally:
         await runner.stop()
 

@@ -2510,7 +2510,13 @@ class RegistryRunner:
                         self._env_values,
                         connection=fhir_lookup_record_name(name),
                     )
-                except Exception:  # its failure is recorded and alerted with the lookup's own
+                except WiringError:  # names the key, never a value
+                    # The lookup's own failure may name another setting, so say this one too.
+                    log.info(
+                        "FhirLookup %r: its url did not resolve, so the URL query-credential "
+                        "check could not read it",
+                        name,
+                    )
                     return
             warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
 
