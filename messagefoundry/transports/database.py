@@ -614,8 +614,10 @@ def _windows_path_verdict(
     drive_target: Callable[[str], str | None],
     cwd: str | Callable[[], str],
 ) -> bool | None:
-    """Whether a Windows ``path`` leads off this host, judged without following it: ``True`` it
-    does, ``False`` it stays local, ``None`` the walk stopped and could not clear it.
+    """Whether a Windows ``path`` leads off this host, judged without following it: ``True`` the
+    walk found it does, ``False`` the walk found nothing that does, ``None`` the walk stopped and
+    could not clear it. ``False`` is not proof the path stays local: ``docs/CONNECTIONS.md``,
+    Generic ODBC, lists at least the paths that lead off the host and are judged ``False``.
 
     :func:`~messagefoundry.auth.anchor_path.windows_chain` walks the path from its volume root. It
     reads each symbolic link or junction with ``readlink`` and splices its target in, up to its hop
@@ -714,12 +716,14 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
 
 
 def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> bool:
-    """Whether a file keyword's ``value`` must be refused: any spelling leads off this host, or the
-    trimmed spelling, which the build treats as the path, cannot be cleared. A padded spelling that
-    cannot be cleared is not refused, since Windows reads ``" C:\\x"`` as a stream name under the
-    working directory. It is read instead, as it was before the walk existed
-    (:func:`driver_file_spellings`), so it never reaches the driver both unread and unrefused. A
-    falsy value names no path. ``verdicts`` are this value's, when the caller already has them."""
+    """Whether a file keyword's ``value`` must be refused: any spelling is judged to lead off this
+    host, or the trimmed spelling, which the build treats as the path, cannot be cleared. A padded
+    spelling that cannot be cleared is not refused, since Windows reads ``" C:\\x"`` as a stream
+    name under the working directory. It is read instead, as it was before the walk existed
+    (:func:`driver_file_spellings`); where Windows refuses that name, nothing is checked at that
+    spelling. A falsy value names no path. ``verdicts`` are this value's, when the caller already
+    has them. What this refuses, and at least what it misses, is in ``docs/CONNECTIONS.md``,
+    Generic ODBC."""
     if not value:
         return False
     if verdicts is None:
@@ -730,8 +734,9 @@ def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> b
 
 def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
     """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
-    since a driver may trim it. Empty for a value that can name another host, so no check opens a
-    remote path (vault BACKLOG #3090), or whose trimmed spelling the walk could not clear. A padded
+    since a driver may trim it. Empty for a value :func:`names_another_host` refuses, so no check
+    opens a path that judgement found leads off the host (vault BACKLOG #3090); a path it does not
+    catch is still read here (``docs/CONNECTIONS.md``, Generic ODBC, lists at least those). A padded
     spelling the walk could not clear, beside a trimmed one it cleared, is kept: the driver may be
     given it as sent, so it is read, and :func:`_read_driver_file` judges what that read finds, as
     it did before the walk existed. Any value, a ``Path`` too, is read as its ``str()``: the text
@@ -748,7 +753,7 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
         verdicts = file_keyword_verdicts(value)
     if names_another_host(value, verdicts):
         return ()
-    return tuple(verdicts)  # none leads off the host here: names_another_host refuses any that does
+    return tuple(verdicts)  # none judged to lead off the host: names_another_host refused those
 
 
 def _refuse_remote_path(
@@ -757,11 +762,12 @@ def _refuse_remote_path(
     """Refuse a file keyword whose path is not a plain local one, judged from its ``verdicts``.
 
     A path that starts with two separators, or with the device prefix, can name another host, and
-    the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. So
-    can a path that leads to one on Windows: a mapped network drive, or a symbolic link or junction,
-    or a chain of them, to a share (:func:`_windows_path_verdict`, BACKLOG #2705). The value sent to
-    the driver is unchanged; only the judgement resolves it. What the check does not catch is listed
-    once, in ``docs/CONNECTIONS.md`` under Generic ODBC."""
+    the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. On
+    Windows this also refuses at least a path the walk finds leads to one: a mapped network drive,
+    or a symbolic link or junction, or a chain of them, to a share (:func:`_windows_path_verdict`,
+    BACKLOG #2705). The value sent to the driver is unchanged; only the judgement resolves it. What
+    the check refuses, and at least what it does not catch, is stated once, in
+    ``docs/CONNECTIONS.md`` under Generic ODBC."""
     if names_another_host(value, verdicts):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
@@ -778,9 +784,9 @@ def _refuse_remote_paths(
     holds, set or not.
 
     It refuses in every ``sslmode``. With TLS off the driver reads no CA, but an ``sslca`` or
-    ``sslcapath`` that leads off the host, by its spelling or by the walk, is refused all the same,
-    as a client certificate or key is. What the build still leaves to the driver unread with TLS
-    off is stated once, in ``docs/CONNECTIONS.md`` under Generic ODBC."""
+    ``sslcapath`` that :func:`names_another_host` refuses is refused all the same, as a client
+    certificate or key is. What the check refuses, and at least what it does not catch, is stated
+    once, in ``docs/CONNECTIONS.md`` under Generic ODBC."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
@@ -959,7 +965,7 @@ def _driver_file_spellings(
     ones that judgement cleared, never a second walk that could disagree with it. A map that lacks
     a set ``keyword`` raises ``KeyError``: it is a caller's bug, and reading it as no verdicts would
     leave the file unread and unrefused. Without a map the path is walked here, once. Either way a
-    set value that does not clear is refused, never passed unread."""
+    set value :func:`names_another_host` refuses is refused here too, never passed unread."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     value = named.get(keyword)
     if not value:

@@ -196,9 +196,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
-    build leaves to the driver. A value that can name or lead to another host is refused here as a
-    setting, unread, in every ``sslmode``, as the build refuses it (BACKLOG #2705). What the build
-    still leaves to the driver unread with TLS off is in ``docs/CONNECTIONS.md``, Generic ODBC.
+    build leaves to the driver. A value the build's remote-path check refuses is refused here as a
+    setting, in every ``sslmode`` (BACKLOG #2705). What that check refuses, and at least what it
+    does not catch, is stated once, in ``docs/CONNECTIONS.md``, Generic ODBC.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -1717,17 +1717,20 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`) and the value stays on this host, and when no spelling the build
+    (:func:`unread_ca_reason`) and the value is not refused below, and when no spelling the build
     checks names an existing path other than a directory: a missing file or a directory is left to
     the driver, as the build leaves it. The first spelling that names one is checked. A pipe or device is a spec, and
     :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
     :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers.
 
-    A value that leads to another host, or that the walk cannot clear (BACKLOG #2705), raises
-    ``ValueError`` and is never opened here, in every ``sslmode``, as the build refuses it
-    (``docs/CONNECTIONS.md``, Generic ODBC, says what the build still leaves to the driver). It is
-    checked again here, not taken from the build: a link swapped in after the build would
-    otherwise leave this check with no spec and no row.
+    A value the build's remote-path check refuses (``names_another_host``, BACKLOG #2705) raises
+    ``ValueError`` here, in every ``sslmode``, before any spelling of it is looked at here. That
+    check does not catch every path that leads off the host: a padded spelling the walk cannot
+    clear, beside a trimmed spelling it clears, is not refused, and is then looked at here with
+    ``os.path.exists`` when the driver reads the CA, like any other spelling.
+    ``docs/CONNECTIONS.md``, Generic ODBC, lists that case and at least the others. The value is
+    judged again here, not taken from the build: a link swapped in after the build would otherwise
+    leave this check with no spec and no row.
     The lane check turns the ``ValueError`` into a refused setting, as it does a bad pin. The path
     is judged once, and the spellings come from that one judgement."""
     value = _generic_odbc_param(settings, "sslca")

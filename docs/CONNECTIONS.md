@@ -1747,27 +1747,37 @@ keyword is sent as you wrote it, and not every driver trims it. A keyword given 
 case, is refused. The list says what the engine accepts. It does not say which keywords your
 driver reads, so check the driver's own manual.
 
-A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path: a drive
-letter, or one leading separator. A path that starts with two separators, or with a device
-prefix, is refused, because it can name another host. On Windows, so is a path that leads to
-another host: a mapped network drive, or a link, a chain of links or a `subst` drive that ends
-at a share. So is a path the check cannot read through, judged at its trimmed spelling. That
-leaves at least one exception: a padded spelling the check could not read through, such as
-`' C:\certs\ca.pem'`, would still be read and checked when its trimmed spelling clears, as
-before this check existed. The check reads links without following them and asks a drive's type
-rather than opening it. A missing folder, or a drive letter with no
-volume on this host, is left to the driver. These refusals hold in every SSL mode: an `SSLCA`
-or `SSLCAPATH` that leads to another host is refused even with TLS off, as under
-`SSLmode=disable`, although the driver then reads no CA. There is at least one exception: under
-TLS off, an `SSLCA` path the check clears, but whose read then fails because Windows could not
-reach a share (errors 53 and 67), is left to the driver unread, as before this check existed.
-The driver still gets the value as you wrote it.
+A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path on this
+host: a drive letter, or one leading separator. When the connection is built, the check refuses
+at least: a share spelling, one that starts with two separators or with a device prefix; on
+Windows, a path on a mapped network drive; on Windows, a path the check reads through a link, a
+chain of links or a `subst` drive to a share; and on Windows, a path whose trimmed spelling the
+check cannot read through. The check reads links without following them and asks a drive's type
+rather than opening it. A missing folder, or a drive letter with no volume on this host, ends
+the check as local and is left to the driver. These refusals apply in every SSL mode, so an
+`SSLCA` or `SSLCAPATH` is refused with TLS off too, although the driver then reads no CA. The
+driver still gets the value as you wrote it. This paragraph and the list below are the one place
+that says what the check refuses and misses; other text points here.
 
-At least these are not caught, so keep those files on a local disk:
+Not caught, at least, so keep those files on a local disk:
 
+- a padded spelling the check cannot read through, when its trimmed spelling clears: the padded
+  spelling is still read and checked, as before this check existed. For a spelling such as
+  `' C:\certs\ca.pem'`, Windows refuses the name, so nothing is checked at that spelling;
+- with the engine's working directory on a share, or a `subst` drive that stands for a share, the
+  check of a padded spelling may not find the share, so that spelling can be opened over the
+  network;
+- a link whose target is a `\DosDevices\...` or `\Sessions\<n>\DosDevices\...` object path: the
+  check clears it as local;
+- a drive-relative spelling such as `C:certs\ca.pem`: the check judges it against the root of
+  that drive, not that drive's current directory;
+- the entries inside an `SSLCAPATH` folder: only the folder's own path is judged;
 - on POSIX, anything past the spelling, including a network filesystem mounted at a local path;
-- a drive mapped or a link made after the connection is built: the check runs at the build, and
-  the driver resolves the path again at each connect.
+- a drive mapped, or a link made or swapped in, after the check: the check runs at the build,
+  and the driver resolves the path again at each connect;
+- under TLS off, an `SSLCA` path the check clears, but whose read then fails because Windows could
+  not reach a share (errors 53 and 67): it is left to the driver unread, as before this check
+  existed.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1791,8 +1801,9 @@ again. A file another account can replace, or whose content now fails, refuses t
 is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
 ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
 the whole reload, and the running lane is not stopped. A file swapped since the last check is
-audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
-where the driver reads no CA, and there is no pin for this file. A missing file or a directory
+audited as `changed`. Under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no
+CA, only the remote-path check above runs here: an `SSLCA` value it refuses is refused here too,
+as a setting, and the file is not checked or audited. There is no pin for this file. A missing file or a directory
 is left to the driver here too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
