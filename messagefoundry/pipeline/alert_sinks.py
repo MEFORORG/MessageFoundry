@@ -1675,6 +1675,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
 
+    def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
+        # BACKLOG #2614: the first start on a restored store revoked every session. The subject
+        # stands in for "connection". `last_audit_at` rides whole because the reason column
+        # redacts a date; both are times, an age and a count, never a row's content.
+        self._emit(
+            {
+                "type": "store_restored",
+                "connection": name,
+                "detail": detail,
+                "last_audit_at": last_audit_at,
+            }
+        )
+
     def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
         # vault BACKLOG #2742: the remote-debugging guard refused injected scripts.
         # `remote_debug:refused[@<process>]` stands in for "connection", so each engine process is

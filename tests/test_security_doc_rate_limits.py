@@ -718,6 +718,7 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         "DELETE /me/mfa",
         "DELETE /me/sessions",
         "DELETE /me/sessions/{session_id}",
+        "DELETE /sessions",
         "PATCH /users/{user_id}",
         "POST /users/{user_id}/reset-password",
         "POST /users/{user_id}/reset-mfa",

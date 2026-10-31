@@ -99,9 +99,10 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # engine's audit export streamed from the console session.
 # Vault BACKLOG #3373 added one /ui route and no JSON route: POST /ui/login/passkey, the passkey
 # sign-in's begin leg (ADR 0197 Amendment A wave 2), un-gated like the sign-in it serves.
-_ROUTES_DEFAULT = 116
-_ROUTES_WITH_DOCS = 120
-_ROUTES_WITH_UI = 244
+# BACKLOG #2614 added one JSON route: DELETE /sessions, users:manage.
+_ROUTES_DEFAULT = 117
+_ROUTES_WITH_DOCS = 121
+_ROUTES_WITH_UI = 245
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
 #: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1304,6 +1305,9 @@ _JSON_STEP_UP_WITHOUT_CONSOLE = frozenset(
         ("POST", "/messages/export"),
         # The console creates a directory account through POST /ui/users, not this route.
         ("POST", "/users/directory"),
+        # Ending every account's sessions is a JSON and host-CLI act; no console page offers it yet
+        # (BACKLOG #2614).
+        ("DELETE", "/sessions"),
     }
 )
 
@@ -2149,8 +2153,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 94 -> 95: BACKLOG #2021's POST /users/directory, users:manage.
     # 95 -> 96: BACKLOG #2345's GET /messages/{message_id}/raw, messages:view_raw.
     # 96 -> 97: BACKLOG #2331's GET /users/{user_id}/federated-identity, users:manage.
-    assert len(gated) == 97, (
-        f"{len(gated)} permission-gated routes, not 97 — update the doc's totals."
+    # 97 -> 98: BACKLOG #2614's DELETE /sessions, users:manage.
+    assert len(gated) == 98, (
+        f"{len(gated)} permission-gated routes, not 98 — update the doc's totals."
     )
 
 

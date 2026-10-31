@@ -226,6 +226,27 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
     return 2
 
 
+#: How old an archive ``restore`` accepts without ``--allow-old-archive`` (BACKLOG #2614). A week:
+#: a daily backup gives several archives inside it, so a refusal means the newest few backups are
+#: missing, which is worth a deliberate decision, and every account change made after the archive
+#: is undone by the restore.
+_RESTORE_MAX_AGE_DAYS = 7.0
+
+
+def _positive_days(text: str) -> float:
+    """``--max-age-days``: a finite number of days above zero. Zero, a negative or NaN would refuse
+    every archive, which reads as a fault in the archive rather than in the flag."""
+    import math
+
+    try:
+        days = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a number of days: {text!r}") from exc
+    if not math.isfinite(days) or days <= 0:
+        raise argparse.ArgumentTypeError(f"must be a number of days above zero, not {text!r}")
+    return days
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -876,6 +897,25 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #2614. DELETE /sessions ends every session through the API; this is the same act from
+    # the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
+    admin_revoke_sessions = sub.add_parser(
+        "admin-revoke-sessions",
+        help="end every account's sessions from the host (offline; the API is not needed)",
+        description="Revoke every session of every account, directly against the store, on the "
+        "same host gate as admin-unlock. Every signed-in user, administrators included, must sign "
+        "in again. Audited. The engine may be running or stopped.",
+    )
+    admin_revoke_sessions.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_revoke_sessions.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    admin_revoke_sessions.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
     # this is how an install gets its first administrator. There is deliberately no --password and no
     # --password-file -- see `_provision_admin`.
@@ -1282,6 +1322,23 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
         "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
+    )
+    # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
+    # old archive is refused unless the operator says it is meant.
+    restore.add_argument(
+        "--max-age-days",
+        type=_positive_days,
+        default=_RESTORE_MAX_AGE_DAYS,
+        help=f"refuse an archive taken more than this many days ago (default "
+        f"{_RESTORE_MAX_AGE_DAYS:g}). An archive of unknown age is refused whatever this is; "
+        "only --allow-old-archive restores it",
+    )
+    restore.add_argument(
+        "--allow-old-archive",
+        action="store_true",
+        help="restore an archive older than --max-age-days, or of unknown age, anyway. Every "
+        "disable, delete, role change and reset made after its newest audit row must then be "
+        "re-applied by hand",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -11036,6 +11093,94 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     return code
 
 
+def _admin_revoke_sessions(args: argparse.Namespace) -> int:
+    """End every account's sessions from the host (BACKLOG #2614).
+
+    ``DELETE /sessions`` does the same through the API, and this exists for when the API is the
+    thing not trusted, such as a suspected compromise of the engine's own host process. The gate
+    is host access, as for ``admin-unlock``, whose docstring says why that gate is a real one.
+    It keeps no session: the shell that runs it holds none.
+
+    The audit row is written after the revoke, as ``admin-unlock`` writes its own, and the audit
+    append is checked for a refusal before the revoke, so a refused row cannot follow a change
+    that already landed."""
+    import getpass
+
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_call_errors,
+    )
+
+    settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
+    if isinstance(settings, int):
+        return settings
+
+    async def run() -> tuple[int | None, str | None]:
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            _refuse_an_unauditable_write(store)
+            try:
+                revoked = await store.revoke_all_sessions()
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
+            except store_call_errors() as exc:
+                # The store opened; the revoke itself was refused and rolled back. Not the open
+                # error the arm below words, which would read as a wrong --db path.
+                return None, f"nothing was revoked: {safe_exc(exc)}. Retry"
+            # The revoke has committed. A failed audit append (a running engine holding the
+            # write lock past the busy timeout, say) must not read as "nothing happened".
+            try:
+                await store.record_audit(
+                    "auth.session_revoked",
+                    actor=f"cli:{getpass.getuser()}",
+                    detail=json.dumps({"scope": "all", "count": revoked}),
+                )
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
+            except store_call_errors() as exc:
+                return revoked, safe_exc(exc)
+            return revoked, None
+        finally:
+            await store.close()
+
+    try:
+        revoked, problem = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreKeyUnresolved,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if revoked is None:
+        return _emit_error(problem or "nothing was revoked", as_json=args.json)
+    if problem is not None:
+        return _emit_error(
+            f"revoked {revoked} session(s), but the audit row could not be written: {problem}. "
+            "The sessions are ended; record the act by hand",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "revoked": revoked}))
+    else:
+        print(f"OK: revoked {revoked} session(s); every signed-in user must sign in again")
+    return 0
+
+
 def _restore(args: argparse.Namespace) -> int:
     """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
 
@@ -11063,15 +11208,31 @@ def _restore(args: argparse.Namespace) -> int:
                 dest_store_path=args.to,
                 store_settings=settings.store,
                 config_dest=args.config_to,
+                max_age_seconds=None if args.allow_old_archive else args.max_age_days * 86400,
             )
         )
     except BackupError as exc:
-        return _emit_error(f"restore failed ({exc.kind}): {exc}", as_json=args.json)
+        # BACKLOG #2614: the primitive states the age; the override is this command's to name.
+        hint = ""
+        if exc.kind in ("age", "age_undated"):
+            # An archive of unknown age passes no limit, so only the flag restores it.
+            larger = " (or a larger --max-age-days)" if exc.kind == "age" else ""
+            hint = (
+                f" Choose a newer archive, or pass --allow-old-archive{larger} to restore this one."
+            )
+        return _emit_error(f"restore failed ({exc.kind}): {exc}{hint}", as_json=args.json)
     except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
         return _emit_key_unresolved(exc, as_json=args.json)
 
+    from messagefoundry.pipeline.alerts import utc_or_unknown
+    from messagefoundry.pipeline.dr_backup import restored_accounts_notice
+
     payload = {
         "archive": result.archive_path,
+        "archive_sha256": result.archive_sha256,
+        "archive_created_at": utc_or_unknown(result.archive_created_at),
+        "last_audit_at": utc_or_unknown(result.last_audit_at),
+        "sessions_revoked": result.sessions_revoked,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
@@ -11089,6 +11250,11 @@ def _restore(args: argparse.Namespace) -> int:
         )
         if result.config_dir is not None:
             print(f"  config: {result.config_files} file(s) into {result.config_dir}")
+        print(
+            f"  archive taken {payload['archive_created_at']}; newest audit row in it "
+            f"{payload['last_audit_at']}"
+        )
+        print(f"  {restored_accounts_notice(result.sessions_revoked)}")
     return 0
 
 
@@ -12365,6 +12531,7 @@ _DISPATCH = {
     "service": _service,
     "admin-set-notify-email": _admin_set_notify_email,
     "admin-reset-totp": _admin_reset_totp,
+    "admin-revoke-sessions": _admin_revoke_sessions,
 }
 
 
