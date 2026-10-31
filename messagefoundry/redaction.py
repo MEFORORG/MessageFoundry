@@ -2675,10 +2675,10 @@ _KNOWN_CODEC_REPRS = frozenset(repr(name) for name in _KNOWN_CODECS)
 
 
 def _kept_notes(notes: list[Any]) -> list[str]:
-    """What a Unicode error's traceback prints of its own notes: the stdlib's codec note alone,
-    naming the codec only when :func:`_names_a_codec` would, since the name is text the caller
-    chose. Every other note is dropped, plain text included, since a caller can build one from the
-    failing input (vault BACKLOG #3340, item 7)."""
+    """What a Unicode error's traceback prints of its own notes: each one that reads exactly like
+    the stdlib's codec note, whoever added it, naming the codec only when :func:`_names_a_codec`
+    would, since the name is text the caller chose. Every other note is dropped, plain text
+    included, since a caller can build one from the failing input (vault BACKLOG #3340, item 7)."""
     kept: list[str] = []
     for note in notes:
         match = _CODEC_NOTE.fullmatch(note) if type(note) is str else None
@@ -2841,8 +2841,9 @@ def _builtin_exc_renders(namespace: dict[str, Any]) -> frozenset[int]:
 
 
 #: The ``id`` of each ``__str__`` and ``__repr__`` a builtin exception class defines. Each is C
-#: code that prints at most the exception's own slots and ``.args``: never its chain, and never
-#: an attribute of another object it holds. Ids, so testing a caller's method against them runs
+#: code that prints at most the exception's own slots and ``.args``, some of them through their
+#: ``repr()``, and never its chain. An object held in a slot or ``.args`` can print its own
+#: attributes that way, and the walk reads those slots and ``.args`` plainly. Ids, so testing a caller's method against them runs
 #: none of the caller's code; each one lives as long as the interpreter, so its id is never reused.
 #: Only C slot wrappers and method descriptors count: a module that put a class of its own into
 #: ``builtins`` before this one was imported would otherwise vouch for its Python method.
@@ -3191,30 +3192,33 @@ class _ScanShare:
     :func:`_added_pass` and :func:`safe_traceback` point here.
 
     BUDGETS. Each link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's
-    scan does, and can end one unit past it. A scan with no share runs its added pass on what its
+    scan does, and can end up to two units past it (a dict read at an odd limit). A scan with no share runs its added pass on what its
     first pass left. In a traceback, a link's added pass runs on the smaller of that and what is
     left of ``added``, one more budget the added passes of every link share, so a long chain whose
     scans each run out is not read once per link. The first passes never draw on ``added``. One
     link's added reads of a single large object, such as an exception group in its chain, can spend
     all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
-    error only they would reach prints raw. That link prints as it did before this change, with two
-    exceptions: a True verdict handed on to it below still prints the note, and its first pass reads
-    an exception's instance ``__dict__`` through :data:`_EXC_DICT`, even where the class puts
-    something else under that name, where before this change it read none.
+    error only they would reach prints raw. That link prints as it did before this change, except at
+    least where a verdict was handed on to it (below), which it then uses without a scan of its own,
+    and where its first pass reads an exception's instance ``__dict__`` through :data:`_EXC_DICT`
+    while the class puts another descriptor under that name: before this change that read raised,
+    and the exception printed the note (fail closed); now its real ``__dict__`` is read.
 
     COSTS IN THE ADDED PASS (:func:`_added_pass`). It reads an object at most twice: once the plain
     way, and once the deep way, beneath or as an exception whose own code renders it. Each read
-    takes only the readers the reads before it lacked. A read of an object no earlier read met costs
-    one unit, one for each element read when it is a container, scalars included, and one for each
-    value read through its readers. Of an object an earlier read met, a plain read with no reader
-    left to add costs nothing; any other plain read costs one unit and each value read, and follows
+    takes only the readers the reads before it lacked. A read of an object the scan has not recorded
+    yet costs one unit, one for each element read when it is a container, scalars included, and one
+    for each value read through its readers; an object of a class not read at all is charged that
+    one unit each time and never recorded. Of an object the scan has recorded, a plain read with no
+    reader left to add costs nothing; any other plain read costs one unit and each value read, and follows
     none of its elements again; a deep read costs one unit, each value read, and one for each
     non-scalar element not yet read the deep way, which it follows again.
 
     VERDICTS. ``verdicts`` maps an exception's id to that exception and its answer, so a later
     link's scan returns the answer without reading. A scan records one only for an exception whose
     own ``__str__`` or ``__repr__`` is not a builtin exception's, and only when its added pass read
-    that exception the deep way: True when it holds a Unicode error, and False only when the scan's
+    that exception the deep way: True when the scan finds it holding a Unicode error or an object it
+    could not read (fail closed), and False only when the scan's
     remainder is larger than the most slots and chain links any one of its reads went through, which
     it takes as the sign that no read was cut short."""
 
@@ -3353,7 +3357,7 @@ class _Scan:
                     nodes[id(child)] = (child, [], "")
                     seeds.append(id(child))
             charged.extend(reversed(follow))  # popped in the order read: .args before attributes
-        # The first pass ends above; it can end one unit past the limit, which leaves none here.
+        # The first pass ends above; it can end two units past the limit, which leaves none here.
         room = max(budget, 0) if share is None else min(max(budget, 0), share.added)
         budget, opened, widest = _added_pass(nodes, seeds, read, order, room)
         if share is not None:

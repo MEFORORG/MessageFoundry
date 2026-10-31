@@ -2245,7 +2245,9 @@ class _ForeignDictData:
     __dict__ = _NoDictOwner.__dict__["__dict__"]
 
 
-def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed() -> None:
+def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Review of vault BACKLOG #3340: an exception's __dict__ is read through _EXC_DICT, so
     # _ForeignDictError above no longer raises, and nothing reached the added pass's own fail-closed
     # arm. The dataclass sits behind a __cause__ link, which only the added pass reads.
@@ -2255,9 +2257,12 @@ def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed() -> None
     holder = _PrintsInnerCause("bad")
     holder.__cause__ = inner
     scan = redaction._Scan(holder, charged_root=True)
-    assert scan.nodes[id(data)][1:] == (None, "TypeError")  # marked unreadable by the added pass
+    assert scan.nodes[id(data)][1:] == (None, "TypeError")  # marked unreadable
     assert id(holder) in scan.holds
     assert redaction.prints_a_codec_error(holder)
+    # Control: with no added pass, nothing reaches it, so the mark above is the added pass's own.
+    monkeypatch.setattr(redaction, "_added_pass", lambda *args: (args[-1], [], 0))
+    assert id(data) not in redaction._Scan(holder, charged_root=True).nodes
 
 
 # --- the added pass never undoes the first (vault BACKLOG #3340) -------------------------------

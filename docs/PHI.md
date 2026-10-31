@@ -1707,10 +1707,11 @@ in a traceback, as a log argument, in
 
 In a traceback the stdlib prints an exception's `__notes__` after its line. A holder's notes are
 all dropped. A `UnicodeError`'s own notes are dropped too, except the note a codec adds itself,
-such as `decoding with 'utf-8' codec failed`, which keeps the codec's name only where
-`safe_exc()` would print it and otherwise reads `decoding with a codec failed`. A note a caller
+such as `decoding with 'utf-8' codec failed`, which keeps the codec's name only when that name is
+one `safe_exc()` can print, and otherwise reads `decoding with a codec failed`. A note a caller
 added is dropped even when it is plain text, since it can be built from the failing input, as
-`add_note(f"segment {seg!r}")` (vault BACKLOG #3340). An exception that neither is nor holds a
+`add_note(f"segment {seg!r}")` (vault BACKLOG #3340); one that reads exactly like a codec's own
+note is kept the same way as that note. An exception that neither is nor holds a
 codec error keeps its notes as they are, so a codec error placed among them still prints raw.
 
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
@@ -1718,8 +1719,9 @@ attribute, each value read from it, and each element of a list or dict found tha
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
 The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads what the
 walk read before that change, on the same budget per log argument and per traceback link, and it
-finishes before the added pass starts.** It differs at least in reading an exception's instance
-`__dict__` even where the class puts something else under that name. The added pass then
+finishes before the added pass starts.** It differs at least where the class of an exception puts
+another descriptor under `__dict__`: that read used to raise, so the exception printed the note,
+and now its real `__dict__` is read. The added pass then
 reads at least the dunder-named slots, the `__cause__` and `__context__` chain links, and what an
 exception's own `__str__` or `__repr__` reaches. It runs on the budget the first pass left, and in
 a traceback within one more budget that the added passes of every link share. **It only adds: it
@@ -1728,8 +1730,10 @@ costs, and when one link's scan hands its verdict on to a later link, is in the 
 docstring in `redaction.py`. At least these stay open. A codec error that only the added reads
 reach can still print raw once those budgets are spent, and one large object in one link, such as
 an exception group in its chain, can spend the shared budget. A slot whose name a subclass uses
-for something else is not read. A verdict handed on within a traceback can make a link print the
-note where its own scan would not, which errs toward the note.
+for something else is not read. A link whose verdict an earlier link's scan handed on is not
+scanned again: a True can make it print the note where its own scan would not, which errs toward
+the note, and a False is handed on only when that scan judged that none of its reads was cut
+short.
 When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
