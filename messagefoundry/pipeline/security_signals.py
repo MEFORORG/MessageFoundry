@@ -304,9 +304,9 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
         self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
-        #: One failure run per (event type, subject) whose sink call is failing; see
-        #: :meth:`_notify`. Trimmed past :data:`MAX_SUBJECTS`, oldest first.
-        self._sink_failures: OrderedDict[tuple[str, str], FailureRun] = OrderedDict()
+        #: One failure run per event type whose sink call is failing; see :meth:`_notify`.
+        #: Keyed on the type alone, so its size is bounded by the fixed set of event types.
+        self._sink_failures: dict[str, FailureRun] = {}
         self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
@@ -459,43 +459,43 @@ class SecuritySignalDetector:
             self._restore(self._posture_raised)
 
     def _restore(self, subject: str) -> None:
-        self._posture_raised = None
-        self._notify("posture_restored", subject, lambda: self._sink.posture_restored(subject))
+        # Cleared only once the sink took the inverse, so a release whose call failed can be
+        # tried again rather than reporting the alert resolved.
+        if self._notify("posture_restored", lambda: self._sink.posture_restored(subject)):
+            self._posture_raised = None
 
     def _raise(self, signal: str, subject: str, count: int, detail: str) -> bool:
         return self._notify(
             signal,
-            subject,
             lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
         )
 
-    def _notify(self, event: str, subject: str, call: Callable[[], None]) -> bool:
+    def _notify(self, event: str, call: Callable[[], None]) -> bool:
         """Run one sink call; False when the sink raised.
 
         A sink that keeps raising no longer starts the refusal quiet period, so a refused peer,
         which costs itself nothing, could otherwise write a line per ``peer_refusals`` refusals.
-        So each (event type, subject) keeps its own :class:`~messagefoundry.log_backoff.FailureRun`:
-        one key's failures never silence another's line, each line carries the run's count, and
-        the first success after a run writes one recovery line. The record carries the sink
-        exception's type name only, as before, never its message, which a sink may build from the
-        alert's subject or detail."""
-        key = (event, subject)
+        So each event type keeps one :class:`~messagefoundry.log_backoff.FailureRun`: one type's
+        failures never silence another's line, each line carries the run's count, and the first
+        success of that type after a run writes one recovery line. It is keyed on the type alone,
+        never the subject, because a caller can choose subjects (a client address, a username):
+        keyed on them, a spread of subjects would write a line each. So the count is of every
+        failed call of that type, over all its subjects, and a line does not say which subject
+        failed. The record carries the sink exception's type name only, never its message, which a
+        sink may build from the alert's subject or detail."""
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            run = self._sink_failures.pop(key, FailureRun())
-            self._sink_failures[key] = run.record(
+            self._sink_failures[event] = self._sink_failures.get(event, FailureRun()).record(
                 log,
                 _SinkFault(f"{type(exc).__module__}.{type(exc).__qualname__}"),
                 "security-signal alert %s could not be raised",
                 event,
                 level=logging.WARNING,
             )
-            if len(self._sink_failures) > MAX_SUBJECTS:
-                self._sink_failures.popitem(last=False)
             return False
-        if key in self._sink_failures:
-            self._sink_failures.pop(key).clear(
+        if event in self._sink_failures:
+            self._sink_failures.pop(event).clear(
                 log, "security-signal alert %s", event, level=logging.WARNING
             )
         return True

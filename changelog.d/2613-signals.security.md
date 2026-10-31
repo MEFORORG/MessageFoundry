@@ -10,5 +10,6 @@
   raises `posture_loosened` naming the switch. A start that records no loosening raises the new
   `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
   process; that alert's key now carries `@node:<id>` or `@shard:<id>` where several engine
-  processes share the store, and an unpinned cluster node resolves its own as it shuts down. See
+  processes share the store, and an unpinned cluster node resolves its own as it shuts down,
+  unless the process is killed outright; an operator then resolves it by hand. See
   [CONFIGURATION.md](../docs/CONFIGURATION.md). (`BACKLOG #2613`)

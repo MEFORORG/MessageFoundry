@@ -620,6 +620,10 @@ def test_a_refusal_alert_the_sink_refused_starts_no_quiet_period() -> None:
     assert det.refusal_quiet("IB_ACME_ADT")
 
 
+#: Planted in every failing sink's exception message, to prove the log never carries it.
+_LEAK_TOKEN = "LEAK-7f3a"
+
+
 class _Switchable(_Sink):
     """A sink whose calls raise while ``down`` holds; records what it took otherwise."""
 
@@ -630,12 +634,12 @@ class _Switchable(_Sink):
 
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         if self.down:
-            raise RuntimeError("sink down for " + name)
+            raise RuntimeError(f"{_LEAK_TOKEN} sink down for {name}")
         super().security_signal(name, signal=signal, count=count, detail=detail)
 
     def posture_restored(self, name: str) -> None:
         if self.down:
-            raise RuntimeError("sink down for " + name)
+            raise RuntimeError(f"{_LEAK_TOKEN} sink down for {name}")
         self.restored.append(name)
 
 
@@ -652,12 +656,48 @@ def test_a_sink_that_keeps_failing_backs_off_and_counts_under_a_refusal_flood(
         for _ in range(500):
             det.observe_refusal("IB_ACME_ADT")
         lines = _failed_lines(caplog)
-        # The 1st, 2nd, 4th ... 256th failure, each with the run's count; never a sink message.
+        # The 1st, 2nd, 4th ... 256th failure, each with the run's count.
         assert len(lines) == 9 and lines[-1].endswith("(consecutive failures: 256)")
-        assert not any("IB_ACME_ADT" in line for line in lines)
+        # caplog.text is formatted with each record's exception text, so a sink message that
+        # reached a record through exc_info would show here, token and subject both.
+        assert "sink down" not in caplog.text and _LEAK_TOKEN not in caplog.text
+        assert "IB_ACME_ADT" not in caplog.text
         sink.down = False
         det.observe_refusal("IB_ACME_ADT")
     assert any("recovered after 500 consecutive failures" in r.getMessage() for r in caplog.records)
+
+
+def test_a_spread_of_failing_subjects_writes_a_bounded_number_of_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink = _Switchable()
+    det = SecuritySignalDetector(sink, _thresholds(signin_failures=1), clock=_Clock())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        for i in range(1000):
+            det.observe("auth.login_failed", None, None, f"2001:db8::{i:x}", None)
+        signin = [line for line in _failed_lines(caplog) if "signin_failure_burst" in line]
+        # One run for the event type: the 1st, 2nd, 4th ... 512th failure, not one per address.
+        assert len(signin) == 10 and signin[-1].endswith("(consecutive failures: 512)")
+        # The control: another event type in the middle of that run still logs its own line.
+        det.observe("logging_level_change", "op", None, None, json.dumps({"to": "DEBUG"}))
+    assert [line for line in _failed_lines(caplog) if "log_level_debug" in line] == [
+        "security-signal alert log_level_debug could not be raised (consecutive failures: 1)"
+    ]
+
+
+def test_a_release_whose_resolve_failed_can_be_tried_again() -> None:
+    sink = _Switchable()
+    sink.down = False
+    det = SecuritySignalDetector(sink, _thresholds(), clock=_Clock())
+    _start(det, ["security.allow_x"])
+    sink.down = True
+    det.release()
+    assert sink.restored == []
+    sink.down = False
+    det.release()  # the alert is still recorded as raised, so this resolves it
+    assert sink.restored == ["posture:start"]
+    det.release()  # the control: once resolved, nothing is left to resolve
+    assert sink.restored == ["posture:start"]
 
 
 def test_one_events_failing_run_does_not_silence_another_events_failure(
