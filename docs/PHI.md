@@ -1691,7 +1691,9 @@ even if it never prints the error. When that method is the class's own code rath
 exception's, the walk also follows the exception's `__cause__` and `__context__`, link after link
 along the whole chain, and reads at least the instance `__dict__`, the slots and the chain links
 of each exception it reaches that way, within the budget below (vault BACKLOG #3340). So such a class raised from a codec
-error, or while one was being handled, loses its message the same way. An exception whose
+error, or while one was being handled, loses its message the same way, raised `from None`
+included: that hides the context from the stdlib's traceback, not from the class's own code. An
+exception whose
 `__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
 stores an error on an attribute keeps its message, unless it is a dataclass, whose attributes are
 read as any dataclass's are, so it prints as the fixed note; and except where the same exception is also reached
@@ -1734,10 +1736,13 @@ an `OSError`'s, its dunder-named slots but not its chain links; and of one whose
 own code, it reads the instance `__dict__`, slots and chain links of each exception it reaches,
 whatever that exception's methods are. Where the class of an exception puts something other than a
 getset or member descriptor under `__dict__`, such as a property or `__dict__ = None`, the first
-pass skips the instance dict, as the walk did before that change, and the added pass, wherever
-it reads that exception's instance dict as above, reads it through the builtin `BaseException`
-descriptor. A class that puts another class's getset there is
-read through that getset: the read raises, and the walk fails closed on that exception. It does not read everything such code can
+pass skips the instance dict, as the walk did before that change, and the added pass reads it
+through the builtin `BaseException` descriptor: of an exception whose `__str__` or `__repr__` is
+not `BaseException`'s own, an `OSError` subclass's included, and of each exception beneath own
+code as above. So such a class loses its message where its instance dict holds a codec error, as
+it would if it did not hide that dict. A class that puts another class's getset there is read
+through that getset: where the exception is not an instance of that class the read raises, and
+the walk fails closed on that exception. It does not read everything such code can
 reach: an object the walk does not read by attribute, as listed below, is not read there either.
 It runs on the budget the first pass left, and in
 a traceback within one more budget that the added passes of every link share. **It only adds: it

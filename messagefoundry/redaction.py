@@ -2892,13 +2892,51 @@ def _reader_record(kind: type[Any], memo: _RecordMemo) -> _ReaderRecord:
     known = memo.get(id(kind))
     if known is not None and known[0] is kind:
         return known[1]
-    fresh, plain, beneath, opens = _find_reader_sets(kind)
     cached = _READERS.get(id(kind))
-    first = cached[1] if cached is not None and cached[0]() is kind else fresh
-    gains = (_less(first, plain), _less(first, beneath), _less(plain, beneath))
-    record = (first, plain, beneath, opens, gains)
+    record: _ReaderRecord
+    if not issubclass(kind, BaseException):
+        # Every read is the first pass's, so no read adds anything: no class walk is needed here.
+        if cached is not None and cached[0]() is kind:
+            first = cached[1]
+        else:
+            first = _find_reader_sets(kind, first_only=True)[0]
+        none = None if first is None else (None,)
+        record = (first, first, first, False, (none, none, none))
+    else:
+        fresh, plain, beneath, opens = _find_reader_sets(kind)
+        first = cached[1] if cached is not None and cached[0]() is kind else fresh
+        gains = (_less(first, plain), _less(first, beneath), _less(plain, beneath))
+        record = (first, plain, beneath, opens, gains)
     memo[id(kind)] = (kind, record)
     return record
+
+
+#: ``id(class)`` -> (a weak reference to the class, :func:`_starts_added_reads`' answer). A flag,
+#: not the readers, so it holds no descriptor and keeps no class alive; the entry goes when the
+#: class dies, as :data:`_READERS`' does.
+_STARTS: dict[int, tuple[Any, bool]] = {}
+
+
+def _starts_added_reads(kind: type[Any], memo: _RecordMemo) -> bool:
+    """Whether :func:`_added_pass` starts from an instance of ``kind`` the first pass read: an
+    exception whose own code renders it, or one whose plain readers add to the first pass's. Kept
+    per class, since this runs for every exception a scan reads."""
+    if not issubclass(kind, BaseException):
+        return False
+    key = id(kind)
+    cached = _STARTS.get(key)
+    if cached is not None and cached[0]() is kind:
+        return cached[1]
+    _first, _plain, _beneath, opens, gains = _reader_record(kind, memo)
+    found = opens or _reads_any(gains[0])
+    if len(_STARTS) >= _READERS_MAX:
+        _STARTS.clear()
+    try:
+        alive = weakref.ref(kind, lambda _gone: _STARTS.pop(key, None))
+    except TypeError:  # a class that cannot be weakly referenced is not kept
+        return found
+    _STARTS[key] = (alive, found)
+    return found
 
 
 def _less(had: _Readers, target: _Readers) -> _Readers:
@@ -3429,8 +3467,7 @@ def _added_pass(
         kind = type(arg)
         if kind in _ARG_SCALARS or issubclass(kind, UnicodeError):
             continue
-        _first, _plain, _beneath, opens, gains = _reader_record(kind, memo)
-        if opens or _reads_any(gains[0]):
+        if _starts_added_reads(kind, memo):
             pending.append((arg, False))
     while pending and budget > 0:
         arg, deep = pending.pop()
@@ -3704,8 +3741,14 @@ class _Rebuild:
         return None
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
-        # An exception, or an object read by attribute: never printed through its own code.
-        if not issubclass(kind, _ARG_WALKED) or _readers(kind) is not None:
+        # An exception, or an object read by attribute: never printed through its own code. An
+        # exception's elements are not rendered either: the note prints none of them, and the
+        # added pass puts what its attributes and chain hold among them (vault BACKLOG #3340).
+        if (
+            issubclass(kind, BaseException)
+            or not issubclass(kind, _ARG_WALKED)
+            or _readers(kind) is not None
+        ):
             return _holder_note(kind)
         if issubclass(kind, UserDict):
             own: Any = kind.__repr__

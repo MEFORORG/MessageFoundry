@@ -2701,6 +2701,32 @@ def test_a_scanned_exception_class_is_not_kept_alive_past_the_scan() -> None:
     assert alive() is None
 
 
+class _CountedRow(collections.namedtuple("_CountedRow", "value")):  # noqa: PYI024 - a subclass
+    """Counts each time its own ``__repr__`` runs."""
+
+    calls = 0
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        return "row"
+
+
+def test_an_exception_holder_renders_none_of_what_it_holds() -> None:
+    # Review of vault BACKLOG #3340: a holder exception's elements, now including what the added
+    # pass read from its attributes, were each rendered, a container subclass by its own __repr__,
+    # and the text thrown away for the fixed note.
+    plain = ValueError("x")
+    plain.row = _CountedRow(_encode_error())  # type: ignore[attr-defined]
+    own = _LinkError("y")
+    own.inner = plain  # type: ignore[attr-defined]
+    _CountedRow.calls = 0
+    record = _record("got %r", ([plain, own],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert out == f"got [[ValueError {_HOLDER[1:]}, [_LinkError {_HOLDER[1:]}]"
+    assert _CountedRow.calls == 0
+
+
 class _Slotted(Exception):
     """Prints its last slot; the slots before it are never assigned."""
 
