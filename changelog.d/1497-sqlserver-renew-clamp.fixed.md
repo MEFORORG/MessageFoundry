@@ -7,5 +7,6 @@
   driver cannot apply one. Unlike Postgres, the two bounds do not share one deadline, so a renew can
   land up to about twice the clamp after it is issued, while the config check compares the clamp
   alone with the detection margin; `serve` logs a warning at start-up when twice the clamp reaches
-  that margin, which the shipped 10/20/30 timings do. The COMMIT after the statement is not bounded
-  by the clamp at all. ADR 0157 Inc 0, deviation 3. (`BACKLOG #1497`)
+  that margin, which the shipped 10/20/30 timings do. The COMMIT after the statement, and the
+  rollback after a failed claim, are bounded by nothing, since `command_timeout` does not bound a
+  SQL Server commit either. ADR 0157 Inc 0, deviation 3. (`BACKLOG #1497`)

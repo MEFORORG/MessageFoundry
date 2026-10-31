@@ -726,9 +726,12 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 - Consequence 1(c): a promote, demote and re-promote in one process passes every guard, on both
   backends. Only a per-claim token closes it.
 - The SQL Server renew inherited `[store].command_timeout` until 2026-10-30 (Inc 0, deviation 3,
-  now BUILT). Its claim's borrow and statement are clamped. At least these are not: the claim's
-  COMMIT, the ROLLBACK after a failed claim, the start-up `_register` and `_ensure_tables`, and the
-  heartbeat, config-version and release statements.
+  now BUILT). Its claim's borrow and statement are clamped. The claim's COMMIT, and the ROLLBACK
+  after a failed claim, are bounded by nothing: they are calls on the connection, which neither the
+  clamp nor `[store].command_timeout` bounds. At least these are not clamped either: the start-up
+  `_register` and `_ensure_tables`, and the heartbeat, config-version and release statements. The
+  claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
+  leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as

@@ -376,6 +376,9 @@ def test_sqlserver_warns_when_twice_the_clamp_reaches_the_margin(tmp_path: Path)
     assert _TWICE_THE_CLAMP in note
     assert "(2 x 4.6 = 9.2 s)" in note
     assert "margin (9 s)" in note
+    # The operator set this value, so the note may tell them to lower it.
+    assert "Lower lease_renew_timeout_seconds below 4.5 s" in note
+    assert "is not set" not in note
 
 
 def test_sqlserver_warns_at_the_shipped_timings(tmp_path: Path) -> None:
@@ -385,7 +388,42 @@ def test_sqlserver_warns_at_the_shipped_timings(tmp_path: Path) -> None:
     assert s.cluster.lease_renew_timeout_seconds == 4.5
     note = s.sqlserver_renew_bound_warning()
     assert note is not None
+    # Derived, so the note names the fence/TTL pair and never a value the operator did not set.
+    assert "lease_renew_timeout_seconds is not set" in note
+    assert "(2 x 4.5 = 9 s)" in note
+    assert "set lease_renew_timeout_seconds explicitly, below 4.5 s" in note
+    assert "Lower lease_renew_timeout_seconds" not in note
+    assert _TWICE_THE_CLAMP not in note
+
+
+def test_the_same_value_set_explicitly_is_named_as_set(tmp_path: Path) -> None:
+    """Control for the derived wording: 4.5 written by hand is the operator's, so lowering it is
+    the remedy, and the derived text does not appear."""
+    note = _load(
+        tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 4.5\n"
+    ).sqlserver_renew_bound_warning()
+    assert note is not None
     assert _TWICE_THE_CLAMP in note
+    assert "Lower lease_renew_timeout_seconds below 4.5 s" in note
+    assert "is not set" not in note
+
+
+def test_a_floored_derived_clamp_names_widening_alone(tmp_path: Path) -> None:
+    """Fence 4.0 / TTL 6.0 leaves a 1.2 s margin; the derived clamp is floored at 1.0, and no clamp
+    at or above the 1 s SQL Server floor is below 0.6 s, so setting one is not offered."""
+    s = _load(
+        tmp_path,
+        _SQLSERVER
+        + "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
+        + "leader_lease_ttl_seconds = 6.0\n",
+    )
+    assert s.cluster.lease_renew_timeout_seconds == 1.0
+    note = s.sqlserver_renew_bound_warning()
+    assert note is not None
+    assert "lease_renew_timeout_seconds is not set" in note
+    assert "Widen the gap between leader_fence_timeout_seconds" in note
+    assert "explicitly" not in note
+    assert "Lower lease_renew_timeout_seconds" not in note
 
 
 def test_the_warning_prints_a_float_margin_short(tmp_path: Path) -> None:

@@ -58,6 +58,7 @@ from pydantic import (
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     ValidatorFunctionWrapHandler,
@@ -6244,6 +6245,10 @@ class ClusterSettings(_Section):
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
     # fit would make the check unfalsifiable -- it would accept everything. Must be > 0.
     lease_renew_timeout_seconds: float | None = None
+    # True when _renew_fits_the_margin filled lease_renew_timeout_seconds in, so the SQL Server
+    # start-up warning names the fence/TTL pair rather than a value the operator never set. A
+    # private attribute because the validator's own assignment adds the field to model_fields_set.
+    _renew_clamp_derived: bool = PrivateAttr(default=False)
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
     # (byte-identical to before this knob existed). A preferred site keeps its nodes at 0.0 and a warm
@@ -6402,6 +6407,7 @@ class ClusterSettings(_Section):
             )
         if self.lease_renew_timeout_seconds is None:
             self.lease_renew_timeout_seconds = _derived_renew_timeout_seconds(margin)
+            self._renew_clamp_derived = True
         # The derived value FALLS THROUGH the same check rather than returning early, and since the
         # derivation gained a floor it can genuinely fail here: any margin at or below the floor. That
         # is the intended refusal -- such a pair cannot carry a clamp that is both inside the margin
@@ -7677,13 +7683,35 @@ class ServiceSettings(_InputHidingModel):
         )
         if not 2 * clamp >= margin:
             return None
+        # A clamp left unset was derived from the fence/TTL pair, so "lower it" would name a value
+        # the operator never wrote. The set-it remedy is offered only while a clamp both under half
+        # the margin and at the 1 s SQL Server floor exists; below that only widening helps.
+        gap = "the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds"
+        half = margin / 2
+        if self.cluster._renew_clamp_derived:
+            cause = (
+                "lease_renew_timeout_seconds is not set, and the value derived from"
+                " leader_fence_timeout_seconds and leader_lease_ttl_seconds leaves the renew no"
+                f" headroom there: twice it (2 x {clamp:g} = {2 * clamp:g} s)"
+            )
+            other = f"set lease_renew_timeout_seconds explicitly, below {half:g} s"
+            first = f"Widen {gap}"
+        else:
+            cause = f"twice lease_renew_timeout_seconds (2 x {clamp:g} = {2 * clamp:g} s)"
+            other = f"widen {gap}"
+            first = f"Lower lease_renew_timeout_seconds below {half:g} s"
+        if half > 1.0:
+            remedy = f"{first}, or {other}"
+        else:
+            remedy = (
+                f"Widen {gap}: no clamp of at least 1 s, the SQL Server floor, is below half this"
+                " margin"
+            )
         return (
-            f"[cluster] on SQL Server: twice lease_renew_timeout_seconds (2 x {clamp:g} ="
-            f" {2 * clamp:g} s) reaches the demotion detection margin ({margin:g} s). There the"
-            " lease claim's pool wait and its statement each get the full clamp, and its COMMIT is"
-            " not bounded by it, so a renew issued just before this node self-fences can still land"
-            " and re-extend the lease. Lower lease_renew_timeout_seconds, or widen the gap between"
-            " leader_fence_timeout_seconds and leader_lease_ttl_seconds"
+            f"[cluster] on SQL Server: {cause} reaches the demotion detection margin"
+            f" ({margin:g} s). There the lease claim's pool wait and its statement each get the full"
+            " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
+            f" self-fences can still land and re-extend the lease. {remedy}"
         )
 
     @model_validator(mode="after")
