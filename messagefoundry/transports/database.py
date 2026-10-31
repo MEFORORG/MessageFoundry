@@ -2304,8 +2304,9 @@ class DatabaseSource(SourceConnector):
         )
         self._encoding: str = declared_encoding(s.get("encoding"))
         # Refused here, when the source is built, by the probe config load uses (BACKLOG #2431). Each
-        # polled row is encoded with this name, so an unusable one would otherwise surface per row. The
-        # name is not rendered: an env() setting resolves to an environment value.
+        # polled row is encoded with this name, so an unusable one would otherwise surface per row.
+        # Config load refuses an env() inbound encoding and a literal naming no codec (BACKLOG #2431),
+        # so this is a backstop for a graph built past load.
         if not _is_text_codec(self._encoding):
             raise ValueError("DATABASE source 'encoding' names no usable text codec")
         self._login_timeout = _login_timeout(

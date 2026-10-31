@@ -575,7 +575,7 @@ def test_a_null_literal_outbound_encoding_is_refused_at_load(tmp_path: Path) -> 
         load_config(tmp_path)
     result = _check_validate(tmp_path)
     assert result.ok is False
-    assert "only an inbound connection reads as utf-8" in result.detail
+    assert "outside an inbound connection it must be a codec name" in result.detail
 
 
 # "UTF_8" is the load-bearing row: Python normalizes case and underscores, so a probe stricter than
@@ -800,8 +800,25 @@ def test_an_env_outbound_encoding_resolving_to_none_or_empty_is_refused(
     with pytest.raises(WiringError) as ei:
         _build_check(load_config(tmp_path), {})
     assert "outbound connection 'o'" in str(ei.value)
-    assert "'charset'" in str(ei.value)
-    assert "value withheld" in str(ei.value)
+    assert "'charset' resolves to no codec name (empty or None)" in str(ei.value)
+
+
+def test_a_cast_raising_any_error_does_not_escape_the_resolved_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1656: a cast is an arbitrary callable, and a lookup-table cast raises KeyError carrying
+    # the value. The resolved pass runs before the connector build, so it must skip such a ref and
+    # leave it to resolve_env_settings, which reports it redacted, rather than let the KeyError out.
+    secret = "pw-C4st_Val-66"  # allowlisted in .gitleaks.toml
+    _encoding_cfg(
+        tmp_path,
+        "TABLE = {}\n"
+        "outbound('o', File(directory='.', encoding=env('charset', cast=TABLE.__getitem__)))",
+    )
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": secret})
+    assert secret not in str(ei.value)
+    assert "charset" in str(ei.value)  # positive control: the ref is still the diagnostic
 
 
 def test_a_non_string_environment_value_names_its_type(tmp_path: Path) -> None:

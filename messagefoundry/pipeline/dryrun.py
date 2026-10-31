@@ -1014,10 +1014,6 @@ def dry_run(
     (:func:`messagefoundry.pipeline.dryrun_trace.trace_dry_run`) can capture the Router/Handler execution;
     it does not change the disposition or would-send payloads (byte-identical to ``tracer=None``).
 
-    ``env_values`` are the instance's ``env()`` values. The decode resolves an ``env()`` encoding
-    against them as the listener does (BACKLOG #2431); ``messagefoundry check`` passes the active
-    environment's.
-
     ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
     default stays ``False`` (§8.1); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
 

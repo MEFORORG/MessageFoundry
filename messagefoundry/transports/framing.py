@@ -121,9 +121,9 @@ def declared_encoding(declared: object) -> str:
     and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
     for the decode (BACKLOG #2431).
     An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
-    Config load refuses an inbound ``env()`` reference, any other non-``str`` value and any name
-    naming no text codec (``Registry.encoding_problems``, BACKLOG #2431), so at run time this sees a
-    ``str`` or ``None``. The ``str()`` stays as a
+    Config load refuses an inbound ``env()`` reference, every non-``str`` value but ``None`` and any
+    name naming no text codec (``Registry.encoding_problems``, BACKLOG #2431), so at run time this
+    sees a ``str`` or ``None``. The ``str()`` stays as a
     backstop: a value that got past load anyway fails as a ``LookupError`` the decode refuses and
     :func:`frame_reply` falls back from, never as a ``TypeError`` out of ``encode`` or ``decode``."""
     return str(declared) if declared else "utf-8"

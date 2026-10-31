@@ -563,6 +563,31 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
     assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
 
 
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
+    store: MessageStore, listener: str
+) -> None:
+    """BACKLOG #2431: config load refuses an env() inbound encoding instead of resolving it, so the
+    decode never reads an environment value. Pinned with a value present, so a return of per-message
+    resolution on either caller fails here rather than passing on an empty value set."""
+    ic = _inbound_declaring(EnvRef("charset"))
+    reg = _registry(ic)
+    preview = dry_run(reg, ADT_UTF8)
+    runner = wiring_runner.RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False), env_values={"charset": "utf-8"}
+    )
+    with contextlib.suppress(
+        ReceiptRefusedRetryable
+    ):  # the HTTP receipt's answer, as in _live_rows
+        await getattr(runner, listener)(reg.inbound["in"], ADT_UTF8)
+
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert preview.disposition is MessageStatus.ERROR
+    assert preview.error is not None and preview.error.startswith("decode error (")
+    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+
+
 async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:
     """The NAK half: the MLLP listener answers AE, since the configuration and not the message is at
     fault and a resend can succeed once it is fixed; bytes invalid in a usable charset stay AR."""

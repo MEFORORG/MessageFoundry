@@ -5347,8 +5347,8 @@ def inbound_binding_conflicts(
 # an escape, but every message on the connection would be refused the same way.
 # Registry.encoding_problems catches it statically; the probe below is how.
 
-#: The `kind` :meth:Registry._declared_encodings gives an inbound connection. An inbound's `env()`
-#: encoding is refused at load (BACKLOG #2431), so the passes below tell it apart by this.
+#: The ``kind`` :meth:`Registry._declared_encodings` gives an inbound connection. An inbound's
+#: ``env()`` encoding is refused at load (BACKLOG #2431), so the passes below tell it apart by this.
 _INBOUND_ENCODING_KIND = "inbound connection"
 
 
@@ -5383,14 +5383,19 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
     :func:`resolve_env_settings`' resolution order — the environment value (cast if a ``cast`` was
     given), else the ``default`` — narrowed to a single ref and made **non-raising**, so a caller that
     only wants to *probe* a value can skip what it cannot resolve instead of pre-empting that
-    function's own loud, all-problems-at-once report."""
+    function's own loud, all-problems-at-once report.
+
+    A cast is an arbitrary callable, so **every** exception it raises is caught, as
+    :func:`resolve_env_settings` catches it (BACKLOG #1656): a ``KeyError`` from a lookup-table cast
+    carries the value. Not logged, for the same reason; that function reports the ref redacted when
+    the connector is built."""
     if ref.key in values:
         raw = values[ref.key]
         if ref.cast is None:
             return raw
         try:
             return ref.cast(raw)
-        except (ValueError, TypeError):
+        except Exception:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
             return _UNSET
     if ref.default is not _UNSET:
         return ref.default
@@ -5414,7 +5419,7 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     the connection is deployed — the accepted cost of the owner ruling that chose this over amending
     ADR 0111, counted by :meth:`Registry.encoding_census` rather than hidden.
 
-    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` rejects — is skipped
+    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` raises on — is skipped
     rather than reported: for a connection, a database lookup and a FHIR lookup,
     :func:`resolve_env_settings` raises on it loudly moments later when the connector is built, and a
     second message here would only make the first read as the failure. :func:`_resolve_port` skips an
@@ -5429,9 +5434,13 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     reference table's build-check resolution, unfiled and named rather than numbered.
 
     **An INBOUND connection is skipped: an ``env()`` inbound encoding is refused outright at load**
-    (:meth:`Registry.encoding_problems`, BACKLOG #2431). The ingress decode reads the inbound's own
-    ``spec.settings``, where an ``env()`` encoding is still the reference, so no environment value
-    this pass could accept would be the name the decode uses."""
+    (:meth:`Registry.encoding_problems`, BACKLOG #2431). The ingress text decode reads the
+    inbound's own ``spec.settings``, where an ``env()`` encoding is still the reference, so no
+    environment value this pass could accept would be the name the decode uses.
+
+    A value resolving to ``None`` or ``""`` is refused with its own message: only the inbound decode
+    reads a falsy name as ``utf-8`` by rule, and at least most outbound connectors and the FHIR
+    lookup read the value as the codec name itself."""
     problems: list[str] = []
     for kind, name, value, deployed in registry._declared_encodings():
         if not isinstance(value, EnvRef):
@@ -5443,10 +5452,16 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
         resolved = _resolve_one_env_value(value, env_values)
         if resolved is _UNSET:
             continue  # no value here — reported loud by resolve_env_settings at connector build
-        # A resolved None or "" is refused like any other unusable value: only the inbound decode
-        # (`transports.framing.declared_encoding`) falls back to utf-8 on a falsy name, and an inbound
-        # never reaches this pass. Most outbound connectors and the FHIR lookup read the value as the
-        # codec name, so None would fail every send (BACKLOG #2431).
+        if resolved is None or resolved == "":
+            # Not every reader would fail on it (the remote-file destination reads a falsy name as
+            # utf-8), so the message says a name is required rather than that sends would fail.
+            problems.append(
+                f"{kind} {name!r}: encoding from environment value {value.key!r} resolves to no "
+                f"codec name (empty or None); outside an inbound connection set a codec name such "
+                f"as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
+                f"(environments/<env>.toml or MEFOR_VALUE_*)"
+            )
+            continue
         if isinstance(resolved, str) and _is_text_codec(resolved):
             continue
         # NEVER render ``resolved``. It is a MEFOR_VALUE_* environment value and this string is raised
@@ -5728,8 +5743,9 @@ class Registry:
 
         Here and not in the factories: a SMART or OAuth2 token hop, which reads the CA, is composed
         onto a spec after its factory returns. The reasons are those of ``unread_ca_reason`` in
-        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems`: an ``env()``
-        value reads as unknown, and the check after resolution refuses it then."""
+        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
+        ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
+        check after resolution refuses it then."""
         from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
 
         dialling = [
@@ -5791,16 +5807,19 @@ class Registry:
         are not the same promise.
 
         **An :func:`env` reference on an INBOUND connection is refused** (BACKLOG #2431), deployed or
-        not, from Python config and ``connections.toml`` alike. The ingress decode reads the inbound's
-        own settings, where the reference is never resolved, so no environment value could make it a
-        codec name. Nothing is resolved to refuse it, so ADR 0111 holds, and the message names the
-        reference's key, never a value. An inbound encoding is set per environment by editing the
-        connection.
+        not, from Python config and ``connections.toml`` alike, and whatever its ``content_type``.
+        The ingress text decode reads the inbound's own settings, where the reference is never
+        resolved, so a text inbound would refuse every message. A binary inbound never text-decodes;
+        it is refused too, so the rule does not turn on a second setting. Nothing is resolved to
+        refuse it, so ADR 0111 holds, and the message names the reference's key, never a value. An
+        inbound encoding is set per environment by editing the connection.
 
         **``None`` is accepted on an inbound connection only**, whose decode reads it as "not
         declared" and falls back to ``utf-8`` (:func:`~messagefoundry.transports.framing.
-        declared_encoding`). Most outbound connectors and the FHIR lookup read the value as the codec
-        name itself, so a ``None`` there would fail every send; it is refused (BACKLOG #2431).
+        declared_encoding`). Elsewhere it is refused (BACKLOG #2431): at least most outbound
+        connectors and the FHIR lookup read the value as the codec name itself, so a ``None`` there
+        would fail every send. Not every reader would (the remote-file destination reads it as
+        ``utf-8``), so the message asks for a codec name rather than predicting a failure.
 
         **A ``deployed=False`` connection is checked HERE and nowhere else — the split is deliberate
         (BACKLOG #1767, owner ruling 2026-09-18), and the old blanket claim above it no longer holds.**
@@ -5822,7 +5841,8 @@ class Registry:
                     problems.append(
                         f"{kind} {name!r}: encoding is the environment reference {value.key!r}, and "
                         f"an inbound encoding must be a literal codec name such as 'utf-8', "
-                        f"'latin-1' or 'cp1252' — set it per environment by editing the connection"
+                        f"'latin-1' or 'cp1252', because the inbound decode never resolves an "
+                        f"env() reference — set it per environment by editing the connection"
                     )
                 # Otherwise spelled out rather than swallowed: probing an EnvRef raises TypeError,
                 # and a try/except wide enough to catch that could not tell it from a real failure.
@@ -5830,8 +5850,8 @@ class Registry:
             if value is None:
                 if not inbound:
                     problems.append(
-                        f"{kind} {name!r}: encoding is None, which only an inbound connection reads "
-                        f"as utf-8; use a codec name such as 'utf-8', 'latin-1' or 'cp1252'"
+                        f"{kind} {name!r}: encoding is None, and outside an inbound connection it "
+                        f"must be a codec name such as 'utf-8', 'latin-1' or 'cp1252'"
                     )
                 continue  # on an inbound, an explicit "not declared": the decode falls back to utf-8
             if not isinstance(value, str):
