@@ -272,9 +272,12 @@ def test_build_odbc_dsn_postgres_shape() -> None:
     )
     assert "DRIVER={PostgreSQL Unicode}" in dsn
     assert "SERVER=db.example" in dsn and "SERVER={" not in dsn  # host unbraced, like the SS preset
-    assert "DATABASE={mefor}" in dsn
-    assert "UID={svc}" in dsn and "PWD={pw}" in dsn  # default credential keywords
-    assert "PORT={5432}" in dsn and "SSLmode={verify-full}" in dsn
+    # BACKLOG #2705: values are sent unbraced. psqlODBC kept braces on UID and DATABASE, did not
+    # honour a braced SSLmode (no TLS at all), and refused a braced PORT.
+    assert "DATABASE=mefor;" in dsn
+    assert "UID=svc;" in dsn and "PWD=pw;" in dsn  # default credential keywords
+    assert "PORT=5432;" in dsn and "SSLmode=verify-full;" in dsn
+    assert dsn.count("{") == 1 and dsn.count("}") == 1  # only the driver name is braced
     # No SQL-Server TLS keywords are forced onto the generic path.
     assert "Encrypt=" not in dsn and "TrustServerCertificate=" not in dsn
 
@@ -321,7 +324,7 @@ def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureF
         ("Encrypt", "no"),
         ("Encrypt", "0"),
         ("Encrypt", "false"),
-        ("Encrypt", "  Off  "),  # value classification tolerates case + surrounding whitespace
+        ("Encrypt", "OFF"),  # value classification tolerates case
     ],
 )
 def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
@@ -360,7 +363,7 @@ def test_build_odbc_dsn_custom_credential_keywords() -> None:
             "odbc_password_key": "PASSWORD",
         }
     )
-    assert "USER={svc}" in dsn and "PASSWORD={pw}" in dsn
+    assert "USER=svc;" in dsn and "PASSWORD=pw;" in dsn
 
 
 def test_build_odbc_dsn_requires_driver() -> None:

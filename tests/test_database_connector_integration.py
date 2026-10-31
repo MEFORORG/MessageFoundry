@@ -88,7 +88,7 @@ async def pool() -> AsyncIterator[Any]:
         _build_dsn(_conn()),
         3,
         autocommit=True,
-        login_timeout=_login_timeout(_conn(), "test", dialect="sqlserver"),
+        login_timeout=_login_timeout(_conn(), "test"),
     )
     try:
         yield p

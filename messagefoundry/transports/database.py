@@ -114,6 +114,7 @@ from messagefoundry.transports.db_endpoint import (
     generic_hop_endpoint,
     odbc_keyword_name,
     odbc_param,
+    reads_brace_escape,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
@@ -271,7 +272,7 @@ def _build_dsn(
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
 # metacharacters (`; { } =`) and newlines is the STORE-5 guard for the operator-supplied generic keys
-# (the VALUES are additionally brace-quoted), so message-influenced data can't smuggle extra keywords.
+# (the VALUES are checked by _odbc_literal), so message-influenced data can't smuggle extra keywords.
 _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 
 # The ONLY keywords ``odbc_params`` may set on the generic dialect (vault BACKLOG #2577), in the form
@@ -509,22 +510,68 @@ def _odbc_unsafe_text(text: str, refused: str) -> bool:
     return not text.isascii() or has_control_char(text) or any(ch in refused for ch in text)
 
 
-def _odbc_literal(value: object, *, what: str, connection: str | None, refused: str = ";{}") -> str:
-    """``value`` brace-quoted for the generic connection string, or a ValueError when it is not
-    printable ASCII or holds a ``refused`` character (vault BACKLOG #2577).
-
-    The braces are the ODBC quoting rule and ``}}`` is its escape. Not every driver is known to read
-    that escape, and one that does not would see the value end at the first ``}`` and read what
-    follows as the next keyword. So for every value the engine can restrict at no cost, the
-    delimiters are refused instead of escaped. A password is the exception (``refused=""``): it must
-    be able to hold any printable ASCII character, so it keeps the ODBC escape and relies on the
-    driver reading it. The refusal names the setting and never the value."""
-    text = str(value)
+def _refuse_unsafe_text(text: str, *, what: str, connection: str | None, refused: str) -> None:
+    """A ValueError when ``text`` is not printable ASCII or holds a ``refused`` character
+    (vault BACKLOG #2577). The refusal names the setting and never the value."""
     if _odbc_unsafe_text(text, refused):
         listed = ", ".join(f"'{ch}'" for ch in refused)
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
+        )
+
+
+def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
+    """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
+    #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
+
+    **Why no braces.** Braces are the ODBC quoting rule, and drivers read them differently. Measured
+    on 2026-10-30: psqlODBC keeps them as part of ``UID`` and ``DATABASE``, and does not honour a
+    braced ``SSLmode``, so ``SSLmode={verify-full}`` connected with no TLS at all; psqlODBC and
+    MySQL both refuse a braced ``port``. A plain value behaved correctly on both. So the value is
+    sent plain, and everything that could change how a driver reads a plain value is refused instead:
+
+    * ``;``, ``{`` and ``}``, which end or quote a value, and ``=``, which a driver may read as a
+      second keyword's separator;
+    * a value that is not printable ASCII (:func:`_odbc_unsafe_text` says why);
+    * an empty or blank value, since an empty ``sslmode`` is the driver's default, and libpq's
+      default ``prefer`` falls back to plaintext;
+    * a leading or trailing space, which one driver may trim and another may keep, so the engine
+      would judge a value the driver does not read.
+
+    The refusal names the setting and never the value. A password follows its own rule
+    (:func:`_odbc_password`), and the driver name stays braced."""
+    text = str(value)
+    _refuse_unsafe_text(text, what=what, connection=connection, refused=";{}=")
+    if not text or text != text.strip():
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {what} must not be empty, blank, "
+            "or start or end with a space"
+        )
+    return text
+
+
+def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+    """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
+
+    Sent plain when it holds none of ``;``, ``{`` or ``}`` and has no leading or trailing space,
+    because a driver that reads no braces (ACE) takes it only that way. Otherwise it needs the
+    braces and the ``}}`` escape, which only a driver :func:`reads_brace_escape` names is
+    measured to read: psqlODBC and MySQL (2026-10-30 probes), and Microsoft's SQL Server drivers,
+    whose escape the SQL Server preset and the store rely on. A driver that does not read it would
+    end the value at the first ``}`` and read the rest as further keywords; the Access driver (ACE)
+    did, and refused even a braced password with no brace in it. So for any other driver the build
+    is refused. A driver missing from the list is unmeasured, not known to be unsafe. A password must be
+    printable ASCII whatever the driver. The refusal names the setting and never the value."""
+    text = str(password)
+    _refuse_unsafe_text(text, what="password", connection=connection, refused="")
+    if not any(ch in ";{}" for ch in text) and text == text.strip():
+        return text
+    if not reads_brace_escape(driver):
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE password holds ';', '{{', '}}' or a leading or "
+            "trailing space, which needs the ODBC '}}' escape, and odbc_driver does not name a "
+            "driver measured to read it (PostgreSQL, MySQL, SQL Server); change the password"
         )
     return odbc_brace(text)
 
@@ -840,10 +887,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     target under another keyword cannot be configured on this path. The egress check itself is the
     caller's (``pipeline.wiring_runner``); this builder keeps the host that check read the host sent.
 
-    Every value is brace-quoted (STORE-5 injection guard) and must be printable ASCII
-    (:func:`_odbc_literal`). ``odbc_driver``, ``database``, ``username`` and every ``odbc_params``
-    value also refuse ``;``, ``{`` and ``}`` rather than escaping them. ``password`` keeps the ODBC
-    ``}}`` escape, so it may hold any printable ASCII character.
+    Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
+    every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
+    they refuse ``;``, ``{``, ``}``, ``=``, an empty or blank value and a leading or trailing space.
+    ``odbc_driver`` is braced and refuses ``;``, ``{`` and ``}``. ``password`` is sent plain when it
+    can be, and braced with the ``}}`` escape only for a driver measured to read it
+    (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
@@ -870,10 +919,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a control character "
             "or a non-ASCII character (ODBC injection risk)"
         )
-    parts = [
-        f"DRIVER={_odbc_literal(driver, what='odbc_driver', connection=connection)}",
-        f"SERVER={server}",
-    ]
+    # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
+    # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
+    _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
         parts.append(f"DATABASE={database}")
@@ -893,8 +942,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        # No refused characters: a password keeps the ODBC escape (see _odbc_literal).
-        secret = _odbc_literal(password, what="password", connection=connection, refused="")
+        secret = _odbc_password(password, driver=driver, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -1458,28 +1506,26 @@ def _import_aioodbc() -> Any:
     return aioodbc
 
 
-def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | None:
+def _login_timeout(s: Mapping[str, Any], label: str) -> int:
     """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
-    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Pool sites take it from here.
-
-    ``dialect`` is the one the caller built its DSN with, passed explicitly rather than read from
-    ``s``: ``db_lookup`` and reference sync always build the SQL Server DSN, whatever the mapping says.
+    setting, for either dialect (BACKLOG #2089, #2705). Pool sites take it from here.
 
     **Why it is not in the DSN.** ODBC Driver 18 ignores a login-timeout keyword in the connection
     string; the comment in ``store/sqlserver.py::connection_string`` records the #1626
     measurement. The driver reads pyodbc's ``timeout=`` argument instead, and :func:`_make_pool`
     passes the value there.
 
-    The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
-    whether an arbitrary operator-named driver accepts the attribute has not been measured.
+    The ``generic`` dialect gets the same value since BACKLOG #2705. Measured on 2026-10-30,
+    ``timeout=5`` bounded a connect to an unreachable host at about 5 s on psqlODBC and on MySQL
+    Connector/ODBC, against about 21 s without it. A driver that ignores the attribute keeps its own
+    default, as every generic connection did before.
 
     ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
     ``label`` names the declaration in its refusal. The destination, poll source and lookup executor
     call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
     ``DatabaseRef`` checks a literal value when it is declared; an ``env()`` value is checked here,
     at each sync, once resolved."""
-    value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
-    return None if dialect == "generic" else value
+    return check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
 
 
 class AutocommitNotConfirmed(RuntimeError):
@@ -1753,16 +1799,14 @@ class _AutocommitPool:
         return getattr(self._pool, name)
 
 
-async def _make_pool(
-    dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
-) -> Any:
+async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int) -> Any:
     """Create an aioodbc connection pool for ``dsn`` (lazy driver import). The destination wraps
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``).
 
     ``login_timeout`` is required, and callers take it from :func:`_login_timeout`, so no pool site
     can quietly go without one. aioodbc forwards ``timeout=`` to every ``pyodbc.connect`` the pool
-    makes. ``None``, for the generic dialect, passes nothing and the driver default applies.
+    makes, for the SQL Server preset and the generic dialect alike (BACKLOG #2705).
 
     **An ``autocommit=True`` pool is wrapped in :class:`_AutocommitPool`** (BACKLOG #2148), so every
     connection it hands out has autocommit set and read back first. The suspected cause is mostly
@@ -1776,10 +1820,13 @@ async def _make_pool(
     is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-    options: dict[str, Any] = {"minsize": 1, "maxsize": max(1, pool_max), "autocommit": autocommit}
-    if login_timeout is not None:
-        options["timeout"] = login_timeout
-    pool = await aioodbc.create_pool(dsn=dsn, **options)
+    pool = await aioodbc.create_pool(
+        dsn=dsn,
+        minsize=1,
+        maxsize=max(1, pool_max),
+        autocommit=autocommit,
+        timeout=login_timeout,
+    )
     return _AutocommitPool(pool) if autocommit else pool
 
 
@@ -1969,9 +2016,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
-        self._login_timeout = _login_timeout(
-            s, f"DATABASE connection {config.name!r}", dialect=self._dialect
-        )
+        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
         )
@@ -2304,7 +2349,6 @@ class DatabaseSource(SourceConnector):
         self._login_timeout = _login_timeout(
             s,
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
-            dialect=self._dialect,
         )
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
@@ -2889,7 +2933,7 @@ class DatabaseLookupExecutor:
             check_lookup_allowed(cname, s, egress)
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
-        self._login_timeout: dict[str, int | None] = {}
+        self._login_timeout: dict[str, int] = {}
         self._acquire_timeout: dict[str, float] = {}
         self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
@@ -2908,9 +2952,7 @@ class DatabaseLookupExecutor:
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )
-            self._login_timeout[cname] = _login_timeout(
-                s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
-            )
+            self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
             self._acquire_timeout[cname] = float_setting(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
                 knob="acquire_timeout",
