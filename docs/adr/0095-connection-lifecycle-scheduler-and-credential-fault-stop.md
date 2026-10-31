@@ -466,11 +466,13 @@ it is not proof against a sender who learns the seed. An object's key is its sor
 and value ids, so the expected work is at most the size of what is interned times the log of its
 widest object. And, as a backstop, at most 250,000 interning steps run for one reply
 (`_NODE_BUDGET`), counting each string, number, `true`, `false`, `null`, object, list and object
-key that is interned, repeats included, and one walk collecting containers to intern stops once
-it holds more than 250,000: past either, or when the process runs out of memory judging the reply,
-it fails closed with this code. The two
-`json` parses are not bounded here; they ran before vault BACKLOG #3796 too, and the 16 MiB read
-cap bounds them.
+key that is interned, repeats included. A walk collecting containers to intern stops once the
+containers it holds pass the steps left in that budget; it counts containers only, so the leaves
+of a container it has collected, such as a flat list of numbers, are iterated before interning
+them trips the budget. Past the budget, or when the process runs out of memory in the keep-first
+parse or the compare, it fails closed with this code. A `MemoryError` in the plain read escapes as
+it did before vault BACKLOG #3796. The two `json` parses are not bounded here; they ran before vault
+BACKLOG #3796 too, and the 16 MiB read cap bounds them.
 
 **CORRECTED 2026-10-30 (vault BACKLOG #3796).** Until this date, the paragraph that now opens
 *"The same refusal applies to an occurrence of a repeated key that reads a third way"* said the
@@ -483,12 +485,14 @@ the compared `etag`, `location` and `lastModified`. And a `NaN` beside a repeat 
 
 It fails closed only on disagreement because a reply that reads one way under both rules carries
 no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
-of an `if-match` update turns into a 412. On `main` before this, `404 Not Found` then `200 OK` was
-delivered on the last key.
+of an `if-match` update turns into a 412. Before vault BACKLOG #2812, `404 Not Found` then
+`200 OK` was delivered on the last key.
 
 **Provenance: decided 2026-10-17 under the owner's standing driver rule, by the Lander's send-back
 of engine PR 2356, and narrowed by the batch 265 Manager to compare judgments rather than status
-text. The owner has not ruled on it and may overturn it.**
+text. The refusal of an occurrence that reads two ways, the interning backstop and the refusal on
+running out of memory are Manager decisions of 2026-10-30 (vault BACKLOG #3796). The owner has not
+ruled on any of it and may overturn it.**
 
 Costs, at least these. A reply nested in the narrow band between the hook's depth limit and plain
 `json`'s is refused with this code although it may repeat no key, and its text then says it does.
@@ -501,16 +505,16 @@ reads two ways refuses even where the reply's two readings reach one judgment, f
 `response` repeating `status` as `200 OK` then `201 Created`, beside a second `response` that does
 not repeat it. A reply whose repeated occurrences or compared values need more than the backstop
 allows refuses although its readings may agree; the rest of the reply does not count toward it.
-So a compared value too large for the backstop refuses as `reply-repeats-a-key`, where `main`
-delivered it; a valid FHIR reply carries no such value.
+So a compared value too large for the backstop refuses as `reply-repeats-a-key`, where it was
+delivered before vault BACKLOG #3796; a valid FHIR reply carries no such value.
 
 Measured on 2026-10-30 at the 16 MiB read cap, under `tracemalloc` on the same Windows box, for
 `_agreed_reading` alone (the plain read, the keep-first parse and the compare, not FhirPeek's parse
 before it), with replies of `[]`, `{}`, `[1]` or `{"a":1}` items. Where the items sit in a list
-beside one small repeated key, it now delivers at a peak of 0.68 to 0.76 GiB in 5 to 10 s. That is
-what holding both parsed trees costs, which the code on `main` also did: two plain parses kept
-alive together took 0.68 to 0.76 GiB here. An earlier draft that interned the whole reply peaked
-at 1.1 to 1.6 GiB and took 36 to 56 s. Where the items fill the two occurrences of the repeated key
+beside one small repeated key, it delivers at a peak of 0.68 to 0.76 GiB in 5 to 10 s. That is
+what holding both parsed trees costs, which the code before vault BACKLOG #3796 also did: two
+plain parses kept alive together took 0.68 to 0.76 GiB here. Where the items fill the two
+occurrences of the repeated key
 instead, the backstop refuses it at a peak of 0.51 to 0.57 GiB in 6 to 13 s, because the keep-first
 parse stops partway.
 

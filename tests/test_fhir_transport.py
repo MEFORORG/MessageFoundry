@@ -1398,6 +1398,26 @@ async def test_running_out_of_memory_judging_a_reply_is_dead_lettered(
     assert ei.value.__context__ is None
 
 
+def test_running_out_of_memory_in_the_plain_read_escapes_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The plain read judges nothing, so a MemoryError there is not refused as this reply's: it
+    # escapes as it did before vault BACKLOG #3796, and only the keep-first parse and the compare
+    # fail closed (the test above).
+    import messagefoundry.transports.fhir as fhir_module
+
+    def _plain_read_runs_out(raw: str | bytes, **kwargs: Any) -> tuple[Any, str | None]:
+        if kwargs.get("object_pairs_hook") is None:
+            raise MemoryError
+        return json_loads_or_refusal(raw, **kwargs)
+
+    monkeypatch.setattr(fhir_module, "json_loads_or_refusal", _plain_read_runs_out)
+    with pytest.raises(MemoryError):
+        fhir_module._agreed_reading(
+            _reply_with('{"status": "200 OK", "status": "200 OK"}').decode()
+        )
+
+
 @pytest.mark.parametrize(
     ("reply", "hint"),
     [

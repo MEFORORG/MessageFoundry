@@ -502,8 +502,11 @@ class _NodeIds:
                 for child in items:
                     if isinstance(child, (dict, list)) and id(child) not in memo:
                         stack.append(child)
+                        # Containers only, against the steps left: the leaves of a container
+                        # already collected are still iterated, and their interning trips the
+                        # budget later.
                         if len(order) + len(stack) > _NODE_BUDGET - self._interned:
-                            raise _TooManyNodes  # before walking what the budget cannot take
+                            raise _TooManyNodes
             for container in reversed(order):
                 items = container.values() if isinstance(container, dict) else container
                 two_ways = id(container) in self._two_ways
@@ -648,12 +651,15 @@ def _both_readings(text: str) -> dict[str, Any] | str | None:
 
     A helper so that both trees and the id tables go when it returns, before
     :func:`_agreed_reading` logs or raises: a refusal raised here would hold this frame on its
-    traceback, and a log line written in the handler would allocate with all of them still held."""
+    traceback, and a log line written in the handler would allocate with all of them still held.
+
+    A ``MemoryError`` in the plain read escapes, as it did before vault BACKLOG #3796: that read
+    judges nothing, so running out of memory there is not this reply's to refuse."""
+    # The plain read first: a body that is not a JSON object stops here, after one more parse.
+    last, hint = json_loads_or_refusal(text)
+    if hint is not None or not isinstance(last, dict):
+        return None
     try:
-        # The plain read first: a body that is not a JSON object stops here, after one more parse.
-        last, hint = json_loads_or_refusal(text)
-        if hint is not None or not isinstance(last, dict):
-            return None
         keep_first = _KeepFirstKey()
         first, hint = json_loads_or_refusal(text, object_pairs_hook=keep_first)
         if hint is not None:
@@ -674,7 +680,7 @@ def _agreed_reading(body: str) -> dict[str, Any] | None:
     body only the plain read can parse, and for an occurrence of a repeated key that reads a third
     way (:class:`_KeepFirstKey` refuses that in the same pass, vault BACKLOG #3796). So does a
     reply whose judgment would take more than :data:`_NODE_BUDGET` interning steps, or that the
-    process runs out of memory judging here. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states
+    process runs out of memory judging in the keep-first parse or the compare. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states
     the rule and its costs."""
     reading = _both_readings(body.lstrip(_BOM))
     if reading is None or isinstance(reading, dict):
