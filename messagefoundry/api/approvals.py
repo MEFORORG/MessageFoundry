@@ -1111,6 +1111,35 @@ class ApprovalGate:
         )
         return [await self._queue_entry(r, caller_user_id, {}) for r in rows]
 
+    async def record_standing_shown(
+        self, approval_ids: list[str], *, actor: str, client: str | None
+    ) -> None:
+        """Write the one ``approval.standing_shown`` row for a queue listing that told ``actor``
+        these requests are ``requester_not_authorized`` (vault BACKLOG #3747). A write that raises
+        does not cost the listing its answer: the lost row is logged and paged, never raised. A
+        write that stalls does, as docs/SECURITY.md says, because nothing here bounds it. The log
+        line's context carries the caller and their address, which the row holds outside its
+        detail. The page's key is fixed, because a lost row belongs to a listing, not to one
+        request. So every lost row folds into one instance until an operator resolves it, later
+        outages included, and nothing resolves it automatically.
+
+        It records this listing's disclosure, not every route to the fact; docs/SECURITY.md says
+        what it does not cover."""
+        await self._record_audit_soft(
+            "listing",
+            "approval.standing_shown",
+            actor=actor,
+            # `count` first: the off-box copy cuts this detail at a length limit and keeps its front,
+            # so a long listing's copy would otherwise lose how many requests it showed.
+            detail=json.dumps({"count": len(approval_ids), "approval_ids": approval_ids}),
+            client=client,  # ADR 0150: the caller's address, matching this row's actor
+            context=(
+                f"the queue was listed by {scrub_log_argument(actor)} "
+                f"from {scrub_log_argument(client or 'an unknown address')}"
+            ),
+            alert_key="approval:listing",
+        )
+
     async def _read[T](self, read: Awaitable[T], *, what: str) -> T:
         """A store read an approval route needs, with a fault answered as 503 rather than a raw
         500 (BACKLOG #3157 item 1). Nothing has been decided or run when it raises.

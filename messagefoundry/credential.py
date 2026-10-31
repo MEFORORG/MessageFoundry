@@ -11,9 +11,9 @@ certificate name compares:
 * the operator API's mTLS client-certificate identity plane (``api/security.py``, ADR 0083), which
   maps the same certificate shape to a MessageFoundry account id.
 
-They share the subject match. They differ in one respect, on purpose for now: the API plane first
-selects the names listed under the certificate's own issuer (BACKLOG #2237), and the intake plane
-still matches a subject from any CA its listener trusts.
+They share the subject match, and both first select the names listed under the certificate's own
+verified issuer, the loaded CA whose key signed it (BACKLOG #2237 for the API plane, #2287 for the
+intake plane's ``intake_client_subjects``), through :func:`client_cert_principal_under_issuer`.
 
 **Neutral and stdlib-only** — no engine, config, FastAPI or Qt imports — so both the transports (which
 must not import the API) and the API (which must not import the transports) can depend on it. Lives at
@@ -29,11 +29,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
-    "CERT_NAME_PREFIXES",
+    "QUALIFIED_CERT_NAME",
     "VERIFIED_ISSUER_KEY",
     "constant_time_equal",
     "constant_time_match",
@@ -124,9 +125,10 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
     return hmac.compare_digest(a_bytes, b_bytes)
 
 
-#: The qualified name spaces :func:`cert_name_candidates` yields. A configured name outside them can
-#: never match, so the loaders that take one refuse it.
-CERT_NAME_PREFIXES = ("CN:", "SAN:")
+#: A configured name :func:`cert_name_candidates` can actually yield: ``CN:<value>`` or
+#: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
+#: Shared by ``[api].tls_client_cert_identities`` and ``Http``'s ``intake_client_subjects`` (#2287).
+QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
 
 
 def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
@@ -159,9 +161,10 @@ def client_cert_principal(
     present in the map. An empty/absent cert, an empty map, or a subject with no listed name all
     return ``None`` — an unmapped or spoofed-CN cert resolves to nothing.
 
-    **Issuer-blind by design**, so the operator API does not call it directly: it goes through
+    **Issuer-blind by design**, so no production caller calls it directly: the operator API and the
+    inbound HTTP listener's ``intake_client_subjects`` both go through
     :func:`client_cert_principal_under_issuer`, which picks the flat map for the cert's own issuer
-    first (BACKLOG #2237). The inbound listener's ``intake_client_subjects`` still calls this one."""
+    first (BACKLOG #2237, #2287)."""
     if not peercert or not cert_map:
         return None
     for candidate in cert_name_candidates(peercert):
@@ -181,12 +184,14 @@ def client_cert_principal(
 # OpenSSL builds the chain by a loose name compare (case-folded, whitespace collapsed), so a second
 # trusted CA named "CN=ACME   CA" can sign a leaf whose issuer field reads "CN=Acme CA" and it still
 # verifies. The api shim instead finds the loaded CA whose key ACTUALLY signed the leaf and records
-# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). This leaf
-# only reads that string, so it stays stdlib-only.
+# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). The inbound
+# HTTP listener does the same for intake_client_subjects (BACKLOG #2287, transports/http_listener.py).
+# This leaf only reads that string, so it stays stdlib-only.
 
-#: The key the api shim adds to a copy of the ``getpeercert()`` dict, holding the canonical RFC 4514
-#: subject of the loaded CA certificate whose key directly signed the leaf, or ``""`` when none qualifies. ``ssl`` never
-#: produces this key, and the shim overwrites it on every connection, so a peer cannot supply it.
+#: The key the api shim and the inbound HTTP listener add to a copy of the ``getpeercert()`` dict,
+#: holding the canonical RFC 4514 subject of the loaded CA certificate whose key directly signed the
+#: leaf, or ``""`` when none qualifies. ``ssl`` never produces this key, and each overwrites it on
+#: every connection, so a peer cannot supply it.
 VERIFIED_ISSUER_KEY = "mf_verified_issuer"
 
 

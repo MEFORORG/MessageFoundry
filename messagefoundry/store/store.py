@@ -161,6 +161,7 @@ from messagefoundry.store.metadata import (
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -934,23 +935,38 @@ class MessageOrigin(StrEnum):
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
-#: negation — ``payload = '' AND body_ref IS NULL`` — is exactly what retention leaves behind, and
-#: three facts make that an exact discriminator rather than a heuristic:
+#: negation, ``payload = '' AND body_ref IS NULL``, means "nothing left to re-queue". It is not proof
+#: that retention erased the row, because at least these write that blank:
 #:
 #: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
-#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
-#: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
-#:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
-#: 3. a store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the
-#:    purge releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing
-#:    for a row the store wrote. It is harmless for any other row: a blank payload is never
-#:    delivered, because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
+#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins), and that includes a dead
+#:    ``Stage.RESPONSE`` work-row, whose payload is a reference and not a body: the purge that erases
+#:    the ``response`` artifact blanks the reference with it. A SQL join could not decide that row,
+#:    because the artifact's destination and sequence exist only inside the sealed reference;
+#: 2. ``ingress_handoff`` on each backend, which is not a purge: it dead-letters and blanks a token
+#:    whose reply retention erased (:data:`REINGRESS_ARTIFACT_ERASED`);
+#: 3. a keyless store's empty body, because ``IdentityCipher.encrypt('')`` is ``''``. On a keyed store
+#:    a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
+#:    through ``_enc``, so it is a ``mfenc:`` cell and can never be ``''``.
+#:
+#: A store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the purge
+#: releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing for a row the
+#: store wrote. It is harmless for any other row: a blank payload is never delivered on a keyed store,
+#: because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
 #:
 #: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
 #: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
 #: frame and the finalizer would record it as a successful send. :meth:`QueueStore.list_replay_targets`
 #: reads with it too, so the console draws no replay button for such a row (BACKLOG #1743).
+#:
+#: The predicate reads the row, so it cannot see an artifact erased after the row was re-pended. That
+#: race is closed in ``ingress_handoff`` on each backend, which dead-letters a token whose artifact
+#: is gone (:data:`REINGRESS_ARTIFACT_ERASED`).
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
+#: #1560). The server backends import it for their own ``ingress_handoff``.
+REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
@@ -8293,7 +8309,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets
 -- age FLOOR first observed (so a pre-existing year-old key gets a fresh clock on upgrade, never a
 -- retroactive alert); `last_rotated` is reset to today when the fingerprint changes (rotation is
 -- AUTO-DETECTED, never operator-attested). NEVER a secret value — the watcher reads a value only to MAC
--- it, and persists/logs the MAC + dates alone.
+-- it, and persists/logs the MAC + dates alone. One row tracks no secret: `rotate-key:incomplete`, the
+-- rotation record (BACKLOG #3737), whose `fingerprint` is an unsealed DEK key-id or blank.
 CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     secret_key    TEXT PRIMARY KEY,   -- registry class id: 'MEFOR_STORE_ENCRYPTION_KEY' (DEK) or an env/setting name
     fingerprint   TEXT NOT NULL,      -- sealed keyed-MAC cell (#3472) / DEK key-id — one-way, NOT the value
@@ -8335,7 +8352,12 @@ _PRESET_OWNER_MATCH = (
 class SecretRotationMetaRow:
     """One persisted secret-rotation watch record (ASVS 13.3.4, BACKLOG #282). All fields are
     NON-SECRET: ``fingerprint`` is a keyed MAC / DEK key-id (one-way), ``tracked_since`` the age-floor
-    ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value."""
+    ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value.
+
+    One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
+    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
+    finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
+    run closed it."""
 
     secret_key: str
     fingerprint: str
@@ -9192,8 +9214,9 @@ class MessageStore:
         **When the marker is written.** Every writable keyed open that completes this sweep visits
         every surface, and leaves each one marked:
 
-        1. Nothing to seal (empty, all blank or NULL, or all marked): the marker is written in its
-           own transaction. This is what keys an empty surface at the first keyed open.
+        1. Nothing to seal (empty, all blank or NULL with no live empty row, or all marked): the
+           marker is written in its own transaction. This is what keys an empty surface at the
+           first keyed open.
         2. Sealed, with unmarked values: they are left, logged and alerted, and the marker is written
            if it was missing.
         3. Unsealed, with legacy plaintext: the marker is written FIRST, inside the seal's one
@@ -9209,7 +9232,8 @@ class MessageStore:
         surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
         it. On a surface that already holds ciphertext the data check refuses it instead. A value
         written into a marked surface by a later KEYLESS run of the same store, or by hand, is
-        refused even if the table had emptied out; the opt-out below seals it for one open. A read-only open writes no marker. A store restored from a file copy keeps
+        refused even if the table had emptied out; the opt-out below seals it for one open, a blank
+        queue row excepted (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -9218,7 +9242,24 @@ class MessageStore:
         marker while the setting is on. Turning it off again restores the refusal on every marked
         surface.
 
-        NULL and blank ``''`` are never sealed: ``''`` is what every purge path writes.
+        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The one
+        exception is a live empty queue row on a surface that is still unsealed (BACKLOG #3495).** A
+        keyless store writes an empty body as ``''``, and :func:`open_queue_cell` refuses a blank on
+        a keyed store, so that row would dead-letter with a false ``integrity_drift`` alarm the first
+        time it was claimed. This open seals it under its own tag instead, in the marker's
+        transaction, and the row stays what it was: owed work, delivered as an empty body, and
+        finalized by what that delivery does. :data:`LIVE_INLINE_ROW` says which rows qualify. The
+        sweep and the claim then agree on every blank:
+
+        - Live, on an unsealed surface: a real row. It is sealed here and delivered.
+        - Terminal: not a row to deliver. A blank ``done``, ``cancelled`` or ``dead`` row may be an
+          erasure, and a keyless store cannot tell that from an empty body, so it stays blank and
+          :data:`_REPLAYABLE_BODY` and the claim both treat it as erased.
+        - Live, on a sealed surface: refused at the claim, dead-lettered and alerted. Nothing a keyed
+          writer does leaves one, so it is what a plant looks like, and sealing it here would launder
+          the plant. That is why this exception reads the sealed state and not the row. The limit: an
+          empty body written by a keyless run of a store that was keyed before reads the same way,
+          and it is refused too, under the opt-out as well.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -9250,6 +9291,7 @@ class MessageStore:
                 aad_cols=QUEUE_TAG_COLUMNS,
                 key_cols=("id",),
                 aad_of=queue_row_aad,
+                blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
             )
             # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
             total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
@@ -9312,6 +9354,7 @@ class MessageStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[aiosqlite.Row], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
@@ -9319,14 +9362,18 @@ class MessageStore:
         The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
         ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
-        queue payload's routing tag, BACKLOG #2593). All identifiers are code constants from
-        :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
+        queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
+        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
+        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
+        something to seal, so the marker can never be written over them unsealed. All identifiers
+        are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
+        parameter.
 
         Three steps, in this order:
 
         1. **Decide whether the surface is sealed.** It is when its ``keyed_surface`` marker exists or
-           it holds a marked value (BACKLOG #3383). No unmarked non-blank value: write the marker if it
-           is missing, and stop. Sealed with unmarked values: leave them in place, refused at read,
+           it holds a marked value (BACKLOG #3383). Nothing to seal: write the marker if it is
+           missing, and stop. Sealed with unmarked values: leave them in place, refused at read,
            and write the marker if it is missing (unless the opt-out is on).
         2. **Reserve the whole burst on the AES-GCM bound first** (ASVS 11.3.4). On SQLite the
            reservation commits the one writer connection, so it cannot happen once the seal's
@@ -9346,27 +9393,34 @@ class MessageStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
-                # its legitimate seal is not reported as a plant.
+                # its legitimate seal is not reported as a plant. A blank here stays refused.
+                blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._insert_keyed_marker(table, column)
                 await self._commit()
             return 0
-        await reserve_invocations_ahead(self._cipher, self._add_cipher_invocations_locked, pending)
+        await reserve_invocations_ahead(
+            self._cipher, self._add_cipher_invocations_locked, pending + blanks
+        )
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=?" for c in keys)
         sealed = 0
         try:
             # The marker goes in FIRST, in the seal's own transaction, so a crash undoes both.
-            if not await self._insert_keyed_marker(table, column) and strict:
+            claimed = await self._insert_keyed_marker(table, column)
+            if not claimed and strict:
                 # Another process keyed this surface after step 1, so it sealed the legacy rows.
                 left = await self._count_unmarked(table, pending_where, like)
                 await self._db.rollback()  # the insert changed nothing; this closes the transaction
@@ -9374,12 +9428,16 @@ class MessageStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
+            # The opt-out reseals plaintext, never a blank on a surface another process keyed.
+            seal_where = (
+                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+            )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.
                 cur = await self._db.execute(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
-                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    f" WHERE {seal_where} LIMIT {int(batch)}",
                     (like,),
                 )
                 rows = list(await cur.fetchall())
@@ -9427,11 +9485,10 @@ class MessageStore:
         )
         return await cur.fetchone() is not None
 
-    async def _count_unmarked(self, table: str, pending_where: str, like: str) -> int:
-        """How many values ``pending_where`` matches in ``table``: the non-blank unmarked ones."""
-        cur = await self._db.execute(
-            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
+    async def _count_unmarked(self, table: str, where: str, *params: str) -> int:
+        """How many values ``where`` matches in ``table``: the non-blank unmarked ones, or the
+        blank ones that are real rows."""
+        cur = await self._db.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE {where}", params)
         row = await cur.fetchone()
         return int(row["n"]) if row is not None else 0
 
@@ -10769,8 +10826,11 @@ class MessageStore:
         # so a legitimately EMPTY body would land as '' — indistinguishable at rest from a retention
         # erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The direct
         # `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two apart
-        # on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
-        # guard is replay-only, so a first delivery is unaffected either way.)
+        # on a keyed store. Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse. A first
+        # delivery still goes out there, because a keyless `open_queue_cell` has no tag to check. If
+        # the store gains a key while the row is live, the first keyed open seals it (BACKLOG #3495),
+        # because a keyed claim refuses a blank. Once the row is terminal, the blank stays and reads
+        # as an erasure.
         stored_payload = self._cipher.encrypt(
             payload if body_ref is None else body_ref,
             aad=queue_payload_aad(
@@ -12527,7 +12587,10 @@ class MessageStore:
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
-        it is dead-lettered and consumed like a corrupt reference, and the failure is audited."""
+        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
+        whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
+        produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
+        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12573,11 +12636,13 @@ class MessageStore:
                 return False
             origin_id = wr["message_id"]
 
-            async def _consume_dead(error: str, event_detail: str) -> bool:
+            async def _consume_dead(error: str, event_detail: str, *, erased: bool = False) -> bool:
                 # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction and
                 # CONSUME it (return True) — never re-loop forever on a row that can't be used.
+                # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
+                blank = ", payload=''" if erased else ""
                 await self._db.execute(
-                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                    f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
@@ -12604,23 +12669,38 @@ class MessageStore:
                     "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
                 )
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
-            #    only if retention purged it — but an outstanding work-row makes the message
-            #    purge-ineligible (Q8), so this is defensive: treat as empty, still consume.
+            #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
+            #    message purge-ineligible, and a DEAD one is blanked with its reply. But on a server
+            #    backend a replay can re-pend the token after the purge read its eligible set and
+            #    before the reply is erased: SQL Server reads `#eligible`, materialized once, and on
+            #    Postgres the blank skips a row a concurrent replay committed as pending while the
+            #    same statement still erases the reply. That leaves a token naming an erased reply,
+            #    and this branch is the only control for it. It must
+            #    never become a child message, so dead-letter the token. Retention keeps the
+            #    `response` row, so a row that is missing altogether is damage, not an erasure. That
+            #    token is dead-lettered and NOT blanked: its sealed reference is the evidence of which
+            #    row went missing. A replay re-queues it into the same dead end once per replay.
             cur = await self._db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
                 (origin_msg_id, dest, seq),
             )
             art = await cur.fetchone()
+            if art is None:
+                return await _consume_dead(
+                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
+                )
+            if art["body"] is None:
+                return await _consume_dead(
+                    REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
+                )
             body = (
                 self._dec(
                     art["body"],
                     aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                 )
-                if (art and art["body"] is not None)
-                else ""
+                or ""
             )
-            body = body or ""
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -12770,9 +12850,11 @@ class MessageStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
-        parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row or artifact is gone (a
-        committed prior handoff). The ``ingress_handoff`` it precedes re-reads the same immutable artifact
-        for the message raw, so the peek and the raw always agree."""
+        parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
+        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
+        ``ingress_handoff`` then dead-letters. The
+        ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
+        peek and the raw always agree."""
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -12784,16 +12866,17 @@ class MessageStore:
             ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
             try:
                 mid, dest, seq_s = ref.split("\x1f")
+                seq = int(seq_s)
             except ValueError:
-                return None
+                return None  # `ingress_handoff` dead-letters it as a corrupt reference
             cur = await db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                (mid, dest, int(seq_s)),
+                (mid, dest, seq),
             )
             art = await cur.fetchone()
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -17783,6 +17866,11 @@ class MessageStore:
         replay re-queues a row's *own* payload, never ``messages.raw``, nulling the message body here
         can't break a later dead-row replay.
 
+        The one exception is a dead ``Stage.RESPONSE`` work-row (BACKLOG #1560). Its payload is a
+        reference to a ``response`` artifact this purge erases, so it is not the row's own body. The
+        reference is blanked here with the artifact, and the row keeps its ``dead`` status and
+        ``last_error`` for :meth:`purge_dead_letters`.
+
         ``metadata`` (#150 SetMeta / operator-attached values, PHI per PHI.md §2) rides this same
         window (ASVS 14.2.7): it is blanked in the SAME statement as the body, so it can never outlive
         it. The guard is therefore ``raw <> '' OR metadata IS NOT NULL`` — a message purged by a
@@ -17800,7 +17888,10 @@ class MessageStore:
         replay must still be able to HYDRATE the ``mfdoc:v1:ref:`` handle — releasing the attachment now
         would GC the document out from under that replay (permanent PHI-document loss). That message's
         attachment is released instead by :meth:`purge_dead_letters` when it blanks the last ``dead`` row
-        (the per-MESSAGE analogue of the ``shared_body`` done/cancelled-vs-dead split).
+        (the per-MESSAGE analogue of the ``shared_body`` done/cancelled-vs-dead split). A dead
+        ``Stage.RESPONSE`` token is not such a row: its payload is blanked above, so it stops holding
+        the attachment, and a message whose only remaining dead row is a token has its attachment
+        released in this same pass.
 
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{channel_id -> cutoff}`` map of
         per-connection retention overrides: a message received by a connection in the map is purged at
@@ -17858,6 +17949,15 @@ class MessageStore:
                     *cutoff_params,
                     *inflight,
                 ),
+            )
+            # A dead RESPONSE work-row's payload is a reference to a `response` artifact, not a body, and
+            # the artifact is erased below. Blank the reference with it, so `_REPLAYABLE_BODY` refuses
+            # the row and no replay can re-ingress an erased reply (BACKLOG #1560). Exact, because the
+            # reference names an artifact of this same message and this purge erases all of them.
+            await self._db.execute(
+                "UPDATE queue SET payload='' WHERE stage=? AND status=? AND payload <> '' "
+                f"AND message_id IN ({eligible})",
+                (Stage.RESPONSE.value, OutboxStatus.DEAD.value, *cutoff_params, *inflight),
             )
             # #149 Phase 3a: release the streaming attachment each eligible message holds — but ONLY
             # once the message has NO queue row that could still be delivered/replayed (the negated

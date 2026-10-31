@@ -45,6 +45,8 @@ ADMINS = "cn=mf-admins,dc=x"
 #: apply, and an empty store answers it without fixtures. The route wants exactly one criterion, and
 #: a field path is the one a query string may carry.
 GATED = "/messages/search?field_path=PID-5"
+#: The verified ``(issuer, sub)`` a federated mint carries, and the pair the test account is bound to.
+FED_PAIR = ("https://idp.example/tenant", "S-1-step-up-seed")
 
 
 @pytest.fixture
@@ -106,6 +108,18 @@ async def _service(
     await service.initialize()
     await engine.store.set_ad_group_role_map([(ADMINS, Role.ADMINISTRATOR.value)])
     return service
+
+
+async def _bound_fed_account(service: AuthService, engine: Engine) -> str:
+    """Make the ``fed`` account by a Windows SSO sign-in and bind it to :data:`FED_PAIR`; its id.
+
+    A federated mint carries the verified pair, and its insert requires the row to hold it
+    (BACKLOG #2738 item 8), so a federated test needs a bound row first."""
+    await service._complete_ad_login(_principal("fed"), None, mfa_verified=False)
+    account = await engine.store.get_user_by_username("fed")
+    assert account is not None
+    assert await engine.store.set_user_federated_subject(account.id, *FED_PAIR) is not None
+    return account.id
 
 
 def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
@@ -170,12 +184,14 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
     missing constant would seed, and the Kerberos test above (always ``mfa_verified=False``) could
     not see."""
     service = await _service(engine)
+    await _bound_fed_account(service, engine)
     out = await service._complete_ad_login(
         _principal("fed"),
         None,
         mfa_verified=True,
         mech="oidc",
         session_mechanism=SessionMechanism.OIDC,
+        federated_subject=FED_PAIR,
         # A federated mint must carry the IdP auth_time it verified (BACKLOG #2143).
         idp_auth_time=time.time(),
     )
@@ -199,7 +215,44 @@ async def test_a_federated_mint_without_the_idp_auth_time_is_refused(engine: Eng
             mfa_verified=True,
             mech="oidc",
             session_mechanism=SessionMechanism.OIDC,
+            federated_subject=FED_PAIR,
         )
+
+
+async def test_an_oidc_mint_without_the_verified_pair_is_refused(engine: Engine) -> None:
+    """BACKLOG #2738 item 8. RED when: ``_complete_ad_login`` accepts ``mech="oidc"`` with no
+    ``federated_subject``. That call counted as federated, so it skipped the refusal of a bound
+    row, and its session insert required no pair: a bound account would get a session.
+
+    The account here IS bound, which is the row that skipped refusal let through. The control
+    call, carrying the pair the row holds, signs in, so the refusal comes from the missing pair
+    and not from anything else about the row."""
+    service = await _service(engine)
+    account_id = await _bound_fed_account(service, engine)
+
+    with pytest.raises(ValueError, match="verified federated_subject"):
+        await service._complete_ad_login(
+            _principal("fed"),
+            None,
+            mfa_verified=True,
+            mech="oidc",
+            session_mechanism=SessionMechanism.OIDC,
+            idp_auth_time=time.time(),
+        )
+    live = await engine.store.list_sessions(account_id)
+    assert live == [], "the refused mint wrote a session"
+
+    # CONTROL: the same call carrying the pair the row holds mints a session.
+    out = await service._complete_ad_login(
+        _principal("fed"),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+        federated_subject=FED_PAIR,
+        idp_auth_time=time.time(),
+    )
+    assert out.ok and out.token is not None
 
 
 def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:

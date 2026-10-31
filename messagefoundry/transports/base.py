@@ -52,6 +52,7 @@ from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.netaddr import peer_ip_allowed
 
 __all__ = [
+    "ENCODING_CODE",
     "InboundHandler",
     "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
@@ -995,6 +996,10 @@ class DestinationStartupError(Exception):
     :class:`DeliveryError` so a start-time refusal is never mistaken for a retryable send failure."""
 
 
+#: The :class:`NegativeAckError` code of a payload :func:`encode_wire_body` cannot encode.
+ENCODING_CODE = "encoding"
+
+
 def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     """Encode an outbound payload to the bytes that go on the wire (or to disk), failing CONTENT-FREE.
 
@@ -1036,7 +1041,7 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     raise NegativeAckError(
         f"{transport}: payload is not encodable as {encoding!r} "
         f"(first offending character at position {offending_position})",
-        code="encoding",
+        code=ENCODING_CODE,
         permanent=True,
     )
 

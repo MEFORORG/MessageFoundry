@@ -233,6 +233,7 @@ from messagefoundry.transports import (
 )
 from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
+    ENCODING_CODE,
     ConnectionEventSink,
     IntakeAuditSink,
     IntakeGate,
@@ -246,7 +247,9 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.egress import warn_url_query_credentials
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
 
@@ -262,8 +265,19 @@ type _LaneFault = Literal["credential", "configuration"]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
-"""A batch member its frame refused: its outbox row id, the content-free error the store keeps, and
-the refusal, with no traceback, whose class name and code the log line reads (BACKLOG #3043)."""
+"""A batch member its frame check refused: its outbox row id, the content-free error the store
+keeps, and the refusal, with no traceback, whose class name and code the log line reads (BACKLOG
+#3043)."""
+
+#: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
+#: ADR 0205 rule 1, ``multiple-messages`` ADR 0209, and ``encoding`` ``encode_wire_body``'s.
+#: A code not named here, or none, reads as the neutral reason below; the line names the code too.
+_MEMBER_REFUSAL_REASONS: Mapping[str, str] = {
+    FRAMING_CODE: "its frame cannot carry it",
+    MULTIPLE_MESSAGES_CODE: "it holds more than one message",
+    ENCODING_CODE: "its charset cannot encode it",
+}
+_MEMBER_REFUSAL_REASON_OTHER = "its frame check refused it"
 
 
 log = logging.getLogger(__name__)
@@ -2534,20 +2548,47 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` is passed to :class:`FhirLookupExecutor`; a reload passes False
-        (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
+        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
+        recorded while its lookup is down, whether its build or another setting failed (ASVS
+        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
+        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
+        and logs none. A caller
+        whose build check has already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
 
-        def build(
-            names: Iterable[str], failed: Mapping[str, str] | None = None
-        ) -> FhirLookupExecutor:
+        def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved = {
-                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-                for name in names
-            }
+            return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+
+        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
+            # ``resolved`` is None when a setting failed to resolve. The url alone is then
+            # resolved, so an env() URL is still named while the lookup is down.
+            if resolved is None:
+                try:
+                    resolved = resolve_env_settings(
+                        {"url": specs[name].settings.get("url")},
+                        self._env_values,
+                        connection=fhir_lookup_record_name(name),
+                    )
+                except WiringError:  # names the key, never a value
+                    # The lookup's own failure may name another setting, so say this one too.
+                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
+                    # as a secret, and a lookup name may end in a credential word.
+                    log.info(
+                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
+                        "check could not read it",
+                        name,
+                    )
+                    return
+            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
+
+        def build(
+            resolved: Mapping[str, Mapping[str, Any]],
+            failed: Mapping[str, str] | None = None,
+        ) -> FhirLookupExecutor:
             # #200 (ADR 0092): stamp the derived posture around the live executor build so each
             # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
             # captures THIS instance's posture rather than the unstamped fail-closed default.
@@ -2563,29 +2604,66 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    warn_query_credentials=warn_query_credentials,
+                    # Logged once per lookup below; this method may build one three times.
+                    warn_query_credentials=False,
                 )
 
-        try:
-            return build(specs)  # a healthy graph builds once, as it always did
-        except Exception:
-            if isolated is None:
-                raise
-        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
-        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
-        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
-        # and attestation lines, so on this path each surviving lookup logs them again per build.
-        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        # Settings resolve once, with no I/O, so the warning has one call site and comes before any
+        # build: a lookup that then fails to build keeps its record.
+        #
+        # Both steps isolate one lookup's failure as its build does (ADR 0031, vault BACKLOG #3008),
+        # so it costs that lookup only and never unwinds the start. WiringError is a configuration
+        # fault, recorded and alerted with the lookup. Anything else is a defect, so it is also
+        # logged at ERROR with its traceback. A lookup whose security warning step raises is
+        # degraded rather than started without its record, which fails safe.
+        settled: dict[str, dict[str, Any]] = {}
         errors: dict[str, Exception] = {}
         for name in specs:
             try:
-                build([name])
+                settled[name] = resolve(name)
+            except WiringError as exc:
+                errors[name] = exc
+            except Exception as exc:
+                log.error("FhirLookup %r settings failed to resolve", name, exc_info=True)
+                errors[name] = exc
+            if not warn_query_credentials:
+                continue
+            try:
+                warn(name, settled.get(name))
+            except Exception as exc:
+                log.error(
+                    "FhirLookup %r URL query-credential check failed, so it is not started",
+                    name,
+                    exc_info=True,
+                )
+                errors.setdefault(name, exc)
+                settled.pop(name, None)
+        if not errors:
+            try:
+                return build(settled)  # a healthy graph builds once, as it always did
+            except Exception:
+                if isolated is None:
+                    raise
+        if isolated is None:
+            raise next(iter(errors.values()))
+        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
+        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its TLS
+        # warning and attestation lines, so on this path each surviving lookup logs those again per
+        # build. That cost falls only on a start that already failed, and keeps the healthy start to
+        # one build.
+        for name, lookup_settings in settled.items():
+            try:
+                build({name: lookup_settings})
             except Exception as exc:
                 errors[name] = exc
+        errors = {name: errors[name] for name in specs if name in errors}  # in graph order
         failed = {name: safe_exc(err) for name, err in errors.items()}
-        executor = build([name for name in specs if name not in errors], failed)
+        survivors = {name: s for name, s in settled.items() if name not in errors}
+        # Before the final build, so a graph-wide failure there still leaves each lookup's own
+        # failure for the start's backstop to log.
         isolated.update(errors)
-        return executor
+        return build(survivors, failed)
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
@@ -5285,7 +5363,9 @@ class RegistryRunner:
                 self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
-    async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+    async def _start_outbound(
+        self, name: str, oc: OutboundConnection, *, warn_query_credentials: bool
+    ) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
         ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
         (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
@@ -5293,7 +5373,7 @@ class RegistryRunner:
         preserving the count-and-log + at-least-once invariants) and a later reload/restart that builds
         the connector self-heals the lane. retry/ordering/etc. are set regardless of build outcome
         because the worker reads them live per item (a reload can swap a working connector under the
-        already-spawned worker)."""
+        already-spawned worker). ``warn_query_credentials`` is :meth:`start`'s."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
         # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
@@ -5373,7 +5453,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
-                connector = build_destination(dest, egress=self._egress)
+                connector = build_destination(
+                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -5405,7 +5487,12 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
-    async def start(self) -> None:
+    async def start(self, *, warn_query_credentials: bool = True) -> None:
+        """Bring the graph up. ``warn_query_credentials=False`` is for a caller that has just run
+        :meth:`build_check` on this graph, which logged the URL query-credential WARNING, at least
+        ``Engine.reload_detail`` with no runner yet (vault BACKLOG #2910). It reaches only the
+        builds this call makes. A later window open or operator start builds a lane this start left
+        unbuilt, and that build logs the WARNING."""
         async with self._reload_lock:
             if self._running:
                 return
@@ -5517,7 +5604,9 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
-                    await self._start_outbound(name, oc)
+                    await self._start_outbound(
+                        name, oc, warn_query_credentials=warn_query_credentials
+                    )
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
@@ -5528,7 +5617,7 @@ class RegistryRunner:
                 # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
                 # A restart and a clustered node's start on promotion both come through here.
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor(
-                    isolated=fhir_lookup_isolated
+                    isolated=fhir_lookup_isolated, warn_query_credentials=warn_query_credentials
                 )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
@@ -9190,9 +9279,10 @@ class RegistryRunner:
         + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
-        The one exception (ADR 0205 rule 1): a member whose payload the frame cannot carry is taken out
-        before the envelope is built and dead-lettered alone, and "all N" above means the rest. The
-        envelope's head is then the first member that survived.
+        The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
+        carry, or that holds more than one message (ADR 0209), is taken out before the envelope is
+        built and dead-lettered alone, and "all N" above means the rest. The envelope's head is then
+        the first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
         ``seq`` order (``reset_stale_inflight``). The members are the lane's oldest contiguous rows in
@@ -9335,10 +9425,11 @@ class RegistryRunner:
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
             # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
             hydrated = [await self._hydrate_payload(it.payload) for it in items]
-            # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
-            # and the rest batch, rather than all N dying on one envelope offset. It runs before the
-            # shadow branch below, so a simulate outbound records the same dispositions. The split
-            # writes nothing; the refused members are dead-lettered after this try, on every path.
+            # ADR 0205 rule 1, per member: one member the frame cannot carry, or that holds more
+            # than one message (ADR 0209), is dead-lettered alone and the rest batch, rather than
+            # all N dying on one envelope offset. It runs before the shadow branch below, so a
+            # simulate outbound records the same dispositions. The split writes nothing; the
+            # refused members are dead-lettered after this try, on every path.
             if _frames(connector):
                 kept, members, refused = self._split_unframeable_members(connector, items, hydrated)
             else:
@@ -9458,8 +9549,11 @@ class RegistryRunner:
         rule 1). Pure: it writes and logs nothing, so a store fault cannot strike between a refusal
         and the send, and the caller dead-letters and logs the refused members once the rest are
         resolved. A refusal that is not permanent, or one that must stop the lane, is re-raised for
-        the whole batch, as a send would raise it. The error text names a byte and an offset in that
-        member, never content."""
+        the whole batch, as a send would raise it. The MLLP and TCP checks name no content: a
+        member the frame cannot carry is named by the frame byte and its offset, one its charset
+        cannot encode by the position of its first offending character, and a
+        ``multiple-messages`` member (ADR 0209) by the rule it breaks. Another connector's own
+        refusal text is its own, stored through ``safe_exc``."""
         kept: list[OutboxItem] = []
         kept_payloads: list[Message | str] = []
         refused: list[_RefusedMember] = []
@@ -9481,17 +9575,28 @@ class RegistryRunner:
         """Dead-letter each batch member :meth:`_split_unframeable_members` refused, alone, then log
         it. The line used to be written in the split, before any write, so a member a later
         refusal sent back with the whole batch was logged as dead-lettered when it was not. It goes
-        through the same throttle as the other permanent-refusal lines (BACKLOG #3043)."""
+        through the same throttle as the other permanent-refusal lines (BACKLOG #3043). Its reason
+        follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
+        frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
+        message (ADR 0209), an ``encoding`` one is not in the charset, and any other reads as
+        refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)
+            # getattr and str, as _RefusalLog.warning reads it: a connector may raise a subclass
+            # built without a code, or with one that is not a string, and neither may turn this
+            # loop into an AttributeError or a TypeError after the dead-letter.
+            reason = _MEMBER_REFUSAL_REASONS.get(
+                str(getattr(exc, "code", "?")), _MEMBER_REFUSAL_REASON_OTHER
+            )
             self._refusal_log.warning(
                 name,
                 exc,
                 1,
-                "delivery worker %r: batch member %s refused permanently, its frame cannot "
-                "carry it; dead-lettered alone, apart from the rest of its batch",
+                "delivery worker %r: batch member %s refused permanently, %s; dead-lettered "
+                "alone, apart from the rest of its batch",
                 name,
                 outbox_id,
+                reason,
             )
 
     def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:

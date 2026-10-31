@@ -165,7 +165,7 @@ transport = "mllp"
   reference written inside one is left to the connector's own rules. An `env()` reference written as
   an array **item** is refused at load, in code and in this file, because only a top-level setting
   is resolved: it may stand for a whole array, never for one item of it. (`http`'s
-  `intake_client_subjects` refuses a whole-array `env()` too, today.) No refusal ever repeats the
+  `intake_client_subjects` is a table of arrays, and refuses `env()` at every level of it.) No refusal ever repeats the
   value — a `[settings]` value can be a credential, and the message reaches the operator log and the
   support bundle.
   The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
@@ -683,11 +683,11 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`; it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). |
 | `tls_ca_file` | — | trust anchor — opt-in **mTLS** (require + verify a client certificate). |
 | `tls_ca_pin` | - | the SHA-256 of `tls_ca_file`. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
-| `intake_auth` | `"none"` | **peer credential required to submit a message** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D6): `none` \| `api_key` \| `bearer` \| `mtls_subject`. A sibling of `source_ip_allowlist` — it authorises *submitting*, never *reading*; it mints no identity and opens no session. A missing or wrong credential is refused `401`. A request that sends the credential header twice gets `400` instead, before any comparison; [SECURITY.md](SECURITY.md) Table B has the rule. Under `mtls_subject`, a verified certificate whose subject is not in `intake_client_subjects` is refused `403`. Each refusal comes **before any request body byte is read**, so it costs an anonymous peer nothing to be turned away. |
+| `intake_auth` | `"none"` | **peer credential required to submit a message** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D6): `none` \| `api_key` \| `bearer` \| `mtls_subject`. A sibling of `source_ip_allowlist` — it authorises *submitting*, never *reading*; it mints no identity and opens no session. A missing or wrong credential is refused `401`. A request that sends the credential header twice gets `400` instead, before any comparison; [SECURITY.md](SECURITY.md) Table B has the rule. Under `mtls_subject`, a verified certificate whose subject is not in `intake_client_subjects` is refused `403`, and so is one whose subject is listed only under a CA that did not sign it. Each refusal comes **before any request body byte is read**, so it costs an anonymous peer nothing to be turned away. |
 | `intake_api_key` | — | the credential for `api_key`/`bearer` — a **secret**, `env()` only (a literal, a `default=` or a `cast=` is refused at the factory). |
 | `intake_api_key_next` | — | rotation slot, accepted **alongside** `intake_api_key` so a partner key rotates with no outage: set it, have the partner cut over, promote it, then clear it. Leaving it set keeps a retired credential live. |
 | `intake_api_key_header` | `"x-api-key"` | which header carries the `api_key` credential. A header **name**, not a secret. |
-| `intake_client_subjects` | — | `mtls_subject` allow-list, entries **qualified**: `"CN:partner.example"` / `"SAN:DNS:partner.example"`. Qualifying the namespace is what stops a spoofed commonName colliding with a pinned SAN; a bare `partner.example` is refused at the factory rather than silently matching nothing. |
+| `intake_client_subjects` | — | `mtls_subject` allow-list, **keyed by the CA that issues each partner's certificate**: a table whose keys are issuing-CA DNs and whose values are lists of **qualified** subject names, `"CN:partner.example"` / `"SAN:DNS:partner.example"`. In TOML, `[inbound.settings.intake_client_subjects]` then `'CN=Acme Partner CA,O=Acme' = ["CN:partner.example"]`; in code, `intake_client_subjects={"CN=Acme Partner CA,O=Acme": ["CN:partner.example"]}`. A subject is admitted only when the CA under its key signed the leaf, found by signature and never by the leaf's issuer field alone, so a certificate with a listed subject is refused `403` when the loaded CA that signed it is not the one the subject is listed under (vault BACKLOG #2287). **Only a CA loaded from `tls_ca_file` counts**: a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file`. To admit one, load the intermediate beside the root that signed it (the listener does not accept a partial chain) and key its subjects by the intermediate's DN. Write the key as `cryptography`'s `Name.rfc4514_string()` renders the CA's subject, single-quoted in TOML; a key that does not round-trip to itself is refused naming the form to write, and the old flat list is refused at load. At start the listener warns about a key naming no loaded CA, or naming two with one subject and different keys (as during a key rollover); no certificate is admitted under such a key until one of the two leaves `tls_ca_file`. Only `mtls_subject` reads the table, so setting it under any other `intake_auth` is refused. Qualifying the namespace is what stops a spoofed commonName colliding with a pinned SAN; a bare `partner.example` is refused at the factory rather than silently matching nothing. [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md), amendment 2026-10-30, has the reasoning. |
 | `intake_auth_health` | `"require"` | whether `GET`/`HEAD` health probes must authenticate too. **`"allow"` is a real exemption**: it hands anyone who can reach the socket an unauthenticated "is MessageFoundry up, and where" oracle. Set it only when a load-balancer check cannot carry the credential. It applies under `api_key` and `bearer` only: under `mtls_subject` the certificate is checked at accept, before the method is read, so a probe still needs a listed certificate. |
 | `intake_auth_rate_limit` | `10` | **failed** intake-auth attempts per minute per peer, then `429` + `Retry-After`. A *successful* authentication never consumes budget, so this bounds guessing without capping throughput. `None`/`0` disables. |
 | `intake_auth_rate_limit_global` | `60` | **failed** attempts per minute across all peers. Consulted only for peers with no successful authentication in the window, so one attacker cannot `429` an authenticated partner. `None`/`0` disables. |
@@ -2141,7 +2141,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id` |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the `db_lookup` read-only test is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
@@ -2158,8 +2158,14 @@ just runs whatever statement you declare, bound from the row.
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
-**unmarked** so it retries — never marked-and-dropped. A poll error is **logged, not fatal** — a bad
-`poll_statement` or a dropped connection never kills the poller; it retries next interval.
+**unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
+`poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
+`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
+advances the cursor past the failed one, so the failed row is never read again. Where that matters,
+mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
+run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
+kills the poller; it retries next interval.
 
 **Security.** TLS is **on by default**; weakening it (`encrypt=false` / `trust_server_certificate=true`)
 is **refused at construction** through the same cell as the `Database(...)` destination, and the
@@ -2640,10 +2646,15 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
   and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
-  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
-  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  agree on what a delivery takes, no occurrence of a key repeated three or more times differs from
+  both its first and last value, and no occurrence of a repeated key reads two ways itself at any
+  depth below it (vault BACKLOG #3796), the reply is judged as above. Values are compared as JSON
+  values, so `1` differs from `true` and `1.0`. Otherwise the update is a permanent
   refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
-  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  as delivered, as with a reply over the byte bound below. A reply whose repeated occurrences and
+  compared values (the resource type, the judgment, `etag`, `location` and `lastModified`) are
+  too large to judge within the bound the ADR states is refused the same way; only those count
+  toward it. The full rule, with what counts as
   agreement and its costs, is in
   [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
   the 2026-10-17 entry.
@@ -3530,7 +3541,7 @@ gate when `serve` loads the graph: see *Per-connection overrides* in
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
 | `messages_days` | in | int | inherit the global body window — set as **`[security].delete_message_bodies_after_days`** (`[retention].messages_days` moved there under ADR 0118 and is **rejected at config load**) | past N days, null this **inbound's** received message bodies (keyed on the receiving inbound), keeping the message row — its PHI columns, `metadata` included, are blanked. `0` = keep forever |
-| `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. `0` = keep forever |
+| `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. This override does not reach a dead re-ingress token (a captured reply owed to a loopback, ADR 0013), which has no outbound and always took the global `[retention].dead_letter_days` window. Its payload is blanked with its reply on the body window, so it is not replayable after that (BACKLOG #1560), and its `last_error` still waits for that global dead-letter purge. `0` = keep forever |
 
 ### Embedded-document pruning ([ADR 0042](adr/0042-embedded-document-pruning.md), #47)
 
@@ -4042,14 +4053,17 @@ text that is not a number are refused when the connection is built, before it st
 is cut down to a whole number.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
-the poll does not fetch is still in the table, unmarked. The next tick takes it. On `DatabasePoll(...)`
+the poll does not fetch is still in the table, unmarked. The next tick takes it. That holds only while
+`poll_statement` does not write, and the read-only test on it misses at least one writing shape; see
+the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
 least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
 the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. Nothing is quarantined,
-errored, or accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never
-read was never received, and there is no disposition to record.
+reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
+never received, and there is no disposition to record. A poll that writes and passes the read-only
+test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
 
 **Why these three default on when the MLLP message pacer ships off.** On a listen socket a rate bound
 has to refuse or stall a sender mid-conversation, and the right number comes from a real feed profile

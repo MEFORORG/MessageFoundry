@@ -587,8 +587,10 @@ class AlertSink(Protocol):
         the engine log, which nobody pages on.
 
         ``name`` keys the subject the lost row was about. The approval gate uses ``approval:<approval
-        id>``, the key :meth:`approval_too_early` uses, and ``approval:<approval id>:resolve`` for a
-        resolution's lost provenance row (vault BACKLOG #3438). ``POST /config/reload`` uses
+        id>``, the key :meth:`approval_too_early` uses, ``approval:<approval id>:resolve`` for a
+        resolution's lost provenance row (vault BACKLOG #3438), and ``approval:listing`` for a lost
+        ``approval.standing_shown`` row, which belongs to a listing rather than to one request
+        (vault BACKLOG #3747). ``POST /config/reload`` uses
         ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
         step-up return's audit budget uses ``step_up_return:audit_budget:<action>`` when its
@@ -602,8 +604,9 @@ class AlertSink(Protocol):
         event, so no
         rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
         the connection-name grammar. Repeated failures on one key fold into one instance, and
-        every inline reload's into the one ``config_reload:inline`` instance until an operator
-        resolves it. Nothing resolves it automatically. Carries the key and the action name only:
+        every inline reload's into the one ``config_reload:inline`` instance, and every queue
+        listing's into the one ``approval:listing`` instance, until an operator resolves it.
+        Nothing resolves it automatically. Carries the key and the action name only:
         no username, no params, no PHI."""
         ...
 
