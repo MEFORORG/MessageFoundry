@@ -1330,13 +1330,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         type=_positive_days,
         default=_RESTORE_MAX_AGE_DAYS,
         help=f"refuse an archive taken more than this many days ago (default "
-        f"{_RESTORE_MAX_AGE_DAYS:g}), or one that does not say when it was taken",
+        f"{_RESTORE_MAX_AGE_DAYS:g}). An archive of unknown age is refused whatever this is; "
+        "only --allow-old-archive restores it",
     )
     restore.add_argument(
         "--allow-old-archive",
         action="store_true",
-        help="restore an archive older than --max-age-days anyway. Every disable, delete, role "
-        "change and reset made after its newest audit row must then be re-applied by hand",
+        help="restore an archive older than --max-age-days, or of unknown age, anyway. Every "
+        "disable, delete, role change and reset made after its newest audit row must then be "
+        "re-applied by hand",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -11160,13 +11162,14 @@ def _restore(args: argparse.Namespace) -> int:
         return _emit_error(f"restore failed ({exc.kind}): {exc}{hint}", as_json=args.json)
 
     from messagefoundry.pipeline.alerts import utc_or_unknown
-    from messagefoundry.pipeline.dr_backup import RESTORED_ACCOUNTS_NOTICE
+    from messagefoundry.pipeline.dr_backup import restored_accounts_notice
 
     payload = {
         "archive": result.archive_path,
         "archive_sha256": result.archive_sha256,
         "archive_created_at": utc_or_unknown(result.archive_created_at),
         "last_audit_at": utc_or_unknown(result.last_audit_at),
+        "sessions_revoked": result.sessions_revoked,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
@@ -11188,7 +11191,7 @@ def _restore(args: argparse.Namespace) -> int:
             f"  archive taken {payload['archive_created_at']}; newest audit row in it "
             f"{payload['last_audit_at']}"
         )
-        print(f"  {RESTORED_ACCOUNTS_NOTICE}")
+        print(f"  {restored_accounts_notice(result.sessions_revoked)}")
     return 0
 
 

@@ -693,11 +693,13 @@ start. The engine does not re-apply
 changes made after the archive was taken.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
-whose manifest does not say when it was taken is refused too. The refusal, and every successful
-restore, print the time of the archive's newest audit row. Every disable, delete, role change and
+whose manifest does not say when it was taken, or that is dated more than an hour in the future,
+is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`
+restores it. The refusal, and every successful restore, print the time of the archive's newest
+audit row. Every disable, delete, role change and
 password or factor reset made after that time is undone by the restore and must be re-applied by
 hand; read the source's audit log, or its off-host copy, for the list. To restore an older archive on
-purpose, pass `--allow-old-archive`, or raise `--max-age-days`.
+purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
 
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI

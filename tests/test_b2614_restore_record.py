@@ -154,6 +154,30 @@ async def test_a_failing_alert_does_not_undo_the_record(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_the_audit_rows_age_is_clamped_at_zero_as_the_alerts_is(tmp_path: Path) -> None:
+    """An archive dated a little after the restore (a backup host whose clock led, inside the age
+    check's skew allowance) has no negative age: the audit row says 0, as the alert says 0.0."""
+    db = tmp_path / "restored.db"
+    store = await MessageStore.open(db)
+    await store.close()
+    write_restore_marker(
+        db,
+        archive_sha256="aa" * 32,
+        archive_created_at=1_000_600.0,
+        last_audit_at=None,
+        restored_at=1_000_000.0,
+    )
+    store = await MessageStore.open(db)
+    try:
+        sink = _Sink()
+        await _record_a_restore(store, sink)
+        rows = await store.list_audit(action=STORE_RESTORED_ACTION, limit=5)
+        assert json.loads(rows[0]["detail"])["archive_age_seconds"] == 0
+        assert "0.0 days old" in sink.raised[0][1]
+    finally:
+        await store.close()
+
+
 async def test_the_restore_writes_the_marker_with_the_archive_hash(tmp_path: Path) -> None:
     """End to end through ``run_restore``: the placed store carries the marker, naming the hash of
     the archive bytes and the time of the newest audit row the archive held."""
@@ -250,23 +274,105 @@ def test_the_schema_carries_the_marker_table_verbatim() -> None:
     assert _RESTORE_MARKER_DDL.strip() in _SCHEMA
 
 
-def test_an_earlier_builds_store_without_a_seal_column_is_still_marked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sealed", [True, False], ids=["seal-column", "pre-seal-column"])
+def test_the_restore_ends_every_open_session_whatever_the_sessions_schema(
+    tmp_path: Path, sealed: bool
+) -> None:
     """An archive from before the session seal (BACKLOG #2592) has a sessions table with no
-    ``seal`` column, which the first open's migration adds. The marker write must not refuse it:
-    restoring an earlier build's archive is the ordinary case. Its sessions are left to the first
-    start, which revokes after that migration."""
+    ``seal`` column, which the first open's migration adds. The marker write must not refuse it,
+    since restoring an earlier build's archive is the ordinary case, and it must still end every
+    open session in it, as it does for a current one: the CLI notice reports this count. A
+    revoked row stays as it was."""
     db = tmp_path / "old.db"
+    seal = ", seal TEXT NOT NULL DEFAULT ''" if sealed else ""
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT, revoked_at REAL)"
+            "CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT, revoked_at REAL"
+            f"{seal})"
         )
-        conn.execute("INSERT INTO sessions VALUES ('h', 'u', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, revoked_at) VALUES ('a', 'u', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, revoked_at) VALUES ('b', 'u', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, revoked_at) VALUES ('c', 'u', 1.0)"
+        )
+    conn.close()
+    ended = write_restore_marker(
+        db, archive_sha256="ef" * 32, archive_created_at=None, last_audit_at=None, restored_at=9.0
+    )
+    assert ended == 2
+    with sqlite3.connect(db) as check:
+        assert check.execute("SELECT sessions_revoked FROM restore_marker").fetchone() == (2,)
+        assert check.execute(
+            "SELECT token_hash, revoked_at FROM sessions ORDER BY 1"
+        ).fetchall() == [
+            ("a", 9.0),
+            ("b", 9.0),
+            ("c", 1.0),
+        ]
+        # The seal column is there either way, as the first open's migration would add it, and
+        # the rows the revoke ended carry the blank seal every revoked row carries.
+        assert check.execute(
+            "SELECT seal FROM sessions WHERE token_hash IN ('a', 'b')"
+        ).fetchall() == [("",), ("",)]
+    check.close()
+
+
+def test_a_store_with_no_sessions_table_is_marked_with_none_ended(tmp_path: Path) -> None:
+    db = tmp_path / "older.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE users (id TEXT PRIMARY KEY)")
     conn.close()
     ended = write_restore_marker(
         db, archive_sha256="ef" * 32, archive_created_at=None, last_audit_at=None, restored_at=9.0
     )
     assert ended == 0
-    with sqlite3.connect(db) as check:
-        assert check.execute("SELECT sessions_revoked FROM restore_marker").fetchone() == (0,)
-        assert check.execute("SELECT revoked_at FROM sessions").fetchone() == (None,)
-    check.close()
+
+
+async def test_a_restore_record_that_raises_still_stops_the_engine_and_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record is the first statement of the lifespan's startup span, so its raise reaches the
+    span's teardown before anything else in the span ran. That teardown reads ``auth``; bound
+    below the record, it raised UnboundLocalError and skipped ``engine.stop()``, which closes the
+    store, so the process hung (BACKLOG #1257). The startup error must surface as itself, and the
+    engine stop and store close must both have run."""
+    import messagefoundry.api.app as appmod
+    from messagefoundry.api import create_managed_app
+    from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    async def _boom(store: object, sink: object) -> None:
+        raise RuntimeError("PROBE: the restore record failed")
+
+    stops: list[str] = []
+    closes: list[str] = []
+    real_stop = Engine.stop
+    real_close = MessageStore.close
+
+    async def _stop(self: Engine, *args: Any, **kwargs: Any) -> None:
+        stops.append("stop")
+        await real_stop(self, *args, **kwargs)
+
+    async def _close(self: MessageStore) -> None:
+        closes.append("close")
+        await real_close(self)
+
+    monkeypatch.setattr(appmod, "_record_a_restore", _boom)
+    monkeypatch.setattr(Engine, "stop", _stop)
+    monkeypatch.setattr(MessageStore, "close", _close)
+    app = create_managed_app(
+        db_path=tmp_path / "probe.db",
+        poll_interval=0.05,
+        auth_settings=AuthSettings(),
+        alerts_settings=AlertsSettings(security_notifications_required=False),
+        egress_settings=EgressSettings(),
+    )
+    with pytest.raises(RuntimeError, match="PROBE: the restore record failed"):
+        async with app.router.lifespan_context(app):
+            pytest.fail("the lifespan served after its restore record raised")
+    assert stops == ["stop"]
+    assert closes, "the store was never closed"

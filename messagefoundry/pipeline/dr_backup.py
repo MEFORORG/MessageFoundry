@@ -327,6 +327,8 @@ class RestoreResult:
     archive_sha256: str
     archive_created_at: float | None = None
     last_audit_at: float | None = None
+    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    sessions_revoked: int = 0
 
 
 class _HashingReader:
@@ -2887,11 +2889,16 @@ REAPPLY_NOTICE = (
     "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
     "delete, role change and reset made after its newest audit row must be re-applied by hand."
 )
-#: The CLI summary's whole notice: what to re-apply, and what the restore already did.
-RESTORED_ACCOUNTS_NOTICE = (
-    f"{REAPPLY_NOTICE} The restore ended every session the archive held, and the first engine "
-    "start on this store records the restore."
-)
+
+
+def restored_accounts_notice(sessions_revoked: int) -> str:
+    """The CLI summary's whole notice: what to re-apply, and what the restore already did. Worded
+    from the count the restore's own revoke returned, so it never claims more than it ended."""
+    return (
+        f"{REAPPLY_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
+        "placed, and the first engine start on this store ends every session again and records "
+        "the restore."
+    )
 
 
 #: How far ahead of this host's clock an archive's date may be before it counts as undated: a
@@ -3244,7 +3251,7 @@ def _restore_blocking(
             # this restore's own row.
             archive_sha256 = src.digest.hexdigest()
             try:
-                write_restore_marker(
+                sessions_revoked = write_restore_marker(
                     snap,
                     archive_sha256=archive_sha256,
                     archive_created_at=archive_created_at,
@@ -3314,6 +3321,7 @@ def _restore_blocking(
         archive_sha256=archive_sha256,
         archive_created_at=archive_created_at,
         last_audit_at=last_audit_at,
+        sessions_revoked=sessions_revoked,
     )
 
 

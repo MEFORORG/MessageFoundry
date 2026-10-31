@@ -101,7 +101,10 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     out = capsys.readouterr().out
     assert "newest audit row in it 20" in out
     assert "must be re-applied by hand" in out
-    assert "The restore ended every session the archive held" in out
+    # Worded from the restore's own count (none here: the archive holds no session), never as
+    # "every session" whether or not its revoke ran.
+    assert "The restore ended 0 open session(s) in the store it placed" in out
+    assert "every session the archive held" not in out
 
     json_dest = tmp_path / "json" / "msg.db"
     argv = ["restore", archive, "--to", str(json_dest), "--service-config", toml, "--json"]
@@ -109,6 +112,7 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["last_audit_at"].startswith("20") and payload["last_audit_at"].endswith("Z")
     assert len(payload["archive_sha256"]) == 64
+    assert payload["sessions_revoked"] == 0
 
 
 def test_an_archive_that_does_not_say_when_it_was_taken_is_refused() -> None:

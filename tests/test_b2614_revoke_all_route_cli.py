@@ -149,6 +149,44 @@ async def test_the_route_refuses_a_caller_without_users_manage(engine: Engine) -
         assert await _alive(c, root)
 
 
+async def test_a_kept_session_that_fails_its_seal_is_counted_with_the_rest(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kept session whose seal fails makes the store write nothing, so the service ends every
+    session, the caller's own included. The count in the reply and the audit row must include that
+    session: ended first by the seal-failure handler, the sweep found it gone and both were one
+    short. The seal failure is injected at the store's keep-one revoke, the call that raises it."""
+    from messagefoundry.store.row_seal import SESSION_KIND, RowSealError
+
+    service = await _service(engine)
+    await _local(service, "root", Role.ADMINISTRATOR)
+    await _local(service, "ops", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        root = await _login(c, "root")
+        await _login(c, "root")
+        await _login(c, "ops")
+
+    store = engine.store
+    real = store.revoke_all_sessions
+
+    async def _refuse_the_keep(
+        *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        if except_token_hash is not None:
+            raise RowSealError(SESSION_KIND)
+        return await real(now=now)
+
+    monkeypatch.setattr(store, "revoke_all_sessions", _refuse_the_keep)
+    revoked, kept = await service.revoke_every_session(
+        actor="root", keep_token_hash=hash_token(root)
+    )
+    assert (revoked, kept) == (3, False)
+    rows = await store.list_audit(action="auth.session_revoked", limit=10)
+    assert [json.loads(row["detail"]) for row in rows] == [{"scope": "all", "count": 3}]
+    row = await store.get_session(hash_token(root))
+    assert row is not None and row.revoked_at is not None
+
+
 async def _seed(db: Path) -> list[str]:
     store = await MessageStore.open(db)
     try:

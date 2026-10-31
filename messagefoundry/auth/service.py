@@ -11578,8 +11578,14 @@ class AuthService:
         try:
             revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:
-            await self._session_seal_failed(keep_token_hash)
-            revoked = await self._store.revoke_all_sessions()
+            # The sweep runs first, so the suspect row is counted with the rest: ended first by
+            # the seal-failure handler, the sweep would find it gone and the reply and the audit
+            # row would be one short. The handler still runs if the sweep raises, so the suspect
+            # row is ended either way; its own revoke then matches nothing, and it reports.
+            try:
+                revoked = await self._store.revoke_all_sessions()
+            finally:
+                await self._session_seal_failed(keep_token_hash)
         # Read back rather than inferred: a revoke of the caller's own session that landed before
         # the sweep leaves nothing kept, and the reply and the audit row must say so.
         kept = await self._load_session(keep_token_hash) is not None

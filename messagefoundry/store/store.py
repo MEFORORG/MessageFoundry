@@ -6293,16 +6293,19 @@ def write_restore_marker(
     naming this archive, raises ``sqlite3.OperationalError``."""
 
     def mark(conn: sqlite3.Connection) -> int:
-        # Two autocommit statements, not one transaction: the file is the restore's staged copy,
+        # Autocommit statements, not one transaction: the file is the restore's staged copy,
         # and a failure between them discards it whole, so no half-written file is ever placed.
         conn.executescript(_RESTORE_MARKER_DDL)
         revoked = 0
         # An archive an earlier build wrote may have no sessions table, or one from before the
-        # seal column (BACKLOG #2592), which the first open's migration adds. Such a file is left
-        # to the first start's consume, which revokes after that migration: a revoke here must
-        # blank the seal, and that column is not there yet.
+        # seal column (BACKLOG #2592). The column is added here first, as the first open's
+        # migration adds it, so such a file's sessions are ended by the same revoke as a current
+        # one's, which blanks the seal: the CLI notice reports this count as ended.
         columns = {str(r[1]) for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
-        if "seal" in columns:
+        if columns and "seal" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
+            columns.add("seal")
+        if "revoked_at" in columns:
             revoked = conn.execute(
                 "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL",
                 (restored_at,),
@@ -17863,10 +17866,12 @@ class MessageStore:
                     {
                         "archive_sha256": record.archive_sha256,
                         "archive_created_at": record.archive_created_at,
+                        # Clamped at zero, as the alert's age is: an archive dated after the
+                        # restore says the backup host's clock led, not that it was taken later.
                         "archive_age_seconds": (
                             None
                             if record.archive_created_at is None
-                            else round(record.restored_at - record.archive_created_at)
+                            else max(0, round(record.restored_at - record.archive_created_at))
                         ),
                         "last_audit_at": record.last_audit_at,
                         "restored_at": record.restored_at,

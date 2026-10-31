@@ -11991,6 +11991,9 @@ def create_managed_app(
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # BACKLOG #2614: hoisted for the same teardown reason. The restore record runs first in the
+        # span, so a raise from it would otherwise reach the finally before `auth` is bound.
+        auth: AuthService | None = None
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
@@ -12016,7 +12019,6 @@ def create_managed_app(
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
             # (the OIDC revocation guard, #1887) stops startup before any connection starts.
             # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
-            auth: AuthService | None = None
             if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
                 # transport, sent to each affected user's own address. The notifier is wired only when the
