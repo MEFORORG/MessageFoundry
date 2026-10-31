@@ -8,13 +8,16 @@ thing to avoid here.* So most tests below are controls: each plants one failure 
 catch and requires the gate to name it.
 
 NO NETWORK. The report the gate judges is npm's verbatim stdout from ``npm audit --json``. It was
-taken on 2026-10-28 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
-It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-24 reading, also npm
-11.19.0, after GitHub published deepmerge GHSA-gcqx-w48m-w2h4. The findings the gate compares differ
-by exactly that one. The report adds seven ``vulnerabilities`` entries, deepmerge and six packages
-that reach it, and the low and total counts rise by seven; every entry the 2026-10-24 reading held
-is unchanged. That reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2, after
-GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
+taken on 2026-10-31 with npm 11.19.0, through this gate's own runner, against the vendored lockfile.
+It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-28 reading, also npm
+11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares differ
+by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
+only entry that moved is minimatch, whose ``via`` gains the advisory and whose ``range`` widens.
+The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
+deepmerge GHSA-gcqx-w48m-w2h4. Those two differ by exactly that one finding, plus seven
+``vulnerabilities`` entries, deepmerge and six packages that reach it, with the low and total counts
+up by seven. The 2026-10-24 reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2,
+after GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
 ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
 ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
 were not traced to a cause. The live call is replaced by an injected runner, so nothing here needs
@@ -41,7 +44,7 @@ from tests._workflow_contexts import jobs_of
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = REPO_ROOT / "scripts" / "security"
-_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-28.json"
+_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "cla_action_audit" / "npm-audit-2026-10-31.json"
 
 
 def _load(name: str) -> ModuleType:
@@ -380,7 +383,7 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     )
 
 
-#: Identifiers measured ABSENT from the bundle, from two readings recorded in
+#: Identifiers measured ABSENT from the bundle, from three readings recorded in
 #: cla-action-advisories.toml. Each must count 0 in ``dist/index.js``. Removing one needs its
 #: reading redone, not just this edit.
 #:
@@ -391,6 +394,11 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #:   measured. The other four are left out because other code uses them too: the
 #:   is-mergeable-object package exports ``isMergeableObject``, ``arrayMerge`` and ``mergeObject``
 #:   are common helper names, and "deepmerge" is in other packages' names, such as deepmerge-ts.
+#: - minimatch, read 2026-10-31: what that reading settles is stated in the triage comment above
+#:   minimatch's GHSA-g3hv-75wg-m249 entry. These three cover minimatch by name, an identifier of
+#:   its own, and glob, its runtime parent. "Toolkit" above covers actions-toolkit, the top of that
+#:   chain. The rest of what it measured is not re-run; these are enough to red a re-vendored bundle
+#:   that carries the chain unminified.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -400,6 +408,9 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("toRegexRange"),  # fill-range
     re.compile("cloneUnlessOtherwiseSpecified"),  # deepmerge
     re.compile("propertyIsUnsafe"),  # deepmerge
+    re.compile("minimatch", re.IGNORECASE),  # minimatch
+    re.compile("twoStarNoDot"),  # minimatch
+    re.compile("GlobSync"),  # glob
 )
 
 #: The control: two @actions/core functions the bundle does carry, so the probes can find code.
@@ -409,7 +420,7 @@ _PRESENT_IN_BUNDLE = re.compile("function getInput|function setFailed")
 def test_the_recorded_bundle_reading_still_holds() -> None:
     """The baseline's recorded bundle readings, of the braces and js-yaml chains, still hold.
 
-    So does the later reading of deepmerge, taken 2026-10-28.
+    So do the later readings of deepmerge, taken 2026-10-28, and minimatch, taken 2026-10-31.
 
     The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
     re-vendored bundle could carry that code while the baseline still said it was absent. This reds

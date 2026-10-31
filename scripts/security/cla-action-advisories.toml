@@ -230,3 +230,32 @@ package = "brace-expansion"
 [[advisory]]
 id = "GHSA-gcqx-w48m-w2h4"
 package = "deepmerge"
+
+# TRIAGED 2026-10-31 by Claude, an AI agent working as a Builder subagent of the Lander, on issue
+# 2695 (scheduled Security run 41198026900, job cla-action-audit). minimatch GHSA-g3hv-75wg-m249,
+# GitHub severity medium, npm moderate, no CVSS score: a glob pattern an attacker supplies can
+# amplify preprocessing into excessive CPU and memory use. GitHub's range is below 11.0.1, which
+# covers the locked 3.1.2. The advisory's text names 10.2.6 and firstPhasePreProcess(). 3.1.2's
+# source is not in this repository and was not read, so this does not claim 3.1.2 lacks that path.
+# THIS IS NOT A DEV-ONLY PACKAGE. The lockfile marks minimatch 3.1.2 neither `dev`, `peer` nor
+# `optional`. Searching the lockfile's `dependencies`, `peerDependencies` and
+# `optionalDependencies` finds two packages naming it: test-exclude, marked `dev`, and glob 7.1.6,
+# not marked. That chain runs glob, rimraf 2.6.3, flat-cache 2.0.1, actions-toolkit 2.2.0, and
+# actions-toolkit is a root runtime dependency. So the lockfile alone does not rule it out.
+# NOT REACHABLE in what cla.yml runs, on the bundle reading instead. action.yml's main is
+# dist/index.js, the action's only JavaScript file, and the file is not minified. "minimatch" and
+# "Minimatch" each returned 0 there, as did firstPhasePreProcess, GLOBSTAR, braceExpand, nonegate,
+# flipNegate, twoStarNoDot and makeRe; GlobSync, nodir and realpathCache for glob; rimraf and
+# maxBusyTries; flatCache and removeCacheFile for flat-cache; and actions-toolkit and Toolkit. The
+# @actions/core control returned 2. The bundle's literal require() calls name only Node built-ins.
+# A wildcard in the `allowlist` input goes through lodash escapeRegExp and a RegExp in
+# isUserNotInAllowList, not a glob library. The first patched release is 11.0.1, outside the ^3.0.4 both parents
+# ask for, and it cannot be applied, because the bundle cannot be rebuilt here.
+# tests/test_cla_action_advisory_gate.py re-runs some of these probes, so a re-vendored bundle
+# carrying this chain unminified reds there. It does NOT see that code minified or renamed inside
+# another package's pre-built file. This reading bears on minimatch's three earlier entries, but
+# they were not triaged on it and stay recorded as found.
+
+[[advisory]]
+id = "GHSA-g3hv-75wg-m249"
+package = "minimatch"
