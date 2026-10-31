@@ -2544,16 +2544,25 @@ class RegistryRunner:
                 )
 
         # Settings resolve once, with no I/O, so the warning has one call site and comes before any
-        # build: a lookup that then fails to build keeps its record.
+        # build: a lookup that then fails to build keeps its record. Resolution raises WiringError
+        # for a configuration fault; anything else is a defect and is let out.
         settled: dict[str, dict[str, Any]] = {}
         errors: dict[str, Exception] = {}
         for name in specs:
             try:
                 settled[name] = resolve(name)
-            except Exception as exc:
+            except WiringError as exc:
                 errors[name] = exc
-            if warn_query_credentials:
+            if not warn_query_credentials:
+                continue
+            try:
                 warn(name, settled.get(name))
+            except Exception as exc:
+                # Broad on purpose, as the build's isolation below is (ADR 0031, vault BACKLOG
+                # #3008): a failure in one lookup's warning step costs that lookup only, so it is
+                # isolated, recorded and alerted rather than unwinding the start.
+                errors.setdefault(name, exc)
+                settled.pop(name, None)
         if not errors:
             try:
                 return build(settled)  # a healthy graph builds once, as it always did

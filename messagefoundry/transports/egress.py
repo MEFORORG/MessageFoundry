@@ -319,7 +319,9 @@ def check_fhir_lookup_allowed(
     being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep).
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. The runner's live builds pass it and log the line themselves (vault BACKLOG #2910)."""
+    refusal. The runner's live builds pass it: a start's builds log the line once per lookup
+    themselves, and a reload's build follows its build check, which has logged it (vault BACKLOG
+    #2910)."""
     # ASVS 14.2.1, before every refusal, so a lookup a refusal takes down is still recorded.
     if warn_query_credentials:
         warn_url_query_credentials(f"FhirLookup {name!r}", settings)

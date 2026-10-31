@@ -41,7 +41,11 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.store import MessageStore
-from messagefoundry.transports.egress import check_egress_allowed, check_fhir_lookup_allowed
+from messagefoundry.transports.egress import (
+    check_egress_allowed,
+    check_fhir_lookup_allowed,
+    warn_url_query_credentials,
+)
 
 _MARK = "carries a credential in its query string"
 
@@ -531,6 +535,13 @@ _KEYED = "https://p.example.invalid/x?key=PLACEHOLDER&v={v}"
 _LOOKUP_URL = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
 
 
+_UNREAD = "its url did not resolve, so the URL query-credential check could not read it"
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records]
+
+
 def _warned(caplog: pytest.LogCaptureFixture, label: str) -> int:
     return sum(1 for r in caplog.records if _MARK in r.getMessage() and label in r.getMessage())
 
@@ -721,12 +732,51 @@ async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_s
         reg.add_fhir_lookup(FhirLookupSpec(name=name, settings=settings))
     runner = _reload_runner(reload_store, reg)
     try:
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             await runner.start(warn_query_credentials=warn)
         assert sorted(runner.degraded_fhir_lookups()) == ["LK_BAD", "LK_TOKEN", "LK_UNSET"]
         for name in ("LK_A", "LK_Z", "LK_BAD", "LK_TOKEN"):
             assert _warned(caplog, f"FhirLookup {name!r}") == int(warn), name
         assert _warned(caplog, "FhirLookup 'LK_UNSET'") == 0
+        # The INFO line says why LK_UNSET has no WARNING, and only for it.
+        unread = [m for m in _messages(caplog) if "its url did not resolve" in m]
+        assert unread == ["FhirLookup 'LK_UNSET': " + _UNREAD] * int(warn)
+    finally:
+        await runner.stop()
+
+
+async def test_a_raising_warning_step_isolates_its_lookup_and_the_rest_start(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control is ADR 0031 / vault BACKLOG #3008 isolation: one lookup's failure costs that
+    lookup only. The warning step runs outside the build, so a failure there must be isolated as
+    a build failure is. Here it raises for ``LK_BOOM`` only. The start completes, ``LK_BOOM`` is
+    degraded, and ``LK_A`` and ``LK_Z`` are built and keep their one WARNING each. Letting the
+    warning step raise out of the resolve loop fails the start, and this test."""
+    real = warn_url_query_credentials
+
+    def warn_or_raise(label: str, settings: Any) -> None:
+        if "LK_BOOM" in label:
+            raise RuntimeError("synthetic failure in the warning step")
+        real(label, settings)
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.wiring_runner.warn_url_query_credentials", warn_or_raise
+    )
+    reg = Registry()
+    for name in ("LK_A", "LK_BOOM", "LK_Z"):
+        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": _LOOKUP_URL}))
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
+        assert runner._running
+        assert list(runner.degraded_fhir_lookups()) == ["LK_BOOM"]
+        assert runner._fhir_lookup_executor is not None
+        assert runner.fhir_lookup_failed("LK_A") is None
+        assert runner.fhir_lookup_failed("LK_Z") is None
+        assert _warned(caplog, "FhirLookup 'LK_A'") == 1
+        assert _warned(caplog, "FhirLookup 'LK_Z'") == 1
     finally:
         await runner.stop()
 
