@@ -38,6 +38,8 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -1103,6 +1105,33 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     )
 
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
+
+
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real SQL Server backend: ``delete_user`` takes the account's ``users``
+    row with ``UPDLOCK, ROWLOCK`` before its sessions (#2733), as the bind does, so the two cannot
+    deadlock.
+
+    The shared body is the one the Postgres suite runs. The probe reads ``sys.dm_exec_requests``: a
+    request whose ``blocking_session_id`` is the bind's session."""
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _session_id(cur: Any) -> object:
+        await cur.execute("SELECT @@SPID")
+        rows = await cur.fetchall()
+        return int(rows[0][0])
+
+    async def _is_blocking(spid: object) -> bool:
+        row = await store._fetchone(
+            "SELECT COUNT(*) AS n FROM sys.dm_exec_requests WHERE blocking_session_id = ?", (spid,)
+        )
+        return bool(row and row["n"])
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_session_id, is_blocking=_is_blocking
+    )
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
@@ -5308,6 +5337,9 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # self-signed certificate; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
@@ -5344,6 +5376,7 @@ async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")  # as above (BACKLOG #2532)
     setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
@@ -5450,6 +5483,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # self-signed certificate; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out
@@ -6064,6 +6100,66 @@ async def test_queue_tag_contract(store) -> None:
         )
     finally:
         await keyed.close()
+
+
+def _raw_adapters(s) -> tuple[Any, Any]:
+    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+
+    async def raw(sql: str, params: tuple[Any, ...]) -> None:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute(sql, params)
+            await conn.commit()
+
+    async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute(sql, params)
+            names = [c[0] for c in cur.description]
+            rows = [dict(zip(names, r, strict=True)) for r in await cur.fetchall()]
+            await conn.commit()
+            return rows
+
+    return raw, fetch
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+@pytest.mark.parametrize("case", ERASED_REPLY_CASES)
+async def test_erased_reply_contract(store, case, keyed) -> None:
+    """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
+    SQLite suite runs, on both cipher shapes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    raw, fetch = _raw_adapters(store)
+    if not keyed:
+        await case(store, fetch, raw)
+        return
+    sealed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
+async def test_keyless_blank_contract(store, case) -> None:
+    """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
+    runs. The ``store`` fixture is the keyless handle, and it clears ``keyed_surface`` on entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    key = generate_key()
+
+    async def open_keyed() -> SqlServerStore:
+        return await SqlServerStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+        )
+
+    raw, fetch = _raw_adapters(store)
+    await case(store, open_keyed, fetch, raw)
 
 
 async def test_cell_tag_contract(store) -> None:

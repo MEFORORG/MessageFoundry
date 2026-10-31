@@ -336,9 +336,11 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
         assert (await c.get("/approvals", headers=admin)).json()["approvals"] == []
 
 
-async def _quiesced_outbound_with_a_pending_row(engine: Engine, tmp_path: Path) -> str:
-    """Start a graph, stop its outbound ``OB`` until it quiesces, and queue one delivery to it,
-    which the paused lane keeps PENDING. Returns the message id."""
+async def _quiesced_outbound_with_a_pending_row(
+    engine: Engine, tmp_path: Path, outbound: str = "OB"
+) -> str:
+    """Start a graph, stop its one outbound until it quiesces, and queue one delivery to it, which
+    the paused lane keeps PENDING. Returns the message id."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     (tmp_path / "out").mkdir()
@@ -355,26 +357,26 @@ async def _quiesced_outbound_with_a_pending_row(engine: Engine, tmp_path: Path) 
     )
     reg.add_outbound(
         OutboundConnection(
-            "OB", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
+            outbound, ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
         )
     )
     reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send("OB", m))
+    reg.add_handler("h", lambda m: Send(outbound, m))
     engine.add_registry(reg)
     await engine.start()
     rr = engine.registry_runner
     assert rr is not None
 
     # Stop OB (idle lane → quiesces), then queue a delivery it retains PENDING while paused.
-    await rr.stop_outbound("OB")
+    await rr.stop_outbound(outbound)
     for _ in range(200):
-        if rr.outbound_quiesced("OB"):
+        if rr.outbound_quiesced(outbound):
             break
         await asyncio.sleep(0.02)
-    assert rr.outbound_quiesced("OB") is True
+    assert rr.outbound_quiesced(outbound) is True
     return str(
         await engine.store.enqueue_message(
-            channel_id="in1", raw=ADT, deliveries=[("OB", ADT)], source_type="file"
+            channel_id="in1", raw=ADT, deliveries=[(outbound, ADT)], source_type="file"
         )
     )
 
@@ -406,7 +408,10 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
         ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
         assert ok.status_code == 200
         # The executor re-checked quiescence at release and REFUSED — a skip result, not a cancel.
-        assert ok.json()["result"] == {"cancelled": 0, "skipped": "outbound running"}
+        assert ok.json()["result"] == {
+            "cancelled": 0,
+            "skipped": "stop the outbound and let it quiesce before purging its queue",
+        }
 
     # Nothing was cancelled: the message's outbox row is never in the CANCELLED state (queue intact).
     statuses = {r["status"] for r in await engine.store.outbox_for(mid)}
@@ -418,8 +423,8 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
     assert await engine.store.list_audit(action="connection_purge") == []
 
 
-async def _hold_a_purge(c: httpx.AsyncClient) -> str:
-    held = await c.post("/connections/OB/purge?scope=top", headers=await _token(c, "op"))
+async def _hold_a_purge(c: httpx.AsyncClient, outbound: str = "OB") -> str:
+    held = await c.post(f"/connections/{outbound}/purge?scope=top", headers=await _token(c, "op"))
     assert held.status_code == 202, held.text
     assert held.json()["operation"] == "connection_purge"
     return str(held.json()["approval_id"])
@@ -465,6 +470,192 @@ async def test_a_released_purge_whose_audit_row_fails_cancels_nothing(
     assert row is not None and str(row["status"]) == "failed"
     assert await engine.store.list_audit(action="connection_purge") == []
     assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+
+
+async def _stored_purge_hold(
+    engine: Engine, requester_user_id: str, params: dict[str, Any], *, requester: str = "op"
+) -> str:
+    """A hold written through the store, for the rows the route cannot file: it refuses a purge
+    with no graph, a purge of an outbound outside the graph, and any scope but the two it admits."""
+    approval_id = uuid4().hex
+    await engine.store.create_pending_approval(
+        approval_id=approval_id,
+        operation="connection_purge",
+        params=json.dumps(params),
+        requester=requester,
+        requester_user_id=requester_user_id,
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    return approval_id
+
+
+async def _assert_nothing_purged(engine: Engine, message_id: str) -> None:
+    assert await engine.store.list_audit(action="connection_purge") == []
+    assert {r["status"] for r in await engine.store.outbox_for(message_id)} == {
+        OutboxStatus.PENDING.value
+    }
+
+
+async def test_a_released_purge_with_no_graph_loaded_cancels_nothing(engine: Engine) -> None:
+    """Vault BACKLOG #3798 item 1: the route answers 404 with no graph, and the executor ran its
+    checks only with one, so a release with no graph went straight to the cancel. It now skips,
+    because loading the graph clears it, and the skip says why."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    assert engine.registry_runner is None  # never started, so no graph is loaded
+    mid = await engine.store.enqueue_message(
+        channel_id="in1", raw=ADT, deliveries=[("OB", ADT)], source_type="file"
+    )
+    held = await _stored_purge_hold(
+        engine, op_id, {"name": "OB", "scope": "all", "requester": "op"}
+    )
+    async with _client(engine, service, ON) as c:
+        ok = await c.post(f"/approvals/{held}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["result"] == {
+        "cancelled": 0,
+        "skipped": "no graph is loaded, so no outbound connection: OB",
+    }
+    await _assert_nothing_purged(engine, str(mid))
+
+
+async def test_a_purge_with_no_graph_loaded_says_so_at_the_route(engine: Engine) -> None:
+    """The route and the release read one refusal, so the 404 no longer reads as a wrong name."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    assert engine.registry_runner is None
+    async with _client(engine, service, ON) as c:
+        r = await c.post("/connections/OB/purge", headers=await _token(c, "op"))
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "no graph is loaded, so no outbound connection: OB"
+
+
+async def test_a_released_purge_of_an_outbound_gone_from_the_graph_cancels_nothing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3798 item 1: the outbound left the graph while the purge was held, and its
+    pause state stayed. The quiesced check alone would pass, and the executor had no name check of
+    its own, so the release cancelled a row the route would answer 404 for. The skip names the
+    real cause, and the queue is intact."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        monkeypatch.delitem(rr.registry.outbound, "OB")
+        assert rr.outbound_quiesced("OB") is True  # so this check alone would let it through
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["result"] == {
+        "cancelled": 0,
+        "skipped": "no such outbound connection: OB",
+    }
+    await _assert_nothing_purged(engine, mid)
+
+
+async def test_a_released_purge_of_an_outbound_another_engine_shard_owns_cancels_nothing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0073 at the release: a non-owning engine shard's quiesced signal is vacuous, so the
+    skip comes from the ownership refusal the executor now shares with the route."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["result"]["cancelled"] == 0
+    assert "owned by engine shard 'other-shard'" in ok.json()["result"]["skipped"]
+    await _assert_nothing_purged(engine, mid)
+
+
+async def test_a_skipped_release_keeps_the_owning_engine_shard_in_the_cut_tee_line(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3798: the tee cuts ``approval.approved``'s detail, and a skip's reason comes
+    last in it. So the ownership refusal names the engine shard before the outbound, whose name
+    could otherwise push the engine shard past the cut. Other refusals carry no such promise, and
+    a requester's name long enough leaves no reason at all (docs/SECURITY.md)."""
+    outbound = "OB_A_PARTNER_WITH_A_LONG_NAME_ADT"
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await _quiesced_outbound_with_a_pending_row(engine, tmp_path, outbound)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c, outbound)
+        monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
+        admin = await _token(c, "approver")
+        with caplog.at_level(logging.INFO, logger="messagefoundry.audit"):
+            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+    assert ok.status_code == 200, ok.text
+    [shipped] = [
+        line["detail"]
+        for line in (
+            json.loads(r.getMessage()) for r in caplog.records if r.name == "messagefoundry.audit"
+        )
+        if line["action"] == "approval.approved"
+    ]
+    assert "(+" in shipped  # the cut happened, or this test proves nothing
+    assert "owned by engine shard 'other-shard'" in shipped
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"name": "OB", "scope": "everything"},
+        {"name": "OB", "scope": "ALL"},
+        {"name": "OB", "scope": None},
+        {"name": "OB", "scope": ["top"]},
+        {"name": "OB"},
+        {"scope": "all"},
+        {"name": None, "scope": "all"},
+        {"name": "", "scope": "all"},
+        {"name": "bad\nname", "scope": "all"},
+    ],
+    ids=[
+        "unknown-scope",
+        "wrong-case-scope",
+        "null-scope",
+        "list-scope",
+        "absent-scope",
+        "absent-name",
+        "null-name",
+        "empty-name",
+        "name-the-route-refuses",
+    ],
+)
+async def test_a_released_purge_with_an_unusable_stored_target_is_refused_and_fails(
+    engine: Engine, tmp_path: Path, stored: dict[str, Any]
+) -> None:
+    """Vault BACKLOG #3798 item 2: anything but "top" used to purge every queued row. The route
+    admits only "top" and "all" and always files a name, so no operator act clears such a row: it
+    raises rather than skips, the release answers 422, and the row's 'failed' is true."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    held = await _stored_purge_hold(engine, op_id, {"requester": "op", **stored})
+    async with _client(engine, service, ON) as c:
+        refused = await c.post(f"/approvals/{held}/approve", headers=await _token(c, "approver"))
+    assert refused.status_code == 422, refused.text
+    assert "records no valid outbound or scope" in refused.json()["detail"]
+    assert await _status_of(engine, held) == "failed"
+    await _assert_nothing_purged(engine, mid)
 
 
 async def test_a_released_purge_with_no_requester_is_refused_before_it_cancels(

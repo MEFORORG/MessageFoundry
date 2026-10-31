@@ -847,7 +847,8 @@ class QueueStore(StoreLifecycle, Protocol):
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
-        :meth:`ingress_handoff`. ``None`` if the row/artifact is gone."""
+        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed, ``""``
+        if the artifact is gone."""
         ...
 
     async def mark_failed(

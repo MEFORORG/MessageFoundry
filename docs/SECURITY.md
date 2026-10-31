@@ -1161,7 +1161,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532); at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -1200,10 +1200,19 @@ named it as still open, waiting on engine PR 1877.
 
 - CORRECTED 2026-10-01: this list named the three Vault hops' missing scheme gate, vault BACKLOG
   #2317. Engine PR 1880 closed it; see the Vault rows above.
-- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
-  they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
-  pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
-  verifying certificate, or the command is changed to pass its posture.
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`. At
+  least `provision-admin`, `store provision-schema` and `check-privileges` pass the posture and
+  keep the escape at `warn`. A site that needs the others on a dev store gives it a verifying
+  certificate. That refusal at `warn` began as a side effect of passing no posture (vault BACKLOG
+  #2354), never as a ruling. BACKLOG #2532 keeps it on purpose (Manager decision
+  d20261031T021248404-699a64: no command loosens). Whether the CLI should honour the escape at
+  `warn` is the owner question in BACKLOG #1886, still open.
+- At least `support-bundle` and `verify` would cross an off-loopback PostgreSQL store hop with no
+  revocation check on a first deployment, at `enforcement = enforce` too, because they pass no
+  posture, no CLI process stamps one, and `RevocationHopGuard` does nothing with neither. `serve`
+  and the commands BACKLOG #2532 covers refuse that hop at `enforce`. #2532 left this open: the
+  fix is a guard that fails closed with no posture, in the store files, rather than another call
+  site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 
@@ -2371,6 +2380,31 @@ as `params_no_requester` writes an `approval.params_no_requester` row against th
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
+**A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
+listing, on `GET /approvals` or on the console's `/ui/approvals`, that marks at least one request
+with that value writes one `approval.standing_shown` row against the caller. The row carries the
+caller's `client` address (ADR 0150), then `count` and those requests' ids in `approval_ids`, in
+that order. The off-box copy of the row holds `detail` to 200 characters, so from about five
+requests it is cut: it keeps `count`, may lose the ids past about the fourth, and is no longer valid
+JSON. The on-box row keeps every id, so read the ids there. A listing that
+shows no such value writes no row. Repeats are not folded together, because a held request may have
+no expiry, so a de-dup key or a throttle would hide months of views. Nothing paces the listing, so
+a client that polls it while such a request is held writes one row per poll. On the console this
+row is the listing's only record, because the console's gates write no grant row. On the JSON route
+it sits beside `auth.permission_granted` while `[security].audit_all_authorization_decisions` is on, and it does
+not depend on that switch. A failed write of this row leaves the listing answering 200, and is
+logged and paged, as below. That covers this row alone. While that switch is on, the JSON route
+writes its grant row first, so a store that refuses every audit write answers that route 500 before
+this row is reached, with no page. The write has no time bound of its own, so a write that stalls
+rather than fails holds the listing until the request timeout, with no row and no page. The value
+itself still needs no step-up.
+
+This row records what that listing disclosed, and only that. It does not record every route to the
+fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
+and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope. The
+console's user pages write no grant row. So a missing `approval.standing_shown` row does not show
+that a caller never learned a requester's standing.
+
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
 together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
@@ -2543,8 +2577,20 @@ Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
 request moves to `failed`, and `approval.failed` names the error type. A released purge does the
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
-attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
-is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
+attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
+makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
+least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
+engine shard. It cancels nothing, writes no
+`connection_purge` row, and its `approval.approved` row records the route's refusal text as the
+skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
+off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail
+puts the request id, the operation, the requester and the count before the reason. So the copy may
+lose the reason. The requester's name is the field that can use up the bound, so a long requester
+name can leave no reason at all. Read the reason on-box. A held purge whose stored scope
+is neither `top` nor `all`, or whose stored name the route would not admit, cancels nothing either.
+No request files one and no operator act clears it, so it answers 422, moves to `failed`, and
+`approval.failed` names the error type; a WARNING in the engine log says why. The queue does not predict this refusal: `release_blocked` stays `null`, as
+for the operation's other own refusals, and the request is claimed first.
 At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
 exception the claim has. The re-queue or the cancel and its row are then committed, and the gate
 still tries to move the request to `failed`. That row is not forwarded off-box, and no alert says
@@ -2561,10 +2607,14 @@ error, as stated for the claim above.
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name. A
 resolution's lost `approval.approver_provenance` row is keyed `approval:<id>:resolve` instead, so it
-cannot fold into a lost release flag on the same request (vault BACKLOG #3438).
+cannot fold into a lost release flag on the same request (vault BACKLOG #3438). A lost
+`approval.standing_shown` row is keyed `approval:listing`, because it belongs to a listing rather
+than to one request.
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
+- the `approval.standing_shown` row a listing writes. The log line carries the row's detail, the
+  caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
 - the request or repeat write, including one that reads back as held, as below. The log line names
@@ -4231,7 +4281,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event. With `tls = true` on the standard asyncio loop the check runs before the handshake, so the socket is closed with no answer and no TLS byte (BACKLOG #2479) |
 | **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s and at most 20 addresses per 60 s in all; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On MLLP and HTTP where the event loop runs the handshake (uvloop), the connection **never reaches the accept path**, so there is no allow-list evaluation. On MLLP and HTTP on the standard asyncio loop the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479). Either way the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
-| **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects`. **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate with an unlisted subject; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
+| **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects` under the loaded `tls_ca_file` CA whose key signed it (vault BACKLOG #2287; the refusals include at least these, and the list is not complete: a listed name is refused when the loaded CA that signed the leaf is not the one the name is listed under, and a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file` and the name is listed under it; no certificate is admitted under a CA that `tls_ca_file` holds twice with one DN and different keys, as during a key rollover, or under one whose certificate cannot be parsed, and the listener warns about both at start). **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate whose subject is not listed under the loaded CA that signed it; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
 | **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
 | **HTTP** — peer-control start gate (ADR 0154 D7) | the listener's bind host × the presence of an **effective** peer control | non-loopback bind, `[security].enforcement = enforce` (the default), and **no** effective peer control: `intake_auth` is `none`, and `source_ip_allowlist` is unset or has an entry wider than a /8 (IPv4) or a /32 (IPv6), so `0.0.0.0/0` does not count. `tls` + `tls_ca_file` alone does not count either, because it binds no subject | **DENY at start** (`WiringError`); the connection degrades per ADR 0031 startup fault isolation. Loopback binds are exempt |
 | **HTTP** — peer-control start gate, not enforcing | as the row above | the same listener shape, with `[security].enforcement` at any level other than `enforce` | **LOG** — the listener starts and a WARNING names the missing control |
@@ -4584,7 +4634,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
   account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that the next bullet states. The
+  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -4597,18 +4647,40 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed, and it then lasts until it expires. The same
-  holds on that store for an unbind and for an administrator's revoke of a user's sessions,
-  which run the same sweep. The Postgres store follows a rotated row and the SQLite store runs
-  one writer at a time, so neither has this limit. This was read from the code and not run
-  against a server. A bind ends sessions only: an engine factor already enrolled on the
-  account stays.
-- **A bind and a user delete can collide on the SQL Server and Postgres stores.** A bind locks
-  the account's row and then its sessions, and deleting a user locks the sessions and then
-  the row. If both run against one account at the same moment, the database ends one of
-  them, so one administrator request fails and is retried. No bound account keeps its
-  sessions and no user is left half deleted. The SQLite store runs one writer at a time and
-  does not have this.
+  in the instant the sweep runs can be missed by it. The same holds on that store for an
+  unbind and for every other whole-account revoke, which run the same sweep: at least an
+  administrator's revoke of a user's sessions, a role change and a password reset. **A missed
+  session is refused the next time it is presented** (BACKLOG #2592), with at least the
+  exception below. Each of these raises the account's session epoch in the same transaction,
+  and a rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
+  session, and the user's own session list hides it and ends it the same way. **The exception:**
+  a request from that session to end the user's other sessions, accepted just before the
+  sweep commits, waits for it and then stamps the session with the new epoch, so it stays
+  usable. **At least three things are also wrong about a refused one.** Its ending is reported
+  as a seal failure: a WARNING, an `integrity.authority_seal_failed` audit row and an
+  `integrity_drift` alert. The report is rate-limited per session, and the alert goes through the
+  alert notifier's re-alert throttle, or only to the log where no alert notifier is running.
+  **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
+  alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
+  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
+  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
+  until the session is presented or listed, the store still holds it as live. A follow-up row,
+  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
+  session, so nothing is missed. That would not change the -1 count. The Postgres store follows a
+  rotated row and the SQLite store runs one writer at a time, so neither has this limit. All
+  of this was read from the code; the skip has not been reproduced against a server. A bind
+  ends sessions only: an engine factor already enrolled on the account stays.
+- **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
+  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  on Postgres since #2738, so the two cannot deadlock against one account. The order was read
+  from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
+  pauses a bind while it holds the row, waits until the delete is queued behind it, then
+  releases the bind and requires both to finish. Under the old Postgres order, by the same
+  reading, the database would end one of them as a deadlock; that was not run. No bind,
+  unbind, revoke or user delete retries a deadlock, so a deadlock between any of them and
+  another write still fails that request, and it has to be made again by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.
@@ -5609,7 +5681,7 @@ list, which admits any certificate its CA ever signed.
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth`. **Refuses an account that holds a federated binding** (vault BACKLOG #2609): that account signs in through the OIDC row, and [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, and the IdP's return to `GET /ui/oidc/callback` both draw the per-actor ceremony limiter, the return under a key of its own for the user the staged flow names (BACKLOG #3374) | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` checks the answer before it elevates the session. Among its checks, the verified (issuer, sub) pair must still be the account's, and the new `auth_time` must be no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and later than the IdP `auth_time` the session holds (BACKLOG #2143). The full list, in order, is under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action, a save that ends the caller's own sessions (BACKLOG #3401), or ending every session (BACKLOG #2614)). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
-| **HTTP intake authentication** (non-interactive, ingest plane, ADR 0154 D6) | per inbound `Http()` connection, `intake_auth` picks one of `none`, `api_key`, `bearer` or `mtls_subject`. **The default is `none`: no credential is checked, so any peer the network rules admit may submit.** `api_key` and `bearer` compare a shared secret (`intake_api_key`, `env()` only, with an `intake_api_key_next` rotation slot) in constant time; `mtls_subject` maps a client certificate already verified against `tls_ca_file` through the qualified `intake_client_subjects` allow-list | **per-peer and global failed-attempt budgets** (defaults `intake_auth_rate_limit` 10/min, `intake_auth_rate_limit_global` 60/min, then `429`; see Table B); a successful attempt never spends budget, and a peer that authenticated inside the window is exempt from the global one. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. Under `api_key` / `bearer` a missing or wrong credential gets `401` before any body byte is read, or `400` if it sends the credential header twice (Table B). Under `mtls_subject` a peer with no certificate from `tls_ca_file` fails the TLS handshake and is never seen by the engine, and a verified certificate with an unlisted subject gets `403`. The refusals the engine sees are audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`. Off loopback, a listener with no effective peer control is refused at start under `[security].enforcement = enforce` (Table B) |
+| **HTTP intake authentication** (non-interactive, ingest plane, ADR 0154 D6) | per inbound `Http()` connection, `intake_auth` picks one of `none`, `api_key`, `bearer` or `mtls_subject`. **The default is `none`: no credential is checked, so any peer the network rules admit may submit.** `api_key` and `bearer` compare a shared secret (`intake_api_key`, `env()` only, with an `intake_api_key_next` rotation slot) in constant time; `mtls_subject` maps a client certificate already verified against `tls_ca_file` through the qualified `intake_client_subjects` allow-list, keyed by the loaded CA whose key signed the certificate | **per-peer and global failed-attempt budgets** (defaults `intake_auth_rate_limit` 10/min, `intake_auth_rate_limit_global` 60/min, then `429`; see Table B); a successful attempt never spends budget, and a peer that authenticated inside the window is exempt from the global one. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. Under `api_key` / `bearer` a missing or wrong credential gets `401` before any body byte is read, or `400` if it sends the credential header twice (Table B). Under `mtls_subject` a peer with no certificate from `tls_ca_file` fails the TLS handshake and is never seen by the engine, and a verified certificate whose subject is not listed under the loaded CA that signed it gets `403`. The refusals the engine sees are audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`. Off loopback, a listener with no effective peer control is refused at start under `[security].enforcement = enforce` (Table B) |
 
 Comparative properties on the dimensions the table's four columns cannot carry:
 

@@ -268,17 +268,20 @@ def _found() -> tuple[Row, ...]:
 #: calls in one function are two rows and neither can hide behind the other.
 _CENSUS: list[Row] = sorted(
     [
-        ("__main__.py", "_admin_reset_totp.opened", "open_store", "-"),
-        ("__main__.py", "_admin_set_notify_email.run", "open_store", "-"),
-        ("__main__.py", "_admin_unlock.run", "open_store", "-"),
-        ("__main__.py", "_admin_revoke_sessions.run", "open_store", "-"),  # BACKLOG #2614
-        ("__main__.py", "_audit_anchor.run", "open_store", "-"),
-        ("__main__.py", "_audit_verify.run", "open_store", "-"),
-        ("__main__.py", "_backup.run", "_BackupRunner", "-"),
-        ("__main__.py", "_backup.run", "open_store", "-"),
+        # The store-opening commands' ``posture`` is ``_command_hop_posture``'s value: the
+        # instance's posture at enforce and None at warn (BACKLOG #2532), so on the Vault hops each
+        # is judged as enforcing, as it was when it passed none.
+        ("__main__.py", "_admin_reset_totp.opened", "open_store", "posture"),
+        ("__main__.py", "_admin_set_notify_email.run", "open_store", "posture"),
+        ("__main__.py", "_admin_unlock.run", "open_store", "posture"),
+        ("__main__.py", "_admin_revoke_sessions.run", "open_store", "posture"),  # BACKLOG #2614
+        ("__main__.py", "_audit_anchor.run", "open_store", "posture"),
+        ("__main__.py", "_audit_verify.run", "open_store", "posture"),
+        ("__main__.py", "_backup.run", "_BackupRunner", "posture"),
+        ("__main__.py", "_backup.run", "open_store", "posture"),
         ("__main__.py", "_build_provision_auth_service", "resolve_secret_provider", "posture"),
         ("__main__.py", "_check_privileges", "probe_vault", "posture"),
-        ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "-"),
+        ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "posture"),
         ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
         ("__main__.py", "_offline_alert_notifier.build", "resolve_secret_provider", "posture"),
@@ -302,9 +305,9 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
         ("__main__.py", "_renew_api_tls_before_spawning._audit", "open_store", "posture"),
-        ("__main__.py", "_rotate_key", "resolve_active_key", "-"),
-        ("__main__.py", "_rotate_key.run", "open_store", "-"),
-        ("__main__.py", "_store_transit_bound.run", "open_store", "-"),
+        ("__main__.py", "_rotate_key", "resolve_active_key", "posture"),
+        ("__main__.py", "_rotate_key.run", "open_store", "posture"),
+        ("__main__.py", "_store_transit_bound.run", "open_store", "posture"),
         ("api/app.py", "create_app", "build_store_cipher", "posture"),
         ("api/app.py", "create_managed_app.lifespan", "Engine", _SERVE_DERIVATION),
         (
@@ -509,6 +512,7 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
+        ("__main__.py", "_command_hop_posture", "settings.security.enforcement"),
         # The offline alert notifier's revocation guards and the offline security notifier's SMTP
         # login guard, each for a caller with no posture (BACKLOG #2193).
         ("__main__.py", "_offline_alert_notifier", "settings.security.enforcement"),
@@ -517,6 +521,8 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
         ("__main__.py", "_start_logging", "settings.security.enforcement"),
         ("__main__.py", "_store_provision_schema", "settings.security.enforcement"),
+        # At warn, the store-opening commands' PostgreSQL revocation WARNING (BACKLOG #2532).
+        ("__main__.py", "_warn_on_an_unrevoked_store_hop", "settings.security.enforcement"),
         ("api/app.py", "create_app", _SERVE_DIAL),
         ("api/app.py", "create_app", "_phi_read_enforcement"),
         ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
