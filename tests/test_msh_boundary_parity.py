@@ -161,6 +161,15 @@ def test_the_batch_split_is_unchanged() -> None:
     assert [body for body in BODIES if split.split_batch(body) != _old_split_batch(body)] == []
 
 
+def test_the_split_boundary_literal_spells_the_shared_cr_msh() -> None:
+    # The split's lookahead is a literal so the static ReDoS scanner can read it, which means it no
+    # longer follows _CR_MSH on its own: hold it to the pure lookahead over that one literal.
+    body = split._MSH_BOUNDARY.pattern.removeprefix("(?=").removesuffix(")")
+    assert split._MSH_BOUNDARY.pattern == "(?=" + body + ")"
+    assert body == split._CR_MSH.replace("\r", r"\r")
+    assert re.fullmatch(body, split._CR_MSH) is not None
+
+
 def test_a_clean_outbound_payload_pays_one_scan() -> None:
     # Item 3.2. A str subclass counts the substring scans the delivery reading makes through find,
     # count and `in`; a payload with no MSH after its lead must stop at the first, and one holding
