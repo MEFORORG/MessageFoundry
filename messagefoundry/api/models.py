@@ -528,6 +528,7 @@ ReleaseBlocked = Literal[
     "params_unreadable",
     "params_no_requester",
     "requester_not_authorized",
+    "seal_failed",
 ]
 
 
@@ -538,7 +539,8 @@ class PendingApprovalInfo(BaseModel):
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
-    means the stored row could not be read as a JSON object.
+    means the stored row could not be read as a JSON object, or, on a ``seal_failed`` row (below),
+    that they are withheld.
 
     ``caller_is_requester`` is True when the caller raised this request, compared on the immutable
     user id as the self-approval refusal is (BACKLOG #2460, #1540). The engine refuses that caller's
@@ -563,9 +565,16 @@ class PendingApprovalInfo(BaseModel):
     does. The read can still report a requester account whose integrity seal fails, as any read
     of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
-    standing the listing could not read, the row's seal and the operation's own refusals, such as a
+    standing the listing could not read, a seal that fails after the listing and the operation's own refusals, such as a
     held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
-    an ``interrupted`` row."""
+    an ``interrupted`` row.
+
+    ``seal_failed`` (BACKLOG #3639; owner ruling 2026-10-26) marks a ``pending`` row that failed
+    its integrity seal, for at least these causes: it was changed outside the engine, sealed under a
+    store key this engine does not hold, or written before the store held a key. It is refused before every value above and is not released while it fails,
+    and the reject closes it (BACKLOG #3638). Its ``params`` are ALWAYS ``None``, withheld rather than
+    unreadable, ``approver`` and ``decided_at`` are ``None``, and its other values are shown as stored, unverified; ``caller_is_requester`` is
+    False on it. ``ApprovalGate._seal_failed_entry`` is the source of record."""
 
     id: str
     operation: str
@@ -1877,7 +1886,7 @@ class AlertTestEmailResult(BaseModel):
     """Result of ``POST /alerts/test-email`` (BACKLOG #118) — a live SMTP send of a synthetic, PHI-free
     event through the **real** alert-email transport (the same path a genuine alert takes). Carries NO
     email addresses: only whether email is configured, the send outcome, how long the attempt took, the
-    recipient count, and a ``safe_exc``-scrubbed failure detail."""
+    recipient count, and a ``safe_exc``-scrubbed failure detail, which can name the relay host."""
 
     configured: bool
     success: bool

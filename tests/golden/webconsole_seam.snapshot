@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-84ae818da5f2f1ed
+b634db50214474e2
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -166,6 +166,7 @@ allow_admin_write: (self, actor: 'str') -> 'bool'
 allow_login_attempt: (self, client: 'str | None') -> 'bool'
 allow_phi_read: (self, actor: 'str') -> 'bool'
 allow_reauth_attempt: (self, actor: 'str') -> 'bool'
+allow_step_up_return_audit: (self, user_id: 'str | None', *, client: 'str | None', reason: "Literal['state_mismatch', 'non_navigation_fetch']") -> 'bool'
 audit_kerberos_reject: (self, reason: 'str', *, client: 'str | None') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str', *, client: 'str | None') -> 'None'
@@ -336,7 +337,7 @@ messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
 messagefoundry.api.models.ApprovalResolveRequest.outcome: effects_applied, effects_not_applied
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
 messagefoundry.api.models.DbInfo.disk_free_status: not_applicable, observed, unobservable
-messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable, requester_not_authorized
+messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable, requester_not_authorized, seal_failed
 messagefoundry.api.models.PendingApprovalInfo.status: interrupted, pending
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
 messagefoundry.api.models.StatsResetTarget.role: destination, source

@@ -170,3 +170,30 @@ def test_the_changelog_fragment_guard_is_IN_the_lane() -> None:
     assert not classify(["changelog.d/2080.changed.md"], **patterns), (
         "a fragment is no longer docs-only; re-read whether this pin is still needed"
     )
+
+
+def test_the_review_standards_guard_is_IN_the_lane() -> None:
+    """A FLOOR MEMBER, NOT A CENSUS.
+
+    ``docs/REVIEW-STANDARDS.md`` is classified docs-only, so a pull request that edits only that
+    sheet skips the main suite. ``tests/test_review_standards.py`` checks its line cap, contiguous
+    rule numbering, relative links and same-line ``CLAUDE.md`` section pointers. Without this pin,
+    dropping the module from ``DOC_GUARDS`` passes every other check here, and a broken sheet-only
+    PR skips its own guard until the merge queue.
+    """
+    member = "tests/test_review_standards.py"
+    assert member in _doc_guards(), (
+        f"{member} dropped from the documentation-only lane -- a REVIEW-STANDARDS.md-only PR would "
+        "skip its own guard until the merge queue."
+    )
+    patterns = {
+        "alwayscode": _extract("alwayscode"),
+        "noncode": _extract("noncode"),
+        "alwayscodepath": _extract("alwayscodepath"),
+    }
+    assert not classify(["docs/REVIEW-STANDARDS.md"], **patterns), (
+        "docs/REVIEW-STANDARDS.md is no longer docs-only; re-read whether this pin is still needed"
+    )
+    assert classify(["tests/test_review_standards.py"], **patterns), (
+        "tests/test_review_standards.py now classifies docs-only; a constant-False classify would hide drift"
+    )

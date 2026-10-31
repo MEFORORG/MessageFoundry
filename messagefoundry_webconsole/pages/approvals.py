@@ -27,6 +27,11 @@ engine names the reason in ``release_blocked``; ``PendingApprovalInfo`` says wha
 The page offers the reject and says why, rather than a button the gate answers with 409. The reject reads Withdraw on the requester's own row and Reject on anyone
 else's, and the note names the same verb.
 
+**A pending row that failed its integrity seal is listed, flagged, with its parameters withheld**
+(BACKLOG #3639; owner ruling 2026-10-26). The engine marks it ``release_blocked = "seal_failed"``
+and sends no parameters for it, so the page has none to render; it says "withheld" and offers the
+reject, which closes it (BACKLOG #3638).
+
 Every value goes through the escaping ``el`` builder.
 """
 
@@ -118,6 +123,14 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "approved while that lasts. If their authority is restored, it can be approved then. "
         "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
     ),
+    "seal_failed": (
+        "FLAGGED: this request failed its integrity check. It may have been changed outside the "
+        "engine, sealed under a store key this engine does not hold, or written before the store "
+        "held a key. Its details may not be what was "
+        "requested, and its parameters are withheld. It cannot be approved while this lasts. If a "
+        "store key is missing, restore it first, because a reject cannot be undone. Otherwise, "
+        "{verb} it to close it, and request the operation again if it is still needed."
+    ),
 }
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
@@ -205,6 +218,9 @@ def _param_value(key: str, value: object) -> str:
 def _params(a: PendingApprovalInfo) -> Markup:
     """What a release would re-run, one ``name: value`` line per captured parameter (BACKLOG
     #2458)."""
+    if a.release_blocked == "seal_failed":
+        # BACKLOG #3639: the engine withholds them; never render a value for this row.
+        return el("span", "withheld", class_="muted")
     if a.params is None:
         return el("span", "unreadable", class_="muted")
     # ``requester`` only carries the requester to the executor (BACKLOG #1646), so it is left out

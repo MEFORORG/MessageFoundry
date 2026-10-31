@@ -128,6 +128,70 @@ class NoLoss:
 
 
 @dataclass(frozen=True)
+class SandboxReading:
+    """One step's ``[sandbox]`` arm and the evidence that it ran as asked (BACKLOG #3132).
+
+    ``requested`` is the arm the profile named; ``effective`` is what the engine's own settings
+    parser reads from the environment the step gave the engine, ``None`` when that did not parse.
+    The two are stamped separately so a record cannot claim a mode nobody checked.
+
+    The process counts are the engine's process subtree, walked before and after the warm-up. A
+    worker spawns on its inbound's first dispatch, so before the warm-up there are none, and the
+    difference is the processes the warm-up started. Under ``subprocess`` that must be at least one
+    per driven inbound, or the arm ran in-process (the ``sandbox_workers`` SLO). On Windows from a
+    venv a worker tree is two processes (the launcher stub and the interpreter), so the difference
+    divided by the driven inbounds is also ADR 0187's processes-per-worker-tree reading, on a live
+    engine. ``None`` where no warm-up ran or the walk failed.
+
+    The warm-up sends one message on every connection and waits for it to be delivered. Under
+    ``subprocess`` each of those first deliveries includes its worker's spawn, so
+    ``warmup_first_delivery_max_ms`` is an UPPER BOUND on the slowest spawn, to read beside
+    ``startup_seconds`` (a spawn past that bound fails, and its message dead-letters). It is not a
+    spawn time on its own: the ``off`` arm's figure is the same path with no spawn in it.
+    """
+
+    requested: str
+    effective: str | None
+    startup_seconds: float | None
+    processes_before_warmup: int | None = None
+    processes_after_warmup: int | None = None
+    warmup_sent: int = 0
+    warmup_delivered: int = 0
+    warmup_seconds: float | None = None
+    warmup_first_delivery_p50_ms: float | None = None
+    warmup_first_delivery_max_ms: float | None = None
+
+    @property
+    def warmup_ran(self) -> bool:
+        return self.warmup_seconds is not None
+
+    @property
+    def processes_started(self) -> int | None:
+        """Processes the warm-up added to the engine's subtree, ``None`` when either walk is absent."""
+        if self.processes_before_warmup is None or self.processes_after_warmup is None:
+            return None
+        return self.processes_after_warmup - self.processes_before_warmup
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "requested": self.requested,
+            "effective": self.effective,
+            "startup_seconds": self.startup_seconds,
+            "processes_before_warmup": self.processes_before_warmup,
+            "processes_after_warmup": self.processes_after_warmup,
+            "processes_started": self.processes_started,
+            "warmup": {
+                "ran": self.warmup_ran,
+                "sent": self.warmup_sent,
+                "delivered": self.warmup_delivered,
+                "seconds": _round_or_none(self.warmup_seconds, 3),
+                "first_delivery_p50_ms": _round_or_none(self.warmup_first_delivery_p50_ms, 3),
+                "first_delivery_max_ms": _round_or_none(self.warmup_first_delivery_max_ms, 3),
+            },
+        }
+
+
+@dataclass(frozen=True)
 class ConnScaleRecord:
     """One sweep step: the 6 connection-scale walls at connection count ``count`` for ``sweep_mode``."""
 
@@ -306,6 +370,21 @@ class ConnScaleRecord:
     # predicted herd floor, so #1415 needs it pinned across every counted run. None means not
     # recorded: a two-box cell, a record built by hand, or an older artifact.
     per_lane_wake: bool | None = None
+    # The [sandbox] arm this step ran and the evidence it ran that way (BACKLOG #3132). None means
+    # not recorded: a two-box cell, a record built by hand, or an older artifact.
+    sandbox: SandboxReading | None = None
+
+    @property
+    def sandbox_mode(self) -> str:
+        """The arm this step asked for; ``off``, the engine default, where nothing was recorded."""
+        return "off" if self.sandbox is None else self.sandbox.requested
+
+    @property
+    def step_label(self) -> str:
+        """The step's name in a console note or an SLO observation. It names the lane and the
+        sandbox arm, so the two arms of those A/Bs read as two steps. The fuse and batch axes are
+        not in it."""
+        return f"{lane_label(self.sweep_mode, self.claim_mode)}@N={self.count} sandbox={self.sandbox_mode}"
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -313,6 +392,7 @@ class ConnScaleRecord:
             "fuse_thread_hops": self.fuse_thread_hops,
             "batch_handoff_statements": self.batch_handoff_statements,
             "per_lane_wake": self.per_lane_wake,
+            "sandbox": None if self.sandbox is None else self.sandbox.to_json_dict(),
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
@@ -513,8 +593,8 @@ def monotonic_pairs(
 
 
 #: Queue-draining workers the connscale graph runs PER CONNECTION, under ``claim_mode = per_lane``.
-#: Read from the graph, not fitted: ``harness/config/connscale/graph.py`` registers one ``outbound()``
-#: and one ``inbound()`` per index inside ``for _i in range(_SHAPE.count)``, and the engine runs a
+#: Read from the graph, not fitted: ``harness/config/connscale/_wire.py`` registers one ``outbound()``
+#: and one ``inbound()`` per index inside ``for i in range(shape.count)``, and the engine runs a
 #: router worker plus a transform worker per inbound and a delivery worker per outbound
 #: (CLAUDE.md section 2, "Concurrency = asyncio"). So three per connection.
 CONNSCALE_WORKERS_PER_CONNECTION = 3
@@ -1191,6 +1271,7 @@ class ConnScaleReport:
                 "claim_mode",
                 "fuse_thread_hops",
                 "batch_handoff_statements",
+                "sandbox_mode",
                 "sweep_mode",
                 "count",
                 "offered_rate",
@@ -1222,6 +1303,7 @@ class ConnScaleReport:
                     _spreadsheet_safe(r.claim_mode),
                     r.fuse_thread_hops,
                     r.batch_handoff_statements,
+                    _spreadsheet_safe(r.sandbox_mode),
                     _spreadsheet_safe(r.sweep_mode),
                     r.count,
                     round(r.offered_aggregate_rate, 2),
@@ -1257,15 +1339,15 @@ class ConnScaleReport:
         lines.append(_coverage_note(self.db_backend, self.shim_installed))
         lines.append("")
         header = (
-            f"{'claim':<9}{'mode':<16}{'N':>6}{'rate':>8}{'achv/s':>8}{'sent':>9}{'inpipe':>7}{'exqd':>6}"
+            f"{'claim':<9}{'mode':<16}{'sandbox':<11}{'N':>6}{'rate':>8}{'achv/s':>8}{'sent':>9}{'inpipe':>7}{'exqd':>6}"
             f"{'poolp99':>9}{'idle':>6}{'empty/s':>9}{'wake/s':>8}{'idle/s':>8}{'fd':>7}{'cpu_s':>8}{'reload':>8}{'ackp99':>9}"
         )
         lines.append(header)
         lines.append("-" * len(header))
         for r in self.records:
             lines.append(
-                f"{r.claim_mode:<9}{r.sweep_mode:<16}{r.count:>6}{r.offered_aggregate_rate:>8.0f}"
-                f"{r.achieved_read_per_s:>8.0f}{r.sent:>9}"
+                f"{r.claim_mode:<9}{r.sweep_mode:<16}{r.sandbox_mode:<11}{r.count:>6}"
+                f"{r.offered_aggregate_rate:>8.0f}{r.achieved_read_per_s:>8.0f}{r.sent:>9}"
                 f"{r.in_pipeline_peak:>7}{_na(r.executor_queue_depth_peak):>6}"
                 f"{_na(r.pool_wait_p99_ms):>9}{_na(r.pool_idle_min):>6}"
                 f"{r.empty_claims_per_s:>9.1f}{r.wake_fanout_per_s:>8.1f}{r.idle_poll_per_s:>8.1f}"
@@ -1278,7 +1360,7 @@ class ConnScaleReport:
             if r.fd_probe_degraded_ticks:
                 causes = ", ".join(r.fd_probe_degraded) or "cause not recorded"
                 lines.append(
-                    f"fd probe: {r.sweep_mode}@N={r.count} -- {r.fd_probe_degraded_ticks} of "
+                    f"fd probe: {r.step_label} -- {r.fd_probe_degraded_ticks} of "
                     f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
                 )
         # BACKLOG #1292: the per-message attribution, printed whenever it says anything beyond "clean".
@@ -1289,7 +1371,7 @@ class ConnScaleReport:
             for audit in (r.intake_audit_live, r.intake_audit):
                 if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):
                     continue
-                lines.append(f"{r.sweep_mode}@N={r.count} -- {audit.summary()}")
+                lines.append(f"{r.step_label} -- {audit.summary()}")
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:
