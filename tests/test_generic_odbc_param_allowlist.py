@@ -317,12 +317,10 @@ def test_a_file_keyword_that_leads_off_the_host_or_cannot_be_cleared_is_refused(
 def test_a_padded_spelling_the_walk_cannot_clear_is_read_as_before(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows reads ``" C:\\x"`` as a stream name under the working directory, which the walk
-    cannot clear, and so does a padded spelling whose walk stops on a ``PermissionError`` or the
-    hop limit. That spelling is not refused, since the trimmed path is the one the build judges,
-    but the driver may be given it as sent, so it is read, as it was before the walk existed: it
-    never reaches the driver both unread and unrefused. Red with ``driver_file_spellings`` keeping
-    only the spellings the walk cleared. A padded spelling that leads off the host is refused."""
+    """A padded spelling whose verdict is ``None``, beside a trimmed spelling whose verdict is
+    ``False``, is kept by ``driver_file_spellings``, and the build reads it and refuses the value
+    when that read fails. With the padded spelling's verdict ``True``, the build refuses the value.
+    Red with ``driver_file_spellings`` keeping only the spellings whose verdict is ``False``."""
     sent = r" C:\certs\ca.pem"
     verdicts: dict[str, bool | None] = {sent: None, sent.strip(): False}
     monkeypatch.setattr(database, "_path_verdict", lambda p: verdicts[p])
@@ -439,8 +437,8 @@ def test_the_walk_refuses_a_share_windows_could_not_reach(winerror: int) -> None
 
 
 def test_the_walk_cannot_clear_a_path_it_cannot_read() -> None:
-    """An unreadable folder, and a link whose target is an NT object path, which the walk would
-    otherwise read as a folder on the link's own drive."""
+    """The walk's verdict is ``None`` for a folder whose probe raises ``PermissionError``, and for a
+    link whose target is ``\\Device\\Mup\\...``."""
     denied = {r"C:\locked": PermissionError(5, "denied")}
     assert _walk(r"C:\locked\ca.pem", failing=denied) is None
     nt = {r"C:\certs\ca.pem": r"\Device\Mup\files.test\share\ca.pem"}

@@ -473,10 +473,8 @@ pure-Python equivalent:
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
-  `transports/database.py`, which asks `GetDriveTypeW` whether a generic ODBC file keyword's path
-  is on a mapped network drive, and `QueryDosDeviceW` which folder a `subst` drive stands for, as
-  inputs to the remote-path check that the Generic ODBC section of `CONNECTIONS.md` describes,
-  with at least what it does not catch (BACKLOG #2705)
+  `transports/database.py`, which calls `GetDriveTypeW` and `QueryDosDeviceW` as inputs to the
+  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
