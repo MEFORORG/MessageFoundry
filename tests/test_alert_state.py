@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import sqlite3
 import threading
 import warnings
@@ -726,9 +727,10 @@ async def test_cancelled_middle_waiter_keeps_later_writes_in_order() -> None:
     assert sink._state_locks == {}
 
 
-async def test_write_cancelled_before_it_starts_closes_its_coroutine() -> None:
-    # Loop shutdown cancels fresh tasks before their first step. The store coroutine they carry
-    # must be closed, not left to warn "never awaited" at garbage collection.
+async def test_write_cancelled_before_it_starts_leaks_no_coroutine() -> None:
+    # Loop shutdown cancels fresh tasks before their first step. Neither the wrapper they carry nor
+    # a store coroutine may be left to warn "never awaited" at garbage collection; since BACKLOG
+    # #3756 the store coroutine is built only once the task runs.
     store = _GatedStore(slow="upsert")
     sink = NotifierAlertSink([], store=store)
     with warnings.catch_warnings(record=True) as caught:
@@ -740,10 +742,206 @@ async def test_write_cancelled_before_it_starts_closes_its_coroutine() -> None:
             task.cancel()
         await _spin()
         assert all(task.cancelled() for task in tasks)
-        del tasks  # drop the last references so the store coroutines are collected here
+        del tasks  # drop the last references so the wrappers are collected here
         gc.collect()
     assert not _store_coroutine_leaks(caught)
     assert store.log == []
+
+
+# --- bounded retry of an inverse's resolve (BACKLOG #3756) ---------------------
+
+
+class _FlakyResolveStore(_GatedStore):
+    """A gated store whose resolve fails its first ``fail`` calls, then lands."""
+
+    def __init__(self, *, fail: int) -> None:
+        super().__init__(slow="none")
+        self.fail = fail
+        self.resolve_calls = 0
+        self.upsert_calls = 0
+
+    async def upsert_alert_instance(self, **kwargs: Any) -> None:
+        self.upsert_calls += 1
+        if self.raise_on_upsert:
+            raise RuntimeError("boom")
+        await super().upsert_alert_instance(**kwargs)
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        self.resolve_calls += 1
+        if self.resolve_calls <= self.fail:
+            raise sqlite3.OperationalError("synthetic: database is locked")
+        return await super().resolve_alert_instances_for(
+            event_type=event_type, connection=connection, now=now
+        )
+
+
+@pytest.fixture
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    zeros = (0.0,) * len(NotifierAlertSink._INVERSE_RETRY_DELAYS)
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", zeros)
+
+
+_ATTEMPTS = len(NotifierAlertSink._INVERSE_RETRY_DELAYS) + 1
+_SINK_LOG = "messagefoundry.pipeline.alert_sinks"
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.usefixtures("no_backoff")
+async def test_a_resolve_that_fails_then_lands_resolves_the_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert _ATTEMPTS > 1
+    store = _FlakyResolveStore(fail=_ATTEMPTS - 1)
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _drain(sink)
+    settled: list[bool] = []
+    with caplog.at_level(logging.WARNING, logger=_SINK_LOG):
+        sink._record_state(
+            {"type": "connection_restored", "connection": "OB_X"}, "info", on_settled=settled.append
+        )
+        await _drain(sink)
+    assert store.resolve_calls == _ATTEMPTS
+    assert store.open == set()
+    assert settled == [True]
+    assert _errors(caplog) == []
+
+
+@pytest.mark.usefixtures("no_backoff")
+async def test_a_resolve_that_always_fails_gives_up_and_logs_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _FlakyResolveStore(fail=10 * _ATTEMPTS)
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _drain(sink)
+    settled: list[bool] = []
+    with caplog.at_level(logging.WARNING, logger=_SINK_LOG):
+        sink._record_state(
+            {"type": "connection_restored", "connection": "OB_X"}, "info", on_settled=settled.append
+        )
+        await _drain(sink)
+    assert store.resolve_calls == _ATTEMPTS
+    assert store.open == {"connection_error:OB_X"}
+    assert settled == [False]  # once, after the last attempt
+    (error,) = _errors(caplog)
+    assert "connection_error" in error and "'OB_X'" in error
+    assert "connection_error:OB_X" not in error  # the fields, never the state key
+    assert sink._state_locks == {}
+
+
+@pytest.mark.usefixtures("no_backoff")
+async def test_an_upsert_is_not_retried() -> None:
+    store = _FlakyResolveStore(fail=0)
+    store.raise_on_upsert = True
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _drain(sink)
+    assert store.upsert_calls == 1
+
+
+def test_the_retry_waits_fit_inside_the_stop_drain() -> None:
+    # The waits alone; an attempt's own time is not bounded here (see the constant's comment).
+    from messagefoundry.pipeline.engine import _ALERT_STATE_DRAIN_SECONDS
+
+    assert sum(NotifierAlertSink._INVERSE_RETRY_DELAYS) < _ALERT_STATE_DRAIN_SECONDS
+
+
+async def test_a_raise_emitted_during_a_resolve_retry_lands_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The resolve fails once and waits out its backoff. A raise emitted meanwhile for the same key
+    # must not land in that gap, or the retry would then close a condition that is open again.
+    # The backoff waits on a gate rather than the clock, so the test does not race a timer.
+    gate = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay: float, result: Any = None) -> Any:
+        if delay == 30.0:
+            await gate.wait()
+            return result
+        return await real_sleep(delay, result)
+
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (30.0, 30.0, 30.0))
+    monkeypatch.setattr(asyncio, "sleep", gated_sleep)
+    store = _FlakyResolveStore(fail=1)
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_restored("OB_X")
+    await _spin()
+    assert store.resolve_calls == 1  # the first attempt failed; the retry is waiting
+    try:
+        sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+        await _spin()
+        assert store.upsert_calls == 0  # queued behind the resolve's retry, under the key's lock
+    finally:
+        gate.set()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X", "upsert OB_X"]
+    assert store.open == {"connection_error:OB_X"}
+    assert sink._state_locks == {}
+
+
+async def test_drain_state_cancels_a_retry_still_running_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", (30.0, 30.0, 30.0))
+    store = _FlakyResolveStore(fail=10 * _ATTEMPTS)
+    sink = NotifierAlertSink([], store=store)
+    settled: list[bool] = []
+    with caplog.at_level(logging.WARNING, logger=_SINK_LOG):
+        sink._record_state(
+            {"type": "connection_restored", "connection": "OB_X"}, "info", on_settled=settled.append
+        )
+        (task,) = sink._state_tasks
+        try:
+            await _spin()
+            assert store.resolve_calls == 1  # failed once, now sleeping its 30 s backoff
+            await asyncio.wait_for(sink.drain_state(0), timeout=5.0)
+            await _spin()
+        finally:
+            task.cancel()
+    assert task.cancelled()
+    assert store.resolve_calls == 1
+    assert settled == [False]
+    errors = _errors(caplog)
+    assert any("alert-state drain ended" in e for e in errors)
+    assert any("cancelled before it landed" in e and "'OB_X'" in e for e in errors)
+    assert sink._state_tasks == set() and sink._state_locks == {} and sink._retrying == set()
+
+
+async def test_drain_state_leaves_a_first_attempt_running_at_its_deadline() -> None:
+    # A write on its first attempt is not cancelled at the deadline, so a clear raised on the way
+    # out can still land while the store closes (BACKLOG #2272). Only a retry is stopped.
+    store = _GatedStore(slow="resolve")
+    sink = NotifierAlertSink([], store=store)
+    sink.connection_restored("OB_X")
+    (task,) = sink._state_tasks
+    await _spin()
+    await asyncio.wait_for(sink.drain_state(0), timeout=5.0)
+    await _spin()
+    assert not task.done()
+    store.gate.set()
+    await _drain(sink)
+    assert store.log == ["resolve OB_X"]
+
+
+@pytest.mark.usefixtures("no_backoff")
+async def test_no_retry_starts_once_drain_state_has_run(caplog: pytest.LogCaptureFixture) -> None:
+    # The store is about to close, so a resolve that fails after the drain gives up at once.
+    store = _FlakyResolveStore(fail=10 * _ATTEMPTS)
+    sink = NotifierAlertSink([], store=store)
+    await sink.drain_state(0)
+    with caplog.at_level(logging.WARNING, logger=_SINK_LOG):
+        sink.connection_restored("OB_X")
+        await _drain(sink)
+    assert store.resolve_calls == 1
+    (error,) = _errors(caplog)
+    assert "gave up after 1 attempt" in error
 
 
 def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:
@@ -758,8 +956,8 @@ def _store_coroutine_leaks(caught: list[warnings.WarningMessage]) -> list[str]:
 
 
 def test_emit_with_no_running_loop_leaks_no_coroutine() -> None:
-    # An emit off any event loop drops the state write. Neither the store coroutine nor the
-    # wrapper around it may be left to warn "never awaited".
+    # An emit off any event loop drops the state write. The wrapper must not be left to warn
+    # "never awaited", and no store coroutine may be built (BACKLOG #3756).
     store = _GatedStore(slow="none")
     sink = NotifierAlertSink([], store=store)
 

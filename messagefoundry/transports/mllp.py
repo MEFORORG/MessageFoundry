@@ -46,6 +46,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
@@ -66,6 +67,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
     relax_verify_expiry,
     resolve_trust_anchor,
+    skips_validity_period,
     warn_hostname_check_off,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
@@ -601,6 +603,7 @@ def _mllp_ssl_context(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     name: str = "",
     listener_family: str = "MLLP listener",
+    on_client_ca: Callable[[str], None] | None = None,
 ) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
@@ -629,7 +632,13 @@ def _mllp_ssl_context(
     refusal does. Not every refusal names it yet: at least a certificate or key load failure here,
     the DICOM listener's labels and the DICOM destination's pin refusal do not.
     ``listener_family`` names the listener in those labels: the inbound HTTP listener builds its
-    context here too, and passes its own."""
+    context here too, and passes its own.
+
+    ``on_client_ca`` (inbound mTLS only) is called once with the exact ``cadata`` text the context
+    loaded as its client trust store. The inbound HTTP listener passes it to index which loaded CA
+    issued each client certificate (vault BACKLOG #2287). Handing over the loaded bytes, rather than
+    the path, is the point: a second read of ``tls_ca_file`` could see a swapped file. ``None``, the
+    default and every MLLP caller, changes nothing."""
     refuse_an_unread_ca_pin(
         s,
         inbound=server,
@@ -662,6 +671,8 @@ def _mllp_ssl_context(
             cadata = inbound_ca_cadata(name, s, enforcing=posture is None or posture.enforcing)
             ctx.load_verify_locations(cadata=cadata)
             ctx.verify_mode = ssl.CERT_REQUIRED
+            if on_client_ca is not None:
+                on_client_ca(cadata)
             # Opt-in revocation (#1005). AFTER the CA load, because the CRL goes into the same
             # trust store. Only meaningful under mTLS -- with no client cert required there is
             # nothing to revoke. Covers the inbound HTTP listener too: it calls this builder
@@ -904,6 +915,11 @@ class MLLPDestination(DestinationConnector):
         # cleartext _hop_guard above — so the two gates never double-refuse one hop. A production-PHI hop
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
+        #
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
+        # is handed to the guard as no context: see skips_validity_period (owner ruling 2026-10-05;
+        # vault BACKLOG #2978, ADR 0173 §13).
+        expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
                 host=self.host,
@@ -912,11 +928,13 @@ class MLLPDestination(DestinationConnector):
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
-                # reached it (via [tls].crl_file through the resolved anchor) sets
-                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting -- so a
-                # sibling hop the same CRL never reached keeps its refusal.
-                context=self._ssl,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket, unless it
+                # skips validity-period checks (above, #2978), when it is deliberately None and
+                # must stay so. A CRL that reached it (via [tls].crl_file through the resolved
+                # anchor) sets VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the
+                # setting -- so a sibling hop the same CRL never reached keeps its refusal.
+                context=None if expiry_relaxed else self._ssl,
+                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None

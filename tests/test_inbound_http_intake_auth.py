@@ -14,19 +14,28 @@ configuration whose failure mode would otherwise be silent or total.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import inspect
 import json
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter, check_http_intake_auth
+from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpRequestError, HttpSource
+from tests.test_api_tls import _NOW, _CaPair, _dn, _new_ca, _pem
 
 KEY = "acme-intake-key"
+#: The issuing CA's DN that keys ``intake_client_subjects`` (vault BACKLOG #2287).
+PARTNER_CA = "CN=Partner CA"
 NEXT_KEY = "acme-intake-key-rotated"
 
 
@@ -47,7 +56,7 @@ def test_valid_configurations_build() -> None:
         tls_key_file="/tmp/server.key",
         tls_ca_file="/tmp/ca.pem",
         intake_auth="mtls_subject",
-        intake_client_subjects=["CN:partner.example", "SAN:DNS:partner.example"],
+        intake_client_subjects={PARTNER_CA: ["CN:partner.example", "SAN:DNS:partner.example"]},
     )
 
 
@@ -62,14 +71,18 @@ def test_intake_auth_offline_validation_refuses() -> None:
     # mtls_subject without tls / without a CA: the SSLContext never REQUESTS a client certificate, so
     # getpeercert() is empty and deny-by-default 403s everything, with no start-time error.
     with pytest.raises(WiringError, match="needs tls=True and tls_ca_file"):
-        Http(port=8443, intake_auth="mtls_subject", intake_client_subjects=["CN:p.example"])
+        Http(
+            port=8443,
+            intake_auth="mtls_subject",
+            intake_client_subjects={PARTNER_CA: ["CN:p.example"]},
+        )
     with pytest.raises(WiringError, match="needs tls=True and tls_ca_file"):
         Http(
             port=8443,
             tls=True,
             tls_cert_file="/tmp/server.pem",
             intake_auth="mtls_subject",
-            intake_client_subjects=["CN:p.example"],
+            intake_client_subjects={PARTNER_CA: ["CN:p.example"]},
         )
 
     # A CA with no subject list is "any certificate this CA ever signed" — no subject binding at all.
@@ -90,7 +103,7 @@ def test_intake_auth_offline_validation_refuses() -> None:
             tls_cert_file="/tmp/server.pem",
             tls_ca_file="/tmp/ca.pem",
             intake_auth="mtls_subject",
-            intake_client_subjects=["partner.example"],
+            intake_client_subjects={PARTNER_CA: ["partner.example"]},
         )
 
     with pytest.raises(WiringError, match="must be one of"):
@@ -125,7 +138,7 @@ def test_credential_configured_without_a_mode_is_refused() -> None:
     with pytest.raises(WiringError, match="intake_auth='none'"):
         Http(port=8080, intake_api_key=env("acme_intake_key"))
     with pytest.raises(WiringError, match="intake_auth='none'"):
-        Http(port=8080, intake_client_subjects=["CN:partner.example"])
+        Http(port=8080, intake_client_subjects={PARTNER_CA: ["CN:partner.example"]})
 
 
 def test_settings_are_carried_onto_the_spec() -> None:
@@ -577,30 +590,60 @@ async def test_intake_auth_none_is_byte_identical() -> None:
 
 
 class _FakeWriter:
-    """Stands in for an accepted TLS socket, so the subject binding is testable without a handshake."""
+    """Stands in for an accepted TLS socket, so the subject binding is testable without a handshake.
 
-    def __init__(self, peercert: object) -> None:
+    ``leaf_der`` is what ``getpeercert(binary_form=True)`` returns: the listener finds the issuer
+    from it (vault BACKLOG #2287). The real-handshake cases are in
+    ``tests/test_inbound_http_intake_issuer.py``."""
+
+    def __init__(self, peercert: object, leaf_der: bytes | None = None) -> None:
         self._peercert = peercert
+        self._leaf_der = leaf_der
 
     def get_extra_info(self, name: str) -> Any:
         if name != "ssl_object":
             return None
-        cert = self._peercert
+        cert, der = self._peercert, self._leaf_der
 
         class _Ssl:
-            def getpeercert(self) -> object:
-                return cert
+            def getpeercert(self, binary_form: bool = False) -> object:
+                return der if binary_form else cert
 
         return _Ssl()
 
 
-def _writer(peercert: object) -> asyncio.StreamWriter:
+def _writer(peercert: object, leaf_der: bytes | None = None) -> asyncio.StreamWriter:
     # get_extra_info is the one StreamWriter call _authorize_peer_cert makes, and the fake answers it.
-    return _FakeWriter(peercert)  # type: ignore[return-value]
+    return _FakeWriter(peercert, leaf_der)  # type: ignore[return-value]
 
 
 def _peercert(common_name: str) -> dict[str, object]:
     return {"subject": ((("commonName", common_name),),)}
+
+
+def _leaf_der(ca: _CaPair) -> bytes:
+    """The DER of a leaf ``ca`` signed."""
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, "any")))
+        .issuer_name(ca[0].subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .sign(ca[1], hashes.SHA256())
+    )
+    return leaf.public_bytes(serialization.Encoding.DER)
+
+
+def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes, bytes]:
+    """A real index over a CA named :data:`PARTNER_CA`, the DER of a leaf that CA signed, and the
+    DER of a leaf an unloaded CA carrying the SAME name signed."""
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
+    unloaded = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
+    index = IssuerIndex(_pem(ca[0]).decode("ascii"))
+    return index, _leaf_der(ca), _leaf_der(unloaded)
 
 
 def test_valid_chain_unlisted_subject_is_403() -> None:
@@ -619,17 +662,19 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
                 "host": "127.0.0.1",
                 "port": 0,
                 "intake_auth": "mtls_subject",
-                "intake_client_subjects": ["CN:partner.example"],
+                "intake_client_subjects": {PARTNER_CA: ["CN:partner.example"]},
             },
         )
     )
+    # Without tls the listener loads no client CA, so it holds no index; give it a real one.
+    src._issuer_index, der, foreign = _partner_ca_index_and_leaf()
 
     # A chain the CA signed, carrying an allow-listed subject: accepted.
-    assert src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1") is None
+    assert src._authorize_peer_cert(_writer(_peercert("partner.example"), der), "10.0.0.1") is None
 
     # The same CA, a subject nobody listed: 403, NOT 401. A bare tls+tls_ca_file would have accepted
     # this — it means "any certificate this CA ever signed".
-    denied = src._authorize_peer_cert(_writer(_peercert("attacker.example")), "10.0.0.1")
+    denied = src._authorize_peer_cert(_writer(_peercert("attacker.example"), der), "10.0.0.1")
     assert isinstance(denied, HttpRequestError)
     assert denied.status == 403
     assert denied.kind == "auth_subject_denied"
@@ -640,9 +685,18 @@ def test_valid_chain_unlisted_subject_is_403() -> None:
     assert missing.status == 401
     assert missing.kind == "intake_auth_failed"
 
+    # A listed subject whose leaf no loaded CA signed names no issuer, so it is refused too.
+    unsigned = src._authorize_peer_cert(_writer(_peercert("partner.example"), foreign), "10.0.0.1")
+    assert isinstance(unsigned, HttpRequestError)
+    assert unsigned.status == 403
+    # ... and so is one presenting no leaf bytes at all.
+    no_der = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
+    assert isinstance(no_der, HttpRequestError)
+    assert no_der.status == 403
+
     # A spoofed commonName cannot collide with a pinned SAN — the namespaces are disjoint.
-    src._intake_subjects = {"SAN:DNS:partner.example": "SAN:DNS:partner.example"}
-    spoofed = src._authorize_peer_cert(_writer(_peercert("partner.example")), "10.0.0.1")
+    src._intake_subjects = {PARTNER_CA: {"SAN:DNS:partner.example": "SAN:DNS:partner.example"}}
+    spoofed = src._authorize_peer_cert(_writer(_peercert("partner.example"), der), "10.0.0.1")
     assert isinstance(spoofed, HttpRequestError)
     assert spoofed.status == 403
 
@@ -727,7 +781,7 @@ def test_a_bare_ca_does_not_satisfy_the_gate() -> None:
             tls_cert_file="/tmp/s.pem",
             tls_ca_file="/tmp/ca.pem",
             intake_auth="mtls_subject",
-            intake_client_subjects=["CN:partner.example"],
+            intake_client_subjects={PARTNER_CA: ["CN:partner.example"]},
         ),
         "IB_HTTP",
         posture=PROD_PHI,

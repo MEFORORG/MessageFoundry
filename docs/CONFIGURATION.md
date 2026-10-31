@@ -609,7 +609,7 @@ from messagefoundry import handler, Send, SetState, state_get
 
 @handler("anonymize")
 def anonymize(msg):
-    mrn = msg["PID-3.1"]
+    mrn = (msg["PID-3.1"] or "").rstrip(" ")       # a state key may not end in a space
     anon = state_get("patient_anon", mrn)          # synchronous read; None on a miss
     ops = []
     if anon is None:
@@ -624,6 +624,15 @@ def anonymize(msg):
   `SetState(namespace, key, value)` (the `value` must be JSON-serializable — validated at construction)
   is an **upsert by `(namespace, key)`** the engine applies **inside the routed→outbound handoff
   transaction**. `Send`-only Handlers are unchanged — fully **backward compatible**.
+- **Keys are exact, and may not end in a space.** `namespace` and `key` must be non-empty strings
+  that do not end in a space (U+0020); `SetState(...)` raises at construction otherwise, on every
+  store backend, and the error names the field, never its value. SQL Server ignores trailing spaces
+  when it compares keys, so `k` and `k ` would otherwise be one stored row there and two everywhere
+  else. A field read from a fixed-width sender can carry such padding: strip it before keying on it,
+  for example `(msg["PID-3.1"] or "").rstrip(" ")`. Case and accents are compared exactly on
+  SQLite, on Postgres, and on a SQL Server database whose `state` table this release or a later one
+  created. A SQL Server `state` table created earlier keeps the database's default collation, which
+  may fold case (BACKLOG #1588).
 - **Exactly-once / re-run safety.** Because the write commits in the **same transaction** as the
   outbound rows, a crash before commit leaves **no** state (atomic with the handoff) and the attempt
   that commits applies the write **exactly once per message** — this preserves the staged pipeline's
@@ -2760,14 +2769,20 @@ only the **leader** polls a poll source. Under active-passive HA the whole graph
 belt-and-suspenders, and the queue's `FOR UPDATE SKIP LOCKED` + row leases serve intra-node concurrency
 and failover recovery rather than concurrent multi-node draining). The brief overlap during a leadership
 transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
-at-least-once guarantees that cover a crash mid-poll — the file-rename / row-claim atomicity and the
-downstream queue's idempotent handoff make a re-read a tolerated duplicate, never data loss. The
+at-least-once guarantees that cover a crash mid-poll — the file rename, the database source's
+mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
+duplicate, never data loss. For a `database` source at least two shapes break that: a
+`poll_statement` that writes, which the read-only test on it does not always catch, and a
+high-water-mark `mark_statement`, whose mark on a later row advances the cursor past a row whose
+handler failed; see the [Database source](CONNECTIONS.md#database-source--databasepoll) section. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
 For a
-`database` source the row-claim atomicity is the operator's `poll_statement`/`mark_statement` (claim
-with a status flag or `UPDATE ... RETURNING`); the engine owns the atomic rename only for file sources.
+`database` source the row claim is the operator's `mark_statement`, run per row after the handler
+returns, so a row read twice in the transition window is a duplicate. `poll_statement` must not
+write; [`CONNECTIONS.md`](CONNECTIONS.md#database-source--databasepoll) says why and what is refused
+(BACKLOG #2178). The engine owns the atomic rename only for file sources.
 
 If the leader stops cleanly it expires its lease so a follower acquires leadership at once; if it
 crashes or is partitioned, the lease ages out and a follower acquires after at most
