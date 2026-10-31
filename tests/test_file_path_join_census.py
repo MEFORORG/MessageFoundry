@@ -680,9 +680,16 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        3,
+        4,
         INTERNAL,
-        "Names from walking a staging directory this module made, never through a link.",
+        "Names from walking a staging directory this module made, never through a link; each "
+        "file is then opened without following one (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
+        1,
+        REVIEWED,
+        "Display path for a directory listed by descriptor; every open goes by name relative to "
+        "the parent's descriptor with O_NOFOLLOW, never through this path (BACKLOG #2420).",
     ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
@@ -711,7 +718,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
     ),
-    "messagefoundry/pipeline/dr_backup.py::_sweep_abandoned_staging": Site(
+    "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(
         3,
         INTERNAL,
         "Fixed lock and marker names inside directories listed by this module's own prefix, after "
