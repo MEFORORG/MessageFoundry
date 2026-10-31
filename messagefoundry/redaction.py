@@ -2841,7 +2841,8 @@ def _builtin_exc_renders(namespace: dict[str, Any]) -> frozenset[int]:
 #: code that prints at most the exception's own slots and ``.args``, some of them through their
 #: ``repr()``, and never its chain. An object held in a slot or ``.args`` can print its own
 #: attributes that way, and the walk reads those slots and ``.args`` plainly. Ids, so testing a caller's method against them runs
-#: none of the caller's code; each one lives as long as the interpreter, so its id is never reused.
+#: none of the caller's code. A true builtin's method lives as long as the interpreter, so its id
+#: is never reused; one of a class another module put there might not (docs/PHI.md lists it open).
 #: Only C slot wrappers and method descriptors count: a module that put a class of its own into
 #: ``builtins`` before this one was imported would otherwise vouch for its Python method.
 _BUILTIN_EXC_RENDERS = _builtin_exc_renders(vars(builtins))
@@ -3237,14 +3238,14 @@ class _ScanShare:
     the one place the added pass's budgets and costs are written down; :class:`_Scan`,
     :func:`_added_pass` and :func:`safe_traceback` point here.
 
-    BUDGETS. Each link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's
-    scan does, and can end up to two units past it (a dict read at an odd limit). A scan with no share runs its added pass on what its
-    first pass left. In a traceback, a link's added pass runs on the smaller of that and what is
-    left of ``added``, one more budget the added passes of every link share, so a long chain whose
-    scans each run out is not read once per link. A link's added pass, too, can end up to two
-    units past what it was given (a dict read at an odd limit), and ``added`` is charged only what
-    was given, so the added reads of a traceback can exceed ``added`` by up to two units per link.
-    The first passes never draw on ``added``. One
+    BUDGETS. A link is each exception :func:`safe_traceback` scans, group members included. Each
+    link's first pass has a whole :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan
+    with no share runs its added pass on what its first pass left. In a traceback, a link's added
+    pass runs on the smaller of that and what is left of ``added``, one more budget the added
+    passes of every link share, so a long chain whose scans each run out is not read once per link.
+    The first passes never draw on ``added``. Any pass, first or added, with or without a share,
+    can end up to two units past what it was given (a dict read at an odd limit). ``added`` is
+    charged what a link's added pass spent, at most what it was given. One
     link's added reads of a single large object, such as an exception group in its chain, can spend
     all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
     error only they would reach prints raw. That link prints as it did before this change, except at
@@ -3403,7 +3404,7 @@ class _Scan:
                     nodes[id(child)] = (child, [], "")
                     seeds.append(id(child))
             charged.extend(reversed(follow))  # popped in the order read: .args before attributes
-        # The first pass ends above; it can end two units past the limit, which leaves none here.
+        # The first pass ends above; a negative remainder gives the added pass nothing (_ScanShare).
         room = max(budget, 0) if share is None else min(max(budget, 0), share.added)
         budget, opened, widest = _added_pass(nodes, seeds, read, order, room)
         if share is not None:

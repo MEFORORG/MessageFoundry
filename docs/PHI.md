@@ -1700,17 +1700,13 @@ read as any dataclass's are, so it prints as the fixed note; and except where th
 beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
-fixed note even where its own `__str__` would not print it. The line between builtin and own code
-is drawn at the `builtins` namespace as it stands when `redaction.py` is imported: the walk trusts
-the C `__str__` and `__repr__` that any exception class found there then defines itself, including
-a class a C extension or a site hook placed there, as never printing the chain (a Python method
-found there is not trusted). So an exception whose method is a trusted one, raised from a codec
-error, keeps its message,
-except where the same exception is also reached beneath one whose own code renders it, as above:
-in that argument it prints as the fixed note too. A `__str__` or `__repr__` that a class not found
-there at that time defines, the standard library included, counts as own code even when it is C code,
-so an exception such as `ssl.SSLError`, whose class defines its own `__str__`, raised from a codec
-error or while one was being handled, gets the fixed note.
+fixed note even where its own `__str__` would not print it. An exception raised from a codec
+error, or while one was being handled, keeps its message only when both its `__str__` and its
+`__repr__` are, by identity, C methods that an exception class in the `builtins` namespace defined
+when `redaction.py` was imported (`_BUILTIN_EXC_RENDERS`); anything else counts as own code. So
+`ssl.SSLError`, whose `__str__` is its own, gets the fixed note, and a class that borrows a trusted
+method object is trusted. Where the same exception is also reached beneath one whose own code
+renders it, as above, it prints as the fixed note in that argument even when it is trusted.
 The rule applies
 in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
@@ -1747,10 +1743,9 @@ it would if it did not hide that dict. A class that puts another class's getset 
 through that getset: where the exception is not an instance of that class the read raises, and
 the walk fails closed on that exception. It does not read everything such code can
 reach: an object the walk does not read by attribute, as listed below, is not read there either.
-It runs on the budget the first pass left, and in
-a traceback within about one more budget that the added passes of every link share: like the first
-pass, a link's added pass can end up to 2 units past what it was given, and the shared budget is
-not charged for those units, so a traceback's added reads can exceed it by up to 2 units per link.
+It runs on what the first pass left and, in a
+traceback, also within a budget that the added passes of every link share, approximately, see the
+`_ScanShare` docstring for the exact accounting.
 **It only adds: it
 can turn a "holds no error" verdict into "holds an error", never the other way.** What each read
 costs, and when one link's scan hands its verdict on to a later link, is in the `_ScanShare`
@@ -1760,7 +1755,11 @@ an exception group in its chain, can spend the shared budget. A slot whose name 
 for something else is not read. A link whose verdict an earlier link's scan handed on is not
 scanned again: a True can make it print the note where its own scan would not, which errs toward
 the note, and a False is handed on only when that scan judged that none of its reads was cut
-short.
+short. An exception class that a C extension or a site hook put into `builtins` before
+`redaction.py` was imported has its C `__str__` and `__repr__` trusted, so if either prints the
+chain, a codec error in that chain would print raw. Trust is keyed on each method's identity, so if
+a class whose method was trusted is freed and another method object later gets that method's id,
+that method would be trusted too.
 When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
