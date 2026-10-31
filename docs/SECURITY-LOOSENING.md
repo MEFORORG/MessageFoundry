@@ -839,8 +839,9 @@ count is above `0` (vault BACKLOG #2613).
   no reason to zero or raise `security_peer_refusals`, since that detector covers what the SIEM
   cannot see. Raising it is acceptable for a listener that ordinary load holds at a connection
   cap, which the `security_peer_refusals` row of [CONFIGURATION.md](CONFIGURATION.md) describes.
-  It is one setting for every inbound listener, so a larger value also delays the alert for
-  allowlist refusals on every listener. Each listener counts its own refusals; the `[alerts]`
+  It is one setting for every inbound listener, so on every listener a larger value delays the
+  refusal alert, and suppresses it outright for any burst below the raised threshold. Each
+  listener counts its own refusals; the `[alerts]`
   table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 
