@@ -124,8 +124,9 @@ def declared_encoding(declared: object) -> str:
     Config load refuses an inbound ``env()`` reference, every non-``str`` value but ``None`` and any
     name naming no text codec (``Registry.encoding_problems``, BACKLOG #2431), so at run time this
     sees a ``str`` or ``None``. The ``str()`` stays as a
-    backstop: a value that got past load anyway fails as a ``LookupError`` the decode refuses and
-    :func:`frame_reply` falls back from, never as a ``TypeError`` out of ``encode`` or ``decode``."""
+    backstop: a value that got past load anyway is never a ``TypeError`` out of ``encode`` or
+    ``decode``. Its ``str()`` either names a codec (``1252`` reads as ``cp1252``) or fails as a
+    ``LookupError`` the decode refuses and :func:`frame_reply` falls back from."""
     return str(declared) if declared else "utf-8"
 
 

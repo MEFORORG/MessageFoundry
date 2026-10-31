@@ -11349,8 +11349,12 @@ class UserCodeCalledSysExit(_RedactedFault):
     the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
     or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
     is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
-    re-raises it out of the event loop and every connection stops. ``KeyboardInterrupt`` and
-    ``CancelledError`` keep propagating: those are signals to the engine, not faults in a message.
+    re-raises it out of the event loop and every connection stops. Only ``SystemExit`` is converted.
+    The catch is no wider, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router or Handler
+    code raises itself still escapes, as it did before this class existed. In a worker thread a
+    ``KeyboardInterrupt`` is no signal to the engine, since Python delivers Ctrl+C to the main
+    thread, so one Router or Handler code raises would still be re-raised out of the event loop and
+    stop every connection. Converting it too is not done here.
 
     Redacted by construction: the text names an integer exit code and nothing else, since
     ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
