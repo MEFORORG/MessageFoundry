@@ -586,7 +586,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    seals gets its record inside that seal's one transaction. So a crash leaves a surface all sealed
    or all unsealed, record included, and the next open finishes the job. Setting the switch `true`
    restores the old behaviour and is a declared loosening. Unmarked values then read back as
-   plaintext, and the open seals every one, recorded surface or not.
+   plaintext, and the open seals every one, recorded surface or not. A blank value is not sealed,
+   with one exception: an open that finds `queue.payload` unsealed also seals a `pending` or
+   `inflight` inline row whose payload is `''`, other than a `response` re-ingress token, because a
+   keyless store writes an empty body that way and a keyed claim refuses a blank (vault BACKLOG
+   #3495). That row stays owed work and is delivered as an empty body. On a surface that is already
+   sealed, a blank live row stays refused at the claim, and the switch does not change that.
    **At least these limits remain.** The DIRECT S/MIME enveloped body is not covered. A row planted
    before the open that first records its surface, on a surface with no ciphertext, looks exactly
    like legacy plaintext. So that open seals it. A surface that already holds ciphertext refuses it
@@ -903,8 +908,10 @@ per tier which of those its code provides, and an operator carries the rest
   + `require_phi_read` (the second since vault BACKLOG #1187), audited `outbound.read` — not by
   `GET /messages/{id}/raw`.
 - **Retention / destruction.** `messages.raw` is blanked in place by `purge_message_bodies`;
-  `queue.payload` is blanked for done/cancelled outbound rows in the same transaction, and for dead rows
-  at **every** stage by `purge_dead_letters`; `response.body` is set to `NULL` in place by the same pass;
+  `queue.payload` is blanked for done/cancelled outbound rows in the same transaction, for a dead
+  `response` work-row, whose payload is a reference to the reply this pass erases (vault BACKLOG
+  #1560), and for dead rows at **every** stage by `purge_dead_letters`; `response.body` is set to
+  `NULL` in place by the same pass;
   `shared_body.body` is refcount-decremented and GC'd at 0 when its **last** referrer is purged;
   streaming attachments are decref'd + GC'd at 0 (plus a startup `sweep_orphan_attachments`).
   The legacy SQL Server `outbox.payload` no longer exists to be purged — its rows were folded into
@@ -2111,7 +2118,8 @@ is enforced by the engine on all three backends.**
 More than the historical "raw/summary/error". Eligibility is `received_at < ` the per-connection-or-global
 cutoff **and** no `queue` row still `pending`/`inflight`, so at-least-once is preserved — a dead row
 stays replayable (re-queueing its *own* stored payload) until `purge_dead_letters` takes it, which is why
-the two windows are independent. In **one transaction** the pass:
+the two windows are independent. A dead `response` work-row is the exception, because its payload is a
+reference to the reply this pass erases, not a body of its own. In **one transaction** the pass:
 
 - sets `messages.raw` to `''` and `messages.summary`, `messages.error` and `messages.metadata` to
   `NULL` — all four in **one** statement, so operator-attached metadata can never outlive the body it
@@ -2119,6 +2127,8 @@ the two windows are independent. In **one transaction** the pass:
   **pre-upgrade** engine — blank `raw`, metadata intact — is swept on the first pass after upgrade and
   **counted**, so that historical sweep lands in the `retention_purge` audit row like any other;
 - blanks `queue.payload` and `queue.last_error` for **done/cancelled** outbound rows;
+- blanks `queue.payload` for a **dead** `response` work-row (vault BACKLOG #1560), and leaves its
+  `last_error` for `purge_dead_letters`;
 - sets `message_events.detail` to `NULL`;
 - sets `response.body`, `response.detail` and `response.resp_headers` to `NULL`;
 - releases `shared_body.body` refs (SQLite — decref, GC at 0) and decrefs the message's streaming

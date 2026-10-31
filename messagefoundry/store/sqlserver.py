@@ -152,6 +152,7 @@ from messagefoundry.store.privilege import (
     sqlserver_excess,
 )
 from messagefoundry.store.queue_tag import (
+    LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -197,6 +198,7 @@ from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -3999,6 +4001,7 @@ class SqlServerStore:
             aad_cols=QUEUE_TAG_COLUMNS,
             key_cols=("id",),
             aad_of=queue_row_aad,
+            blank_where=f"DATALENGTH([payload]) = 0 AND {LIVE_INLINE_ROW}",
         )
         # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
         # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
@@ -4069,6 +4072,7 @@ class SqlServerStore:
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[dict[str, Any]], bytes] | None = None,
+        blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -4078,8 +4082,10 @@ class SqlServerStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code constant and is
-        bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is a parameter.
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
+        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        Every identifier is a code constant and is bracket-quoted (``key`` is a T-SQL reserved word);
+        only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
         transaction opens, because a reservation must commit independently of the seal it covers.
@@ -4096,26 +4102,34 @@ class SqlServerStore:
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(count_sql, like)
+        blanks = 0
+        if blank_where is not None and not keyed:
+            blanks = await self._count_unmarked(
+                f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
+            )
         is_sealed = keyed
-        if pending and strict and not keyed:
+        if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant.
+                # so count again rather than report its legitimate seal as a plant. A blank here
+                # stays refused.
+                blanks = 0
                 pending = await self._count_unmarked(count_sql, like)
-        if not pending or (strict and is_sealed):
+        if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._mark_surface_keyed(table, column)
             return 0
-        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending + blanks)
         select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"[{c}]=?" for c in keys)
         sealed = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                if not await self._claim_keyed_surface(conn, cur, table, column) and strict:
+                claimed = await self._claim_keyed_surface(conn, cur, table, column)
+                if not claimed and strict:
                     # A peer keyed this surface after the reads above, so it sealed the legacy
                     # rows. Count what it left unmarked, then end the transaction: the MERGE
                     # changed nothing.
@@ -4141,12 +4155,16 @@ class SqlServerStore:
                     if left:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
+                # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
+                seal_where = (
+                    f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                )
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
                     # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
                     await cur.execute(
                         f"SELECT TOP ({int(batch)}) {select_cols}, [{column}] AS v FROM {table}"
-                        f" WHERE {pending_where}",
+                        f" WHERE {seal_where}",
                         (like,),
                     )
                     names = [c[0] for c in cur.description]
@@ -4194,9 +4212,9 @@ class SqlServerStore:
         )
         return row is not None
 
-    async def _count_unmarked(self, count_sql: str, like: str) -> int:
-        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``like``."""
-        row = await self._fetchone(count_sql, (like,))
+    async def _count_unmarked(self, count_sql: str, *params: str) -> int:
+        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``params``."""
+        row = await self._fetchone(count_sql, params)
         return int(row["n"]) if row is not None else 0
 
     async def _mark_surface_keyed(self, table: str, column: str) -> None:
@@ -7865,8 +7883,9 @@ class SqlServerStore:
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
-        ``False`` if the work-row was already consumed. A corrupt/unparseable ref or a re-ingress that
-        would exceed ``correlation_depth_cap`` is dead-lettered (and the token still consumed). The
+        ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
+        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed."""
@@ -7903,8 +7922,8 @@ class SqlServerStore:
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures`` for the caller to audit."""
-        # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
-        # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
+        # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
         output, guard, guard_params = self._resolve_guard()
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -7922,14 +7941,18 @@ class SqlServerStore:
                 work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
                 origin_id = work_row["message_id"]
 
-                async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                async def _consume_dead(
+                    label: str, error: str, event_detail: str, *, erased: bool = False
+                ) -> bool:
                     # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
-                    # and CONSUME it (status flipped), never re-loop.
+                    # and CONSUME it (status flipped), never re-loop. `erased` blanks the token too,
+                    # so `_REPLAYABLE_BODY` refuses it from then on.
+                    blank = ", payload=''" if erased else ""
                     await self._exec_terminal(
                         cur,
                         label,
                         (response_row_id,),
-                        "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                        f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
                         + output
                         + " WHERE id=?"
                         + guard,
@@ -7970,13 +7993,30 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
+                # A missing row is a corrupt reference. A NULL body means retention erased the reply
+                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
+                # materialized once, so a replay can commit between that read and the erasure. It
+                # must never become a child message. A missing row is damage, not an erasure, so
+                # that token is not blanked: its sealed reference is the evidence.
+                if art is None:
+                    return await _consume_dead(
+                        "ingress_handoff(missing-artifact)",
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
+                if art[0] is None:
+                    return await _consume_dead(
+                        "ingress_handoff(erased)",
+                        REINGRESS_ARTIFACT_ERASED,
+                        "re-ingress reply erased",
+                        erased=True,
+                    )
                 body = (
                     self._cipher.decrypt(
                         art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
                     )
-                    if (art and art[0])
-                    else ""
-                ) or ""
+                    or ""
+                )
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -8178,16 +8218,15 @@ class SqlServerStore:
         ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
+            seq = int(seq_s)
         except ValueError:
-            return None
+            return None  # `ingress_handoff` dead-letters it as a corrupt reference
         art = await self._fetchone(
             "SELECT body FROM response WHERE message_id=? AND destination_name=? AND response_seq=?",
-            (mid, dest, int(seq_s)),
+            (mid, dest, seq),
         )
         return (
-            self._cipher.decrypt(
-                art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s))
-            )
+            self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"])
             else ""
         )
@@ -8909,8 +8948,11 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank message bodies (and terminal outbound payloads + event details) for messages received
-        before ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Bodies are
+        """Blank message bodies (and done/cancelled outbound payloads with their ``last_error``, a dead
+        ``Stage.RESPONSE`` work-row's reference to the reply erased here (BACKLOG #1560, the SQLite
+        twin says why), event details and captured replies) for messages received before
+        ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Other ``dead`` rows
+        are left to :meth:`purge_dead_letters`. Bodies are
         blanked to '' (not deleted) so the cipher re-encrypt scans skip them and the FK to messages
         stays intact. The eligible set is materialized ONCE so all three tables purge exactly the same
         messages. ``metadata`` is NULLed in the SAME statement as the body (ASVS 14.2.7) — NULL is
@@ -8946,9 +8988,18 @@ class SqlServerStore:
                 purged = cur.rowcount
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    " WHERE stage=? AND status IN (?, ?) AND payload <> ''"
+                    " WHERE stage=? AND status IN (?, ?)"
+                    " AND (payload <> '' OR last_error IS NOT NULL)"
                     " AND message_id IN (SELECT id FROM #eligible)",
                     (Stage.OUTBOUND.value, OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value),
+                )
+                # A dead RESPONSE work-row's reference goes with the artifact erased below, so
+                # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
+                await cur.execute(
+                    "UPDATE queue SET payload=''"
+                    " WHERE stage=? AND status=? AND payload <> ''"
+                    " AND message_id IN (SELECT id FROM #eligible)",
+                    (Stage.RESPONSE.value, OutboxStatus.DEAD.value),
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
                 # message holds — but ONLY once the message has NO queue row that could still be
@@ -9217,7 +9268,8 @@ class SqlServerStore:
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
-        dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
+        dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
+        idempotent, because a row left with neither no longer matches.
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9238,7 +9290,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
+                    f" AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
