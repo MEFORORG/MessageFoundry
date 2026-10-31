@@ -1727,7 +1727,7 @@ differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_d
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
-The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+The DSN is built as `DRIVER={<odbc_driver>};SERVER=<server>;[DATABASE=<database>;][<user>=<username>;<pwd>=<password>;]<odbc_params…>`, where only the driver name is braced, and a password only when [*Values*](#values-on-the-generic-dialect) says so. `server` is emitted as the near-universal `SERVER` keyword.
 
 ##### The port an `allowed_db` entry binds
 
@@ -1889,12 +1889,15 @@ and another may not.
 
 **The password.** A password holding none of `;`, `{` or `}`, with no leading or trailing space,
 is sent plain to any driver. Any other password needs braces and the ODBC `}}` escape, and is
-accepted only when `odbc_driver` is the whole registered name of a driver measured to read that
-escape, in any case and spacing:
+accepted only when `odbc_driver` is, in any case but spelled with single spaces, the whole
+registered name of one of these drivers:
 
-- psqlODBC: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`;
-- MySQL Connector/ODBC: `MySQL ODBC <version> Unicode Driver` or `... ANSI Driver`;
-- Microsoft's SQL Server drivers: `SQL Server` or `ODBC Driver <n> for SQL Server`.
+- psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
+  `(x64)`;
+- MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
+  `... ANSI Driver`;
+- Microsoft's SQL Server drivers, not probed for this item but relied on for the same escape by
+  the SQL Server preset and the store: `SQL Server` or `ODBC Driver <n> for SQL Server`.
 
 For any other name, a library path or another vendor's driver for the same database included,
 such a password is refused when the connection is built, so change the password. The engine reads

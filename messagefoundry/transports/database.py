@@ -543,11 +543,12 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# The ``odbc_driver`` names, folded by ``odbc_keyword_name``, of the drivers measured to read the
-# ODBC ``}}`` escape in a braced password (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's
-# registered names, and Microsoft's SQL Server drivers, whose escape the SQL Server preset and the
-# store rely on. Whole names on purpose: a vendor driver whose name merely mentions a database, or
-# a library path, is unmeasured and does not match.
+# The ``odbc_driver`` names, in lower case, of the drivers trusted to read the ODBC ``}}`` escape
+# in a braced password (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered names,
+# measured on 2026-10-30, and Microsoft's SQL Server drivers, not probed then but relied on for the
+# same escape by the SQL Server preset and the store. Whole names, spacing included, on purpose: a
+# vendor driver whose name merely mentions a database, a library path, or another registered name
+# that only folds to one of these is unmeasured and does not match.
 _ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
     r"postgresql (?:unicode|ansi)(?:\(x64\))?"
     r"|mysql odbc [0-9.]+ (?:unicode|ansi) driver"
@@ -570,7 +571,7 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
     if not any(ch in ";{}" for ch in text) and text == text.strip():
         return text
-    if not _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(odbc_keyword_name(driver)):
+    if not _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE password holds ';', '{{', '}}' or a leading or "
             "trailing space, which needs the ODBC '}}' escape, and odbc_driver does not name a "

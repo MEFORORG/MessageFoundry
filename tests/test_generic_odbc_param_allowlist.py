@@ -308,13 +308,15 @@ _ESCAPE_DRIVERS = [
     "MySQL ODBC 9.1 Unicode Driver",
     "PostgreSQL Unicode(x64)",
     "SQL Server",
-    "ODBC  Driver 18 for SQL Server",
+    "ODBC Driver 18 for SQL Server",
 ]
 _OTHER_DRIVERS = [
     "Microsoft Access Driver (*.mdb, *.accdb)",
     "SQLite3 ODBC Driver",
     "Oracle in OraClient19Home1",
     "MariaDB ODBC 3.2 Driver",
+    # Another registered name that only folds to a measured one.
+    "PostgreSQL  Unicode",
     # A vendor driver for a measured database, and a library path, are unmeasured.
     "Devart ODBC Driver for PostgreSQL",
     "CData ODBC Driver for MySQL",
