@@ -940,6 +940,7 @@ def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
             cert_monitor=settings.cert_monitor,
             backup=settings.backup,
             secrets=settings.secrets,
+            ai=settings.ai,
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

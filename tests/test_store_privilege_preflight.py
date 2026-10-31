@@ -47,6 +47,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -988,6 +989,7 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=store_privilege,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1057,6 +1059,7 @@ def test_the_opt_out_is_named_as_a_loosening() -> None:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1092,6 +1095,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 cert_monitor=CertMonitorSettings(),
                 backup=BackupSettings(),
                 secrets=SecretsSettings(),
+                ai=AiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
