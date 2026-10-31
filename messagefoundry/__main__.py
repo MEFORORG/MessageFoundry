@@ -8623,7 +8623,7 @@ def _build_provision_auth_service(
     from messagefoundry.auth.webauthn import configured_rp_id
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
-    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.config.tls_policy import InsecureHopRefused, is_vault_hop_refusal
     from messagefoundry.transports.signing import SigningError
 
     refusal: str | None = None
@@ -8646,14 +8646,19 @@ def _build_provision_auth_service(
         )
     except SecretProviderError as exc:
         # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
-        # Its text is fixed and names no part of the address, so it is shown, as the
-        # InsecureHopRefused arm below would show it.
+        # Its text is fixed and names no part of the address, so it is shown. Only for exactly
+        # the Vault hop's marked refusal (BACKLOG #3471): any other hop refusal as the cause is
+        # named by its type, as `vault_failure_text` keeps no other refusal's text.
         cause = exc.__cause__
-        refusal = (
-            _sentence(cause)
-            if isinstance(cause, InsecureHopRefused)
-            else _PROVISION_AUTH_REFUSALS["reference"]
-        )
+        if is_vault_hop_refusal(cause):
+            refusal = _sentence(cause)
+        elif isinstance(cause, InsecureHopRefused):
+            refusal = (
+                f"the [secrets] Vault hop was refused ({type(cause).__name__}); its text is not "
+                "shown, because it is not the Vault hop's own fixed refusal"
+            )
+        else:
+            refusal = _PROVISION_AUTH_REFUSALS["reference"]
     except LdapError:
         refusal = _PROVISION_AUTH_REFUSALS["ldap"]
     except FileNotFoundError:
@@ -10403,9 +10408,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # refusal when the open below meets it: it comes from the settings or the key provider, and
         # only the key is resolved here, so nothing a store holds can reach this arm.
         #
-        # Printed through `codec_safe_str`, not as `{exc}`. One ValueError here is a
-        # UnicodeDecodeError from a DPAPI key file that unprotects to bytes that are not ASCII, and
-        # its own text quotes a byte of the key. Every other text is printed whole.
+        # Printed through `codec_safe_str`, not as `{exc}`. A DPAPI key file that unprotects to
+        # bytes that are not ASCII raised a UnicodeDecodeError here, whose own text quotes a byte
+        # of the key; it is a DpapiError with fixed text since BACKLOG #3471, and this stays the
+        # backstop for any other key source's codec error. Every other text is printed whole.
         from messagefoundry.redaction import codec_safe_str
 
         print(
@@ -10705,6 +10711,8 @@ def _backup(args: argparse.Namespace) -> int:
         result = run_guarded(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
+    except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
+        return _emit_key_unresolved(exc, as_json=args.json)
     except (StoreNotFoundError, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1780, #1916: could not start, so exit 2 like #1670 below
         _emit_error(str(exc), as_json=args.json)
@@ -10776,11 +10784,18 @@ def _restore_verify(args: argparse.Namespace) -> int:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
-    # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
-    # reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    result = run_guarded(
-        run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
-    )
+    # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
+    # with a reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
+    # Its later cipher build is outside that handler; the key arm below says what reaches it.
+    try:
+        result = run_guarded(
+            run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
+        )
+    except _key_unresolved() as exc:
+        # The keyring is resolved before the archive is read, so this is "could not start", not a
+        # FAIL (BACKLOG #3471). A --full verify builds the cipher again for its open, outside that
+        # check's own handler, so a key error there lands here too, after the archive was read.
+        return _emit_key_unresolved(exc, as_json=args.json)
     payload = {
         "status": result.status,
         "integrity_ok": result.integrity_ok,
@@ -10887,12 +10902,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     try:
         cipher = build_store_cipher(store, posture=posture)
     except _key_unresolved() as exc:
-        # Through `codec_safe_str`, as rotate-key prints it: a DPAPI key file that unprotects to
-        # bytes that are not ASCII raises a decode error whose text quotes a byte of the key.
-        from messagefoundry.redaction import codec_safe_str
-
-        _emit_error(f"the store key could not be resolved: {codec_safe_str(exc)}", as_json=as_json)
-        return 2
+        return _emit_key_unresolved(exc, as_json=as_json)
     try:
         conn = connect_readonly(path, busy_timeout=args.busy_timeout)
     except sqlite3.Error as exc:
@@ -11057,6 +11067,8 @@ def _restore(args: argparse.Namespace) -> int:
         )
     except BackupError as exc:
         return _emit_error(f"restore failed ({exc.kind}): {exc}", as_json=args.json)
+    except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
+        return _emit_key_unresolved(exc, as_json=args.json)
 
     payload = {
         "archive": result.archive_path,
@@ -12065,6 +12077,21 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
     from messagefoundry.store.keyprovider import KeyProviderError
 
     return (KeyProviderError, DpapiError, DpapiUnavailable, StoreCipherConfigError)
+
+
+def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
+    """Report one of :func:`_key_unresolved`'s errors and return 2, could not start: for
+    ``cipher-audit``, ``backup``, ``restore-verify`` and ``restore`` (BACKLOG #3471; the last
+    three reached the dispatch floor and exited 1, which ``restore-verify`` gives a FAIL).
+
+    Through ``codec_safe_str``, as rotate-key prints it, so a codec error from a key source names
+    no byte of what it decoded."""
+    from messagefoundry.redaction import codec_safe_str
+
+    _emit_error(
+        f"the store key or cipher could not be resolved: {codec_safe_str(exc)}", as_json=as_json
+    )
+    return 2
 
 
 class _StoreKeyUnresolved(RuntimeError):

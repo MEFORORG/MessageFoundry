@@ -48,6 +48,7 @@ import ipaddress
 import logging
 import os
 import ssl
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -91,6 +92,8 @@ __all__ = [
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
+    "is_vault_hop_refusal",
+    "vault_hop_refusal_text",
     "RevocationHopGuard",
     "TrustAnchor",
     "TrustAnchorMode",
@@ -2069,6 +2072,32 @@ class InsecureHopRefused(ValueError):
     A ``ValueError`` subclass so it flows through the existing connector-construction error handling
     (the loader / ``build_check`` surfaces a ``ValueError`` as a ``WiringError``/422 at ``messagefoundry
     check`` / dry-run / reload) with no new except-arms needed."""
+
+
+#: The module that defines the Vault hop's marked refusal; see :func:`is_vault_hop_refusal`.
+_VAULT_HOP_MODULE = "messagefoundry.transports.strict_requests"
+
+
+def is_vault_hop_refusal(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is exactly ``transports.strict_requests.VaultHopRefused``, the Vault hop's
+    refusal built from fixed text, and so the one hop refusal whose text a Vault handler may keep
+    (BACKLOG #3471). Any other ``InsecureHopRefused``, a subclass of the marked type included,
+    answers ``False``, as ``strict_requests.vault_failure_text`` reads it.
+
+    For a caller that cannot import that module: it needs the ``[vault]`` extra. A marked refusal
+    exists only once the module is loaded, so it is read from ``sys.modules``, never imported."""
+    module = sys.modules.get(_VAULT_HOP_MODULE)
+    return module is not None and type(exc) is getattr(module, "VaultHopRefused", None)
+
+
+def vault_hop_refusal_text(exc: InsecureHopRefused, connector: str) -> str:
+    """What a Vault client build says when its strict reader's mount refuses the hop (BACKLOG
+    #3471): the refusal's own fixed text when :func:`is_vault_hop_refusal`, else ``connector`` and
+    the type's name only. The build's handler catches the base type, so a refusal built elsewhere
+    keeps no text there, as ``strict_requests.vault_failure_text`` keeps none."""
+    if is_vault_hop_refusal(exc):
+        return str(exc)
+    return f"{connector}: the hop was refused ({type(exc).__name__})"
 
 
 @dataclass(frozen=True, slots=True)
