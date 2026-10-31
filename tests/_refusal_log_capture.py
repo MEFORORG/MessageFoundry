@@ -31,8 +31,7 @@ def record_texts(record: logging.LogRecord) -> Iterable[str]:
 
 
 def assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    """Fail if any record carries :data:`TOKEN`. Nothing is skipped: the one message that used to be,
-    the ``connection_error`` alert, logs no transport text since BACKLOG #3210."""
+    """Fail if any record carries :data:`TOKEN`; no record is skipped."""
     leaks = [
         f"{r.name}:{r.levelname}:{r.getMessage()}"
         for r in records

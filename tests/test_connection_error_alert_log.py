@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #3210: the default alert sink's ``connection_error`` line withholds the transport's error
-text. What it logs instead, and why, is stated in ``LoggingAlertSink.connection_error``.
-
-The runner test writes the ``connection_lost`` event through the real store and reads its reason
-back. The planted token stands in for payload content that no redaction pattern matches.
+"""BACKLOG #3210: ``LoggingAlertSink.connection_error`` logs a stand-in, not the detail. The planted
+token stands in for payload content that no redaction pattern matches.
 """
 
 from __future__ import annotations
@@ -47,30 +44,36 @@ def test_the_sink_logs_the_class_and_not_the_detail(caplog: pytest.LogCaptureFix
 
 
 @pytest.mark.parametrize(
-    "detail",
-    [f"{TOKEN} refused", f"not a class: {TOKEN}", f"Ünïcode{TOKEN}: x", "", None],
-    ids=["no-colon", "spaced-head", "non-ascii-head", "empty", "none"],
+    ("detail", "stand_in"),
+    [
+        (f"{TOKEN} refused", "unnamed error"),
+        (f"not a class: {TOKEN}", "unnamed error"),
+        (f"Ünïcode{TOKEN}: x", "unnamed error"),
+        ("", "unnamed error"),
+        (None, "unnamed error"),
+        ("DeliveryError", "DeliveryError"),
+        ("SYN900002", "SYN900002"),
+    ],
+    ids=["spaced", "spaced-head", "non-ascii-head", "empty", "none", "bare-class", "bare-token"],
 )
-def test_a_head_that_is_no_class_name_is_not_logged(
-    caplog: pytest.LogCaptureFixture, detail: str | None
+def test_the_stand_in_for_each_detail_shape(
+    caplog: pytest.LogCaptureFixture, detail: str | None, stand_in: str
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
     LoggingAlertSink().connection_error(OUT, kind="connection_lost", detail=detail)
     (line,) = _warnings(caplog)
-    assert "(unnamed error)" in line.getMessage()
+    assert f"({stand_in})" in line.getMessage()
     assert_no_token(caplog.records)
 
 
 @pytest.mark.parametrize(
-    "transport_text",
-    [_TRANSPORT_TEXT, f"{_TRANSPORT_TEXT}{' x' * 200}"],
+    ("transport_text", "stored_whole"),
+    [(_TRANSPORT_TEXT, True), (f"{_TRANSPORT_TEXT}{' x' * 200}", False)],
     ids=["short", "long"],
 )
 async def test_the_stored_event_reason_is_the_detail_bounded_again_and_no_log_has_it(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, transport_text: str
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, transport_text: str, stored_whole: bool
 ) -> None:
-    # The real emit site with the real default sink, and the event written through the real store.
-    # Engine loggers at DEBUG, so every record they write is scanned, with no message skipped.
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
@@ -94,11 +97,9 @@ async def test_the_stored_event_reason_is_the_detail_bounded_again_and_no_log_ha
     finally:
         await store.close()
     detail = safe_exc(exc)
-    # The store keeps the detail the sink withheld, bounded again by its own safe_text chokepoint:
-    # whole when short, cut further when long.
     assert event.kind == "connection_lost" and event.reason == safe_text(detail, limit=200)
     assert TOKEN in event.reason
-    assert (event.reason == detail) is (transport_text == _TRANSPORT_TEXT)
+    assert (event.reason == detail) is stored_whole
     (line,) = [r for r in _warnings(caplog) if "ALERT connection_error" in r.getMessage()]
     assert "(DeliveryError)" in line.getMessage()
     assert_no_token(caplog.records)

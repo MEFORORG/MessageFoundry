@@ -326,9 +326,8 @@ class AlertSink(Protocol):
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
-        event kind (``connection_lost``); ``detail`` is a ``safe_exc``-scrubbed reason. What
-        :meth:`LoggingAlertSink.connection_error` logs of it, and why, is stated there
-        (BACKLOG #3210). A partner *rejection*
+        event kind (``connection_lost``); ``detail`` can echo transport text, so an implementation
+        must not assume it is free of message content. A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
 
@@ -989,22 +988,7 @@ class LoggingAlertSink:
         )
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
-        """Log the connection, the kind and a stand-in for ``detail``, not ``detail`` itself. This
-        is the one statement of the rule; other text points here (BACKLOG #3210).
-
-        Why: ``detail`` is a ``safe_exc`` rendering, and that keeps the transport's own text, which
-        can echo payload content, such as a partner's reply or an OS error naming a file built from
-        message fields.
-
-        The stand-in is ``detail`` up to its first colon, or the whole of it where there is none,
-        when that is a plain ASCII identifier, and ``unnamed error`` otherwise. ``safe_exc`` puts the
-        exception class first, so for its output the stand-in is the class. The rule trusts its
-        caller for that: an identifier-shaped head of any other text is logged as it stands.
-
-        Where the withheld text is kept, when connection events are recorded: the runner queues it
-        as the ``connection_lost`` event's reason, and a full queue drops the event. The store bounds
-        that reason again, through ``safe_text`` at 200 characters, so a long one is stored cut
-        short. The read routes mask it until an audited reveal."""
+        """Log a stand-in in place of ``detail`` (BACKLOG #3210): ``error_class``, below."""
         head = (detail or "").partition(":")[0]
         error_class = head if head.isascii() and head.isidentifier() else "unnamed error"
         log.warning(
