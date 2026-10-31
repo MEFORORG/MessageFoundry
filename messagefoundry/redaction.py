@@ -3287,6 +3287,9 @@ class _Scan:
                 charged = later[::-1]
                 if share is not None:
                     budget = min(budget, share.budget)
+                # The first phase can end one unit past the limit; counted from below zero, the
+                # share would be paid back the overshoot rather than charged nothing.
+                budget = max(budget, 0)
                 start = budget
             while charged and budget > 0:
                 arg, deep, met_first = charged.pop()
@@ -3323,7 +3326,12 @@ class _Scan:
                     # slots and chain links the second phase would read are read first, in place
                     # of the values past the limit: a large __dict__ cannot hide a __cause__ the
                     # object's own __str__ prints (vault BACKLOG #3340, item 3).
-                    storage = target[0].__get__(arg)
+                    # The read below, under the try, marks this object unreadable if it fails, as
+                    # on origin/main; this one must not end the whole scan first.
+                    try:
+                        storage = target[0].__get__(arg)
+                    except Exception:  # noqa: BLE001 -- a log call must never raise
+                        storage = None
                     deeper = beneath if deep else shallow
                     if deeper is not None and type(storage) is dict and len(storage) >= budget - 1:
                         target = (*target, *_added_readers(target, deeper)[1:])

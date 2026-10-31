@@ -2232,6 +2232,38 @@ def test_a_deep_re_read_reads_the_chain_links_a_large_dict_would_crowd_out() -> 
         assert spelling not in out
 
 
+class _NoDictOwner:
+    pass
+
+
+class _ForeignDictError(Exception):
+    """Its ``__dict__`` reader is another class's, so reading it raises ``TypeError``."""
+
+    __dict__ = _NoDictOwner.__dict__["__dict__"]
+
+    def __str__(self) -> str:
+        return "h"
+
+
+def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -> None:
+    # Review of vault BACKLOG #3340: the large-__dict__ check read the reader outside the try,
+    # so its TypeError ended the scan and the whole argument was withheld, not one element.
+    record = _record("got %s", ([_ForeignDictError(), _encode_error()],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "position 3" in out  # the codec error's safe text: its sibling did not take it down
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_a_first_phase_overshoot_does_not_grow_the_shared_budget() -> None:
+    # Review of vault BACKLOG #3340: a first phase ending at -1 paid the share back one unit.
+    share = redaction._ScanShare()
+    share.budget = 2
+    redaction.prints_a_codec_error(RuntimeError(list(range(10000))), share=share)
+    assert share.budget <= 2
+
+
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
