@@ -87,8 +87,10 @@ from types import (
     FunctionType,
     GetSetDescriptorType,
     MemberDescriptorType,
+    MethodDescriptorType,
     SimpleNamespace,
     TracebackType,
+    WrapperDescriptorType,
 )
 from typing import Any
 
@@ -2605,9 +2607,9 @@ def safe_traceback(ei: ExcInfo) -> str:
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
     a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
     exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
-    ``UnicodeError`` keeps the plain-text notes it holds itself (:func:`_kept_note`). One whose message was built as text,
-    ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the third path, closed
-    where the wrap is written."""
+    ``UnicodeError`` keeps only the codec's own note (:func:`_kept_notes`). One whose message was
+    built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
+    third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -2629,11 +2631,11 @@ def safe_traceback(ei: ExcInfo) -> str:
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None
             notes = getattr(node, "__notes__", None)
             if notes is not None:  # printed after the line, each by its own str() or repr()
-                # A Unicode error's own keep each note that is exact text, as add_note writes it,
-                # which the stdlib printed (vault BACKLOG #3340, item 7). Any other note may be
-                # an error itself, and a holder's go whole, as its message did.
+                # A Unicode error's own keep only the codec's note (vault BACKLOG #3340, item 7).
+                # A caller's note can be built from the failing input, as add_note(f"{seg!r}"), so
+                # it goes with every other note, and a holder's go whole, as its message did.
                 keep = isinstance(exc, UnicodeError) and _own_notes(exc) is notes
-                node.__notes__ = [_kept_note(n) for n in notes if type(n) is str] if keep else None
+                node.__notes__ = _kept_notes(notes) if keep else None
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2670,14 +2672,18 @@ _CODEC_NOTE = re.compile(
 _KNOWN_CODEC_REPRS = frozenset(repr(name) for name in _KNOWN_CODECS)
 
 
-def _kept_note(note: str) -> str:
-    """A Unicode error's text note as its traceback prints it. The stdlib's codec note names the
-    codec only when :func:`_names_a_codec` would, since the name is text the caller chose (vault
-    BACKLOG #3340); any other note is the caller's own text and is kept as written."""
-    match = _CODEC_NOTE.fullmatch(note)
-    if match is None or match["name"] in _KNOWN_CODEC_REPRS:
-        return note
-    return f"{match['op']} with a codec failed"
+def _kept_notes(notes: list[Any]) -> list[str]:
+    """What a Unicode error's traceback prints of its own notes: the stdlib's codec note alone,
+    naming the codec only when :func:`_names_a_codec` would, since the name is text the caller
+    chose. Every other note is dropped, plain text included, since a caller can build one from the
+    failing input (vault BACKLOG #3340, item 7)."""
+    kept: list[str] = []
+    for note in notes:
+        match = _CODEC_NOTE.fullmatch(note) if type(note) is str else None
+        if match is not None:
+            known = match["name"] in _KNOWN_CODEC_REPRS
+            kept.append(note if known else f"{match['op']} with a codec failed")
+    return kept
 
 
 def _codec_line(exc: BaseException) -> str | None:
@@ -2811,6 +2817,8 @@ _CHAIN_LINKS: tuple[Any, ...] = (
 #: code that prints at most the exception's own slots and ``.args``: never its chain, and never
 #: an attribute of another object it holds. Ids, so testing a caller's method against them runs
 #: none of the caller's code; each one lives as long as the interpreter, so its id is never reused.
+#: Only C slot wrappers and method descriptors count: a module that put a class of its own into
+#: ``builtins`` before this one was imported would otherwise vouch for its Python method.
 _BUILTIN_EXC_RENDERS = frozenset(
     id(method)
     for kind in vars(builtins).values()
@@ -2818,6 +2826,7 @@ _BUILTIN_EXC_RENDERS = frozenset(
     for name in ("__str__", "__repr__")
     if name in vars(kind)  # no walrus: at module level it would leave a stray global behind
     for method in (vars(kind)[name],)
+    if type(method) is WrapperDescriptorType or type(method) is MethodDescriptorType
 )
 
 
@@ -2921,21 +2930,38 @@ def _resolve_readers(
     return tuple(found)
 
 
+def _added_readers(shallow: tuple[Any, ...], beneath: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The readers in ``beneath`` that ``shallow`` lacks, in :func:`_readers`' shape: the instance
+    ``__dict__``'s descriptor, or None when ``shallow`` reads it already, then the rest. Compared
+    by identity, so no descriptor's own code runs."""
+    own_dict = None if shallow[0] is not None else beneath[0]
+    rest = tuple(r for r in beneath[1:] if not any(r is s for s in shallow[1:]))
+    return (own_dict, *rest)
+
+
 def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
     """What the attributes of ``arg`` hold: every value in its instance ``__dict__``, and each
     slot, ``limit`` of them at most. Both are read through the builtin descriptors
     (:func:`_readers`), so none of the object's code runs.
 
     It reads every instance attribute, not the fields a generated ``repr`` lists, so a dataclass
-    field declared ``repr=False`` counts. That errs toward the fixed note and prints nothing."""
+    field declared ``repr=False`` counts. That errs toward the fixed note and prints nothing.
+
+    A slot or chain link that holds None is left out, so it is not charged: an exception with no
+    cause or context costs what it did before its chain links were read (vault BACKLOG #3340). The
+    slots are the class's, a number its code fixes, so skipping them keeps the work bounded."""
     values: list[Any] = []
     if readers[0] is not None:
         values.extend(islice(dict.values(readers[0].__get__(arg)), limit))
-    for slot in readers[1 : 1 + max(limit - len(values), 0)]:
+    for slot in readers[1:]:
+        if len(values) >= limit:
+            break
         try:
-            values.append(slot.__get__(arg))
+            value = slot.__get__(arg)
         except AttributeError:  # a slot never assigned
             continue
+        if value is not None:
+            values.append(value)
     return values
 
 
@@ -3119,8 +3145,12 @@ class _Scan:
     Beneath an exception whose own code renders it (:func:`_reader_record`), the second walk
     reads every exception the deep way, its chain, instance ``__dict__`` and slots included, since
     that code may print any of them (vault BACKLOG #3340). The first walk carries that depth, so an
-    object it meets is charged once, at the depth it ends with. An object met both ways is read the deep way, so
-    a plain exception shared with such a holder can print as a note where it is met plainly too.
+    object it meets both plainly and beneath such an exception is read once, the deep way. An
+    object the second walk reads plainly and then reaches more deeply through an attribute is read
+    a second time, for what the deep way adds alone, and charged again: one unit, its elements, and
+    each value that read adds. So an object is read, and charged, at most twice. An object met both
+    ways is read the deep way, so a plain exception shared with such a holder can print as a note
+    where it is met plainly too.
 
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
     So an error past the budget prints raw, as it did before any object was read by attribute. A
@@ -3139,8 +3169,8 @@ class _Scan:
         first: list[Any] = []
         # id -> whether the first walk met it beneath an exception whose own code renders it
         # (:func:`_reader_record`). One met plainly and then that way is met again, so what it
-        # holds is too, and each object is charged once, at the depth it ends with: charging it
-        # once per depth spent the budget twice on the same elements (vault BACKLOG #3340).
+        # holds is too, and the second walk starts it at the depth it ends with: starting it once
+        # per depth spent the budget twice on the same elements (vault BACKLOG #3340).
         met: dict[int, bool] = {}
         # The ids whose elements were already followed the deep way, so the second walk does not
         # follow them again.
@@ -3209,6 +3239,15 @@ class _Scan:
                 continue  # the first walk could not read it, and it already counts as an error
             shallow, beneath, opens = _reader_record(kind)
             slots = beneath if deep else shallow
+            if (
+                before is not None
+                and shallow is not None
+                and slots is not None
+                and slots is not shallow
+            ):
+                # Read once through shallow: read only what the deep way adds, so a large
+                # __dict__ read again cannot use up the limit before the chain links after it.
+                slots = _added_readers(shallow, slots)
             if known is None and slots is None and not issubclass(kind, _ARG_WALKED):
                 budget -= 1  # an object that is not read at all: nothing beneath it to follow
                 continue

@@ -1701,13 +1701,22 @@ in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
 `codec_safe_str()` returns the note alone, with no class.
 
+In a traceback the stdlib prints an exception's `__notes__` after its line. A holder's notes are
+all dropped. A `UnicodeError`'s own notes are dropped too, except the note a codec adds itself,
+such as `decoding with 'utf-8' codec failed`, which keeps the codec's name only where
+`safe_exc()` would print it and otherwise reads `decoding with a codec failed`. A note a caller
+added is dropped even when it is plain text, since it can be built from the failing input, as
+`add_note(f"segment {seg!r}")` (vault BACKLOG #3340).
+
 **The attribute walk has a work limit, and past it an error prints raw.** Reading an object by
 attribute, each value read from it, and each element of a list or dict found that way all count
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
-An object the unlimited first pass reaches is charged once, at the depth it ends with: one met
-plainly and also beneath an exception whose own code renders it is read that deeper way alone.
-One first reached through an attribute and then again more deeply is charged a second time, for
-its elements and for any attribute the second read adds. When it runs out the filter leaves the rest as it is, and which objects those are is not defined.
+A slot or chain link that holds None is not counted. An object the unlimited first pass reaches
+both plainly and beneath an exception whose own code renders it is read once, the deeper way.
+One read plainly and then reached more deeply through an attribute is read and charged a second
+time: one unit, its elements, and each value the deeper read adds. So an object is charged at
+most twice. When it runs out the filter leaves the rest as it is, and which objects those are is
+not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
 by attribute even when it is the single mapping argument, so a large map in it can use up the

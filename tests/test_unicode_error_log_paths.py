@@ -1734,17 +1734,22 @@ def test_a_holder_traceback_drops_its_notes_and_a_syntax_errors_line_number() ->
     assert safe_traceback(ei) == logging.Formatter().formatException(ei)  # a clean one keeps them
 
 
-def test_a_bare_unicode_errors_text_notes_survive_its_traceback() -> None:
-    # Vault BACKLOG #3340 item 7: the note-drop meant for a holder took a bare error's notes too,
-    # which the stdlib renderer printed. A note that is not text can print anything, so it goes.
-    error = _decode_error()
+def test_a_bare_unicode_error_keeps_only_the_codecs_own_note() -> None:
+    # Vault BACKLOG #3340 item 7 is not restored: a caller's text note can be built from the
+    # failing input, so only the stdlib's codec note survives, as origin/main dropped the rest.
+    try:
+        codecs.decode(b"ok" + _BYTE, "utf-8")
+    except UnicodeDecodeError as exc:
+        error = exc
+    error.add_note(f"segment caf{_CHAR!r}")
     error.add_note("while reading feed.csv")
     error.__notes__.append(_encode_error())  # type: ignore[arg-type]
     out = safe_traceback((type(error), error, None))
     _assert_decode_safe(out)
     for spelling in _CHAR_SPELLINGS:
         assert spelling not in out
-    assert out.endswith("invalid start byte\nwhile reading feed.csv")
+    assert "feed.csv" not in out
+    assert out.endswith("invalid start byte\ndecoding with 'utf-8' codec failed"), out
 
 
 class _NotesRaise(UnicodeDecodeError):
@@ -2076,6 +2081,67 @@ def test_an_object_beneath_an_exceptions_own_code_is_charged_once(element: Any) 
     RedactionFilter().filter(record)
     out = record.getMessage()
     assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _OwnStrError(Exception):
+    """A ``__str__`` of its own and nothing else: no slot, no attribute, no chain."""
+
+    def __str__(self) -> str:
+        return "own"
+
+
+def test_an_exception_with_no_chain_costs_what_it_did_before_the_chain_was_read() -> None:
+    # Review of vault BACKLOG #3340: each read charged both chain links even when both were None,
+    # so 1,500 such exceptions cost three units each where origin/main charged one, and an error a
+    # sibling held by attribute printed raw.
+    crowd = [_OwnStrError() for _ in range(1500)]
+    record = _record("got %r", ([crowd, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_plain_exceptions_beneath_an_exceptions_own_code_cost_one_unit_each() -> None:
+    # Review of vault BACKLOG #3340: beneath _Batch each RuntimeError is read the deep way, and its
+    # two empty chain links were charged, so 1,400 of them spent the budget.
+    batch = _Batch("bad", [RuntimeError(i) for i in range(1400)])
+    record = _record("got %r", ([batch, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _PrintsInnerCause(Exception):
+    """Its own ``__str__`` prints the cause of the exception it keeps on ``.inner``."""
+
+    inner: BaseException
+
+    def __str__(self) -> str:
+        return f"wrapped: {self.inner.__cause__}"
+
+    __repr__ = __str__  # a list prints its elements' repr()
+
+
+def test_a_deep_re_read_reads_the_chain_links_a_large_dict_would_crowd_out() -> None:
+    # Review of vault BACKLOG #3340: the deep re-read read the whole __dict__ again up to the
+    # budget, dropped what the plain read had found, and never reached the chain links after it.
+    shared = OSError("cannot open")
+    for i in range(3000):
+        setattr(shared, f"a{i}", i)
+    shared.__cause__ = _encode_error()
+    holder = _PrintsInnerCause("bad")
+    holder.inner = shared
+    assert "\\xe9" in repr([shared, holder])  # control: its own code prints the character
+    record = _record("got %s", ([shared, holder],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_PrintsInnerCause holding a codec error, not rendered]" in out
     for spelling in _CHAR_SPELLINGS:
         assert spelling not in out
 
