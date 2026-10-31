@@ -295,6 +295,25 @@ def test_an_accepted_proxy_user_build_writes_the_cleartext_acceptance_audit(
         assert part not in audit[0], part
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({"proxy_auth_type": "ntlm"}, id="deferred-type"),
+        pytest.param({"proxy_auth_type": "kerberos"}, id="unknown-type"),
+        pytest.param({"headers": {"Proxy-Authorization": "Basic eA=="}}, id="static-header"),
+    ],
+)
+def test_a_refused_accepted_proxy_user_build_writes_no_acceptance_audit(
+    caplog: pytest.LogCaptureFixture, extra: dict[str, object]
+) -> None:
+    """The acceptance record says a crossing was accepted, so a build refused for the proxy
+    credential's type or for a static header beside it must not leave one (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"), pytest.raises(ValueError):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN, **extra)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+
+
 def test_enforcement_warn_with_no_declaration_refuses_a_proxy_credential() -> None:
     """``_shipped_strict_disposition`` floors the dial's WARN back to REFUSE. The control is the same
     connection, with the acceptance, on the same dial."""

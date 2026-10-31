@@ -2240,6 +2240,33 @@ def proxy_auth_handler_from_settings(
     # The owner's rulings leave this leg one declaration, the cleartext acceptance with a reason, so
     # attested is False here for every connection (vault BACKLOG #3007). ADR 0153's 2026-10-27
     # amendment records the split from the destination's credentials.
+    # The type is settled before the guard runs, because an accepted crossing writes its audit
+    # record there: a build refused for its type must leave no record of a crossing (vault BACKLOG
+    # #3007).
+    kind = str(auth_type or "basic").strip().lower()
+    result: tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]
+    if kind == "basic":
+        raw = f"{user}:{password}".encode()
+        header = ("Proxy-Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
+        result = (header,), None
+    elif kind == "digest":
+        if dest_scheme == "https":
+            raise ValueError(
+                "proxy_auth_type='digest' is not supported for an https destination — the proxy's 407 "
+                "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
+                "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
+            )
+        result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
+    elif kind in ("ntlm", "windows"):
+        raise ValueError(
+            f"proxy_auth_type={kind!r} is deferred (NTLM/Negotiate is connection-bound; urllib opens a "
+            "new connection per request) — use 'basic'/'digest' or a local authenticating proxy such as "
+            "cntlm (ADR 0126)"
+        )
+    else:
+        raise ValueError(
+            f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
+        )
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"
@@ -2259,28 +2286,7 @@ def proxy_auth_handler_from_settings(
         cleartext_reason=cleartext_reason,
         connection=connection,
     )
-    kind = str(auth_type or "basic").strip().lower()
-    if kind == "basic":
-        raw = f"{user}:{password}".encode()
-        header = ("Proxy-Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
-        return (header,), None
-    if kind == "digest":
-        if dest_scheme == "https":
-            raise ValueError(
-                "proxy_auth_type='digest' is not supported for an https destination — the proxy's 407 "
-                "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
-                "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
-            )
-        return (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
-    if kind in ("ntlm", "windows"):
-        raise ValueError(
-            f"proxy_auth_type={kind!r} is deferred (NTLM/Negotiate is connection-bound; urllib opens a "
-            "new connection per request) — use 'basic'/'digest' or a local authenticating proxy such as "
-            "cntlm (ADR 0126)"
-        )
-    raise ValueError(
-        f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
-    )
+    return result
 
 
 def _refuse_a_static_proxy_header(headers: object) -> None:
@@ -2424,6 +2430,11 @@ def proxy_config_from_settings(
     # judged (vault BACKLOG #2965). It refuses every value on which urlsplit and urllib read another
     # host, so the loopback test in the proxy_user guard below judges the host urllib dials.
     proxy_url = parse_proxy_url(proxy_url).url
+    if s.get("proxy_user") and s.get("proxy_password"):
+        # Before the handler, whose guard writes the acceptance audit record: a build this refuses
+        # leaves no record of a crossing (vault BACKLOG #3007). These are the settings on which the
+        # handler returns a header or a digest recipe, or refuses for the type.
+        _refuse_a_static_proxy_header(s.get("headers"))
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,
@@ -2433,8 +2444,6 @@ def proxy_config_from_settings(
         cleartext_reason=cleartext_reason,
         connection=connection,
     )
-    if auth_header or digest is not None:
-        _refuse_a_static_proxy_header(s.get("headers"))
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
         use_default=False,
