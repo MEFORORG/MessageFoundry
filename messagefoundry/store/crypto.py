@@ -365,8 +365,10 @@ class _UnmarkedPolicy:
     the AEAD tag's protection against modification was lost: substitution has a tag to fail, and a
     downgrade to plaintext has none, so only a refusal can stop it.
 
-    **Blank is not refused.** Every purge path writes a literal ``''``, and the sweep never seals one,
-    so ``''`` is the one unmarked value a keyed store legitimately holds. NULL never reaches here.
+    **Blank is not refused.** Every purge path writes a literal ``''``, and the sweep seals one only
+    in the one case ``MessageStore._encrypt_existing_rows`` names (BACKLOG #3495), so ``''`` is the
+    one unmarked value a keyed store legitimately holds. ``open_queue_cell`` refuses a blank queue
+    cell on its own terms. NULL never reaches here.
 
     ``allow_unmarked`` is the audited opt-out, ``[store].allow_unmarked_ciphertext``. The per-call
     ``allow_unmarked=True`` belongs to the uploaded-file store (``uploads.py``). Its reseal pass, run

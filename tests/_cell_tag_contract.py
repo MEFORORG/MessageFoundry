@@ -25,6 +25,7 @@ from uuid import uuid4
 from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION, PRESET_TAG_FAILED_ACTION
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.store import MessageStatus, OutboxStatus, Stage
+from tests._store_audit import no_operator_audit
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -169,12 +170,18 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- an edit-and-resubmit from a moved origin is refused -----------------------------------
     outcome = await store.reingress(
-        origin_message_id=ctl, raw=_RAW, idempotency_key=f"ct-reingress-ctl-{_RUN}"
+        origin_message_id=ctl,
+        raw=_RAW,
+        idempotency_key=f"ct-reingress-ctl-{_RUN}",
+        audit=no_operator_audit,
     )
     assert outcome.status != "duplicate"  # control: an untouched origin resubmits
     await _refused(
         lambda: store.reingress(
-            origin_message_id=moved, raw=_RAW, idempotency_key=f"ct-reingress-moved-{_RUN}"
+            origin_message_id=moved,
+            raw=_RAW,
+            idempotency_key=f"ct-reingress-moved-{_RUN}",
+            audit=no_operator_audit,
         ),
         "reingress",
     )
