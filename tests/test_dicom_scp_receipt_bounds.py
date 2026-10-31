@@ -357,7 +357,8 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
         baseline = await _thread_baseline()
         sock = await _a_held_association(scp.sockport)
         try:
-            with caplog.at_level(logging.ERROR):
+            # WARNING: pynetdicom's 'Received unexpected ... service message' line is one.
+            with caplog.at_level(logging.WARNING):
                 sock.sendall(sends)
                 answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
                 assert answer == _ABORT_INVALID, answer

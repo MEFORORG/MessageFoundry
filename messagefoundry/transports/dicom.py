@@ -845,8 +845,11 @@ def _admitting_server_class() -> type[Any]:
             accepted this association, so it is not a refused connection, and it must not use up an
             address's refusal line. ``_read_pdu`` hands the DUL an empty header for a short body,
             so either short read is silent in the DUL. It is a deadline per read and not per
-            object: a peer that keeps finishing PDUs is for :class:`_ReceiptTally` and pynetdicom's
-            own timers."""
+            object. **A peer that keeps a message incomplete, finishing a small fragment's PDU
+            inside each deadline, is not bounded by this, by :class:`_ReceiptTally`, or by
+            pynetdicom's timers**: each PDU restarts pynetdicom's idle timer, and the tally ends
+            only on size. Such a peer holds a ``max_associations`` slot for as long as it keeps
+            sending, and enough of them fill it. No per-message deadline is built here."""
             seconds = cast(float, self.ae.network_timeout)
             expired = _RefusedPeer(f"no complete PDU within {seconds:g}s")
             restore = sock.gettimeout()  # None: pynetdicom reads a blocking socket
