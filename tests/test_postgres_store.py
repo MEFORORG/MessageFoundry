@@ -1296,6 +1296,35 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
 
 
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real Postgres backend: ``delete_user`` takes the account's ``users``
+    row before its sessions, as the bind does, so the two cannot deadlock.
+
+    The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
+    request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
+    from typing import Any
+
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _backend_pid(conn: Any) -> object:
+        return conn.get_server_pid()
+
+    async def _is_blocking(pid: object) -> bool:
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
+            )
+        )
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_backend_pid, is_blocking=_is_blocking
+    )
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
