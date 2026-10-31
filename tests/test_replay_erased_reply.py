@@ -237,7 +237,7 @@ _BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
 def test_every_backend_blanks_the_token_before_it_erases_the_reply(module: str) -> None:
     """The behaviour above needs a live server on two backends and a skipped suite reads as green, so
     the order the fix depends on is read off the source on every leg: the token's blank comes before
-    the attachment release, and before the artifact's erasure."""
+    the attachment release, and the artifact's erasure does not come before the blank."""
     source = (_STORE_DIR / module).read_text(encoding="utf-8")
     text = ast.get_source_segment(source, named_func(parse_source(source), "purge_message_bodies"))
     assert text is not None
@@ -246,14 +246,37 @@ def test_every_backend_blanks_the_token_before_it_erases_the_reply(module: str) 
     assert statement is not None
     attachments = text.index("_release_message_attachments")
     erase = text.index("UPDATE response SET body=NULL")
-    assert statement.start() < attachments < erase
+    assert statement.start() < attachments and statement.start() < erase
     binds = text[statement.start() : attachments]
     assert "Stage.RESPONSE.value" in binds and "OutboxStatus.DEAD.value" in binds
 
 
+def test_postgres_blanks_the_token_and_erases_the_reply_from_one_eligible_read() -> None:
+    """Under READ COMMITTED each Postgres statement re-reads the eligible set, so the blank and the
+    erase must be one statement over one CTE, or a commit between them splits the set. SQL Server
+    reads its ``#eligible`` table, materialized once; SQLite holds the writer lock for the whole
+    pass. A behavioural test would need a second connection committing between two statements, which
+    one statement no longer has, so the shape is pinned here instead."""
+    fn = named_func(
+        parse_source((_STORE_DIR / "postgres.py").read_text(encoding="utf-8")),
+        "purge_message_bodies",
+    )
+    texts = [
+        ast.unparse(node.args[0])
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.JoinedStr)
+    ]
+    [statement] = [t for t in texts if "UPDATE response SET body=NULL" in t]
+    assert "WITH elig AS ({eligible})" in statement  # the one read of the eligible set
+    assert statement.count("{eligible}") == 1
+    assert "UPDATE queue SET payload=''" in statement
+    assert statement.count("message_id IN (SELECT id FROM elig)") == 2
+
+
 @pytest.mark.parametrize("module", _BACKENDS)
-def test_every_backend_dead_letters_a_missing_artifact(module: str) -> None:
-    """``ingress_handoff`` on each backend names the erased error and blanks the token with it."""
+def test_every_backend_blanks_only_the_erased_token_and_keeps_a_missing_rows(module: str) -> None:
+    """``ingress_handoff`` on each backend names the erased error and blanks that token with it. A
+    token whose row is missing is dead-lettered without the blank, so its reference stays."""
     tree = parse_source((_STORE_DIR / module).read_text(encoding="utf-8"))
     name = "ingress_handoff" if module == "postgres.py" else "_ingress_handoff_txn"
     fn = named_func(tree, name)

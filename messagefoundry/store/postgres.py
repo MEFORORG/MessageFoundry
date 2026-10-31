@@ -10533,9 +10533,9 @@ class PostgresStore:
         counted — on the first pass after upgrade. Returns the number of messages purged.
 
         In the same transaction it blanks the ``done``/``cancelled`` outbound payloads and their
-        ``last_error``, blanks a dead ``Stage.RESPONSE`` work-row's reference before the reply it
-        names is erased (BACKLOG #1560, the SQLite twin says why), and nulls event details and the
-        captured replies. Other ``dead`` rows are left to :meth:`purge_dead_letters`.
+        ``last_error``, blanks a dead ``Stage.RESPONSE`` work-row's reference in the one statement
+        that erases the captured replies (BACKLOG #1560, the SQLite twin says why), and nulls event
+        details. Other ``dead`` rows are left to :meth:`purge_dead_letters`.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
@@ -10577,16 +10577,23 @@ class PostgresStore:
                     Stage.OUTBOUND.value,
                     [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value],
                 )
-                # A dead RESPONSE work-row's reference goes with the artifact erased below, so
+                # A dead RESPONSE work-row's reference goes with the reply it names, so
                 # `_REPLAYABLE_BODY` refuses the row (BACKLOG #1560; the SQLite twin says why).
-                # Under READ COMMITTED each statement re-reads `eligible`, so a resend committed
-                # between this one and the erase can leave the reply kept and its token blanked.
-                # That refuses a replay the reply would have served; the message is past its
-                # cutoff, so the next pass erases the reply anyway.
+                # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
+                # (row kept, FK to messages(id) never violated — purge keeps the messages row).
+                # ONE statement, so the token blank and the reply erase read `eligible` once, from
+                # one snapshot. As two statements under READ COMMITTED each re-read it, and a
+                # resend or a sibling's completion committed between them could blank a token
+                # whose reply was kept, or keep a replayable token whose reply was erased. A
+                # data-modifying CTE runs to completion although the outer UPDATE never reads it.
                 await conn.execute(
-                    f"UPDATE queue SET payload=''"
+                    f"WITH elig AS ({eligible}),"
+                    f" tokens AS (UPDATE queue SET payload=''"
                     f" WHERE stage=${nxt} AND status=${nxt + 1} AND payload <> ''"
-                    f" AND message_id IN ({eligible})",
+                    f" AND message_id IN (SELECT id FROM elig) RETURNING id)"
+                    f" UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
+                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
+                    f" AND message_id IN (SELECT id FROM elig)",
                     *lead,
                     Stage.RESPONSE.value,
                     OutboxStatus.DEAD.value,
@@ -10605,14 +10612,6 @@ class PostgresStore:
                 await conn.execute(
                     f"UPDATE message_events SET detail=NULL"
                     f" WHERE detail IS NOT NULL AND message_id IN ({eligible})",
-                    *lead,
-                )
-                # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
-                # (row kept, FK to messages(id) never violated — purge keeps the messages row).
-                await conn.execute(
-                    f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
-                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
-                    f" AND message_id IN ({eligible})",
                     *lead,
                 )
         return purged
