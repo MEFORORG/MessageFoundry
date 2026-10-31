@@ -50,6 +50,13 @@ this line.**
   draw it, and the admin-write floor this route's gate charges first is unchanged. Its 429 now
   sends the constant `POST /ui/mfa`, `/ui/reauth` and `/ui/reauth/webauthn` send. Seam change:
   `AuthService.finish_webauthn_registration` gains the `factor_refused` keyword. (BACKLOG #3690)
+- **A step-up return's `non_navigation_fetch` row draws the engine's step-up return audit
+  budget.** `GET /ui/oidc/callback` now writes that row for a live step-up flow only when
+  `AuthService.allow_step_up_return_audit` allows it, which holds such rows to 10 per user a
+  window behind a backstop of 60 across all users that still lets each user write one row a
+  window, and pages when it stops a row. Over it the refusal is the same 303 that keeps the flow, with a
+  WARNING line and no row. A sign-in return is unchanged. Needs the engine seam that carries
+  that method. (BACKLOG #3965)
 - **`/ui/logout` ends the session an elevation in another tab re-keyed up to 5 seconds before,
   and still clears the cookie when the sign-out's audit row fails.** A retired cookie that
   sign-out sends now ends the session it became, with the owner as the row's actor, rather

@@ -34,6 +34,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -79,6 +80,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         cert_monitor=CertMonitorSettings(),
         backup=BackupSettings(),
         secrets=SecretsSettings(),
+        ai=AiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,

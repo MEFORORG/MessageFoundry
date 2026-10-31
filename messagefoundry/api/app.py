@@ -438,6 +438,7 @@ from messagefoundry.pipeline.alerts import (
     administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
+    step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
@@ -2046,6 +2047,9 @@ def _posture_loosenings(
             # Vault BACKLOG #2983: the secret provider's Vault revocation attestation, off the
             # [secrets] section the managed lifespan stashed. The same stash-or-default rule.
             secrets=getattr(state, "secrets_settings", None) or SecretsSettings(),
+            # BACKLOG #2193 slice (e): the AI endpoint's revocation attestation, off the [ai]
+            # section create_app stashed. The same stash-or-default rule.
+            ai=getattr(state, "ai", None) or AiSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -2469,6 +2473,13 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 #: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
 #: times over. The cut keeps the head, so an error longer than this still loses its tail.
 _REFUSAL_LOG_LIMIT: Final = 8192
+
+#: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
+#: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
+#: past ``safe_exc``'s default 200, so the default cut answered a refusal with no way across. Not
+#: :data:`_REFUSAL_LOG_LIMIT`: that one bounds a log line whose text the answer withholds, and this
+#: one bounds what the answer carries. 2048 leaves room for any DNS host name in that text.
+_TEST_SEND_BUILD_REFUSAL_LIMIT: Final = 2048
 
 
 async def _answer_refused_reload(
@@ -4216,6 +4227,9 @@ def create_app(
         if ai_settings is not None
         else None
     )
+    # BACKLOG #2193: the posture the alerts test send's SMTP login guard reads, for an embedding
+    # of create_app alone. The managed lifespan sets it again from the same derivation.
+    app.state.alert_hop_posture = _phi_read_posture
     app.state.phi_read_hop_disposition = phi_read_hop_disposition(
         _phi_read_posture,
         serve_hop_secure=phi_read_hop_secure,
@@ -4535,11 +4549,11 @@ def create_app(
             )
         # Build the broker from the SERVER's settings (never the request body). The SSRF endpoint-allowlist
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
-        # #329: thread the derived instance posture (the same _phi_read_posture derived at create_app time
-        # from ai_settings, which == app.state.ai == `ai` on the managed path) so the broker's cleartext-
-        # http credential refusal is clamped on an enforcing-PHI instance — the escape can no longer put
-        # the api_key on the wire. Without this the route would build the broker with an unclamped escape
-        # (green and inert), the exact failure mode #329 exists to close.
+        # BACKLOG #2193 slice (e): the derived instance posture (the same _phi_read_posture derived at
+        # create_app time from ai_settings, which == app.state.ai == `ai` on the managed path) keys
+        # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
+        # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
+        # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         try:
             broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
@@ -6264,7 +6278,7 @@ def create_app(
         Admin-gated (``service:configure``): it fires a live outbound SMTP dial, so it is service/settings
         administration, not the diagnostic ack/resolve tier. The result carries **no** email addresses —
         only a configured/success flag, the duration, the recipient count, and a ``safe_exc``-scrubbed
-        failure detail. One metadata-only ``alert_test_email`` audit row is written (best-effort; skipped
+        failure detail, which can name the relay host. One metadata-only ``alert_test_email`` audit row is written (best-effort; skipped
         when no engine is bound). Never touches the message pipeline / staged queue."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
@@ -6291,6 +6305,7 @@ def create_app(
         secret_provider = getattr(request.app.state, "secret_provider", None)
         success = False
         detail: str | None = None
+        building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
             smtp_password = resolve_connector_secret(
@@ -6299,7 +6314,12 @@ def create_app(
                 literal=alerts.email_password,
                 label="[alerts].email_password",
             )
-            transport = EmailTransport(
+            tls_settings = getattr(request.app.state, "tls_settings", None)
+            # Built off the event loop (BACKLOG #2193): with a login, the constructor's revocation
+            # guard builds the hop's TLS context, which reads the trust store and any CRL from disk.
+            building = True
+            transport = await asyncio.to_thread(
+                EmailTransport,
                 host=alerts.email_smtp_host,
                 port=alerts.email_smtp_port,
                 sender=alerts.email_from,
@@ -6318,13 +6338,14 @@ def create_app(
                 # about. Same fields, same source, same factory.
                 tls_verify=alerts.email_tls_verify,
                 tls_ca_file=alerts.email_tls_ca_file,
-                trust_anchor_policy=(
-                    tls_settings.policy()
-                    if (tls_settings := getattr(request.app.state, "tls_settings", None))
-                    is not None
-                    else None
-                ),
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+                # BACKLOG #2193: the login's revocation guard too, on the posture a live alert
+                # reads, so this test cannot pass a relay the live sink would refuse.
+                posture=getattr(request.app.state, "alert_hop_posture", None),
+                revocation_attested=alerts.email_tls_revocation_attested,
+                revocation_attested_reason=alerts.email_tls_revocation_attested_reason,
             )
+            building = False
             # A fixed synthetic event — carries only a type/severity/connection label + a static detail
             # string; NO message body, NO PHI. The template-value allowlist maps these safely too.
             await transport.send(
@@ -6338,8 +6359,13 @@ def create_app(
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
             # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller.
-            detail = safe_exc(exc)
+            # host/credential hints) escapes to the caller. A hop refusal from the build is the
+            # exception: the build dials nothing, so it is the engine's own text, the operator's
+            # host and the remedy. A send's refusal can quote what the relay advertised.
+            if building and isinstance(exc, InsecureHopRefused):
+                detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
+            else:
+                detail = safe_exc(exc)
         duration_ms = (time.perf_counter() - start) * 1000.0
         # Best-effort metadata-only audit (no addresses, no bodies) — mirrors connection_test. Skipped in
         # a no-engine (embedded/test) deployment where there is no store to record into.
@@ -11427,8 +11453,9 @@ def create_managed_app(
         # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
         # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
         # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
-        # fails closed (vault BACKLOG #2354), but the two revocation guards are the unstamped
-        # no-op, as for any hop built outside a posture. Reuses
+        # fails closed (vault BACKLOG #2354), and so do the [alerts] SMTP login and webhook
+        # revocation guards, which count no posture as enforcing (ADR 0173 section 12); the LDAPS
+        # bind's and the OIDC legs' guards are the unstamped no-op there. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
@@ -11437,6 +11464,9 @@ def create_managed_app(
             if ai_settings is not None
             else None
         )
+        # BACKLOG #2193: the alerts test send builds an EmailTransport per request, and its SMTP
+        # login takes the revocation guard a live alert takes, so it reads this same posture.
+        app.state.alert_hop_posture = _hop_posture
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
@@ -12008,6 +12038,8 @@ def create_managed_app(
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
                         audit=store,
+                        # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
+                        posture=_hop_posture,
                     )
                 auth = AuthService(
                     store,
@@ -12034,6 +12066,11 @@ def create_managed_app(
                     # administrator_granted here, as a directory sign-in does in its route.
                     admin_grant_alert=administrator_granted_alert(
                         notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                    ),
+                    # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
+                    # audit_write_failed here when it stops a row, at most once a window.
+                    step_up_return_audit_alert=step_up_return_audit_alert(
+                        notifier or LoggingAlertSink()
                     ),
                     # BACKLOG #3937: the relying party a passkey must be under to count as a way
                     # past the sign-in lock at the factor-drop gates; None counts none.

@@ -744,6 +744,26 @@ from typing import Any
 #: 84ae818da5f2f1ed; this branch at 57a4b8457b930c63). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3965: the ``/ui/oidc/callback`` route calls the new
+#: ``AuthService.allow_step_up_return_audit`` before it writes a step-up return's
+#: ``non_navigation_fetch`` row. A newer console on an older engine would raise AttributeError on
+#: that branch, so it forces a bump. Re-derived with ``--write`` (from 9cd9fe02e6e90c18).
+#:
+#: BACKLOG #3965 review repair: ``allow_step_up_return_audit`` now takes the callback's ``client``
+#: and the refusal's ``reason``, so the budget is kept per source with a paging backstop. The
+#: console's call passes both, and an older engine would raise TypeError there, so it forces a
+#: bump. Re-derived with ``--write`` on the merged tree (from 449ea6021c083aa8). Its review then spelled
+#: ``reason``'s closed set out in the signature, so the digest records it; re-derived again (from
+#: 17b6da621787ad8b).
+#:
+#: BACKLOG #3965 merged with main again, after BACKLOG #3690 landed there (digest
+#: 84ae818da5f2f1ed; this branch at dd768841fe24ec45). Neither parent's value covered both, so
+#: the value below was re-derived with ``--write`` on the merged tree.
+#:
+#: BACKLOG #3965 merged with main again, after BACKLOG #3638 and #3639 landed there (digest
+#: 9ad245683e8594e1; this branch at 75c4b3550c195a62). Neither parent's value covered both, so
+#: the value below was re-derived with ``--write`` on the merged tree.
+#:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
@@ -755,7 +775,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "9ad245683e8594e1"
+ENGINE_UI_SEAM: str = "b634db50214474e2"
 
 
 @dataclass(frozen=True, slots=True)
