@@ -6405,9 +6405,8 @@ A listener's refusal of a peer at its source allowlist or a connection cap write
 `connection_event` row only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
 listeners and the DICOM server tell the layer directly, with the inbound's name and never the
 peer's address. Once a listener's burst raises, its refusals are not counted again for the window,
-or for five minutes when the window is longer, so a flood raises one alert per listener in that
-time. A refusal at a connection cap counts too, so a listener held full by ordinary load raises
-it as well.
+or for five minutes when the window is longer. A refusal at a connection cap counts too, so a
+listener held full by ordinary load raises it as well.
 
 **Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
 a detector count of `0` or above its default, or a window shorter than its default while any
@@ -6417,9 +6416,9 @@ With the layer off, every detector stops but the posture one, so that start stil
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
 process and pages nobody. An unpinned cluster node's identity changes on every start, so that
 node raises the inverse for its own alert as it shuts down instead. That alert can stay open after
-shutdown, at least after a hard kill or a resolve that did not land: resolve it by hand with an
-account that is not channel-scoped and holds `monitoring:diagnose`, or in the web console's alert
-list. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
+shutdown, at least after a hard kill or a resolve that did not land: resolve it by hand with
+`POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same
+scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET

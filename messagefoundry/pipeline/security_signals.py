@@ -476,9 +476,9 @@ class SecuritySignalDetector:
 
         A failure is logged at WARNING at most once per :data:`_SINK_FAILURE_LOG_SECONDS` per
         event type, whatever the subject, the exception type, or any success in between. The next
-        line carries how many failures of that type were held back since the last line or
-        success, since a success resets that count; :meth:`flush_held` logs what is still held at
-        release. So the lines written are bounded by the event types times the minutes elapsed. A
+        line carries how many failures of that type were held since the last such line, and
+        :meth:`flush_held` logs what is still held at release. So each event type writes at most
+        one failure line a minute, plus at most one flush line at release. A
         sink that keeps raising no longer starts the refusal quiet period, and a caller can choose
         subjects (a client address, a username), so a key on the subject would let a refused
         peer, or a spread of subjects, write a line each. A line does not say which subject
@@ -493,28 +493,35 @@ class SecuritySignalDetector:
                 self._sink_failures[event] = (next_at, held + 1)
                 return False
             self._sink_failures[event] = (now + _SINK_FAILURE_LOG_SECONDS, 0)
-            log.warning(
-                "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
-                "alert type held back since the last line or success; at most one line every %gs)",
-                event,
-                f"{type(exc).__module__}.{type(exc).__qualname__}",
-                held,
-                _SINK_FAILURE_LOG_SECONDS,
-            )
+            kind = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            if held:
+                log.warning(
+                    "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
+                    "alert type held since the last such line; at most one line every %gs)",
+                    event,
+                    kind,
+                    held,
+                    _SINK_FAILURE_LOG_SECONDS,
+                )
+            else:
+                log.warning(
+                    "security-signal alert %s could not be raised: %s (at most one line every %gs)",
+                    event,
+                    kind,
+                    _SINK_FAILURE_LOG_SECONDS,
+                )
             return False
-        failing = self._sink_failures.get(event)
-        if failing is not None and failing[1]:
-            self._sink_failures[event] = (failing[0], 0)
         return True
 
     def flush_held(self) -> None:
-        """Log, once per event type, the sink failures still held back, so a run that ends with
-        no later failure line is not lost from the log."""
+        """Log, at most once per event type, the sink failures held since that type's last
+        failure line, so failures that no later line reported reach the log at release. Failures
+        that arrive after this runs, from calls already queued onto the loop, are not flushed."""
         for event, (_next_at, held) in self._sink_failures.items():
             if held:
                 log.warning(
-                    "security-signal alert %s: %d failure(s) held back since the last line or "
-                    "success were not logged before the detector was released",
+                    "security-signal alert %s: %d failure(s) held since the last such line were "
+                    "not logged before the detector was released",
                     event,
                     held,
                 )

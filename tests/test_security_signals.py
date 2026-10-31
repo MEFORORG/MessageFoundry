@@ -648,8 +648,8 @@ def _failed_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 
 def _held_back(line: str) -> int:
-    """The held-back count a failure line carries."""
-    return int(line.split("(")[1].split(" more")[0])
+    """The held count a failure line carries; a line with none held omits the clause."""
+    return int(line.split("(")[1].split(" more")[0]) if " more failure" in line else 0
 
 
 def test_a_sink_that_keeps_failing_logs_once_a_minute_with_the_held_back_count(
@@ -664,6 +664,7 @@ def test_a_sink_that_keeps_failing_logs_once_a_minute_with_the_held_back_count(
         det.observe_refusal("IB_ACME_ADT")
         lines = _failed_lines(caplog)
         assert [_held_back(line) for line in lines] == [0, 499]
+        assert "held" not in lines[0]  # the first line has nothing held, so no clause
         # caplog.text is formatted with each record's exception text too, so a sink message
         # that reached a record would show here, token and subject both.
         assert "sink down" not in caplog.text and _LEAK_TOKEN not in caplog.text
@@ -708,29 +709,9 @@ def test_success_for_another_subject_does_not_reopen_the_line(
             det.observe("auth.login_failed", None, None, "good", None)
         clock.now += 61
         det.observe("auth.login_failed", None, None, "bad", None)
-    # Each success resets the held count, so the second window's line counts none.
-    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 0]
+    # A success between failures resets nothing: every failure since the last line is counted.
+    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 199]
     assert "recovered" not in caplog.text
-
-
-def test_a_success_resets_the_held_count_but_not_the_line_throttle(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    sink, clock = _Switchable(), _Clock()
-    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=1), clock=clock)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
-        for _ in range(5):
-            det.observe_refusal("IB_A")  # one line, then four held
-        sink.down = False
-        det.observe_refusal("IB_B")  # a success: the four are dropped from the count
-        sink.down = True
-        for _ in range(3):
-            det.observe_refusal("IB_C")  # still inside the window: held, no line
-        assert len(_failed_lines(caplog)) == 1
-        clock.now += 61
-        det.observe_refusal("IB_D")
-    # The control: the three failures after the success are counted.
-    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 3]
 
 
 def test_differing_exception_types_per_subject_share_one_line_per_window(
@@ -816,8 +797,8 @@ async def test_release_logs_each_event_types_held_failures_once(
         remove()
     released = [r.getMessage() for r in caplog.records if "were not logged" in r.getMessage()]
     assert released == [
-        "security-signal alert peer_refused_burst: 3 failure(s) held back since the last line "
-        "or success were not logged before the detector was released"
+        "security-signal alert peer_refused_burst: 3 failure(s) held since the last such line "
+        "were not logged before the detector was released"
     ]
 
 
