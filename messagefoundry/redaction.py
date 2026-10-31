@@ -2975,15 +2975,15 @@ def _resolve_readers(
     ``kind``, then ``extra``; or None when ``names`` is None."""
     if names is None:
         return None
-    # Every exception has an instance dict, and BaseException's own descriptor reads it whatever a
-    # subclass puts under that name: a class attribute `__dict__ = None` must not hide it.
-    own_dict = _EXC_DICT if issubclass(kind, BaseException) else _class_attribute(kind, "__dict__")
+    own_dict = _class_attribute(kind, "__dict__")
     # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
-    found: list[Any] = [
-        own_dict
-        if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
-        else None
-    ]
+    reader = type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
+    if not reader and issubclass(kind, BaseException):
+        # Every exception has an instance dict, and BaseException's own descriptor reads it: a
+        # property or `__dict__ = None` must not hide it. Another class's getset is still used,
+        # so a read that raises fails closed as it did before.
+        own_dict, reader = _EXC_DICT, True
+    found: list[Any] = [own_dict if reader else None]
     for name in names:
         slot = _class_attribute(kind, name)
         if type(slot) is MemberDescriptorType:

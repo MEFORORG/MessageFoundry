@@ -1724,14 +1724,18 @@ attribute, each value read from it, and each element of a list or dict found tha
 against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the number there).
 The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads what the
 walk read before that change, on the same budget per log argument and per traceback link, and it
-finishes before the added pass starts.** It differs at least where the class of an exception puts
-something other than the builtin getset under `__dict__`, such as a property, `__dict__ = None`
-or another class's getset: the first pass now reads the instance dict through the builtin
-`BaseException` descriptor, so none of that class's code runs. That is a tightening. Where the
-walk before that change skipped that dict, or withheld the whole argument because the read
-raised, a codec error held in the dict now prints as the fixed note. The added pass then
-reads at least the dunder-named slots, the `__cause__` and `__context__` chain links, and what an
-exception's own `__str__` or `__repr__` reaches. It runs on the budget the first pass left, and in
+finishes before the added pass starts,** except on a link whose verdict an earlier link's scan
+handed on, as below. It differs at least where the class of an exception puts something other
+than a getset or member descriptor under `__dict__`, such as a property or `__dict__ = None`: the
+walk before that change skipped the instance dict, so a codec error held there that the
+exception's own code printed came out raw, and the first pass now reads that dict through the
+builtin `BaseException` descriptor, so such an exception prints as the fixed note. That is a tightening. A class that puts another class's getset there
+is read as before: the read raises, and the walk fails closed on that exception. The added pass
+then reads at least the dunder-named slots and the `__cause__` and `__context__` chain links, and
+beneath an exception whose own `__str__` or `__repr__` is its own code, the instance `__dict__`,
+slots and chain links of each exception it reaches. It does not read everything such code can
+reach: an object the walk does not read by attribute, as listed below, is not read there either.
+It runs on the budget the first pass left, and in
 a traceback within one more budget that the added passes of every link share. **It only adds: it
 can turn a "holds no error" verdict into "holds an error", never the other way.** What each read
 costs, and when one link's scan hands its verdict on to a later link, is in the `_ScanShare`

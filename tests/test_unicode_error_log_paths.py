@@ -2251,9 +2251,8 @@ class _NoDictOwner:
 
 
 class _ForeignDictError(Exception):
-    """Its class puts another class's ``__dict__`` getset under ``__dict__``, so ``exc.__dict__``
-    raises ``TypeError``. The scan reads the instance dict through the builtin ``BaseException``
-    reader instead, so the foreign one is never called."""
+    """Its class puts another class's ``__dict__`` getset under ``__dict__``, so reading the
+    instance dict through it raises ``TypeError``, and the scan fails closed on it."""
 
     __dict__ = _NoDictOwner.__dict__["__dict__"]
 
@@ -2272,6 +2271,23 @@ def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -
         assert spelling not in out
 
 
+class _ForeignDictPrintsVars(_ForeignDictError):
+    """Its own ``__str__`` reads ``vars(self)``, which raises through the foreign reader."""
+
+    def __str__(self) -> str:
+        return f"ctx {vars(self)!r}"
+
+
+def test_a_foreign_dict_reader_still_fails_closed_rather_than_rendering() -> None:
+    # Review of vault BACKLOG #3340: reading such a dict through BaseException's own reader let
+    # safe_exc reach str(exc), which raised, where origin/main returned the fixed note.
+    error = _ForeignDictPrintsVars("bad")
+    with pytest.raises(TypeError):  # control: its own str() raises
+        str(error)
+    assert redaction.safe_exc(error) == f"_ForeignDictPrintsVars: {redaction._HOLDER_TEXT}"
+    assert codec_safe_str(error) == redaction._HOLDER_TEXT
+
+
 @dataclasses.dataclass
 class _ForeignDictData:
     """A dataclass whose ``__dict__`` reader is another class's, so reading it raises."""
@@ -2283,9 +2299,9 @@ class _ForeignDictData:
 def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Review of vault BACKLOG #3340: an exception's __dict__ is read through _EXC_DICT, so
-    # _ForeignDictError above no longer raises, and nothing reached the added pass's own fail-closed
-    # arm. The dataclass sits behind a __cause__ link, which only the added pass reads.
+    # Review of vault BACKLOG #3340: the added pass's own fail-closed arm needs an unreadable object
+    # that only it reaches. The dataclass sits behind a __cause__ link, which only the added pass
+    # reads.
     data = _ForeignDictData()
     inner = RuntimeError("inner")
     inner.payload = data  # type: ignore[attr-defined]
