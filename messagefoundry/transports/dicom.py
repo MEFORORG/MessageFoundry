@@ -1234,10 +1234,11 @@ class DicomScpSource(SourceConnector):
             return _STATUS_OUT_OF_RESOURCES
         if receipt.refusal is not None:
             logger.warning(
-                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR (%s), "
+                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR %s (%s), "
                 "returning failure",
                 peer_ip,
                 sop_instance,
+                receipt.message_id,
                 receipt.refusal.value,
             )
             if receipt.refusal is RefusalKind.TEMPORARY:

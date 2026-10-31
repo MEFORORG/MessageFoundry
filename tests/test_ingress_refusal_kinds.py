@@ -152,7 +152,7 @@ async def test_a_body_larger_than_the_whole_stream_budget_is_413(store: MessageS
     assert resp.status == 413
     assert "retry-after" not in resp.headers
     row = await _the_one_error_row(store)
-    assert "in-flight budget exceeded" in row["error"]
+    assert "the body alone is over the budget" in row["error"]
     _assert_names_the_row(resp, row)
 
 
@@ -231,6 +231,28 @@ async def test_an_hl7_body_over_the_peek_ceiling_is_413_and_names_its_row(
     assert resp.status == 413
     row = await _the_one_error_row(store)
     assert "exceeds max size" in row["error"]
+    _assert_names_the_row(resp, row)
+
+
+@pytest.mark.parametrize(("oversize", "status"), [(True, 413), (False, 422)])
+async def test_a_strict_validation_failure_over_its_size_cap_is_413(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, oversize: bool, status: int
+) -> None:
+    # validate() keeps the engine-default size cap even where max_message_bytes admitted the body to
+    # the peek. A failure on a body over that cap is a size refusal; the control, the same failure on
+    # a body under it, is about content.
+    from messagefoundry.parsing.validate import ValidationResult
+
+    monkeypatch.setattr(
+        wiring_runner,
+        "validate",
+        lambda text, **_: ValidationResult(False, "2.5.1", ["message exceeds max size"]),
+    )
+    monkeypatch.setattr(wiring_runner, "DEFAULT_MAX_MESSAGE_BYTES", 10 if oversize else 10_000)
+    resp = await _post_through_runner(store, _ic(validation=Validation(strict=True)), HL7.encode())
+    assert resp.status == status
+    row = await _the_one_error_row(store)
+    assert "strict-validation failed" in row["error"]
     _assert_names_the_row(resp, row)
 
 

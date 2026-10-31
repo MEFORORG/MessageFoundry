@@ -137,7 +137,11 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
+from messagefoundry.parsing.peek import (
+    DEFAULT_MAX_MESSAGE_BYTES,
+    PEEK_READ_FAULTS,
+    HL7MessageTooLarge,
+)
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
@@ -891,7 +895,8 @@ class _StreamBudgetExceeded(Exception):
     clear however the concurrent detaches finish: a receipt source answers it as over-size rather
     than inviting a re-send (BACKLOG #2105)."""
 
-    def __init__(self, message: str, *, alone: bool) -> None:
+    def __init__(self, message: str, *, alone: bool = False) -> None:
+        # The default keeps cls(*args), which pickle and copy rebuild an exception with, working.
         super().__init__(message)
         self.alone = alone
 
@@ -7895,9 +7900,14 @@ class RegistryRunner:
                 )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                return await self._refuse(
-                    ic, raw, text, RefusalKind.PERMANENT, error=persisted, peek=peek
+                # validate() keeps its own size cap, the engine default, even where the inbound's
+                # max_message_bytes admitted the body to the peek, so a body over it failed for size.
+                kind = (
+                    RefusalKind.OVERSIZE
+                    if len(text) > DEFAULT_MAX_MESSAGE_BYTES
+                    else RefusalKind.PERMANENT
                 )
+                return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns a refusal — never accepted-and-dropped.
         skeleton = text
@@ -8000,10 +8010,12 @@ class RegistryRunner:
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
+            alone = size > budget
             raise _StreamBudgetExceeded(
                 f"streaming in-flight budget exceeded ({self._stream_inflight_bytes} + {size} > "
-                f"{budget} bytes); refusing the detach (backpressure)",
-                alone=size > budget,
+                f"{budget} bytes); refusing the detach "
+                + ("(the body alone is over the budget)" if alone else "(backpressure)"),
+                alone=alone,
             )
         # Reserve the budget for the whole detach window (buffer + per-chunk seal); release in finally the
         # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.

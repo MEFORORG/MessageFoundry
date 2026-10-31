@@ -662,6 +662,8 @@ semantics** of a `reply_from`-less inbound, not to every byte on the wire. Sayin
 the claim. *(Amended 2026-09-26: a fourth delta now changes that path's status semantics too. A body the
 handler refuses is answered `422`, not `202`. See the
 [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
+*(Amended 2026-10-30: that refusal is now `503`, `413` or `422` by kind. See the
+[amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 **Bounding is three independent clocks**: `receive_timeout` (read only, unchanged) + `reply_timeout` (the
 block) + `reply_write_timeout` (the drain). `self._active` already spans all of `_serve_one`, so
@@ -1430,7 +1432,8 @@ dead-letter messages that a re-send a few seconds later would have delivered.
 **The receipt contract.** A source that declares `wants_receipt` is started with a receipt handler that
 returns an `IngressReceipt` ([`transports/receipt.py`](../../messagefoundry/transports/receipt.py)). It
 holds the committed `message_id`, or a `RefusalKind` and the `ERROR` row's `message_id`. The generic
-`InboundHandler` that MLLP, TCP and the file sources use is unchanged. A receipt is a refusal only when
+`InboundHandler` that MLLP, TCP and the file sources use is unchanged. The `HttpReceiptHandler` alias
+the Context's code map names is gone; `ReceiptHandler` replaces it. A receipt is a refusal only when
 `enqueue_ingress` did not run, so an accepted body can never be reported refused.
 
 **The classification.** `RegistryRunner._handle_inbound_http` sorts each refusal, and the two receipt
@@ -1439,7 +1442,7 @@ sources answer it in step.
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers |
 | --- | --- | --- | --- |
 | the streaming detach's in-flight budget, held by other detaches | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
-| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes`, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
+| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
 | every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
 
 A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
