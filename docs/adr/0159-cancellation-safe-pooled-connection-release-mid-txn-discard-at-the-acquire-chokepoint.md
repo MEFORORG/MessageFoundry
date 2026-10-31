@@ -551,8 +551,10 @@ the next reader does not re-derive the wrong precedent from the same comment.
     INSERT uncommitted and its locks held, for the next send's commit or rollback to settle. This is
     not the rollback rejected in *Why not a rollback in the same place* above: nothing awaits it,
     and it runs on the statement's own thread after the statement, not on the loop's executor
-    beside it. A connection whose rollback fails is closed and its handle dropped, so its pool
-    cannot lend it.
+    beside it. A failed rollback is logged and the connection still goes back: dropping its handle
+    would leave a waiting borrower or `wait_closed` unwoken, since aioodbc wakes neither for a
+    closed connection. The rollback runs only on a gated connection; on an ungated one it would run
+    beside the statement.
   - **Otherwise it returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc
     wakes no waiting borrower when a closed connection is released, so a detached connection could
     leave that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for
@@ -572,8 +574,10 @@ the next reader does not re-derive the wrong precedent from the same comment.
     retries, so a held slot delays work but does not wedge it.
   - A pool close waits for the held connection, at most `_POOL_CLOSE_TIMEOUT_S` (2 s) in at least
     the destination's and the lookup executor's `aclose()`, a `DatabaseRef` sync's own pool
-    teardown (`_close_pool_bounded`), and `DatabaseSource.stop()` after a cancel. The close goes on
-    past the bound, and the held connection is released only once its statement returns.
+    teardown (`_close_pool_bounded`), and `DatabaseSource.stop()` after a cancel. Past the bound,
+    `_close_pool_bounded` lets the close go on by itself; the source's bound, from BACKLOG #1620,
+    cancels its close instead. Either way the held connection is released only once its statement
+    returns.
 
   **What it leaves open.** At least these:
 
@@ -583,6 +587,11 @@ the next reader does not re-derive the wrong precedent from the same comment.
   - `DatabaseSource.stop()` with no cancel closes its pool without a bound, so the connection test
     in `api/app.py`, which stops a source it probed, can wait past its own timeout for a probe its
     timeout cancelled.
+  - A cancelled call whose worker thread has started but has not yet entered the gate is invisible
+    to `run_after_running_call`. The close job can then take the gate first, and the connection
+    can go back before that call runs on it. The store detaches its connection and so tolerates the
+    same race; this connector returns it.
+  - A cursor with no raw handle gets no rollback on a cancel.
 
   Pinned offline by `tests/test_backlog2394_database_gate.py`.
 

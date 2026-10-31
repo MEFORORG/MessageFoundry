@@ -111,12 +111,14 @@ async def rig() -> AsyncIterator[_Rig]:
         executor.shutdown(wait=True)
 
 
-def _aioodbc_serving(monkeypatch: pytest.MonkeyPatch, rig: _Rig, **raw_kw: Any) -> None:
+def _aioodbc_serving(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, *, gateable: bool = True, **raw_kw: Any
+) -> None:
     """Stand ``aioodbc`` in: each ``create_pool`` hands out a pool over one aioodbc-shaped
     connection on ``rig``'s executor, recorded in ``rig.pools``."""
 
     async def create_pool(**kwargs: Any) -> _ClosingPool:
-        pool = _ClosingPool(AioConn(rig.raw(**raw_kw), rig.executor))
+        pool = _ClosingPool(AioConn(rig.raw(**raw_kw), rig.executor, gateable=gateable))
         rig.pools.append(pool)
         return pool
 
@@ -210,24 +212,42 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
 
 
-async def test_a_cancelled_send_whose_rollback_fails_discards_its_connection(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+async def test_a_cancelled_send_whose_rollback_fails_still_returns_its_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A refused rollback leaves the transaction open, so the connection must not go back to be
-    lent: it is closed, inside the gate, after the cursor."""
+    """A refused rollback is logged, and the connection still goes back open: dropping its handle
+    would leave a waiting borrower or pool close unwoken, since aioodbc wakes neither for a
+    closed connection."""
     _aioodbc_serving(monkeypatch, rig, raw_type=_RollbackRefused, blocks=lambda s: s == _INSERT)
     task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
     done, _pending = await asyncio.wait({task}, timeout=1.0)
     assert done, "the cancellation waited for the running statement"
 
-    rig.release.set()
-    await wait_for_entry(rig.log, "conn.close")
-    assert await wait_until(lambda: rig.pools[0].in_release.is_set()), "it was never released"
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.database"):
+        rig.release.set()
+        assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
 
     assert USE_AFTER_FREE not in rig.log, rig.log
     end = rig.log.index("execute:end")
-    assert end < rig.log.index("rollback:refused") < rig.log.index("conn.close"), rig.log
-    assert rig.conn.closed and rig.pools[0].free == [], "a connection with an open txn went back"
+    assert end < rig.log.index("cursor.close") < rig.log.index("rollback:refused"), rig.log
+    assert not rig.conn.closed and "conn.close" not in rig.log, rig.log
+    assert "rollback after a cancelled statement failed" in caplog.text
+
+
+async def test_an_ungated_connection_gets_no_rollback_beside_its_statement(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A connection the gate could not wrap. Its cursor close still runs beside the statement,
+    the hazard an ungated connection keeps, but no rollback is added to it."""
+    _aioodbc_serving(monkeypatch, rig, gateable=False, blocks=lambda sql: sql == _INSERT)
+    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running statement"
+    assert call_gate(rig.conn) is None, "the arm is vacuous: the connection was gated"
+
+    rig.release.set()
+    assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
+    assert "rollback" not in rig.log, rig.log
 
 
 async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_returns(

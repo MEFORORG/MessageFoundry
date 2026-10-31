@@ -1658,9 +1658,10 @@ class _AutocommitPool:
     included, runs beside it.
 
     **What that does not bound.** Until a hung call returns, its connection is still in use, so a
-    ``pool.close(); await pool.wait_closed()`` on this pool waits for it: a ``DatabaseRef`` sync's
-    teardown, or a source's or lookup's ``aclose()``. How long is the driver's own network timeout.
-    That wait is the price of never freeing a connection under a running driver call."""
+    close of this pool waits for it. A ``DatabaseRef`` sync's teardown and a lookup's ``aclose()``
+    stop waiting at a bound (:func:`_close_pool_bounded`, BACKLOG #2394), and so does a source's
+    stop after a cancel; a source's ordinary ``aclose()`` does not. That wait is the price of never
+    freeing a connection under a running driver call."""
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
@@ -1867,13 +1868,15 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     cancelled = _unwinding_a_cancel()
     work: asyncio.Future[Any]
     if raw_cur is not None:
+        gate = call_gate(conn)
+        # Only inside a gate: on an ungated connection a rollback would run beside the statement.
         close = (
             partial(_close_after_a_cancel, conn, raw_cur)
-            if cancelled
+            if cancelled and gate is not None
             else partial(_close_raw_cursor, raw_cur)
         )
         try:
-            work = _thread_settled(close, gate=call_gate(conn))
+            work = _thread_settled(close, gate=gate)
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
@@ -1913,33 +1916,33 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
     A cancellation skips every caller's ``except Exception: rollback``. On the destination's
     manual-commit pool the connection would otherwise go back holding the cancelled INSERT
     uncommitted, with its locks, for the next send's commit or rollback to settle. On an autocommit
-    connection the rollback has nothing to undo. Never raises. A connection whose rollback fails
-    is closed and its handle dropped, so its pool cannot lend it with that transaction open; aioodbc
-    then wakes no waiting borrower for it, which costs that borrower at most its acquire limit."""
+    connection the rollback has nothing to undo. Never raises.
+
+    **A failed rollback is logged, and the connection still goes back.** Discarding it would drop
+    its handle, and aioodbc wakes neither a waiting borrower nor a waiting ``wait_closed`` for a
+    closed connection, so that wait could last until something else woke it. A rollback usually
+    fails because the session is gone, and its transaction with it. A session still alive keeps
+    the transaction until the next borrower's own commit or rollback, as before this function."""
     _close_raw_cursor(raw_cur)
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
     try:
         raw.rollback()
-    except Exception as exc:  # noqa: BLE001 - every driver fault; the connection is discarded below
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
         logger.warning(
-            "DATABASE: rollback after a cancelled statement failed; discarding the connection: %s",
+            "DATABASE: rollback after a cancelled statement failed; the connection goes back to "
+            "its pool: %s",
             _safe_db_error(exc),
         )
-        conn._conn = None  # aioodbc's pool lends only a connection that is not closed
-        try:
-            raw.close()
-        except Exception as close_exc:  # noqa: BLE001 - it is out of the pool either way
-            logger.debug("DATABASE: closing a discarded connection failed: %s", close_exc)
 
 
 async def _close_pool_bounded(pool: Any, what: str) -> None:
     """Close ``pool``, waiting at most :data:`_POOL_CLOSE_TIMEOUT_S` for its connections in use.
 
     BACKLOG #2394: a connection whose cancelled statement still runs goes back only once that
-    statement returns, and this connector has no statement timeout, so an unbounded
-    ``wait_closed`` would hold a stop or a reload for as long as the server runs the statement. On
+    statement returns, which nothing bounds (ADR 0159, amendment of 2026-10-30), so an unbounded
+    ``wait_closed`` would hold a stop or a reload with it. On
     the bound this stops waiting and logs it, and the close goes on by itself: it is waited on
     through :func:`asyncio.wait`, which never cancels it, so a close cut halfway never leaves a
     connection's handle for aioodbc's ``__del__`` to free. The held connection is still released
@@ -1949,7 +1952,11 @@ async def _close_pool_bounded(pool: Any, what: str) -> None:
     closing = asyncio.ensure_future(pool.wait_closed())
     _DETACHED_SETTLES.add(closing)
     closing.add_done_callback(_DETACHED_SETTLES.discard)
-    done, _pending = await asyncio.wait({closing}, timeout=_POOL_CLOSE_TIMEOUT_S)
+    try:
+        done, _pending = await asyncio.wait({closing}, timeout=_POOL_CLOSE_TIMEOUT_S)
+    except BaseException:  # a cancelled caller: the close goes on, and a failure is still logged
+        closing.add_done_callback(partial(_log_late_pool_close, what))
+        raise
     if done:
         closing.result()
         return
@@ -2262,9 +2269,9 @@ class DatabaseDestination(DestinationConnector):
     async def aclose(self) -> None:
         """Close the pool, bounded (BACKLOG #2394): a cancelled send's statement can hold its
         connection with no time limit, and a stop must not wait on it."""
-        pool, self._pool = self._pool, None
-        if pool is not None:
-            await _close_pool_bounded(pool, "DATABASE destination")
+        if self._pool is not None:
+            await _close_pool_bounded(self._pool, "DATABASE destination")
+            self._pool = None
 
 
 #: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
@@ -3092,6 +3099,9 @@ class DatabaseLookupExecutor:
     async def aclose(self) -> None:
         """Close every opened pool (idempotent; safe if no pool was ever opened). Each close is
         bounded, as the destination's is (BACKLOG #2394)."""
-        for connection, pool in self._pools.items():
-            await _close_pool_bounded(pool, f"DatabaseLookup {connection!r}")
-        self._pools.clear()
+        pools = list(self._pools.items())  # a snapshot: a lookup may open a pool meanwhile
+        await asyncio.gather(
+            *(_close_pool_bounded(pool, f"DatabaseLookup {name!r}") for name, pool in pools)
+        )
+        for name, _pool in pools:
+            self._pools.pop(name, None)

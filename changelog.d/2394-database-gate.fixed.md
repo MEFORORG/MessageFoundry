@@ -5,10 +5,10 @@
   still runs, which on a real driver frees the handle the statement returns to and can crash the
   process. The cursor now closes once the statement returns, on the statement's own thread, and the
   same step rolls back what the cancelled statement left open, so a destination's connection no
-  longer goes back holding a cancelled INSERT for the next send to commit. A connection whose
-  rollback fails is discarded. The connection then goes back to its pool. The cancelled task does
-  not wait for the statement, but the connection keeps its pool slot until the statement returns,
-  and since this connector has no statement timeout, nothing in the engine bounds that time. The
+  longer goes back holding a cancelled INSERT for the next send to commit. The connection then goes
+  back to its pool. The cancelled task does not wait for the statement, but the connection keeps
+  its pool slot until the statement returns, which nothing in the engine bounds. The
   destination's, the lookup's and a `DatabaseRef` sync's pool close now wait at most 2 s for it. At
-  least these are not covered: a cancellation while a cursor is still being created, and a
-  source's ordinary stop, whose pool close is still unbounded. (`BACKLOG #2394`)
+  least these are not covered: a cancellation while a cursor is still being created, a
+  cancellation before the cancelled call has entered the gate, and a source's ordinary stop, whose
+  pool close is still unbounded. (`BACKLOG #2394`)
