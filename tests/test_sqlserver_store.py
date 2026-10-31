@@ -38,6 +38,13 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._keyed_reopen_contract import (
+    CONTROL_CELL,
+    KeyedReopenReport,
+    assert_names_the_control_cell_alone,
+    remove_seal_passes,
+    server_keyed_reopen_report,
+)
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -3088,6 +3095,27 @@ async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:
                 await conn.commit()
         finally:
             await cleanup.close()
+
+
+async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
+    """BACKLOG #1723: a no-key -> key restart must seal every written cell IN PLACE on this backend,
+    and each must then read back through its real read path.
+
+    The cells are the ones ``tests/test_store_cipher_sweep_parity.py`` finds written in
+    ``sqlserver.py``, and the writers and readers are ``tests/_keyed_reopen_contract.py``, which the
+    ``postgres-store`` leg and the plain leg share. It takes ``state`` through its ``MERGE`` writer
+    and every other cell through its own, under the cell-bound format.
+    """
+    assert await server_keyed_reopen_report(store) == KeyedReopenReport()
+
+
+async def test_removing_a_cells_on_open_pass_reds_the_keyed_reopen_contract(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control on this backend's own sweep, so the test above is shown able to fail
+    here and not only on SQLite."""
+    remove_seal_passes(monkeypatch, type(store), {CONTROL_CELL})
+    assert_names_the_control_cell_alone(await server_keyed_reopen_report(store))
 
 
 # --- ADR 0006 reference snapshots (BACKLOG #235) — the T-SQL port proof --------------------------
