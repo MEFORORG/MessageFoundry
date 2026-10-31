@@ -520,6 +520,15 @@ def _refuse_unsafe_text(text: str, *, what: str, connection: str | None, refused
         )
 
 
+def _refuse_none(value: object, *, what: str, connection: str | None) -> None:
+    """A ValueError when ``value`` is ``None`` (BACKLOG #2705). An unbraced setting is sent as its
+    ``str()``, so a ``None`` would reach the driver as the four letters ``None`` rather than as no
+    value. An unset ``database``, ``username`` or ``password`` is left out of the string instead,
+    and an ``odbc_params`` keyword with no value should be left out of the table."""
+    if value is None:
+        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {what} must not be None")
+
+
 def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
     #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
@@ -531,8 +540,12 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     empty or blank value, which a driver reads as its default (libpq's ``prefer`` falls back to
     plaintext); and a leading or trailing space, which one driver may trim and another keep.
 
+    ``None`` is refused here, before ``str()`` would turn it into the text ``None`` and send that
+    as the value (:func:`_refuse_none`).
+
     The refusal names the setting and never the value. A password follows its own rule
     (:func:`_odbc_password`), and the driver name stays braced."""
+    _refuse_none(value, what=what, connection=connection)
     text = str(value)
     _refuse_unsafe_text(text, what=what, connection=connection, refused=";{}=")
     if not text or text != text.strip():
@@ -543,16 +556,17 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# The ``odbc_driver`` names, in lower case, of the drivers trusted to read the ODBC ``}}`` escape
-# in a braced password (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered names,
-# measured on 2026-10-30, and Microsoft's SQL Server drivers, not probed then but relied on for the
-# same escape by the SQL Server preset and the store. Whole names, spacing included, on purpose: a
-# vendor driver whose name merely mentions a database, a library path, or another registered name
-# that only folds to one of these is unmeasured and does not match.
+# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
+# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
+# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
+# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
+# store. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
+# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
+# merely mentions a database, a library path, or another registered name that only folds to one of
+# these is unmeasured and does not match.
 _ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
     r"postgresql (?:unicode|ansi)(?:\(x64\))?"
     r"|mysql odbc [0-9.]+ (?:unicode|ansi) driver"
-    r"|sql server"
     r"|odbc driver [0-9]+ for sql server"
 )
 
@@ -560,24 +574,29 @@ _ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    Sent plain when it holds none of ``;``, ``{`` or ``}`` and has no leading or trailing space,
-    since a driver that reads no braces (the Access driver) takes it only that way. Otherwise it
-    needs the braces and the ``}}`` escape. A driver that does not read the escape ends the value
-    at the first ``}`` and reads the rest as further keywords, so the build is refused unless
-    ``driver`` is one :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names. A driver missing there is
-    unmeasured, not known to be unsafe. A password must be printable ASCII whatever the driver.
-    The refusal names the setting and never the value."""
+    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
+    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
+    literally, so only the braced form sends the password as written.
+
+    For any other driver it is sent plain, and only when it holds none of ``;``, ``{`` or ``}`` and
+    has no leading or trailing space: a driver that reads no braces (the Access driver) takes it
+    only that way, and one that does not read the escape would end a braced value at the first
+    ``}`` and read the rest as further keywords. Any other password is refused for such a driver.
+    A driver missing from the list is unmeasured, not known to be unsafe.
+
+    A password must be printable ASCII whatever the driver. A refusal names the setting and never
+    describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
+    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+        return odbc_brace(text)
     if not any(ch in ";{}" for ch in text) and text == text.strip():
         return text
-    if not _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
-        raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE password holds ';', '{{', '}}' or a leading or "
-            "trailing space, which needs the ODBC '}}' escape, and odbc_driver does not name a "
-            "driver measured to read it (see docs/CONNECTIONS.md); change the password"
-        )
-    return odbc_brace(text)
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE password cannot be carried by this odbc_driver; "
+        "change the password (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
 
 
 def _is_remote_spelling(value: object) -> bool:
@@ -894,8 +913,9 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
     they refuse ``;``, ``{``, ``}``, ``=``, an empty or blank value and a leading or trailing space.
-    ``odbc_driver`` is braced and refuses ``;``, ``{`` and ``}``. ``password`` is sent plain when it
-    can be, and braced with the ``}}`` escape only for a driver measured to read it
+    ``server`` and every ``odbc_params`` value also refuse ``None``. ``odbc_driver`` is braced and
+    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
+    on the escape list, and otherwise sent plain when it can be and refused when it cannot
     (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
@@ -917,6 +937,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         raise ValueError(f"{where}DATABASE generic dialect requires an 'odbc_driver' setting")
     # SERVER is emitted UNBRACED (validated, not brace-quoted) so a driver that parses a ",port"/":port"
     # suffix in SERVER can resolve the host — mirrors the SQL Server preset's rationale.
+    _refuse_none(s["server"], what="server", connection=connection)
     server = str(s["server"])
     if _odbc_unsafe_text(server, ";{}="):
         raise ValueError(
@@ -968,6 +989,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 f"{where}DATABASE odbc_params names {name} more than once "
                 "(keywords are case-insensitive); give it once"
             )
+        # Before anything reads the value: the remote-path screen reads its str() too.
+        _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
         named[name] = value
         if name in _ODBC_PATH_KEYS:
             _refuse_remote_path(value, name=name, connection=connection)

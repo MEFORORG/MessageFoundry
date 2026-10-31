@@ -14,9 +14,9 @@ other places a keyword can come from, so this file pins all three:
 * ``odbc_user_key`` and ``odbc_password_key`` accept the credential keywords and nothing else.
 * Every value must be printable ASCII. An ``odbc_params`` value, the database and the user name are
   sent without braces (BACKLOG #2705), so they refuse ``;``, ``{``, ``}`` and ``=``, and an empty,
-  blank or padded value. The driver name stays braced and refuses ``;``, ``{`` and ``}``. A
-  password is sent plain when it can be, and braced with the ODBC escape only for a driver
-  measured to read it.
+  blank or padded value, and ``None``. The driver name stays braced and refuses ``;``, ``{`` and
+  ``}``. A password is always braced with the ODBC escape for a driver on the escape list, and for
+  any other driver sent plain when it can be and refused when it cannot.
 * A keyword given twice is refused, and a file keyword must be a plain local path.
 
 Each refusal is paired with a control that must still build, and the control uses the same builder
@@ -213,7 +213,8 @@ def test_the_credential_keywords_drivers_use_still_build(user_key: str, password
         username="svc", password="pw", odbc_user_key=user_key, odbc_password_key=password_key
     )
     assert f"{user_key}=svc;" in dsn
-    assert f"{password_key}=pw;" in dsn
+    # The default driver is psqlODBC, so the password is braced (BACKLOG #2705).
+    assert f"{password_key}={{pw}};" in dsn
 
 
 # --- values --------------------------------------------------------------------------------------
@@ -265,7 +266,8 @@ _PADDING = "must not be empty, blank, or start or end with a space"
 
 def test_the_built_psqlodbc_string_sends_every_checked_value_unbraced() -> None:
     """psqlODBC did not honour ``SSLmode={verify-full}`` (2026-10-30 probe: it connected with no
-    TLS), kept braces on UID and DATABASE, and refused a braced port. Red before #2705."""
+    TLS), kept braces on UID and DATABASE, and refused a braced port. Red before #2705. The
+    password alone stays braced: psqlODBC URL-decodes an unbraced one."""
     dsn = _build(
         database="results",
         username="svc",
@@ -273,7 +275,7 @@ def test_the_built_psqlodbc_string_sends_every_checked_value_unbraced() -> None:
         odbc_params={"port": 5432, "SSLmode": "verify-full"},
     )
     assert dsn == (
-        "DRIVER={PostgreSQL Unicode};SERVER=db.test;DATABASE=results;UID=svc;PWD=pw;"
+        "DRIVER={PostgreSQL Unicode};SERVER=db.test;DATABASE=results;UID=svc;PWD={pw};"
         "port=5432;SSLmode=verify-full;"
     )
 
@@ -303,14 +305,17 @@ def test_a_blank_or_padded_typed_setting_is_refused(setting: str, value: str) ->
 
 _ESCAPE_DRIVERS = [
     "PostgreSQL Unicode",
+    "PostgreSQL ANSI",
     "PostgreSQL ANSI(x64)",
     "postgresql unicode",
     "MySQL ODBC 9.1 Unicode Driver",
+    "MySQL ODBC 8.0 ANSI Driver",
     "PostgreSQL Unicode(x64)",
-    "SQL Server",
     "ODBC Driver 18 for SQL Server",
 ]
 _OTHER_DRIVERS = [
+    # The legacy name: on Linux commonly a FreeTDS alias, which has not been measured.
+    "SQL Server",
     "Microsoft Access Driver (*.mdb, *.accdb)",
     "SQLite3 ODBC Driver",
     "Oracle in OraClient19Home1",
@@ -326,25 +331,32 @@ _OTHER_DRIVERS = [
 _NEEDS_BRACES = ["p}w", "p;w", "p{w", " pw", "pw ", "a};DBQ=C:\\x.accdb;X=}"]
 
 
-@pytest.mark.parametrize("driver", _ESCAPE_DRIVERS + _OTHER_DRIVERS)
-@pytest.mark.parametrize("password", ["pw", "p=w", "p w"])
-def test_a_password_with_no_delimiter_is_sent_unbraced_to_any_driver(
+@pytest.mark.parametrize("driver", _OTHER_DRIVERS)
+@pytest.mark.parametrize("password", ["pw", "p=w", "p w", "a+b%41c"])
+def test_a_password_with_no_delimiter_is_sent_unbraced_to_any_other_driver(
     driver: str, password: str
 ) -> None:
-    """ACE rejects any braced password, even one with no brace in it (2026-10-30 probe), so a
-    password that needs no braces is sent without them, whatever the driver."""
+    """ACE rejects any braced password, even one with no brace in it (2026-10-30 probe), so for a
+    driver off the escape list a password that needs no braces is sent without them."""
     assert f"PWD={password};" in _build(odbc_driver=driver, username="svc", password=password)
 
 
 @pytest.mark.parametrize("driver", _ESCAPE_DRIVERS)
-@pytest.mark.parametrize("password", _NEEDS_BRACES)
-def test_a_password_needing_braces_is_escaped_for_a_measured_driver(
+@pytest.mark.parametrize("password", ["pw", "p=w", "p w", "a+b%41c", *_NEEDS_BRACES])
+def test_a_password_is_always_braced_for_a_driver_on_the_escape_list(
     driver: str, password: str
 ) -> None:
-    """psqlODBC and MySQL honoured the ``}}`` escape on 2026-10-30, and the SQL Server drivers'
-    escape is what the preset and the store rely on."""
+    """psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space, ``%41`` an ``A``) and takes a
+    braced one literally, and psqlODBC and MySQL honoured the ``}}`` escape on 2026-10-30. So for a
+    driver on the list every password is braced, as main always did. Red on the previous head,
+    which sent ``pw`` and ``a+b%41c`` plain."""
     escaped = "{" + password.replace("}", "}}") + "}"
     assert f"PWD={escaped};" in _build(odbc_driver=driver, username="svc", password=password)
+
+
+def test_a_psqlodbc_password_holding_url_escapes_is_built_braced() -> None:
+    dsn = _build(username="svc", password="a+b%41c")
+    assert dsn == "DRIVER={PostgreSQL Unicode};SERVER=db.test;UID=svc;PWD={a+b%41c};"
 
 
 @pytest.mark.parametrize("driver", _OTHER_DRIVERS)
@@ -353,13 +365,40 @@ def test_a_password_needing_braces_is_refused_for_any_other_driver(
     driver: str, password: str
 ) -> None:
     """ACE did not read the escape: ``PWD={a}};DBQ=...;X=}`` opened the file the password named
-    (2026-10-30 probe). An unmeasured driver is refused the same way. Red before #2705, which
-    braced the password for every driver."""
-    with pytest.raises(ValueError, match="measured to read it") as refused:
+    (2026-10-30 probe). An unmeasured driver is refused the same way, and the legacy ``SQL Server``
+    name with it. The refusal says only that the driver cannot carry the password."""
+    with pytest.raises(ValueError, match="password cannot be carried by this odbc_driver") as r:
         _build(odbc_driver=driver, username="svc", password=password)
-    message = str(refused.value)
+    message = str(r.value)
     assert _CONNECTION in message
     assert password.strip() not in message
+    # Nothing about what the password holds.
+    assert "brace" not in message and "space" not in message and "';'" not in message
+
+
+# --- None is refused, never sent as text (BACKLOG #2705) ------------------------------------------
+
+
+@pytest.mark.parametrize("keyword", ["SSLmode", "PORT", "SSLCA"])
+def test_a_none_odbc_params_value_is_refused(keyword: str) -> None:
+    """``str(None)`` would send the four letters ``None``. Red on the previous head, which sent
+    ``SSLmode=None``."""
+    name = odbc_keyword_name(keyword)
+    with pytest.raises(ValueError, match=f"odbc_params value for '{name}' must not be None") as r:
+        _build(odbc_params={keyword: None})
+    assert _CONNECTION in str(r.value)
+
+
+def test_a_none_server_is_refused() -> None:
+    with pytest.raises(ValueError, match="DATABASE server must not be None") as refused:
+        _build(server=None)
+    assert _CONNECTION in str(refused.value)
+
+
+@pytest.mark.parametrize("setting", ["database", "username", "password"])
+def test_an_unset_typed_setting_is_left_out_not_sent_as_none(setting: str) -> None:
+    # The control: an unset optional setting is omitted, as it always was.
+    assert "None" not in _build(**{setting: None})
 
 
 @pytest.mark.parametrize("character", ["\n", "\x00", *_NON_ASCII])
@@ -459,7 +498,7 @@ def _documented_source(odbc_params: dict[str, Any]) -> Source:
 
 _DOCUMENTED_PARAMS: dict[str, Any] = {"PORT": 5432, "SSLmode": "verify-full"}
 _DOCUMENTED_DSN = (
-    "DRIVER={PostgreSQL Unicode};SERVER=pg.test;DATABASE=results;UID=svc;PWD=pw;"
+    "DRIVER={PostgreSQL Unicode};SERVER=pg.test;DATABASE=results;UID=svc;PWD={pw};"
     "PORT=5432;SSLmode=verify-full;"
 )
 

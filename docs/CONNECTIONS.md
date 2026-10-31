@@ -1727,7 +1727,7 @@ differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_d
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
-The DSN is built as `DRIVER={<odbc_driver>};SERVER=<server>;[DATABASE=<database>;][<user>=<username>;<pwd>=<password>;]<odbc_params…>`, where only the driver name is braced, and a password only when [*Values*](#values-on-the-generic-dialect) says so. `server` is emitted as the near-universal `SERVER` keyword.
+The DSN is built as `DRIVER={<odbc_driver>};SERVER=<server>;[DATABASE=<database>;][<user>=<username>;<pwd>=<password>;]<odbc_params…>`, where only the driver name is braced, and the password for the drivers [*Values*](#values-on-the-generic-dialect) lists. `server` is emitted as the near-universal `SERVER` keyword.
 
 ##### The port an `allowed_db` entry binds
 
@@ -1866,16 +1866,16 @@ Two limits follow from this:
 ##### Values on the generic dialect
 
 **On the generic dialect, values are sent WITHOUT braces** (BACKLOG #2705). Only the
-`odbc_driver` name is braced, and a password needs braces in the one case the table names. Every
-value must be printable ASCII. A value that breaks its rule is refused when the connection is
+`odbc_driver` name is braced, and a password is braced for the drivers the password rule
+below lists. Every value must be printable ASCII. A value that breaks its rule is refused when the connection is
 built, and the error names the setting and never the value:
 
 | Setting | Sent as | Rule |
 |---|---|---|
-| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`; not empty or blank; no leading or trailing space |
+| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An unset `database` or `username` is left out of the string |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=` |
-| `password` | plain, unless it needs braces | printable ASCII. See below |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`; `None` is refused |
+| `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
 psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each connected with no TLS
@@ -1887,24 +1887,31 @@ instead. An empty value is refused because the driver would read it as its defau
 default `prefer` falls back to plaintext. A padded value is refused because one driver may trim it
 and another may not.
 
-**The password.** A password holding none of `;`, `{` or `}`, with no leading or trailing space,
-is sent plain to any driver. Any other password needs braces and the ODBC `}}` escape, and is
-accepted only when `odbc_driver` is, in any case but spelled with single spaces, the whole
-registered name of one of these drivers:
+**The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
+registered name of one of these drivers, the password is **always** sent braced, with the ODBC
+`}}` escape, whatever it holds:
 
 - psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
   `(x64)`;
 - MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
   `... ANSI Driver`;
-- Microsoft's SQL Server drivers, not probed for this item but relied on for the same escape by
-  the SQL Server preset and the store: `SQL Server` or `ODBC Driver <n> for SQL Server`.
+- Microsoft's `ODBC Driver <n> for SQL Server`, not probed for this item but relied on for the
+  same escape by the SQL Server preset and the store.
 
-For any other name, a library path or another vendor's driver for the same database included,
-such a password is refused when the connection is built, so change the password. The engine reads
-the driver name as written, never the library it loads, so a driver manager alias that reuses one
-of these names is taken at its word. The Microsoft Access
-driver (ACE) is one that does not read the escape: it refused even a braced password with no brace
-in it, and a `}` let password text set another keyword.
+Braces matter even for a password with no delimiter in it. psqlODBC URL-decodes an unbraced `PWD`,
+so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (its
+`dlg_specific.c`, where `copyConnAttributes` calls `decode_or_remove_braces`). The braced form is
+the only one that sends such a password as written.
+
+For any other driver name, the password is sent plain when it holds none of `;`, `{` or `}` and
+has no leading or trailing space. Any other password is refused when the connection is built,
+with an error that says only that this driver cannot carry it, so change the password. This
+covers a library path, another vendor's driver for the same database, and the legacy name
+`SQL Server`, which is not on the list: on Linux it is commonly a FreeTDS alias, which has not been
+measured. The engine reads the driver name as written, never the library it loads, so a driver
+manager alias that reuses a listed name is taken at its word. The Microsoft Access driver (ACE)
+is one that does not read the escape: it refused even a braced password with no brace in it, and
+a `}` let password text set another keyword.
 
 ASCII only, because a driver manager may convert the string for the driver, and some
 conversions turn a non-ASCII character into a delimiter.

@@ -275,9 +275,11 @@ def test_build_odbc_dsn_postgres_shape() -> None:
     # BACKLOG #2705: values are sent unbraced. psqlODBC kept braces on UID and DATABASE, did not
     # honour a braced SSLmode (no TLS at all), and refused a braced PORT.
     assert "DATABASE=mefor;" in dsn
-    assert "UID=svc;" in dsn and "PWD=pw;" in dsn  # default credential keywords
+    assert "UID=svc;" in dsn and "PWD={pw};" in dsn  # default credential keywords
     assert "PORT=5432;" in dsn and "SSLmode=verify-full;" in dsn
-    assert dsn.count("{") == 1 and dsn.count("}") == 1  # only the driver name is braced
+    # Only the driver name and, for psqlODBC, the password are braced: psqlODBC URL-decodes an
+    # unbraced PWD.
+    assert dsn.count("{") == 2 and dsn.count("}") == 2
     # No SQL-Server TLS keywords are forced onto the generic path.
     assert "Encrypt=" not in dsn and "TrustServerCertificate=" not in dsn
 
@@ -363,7 +365,7 @@ def test_build_odbc_dsn_custom_credential_keywords() -> None:
             "odbc_password_key": "PASSWORD",
         }
     )
-    assert "USER=svc;" in dsn and "PASSWORD=pw;" in dsn
+    assert "USER=svc;" in dsn and "PASSWORD={pw};" in dsn  # MySQL is on the escape list
 
 
 def test_build_odbc_dsn_requires_driver() -> None:
