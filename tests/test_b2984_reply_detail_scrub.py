@@ -124,18 +124,12 @@ async def test_in_tree_reply_details_are_unchanged(
 async def test_a_ta1_reply_detail_is_stored_without_the_partners_code(
     sqlite_store: MessageStore,
 ) -> None:
-    # X12 used to carry the partner's TA1-04 verbatim as "TA1*<TA1-04>". The store's scrub does not
-    # know that shape: the control below shows "TA1*MRN7731" stored unchanged. So the transport emits
-    # only a code from TA1-04's closed set, and the TA1-shaped reply stores no partner text.
+    # X12 used to carry the partner's TA1-04 verbatim as "TA1*<TA1-04>". The transport now emits
+    # only a code from TA1-04's closed set, so the partner's text never reaches the store. The test
+    # asserts that on the store's INPUT, which makes the X12 change the control, whatever the store's
+    # scrub would do with partner text.
     from messagefoundry.config.models import ConnectorType, Destination
     from messagefoundry.transports.x12 import X12Destination
-
-    control_mid, control_item = await _delivered(sqlite_store, dest="OB_2984_CONTROL")
-    await sqlite_store.complete_with_response(
-        control_item.id, body="x", outcome="accepted", detail="TA1*MRN7731", now=101.0
-    )
-    (control,) = await sqlite_store.correlate_response(control_mid)
-    assert control.detail == "TA1*MRN7731"  # the scrub alone is not the control for this shape
 
     isa = (
         "ISA*00*" + " " * 10 + "*00*" + " " * 10 + "*ZZ*" + "SENDERID".ljust(15) + "*ZZ*"
@@ -154,7 +148,9 @@ async def test_a_ta1_reply_detail_is_stored_without_the_partners_code(
         )
     )
     captured = dest._check_ta1(reply, payload=sent)
-    assert captured is not None
+    assert captured is not None and captured.detail is not None
+    assert "MRN7731" not in captured.detail  # the store is never handed the partner's code
+    assert captured.detail == "TA1 with a TA1-04 outside A, E and R"
     mid, item = await _delivered(sqlite_store)
     await sqlite_store.complete_with_response(
         item.id,

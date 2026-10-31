@@ -159,9 +159,17 @@ def test_ta1_code_outside_the_set_is_not_echoed_into_the_detail(code: str) -> No
     assert r.detail == "TA1 with a TA1-04 outside A, E and R"
     assert code not in r.detail
     # The control: a code in the set, in either case, still reads back as the code.
-    for in_set in ("A", "a", ""):
+    for in_set in ("A", "a"):
         ok = _dest(capture_response=True)._check_ta1(_ta1(in_set), payload=EDI)
         assert isinstance(ok, DeliveryResponse) and ok.detail == "TA1*A"
+
+
+def test_an_empty_ta1_code_is_not_recorded_as_a() -> None:
+    # BACKLOG #2984: the partner sent no TA1-04 code, so the detail must not read "TA1*A", a code the
+    # partner never sent. It is still accepted, as before; the detail is a fixed phrase saying so.
+    r = _dest(capture_response=True)._check_ta1(_ta1(""), payload=EDI)
+    assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
+    assert r.detail == "TA1 with no TA1-04 code"
 
 
 def test_business_response_instead_of_ta1_is_accepted() -> None:

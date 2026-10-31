@@ -531,12 +531,19 @@ class X12Destination(DestinationConnector):
                         body=text, outcome="accepted", detail="TA1*E accepted-with-errors"
                     )
                 return None
-            # TA1*A (or any other present code) → accepted.
+            # Every value that reaches here is accepted: A, an empty TA1-04, and any other value.
             if self.capture_response:
-                # TA1-04 is a closed code set (A, E, R; E and R are handled above), but the element is
-                # the partner's text, so it is echoed only as A. Any other value gets a fixed phrase
-                # carrying none of it: the store's scrub does not catch every identifier (BACKLOG #2984).
-                detail = "TA1*A" if ta104 in ("", "A") else "TA1 with a TA1-04 outside A, E and R"
+                # TA1-04 is a closed code set (A, E, R), but the element is the partner's text. The
+                # arms above match only an exact "R" or "E": ta104 is upper-cased, not stripped, so a
+                # padded value such as "R " reaches here. Only a literal A is echoed, as TA1*A; an
+                # empty TA1-04 and any other value get a fixed phrase carrying none of the partner's
+                # text, since the store's scrub does not catch every identifier (BACKLOG #2984).
+                if ta104 == "A":
+                    detail = "TA1*A"
+                elif not ta104:
+                    detail = "TA1 with no TA1-04 code"
+                else:
+                    detail = "TA1 with a TA1-04 outside A, E and R"
                 return DeliveryResponse(body=text, outcome="accepted", detail=detail)
             return None
         # No TA1: a business response (271/277/278) returned instead — it IS the confirmation.
