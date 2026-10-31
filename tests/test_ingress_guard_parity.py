@@ -14,6 +14,7 @@ listener carries its own copy of the sequence.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import textwrap
@@ -28,6 +29,7 @@ from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
+    EnvRef,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -37,6 +39,7 @@ from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.base import ReceiptRefusedRetryable
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -330,7 +333,10 @@ async def _live_rows(
         wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)),
         listener,
     )
-    await handler(reg.inbound[ic.name], body)
+    # The HTTP receipt handler raises, after recording the row, for a codec name that sets up no
+    # decode; the row is what this compares, so the raise is the listener's answer and not a fault.
+    with contextlib.suppress(ReceiptRefusedRetryable):
+        await handler(reg.inbound[ic.name], body)
     cur = await store._db.execute("SELECT status, error FROM messages")
     return [dict(r) for r in await cur.fetchall()]
 
@@ -505,20 +511,100 @@ def test_the_nul_reason_is_the_listeners_stored_wording() -> None:
     )
 
 
-async def test_the_codec_name_is_where_the_two_callers_still_differ(store: MessageStore) -> None:
-    """Pins the codec-name difference ``decode_ingress``'s docstring states, so a change to it has to
-    update that docstring too. It is reported, not endorsed: the listener's side is a raise with no
-    ERROR row."""
-    ic = InboundConnection(
+def _inbound_declaring(encoding: object) -> InboundConnection:
+    """An inbound whose ``encoding`` setting holds ``encoding`` as-is, past the load-time name check."""
+    return InboundConnection(
         "in",
-        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": None}),
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": encoding}),
         router="r",
         content_type=ContentType.HL7V2,
     )
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_a_null_encoding_decodes_as_utf8_on_the_listener_as_in_the_dry_run(
+    store: MessageStore, listener: str
+) -> None:
+    """BACKLOG #2431: an explicit ``None`` is "not declared" on both callers. Before the fix the
+    listener handed ``None`` to ``bytes.decode`` and a ``TypeError`` escaped with no row at all."""
+    ic = _inbound_declaring(None)
     assert dry_run(_registry(ic), ADT_UTF8).disposition is MessageStatus.RECEIVED
 
-    with pytest.raises(TypeError):
-        await _live_rows(store, ic, ADT_UTF8, "_handle_inbound")
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert rows == [{"status": MessageStatus.RECEIVED.value, "error": None}]
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param("not-a-real-codec", id="unknown_name"),
+        pytest.param("base64", id="not_a_text_codec"),
+        pytest.param("undefined", id="refusing_codec"),
+        # An env() reference, which the decode never resolves. Config load refuses it on an inbound
+        # (test_wiring.py); the backstop refuses one that got past load all the same.
+        pytest.param(EnvRef("charset"), id="unresolved_env_ref"),
+    ],
+)
+async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_callers(
+    store: MessageStore, listener: str, declared: object
+) -> None:
+    """BACKLOG #2431: a name that sets up no decode is a ``decode`` ERROR row on the listener, worded
+    as the dry-run words it. Before the fix a ``LookupError`` or ``TypeError`` escaped the listener
+    into its transport with no row."""
+    ic = _inbound_declaring(declared)
+    preview = dry_run(_registry(ic), ADT_UTF8)
+
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert preview.disposition is MessageStatus.ERROR
+    assert preview.error is not None and preview.error.startswith("decode error (")
+    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
+    store: MessageStore, listener: str
+) -> None:
+    """BACKLOG #2431: config load refuses an env() inbound encoding instead of resolving it, so the
+    decode never reads an environment value. Pinned with a value present, so a return of per-message
+    resolution on either caller fails here rather than passing on an empty value set."""
+    ic = _inbound_declaring(EnvRef("charset"))
+    reg = _registry(ic)
+    preview = dry_run(reg, ADT_UTF8)
+    runner = wiring_runner.RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False), env_values={"charset": "utf-8"}
+    )
+    with contextlib.suppress(
+        ReceiptRefusedRetryable
+    ):  # the HTTP receipt's answer, as in _live_rows
+        await getattr(runner, listener)(reg.inbound["in"], ADT_UTF8)
+
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert preview.disposition is MessageStatus.ERROR
+    assert preview.error is not None and preview.error.startswith("decode error (")
+    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+
+
+async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:
+    """The NAK half: the MLLP listener answers AE, since the configuration and not the message is at
+    fault and a resend can succeed once it is fixed; bytes invalid in a usable charset stay AR."""
+    ic = _inbound_declaring("not-a-real-codec")
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
+
+    ack = await runner._handle_inbound(reg.inbound["in"], ADT_UTF8)
+
+    assert ack is not None and "MSA|AE|" in ack
+    ic_utf8 = _inbound(encoding="utf-8")
+    reg_utf8 = _registry(ic_utf8)
+    runner_utf8 = wiring_runner.RegistryRunner(
+        reg_utf8, store, egress=EgressSettings(deny_by_default=False)
+    )
+    invalid = await runner_utf8._handle_inbound(reg_utf8.inbound["in"], ADT_LATIN1)
+    assert invalid is not None and "MSA|AR|" in invalid
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:
@@ -529,3 +615,189 @@ def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:
 def test_ingress_encoding_falls_back_for_an_absent_or_null_declaration() -> None:
     assert ingress_guards.ingress_encoding(_inbound()) == "utf-8"
     assert ingress_guards.ingress_encoding(_inbound(encoding="latin-1")) == "latin-1"
+
+
+def test_only_a_codec_name_that_decodes_nothing_is_the_configurations_fault() -> None:
+    """BACKLOG #2431: the AE/AR split rests on the codec NAME, probed, not on the error's type, so a
+    usable codec refusing one body stays that body's fault (AR on MLLP)."""
+    with pytest.raises(ingress_guards.IngressGuardError) as body_fault:
+        ingress_guards.decode_body(ADT_LATIN1, _inbound(encoding="ascii"))
+    assert type(body_fault.value) is ingress_guards.IngressGuardError
+    for unusable in ("not-a-real-codec", "undefined", "base64"):
+        with pytest.raises(ingress_guards.IngressCodecUnusable):
+            ingress_guards.decode_body(ADT_UTF8, _inbound_declaring(unusable))
+
+
+# --- the strict-validation timeout (BACKLOG #1689 remainder) -----------------------------------
+
+
+def _strict_inbound(timeout: float | None, **kwargs: Any) -> InboundConnection:
+    return InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=True, hl7_version="2.5.1", strict_timeout_s=timeout),
+        **kwargs,
+    )
+
+
+def _slow_validate(monkeypatch: pytest.MonkeyPatch, seconds: float) -> list[int]:
+    """Make hl7apy's validate take ``seconds`` longer, in BOTH callers' namespaces; the returned list
+    counts the calls. On the unfixed dry-run, which validated un-timed, the call then goes on to
+    hl7apy, and the test fails on the ERROR hl7apy previews ("Missing required child
+    ADT_A01.PV1", since the fixture has no PV1) rather than on the timeout's text."""
+    import time
+
+    from messagefoundry.parsing import validate as real
+    from messagefoundry.pipeline import dryrun
+
+    calls: list[int] = []
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        time.sleep(seconds)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dryrun, "validate", slow)
+    monkeypatch.setattr(wiring_runner, "validate", slow)
+    return calls
+
+
+@pytest.mark.parametrize("listener", _LISTENERS)
+async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_sides(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, listener: str
+) -> None:
+    """The listener refuses a validate that outruns ``validation.strict_timeout_s`` (#89); a dry-run
+    that validated un-timed waited it out and previewed hl7apy's own refusal of the body instead
+    ("Missing required child ADT_A01.PV1"). Both must now say the same words."""
+    _slow_validate(monkeypatch, 0.3)
+    ic = _strict_inbound(0.05)
+
+    preview = dry_run(_registry(ic), ADT_UTF8)
+    rows = await _live_rows(store, ic, ADT_UTF8, listener)
+
+    assert preview.disposition is MessageStatus.ERROR, preview.error
+    assert preview.error == "strict-validation timed out after 0.05s"
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert rows[0]["error"] == preview.error
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, step: float) -> None:
+    """Advance the dry-run's monotonic clock by ``step`` on every read, so a validate measures as
+    ``step`` seconds long without the test sleeping."""
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dryrun
+
+    ticks = iter(range(1_000_000))
+    # The module's own `time` name only, so the patched clock reaches nothing outside dryrun.
+    fake = SimpleNamespace(time=time.time, monotonic=lambda: next(ticks) * step)
+    monkeypatch.setattr(dryrun, "time", fake)
+
+
+def test_a_validate_measured_past_the_timeout_gives_the_listener_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inline, the preview cannot abandon a validate; it measures it, and a finished validate that
+    took longer than the timeout is refused with the listener's text, not with what it returned."""
+    _clock(monkeypatch, 31.0)
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == "strict-validation timed out after 30.0s"
+
+
+def test_a_fault_raised_after_the_timeout_gives_the_timeout_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The listener has given up by the time a late validate raises, so its row says timed out; the
+    preview checks the elapsed time before re-raising, and says the same. The fault is not dropped
+    silently: its class is logged, never its text (CLAUDE.md section 6)."""
+    import logging
+
+    from messagefoundry.pipeline import dryrun
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("validator fault MRN-77031")
+
+    monkeypatch.setattr(dryrun, "validate", boom)
+    _clock(monkeypatch, 31.0)
+
+    with caplog.at_level(logging.DEBUG, logger=dryrun.__name__):
+        result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.error == "strict-validation timed out after 30.0s"
+    late = [r for r in caplog.records if "after its timeout" in r.getMessage()]
+    assert len(late) == 1 and "RuntimeError" in late[0].getMessage()
+    assert "MRN-77031" not in caplog.text
+
+
+def test_a_disabled_timeout_validates_un_timed_as_the_listener_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``strict_timeout_s <= 0`` turns the backstop off on the listener, so the preview never times
+    the validate out, however long it measures."""
+    _clock(monkeypatch, 1e6)
+
+    result = dry_run(_registry(_strict_inbound(0)), ADT_UTF8)
+
+    # The fixture has no PV1, so hl7apy refuses it; what matters is that it was not a timeout.
+    assert result.error == "Missing required child ADT_A01.PV1"
+
+
+def test_an_invalid_result_with_empty_error_text_is_still_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``validate`` reports a fault as ``ok=False`` with the exception's text, which can be empty; the
+    listener refuses on ``ok`` alone, so the preview must not read the empty text as valid."""
+    from messagefoundry.parsing import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(
+        dryrun, "validate", lambda *a, **k: ValidationResult(ok=False, version=None, errors=[""])
+    )
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+
+
+def test_a_fast_validate_inside_the_timeout_still_reports_its_errors() -> None:
+    """The bound changes nothing for a validate that finishes in time: hl7apy's own errors come back."""
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == "Missing required child ADT_A01.PV1"
+
+
+def test_a_validate_that_raises_inside_the_timeout_still_raises_out_of_the_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault inside the timeout is the validator's, not a timeout, and leaves ``dry_run`` as before."""
+    from messagefoundry.pipeline import dryrun
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("validator fault")
+
+    monkeypatch.setattr(dryrun, "validate", boom)
+
+    with pytest.raises(RuntimeError, match="validator fault"):
+        dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+
+def test_a_streaming_body_over_its_threshold_is_not_whole_body_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The listener validates only the header of such a body, so a whole-body validate the preview
+    timed out on would refuse a message the engine takes."""
+    calls = _slow_validate(monkeypatch, 0.0)
+    _clock(monkeypatch, 1e6)
+    ic = _strict_inbound(0.05, stream_threshold_bytes=16)
+
+    result = dry_run(_registry(ic), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.RECEIVED, result.error
+    assert calls == []
