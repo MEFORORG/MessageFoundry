@@ -708,8 +708,29 @@ def test_success_for_another_subject_does_not_reopen_the_line(
             det.observe("auth.login_failed", None, None, "good", None)
         clock.now += 61
         det.observe("auth.login_failed", None, None, "bad", None)
-    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 199]
+    # Each success resets the held count, so the second window's line counts none.
+    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 0]
     assert "recovered" not in caplog.text
+
+
+def test_a_success_resets_the_held_count_but_not_the_line_throttle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink, clock = _Switchable(), _Clock()
+    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=1), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        for _ in range(5):
+            det.observe_refusal("IB_A")  # one line, then four held
+        sink.down = False
+        det.observe_refusal("IB_B")  # a success: the four are dropped from the count
+        sink.down = True
+        for _ in range(3):
+            det.observe_refusal("IB_C")  # still inside the window: held, no line
+        assert len(_failed_lines(caplog)) == 1
+        clock.now += 61
+        det.observe_refusal("IB_D")
+    # The control: the three failures after the success are counted.
+    assert [_held_back(line) for line in _failed_lines(caplog)] == [0, 3]
 
 
 def test_differing_exception_types_per_subject_share_one_line_per_window(
@@ -739,20 +760,23 @@ async def test_a_release_whose_resolve_fails_leaves_the_alert_open_and_nothing_r
     remove = install_security_signals(
         sink, _thresholds(), asyncio.get_running_loop(), resolve_on_stop=True
     )
-    cast(Any, audit_tee).emit_audit_tee(
-        action="config_loaded",
-        actor="system",
-        channel_id=None,
-        detail=json.dumps({"loosenings": ["security.allow_x"]}),
-        ts=0.0,
-        row_id=1,
-        seq=1,
-        row_hash="0" * 64,
-    )
-    assert [s for s, _n, _c, _d in sink.signals] == ["posture_loosened"]
-    sink.down = True
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
-        remove()  # the production caller, which the lifespan runs once
+    try:
+        cast(Any, audit_tee).emit_audit_tee(
+            action="config_loaded",
+            actor="system",
+            channel_id=None,
+            detail=json.dumps({"loosenings": ["security.allow_x"]}),
+            ts=0.0,
+            row_id=1,
+            seq=1,
+            row_hash="0" * 64,
+        )
+        assert [s for s, _n, _c, _d in sink.signals] == ["posture_loosened"]
+        sink.down = True
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+            remove()  # the production caller, which the lifespan runs once
+    finally:
+        remove()  # idempotent on the observers
     assert sink.restored == []
     assert [line.split(" could")[0] for line in _failed_lines(caplog)] == [
         "security-signal alert posture_restored"
@@ -760,6 +784,41 @@ async def test_a_release_whose_resolve_fails_leaves_the_alert_open_and_nothing_r
     sink.down = False
     remove()  # a second call, which the lifespan never makes, still resolves nothing
     assert sink.restored == []
+
+
+async def test_release_logs_each_event_types_held_failures_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink = _Switchable()
+    remove = install_security_signals(
+        sink, _thresholds(peer_refusals=1, signin_failures=1), asyncio.get_running_loop()
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+            for i in range(4):
+                admission.notify_refusal(f"IB_{i}")  # one line, three held
+            await asyncio.sleep(0)
+            # The control: an event type that failed once, with nothing held, writes no
+            # release line.
+            cast(Any, audit_tee).emit_audit_tee(
+                action="auth.login_failed",
+                actor=None,
+                channel_id=None,
+                detail=None,
+                ts=0.0,
+                row_id=1,
+                seq=1,
+                row_hash="0" * 64,
+                client="10.0.0.1",
+            )
+            remove()
+    finally:
+        remove()
+    released = [r.getMessage() for r in caplog.records if "were not logged" in r.getMessage()]
+    assert released == [
+        "security-signal alert peer_refused_burst: 3 failure(s) held back since the last line "
+        "or success were not logged before the detector was released"
+    ]
 
 
 def test_failed_raises_spend_no_named_slot() -> None:

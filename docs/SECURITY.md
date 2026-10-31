@@ -6411,19 +6411,16 @@ it as well.
 
 **Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
 a detector count of `0` or above its default, or a window shorter than its default while any
-count is above `0`, is named in
-`GET /security/posture` and in the start's `config_loaded` row.
+count is above `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
 With the layer off, every detector stops but the posture one, so that start still raises
 `posture_loosened` naming the switch. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
 process and pages nobody. An unpinned cluster node's identity changes on every start, so that
-node raises the inverse for its own alert as it shuts down instead. On such a node the alert can
-stay open, at least after a hard kill or a failed resolve at shutdown; resolve it by hand with
-`POST /alerts/{alert_id}/resolve`, which needs `monitoring:diagnose`, or from the web console's
-alert list. `install_security_signals` in `messagefoundry/pipeline/security_signals.py` states the boundary. `posture_loosened` does not fire, and nothing
-resolves, on a start whose
-`config_loaded` row records its loosenings as unknown, such as one whose config snapshot could not
-be taken.
+node raises the inverse for its own alert as it shuts down instead. That alert can stay open after
+shutdown, at least after a hard kill or a resolve that did not land: resolve it by hand with an
+account that is not channel-scoped and holds `monitoring:diagnose`, or in the web console's alert
+list. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
+records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

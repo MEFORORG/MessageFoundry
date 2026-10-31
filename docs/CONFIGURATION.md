@@ -1956,7 +1956,7 @@ the instance on the alert list. A later start that records an empty list resolve
 `@shard:<id>` where several engine processes share the store, so one process's clean start never
 resolves another's; an unpinned cluster node's id changes on every start, so that node raises the
 inverse for its own alert as it shuts down. When that alert can still stay open, and how to
-resolve it by hand, is in [SECURITY.md](SECURITY.md), *Audit*.
+resolve it by hand, is in [SECURITY.md](SECURITY.md#audit-1).
 `log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
 resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a

@@ -455,9 +455,9 @@ class SecuritySignalDetector:
         )
 
     def release(self) -> None:
-        """Raise ``posture_restored`` for the ``posture_loosened`` this detector raised. Called
-        once, by the remover :func:`install_security_signals` returns; its ``resolve_on_stop``
-        says when that resolves the alert and when the alert stays open."""
+        """Raise ``posture_restored`` for the ``posture_loosened`` this detector raised, from the
+        remover :func:`install_security_signals` returns. docs/SECURITY.md, *Audit*, says when the
+        alert can stay open anyway."""
         if self._posture_raised is not None:
             self._restore(self._posture_raised)
 
@@ -476,8 +476,9 @@ class SecuritySignalDetector:
 
         A failure is logged at WARNING at most once per :data:`_SINK_FAILURE_LOG_SECONDS` per
         event type, whatever the subject, the exception type, or any success in between. The next
-        line carries how many failures of that type were held back since the last one. So the
-        lines written are bounded by the number of event types times the minutes elapsed. A
+        line carries how many failures of that type were held back since the last line or
+        success, since a success resets that count; :meth:`flush_held` logs what is still held at
+        release. So the lines written are bounded by the event types times the minutes elapsed. A
         sink that keeps raising no longer starts the refusal quiet period, and a caller can choose
         subjects (a client address, a username), so a key on the subject would let a refused
         peer, or a spread of subjects, write a line each. A line does not say which subject
@@ -494,14 +495,30 @@ class SecuritySignalDetector:
             self._sink_failures[event] = (now + _SINK_FAILURE_LOG_SECONDS, 0)
             log.warning(
                 "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
-                "alert type held back since the last such line; at most one line every %gs)",
+                "alert type held back since the last line or success; at most one line every %gs)",
                 event,
                 f"{type(exc).__module__}.{type(exc).__qualname__}",
                 held,
                 _SINK_FAILURE_LOG_SECONDS,
             )
             return False
+        failing = self._sink_failures.get(event)
+        if failing is not None and failing[1]:
+            self._sink_failures[event] = (failing[0], 0)
         return True
+
+    def flush_held(self) -> None:
+        """Log, once per event type, the sink failures still held back, so a run that ends with
+        no later failure line is not lost from the log."""
+        for event, (_next_at, held) in self._sink_failures.items():
+            if held:
+                log.warning(
+                    "security-signal alert %s: %d failure(s) held back since the last line or "
+                    "success were not logged before the detector was released",
+                    event,
+                    held,
+                )
+        self._sink_failures.clear()
 
 
 def install_security_signals(
@@ -516,18 +533,11 @@ def install_security_signals(
     observers while it counts refusals; returns the function that removes it.
 
     ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
-    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. A lone
-    engine or a pinned node needs no such step: its next start that records no loosening resolves
-    the alert under the same subject. With ``resolve_on_stop``, the function this returns raises
-    ``posture_restored`` once, as
-    :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts. The
-    managed lifespan calls it from the ``finally`` block around its whole span, so it runs on any
-    shutdown that reaches that block, a failed startup or a cancelled lifespan among them. The
-    unpinned node's alert stays open under the dead node's id at least after a hard kill, which
-    never reaches the block, and when that ``posture_restored`` call fails or its write does not
-    land before the store closes: nothing retries it. An operator then resolves it with
-    ``POST /alerts/{alert_id}/resolve``, which needs ``monitoring:diagnose``, or from the web
-    console's alert list. The docs point here for this boundary. The removal must run on
+    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. With it,
+    the function this returns raises ``posture_restored`` for that alert, as
+    :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts.
+    docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. The function also logs
+    the sink failures still held back (:meth:`SecuritySignalDetector.flush_held`). It must run on
     ``loop``'s thread, before the store closes.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
@@ -570,5 +580,6 @@ def install_security_signals(
         remove_refusal_observer(_refused)
         if resolve_on_stop:
             detector.release()
+        detector.flush_held()
 
     return _remove

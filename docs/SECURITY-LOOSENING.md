@@ -839,9 +839,8 @@ count is above `0` (vault BACKLOG #2613).
   no reason to zero or raise `security_peer_refusals`, since that detector covers what the SIEM
   cannot see. Raising it is acceptable for a listener that ordinary load holds at a connection
   cap, which the `security_peer_refusals` row of [CONFIGURATION.md](CONFIGURATION.md) describes.
-  It is one setting for every inbound listener. Each listener counts its own refusals and raises
-  its own alert, so after raising it every inbound listener needs that larger burst, allowlist
-  refusals included, before its own alert raises.
+  It is one setting for every inbound listener, and each listener counts its own refusals; the
+  `[alerts]` table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating

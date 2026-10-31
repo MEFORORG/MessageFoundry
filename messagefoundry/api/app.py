@@ -3107,8 +3107,7 @@ def _install_security_signals(
     return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
     itself a loosening, and the posture detector, the one it leaves running, is what reports it.
     The posture subject names this engine process, and an unpinned cluster node, whose id changes
-    on every start, raises the inverse for its own posture alert as it shuts down;
-    ``install_security_signals``'s ``resolve_on_stop`` says when that alert still stays open."""
+    on every start, raises the inverse for its own posture alert as it shuts down."""
     return install_security_signals(
         sink,
         SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
