@@ -12,11 +12,16 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import AlertRule, AlertSeverity, AlertsSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import (
     AlertRuleSet,
     NotifierAlertSink,
     notifier_from_settings,
 )
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _RecordingTransport:
@@ -303,7 +308,7 @@ def test_factory_passes_rules() -> None:
         webhook_url="https://hooks.example/x",
         rules=[AlertRule(event_type="connection_stopped", severity=AlertSeverity.CRITICAL)],
     )
-    sink = notifier_from_settings(settings)
+    sink = notifier_from_settings(settings, posture=_NOT_ENFORCING)
     assert sink is not None
     d = sink._rules.decide({"type": "connection_stopped", "connection": "OB_X"})
     assert d.severity == "critical"
@@ -316,7 +321,7 @@ def test_factory_rejects_rule_to_unconfigured_transport() -> None:
         rules=[AlertRule(event_type="queue_buildup", transports=["email"])],
     )
     with pytest.raises(ValueError, match="unconfigured transport"):
-        notifier_from_settings(settings)
+        notifier_from_settings(settings, posture=_NOT_ENFORCING)
 
 
 # --- AlertRule model validation ----------------------------------------------

@@ -1878,10 +1878,14 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
     # Return a MUTABLE bytearray (not immutable bytes) so the cipher that receives it can lock + zeroize
     # the raw key material after AESGCM has copied it in (ASVS 13.3.3). base64.b64decode returns bytes;
     # bytearray(...) makes the single owned, wipeable copy the DEK travels in.
-    try:
+    # Raised outside the handler, with no chain: for a key with a character that is not ASCII the
+    # error's context is a UnicodeEncodeError, which names that character and holds the whole key
+    # (BACKLOG #3471).
+    decoded: bytes | None = None
+    with contextlib.suppress(ValueError):  # binascii.Error is a ValueError
         decoded = base64.b64decode(key_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-        raise ValueError(f"{name} must be valid base64") from exc
+    if decoded is None:
+        raise ValueError(f"{name} must be valid base64")
     if len(decoded) != 32:
         raise ValueError(
             f"{name} must decode to 32 bytes (got {len(decoded)}); generate one with `messagefoundry gen-key`"

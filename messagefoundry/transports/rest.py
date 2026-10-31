@@ -102,6 +102,7 @@ from messagefoundry.transports.bounded_read import (
     proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
+from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -2308,7 +2309,12 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
     sends the password. A user with no password sends nothing. Never raises: a URL the transport
     cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
-    caller passes a value, and anything that is not a string answers ``False``."""
+    caller passes a value, and anything that is not a string answers ``False``.
+
+    Since vault BACKLOG #2965 the transport also refuses at build a value with a path, query or
+    fragment, which is how an unencoded ``/``, ``?`` or ``#`` in the password reads. This still
+    answers ``True`` for such a value, as ``_parse_proxy`` reads it: it may report a hop the build
+    refuses, and it never hides one the build accepts."""
     if not isinstance(proxy_url, str):
         return False
     proxy = proxy_url.strip()
@@ -2317,8 +2323,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     try:
         if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
             return False
-        # Private, but it is exactly what ProxyHandler.proxy_open calls; a test pins the pairing.
-        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+        # The parser ProxyHandler.proxy_open runs; a test pins the pairing.
+        _, user, password, _ = read_like_urllib(proxy)
     except ValueError:
         return False
     return bool(user and password)
@@ -2359,7 +2365,12 @@ def proxy_config_from_settings(
     target's scheme (for the digest-over-https refusal); ``attested`` keys the cleartext-proxy-hop guard.
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
-    (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes."""
+    (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
+
+    An explicit URL is parsed once, by :func:`~messagefoundry.transports.proxy_address.parse_proxy_url`,
+    which refuses a path, a query, a fragment and any value urllib's proxy parser would read as
+    naming another host (vault BACKLOG #2965). The connector dials the URL rebuilt from those parts,
+    so it dials the host ``[egress].allowed_proxy`` judged."""
     raw = s.get("proxy_url")
     if not raw:
         return None
@@ -2387,6 +2398,9 @@ def proxy_config_from_settings(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
             "(ADR 0126)"
         )
+    # Rebuilt from the one parse the allow-list gate also reads, so what is dialled is what was
+    # judged (vault BACKLOG #2965).
+    proxy_url = parse_proxy_url(proxy_url).url
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,

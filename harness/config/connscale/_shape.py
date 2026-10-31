@@ -6,9 +6,11 @@ Loader skips ``_*`` modules, so this file is *imported* by :mod:`graph` rather t
 It centralizes the ``MEFOR_CONNSCALE_*`` env knobs (mirroring ``harness/config/load/_shape.py``'s
 pattern) so the N-inbound graph reads them in one place — no copy-paste across registered modules.
 
-The connection-scale harness sets ``MEFOR_CONNSCALE_COUNT=N`` (and the matching sink env) in the
-engine subprocess environment **before each sweep step**, so ONE graph file serves every N (500 /
-1000 / 1500 — or the CI smoke's 50 / 100) by env alone, with no per-N file generation. Each of the N
+Serving ``harness/config/connscale`` reads the shape from ``MEFOR_CONNSCALE_COUNT=N`` (and the
+matching sink env), so ONE graph file serves every N by env alone. That env route reaches the engine
+process only: a ``[sandbox].mode = "subprocess"`` worker never receives a ``MEFOR_`` name, so the
+connscale sweep runner writes each step's shape into a generated config directory instead, validated
+by the same :func:`make_connscale_shape` (BACKLOG #3132). Each of the N
 inbounds points at a trivial router → trivial handler → one outbound to the correlation sink, so the
 measured cost is the engine's *per-connection machinery* (workers, wake events, pool, executor hops),
 not transform CPU.
@@ -55,19 +57,16 @@ _MAX_COUNT = 5000  # generous headroom over the 1500 ceiling; a typo of 50000 fa
 _NAME_PREFIX_RE = re.compile(r"^[A-Za-z0-9_]*$")
 
 
-def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+def _env_int(name: str) -> int | None:
+    """Parse one integer knob, or ``None`` when it is unset. Parsing only: the bounds live once, in
+    :func:`make_connscale_shape`, so the env route and the generated route cannot disagree."""
     raw = os.environ.get(name)
     if not raw:
-        return default
+        return None
     try:
-        value = int(raw)
+        return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
-    if value > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value}")
-    return value
 
 
 @dataclass(frozen=True)
@@ -99,21 +98,35 @@ class ConnScaleShape:
         return f"{role}_{tag}CS_{index:05d}"
 
 
-def load_connscale_shape() -> ConnScaleShape:
-    transform = os.environ.get("MEFOR_CONNSCALE_TRANSFORM", CHEAP).strip().lower() or CHEAP
+def make_connscale_shape(
+    *,
+    count: int = 50,
+    base_port: int = 2600,
+    sink_host: str = "127.0.0.1",
+    sink_port: int = 2700,
+    sink_ports: int = 1,
+    transform: str = CHEAP,
+    name_prefix: str = "",
+) -> ConnScaleShape:
+    """Validate the knobs and build a :class:`ConnScaleShape`. The ONE validation both routes share:
+    the env route (:func:`load_connscale_shape`) and the generated per-step config directory the
+    connscale runner writes (``harness.load.connscale.stepconfig``, BACKLOG #3132), so a shape that
+    one route refuses the other refuses too."""
+    # Each refusal names the knob both ways: the profile/CLI name the sweep runner sets, and the
+    # MEFOR_CONNSCALE_* variable the env route reads.
     if transform not in _TRANSFORMS:
         raise ValueError(
-            f"MEFOR_CONNSCALE_TRANSFORM must be one of {sorted(_TRANSFORMS)}, got {transform!r}"
+            f"transform (MEFOR_CONNSCALE_TRANSFORM) must be one of {sorted(_TRANSFORMS)}, "
+            f"got {transform!r}"
         )
-    count = _env_int("MEFOR_CONNSCALE_COUNT", 50, minimum=_MIN_COUNT, maximum=_MAX_COUNT)
-    base_port = _env_int("MEFOR_CONNSCALE_BASE_PORT", 2600, minimum=1, maximum=_MAX_PORT)
-    sink_port = _env_int("MEFOR_CONNSCALE_SINK_PORT", 2700, minimum=1, maximum=_MAX_PORT)
-    sink_ports = _env_int("MEFOR_CONNSCALE_SINK_PORTS", 1, minimum=1, maximum=4096)
-    name_prefix = os.environ.get("MEFOR_CONNSCALE_NAME_PREFIX", "").strip()
+    _bounded("count (MEFOR_CONNSCALE_COUNT)", count, minimum=_MIN_COUNT, maximum=_MAX_COUNT)
+    _bounded("base_port (MEFOR_CONNSCALE_BASE_PORT)", base_port, minimum=1, maximum=_MAX_PORT)
+    _bounded("sink port (MEFOR_CONNSCALE_SINK_PORT)", sink_port, minimum=1, maximum=_MAX_PORT)
+    _bounded("sink ports (MEFOR_CONNSCALE_SINK_PORTS)", sink_ports, minimum=1, maximum=4096)
     if not _NAME_PREFIX_RE.match(name_prefix):
         raise ValueError(
-            f"MEFOR_CONNSCALE_NAME_PREFIX must match [A-Za-z0-9_]* (safe in a connection name), "
-            f"got {name_prefix!r}"
+            f"name prefix (MEFOR_CONNSCALE_NAME_PREFIX) must match [A-Za-z0-9_]* (safe in a "
+            f"connection name), got {name_prefix!r}"
         )
     # The N inbound ports occupy [base_port, base_port + count). Validate the block stays inside the
     # port space and does NOT overlap the sink port range — a collision would have an inbound listener
@@ -121,21 +134,59 @@ def load_connscale_shape() -> ConnScaleShape:
     inbound_hi = base_port + count - 1
     if inbound_hi > _MAX_PORT:
         raise ValueError(
-            f"MEFOR_CONNSCALE_BASE_PORT={base_port} + COUNT={count} runs past port {_MAX_PORT} "
+            f"base_port {base_port} + count {count} runs past port {_MAX_PORT} "
             f"(highest inbound port would be {inbound_hi})"
         )
     sink_lo, sink_hi = sink_port, sink_port + sink_ports - 1
     if base_port <= sink_hi and sink_lo <= inbound_hi:
         raise ValueError(
             f"inbound port block [{base_port}, {inbound_hi}] overlaps the sink port range "
-            f"[{sink_lo}, {sink_hi}] — move MEFOR_CONNSCALE_BASE_PORT or MEFOR_CONNSCALE_SINK_PORT apart"
+            f"[{sink_lo}, {sink_hi}] — move base_port (MEFOR_CONNSCALE_BASE_PORT) or the sink "
+            f"port (--sink-port, MEFOR_CONNSCALE_SINK_PORT) apart"
         )
     return ConnScaleShape(
         count=count,
         base_port=base_port,
-        sink_host=os.environ.get("MEFOR_CONNSCALE_SINK_HOST", "127.0.0.1") or "127.0.0.1",
+        sink_host=sink_host or "127.0.0.1",
         sink_port=sink_port,
         sink_ports=sink_ports,
         transform=transform,
         name_prefix=name_prefix,
     )
+
+
+def _bounded(name: str, value: int, *, minimum: int, maximum: int) -> None:
+    # bool is an int; a True count is a typo, not 1.
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    if value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value}")
+
+
+def load_connscale_shape() -> ConnScaleShape:
+    """The shape the ``MEFOR_CONNSCALE_*`` environment names. The env route reaches the engine only:
+    a ``[sandbox].mode = "subprocess"`` worker's environment is an allowlist that never carries a
+    ``MEFOR_`` name, so a worker that ran this would build the default shape (BACKLOG #3132). The
+    connscale runner therefore writes the shape into a generated config directory instead."""
+    # Only what is set is passed, so each default lives once, in make_connscale_shape's signature.
+    knobs: dict[str, int | str] = {}
+    for key, name in (
+        ("count", "MEFOR_CONNSCALE_COUNT"),
+        ("base_port", "MEFOR_CONNSCALE_BASE_PORT"),
+        ("sink_port", "MEFOR_CONNSCALE_SINK_PORT"),
+        ("sink_ports", "MEFOR_CONNSCALE_SINK_PORTS"),
+    ):
+        value = _env_int(name)
+        if value is not None:
+            knobs[key] = value
+    for key, name in (
+        ("sink_host", "MEFOR_CONNSCALE_SINK_HOST"),
+        ("transform", "MEFOR_CONNSCALE_TRANSFORM"),
+        ("name_prefix", "MEFOR_CONNSCALE_NAME_PREFIX"),
+    ):
+        text = os.environ.get(name, "").strip()
+        if text:
+            knobs[key] = text.lower() if key == "transform" else text
+    return make_connscale_shape(**knobs)  # type: ignore[arg-type]
