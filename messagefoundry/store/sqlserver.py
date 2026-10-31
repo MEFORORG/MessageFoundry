@@ -2065,8 +2065,14 @@ _SCHEMA: list[str] = [
     # Transform-accessible state (ADR 0005). Written here via transform_handoff (parity with SQLite/
     # Postgres): the read-through cache is loaded at open and refreshed post-commit, so a Handler's
     # cross-message state_get(...) resolves in-process. Schema matches SQLite.
+    # BACKLOG #1588: namespace and [key] are BIN2 so pk_state, the MERGE match and the re-seal UPDATEs
+    # compare case- and accent-exactly, as the cache and SQLite/Postgres do. Under a _CI_ default the
+    # MERGE matched another spelling and kept it, while the value was sealed to the incoming one, so a
+    # keyed reopen failed closed. BIN2 does NOT fix trailing spaces: `=` and the PK pad them under
+    # every collation, so 'k' and 'k ' would still be one row. SetState refuses a trailing space instead.
     """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
-        namespace NVARCHAR(256) NOT NULL, [key] NVARCHAR(256) NOT NULL, value NVARCHAR(MAX) NOT NULL,
+        namespace NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        [key] NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL, value NVARCHAR(MAX) NOT NULL,
         set_at FLOAT NOT NULL, message_id NVARCHAR(64) NULL,
         CONSTRAINT pk_state PRIMARY KEY (namespace, [key]))""",
     """IF INDEXPROPERTY(OBJECT_ID('state'),'ix_state_set_at','IndexID') IS NULL
@@ -2077,10 +2083,11 @@ _SCHEMA: list[str] = [
     # fits SQL Server's 1700-byte nonclustered-index key cap (2*(256+64+450) = 1540 bytes) — hence
     # PRIMARY KEY NONCLUSTERED; write_reference_snapshot fail-closes on wider keys BEFORE its
     # transaction (the runtime rejector is the column width itself, via truncation). The explicit
-    # binary collation (BIN2) makes key equality a byte comparison like SQLite/Postgres: under a
-    # case-insensitive database default, externally-sourced keys differing only by case (or a trailing
-    # space, per ANSI padding on index keys) would raise a PK duplicate MID-transaction — a perpetual
-    # per-interval sync-failure alert. value is ciphertext at rest (snapshot values may carry PHI).
+    # binary collation (BIN2) makes key equality case- and accent-exact like SQLite/Postgres: under a
+    # case-insensitive database default, externally-sourced keys differing only by case would raise a
+    # PK duplicate MID-transaction — a perpetual per-interval sync-failure alert. BIN2 does NOT fix a
+    # trailing space: `=` and the PK pad it under every collation, BIN2 included, so keys differing only
+    # by trailing spaces still collide here. value is ciphertext at rest (snapshot values may carry PHI).
     # reference_version.name/version carry the same collation so the active-snapshot LEFT JOIN can
     # never hit a cross-column collation conflict.
     """IF OBJECT_ID('reference','U') IS NULL CREATE TABLE reference (
