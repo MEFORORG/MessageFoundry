@@ -94,6 +94,7 @@ from messagefoundry.config.settings import (
     SyslogProtocol,
 )
 from messagefoundry.config.wiring import (
+    _WITHHELD_PEER,
     Registry,
     WiringError,
     _peer_label,
@@ -317,9 +318,39 @@ def _proxy_hop(
     return StaticCredentialHop(
         f"proxy:{name}",
         "static",
-        f"forward-proxy {kind} credential ({_peer_label({'url': proxy_url})})",
+        f"forward-proxy {kind} credential ({_proxy_peer_label(proxy_url)})",
         False,
     )
+
+
+def _proxy_peer_label(proxy_url: object) -> str:
+    """The proxy hop's peer label: the host and port the connector dials (vault BACKLOG #2965).
+
+    A configured URL is read by the transport's one proxy parse, so the label names the host
+    ``[egress].allowed_proxy`` judges and urllib dials, not one ``urlsplit`` alone reads. A value
+    that parse refuses is refused at build too, so its label is withheld rather than guessed. An
+    ``env()`` reference, an empty value, ``"default"`` and a value with no ``http(s)`` scheme keep
+    the generic label."""
+    # Lazy, like ``_smart``: the transport owns how its proxy URL is read.
+    from messagefoundry.transports.proxy_address import parse_proxy_url
+    from messagefoundry.transports.rest import PROXY_DEFAULT, url_scheme
+
+    proxy = proxy_url.strip() if isinstance(proxy_url, str) else ""
+    if proxy.lower() in ("", PROXY_DEFAULT):
+        return _peer_label({"url": proxy_url})
+    try:
+        scheme = url_scheme(proxy, "proxy_url")
+    except ValueError:
+        scheme = ""
+    if scheme not in ("http", "https"):
+        # The build refuses any other scheme before it parses the address, so nothing is dialled
+        # through this value; the generic label reads it as it always has.
+        return _peer_label({"url": proxy_url})
+    try:
+        address = parse_proxy_url(proxy)
+    except ValueError:
+        return _WITHHELD_PEER
+    return _peer_label({"url": address.label_url})
 
 
 def _remote_file_hop(

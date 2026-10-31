@@ -4,7 +4,7 @@
 
 The router/transform workers run ``route_only``/``transform_one`` via bare ``asyncio.to_thread``,
 which dispatches onto the event loop's **default** ``ThreadPoolExecutor`` (lazily created at the
-first ``run_in_executor(None, ...)`` with ``max_workers = min(32, (os.cpu_count() or 1) + 4)``). That
+first ``run_in_executor(None, ...)`` with ``max_workers = min(32, (os.process_cpu_count() or 1) + 4)``). That
 default pool is shared by EVERY inbound's workers, so it is the "executor saturation" wall the
 connection-scale harness measures — but Python never exposes its submit-queue depth or in-flight
 count, and a lazily-created default executor isn't reachable to read.
@@ -38,9 +38,13 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 def default_executor_max_workers() -> int:
     """The CPython default ``ThreadPoolExecutor`` size for ``asyncio``'s default executor —
-    ``min(32, (os.cpu_count() or 1) + 4)``. The shim installs EXACTLY this so the measured wall is the
-    real default pool, not a capacity we chose."""
-    return min(32, (os.cpu_count() or 1) + 4)
+    ``min(32, (os.process_cpu_count() or 1) + 4)``. The shim installs EXACTLY this so the measured wall
+    is the real default pool, not a capacity we chose.
+
+    ``process_cpu_count``, not ``cpu_count``: CPython reads it since 3.13, and it honours a CPU
+    affinity mask, so on an engine pinned to some of a machine's CPUs the two differ. This read
+    ``cpu_count`` until BACKLOG #3132 and installed the larger pool there."""
+    return min(32, (os.process_cpu_count() or 1) + 4)
 
 
 class InstrumentedThreadPoolExecutor(ThreadPoolExecutor):

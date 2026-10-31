@@ -37,6 +37,7 @@ from fastapi import FastAPI
 from messagefoundry.api import create_managed_app
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -259,6 +260,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -296,6 +298,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

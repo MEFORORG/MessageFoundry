@@ -23,6 +23,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -148,6 +149,7 @@ def _loosenings(
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=secrets or SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

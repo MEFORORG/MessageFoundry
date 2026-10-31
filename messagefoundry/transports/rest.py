@@ -102,6 +102,7 @@ from messagefoundry.transports.bounded_read import (
     proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
+from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -1042,13 +1043,6 @@ _PROXY_URL_CREDENTIAL_REFUSED = (
     "credential written in a proxy URL. Take it out of the URL. To log in to the proxy, set "
     "proxy_user and proxy_password: a proxy off this machine then also takes cleartext_accepted "
     "with a cleartext_reason"
-)
-#: The refusal of a ``proxy_url`` the engine's checks and urllib would read differently. Fixed text,
-#: for the same reason.
-_PROXY_URL_UNREADABLE_REFUSED = (
-    "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
-    "[egress], holds an @ that urllib cannot read, or it names a host urllib would not dial. "
-    "Correct the URL; a password in it belongs in proxy_password"
 )
 
 
@@ -2073,12 +2067,14 @@ class ProxyConfig:
 
     def for_host(self, url: str) -> _HostProxy | None:
         """The proxy resolved for the host of the target ``url``, or ``None`` if that host is bypassed
-        (#128) — a bypassed host gets NO handler from this config and NO proxy credential
-        (byte-identical to a connection with no ``proxy_url``).
+        (#128) — a bypassed host gets NO handler from this config and NO proxy credential, so a
+        request to it carries what a connection with no ``proxy_url`` would send. The build still
+        judges the proxy credential, whatever the targets.
 
-        ``None`` is not proof of a direct hop. The opener's own default then applies, which reads
-        the environment and the system proxy settings, so a proxy from either can still take a
-        ``proxy_no_proxy`` match, ``proxy_url = "default"`` included.
+        ``None`` is not proof of a direct hop. The opener the connection then sends on applies its
+        own default, read from the environment and the system proxy settings when that opener was
+        built, so a proxy from either can still take a ``proxy_no_proxy`` match,
+        ``proxy_url = "default"`` included.
 
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
@@ -2170,8 +2166,9 @@ def hop_reaches_a_proxy(
     with it and its ``handlers`` (vault BACKLOG #3533, Lander finding 2 on engine PR 2576).
 
     ``proxy_dest`` is what :meth:`ProxyConfig.for_host` returned for ``url``, and ``handlers``
-    what its ``opener_handlers()`` built. A ``None`` or uncredentialed ``proxy_dest`` answers
-    ``False``, which is not proof of a direct hop: that method says what each does to the route.
+    what its ``opener_handlers()`` built. A ``None`` ``proxy_dest``, or an uncredentialed one,
+    which is a host urllib's own bypass list names, answers ``False``. That is not proof of a
+    direct hop: :meth:`ProxyConfig.for_host` says what each does to the route.
     Otherwise the proxy for ``url``'s scheme is read off the built handler, so
     ``proxy_url = "default"`` with no system proxy for the scheme goes direct. The handler took
     the system map when it was built, so this reads the map the opener holds, not a later one. An
@@ -2323,8 +2320,14 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     parser the handler runs. ``urlsplit`` would be the wrong reader: with an unencoded ``/``, ``?`` or
     ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
     sends the password. A user with no password sends nothing. Never raises: a URL the transport
-    cannot parse sends nothing either. Not an ``env()`` reference: the caller passes a value, and
-    anything that is not a string answers ``False``."""
+    cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
+    caller passes a value, and anything that is not a string answers ``False``.
+
+    Since vault BACKLOG #2965 the transport also refuses at build a value with a path, query or
+    fragment, which is how an unencoded ``/``, ``?`` or ``#`` in the password reads. This still
+    answers ``True`` for such a value, as ``_parse_proxy`` reads it: it may report a hop the build
+    refuses, and it never hides one the build accepts. :func:`proxy_config_from_settings` asks this
+    first, so such a value is refused for its credential (vault BACKLOG #3007)."""
     if not isinstance(proxy_url, str):
         return False
     proxy = proxy_url.strip()
@@ -2333,29 +2336,11 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     try:
         if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
             return False
-        # Private, but it is exactly what ProxyHandler.proxy_open calls; a test pins the pairing.
-        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+        # The parser ProxyHandler.proxy_open runs; a test pins the pairing.
+        _, user, password, _ = read_like_urllib(proxy)
     except ValueError:
         return False
     return bool(user and password)
-
-
-def _proxy_url_misleads_the_checks(proxy_url: str) -> bool:
-    """Whether the checks that read an ``http(s)`` ``proxy_url`` with ``urlsplit`` would judge
-    another host than the one ``_parse_proxy`` hands the proxy handler to dial.
-
-    An ``@`` after a ``/``, a ``?`` or a ``#`` ends the authority for ``urlsplit`` and not for
-    ``_parse_proxy``. So ``http://127.0.0.1/@proxy.example`` reads as loopback to the
-    ``proxy_user`` guard, and as ``127.0.0.1`` to ``[egress].allowed_proxy``, while urllib would
-    dial ``proxy.example``. A URL ``_parse_proxy`` cannot read and that holds an ``@`` counts too,
-    as it does at send."""
-    try:
-        # Private, but it is what ProxyHandler.proxy_open calls; a test pins the pairing.
-        _, _, _, hostport = urllib.request._parse_proxy(proxy_url)  # type: ignore[attr-defined]
-        authority = urllib.parse.urlsplit(proxy_url).netloc
-    except ValueError:
-        return "@" in proxy_url
-    return authority.rpartition("@")[2].lower() != str(hostport).lower()
 
 
 def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
@@ -2397,8 +2382,13 @@ def proxy_config_from_settings(
     A user and a password in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`, in
     every posture and under every declaration, including one inherited from
     ``[egress].proxy_url`` (vault BACKLOG #3007). At send they would meet a refusal that retries,
-    so a known fault is reported here rather than on each message. So does a URL
-    :func:`_proxy_url_misleads_the_checks` reads, with or without a credential."""
+    so a known fault is reported here rather than on each message.
+
+    An explicit URL is then parsed once, by :func:`~messagefoundry.transports.proxy_address.parse_proxy_url`,
+    which refuses a path, a query, a fragment and any value urllib's proxy parser would read as
+    naming another host (vault BACKLOG #2965), with or without a credential. The connector dials
+    the URL rebuilt from those parts, so it dials the host ``[egress].allowed_proxy`` judged, and
+    the ``proxy_user`` guard below judges that host too."""
     raw = s.get("proxy_url")
     if not raw:
         return None
@@ -2426,10 +2416,14 @@ def proxy_config_from_settings(
             f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
             "(ADR 0126)"
         )
+    # The credential first, so a URL that holds one is refused for it, with the advice that fits,
+    # even where the parse below would refuse its shape too.
     if proxy_url_sends_userinfo(proxy_url):
         raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_CREDENTIAL_REFUSED}")
-    if _proxy_url_misleads_the_checks(proxy_url):
-        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_UNREADABLE_REFUSED}")
+    # Rebuilt from the one parse the allow-list gate also reads, so what is dialled is what was
+    # judged (vault BACKLOG #2965). It refuses every value on which urlsplit and urllib read another
+    # host, so the loopback test in the proxy_user guard below judges the host urllib dials.
+    proxy_url = parse_proxy_url(proxy_url).url
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,

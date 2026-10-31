@@ -126,8 +126,14 @@ class FrameCodec:
     ``start`` and ``end`` must differ, and neither may be ``0x20``, the space (BACKLOG #2900).
     :meth:`neutralise` replaces each frame byte in a reply with a space, so a space frame byte would
     be replaced by itself and the reply could not go as one frame; and a delivery holding a space
-    would be refused under ADR 0205 rule 1. A space trailer is allowed: the start byte is never a
-    space, so a space trailer cannot open a frame.
+    would be refused under ADR 0205 rule 1. A space trailer is allowed, since it never equals the
+    start byte (below).
+
+    The ``trailer`` must not equal ``start`` (BACKLOG #3742). A decoder never steps over a start
+    byte as a frame's ending, because it may open the next frame; so a trailer equal to the start
+    byte would open a frame itself, and each later message would arrive with that byte in front of
+    it, the last leaving a frame open. Decoding it "correctly" would mean swallowing a real start
+    byte, so the codec is refused when it is built instead.
     """
 
     start: int
@@ -148,6 +154,12 @@ class FrameCodec:
                     f"frame {name} must not be 0x20 (a space): a space is what replaces a frame "
                     "byte in a reply, and a space in a message would be taken as a frame byte"
                 )
+        if self.trailer is not None and self.trailer == self.start:  # the docstring says why
+            raise ValueError(
+                f"frame trailer must not equal the start byte 0x{self.start:02X}: a decoder takes "
+                "that trailer as the start of the next frame, so every message after the first "
+                "would arrive with a stray leading byte and the last would leave a frame open"
+            )
 
     def frame(self, payload: str | bytes, encoding: str = "utf-8") -> bytes:
         """Wrap a message: ``start payload end [trailer]``."""

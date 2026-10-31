@@ -173,15 +173,32 @@ def test_webhook_notifier_threads_posture(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Negative control: an https webhook is never refused, whatever the posture.
+    # Negative control: the cleartext gate never refuses an https webhook, whatever the posture.
+    # Since BACKLOG #2193 an off-box https webhook on an enforcing posture also takes the revocation
+    # guard, so the attestation pair is set here to keep this a test of the cleartext gate alone;
+    # tests/test_alert_revocation_guard.py holds that guard's arms.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    WebhookTransport("https://hooks.example/x", posture=PROD_PHI)
+    WebhookTransport(
+        "https://hooks.example/x",
+        posture=PROD_PHI,
+        revocation_attested=True,
+        revocation_attested_reason="synthetic: the hook host certificate is short-lived",
+    )
+    WebhookTransport("https://hooks.example/x", posture=STAGING_PHI)
 
 
 # --- Cell (4): AI-broker cleartext http credential hop (refused in every posture, #3533) ---------
 
 _HTTP_ENDPOINT = "http://ai.internal/v1/messages"
 _HTTPS_ENDPOINT = "https://ai.internal/v1/messages"
+# BACKLOG #2193 slice (e): the https controls below would otherwise be refused for revocation under
+# an enforcing posture, so they carry the attestation pair. The http tests carry none: the
+# cleartext refusal comes first.
+_AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
+_AI_ATTESTED: dict[str, object] = {
+    "endpoint_revocation_attested": True,
+    "endpoint_revocation_attested_reason": _AI_ATTESTED_REASON,
+}
 
 
 def _managed_ai(**over: object) -> AiSettings:
@@ -213,8 +230,14 @@ def test_ai_broker_cleartext_is_refused_in_every_posture_even_with_escape(
 
 def test_ai_broker_https_secure_path_unaffected() -> None:
     # Negative control: an https endpoint builds through the factory and the constructor alike.
-    ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT), posture=PROD_PHI)
-    AiBroker(endpoint=_HTTPS_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    ai_broker_from_settings(_managed_ai(endpoint=_HTTPS_ENDPOINT, **_AI_ATTESTED), posture=PROD_PHI)
+    AiBroker(
+        endpoint=_HTTPS_ENDPOINT,
+        api_key="k",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
 
 
 # --- The real create_app ai_chat route refuses an http endpoint at every posture ------------------
@@ -276,7 +299,11 @@ async def test_ai_chat_route_allows_https(
     # Companion control: the same setup over an HTTPS endpoint is NOT 503, so the 503 above is the
     # cleartext refusal, not a blanket refusal of the route.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    app = create_app(engine, ai_settings=_managed_ai(endpoint=_HTTPS_ENDPOINT), allow_no_auth=True)
+    app = create_app(
+        engine,
+        ai_settings=_managed_ai(endpoint=_HTTPS_ENDPOINT, **_AI_ATTESTED),
+        allow_no_auth=True,
+    )
     async with _client(app) as c:
         r = await c.post("/ai/chat", json={"prompt": "hi"})
     assert r.status_code == 200

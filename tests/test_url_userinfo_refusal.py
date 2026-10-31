@@ -42,6 +42,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
@@ -108,6 +109,11 @@ _USERINFO_SHAPES = {
     # ``hostname`` is the username and the password head (BACKLOG #2686).
     "encoded_colon_bracket_head": f"https://svc%3A{SECRET}%5D/tail@endpoint.example.invalid/x",
 }
+
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 def _dest(ctype: ConnectorType, url: str, **extra: Any) -> Destination:
@@ -495,7 +501,9 @@ def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None
     with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be http or https"):
         WebhookTransport(f"ftp://hooks.example.invalid/{SECRET}")
     sink = WebhookTransport(
-        f"https://hooks.example.invalid/services/{SECRET}", allowed_hosts=("ok.example",)
+        f"https://hooks.example.invalid/services/{SECRET}",
+        allowed_hosts=("ok.example",),
+        posture=_NOT_ENFORCING,
     )
     with pytest.raises(ValueError) as exc:
         sink._post({"type": "t", "connection": "c"})
@@ -512,7 +520,7 @@ def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
         "https://hooks.example.invalid/users/@me?who=a@b",
         "https://hooks.example.invalid:8443/x?who=a@b",
     ):
-        assert WebhookTransport(url).url == url
+        assert WebhookTransport(url, posture=_NOT_ENFORCING).url == url
 
 
 # --- 5. the [egress] allowlist neither raises with nor echoes a credential ----------------------------

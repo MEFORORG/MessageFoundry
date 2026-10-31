@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import (
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -396,6 +397,7 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

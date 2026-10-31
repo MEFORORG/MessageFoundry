@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.load.connscale.compare import build_batch_comparison
-from harness.load.connscale.profile import FUSE_OFF, ConnScaleProfile
+from harness.load.connscale.profile import FUSE_OFF, SANDBOX_OFF, ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
@@ -154,7 +154,17 @@ def iter_batch_cells(profile: ConnScaleProfile, *, claim_mode: str) -> list[Batc
     """The batch_ab cell list, in the SAME nesting order :func:`run_connscale` walks (batch arm × sweep
     mode × count × trial). Fusion is pinned OFF (batching does not compose with fusion, ADR 0075) and
     the claim mode is the ``--claim-mode`` pin (batch_ab's profile pins a single ``pooled`` claim axis),
-    so both halves — given the same profile + flag — produce the identical, order-stable list."""
+    so both halves — given the same profile + flag — produce the identical, order-stable list.
+
+    A profile with a sandbox arm or a warm-up is REFUSED (BACKLOG #3132): the batch box runs every
+    cell at ``[sandbox].mode = off`` with no warm-up, and the shared SLOs would then fail every cell
+    for an axis the box never ran."""
+    if profile.sandbox_modes != (SANDBOX_OFF,) or profile.warmup_timeout_s > 0.0:
+        raise ConnScaleError(
+            f"the batch box runs no sandbox arm and no warm-up; profile {profile.name!r} names "
+            f"sandbox_modes={list(profile.sandbox_modes)} and warmup_timeout_s="
+            f"{profile.warmup_timeout_s}. Run it with the single-box connscale runner instead"
+        )
     cells: list[BatchCell] = []
     for batch_mode in profile.batch_modes:
         for mode in profile.modes():

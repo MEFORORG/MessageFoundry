@@ -69,6 +69,7 @@ from messagefoundry.transports.bounded_read import (
     build_strict_opener,
 )
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.proxy_address import parse_proxy_url
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 from tests._wire_proxy import _WireProxy
@@ -767,8 +768,10 @@ def test_a_proxy_url_the_checks_would_misread_fails_the_build(
 ) -> None:
     """urlsplit reads the first three as loopback and urllib would dial the host after the ``@``,
     so the ``proxy_user`` guard's loopback admission and ``[egress].allowed_proxy`` would both judge
-    a host the request never reaches. Called directly, because this is the seam that refuses."""
-    with pytest.raises(InsecureHopRefused, match="would not dial") as raised:
+    a host the request never reaches. The transport's one proxy parse refuses each before the guard
+    reads the host (vault BACKLOG #2965), so no loopback admission is granted on a misread. Called
+    directly, because the egress gate refuses these first on the wired path."""
+    with pytest.raises(ValueError, match="#2965") as raised:
         rest.proxy_config_from_settings(
             {"proxy_url": proxy_url, **login}, dest_scheme="https", connection="OB"
         )
@@ -786,7 +789,17 @@ def test_a_proxy_url_the_checks_would_misread_fails_the_build(
     ],
 )
 def test_control_a_proxy_url_both_readers_agree_on_builds(proxy_url: str) -> None:
-    assert not rest._proxy_url_misleads_the_checks(proxy_url)
+    config = rest.proxy_config_from_settings(
+        {"proxy_url": proxy_url}, dest_scheme="https", connection="OB"
+    )
+    assert config is not None
+
+
+def test_a_well_formed_credentialed_proxy_url_passes_the_parse_and_still_fails_the_build() -> None:
+    """The credential refusal is this row's, not #2965's: the one proxy parse accepts a userinfo,
+    so the refusal is still what stops a well-formed credentialed URL (vault BACKLOG #3007)."""
+    assert parse_proxy_url(_CREDENTIALED).userinfo == _CRED
+    _refused_at_build(lambda: _rest(proxy_url=_CREDENTIALED))
 
 
 @pytest.mark.parametrize(

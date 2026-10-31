@@ -5823,6 +5823,34 @@ async def test_approval_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_rotation_moves_an_approval_tombstone_to_the_active_key(store) -> None:
+    """BACKLOG #3638: the re-seal pass moves a rejected request's tombstone to the active key and
+    still refuses one changed outside the store, the same contract the SQLite suite runs. The table
+    is shared across tests, so its refused counts are not pinned here."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._approval_seal_contract import assert_tombstone_reseal_contract
+    from tests._session_seal_contract import RawSql
+
+    async def open_store(key: str, retired: tuple[str, ...]) -> SqlServerStore:
+        return await SqlServerStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, list(retired))
+        )
+
+    def raw_for(keyed: SqlServerStore) -> RawSql:
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        return raw
+
+    first, second = await assert_tombstone_reseal_contract(open_store, raw_for)
+    # Only the contract's rows verify under its two keys: the sound request and the tombstone.
+    assert first[0] == 2 and second[0] == 0
+
+
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
     """BACKLOG #2592: this backend has the ``user_roles`` role foreign key too, so a grant that
     commits while its custom role is deleted fails the delete rather than leaving a sealed role row

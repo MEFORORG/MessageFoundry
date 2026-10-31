@@ -135,6 +135,7 @@ from typing import Any, Literal, Protocol, cast, overload
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
+from messagefoundry.transports.proxy_address import read_like_urllib
 
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
@@ -963,8 +964,8 @@ def _sends_cleartext_proxy_credentials(
     unless the leg is cleartext and would be refused for another reason too. That leaves the
     cleartext text where it applies, and gives a verified TLS leg a text that is true of it."""
     try:
-        # Private, but it is the parser proxy_open runs, so the two readings cannot differ.
-        scheme, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+        # The parser proxy_open runs, so the two readings cannot differ (vault BACKLOG #2965).
+        scheme, user, password, _ = read_like_urllib(proxy)
     except ValueError:
         # urllib raises this error itself, for every request, and its text quotes the value. So a
         # value that could hold credentials is refused first, in fixed text. Any other is left to it.
@@ -1373,7 +1374,7 @@ def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:
     made: set[str] = set()
     for value in proxies.values():
         try:
-            _, user, password, _ = urllib.request._parse_proxy(value)  # type: ignore[attr-defined]
+            _, user, password, _ = read_like_urllib(value)
         except ValueError:
             continue
         if user and password:
