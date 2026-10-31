@@ -238,7 +238,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
-| | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default or a shorter window makes it raise later, and each is named as `alerts.<setting>`) |
+| | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
@@ -826,16 +826,14 @@ Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_s
 `alerts.security_denials`, `alerts.security_body_views`, `alerts.security_export_messages`,
 `alerts.security_peer_refusals` or `alerts.security_window_seconds` (vault BACKLOG #2613).
 - **What you lose:** the alert, or an early one. Refused sign-ins, refused requests, stored-body
-  reads and exports still leave audit rows. A refused connection leaves no audit row: an allowlist
-  or per-host refusal leaves a throttled log line, a global connection-cap refusal leaves none, and
-  each leaves a `connection_event` row only while capture is on. With the layer off a DEBUG log
-  level raises no alert either. The `[alerts]` table of [CONFIGURATION.md](CONFIGURATION.md) says
-  what each detector counts.
+  reads and exports still leave audit rows. A refused connection leaves no audit row, and on some
+  paths no log line or `connection_event` row either, so this detector may be its only record.
+  With the layer off a DEBUG log level raises no alert either. The `[alerts]` table of
+  [CONFIGURATION.md](CONFIGURATION.md) says what each detector counts.
 - **What stays:** the posture detector. With the layer off it still runs, so a start that records
   its loosenings raises `posture_loosened` naming this one.
 - **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
-  does not see refused connections, so keep `security_peer_refusals` at its default unless the
-  SIEM reads the listeners' log lines or the `connection_event` table instead.
+  does not see refused connections, so keep `security_peer_refusals` at its default.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating

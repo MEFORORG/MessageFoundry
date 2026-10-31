@@ -3097,6 +3097,28 @@ def _raise_config_changed(
         _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
 
 
+def _install_security_signals(
+    engine: Engine,
+    sink: AlertSink,
+    alerts_settings: AlertsSettings | None,
+    cluster_settings: ClusterSettings | None,
+) -> Callable[[], None]:
+    """Install the security-signal layer for the managed lifespan (vault BACKLOG #2613) and
+    return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
+    itself a loosening, and the posture detector, the one it leaves running, is what reports it.
+    The posture subject names this engine process, and an unpinned cluster node, whose id changes
+    on every start, resolves its own posture alert at stop, as the intake monitor clears its own;
+    nothing could resolve it later."""
+    return install_security_signals(
+        sink,
+        SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
+        asyncio.get_running_loop(),
+        identity=lambda: engine.instance_identity,
+        resolve_on_stop=engine.coordinator.is_clustered()
+        and not (cluster_settings is not None and cluster_settings.node_id),
+    )
+
+
 async def _record_start_audit(
     app: FastAPI,
     engine: Engine,
@@ -11981,17 +12003,8 @@ def create_managed_app(
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
-        # Installed even with [alerts].security_signals = false: that switch is itself a loosening,
-        # and the posture detector, the one it leaves running, is what reports it.
-        remove_security_signals = install_security_signals(
-            notifier or LoggingAlertSink(),
-            SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
-            asyncio.get_running_loop(),
-            identity=lambda: engine.instance_identity,
-            # An unpinned cluster node's id changes on every start, so it clears its own posture
-            # alert at stop, as the intake monitor does; nothing could clear it later.
-            resolve_on_stop=engine.coordinator.is_clustered()
-            and not (cluster_settings is not None and cluster_settings.node_id),
+        remove_security_signals = _install_security_signals(
+            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

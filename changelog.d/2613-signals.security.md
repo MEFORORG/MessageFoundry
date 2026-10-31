@@ -3,7 +3,7 @@
   TCP, X12, HTTP and the DICOM server) refuses `[alerts].security_peer_refusals` connections
   (default `100`, at most `100000`) at its `source_ip_allowlist` or a connection cap inside the
   window, whether or not connection-event capture is on, and then stays quiet for that listener
-  until the window ends. It is keyed `inbound:<name>`, never the peer's address.
+  for the window, at most 300 s. It is keyed `inbound:<name>`, never the peer's address.
   `[alerts].security_signals = false`, a detector count of `0` or above its default, and a
   shorter `security_window_seconds`, are now loosenings that `GET /security/posture` names; with
   the layer off the posture detector still runs, so the start raises `posture_loosened` naming the

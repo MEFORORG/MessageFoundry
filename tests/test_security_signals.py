@@ -19,6 +19,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
+from messagefoundry.api import app as app_module
 from messagefoundry.auth.audit_visibility import DIRECTORY_LOCKED_REFUSAL_DETAIL
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Source
@@ -28,6 +29,7 @@ from messagefoundry.config.settings import (
     _SECURITY_SIGNAL_COUNTS,
     AlertsSettings,
     AuthSettings,
+    ClusterSettings,
     _security_signal_loosenings,
 )
 from messagefoundry.connection_names import inbound_record_name
@@ -582,6 +584,18 @@ def test_a_flood_raises_once_per_listener_per_window() -> None:
     assert [n for _s, n, _c, _d in sink.signals] == ["inbound:IB_ACME_ADT"] * 2
 
 
+def test_a_long_window_holds_a_listener_quiet_for_at_most_five_minutes() -> None:
+    det, sink, clock = _detector(peer_refusals=2, window_seconds=86400)
+    for _ in range(2):
+        det.observe_refusal("IB_ACME_ADT")
+    assert det.refusal_quiet("IB_ACME_ADT")
+    clock.now += 301
+    assert not det.refusal_quiet("IB_ACME_ADT")
+    for _ in range(2):
+        det.observe_refusal("IB_ACME_ADT")
+    assert len(sink.signals) == 2
+
+
 def test_the_refusal_subject_is_spelled_as_an_inbound_record_name() -> None:
     det, sink, _ = _detector(peer_refusals=1)
     det.observe_refusal("IB_ACME_ADT")
@@ -649,7 +663,7 @@ def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
 def test_a_failing_refusal_observer_never_reaches_the_listener(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(admission, "_OBSERVER_FAILURE_LOGGED", False)
+    monkeypatch.setattr(admission, "_OBSERVER_FAILURE_LOG_AFTER", 0.0)
 
     def broken(_connection: str) -> None:
         raise RuntimeError("observer down")
@@ -693,9 +707,14 @@ def test_a_count_above_its_default_or_a_shorter_window_is_a_named_loosening() ->
     assert _loosenings(AlertsSettings(security_window_seconds=60)) == [
         "alerts.security_window_seconds"
     ]
-    # The controls: a stricter count, and a longer window, loosen nothing.
+    # The controls: a stricter count, and a longer window, loosen nothing, and nor does a
+    # shorter window that no running counting detector reads.
     assert _loosenings(AlertsSettings(security_signin_failures=5)) == []
     assert _loosenings(AlertsSettings(security_window_seconds=600)) == []
+    off = AlertsSettings.model_validate(
+        {"security_window_seconds": 60, **{f: 0 for f, _s, _w in _SECURITY_SIGNAL_COUNTS}}
+    )
+    assert "alerts.security_window_seconds" not in _loosenings(off)
 
 
 def test_the_count_table_covers_every_count_setting_and_only_signal_types() -> None:
@@ -820,6 +839,53 @@ async def test_resolve_on_stop_clears_the_posture_alert_this_process_raised() ->
     quiet = _PostureSink()
     install_security_signals(quiet, _thresholds(), loop, resolve_on_stop=True)()
     assert quiet.restored == []
+
+
+class _Coordinator:
+    def __init__(self, clustered: bool) -> None:
+        self.clustered = clustered
+
+    def is_clustered(self) -> bool:
+        return self.clustered
+
+
+class _Engine:
+    def __init__(self, identity: str | None, clustered: bool) -> None:
+        self.instance_identity = identity
+        self.coordinator = _Coordinator(clustered)
+
+
+@pytest.mark.parametrize(
+    ("clustered", "node_id", "resolved_at_stop"),
+    [(True, None, True), (True, "pinned", False), (False, None, False)],
+)
+async def test_the_lifespan_wiring_names_the_process_and_resolves_only_an_unpinned_node(
+    clustered: bool, node_id: str | None, resolved_at_stop: bool
+) -> None:
+    sink = _PostureSink()
+    engine = _Engine("node:h-1" if clustered else None, clustered)
+    remove = app_module._install_security_signals(
+        cast(Any, engine),
+        sink,
+        AlertsSettings(security_signals=False),  # installed even with the layer off
+        ClusterSettings(node_id=node_id),
+    )
+    try:
+        cast(Any, audit_tee).emit_audit_tee(
+            action="config_loaded",
+            actor="system",
+            channel_id=None,
+            detail=json.dumps({"loosenings": ["alerts.security_signals"]}),
+            ts=0.0,
+            row_id=1,
+            seq=1,
+            row_hash="0" * 64,
+        )
+    finally:
+        remove()
+    subject = "posture:start@node:h-1" if clustered else "posture:start"
+    assert [(s, n) for s, n, _c, _d in sink.signals] == [("posture_loosened", subject)]
+    assert sink.restored == ([subject] if resolved_at_stop else [])
 
 
 def test_a_failing_posture_restored_never_reaches_the_audit_writer() -> None:

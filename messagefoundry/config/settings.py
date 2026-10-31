@@ -9853,10 +9853,10 @@ def _security_signal_loosenings(alerts: AlertsSettings) -> list[tuple[str, str]]
                 "[alerts].security_signals = false switches the security-signal layer off -- a "
                 "burst of refused sign-ins, refused requests, stored-body reads, exported "
                 "messages or refused connections, and a DEBUG log level, raise no alert. The "
-                "first four leave audit rows; a refused connection leaves no audit row, only a "
-                "throttled log line for an allowlist or per-host refusal and a connection_event "
-                "row while capture is on. The posture_loosened alert still fires at each start "
-                "that records its loosenings",
+                "first four leave audit rows. A refused connection leaves no audit row, and on "
+                "some paths no log line or connection_event row either, so nothing else may "
+                "record it. The posture_loosened alert still fires at each start that records "
+                "its loosenings",
             )
         ]
     fields = AlertsSettings.model_fields
@@ -9883,7 +9883,10 @@ def _security_signal_loosenings(alerts: AlertsSettings) -> list[tuple[str, str]]
         alerts.security_window_seconds,
         fields["security_window_seconds"].default,
     )
-    if window < default_window:
+    # Only while some counting detector runs, since none other reads the window.
+    if window < default_window and any(
+        getattr(alerts, field) > 0 for field, _signal, _what in _SECURITY_SIGNAL_COUNTS
+    ):
         out.append(
             (
                 "alerts.security_window_seconds",

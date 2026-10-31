@@ -99,6 +99,9 @@ MAX_SUBJECT_ALERTS: Final = 5
 #: Characters of a subject. SQL Server holds ``alert_instance.connection`` in 256.
 _SUBJECT_LIMIT: Final = 200
 _SWITCH_LIST_LIMIT: Final = 200
+#: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
+#: longer window, which counts more strictly, must not also hold a second attack back for as long.
+_REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -371,16 +374,22 @@ class SecuritySignalDetector:
         ``connection`` refused a peer at its source allowlist or a connection cap."""
         try:
             now = self._clock()
-            quiet = self._refusals_quiet
-            if quiet.get(connection, now) > now:
-                return  # raised this window: not even counted, which is the cheap path
-            quiet.pop(connection, None)
+            if self.refusal_quiet(connection, now):
+                return  # raised lately: not even counted, which is the cheap path
+            self._refusals_quiet.pop(connection, None)
             if self._on_burst(_REFUSED, self._refused, connection, 1):
-                quiet[connection] = now + self._refused.window_seconds
-                if len(quiet) > MAX_SUBJECTS:
-                    quiet.popitem(last=False)
+                quiet_for = min(self._refused.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
+                self._refusals_quiet[connection] = now + quiet_for
+                if len(self._refusals_quiet) > MAX_SUBJECTS:
+                    self._refusals_quiet.popitem(last=False)
         except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the listener
             log.warning("security-signal detector failed: %s", type(exc).__name__)
+
+    def refusal_quiet(self, connection: str, now: float | None = None) -> bool:
+        """Whether ``connection``'s refusals are held quiet after a raise. A read only, so the
+        installer may ask it from a listener's own thread before it hops a refusal onto the loop."""
+        until = self._refusals_quiet.get(connection)
+        return until is not None and until > (self._clock() if now is None else now)
 
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
         """Count ``weight`` for ``key``; True when that raised the alert."""
@@ -494,7 +503,10 @@ def install_security_signals(
         _on_loop(detector.observe, action, actor, channel_id, client, detail)
 
     def _refused(connection: str) -> None:
-        _on_loop(detector.observe_refusal, connection)
+        # Asked before the hop, so a refusal flood from the DICOM server's threads costs the loop
+        # nothing while the listener is quiet. A stale read only lets one refusal through.
+        if not detector.refusal_quiet(connection):
+            _on_loop(detector.observe_refusal, connection)
 
     add_audit_observer(_observe)
     if detector.counts_refusals:
