@@ -2216,7 +2216,12 @@ class RegistryRunner:
         refuses one too, but there a single bad row fails the whole burst, and a run of them trips the
         drainer's store-is-refusing cutoff and loses the declared rows behind them. Refused here it
         is dropped, added to the overflow-drop tally, and warned about through a throttled line that
-        reports the running total; the store's check stays as the backstop for any other writer."""
+        reports the running total; the store's check stays as the backstop for any other writer.
+
+        All of that holds only while the drain queue exists. With no queue the method returns first,
+        so any event, declared or not, is discarded with no row, no count and no warning. At least
+        one configuration reaches that: the ``[diagnostics].connection_events`` master switch off
+        with one inbound's ``capture_connection_errors`` on, which builds a sink but no queue."""
         q = self._conn_event_q
         if q is None:
             return
@@ -2244,12 +2249,14 @@ class RegistryRunner:
         :class:`RefusalLog` window and within its cross-key cap. Every refusal is noted, and each
         line carries the running total, so refusals inside a quiet window show in the next line.
 
-        The kind is a code identifier, but it reached here through a variable, so the warning keys
-        on and shows only its first ``_UNDECLARED_KIND_SHOWN`` characters, scrubbed by ``safe_text``
-        only when a line is written. Scrubbing first would make the hot path pay a redaction pass for
-        every refusal, and a long kind would scrub to an ellipsis that names nothing."""
-        head = kind[:_UNDECLARED_KIND_SHOWN]
-        total = self._undeclared_kind_log.note(f"{connection}\x00{head}")
+        The kind is a code identifier, but it reached here through a variable, so it is treated as
+        free text. The throttle keys on its raw first ``_UNDECLARED_KIND_SHOWN`` characters, which
+        never reach the log. The line shows ``safe_text(kind, limit=_UNDECLARED_KIND_SHOWN)``:
+        redacted whole, then bounded. Cutting first would be the form ``messagefoundry.redaction``
+        documents as a leak, because a cut can leave a name fragment too short to match. A long
+        single-token kind therefore shows as an ellipsis with its length. The scrub runs only when a
+        line is written, so a refusal that is not logged pays no redaction pass."""
+        total = self._undeclared_kind_log.note(f"{connection}\x00{kind[:_UNDECLARED_KIND_SHOWN]}")
         if total is None:
             return
         log.warning(
@@ -2257,7 +2264,7 @@ class RegistryRunner:
             "(%d such event(s) dropped by this runner so far; repeats inside a minute are not "
             "logged). Declare the kind in messagefoundry.connection_events",
             connection,
-            safe_text(head),
+            safe_text(kind, limit=_UNDECLARED_KIND_SHOWN),
             total,
         )
 

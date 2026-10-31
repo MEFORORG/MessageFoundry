@@ -29,6 +29,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import ConnectionEventWrite
 
@@ -227,16 +228,34 @@ async def test_undeclared_kinds_are_refused_at_enqueue_and_the_burst_keeps_every
     assert not [r for r in caplog.records if "burst write failed" in r.getMessage()]
 
 
-def test_the_refusal_warning_names_a_long_kind_by_its_bounded_head(
+def _refusal_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "undeclared connection_event" in r.getMessage()
+    ]
+
+
+def test_the_refusal_warning_shows_the_kind_redacted_then_bounded(
     runner: RegistryRunner, caplog: pytest.LogCaptureFixture
 ) -> None:
     long_kind = "undeclared_long_" + "x" * 500
     with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
         _enqueue(runner, _event(0, kind=long_kind))
-    [line] = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
-    head = long_kind[: wiring_runner._UNDECLARED_KIND_SHOWN]
-    assert repr(head) in line, "the line names the kind by its bounded head, not an ellipsis"
-    assert long_kind not in line
+    [line] = _refusal_lines(caplog)
+    shown = safe_text(long_kind, limit=wiring_runner._UNDECLARED_KIND_SHOWN)
+    assert repr(shown) in line, "the line carries safe_text of the WHOLE kind, bounded"
+    # Not the cut-then-redact form: a raw head of the kind must not appear.
+    assert long_kind[: wiring_runner._UNDECLARED_KIND_SHOWN] not in line
+
+
+def test_no_fragment_of_a_name_in_the_kind_reaches_the_log(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Synthetic. Cutting at 64 characters before redacting would leave "Jane" in the line.
+    kind = "k" * 58 + " Jane Doe"
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0, kind=kind))
+    [line] = _refusal_lines(caplog)
+    assert "Jane" not in line and "Doe" not in line, line
 
 
 def test_the_refusal_warning_is_throttled_per_pair_and_capped_across_pairs(

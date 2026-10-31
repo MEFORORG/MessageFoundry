@@ -11,7 +11,9 @@ the connector contract. At least three places read it at run time:
 
 * the runner, which drops an undeclared kind before the event is queued
   (``RegistryRunner._enqueue_connection_event``) and logs a throttled WARNING, so it never joins a
-  burst;
+  burst. That holds while the runner's connection-event queue exists; at least one configuration
+  has no queue, and there every event returns earlier with no row and no warning (the method's
+  docstring names it);
 * the store, as the backstop for any other writer: every backend's connection-event writer calls
   :func:`check_connection_event_kind` and raises on an undeclared kind;
 * the web console's event-log filter, which offers :data:`CONNECTION_EVENT_KIND_ORDER` as its
