@@ -64,13 +64,19 @@ _WEBCONSOLE = _ROOT / "messagefoundry_webconsole"
 
 _H_CONFIG_AUTH = "### `[auth]` — authentication & RBAC"
 
-#: The three limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other two
+#: The four limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other two
 #: (``allow_phi_read``, ``allow_admin_write``) are post-authentication business-logic limits and
 #: belong to the 2.1.3 table instead. The split is asserted rather than assumed:
-#: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a sixth
+#: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a new
 #: limiter appears, forcing an explicit decision about which table it joins.
 _AUTH_SURFACE_ACCESSORS = frozenset(
-    {"allow_login_attempt", "allow_reauth_attempt", "allow_repeated_credential_audit"}
+    {
+        "allow_login_attempt",
+        "allow_reauth_attempt",
+        "allow_repeated_credential_audit",
+        # BACKLOG #3965: the audit-row budget of an IdP step-up return's repeatable refusals.
+        "allow_step_up_return_audit",
+    }
 )
 _BUSINESS_LIMIT_ACCESSORS = frozenset({"allow_phi_read", "allow_admin_write"})
 
@@ -1964,10 +1970,10 @@ def _derived_protection_seams() -> dict[str, str]:
 
 
 def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> None:
-    """A sixth limiter must join one table or the other — it cannot land undocumented.
+    """A new limiter must join one table or the other — it cannot land undocumented.
 
-    ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit`` defend the
-    AUTHENTICATION surface (6.1.1);
+    ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit``/
+    ``allow_step_up_return_audit`` defend the AUTHENTICATION surface (6.1.1);
     ``allow_phi_read``/``allow_admin_write`` are post-authentication business-logic limits (2.1.3).
     The split is asserted, so a new accessor forces an explicit decision rather than silently
     inheriting one table's coverage claim.

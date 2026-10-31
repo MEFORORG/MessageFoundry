@@ -80,6 +80,9 @@ _BUILDERS = frozenset(
         # two stay the sites and the wrapper hands its opener on, as build_idp_opener does.
         "build_idp_opener_from_settings",
         "NarrowedTls",
+        # pipeline/alert_sinks.py: the [alerts] SMTP recipe the send and its guard share
+        # (BACKLOG #2193), so both stay the sites, as for the IdP wrapper above.
+        "_alerts_smtp_context",
     }
 )
 
@@ -113,16 +116,16 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         "_refuse_idp_revocation",
         "idp_revocation_guards",
         "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
+        # pipeline/alert_sinks.py, the [alerts] SMTP login and the webhook (BACKLOG #2193)
+        "_refuse_alert_smtp_revocation",
+        "_refuse_webhook_revocation",
+        "_refuse_an_unrevoked_ai_hop",  # transports/ai_broker.py, the AI endpoint (BACKLOG #2193)
         # transports/strict_requests.py, the Vault hops (vault BACKLOG #2983)
         "refuse_an_unrevoked_hop",  # StrictReplyAdapter's, at the mount and before each send
         "mount_strict_reply_adapter",
     }
 )
 
-#: Ungated verifying hops, with the reason recorded in docs/DEPLOYMENT.md.
-_UNGATED = (
-    "an ungated verifying hop, listed in docs/DEPLOYMENT.md under 'Ungated verifying TLS hop'"
-)
 #: What the two Vault entries' guard covers, and what this census does not follow there.
 _VAULT_GUARD = (
     "through mount_strict_reply_adapter, which runs _refuse_an_unrevoked_vault_hop at "
@@ -203,26 +206,36 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
+    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
+        note="the AI endpoint, through _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). No "
+        "CRL lever is built for this hop, so off the box it crosses an enforcing posture only on "
+        "its [ai].endpoint_revocation_attested pair; an unknown posture counts as enforcing"
+    ),
     "messagefoundry/config/secretprovider_vault.py::_build_client": Guarded(
         note=f"the Vault KV secret provider hop, {_VAULT_GUARD}"
     ),
     "messagefoundry/store/keyprovider_vault.py::_build_client": Guarded(
         note=f"the Vault Transit key provider hop, which the Transit cipher shares, {_VAULT_GUARD}"
     ),
-    # --- exempt: ungated verifying hops ------------------------------------------------------------
-    "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Exempt(
-        f"the webhook alert sink: {_UNGATED}"
+    "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Guarded(
+        by="messagefoundry/pipeline/alert_sinks.py::WebhookTransport.__init__",
+        note="the webhook's shared opener, built at import. Each WebhookTransport runs "
+        "_refuse_webhook_revocation for an https URL, with its [alerts] attestation pair as the "
+        "only lever (BACKLOG #2193)",
     ),
-    "messagefoundry/pipeline/alert_sinks.py::WebhookTransport._post": Exempt(
-        f"the webhook alert sink: {_UNGATED}"
+    "messagefoundry/pipeline/alert_sinks.py::WebhookTransport._post": Guarded(
+        by="messagefoundry/pipeline/alert_sinks.py::WebhookTransport.__init__",
+        note="each POST dials the shared opener the constructor's guard judged (BACKLOG #2193)",
     ),
-    "messagefoundry/pipeline/alert_sinks.py::send_plain_email": Exempt(
-        f"the [alerts] SMTP sink and the security notifier, built outside every "
-        f"active_hop_posture scope. A guard could take the posture explicitly, as the syslog "
-        f"forwarder's does; none is built: {_UNGATED}"
+    "messagefoundry/pipeline/alert_sinks.py::send_plain_email": Guarded(
+        by="messagefoundry/pipeline/alert_sinks.py::EmailTransport.__init__",
+        note="the [alerts] SMTP hop when it carries a login. EmailTransport and "
+        "SecurityEventNotifier each run _refuse_alert_smtp_revocation at construction; Guarded "
+        "names one caller, so the notifier's call is pinned by tests/test_alert_revocation_guard.py. "
+        "A hop with no login takes no guard by design (ADR 0173)",
     ),
-    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
-        f"the AI-broker endpoint: {_UNGATED}"
+    "messagefoundry/pipeline/alert_sinks.py::_refuse_alert_smtp_revocation": Guarded(
+        note="the SMTP login guard itself, which builds the context each send builds (BACKLOG #2193)"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(

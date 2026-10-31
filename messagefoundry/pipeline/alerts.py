@@ -626,7 +626,10 @@ class AlertSink(Protocol):
         id>``, the key :meth:`approval_too_early` uses, and ``approval:<approval id>:resolve`` for a
         resolution's lost provenance row (vault BACKLOG #3438). ``POST /config/reload`` uses
         ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
-        an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). ``action`` is
+        an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
+        step-up return's audit budget uses ``step_up_return:audit_budget:<action>`` when its
+        all-callers backstop stops a row, at most once a window per action (BACKLOG #3965); that
+        row was shed by the budget, not refused by the store. ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
@@ -1550,6 +1553,34 @@ def administrator_granted_alert(sink: AlertSink, *, granted_by: str) -> Callable
             sink.administrator_granted(f"user:{username}", via=via, granted_by=granted_by)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("the administrator_granted alert could not be delivered", exc_info=True)
+
+    return _raise
+
+
+#: The prefix of the ``audit_write_failed`` key for the IdP step-up return's audit budget, raised
+#: when its all-callers backstop stops a row (BACKLOG #3965). The key is this, a colon, and the
+#: stopped row's audit action, so each action is its own instance and throttle key at the sink. The
+#: colon keeps it outside the connection-name grammar, as for the other keys of that alert.
+STEP_UP_RETURN_AUDIT_KEY = "step_up_return:audit_budget"
+
+
+def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with the
+    audit action of the row the step-up return audit budget's backstop stopped, raises
+    :meth:`AlertSink.audit_write_failed` keyed ``<STEP_UP_RETURN_AUDIT_KEY>:<action>`` (BACKLOG
+    #3965). The service calls it at most once a window per action. The row was shed by a budget,
+    not refused by the store; the key names the budget so a responder does not look at the store.
+
+    Carries the key and the action name only. Never raises: an alert failure must not change what a
+    step-up return answers."""
+
+    def _raise(action: str) -> None:
+        try:
+            sink.audit_write_failed(f"{STEP_UP_RETURN_AUDIT_KEY}:{action}", action=action)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning(
+                "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+            )
 
     return _raise
 
