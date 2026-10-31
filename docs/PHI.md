@@ -1693,7 +1693,8 @@ along the whole chain, and reads at least the instance `__dict__`, the slots and
 of each exception it reaches that way, within the budget below (vault BACKLOG #3340). So such a class raised from a codec
 error, or while one was being handled, loses its message the same way. An exception whose
 `__str__` and `__repr__` are `BaseException`'s own prints only its arguments, so one that merely
-stores an error on an attribute keeps its message, except where the same exception is also reached
+stores an error on an attribute keeps its message, unless it is a dataclass, whose attributes are
+read as any dataclass's are, so it prints as the fixed note; and except where the same exception is also reached
 beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
@@ -1725,15 +1726,18 @@ against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the
 The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads what the
 walk read before that change, on the same budget per log argument and per traceback link, and it
 finishes before the added pass starts,** except on a link whose verdict an earlier link's scan
-handed on, as below. It differs at least where the class of an exception puts something other
-than a getset or member descriptor under `__dict__`, such as a property or `__dict__ = None`: the
-walk before that change skipped the instance dict, so a codec error held there that the
-exception's own code printed came out raw, and the first pass now reads that dict through the
-builtin `BaseException` descriptor, so such an exception prints as the fixed note. That is a tightening. A class that puts another class's getset there
-is read as before: the read raises, and the walk fails closed on that exception. The added pass
-then reads at least the dunder-named slots and the `__cause__` and `__context__` chain links, and
-beneath an exception whose own `__str__` or `__repr__` is its own code, the instance `__dict__`,
-slots and chain links of each exception it reaches. It does not read everything such code can
+handed on, as below. The added pass then reads, of an exception whose own `__str__` or
+`__repr__` is its own code, at least its dunder-named slots and its `__cause__` and `__context__`
+chain links; of one whose methods are a builtin exception's other than `BaseException`'s, such as
+an `OSError`'s, its dunder-named slots but not its chain links; and of one whose methods are
+`BaseException`'s own, nothing more. Beneath an exception whose own `__str__` or `__repr__` is its
+own code, it reads the instance `__dict__`, slots and chain links of each exception it reaches,
+whatever that exception's methods are. Where the class of an exception puts something other than a
+getset or member descriptor under `__dict__`, such as a property or `__dict__ = None`, the first
+pass skips the instance dict, as the walk did before that change, and the added pass, wherever
+it reads that exception's instance dict as above, reads it through the builtin `BaseException`
+descriptor. A class that puts another class's getset there is
+read through that getset: the read raises, and the walk fails closed on that exception. It does not read everything such code can
 reach: an object the walk does not read by attribute, as listed below, is not read there either.
 It runs on the budget the first pass left, and in
 a traceback within one more budget that the added passes of every link share. **It only adds: it

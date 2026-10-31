@@ -2607,7 +2607,7 @@ def safe_traceback(ei: ExcInfo) -> str:
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
     a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
     exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
-    ``UnicodeError`` keeps only the codec's own note (:func:`_kept_notes`). One whose message was
+    ``UnicodeError`` keeps only the notes that read like a codec's own (:func:`_kept_notes`). One whose message was
     built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
     third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
@@ -2798,21 +2798,17 @@ type _Readers = tuple[Any, ...] | None
 type _ReaderGains = tuple[_Readers, _Readers, _Readers]
 #: :func:`_reader_record`'s answer for one class: the three reader sets, whether it opens, and
 #: the readers each of the added pass's reads takes beyond the reads before it
-#: (:func:`_added_pass`), worked out once per class rather than once per object.
+#: (:func:`_added_pass`), worked out once per class per scan rather than once per object.
 type _ReaderRecord = tuple[_Readers, _Readers, _Readers, bool, _ReaderGains]
+#: One scan's :func:`_reader_record` answers: ``id(class)`` -> (the class, its record).
+type _RecordMemo = dict[int, tuple[type[Any], _ReaderRecord]]
 
-#: ``id(class)`` -> (a weak reference to the class, its :func:`_reader_record`). Keyed by id
+#: ``id(class)`` -> (a weak reference to the class, its :func:`_readers` answer). Keyed by id
 #: because hashing a class runs its metaclass. The reference's callback drops the entry when the
-#: class dies, which is before its id can be reused.
-#:
-#: THE WEAK REFERENCE DOES NOT KEEP EVERY CLASS FROM BEING PINNED (vault BACKLOG #3340, item 6).
-#: The cached descriptors of a class's own ``__dict__`` and of its own slots each hold the class
-#: strongly, so a class that defines either stays alive here, its id taken, until the cache clears
-#: at :data:`_READERS_MAX` entries. A dataclass defines its own ``__dict__``, so a reloaded config
-#: module's dataclasses are among them, as is an exception with a slot of its own. That is bounded,
-#: at :data:`_READERS_MAX` classes. A class whose answer holds only inherited descriptors, as a
-#: plain exception's does, is not pinned, and its entry goes when it dies.
-_READERS: dict[int, tuple[Any, _ReaderRecord]] = {}
+#: class dies, which is before its id can be reused. Only :func:`_readers` writes here; the added
+#: pass's readers (:func:`_reader_record`) are kept for one scan, so they keep no class alive past
+#: it (vault BACKLOG #3340).
+_READERS: dict[int, tuple[Any, _Readers]] = {}
 _READERS_MAX = 1024
 _EXC_STR: Any = BaseException.__dict__["__str__"]
 _EXC_REPR: Any = BaseException.__dict__["__repr__"]
@@ -2868,19 +2864,11 @@ def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
 
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
     class changed after an instance of it was first logged keeps its first answer."""
-    return _reader_record(kind)[0]
-
-
-def _reader_record(kind: type[Any]) -> _ReaderRecord:
-    """For ``kind``: :func:`_readers`' answer, then the readers :class:`_Scan`'s added pass uses
-    for an instance it reaches plainly, then those it uses for one beneath an exception whose own
-    code renders it, then whether ``kind`` is such an exception, then what each added read takes
-    beyond the reads before it (:data:`_ReaderGains`). Kept per class."""
     key = id(kind)
     cached = _READERS.get(key)
     if cached is not None and cached[0]() is kind:
         return cached[1]
-    found = _find_readers(kind)
+    found = _find_reader_sets(kind, first_only=True)[0]
     if len(_READERS) >= _READERS_MAX:
         _READERS.clear()
     try:
@@ -2891,14 +2879,26 @@ def _reader_record(kind: type[Any]) -> _ReaderRecord:
     return found
 
 
-def _find_readers(kind: type[Any]) -> _ReaderRecord:
-    first, plain, beneath, opens = _find_reader_sets(kind)
-    gains = (
-        _less(first, plain),
-        _less(first, beneath),
-        _less(plain, beneath),
-    )
-    return first, plain, beneath, opens, gains
+def _reader_record(kind: type[Any], memo: _RecordMemo) -> _ReaderRecord:
+    """For ``kind``: :func:`_readers`' answer, then the readers :class:`_Scan`'s added pass uses
+    for an instance it reaches plainly, then those it uses for one beneath an exception whose own
+    code renders it, then whether ``kind`` is such an exception, then what each added read takes
+    beyond the reads before it (:data:`_ReaderGains`).
+
+    Kept in ``memo``, one scan's, and never in :data:`_READERS`: the descriptors of a class's own
+    slots hold the class, and a class whose :func:`_readers` answer holds none of them must be
+    free to go once the scan ends. :func:`_readers`' answer is read from that cache when it is
+    there and never written to it, so a class only the added pass reaches is not cached."""
+    known = memo.get(id(kind))
+    if known is not None and known[0] is kind:
+        return known[1]
+    fresh, plain, beneath, opens = _find_reader_sets(kind)
+    cached = _READERS.get(id(kind))
+    first = cached[1] if cached is not None and cached[0]() is kind else fresh
+    gains = (_less(first, plain), _less(first, beneath), _less(plain, beneath))
+    record = (first, plain, beneath, opens, gains)
+    memo[id(kind)] = (kind, record)
+    return record
 
 
 def _less(had: _Readers, target: _Readers) -> _Readers:
@@ -2907,7 +2907,11 @@ def _less(had: _Readers, target: _Readers) -> _Readers:
     return target if had is None or target is None else _added_readers(had, target)
 
 
-def _find_reader_sets(kind: type[Any]) -> tuple[_Readers, _Readers, _Readers, bool]:
+def _find_reader_sets(
+    kind: type[Any], *, first_only: bool = False
+) -> tuple[_Readers, _Readers, _Readers, bool]:
+    """:func:`_readers`' answer, then :func:`_reader_record`'s three sets after it; with
+    ``first_only``, only the first is worked out, and the rest repeat it."""
     # Identity tests along the real MRO, so no caller code answers for the class.
     mro = _TYPE_MRO.__get__(kind)
     names: tuple[str, ...] | None = None
@@ -2941,8 +2945,9 @@ def _find_reader_sets(kind: type[Any]) -> tuple[_Readers, _Readers, _Readers, bo
         if own_render
         else names,
         (),
+        exc_dict=False,
     )
-    if not is_exception:
+    if first_only or not is_exception:
         return first, first, first, False
     slots = tuple(
         dict.fromkeys(  # each name is a str, so hashing it runs no caller code
@@ -2969,19 +2974,21 @@ def _find_reader_sets(kind: type[Any]) -> tuple[_Readers, _Readers, _Readers, bo
 
 
 def _resolve_readers(
-    kind: type[Any], names: tuple[str, ...] | None, extra: tuple[Any, ...]
+    kind: type[Any], names: tuple[str, ...] | None, extra: tuple[Any, ...], *, exc_dict: bool = True
 ) -> tuple[Any, ...] | None:
     """The instance ``__dict__``'s descriptor or None, then each of ``names`` that is a slot of
-    ``kind``, then ``extra``; or None when ``names`` is None."""
+    ``kind``, then ``extra``; or None when ``names`` is None. ``exc_dict`` is False for the first
+    pass's readers (:func:`_readers`), which read an instance dict only through the descriptor the
+    class itself keeps under ``__dict__``."""
     if names is None:
         return None
     own_dict = _class_attribute(kind, "__dict__")
     # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
     reader = type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
-    if not reader and issubclass(kind, BaseException):
-        # Every exception has an instance dict, and BaseException's own descriptor reads it: a
-        # property or `__dict__ = None` must not hide it. Another class's getset is still used,
-        # so a read that raises fails closed as it did before.
+    if not reader and exc_dict and issubclass(kind, BaseException):
+        # The added pass's readers only. Every exception has an instance dict, and BaseException's
+        # own descriptor reads it: a property or `__dict__ = None` must not hide it from the added
+        # pass. Another class's getset is still used, so a read that raises fails closed.
         own_dict, reader = _EXC_DICT, True
     found: list[Any] = [own_dict if reader else None]
     for name in names:
@@ -3200,10 +3207,7 @@ class _ScanShare:
     link's added reads of a single large object, such as an exception group in its chain, can spend
     all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
     error only they would reach prints raw. That link prints as it did before this change, except at
-    least where a verdict was handed on to it (below), which it then uses without a scan of its own,
-    and where its first pass reads an exception's instance ``__dict__`` through :data:`_EXC_DICT`
-    while the class puts another descriptor under that name: before this change that read raised,
-    and the exception printed the note (fail closed); now its real ``__dict__`` is read.
+    least where a verdict was handed on to it (below), which it then uses without a scan of its own.
 
     COSTS IN THE ADDED PASS (:func:`_added_pass`). It reads an object at most twice: once the plain
     way, and once the deep way, beneath or as an exception whose own code renders it. Each read
@@ -3415,6 +3419,7 @@ def _added_pass(
     deep way, and the most slots any read here went through."""
     # id -> 1 when read the plain way here, 2 when read the deep way.
     done: dict[int, int] = {}
+    memo: _RecordMemo = {}
     opened: list[Any] = []
     pending: list[tuple[Any, bool]] = []
     widest = 0
@@ -3424,7 +3429,7 @@ def _added_pass(
         kind = type(arg)
         if kind in _ARG_SCALARS or issubclass(kind, UnicodeError):
             continue
-        _first, _plain, _beneath, opens, gains = _reader_record(kind)
+        _first, _plain, _beneath, opens, gains = _reader_record(kind, memo)
         if opens or _reads_any(gains[0]):
             pending.append((arg, False))
     while pending and budget > 0:
@@ -3441,7 +3446,7 @@ def _added_pass(
         known = nodes.get(key)
         if known is not None and known[1] is None:
             continue  # unreadable, and it already counts as an error
-        _first, plain, beneath, opens, gains = _reader_record(kind)
+        _first, plain, beneath, opens, gains = _reader_record(kind, memo)
         inner = deep or opens  # what it reaches is read the deep way
         level = 2 if inner else 1
         before = done.get(key, 0)

@@ -24,13 +24,16 @@ import collections.abc
 import configparser
 import dataclasses
 import functools
+import gc
 import io
 import itertools
 import logging
+import random
 import struct
 import sys
 import traceback
 import types
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -2437,6 +2440,15 @@ def _shared_beneath(payload: bool) -> _Scenario:
     return "arg", arg, {"plain": plain, "own": own, "shared": shared, "arg": arg}
 
 
+def _hidden_dict_beside_a_holder() -> _Scenario:
+    # The first pass reads no instance dict the class hides behind `__dict__ = None`, as on
+    # origin/main, so a large one cannot spend the budget a sibling holder needs.
+    hidden = _with_attributes(_ShadowedDict("x"), 5000)
+    held = _Held(_encode_error())
+    error = RuntimeError(hidden, held)
+    return "exc", error, {"error": error, "hidden": hidden, "held": held}
+
+
 _DIFFERENTIAL: dict[str, Any] = {
     "repeated-dataclass": _repeated_dataclass,
     "large-slot-before-dict-value": functools.partial(_slot_then_attribute, "exc"),
@@ -2450,6 +2462,7 @@ _DIFFERENTIAL: dict[str, Any] = {
     "outer-link-starves-a-later-one": _outer_link_starves,
     "shared-by-plain-and-own-code-holder": functools.partial(_shared_beneath, True),
     "shared-plain-exception-holding-by-attribute": functools.partial(_shared_beneath, False),
+    "hidden-dict-beside-a-holder": _hidden_dict_beside_a_holder,
 }
 
 #: Which targets the scan with no added pass found holding an error (engine commit 68820faf03).
@@ -2466,6 +2479,7 @@ _FIRST_PASS_HOLDS: dict[str, frozenset[str]] = {
     "outer-link-starves-a-later-one": frozenset({"inner"}),
     "shared-by-plain-and-own-code-holder": frozenset({"arg", "own", "plain", "shared"}),
     "shared-plain-exception-holding-by-attribute": frozenset(),
+    "hidden-dict-beside-a-holder": frozenset({"error", "held"}),
 }
 
 
@@ -2490,6 +2504,201 @@ def test_the_added_pass_holds_wherever_the_first_pass_alone_holds(name: str) -> 
 def test_the_added_pass_reaches_what_only_it_reads() -> None:
     # A control for the test above: the added pass does find what the first pass never reads.
     assert {"own", "arg"} <= _verdicts(_DIFFERENTIAL["shared-plain-exception-holding-by-attribute"])
+
+
+class _SlotOnly(Exception):
+    """A slot of its own and the builtin ``__str__`` and ``__repr__``."""
+
+    __slots__ = ("code",)
+    code: object
+
+
+def _fuzz_graph(seed: int) -> _Scenario:
+    """One random graph of containers, dataclasses and exceptions, some large enough to spend the
+    budget, with codec errors among them. Every non-scalar is a target, named in creation order."""
+    rng = random.Random(seed)
+    named: dict[str, object] = {}
+
+    def keep[T](obj: T) -> T:
+        named[f"n{len(named)}"] = obj
+        return obj
+
+    def pad(error: BaseException) -> BaseException:
+        return _with_attributes(error, rng.choice((0, 0, 3, 2000, 4100)))
+
+    def exc(depth: int) -> BaseException:
+        child = value(depth)
+        return child if isinstance(child, BaseException) else keep(RuntimeError(child))
+
+    def value(depth: int) -> object:
+        roll = rng.random()
+        if depth >= 4 or roll < 0.25:
+            leaf = rng.random()
+            if leaf < 0.3:
+                return keep(_encode_error())
+            if leaf < 0.6:
+                return rng.randrange(100)
+            return keep(list(range(rng.choice((3, 60, 3000, 5000)))))
+        return node(depth + 1)
+
+    def node(depth: int) -> object:
+        kind = rng.randrange(12)
+        kids = [value(depth) for _ in range(rng.randrange(1, 4))]
+        if kind == 0:
+            return keep(kids)
+        if kind == 1:
+            return keep({f"k{i}": kid for i, kid in enumerate(kids)})
+        if kind == 2:
+            return keep(_Held(kids[0] if kids else None))
+        if kind == 3:
+            return keep(pad(RuntimeError(*kids)))
+        if kind == 4:
+            error = keep(pad(RuntimeError("x")))
+            error.original = value(depth)  # type: ignore[attr-defined]
+            return error
+        if kind == 5:
+            return keep(pad(_PayloadError(kids[0] if kids else None)))
+        if kind == 6:
+            return keep(pad(_Batch(*kids)))
+        if kind == 7:
+            error = keep(pad(_CauseError("x")))
+            error.__cause__ = exc(depth)
+            return error
+        if kind == 8:
+            hidden = keep(_ShadowedDict("x"))
+            pad(hidden)
+            hidden.payload = kids[0] if kids else None
+            return hidden
+        if kind == 9:
+            slotted = keep(_Slotted("x"))
+            slotted.payload = kids[0] if kids else None
+            return slotted
+        if kind == 10:
+            only = keep(_SlotOnly("x"))
+            only.code = kids[0] if kids else None
+            return only
+        error = keep(pad(_LinkError("x")))
+        error.__context__ = exc(depth)
+        return error
+
+    mode = rng.choice(("arg", "arg", "exc", "chain"))
+    if mode == "arg":
+        root = node(0)
+        return "arg", root, named
+    root = exc(0)
+    if mode == "exc":
+        return "exc", root, named
+    # The links in the order safe_traceback scans them: each link, then its context, then its
+    # cause, each once.
+    links: dict[str, object] = {}
+    pending: list[BaseException | None] = [root]
+    seen: set[int] = set()
+    while pending:
+        link = pending.pop()
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        links[f"n{list(map(id, named.values())).index(id(link))}"] = link
+        pending.append(link.__cause__)
+        pending.append(link.__context__)
+    return "chain", root, links
+
+
+_FUZZ_SEED = 3340
+_FUZZ_GRAPHS = 300
+#: For each graph whose verdicts on engine commit 68820faf03 hold anything, the targets they hold,
+#: worked out by running that commit's redaction.py on the same graphs. A graph not listed holds none.
+_FUZZ_MAIN_HOLDS: dict[int, frozenset[str]] = {
+    4: frozenset({"n0", "n21", "n22"}),
+    5: frozenset({"n31", "n32", "n86"}),
+    6: frozenset({"n15"}),
+    10: frozenset({"n18"}),
+    26: frozenset({"n0"}),
+    27: frozenset({"n0", "n1", "n2", "n3", "n8", "n9", "n32", "n33"}),
+    41: frozenset({"n0"}),
+    52: frozenset({"n3"}),
+    59: frozenset({"n37"}),
+    68: frozenset({"n0", "n5"}),
+    69: frozenset({"n0", "n3", "n4"}),
+    77: frozenset({"n8", "n9"}),
+    82: frozenset({"n0", "n2", "n3", "n12", "n25", "n26"}),
+    83: frozenset({"n0", "n1", "n22"}),
+    86: frozenset({"n0", "n11", "n12", "n13"}),
+    101: frozenset({"n0", "n2", "n5", "n19", "n20"}),
+    104: frozenset({"n0"}),
+    110: frozenset({"n0"}),
+    112: frozenset({"n4"}),
+    121: frozenset({"n0"}),
+    130: frozenset({"n1", "n2", "n7", "n8", "n32"}),
+    131: frozenset({"n0", "n17"}),
+    133: frozenset({"n23", "n24", "n43", "n44"}),
+    134: frozenset({"n11"}),
+    135: frozenset({"n4", "n5", "n6", "n7"}),
+    137: frozenset({"n8", "n9", "n12"}),
+    149: frozenset({"n0", "n21"}),
+    158: frozenset({"n0", "n34", "n47", "n48", "n49"}),
+    163: frozenset({"n0", "n29", "n30", "n31"}),
+    171: frozenset({"n10", "n11", "n18", "n19", "n21", "n22"}),
+    180: frozenset({"n36"}),
+    184: frozenset({"n0", "n1"}),
+    193: frozenset({"n24"}),
+    198: frozenset({"n25", "n26", "n27", "n28"}),
+    208: frozenset({"n0", "n3", "n16", "n29", "n30", "n31"}),
+    213: frozenset({"n0", "n2", "n15", "n16"}),
+    221: frozenset({"n0", "n6"}),
+    229: frozenset({"n10", "n11"}),
+    237: frozenset({"n0", "n1"}),
+    241: frozenset({"n54", "n62", "n63", "n71", "n72"}),
+    245: frozenset({"n5"}),
+    246: frozenset({"n3", "n4", "n5", "n6", "n14", "n19"}),
+    251: frozenset({"n52"}),
+    255: frozenset({"n9"}),
+    256: frozenset({"n0", "n1", "n20", "n21"}),
+    264: frozenset({"n0", "n1", "n2"}),
+    267: frozenset({"n0", "n1"}),
+    273: frozenset({"n51"}),
+    274: frozenset({"n0"}),
+    285: frozenset({"n31"}),
+    291: frozenset({"n0", "n2", "n10", "n13", "n15", "n32", "n48", "n49"}),
+    293: frozenset({"n0", "n2", "n3", "n4", "n5", "n20", "n40"}),
+    295: frozenset({"n0", "n1", "n2", "n4", "n8", "n9", "n32", "n33"}),
+    297: frozenset({"n30"}),
+}
+
+
+@pytest.mark.parametrize("index", range(_FUZZ_GRAPHS))
+def test_the_added_pass_holds_wherever_the_first_pass_alone_holds_on_random_graphs(
+    index: int,
+) -> None:
+    graph = functools.partial(_fuzz_graph, _FUZZ_SEED * 1000 + index)
+    assert _verdicts(graph) >= _FUZZ_MAIN_HOLDS.get(index, frozenset())
+
+
+def test_the_random_graphs_reach_both_verdicts() -> None:
+    # A control for the test above: the graphs are neither all holding nor all empty.
+    assert 0 < len(_FUZZ_MAIN_HOLDS) < _FUZZ_GRAPHS
+
+
+def _scanned_class() -> weakref.ref[type[BaseException]]:
+    class Slotted(Exception):
+        __slots__ = ("code",)
+        code: object
+
+    error = Slotted("y")
+    error.code = 1
+    redaction.safe_exc(error)
+    redaction.prints_a_codec_error(error)
+    safe_traceback((Slotted, error, None))
+    return weakref.ref(Slotted)
+
+
+def test_a_scanned_exception_class_is_not_kept_alive_past_the_scan() -> None:
+    # Review of vault BACKLOG #3340: the added pass's readers were cached with the first pass's,
+    # and a slot's descriptor holds its class, so an exception class origin/main let go stayed
+    # alive until the cache filled.
+    alive = _scanned_class()
+    gc.collect()
+    assert alive() is None
 
 
 class _Slotted(Exception):
