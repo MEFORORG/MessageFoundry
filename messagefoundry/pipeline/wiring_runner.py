@@ -8795,10 +8795,11 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, an
-        :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError` from the parse or the
-        splice, is a permanent :class:`NegativeAckError` instead, since no retry could clear it (vault
-        BACKLOG #2809). Any other ``ValueError`` propagates to the outbound's internal-error policy."""
+        into the partner's ``OBX-5.5`` = silent corruption). A malformed handle (:class:`DocRefError`) takes that
+        same retryable path. A failure the payload itself causes, an
+        :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
+        :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
+        other ``ValueError`` propagates to the outbound's internal-error policy."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8826,7 +8827,7 @@ class RegistryRunner:
             # fault in the re-attach still reaches the outbound's internal-error policy, and STOP
             # still stops the lane. Raised after the handler ends, so a parse error that quotes the
             # payload is on neither chain (see IngressGuardError).
-            refused = f"document re-attach failed: {safe_exc(exc.__cause__ or exc)}"
+            refused = f"document re-attach failed: {safe_exc(exc)}"
         raise NegativeAckError(refused, code="reattach", permanent=True)
 
     async def _pace_outbound(self, name: str) -> None:

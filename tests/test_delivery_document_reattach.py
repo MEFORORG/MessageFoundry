@@ -472,6 +472,45 @@ async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
 
 
+async def test_a_parser_fault_in_the_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # parse_or_refuse turns a parser fault into an HL7PeekError; the re-attach must not read that one
+    # as the payload's and dead-letter it (vault BACKLOG #2809).
+    from messagefoundry.parsing import _builtin_hl7
+
+    def _faulting_parse(*_args: object, **_kwargs: object) -> object:
+        raise IndexError("parser bug")
+
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner._destinations[DEST] = _Collector()
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(_builtin_hl7, "parse", _faulting_parse)
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+async def test_a_payload_whose_msh2_names_no_separators_is_a_permanent_refusal(
+    store: MessageStore,
+) -> None:
+    ref = await _store_doc(store, _big_b64(600))
+    payload = _hl7_with_value(make_doc_ref(ref, "application/pdf")).replace("|^~\\&|", "|^~\\|", 1)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    with pytest.raises(NegativeAckError) as ei:
+        await runner._hydrate_payload(payload)
+    assert ei.value.permanent is True and ei.value.code == "reattach"
+
+
 async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
