@@ -4,7 +4,8 @@
 read by the connectors, the store and the web console's event-log filter.
 
 ``tests/test_phi_logging_inventory.py`` pins that the set equals the kinds the emit sites write, and
-``tests/test_connection_event_burst.py`` that the drainer loses only an undeclared row.
+``tests/test_connection_event_burst.py`` that the runner refuses an undeclared kind before it
+reaches a burst.
 """
 
 from __future__ import annotations

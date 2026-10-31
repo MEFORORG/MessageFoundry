@@ -409,7 +409,7 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 
 # A source emits connection-lifecycle / transport events (Corepoint-style log, #46) to this OPTIONAL,
 # store-agnostic sink: ``(kind, peer_host, reason)``, where ``kind`` is a member of
-# :data:`CONNECTION_EVENT_KINDS` (the store refuses any other). The runner injects it after build
+# :data:`CONNECTION_EVENT_KINDS` (the runner drops any other). The runner injects it after build
 # and binds the connection name + transport + direction; the source only knows the wire-level facts.
 # ``None`` (the default) makes every emit site a no-op (byte-identical when off). Metadata only —
 # never a raw frame or message body; the source passes a ``safe_exc``-scrubbed reason and the store
@@ -1141,7 +1141,8 @@ class SourceConnector(abc.ABC):
 
     Some sources also report some refusals and quarantines through :attr:`on_connection_event`,
     where capture is on; no source reports a deferral there. Each kind passed there must be a
-    member of :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
+    member of :data:`CONNECTION_EVENT_KINDS`. The runner drops any other with a throttled
+    WARNING, and the store refuses one as a backstop.
 
     **When the inbound handler raises.** The inbound handler records every message-level outcome
     itself (a parse or validation failure is an ``ERROR`` row, and it returns). An exception

@@ -7,10 +7,11 @@ accept, refusal or close, a poll source's reject of an item it could not read, a
 outbound lane transitions. Its ``kind`` names which. This module holds the closed set of kinds.
 
 The connectors emit these kinds, and :mod:`messagefoundry.transports.base` re-exports the set beside
-the connector contract. Three places read it at run time:
+the connector contract. At least three places read it at run time:
 
-* the runner, which refuses an undeclared kind before the event is queued
-  (``RegistryRunner._enqueue_connection_event``), counts it and logs it, so it never joins a burst;
+* the runner, which drops an undeclared kind before the event is queued
+  (``RegistryRunner._enqueue_connection_event``) and logs a throttled WARNING, so it never joins a
+  burst;
 * the store, as the backstop for any other writer: every backend's connection-event writer calls
   :func:`check_connection_event_kind` and raises on an undeclared kind;
 * the web console's event-log filter, which offers :data:`CONNECTION_EVENT_KIND_ORDER` as its
@@ -76,8 +77,9 @@ def check_connection_event_kind(kind: str) -> None:
 
     A row with an undeclared kind would be stored, but the console's kind filter could not select
     it and ``docs/PHI.md`` would not say what it means, so the store refuses it rather than write it.
-    A burst holding one undeclared row is refused whole. The runner refuses undeclared kinds before
-    they are queued, so its bursts never meet this check; it is the backstop for other writers."""
+    A burst holding one undeclared row is refused whole. The runner drops undeclared kinds before
+    they are queued, so every row of its bursts passes this check; the check is still run on them,
+    and is the backstop for any row that reaches the store another way."""
     if kind not in CONNECTION_EVENT_KINDS:
         raise ValueError(
             f"unknown connection_event kind {kind!r}: add it to "

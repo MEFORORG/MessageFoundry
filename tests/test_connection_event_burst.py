@@ -227,17 +227,35 @@ async def test_undeclared_kinds_are_refused_at_enqueue_and_the_burst_keeps_every
     assert not [r for r in caplog.records if "burst write failed" in r.getMessage()]
 
 
-def test_the_refusal_warning_bounds_the_kind_and_stops_at_the_cap(
-    runner: RegistryRunner, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+def test_the_refusal_warning_names_a_long_kind_by_its_bounded_head(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(wiring_runner, "_CONN_EVENT_REFUSAL_LOG_MAX", 2)
+    long_kind = "undeclared_long_" + "x" * 500
     with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
-        for i in range(4):
-            _enqueue(runner, _event(i, kind=f"undeclared_{i}_" + "x" * 500))
-    refusals = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
-    assert len(refusals) == 2, "past the cap, refusals are counted and not logged"
-    assert all(len(m) < 400 for m in refusals), "the kind is bounded in the log line"
-    assert runner._conn_events_dropped == 4
+        _enqueue(runner, _event(0, kind=long_kind))
+    [line] = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    head = long_kind[: wiring_runner._UNDECLARED_KIND_SHOWN]
+    assert repr(head) in line, "the line names the kind by its bounded head, not an ellipsis"
+    assert long_kind not in line
+
+
+def test_the_refusal_warning_is_throttled_per_pair_and_capped_across_pairs(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two distinct kinds on one connection each log; a repeat inside the window does not, but the
+    # next line written reports the running total, repeats included.
+    cap = runner._undeclared_kind_log.max_per_window
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0, kind="undeclared_a"))
+        _enqueue(runner, _event(0, kind="undeclared_a"))
+        _enqueue(runner, _event(0, kind="undeclared_b"))
+        for i in range(cap + 5):
+            _enqueue(runner, _event(0, kind=f"undeclared_more_{i}"))
+    lines = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    assert len(lines) == cap, "every pair past the cross-pair cap is counted and not logged"
+    assert "undeclared_a" in lines[0] and "(1 such event(s)" in lines[0]
+    assert "undeclared_b" in lines[1] and "(3 such event(s)" in lines[1]
+    assert runner._conn_events_dropped == cap + 8
 
 
 async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(
