@@ -711,21 +711,28 @@ def test_a_validate_measured_past_the_timeout_gives_the_listener_text(
 
 
 def test_a_fault_raised_after_the_timeout_gives_the_timeout_text(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The listener has given up by the time a late validate raises, so its row says timed out; the
-    preview checks the elapsed time before re-raising, and says the same."""
+    preview checks the elapsed time before re-raising, and says the same. The fault is not dropped
+    silently: its class is logged, never its text (CLAUDE.md section 6)."""
+    import logging
+
     from messagefoundry.pipeline import dryrun
 
     def boom(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("validator fault")
+        raise RuntimeError("validator fault MRN-77031")
 
     monkeypatch.setattr(dryrun, "validate", boom)
     _clock(monkeypatch, 31.0)
 
-    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+    with caplog.at_level(logging.DEBUG, logger=dryrun.__name__):
+        result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
 
     assert result.error == "strict-validation timed out after 30.0s"
+    late = [r for r in caplog.records if "after its timeout" in r.getMessage()]
+    assert len(late) == 1 and "RuntimeError" in late[0].getMessage()
+    assert "MRN-77031" not in caplog.text
 
 
 def test_a_disabled_timeout_validates_un_timed_as_the_listener_does(

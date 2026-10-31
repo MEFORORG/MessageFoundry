@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import textwrap
@@ -536,12 +537,12 @@ def test_check_validate_fails_on_invalid_encoding(tmp_path: Path) -> None:
     assert "not a Python text codec" in result.detail
 
 
-@pytest.mark.parametrize("literal", ["8", "True"])
+@pytest.mark.parametrize("literal", ["8", "True", "1252"])
 def test_check_validate_fails_on_a_non_str_encoding_naming_the_connection(
     tmp_path: Path, literal: str
 ) -> None:
-    # BACKLOG #2431: the run-time rule stringifies a non-str value into a name no codec has, so every
-    # message would be refused and a DATABASE poll would fail outright. Refused at load instead.
+    # BACKLOG #2431: an encoding must be a codec NAME string. A number is ambiguous: the run-time rule
+    # stringifies it, and 1252 then names cp1252 while 8 names nothing. Refused at load either way.
     from messagefoundry.checks import _check_validate
 
     _encoding_cfg(tmp_path, f"inbound('i', MLLP(port=2575, encoding={literal}), router='r')")
@@ -804,7 +805,7 @@ def test_an_env_outbound_encoding_resolving_to_none_or_empty_is_refused(
 
 
 def test_a_cast_raising_any_error_does_not_escape_the_resolved_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # BACKLOG #1656: a cast is an arbitrary callable, and a lookup-table cast raises KeyError carrying
     # the value. The resolved pass runs before the connector build, so it must skip such a ref and
@@ -815,10 +816,17 @@ def test_a_cast_raising_any_error_does_not_escape_the_resolved_pass(
         "TABLE = {}\n"
         "outbound('o', File(directory='.', encoding=env('charset', cast=TABLE.__getitem__)))",
     )
-    with pytest.raises(WiringError) as ei:
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry.config.wiring"),
+        pytest.raises(WiringError) as ei,
+    ):
         _build_check(load_config(tmp_path), {"charset": secret})
     assert secret not in str(ei.value)
     assert "charset" in str(ei.value)  # positive control: the ref is still the diagnostic
+    # Not dropped silently (CLAUDE.md section 6): the probe logs the cast error's CLASS only.
+    probed = [r for r in caplog.records if "skipped by this probe" in r.getMessage()]
+    assert probed and all("KeyError" in r.getMessage() for r in probed)
+    assert secret not in caplog.text
 
 
 def test_a_non_string_environment_value_names_its_type(tmp_path: Path) -> None:

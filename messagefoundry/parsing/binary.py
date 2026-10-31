@@ -74,6 +74,7 @@ __all__ = [
     "BinaryCarriageError",
     "DocRefError",
     "EscapedDocumentError",
+    "UnreattachableDocumentError",
     "encode",
     "decode",
     "is_marked",
@@ -121,6 +122,17 @@ class EscapedDocumentError(ValueError):
     to the character it names, so the stored value would not be the sender's bytes, and a decoded CR
     would make every later re-attach raise. Base64 needs no escape, so the ingress detach refuses the
     message instead. The text names the OBX occurrence only, never a byte of the value."""
+
+
+class UnreattachableDocumentError(ValueError):
+    """The payload itself stops a re-attach (vault BACKLOG #2809). Three shapes only: the parser
+    refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), its
+    MSH-1 and MSH-2 do not name its separators, or a stored document holds a CR or LF (which a
+    detach that decoded ``\\X0D\\`` or ``\\X0A\\`` once left) and so cannot be set back into
+    ``OBX-5.5``. The same payload fails the same way on every attempt, so the delivery path refuses
+    it permanently. Every other ``ValueError`` in the re-attach, a parser fault included, may be an
+    engine fault and stays the outbound's internal-error policy to judge. The text names the step
+    and the OBX occurrence, never a byte of the payload."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
@@ -550,7 +562,9 @@ async def reattach_documents_in_hl7(
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched."""
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The three
+    payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
+    ``ValueError`` propagates as it is."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -558,6 +572,7 @@ async def reattach_documents_in_hl7(
     import asyncio
 
     from messagefoundry.parsing.message import Message
+    from messagefoundry.parsing.peek import HL7PeekError
 
     # The parse, each splice and the re-encode run in a thread (vault BACKLOG #2757): the splice and
     # the encode scale with the document, and this runs on every delivery attempt. Measured 2026-10-06
@@ -566,7 +581,23 @@ async def reattach_documents_in_hl7(
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
     def _handles() -> tuple[Message, list[tuple[int, str]]]:
-        message = Message.parse(text)
+        refused: str | None = None
+        try:
+            message = Message.parse(text)
+        except HL7PeekError as exc:
+            if exc.parser_fault:
+                raise  # a fault in the parser, not the payload: the internal-error policy judges it
+            refused = "the payload does not parse as HL7"
+        if refused is not None:
+            # Raised after the handler, so the parse error, which may quote the payload, is on no
+            # chain.
+            raise UnreattachableDocumentError(refused)
+        # The separators every OBX-5.5 read below needs, by the rule Message._encoding_chars applies:
+        # an MSH-1 or MSH-2 that cannot name them is the payload's, and every read would raise on it.
+        if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
+            raise UnreattachableDocumentError(
+                "the payload's MSH-1 and MSH-2 do not name its separators"
+            )
         found: list[tuple[int, str]] = []
         for occ in range(1, message.count_segments("OBX") + 1):
             value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -589,6 +620,13 @@ async def reattach_documents_in_hl7(
             raise DocRefError(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"
+            )
+        if "\r" in verbatim or "\n" in verbatim:
+            # Message.set refuses a CR or LF in a field value. Checked here rather than caught from
+            # set, so any other ValueError set raises stays an engine fault.
+            raise UnreattachableDocumentError(
+                f"the stored document for OBX-5.5 occurrence {occ} holds a CR or LF, so it cannot "
+                "be set back"
             )
         await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
     return await asyncio.to_thread(message.encode)

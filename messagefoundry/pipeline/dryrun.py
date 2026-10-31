@@ -975,6 +975,13 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
         fault = exc
     # Measured before a fault is re-raised: the listener had given up by then, so it says timed out.
     if timeout is not None and time.monotonic() - started > timeout:
+        if fault is not None:
+            # The verdict is the timeout, so the fault is not raised, but it is not dropped silently
+            # either (CLAUDE.md section 6). The class only: a validate error can quote the message.
+            log.debug(
+                "dry-run strict validation raised %s after its timeout; reported as timed out",
+                type(fault).__name__,
+            )
         return f"strict-validation timed out after {timeout}s"
     if fault is not None:
         raise fault

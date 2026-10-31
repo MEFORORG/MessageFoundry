@@ -132,6 +132,7 @@ from messagefoundry.parsing.binary import (
     DOC_REF_MARKER,
     DocRefError,
     EscapedDocumentError,
+    UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
@@ -8794,9 +8795,11 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, a
-        ``ValueError`` from the parse or the splice, is a permanent :class:`NegativeAckError` instead,
-        since no retry could clear it (vault BACKLOG #2809)."""
+        into the partner's ``OBX-5.5`` = silent corruption). A malformed handle (:class:`DocRefError`) takes that
+        same retryable path. A failure the payload itself causes, an
+        :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
+        :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
+        other ``ValueError`` propagates to the outbound's internal-error policy."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8816,14 +8819,14 @@ class RegistryRunner:
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
-        except ValueError as exc:
-            # Below the DocRefError arm on purpose, since DocRefError is a ValueError. Every other
-            # ValueError here is the MESSAGE's: the payload does not parse, or a stored value cannot be
-            # set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The reader raises none, since a
-            # store fault arrives as _StoreReadFault. The same payload fails the same way on every
-            # attempt, so a retry could never succeed and the internal-error arm could stop the lane:
-            # refuse it permanently, which dead-letters this row alone. Raised after the handler ends,
-            # so a parse error that quotes the payload is on neither chain (see IngressGuardError).
+        except UnreattachableDocumentError as exc:
+            # Only the two failures the MESSAGE causes: the payload does not parse, or a stored value
+            # cannot be set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The same payload fails
+            # the same way on every attempt, so a retry could never succeed: refuse it permanently,
+            # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
+            # fault in the re-attach still reaches the outbound's internal-error policy, and STOP
+            # still stops the lane. Raised after the handler ends, so a parse error that quotes the
+            # payload is on neither chain (see IngressGuardError).
             refused = f"document re-attach failed: {safe_exc(exc)}"
         raise NegativeAckError(refused, code="reattach", permanent=True)
 
@@ -11347,8 +11350,12 @@ class UserCodeCalledSysExit(_RedactedFault):
     the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
     or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
     is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
-    re-raises it out of the event loop and every connection stops. ``KeyboardInterrupt`` and
-    ``CancelledError`` keep propagating: those are signals to the engine, not faults in a message.
+    re-raises it out of the event loop and every connection stops. Only ``SystemExit`` is converted.
+    The catch is no wider, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router or Handler
+    code raises itself still escapes, as it did before this class existed. In a worker thread a
+    ``KeyboardInterrupt`` is no signal to the engine, since Python delivers Ctrl+C to the main
+    thread, so one Router or Handler code raises would still be re-raised out of the event loop and
+    stop every connection. Converting it too is not done here.
 
     Redacted by construction: the text names an integer exit code and nothing else, since
     ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading

@@ -5387,15 +5387,20 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
 
     A cast is an arbitrary callable, so **every** exception it raises is caught, as
     :func:`resolve_env_settings` catches it (BACKLOG #1656): a ``KeyError`` from a lookup-table cast
-    carries the value. Not logged, for the same reason; that function reports the ref redacted when
-    the connector is built."""
+    carries the value. Only the exception's class is logged, at DEBUG, never its message, for the
+    same reason; that function reports the ref redacted when the connector is built."""
     if ref.key in values:
         raw = values[ref.key]
         if ref.cast is None:
             return raw
         try:
             return ref.cast(raw)
-        except Exception:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+            _logger.debug(
+                "env() value %r: its cast raised %s; skipped by this probe",
+                ref.key,
+                type(exc).__name__,
+            )
             return _UNSET
     if ref.default is not _UNSET:
         return ref.default
@@ -5438,9 +5443,12 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     inbound's own ``spec.settings``, where an ``env()`` encoding is still the reference, so no
     environment value this pass could accept would be the name the decode uses.
 
-    A value resolving to ``None`` or ``""`` is refused with its own message: only the inbound decode
-    reads a falsy name as ``utf-8`` by rule, and at least most outbound connectors and the FHIR
-    lookup read the value as the codec name itself."""
+    A value resolving to ``None`` or ``""`` is refused with its own message, because readers differ
+    on it and an env() value should not depend on which one reads it. At least the remote-file
+    destination reads a falsy name as ``utf-8``, a reference set's ``encoding`` is informational (its
+    loaders read ``utf-8``), and at least some other outbound connectors and the FHIR lookup read the
+    value as the codec name itself. So the message asks for a codec name rather than saying every send would
+    fail."""
     problems: list[str] = []
     for kind, name, value, deployed in registry._declared_encodings():
         if not isinstance(value, EnvRef):
@@ -5855,14 +5863,16 @@ class Registry:
                     )
                 continue  # on an inbound, an explicit "not declared": the decode falls back to utf-8
             if not isinstance(value, str):
-                # A literal such as `encoding = 8` or `true`. The run-time rule would stringify it into
-                # a name no codec has and refuse every message, and a DATABASE source poll would fail
-                # outright, so it is refused here instead (BACKLOG #2431). The type is named so the
-                # operator is not sent hunting a misspelling.
+                # A literal such as `encoding = 1252` or `true`. An encoding must be a codec NAME, a
+                # string. A number is ambiguous: the run-time rule stringifies it, and some numbers
+                # then name a real codec (1252 reads as cp1252, 8859 as iso8859-1, 437 as cp437)
+                # while others name none, so what it decodes with would depend on that accident. It
+                # is refused here, whatever str() would make of it (BACKLOG #2431). The type is
+                # named so the operator is not sent hunting a misspelling.
                 problems.append(
-                    f"{kind} {name!r}: encoding is a {type(value).__name__}, not a codec name — "
-                    f"every message would fail at decode/encode; use a codec name such as 'utf-8', "
-                    f"'latin-1' or 'cp1252'"
+                    f"{kind} {name!r}: encoding is a {type(value).__name__}, not a codec name "
+                    f"string; a number or other non-string value is ambiguous, so write the name "
+                    f"quoted, such as 'utf-8', 'latin-1' or 'cp1252'"
                 )
                 continue
             if not _is_text_codec(value):
