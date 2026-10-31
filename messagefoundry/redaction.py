@@ -3241,7 +3241,10 @@ class _ScanShare:
     scan does, and can end up to two units past it (a dict read at an odd limit). A scan with no share runs its added pass on what its
     first pass left. In a traceback, a link's added pass runs on the smaller of that and what is
     left of ``added``, one more budget the added passes of every link share, so a long chain whose
-    scans each run out is not read once per link. The first passes never draw on ``added``. One
+    scans each run out is not read once per link. A link's added pass, too, can end up to two
+    units past what it was given (a dict read at an odd limit), and ``added`` is charged only what
+    was given, so the added reads of a traceback can exceed ``added`` by up to two units per link.
+    The first passes never draw on ``added``. One
     link's added reads of a single large object, such as an exception group in its chain, can spend
     all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
     error only they would reach prints raw. That link prints as it did before this change, except at

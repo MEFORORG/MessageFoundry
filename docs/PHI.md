@@ -1701,11 +1701,14 @@ beneath one whose own code renders it: the walk then reads it the deep way, and 
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
 fixed note even where its own `__str__` would not print it. The line between builtin and own code
-is drawn at the `builtins` namespace: a `__str__` or `__repr__` that a class defined there
-carries never prints the chain, so such an exception raised from a codec error keeps its message,
+is drawn at the `builtins` namespace as it stands when `redaction.py` is imported: the walk trusts
+the C `__str__` and `__repr__` that any exception class found there then defines itself, including
+a class a C extension or a site hook placed there, as never printing the chain (a Python method
+found there is not trusted). So an exception whose method is a trusted one, raised from a codec
+error, keeps its message,
 except where the same exception is also reached beneath one whose own code renders it, as above:
-in that argument it prints as the fixed note too. A `__str__` or `__repr__` that a class defined
-anywhere else carries, the standard library included, counts as own code even when it is C code,
+in that argument it prints as the fixed note too. A `__str__` or `__repr__` that a class not found
+there at that time defines, the standard library included, counts as own code even when it is C code,
 so an exception such as `ssl.SSLError`, whose class defines its own `__str__`, raised from a codec
 error or while one was being handled, gets the fixed note.
 The rule applies
@@ -1745,7 +1748,10 @@ through that getset: where the exception is not an instance of that class the re
 the walk fails closed on that exception. It does not read everything such code can
 reach: an object the walk does not read by attribute, as listed below, is not read there either.
 It runs on the budget the first pass left, and in
-a traceback within one more budget that the added passes of every link share. **It only adds: it
+a traceback within about one more budget that the added passes of every link share: like the first
+pass, a link's added pass can end up to 2 units past what it was given, and the shared budget is
+not charged for those units, so a traceback's added reads can exceed it by up to 2 units per link.
+**It only adds: it
 can turn a "holds no error" verdict into "holds an error", never the other way.** What each read
 costs, and when one link's scan hands its verdict on to a later link, is in the `_ScanShare`
 docstring in `redaction.py`. At least these stay open. A codec error that only the added reads
