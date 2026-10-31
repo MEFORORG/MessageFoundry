@@ -1682,9 +1682,17 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > `[settings]` key. `FhirLookup` does not take it. CORRECTED 2026-10-01: this said no inbound takes it,
 > which was false for that poller.
 > [ADR 0094](adr/0094-granular-expiry-only-tls-relaxation.md).
-- **What you lose:** the certificate **validity-period** check on that hop, and nothing else. An expired
-  server certificate is accepted **indefinitely** — the relaxation has no end date, and nothing removes
-  it when the peer renews.
+- **What you lose:** the certificate **validity-period** check on that hop, and with it the CRL lever on
+  the revocation guard. An expired server certificate is accepted **indefinitely** — the relaxation has
+  no end date, and nothing removes it when the peer renews. The same flag also skips a CRL's own
+  validity window, so a `[tls].crl_file` that reaches the hop earns it no credit with the revocation
+  guard. Off the box on an enforcing instance such a hop is therefore refused unless the connection
+  sets `tls_revocation_attested` with a reason: on REST, SOAP and FHIR, already refused on main; on
+  both FTPS directions since vault BACKLOG #2193; and on MLLP and the DICOM C-STORE SCU since vault
+  BACKLOG #2978
+  ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+  §13). A CRL that reaches the hop still refuses a leaf certificate it lists. CORRECTED 2026-10-30:
+  this said the validity-period check was lost "and nothing else".
 - **What you keep, and it is most of it:** the chain signature, name constraints, key usage / EKU, basic
   constraints and the hostname match all still apply — it ORs exactly one flag
   (`X509_V_FLAG_NO_CHECK_TIME`). The hostname match holds only while the same connection leaves
@@ -1705,9 +1713,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   in `security_loosenings()`, and so in `GET /security/posture` on a running engine. **Not** the
   serve-time loosening warning — that fires before the graph is loaded, exactly as for
   `cleartext_accepted`, and the construction WARN covers the same ground moments later.
-- **What it cannot do — and the one thing you must supply:** it is **advisory only**. No posture gate
-  keys on it, `[security].enforcement = enforce` does not touch it, and no `MEFOR_ALLOW_INSECURE_TLS`
-  is needed to set it. Reported is not gated. The engine will tell you *which* connections have it set,
+- **What it cannot do — and the one thing you must supply:** it is **advisory only** as a setting. No
+  posture gate refuses the setting itself, `[security].enforcement = enforce` does not clamp it, and no
+  `MEFOR_ALLOW_INSECURE_TLS` is needed to set it. Reported is not gated. What it does change is the
+  revocation guard's answer, in either posture. Under an enforcing posture the hop is refused as *What
+  you lose* says. On an instance that does not enforce, an MLLP or DICOM C-STORE SCU hop that sets it,
+  which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
+  least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
+  `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
+  this said "No posture gate keys on it", which was false once the call sites handed the guard no
+  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
