@@ -286,10 +286,13 @@ first-ever reference-row key-rotation tests on all three backends.
   alerts. The error **never embeds the raw key** (reference keys may be PHI for patient-keyed sets):
   it carries the set name plus the key's length, ordinal, and a truncated SHA-256 only.
 - **Binary collation (divergence 2).** `COLLATE Latin1_General_100_BIN2` on `name` / `version` /
-  `[key]` (both tables), so key equality is a **byte comparison** like SQLite/Postgres. Under a
+  `[key]` (both tables), so key equality is case- and accent-exact like SQLite/Postgres. Under a
   case-insensitive database default (SQL Server's norm), externally-sourced keys differing only by
-  case — or by a trailing space, per ANSI padding on index keys — would collide into a PK duplicate
-  mid-transaction, turning a valid snapshot into a perpetual per-interval sync failure.
+  case would collide into a PK duplicate mid-transaction, turning a valid snapshot into a perpetual
+  per-interval sync failure. **CORRECTED 2026-10-30 (BACKLOG #1588):** this read that BIN2 also
+  stops keys differing only by a trailing space from colliding. It does not: SQL Server pads
+  trailing spaces in `=` and in index keys under every collation, BIN2 included, so such keys still
+  collide here, and nothing refuses them yet.
 - **Encryption at rest.** Values are `cipher.encrypt(json.dumps(v))` (`mfenc`), covered by **both**
   `reencrypt_to_active` (key rotation) **and** `_encrypt_existing_rows` (the no-key→key migration
   pass). The migration pass is required because "born encrypted" is false: under a no-key deployment

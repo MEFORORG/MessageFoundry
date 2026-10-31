@@ -93,6 +93,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
@@ -2061,20 +2062,6 @@ def _make_client(
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
-#: The remedy a ``tls_allow_expired`` FTPS hop's revocation refusal names. No CRL can relax that
-#: refusal (see :func:`_guard_ftps_revocation`), so the connection-shaped default, which offers
-#: ``[tls].crl_file``, would name a lever that cannot work there (SDS-3.7).
-_EXPIRY_RELAXED_WAYS_ACROSS = (
-    "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
-    "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
-    "skips the CRL's validity window at the handshake, and a CA may drop an expired "
-    "certificate from its CRL, which is the certificate this setting accepts. Set "
-    "tls_revocation_attested=true with a "
-    "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
-    "[tls].crl_file on this hop can admit it."
-)
-
-
 def _guard_ftps_revocation(
     context: ssl.SSLContext | None,
     s: dict[str, Any],
@@ -2115,7 +2102,7 @@ def _guard_ftps_revocation(
         attested_reason=attested_reason,
         connection=connection,
         context=None if expiry_relaxed else context,
-        ways_across=_EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+        ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
     ).enforce_construction()
 
 

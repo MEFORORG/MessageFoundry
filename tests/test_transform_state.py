@@ -98,6 +98,26 @@ def test_setstate_rejects_empty_namespace_or_key() -> None:
         SetState("ns", "", "v")
 
 
+def test_setstate_rejects_a_trailing_space_and_names_no_value() -> None:
+    """BACKLOG #1588: SQL Server pads a trailing space in ``=`` and its primary key under every
+    collation, so 'k' and 'k ' would be one row there. Refused on every backend, at construction.
+    The value may be PHI, so the message names only the field."""
+    with pytest.raises(WiringError, match="namespace must not end with a space") as ns_exc:
+        SetState("MRN-NS ", "k", "v")
+    with pytest.raises(WiringError, match="key must not end with a space") as key_exc:
+        SetState("ns", "MRN-KEY ", "v")
+    assert "MRN" not in str(ns_exc.value) and "MRN" not in str(key_exc.value)
+    # Control: a space anywhere else, and a trailing tab, are still accepted; only U+0020 pads.
+    for ns, key in (("ns", " k"), ("ns", "k k"), (" ns", "k"), ("n s", "k"), ("ns", "k\t")):
+        assert SetState(ns, key, "v").key == key
+    # The JSON check beside it names no value either.
+    with pytest.raises(WiringError, match="JSON-serializable") as json_exc:
+        SetState("MRN-NS", "MRN-KEY", {"MRN-IN-VALUE": object()})
+    assert "MRN" not in str(json_exc.value)
+    # Nothing chained: json's own exception carries a note naming the dict key it failed on.
+    assert json_exc.value.__cause__ is None and json_exc.value.__context__ is None
+
+
 # --- write side: applied in the handoff transaction --------------------------
 
 
