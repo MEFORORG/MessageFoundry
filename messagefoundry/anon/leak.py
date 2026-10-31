@@ -275,9 +275,8 @@ def known_segments(version: str) -> frozenset[str]:
 
 
 #: The fewest split fields a header line (``HEADER_SEGMENTS``) can have: the id, the encoding
-#: characters, and one field after them. The separator that ends the encoding characters is what
-#: the engine's parser looks for. Without it the parser cuts the encoding characters short and
-#: re-encodes the line with its own text repeated (BACKLOG #2998).
+#: characters, and one field after them, the first a rule may rewrite. Without it the line's text
+#: sits in field 2, which no rule may rewrite, so it would pass through untouched (BACKLOG #2998).
 _HEADER_MIN_FIELDS = 3
 
 
@@ -294,8 +293,8 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     A header line (``MSH``, ``FHS``, ``BHS``) is malformed with fewer than
     :data:`_HEADER_MIN_FIELDS` split fields. A bare one carries no separators, and the engine's
     parser refuses it where the tee would emit it. One with no separator after its encoding
-    characters (``BHS|TEXT``) is re-encoded out of shape by the engine, with ``TEXT`` written
-    twice, where the tee would emit it as it came (BACKLOG #2998)."""
+    characters (``BHS|TEXT``) holds its text in field 2, which no rule may rewrite, so it would
+    pass through untouched (BACKLOG #2998)."""
     seg_id = fields[0]
     if not _SEGMENT_ID.fullmatch(seg_id):
         return True

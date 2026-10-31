@@ -274,6 +274,8 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     append_rename_audits,
+    approval_fails_seal,
+    approval_tombstone,
     approval_update,
     audit_active_key_id,
     audit_append_refusal,
@@ -292,6 +294,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    held_approval_tombstone,
     if_applied,
     judge_totp,
     load_audit_chain,
@@ -851,6 +854,19 @@ _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
     " seal = ? OUTPUT inserted.id"
     " WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+)
+#: store.py's ``_SQLITE_APPROVAL_TOMBSTONE`` (BACKLOG #3638), which states the contract, with an
+#: ``OUTPUT`` so the caller learns whether it landed. Used only by `_tombstone_approval`.
+_MSSQL_APPROVAL_TOMBSTONE: Final = (
+    "UPDATE pending_approvals SET status = 'rejected', approver = ?, decided_at = ?, seal = ?"
+    " OUTPUT inserted.id WHERE id = ? AND status = 'pending'"
+    " AND seal COLLATE Latin1_General_100_BIN2 = ?"
+)
+#: store.py's ``_SQLITE_APPROVAL_TOMBSTONE_RESEAL`` (BACKLOG #3638), which states the contract,
+#: with an ``OUTPUT`` so the caller learns whether it landed. Used only by `_reseal_tombstone`.
+_MSSQL_APPROVAL_TOMBSTONE_RESEAL: Final = (
+    "UPDATE pending_approvals SET seal = ? OUTPUT inserted.id WHERE id = ?"
+    " AND status = 'rejected' AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -2160,8 +2176,14 @@ _SCHEMA: list[str] = [
     # Transform-accessible state (ADR 0005). Written here via transform_handoff (parity with SQLite/
     # Postgres): the read-through cache is loaded at open and refreshed post-commit, so a Handler's
     # cross-message state_get(...) resolves in-process. Schema matches SQLite.
+    # BACKLOG #1588: namespace and [key] are BIN2 so pk_state, the MERGE match and the re-seal UPDATEs
+    # compare case- and accent-exactly, as the cache and SQLite/Postgres do. Under a _CI_ default the
+    # MERGE matched another spelling and kept it, while the value was sealed to the incoming one, so a
+    # keyed reopen failed closed. BIN2 does NOT fix trailing spaces: `=` and the PK pad them under
+    # every collation, so 'k' and 'k ' would still be one row. SetState refuses a trailing space instead.
     """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
-        namespace NVARCHAR(256) NOT NULL, [key] NVARCHAR(256) NOT NULL, value NVARCHAR(MAX) NOT NULL,
+        namespace NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        [key] NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL, value NVARCHAR(MAX) NOT NULL,
         set_at FLOAT NOT NULL, message_id NVARCHAR(64) NULL,
         CONSTRAINT pk_state PRIMARY KEY (namespace, [key]))""",
     """IF INDEXPROPERTY(OBJECT_ID('state'),'ix_state_set_at','IndexID') IS NULL
@@ -2172,10 +2194,11 @@ _SCHEMA: list[str] = [
     # fits SQL Server's 1700-byte nonclustered-index key cap (2*(256+64+450) = 1540 bytes) — hence
     # PRIMARY KEY NONCLUSTERED; write_reference_snapshot fail-closes on wider keys BEFORE its
     # transaction (the runtime rejector is the column width itself, via truncation). The explicit
-    # binary collation (BIN2) makes key equality a byte comparison like SQLite/Postgres: under a
-    # case-insensitive database default, externally-sourced keys differing only by case (or a trailing
-    # space, per ANSI padding on index keys) would raise a PK duplicate MID-transaction — a perpetual
-    # per-interval sync-failure alert. value is ciphertext at rest (snapshot values may carry PHI).
+    # binary collation (BIN2) makes key equality case- and accent-exact like SQLite/Postgres: under a
+    # case-insensitive database default, externally-sourced keys differing only by case would raise a
+    # PK duplicate MID-transaction — a perpetual per-interval sync-failure alert. BIN2 does NOT fix a
+    # trailing space: `=` and the PK pad it under every collation, BIN2 included, so keys differing only
+    # by trailing spaces still collide here. value is ciphertext at rest (snapshot values may carry PHI).
     # reference_version.name/version carry the same collation so the active-snapshot LEFT JOIN can
     # never hit a cross-column collation conflict.
     """IF OBJECT_ID('reference','U') IS NULL CREATE TABLE reference (
@@ -13025,7 +13048,7 @@ class SqlServerStore:
     async def _write_approval(
         self, cur: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
     ) -> bool:
-        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        """The writer of a sealed ``pending_approvals`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_approval`` states the contract. Call it on ``cur`` inside an open
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
@@ -13132,6 +13155,73 @@ class SqlServerStore:
         tee_audits(audits, appended, ts=now)
         return moved
 
+    async def reject_seal_failed_approval(
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        decided_at: float,
+        seal_read: object,
+        audits: Sequence[AuditAppend] = (),
+    ) -> bool:
+        """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
+        #3638); the Store protocol states the contract. Locks as :meth:`decide_pending_approval`
+        does: the audit applock first, then the row under ``UPDLOCK``."""
+        now = time.time()
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await self._open_under_audit_applock(cur)
+                        await cur.execute(
+                            "SELECT "
+                            + _MSSQL_APPROVAL_COLUMNS
+                            + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                            (approval_id,),
+                        )
+                        found = await self._fetch_dicts(cur)
+                        moved = (
+                            bool(found)
+                            and str(found[0]["status"]) == "pending"
+                            and found[0]["seal"] == seal_read
+                            and approval_fails_seal(self._row_sealer, found[0])
+                            and await self._tombstone_approval(
+                                cur,
+                                approval_id,
+                                approver=approver,
+                                decided_at=decided_at,
+                                seal_read=seal_read,
+                            )
+                        )
+                        appended_audits: tuple[AuditAppend, ...] = tuple(audits) if moved else ()
+                        appended = await self._append_audits(cur, appended_audits, now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(appended_audits, appended, ts=now)
+        return moved
+
+    async def _tombstone_approval(
+        self, cur: Any, approval_id: str, *, approver: str, decided_at: float, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE` (BACKLOG #3638); store.py's
+        ``MessageStore._tombstone_approval`` states the contract."""
+        await cur.execute(
+            _MSSQL_APPROVAL_TOMBSTONE,
+            (
+                approver,
+                float(decided_at),
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+                seal_read,
+            ),
+        )
+        return bool(await cur.fetchall())
+
     async def list_executing_approvals(
         self, *, claim_owner: str | None = None, limit: int = 1000
     ) -> list[dict[str, Any]]:
@@ -13185,8 +13275,7 @@ class SqlServerStore:
                     )
                     locked = await self._fetch_dicts(cur)
                     if locked:
-                        current = ApprovalRow.from_mapping(locked[0])
-                        resealed += await self._write_approval(cur, current, current=current)
+                        resealed += await self._reseal_approval(cur, locked[0])
                     await self._commit(conn)
                 except RowSealError:
                     await conn.rollback()
@@ -13195,6 +13284,38 @@ class SqlServerStore:
                     await conn.rollback()
                     raise
         return resealed, refused
+
+    async def _reseal_approval(self, cur: Any, found: Mapping[str, Any]) -> bool:
+        """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
+        or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
+        :class:`RowSealError` when neither holds; store.py's twin states the contract."""
+        try:
+            current = ApprovalRow.from_mapping(found)
+            return await self._write_approval(cur, current, current=current)
+        except RowSealError:
+            tombstone = held_approval_tombstone(self._row_sealer, found)
+            if tombstone is None:
+                raise
+        return await self._reseal_tombstone(
+            cur, str(found["id"]), *tombstone, seal_read=found["seal"]
+        )
+
+    async def _reseal_tombstone(
+        self, cur: Any, approval_id: str, approver: str, decided_at: float, *, seal_read: object
+    ) -> bool:
+        """The one writer of :data:`_MSSQL_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638); store.py's
+        ``MessageStore._reseal_tombstone`` states the contract."""
+        await cur.execute(
+            _MSSQL_APPROVAL_TOMBSTONE_RESEAL,
+            (
+                approval_tombstone(
+                    self._row_sealer, approval_id, approver=approver, decided_at=decided_at
+                ),
+                approval_id,
+                seal_read,
+            ),
+        )
+        return bool(await cur.fetchall())
 
     async def _execute_with_audits(
         self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
