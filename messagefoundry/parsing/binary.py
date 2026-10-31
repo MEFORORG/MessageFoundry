@@ -123,6 +123,16 @@ class EscapedDocumentError(ValueError):
     message instead. The text names the OBX occurrence only, never a byte of the value."""
 
 
+class UnreattachableDocumentError(ValueError):
+    """The payload itself stops a re-attach (vault BACKLOG #2809): it does not parse as HL7, or a
+    stored document cannot be set back into its ``OBX-5.5`` (a CR in the stored value, which a
+    detach that decoded ``\\X0D\\`` once left). The same payload fails the same way on every
+    attempt, so the delivery path refuses it permanently. Raised only from those two steps, never
+    for any other ``ValueError``: one from anywhere else in the re-attach may be an engine fault,
+    and that stays the outbound's internal-error policy to judge. The text names the step and the
+    underlying class only; the underlying error is the ``__cause__``."""
+
+
 def _b64encode_unbroken(data: bytes) -> str:
     """Standard base64 on a single line. ``base64.b64encode`` never inserts line breaks, whereas
     ``base64.encodebytes`` wraps at 76 chars (RFC 2045) and plants a ``\\n`` — which, inside an HL7
@@ -550,7 +560,9 @@ async def reattach_documents_in_hl7(
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched."""
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. A payload that
+    does not parse, or a stored value ``OBX-5.5`` refuses, raises :class:`UnreattachableDocumentError`;
+    every other ``ValueError`` propagates as it is."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -566,7 +578,12 @@ async def reattach_documents_in_hl7(
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
     def _handles() -> tuple[Message, list[tuple[int, str]]]:
-        message = Message.parse(text)
+        try:
+            message = Message.parse(text)
+        except ValueError as exc:
+            raise UnreattachableDocumentError(
+                f"the payload does not parse as HL7 ({type(exc).__name__})"
+            ) from exc
         found: list[tuple[int, str]] = []
         for occ in range(1, message.count_segments("OBX") + 1):
             value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -590,5 +607,11 @@ async def reattach_documents_in_hl7(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"
             )
-        await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
+        try:
+            await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
+        except ValueError as exc:
+            raise UnreattachableDocumentError(
+                f"the stored document cannot be set back into OBX-5.5 occurrence {occ} "
+                f"({type(exc).__name__})"
+            ) from exc
     return await asyncio.to_thread(message.encode)

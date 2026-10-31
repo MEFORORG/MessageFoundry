@@ -132,6 +132,7 @@ from messagefoundry.parsing.binary import (
     DOC_REF_MARKER,
     DocRefError,
     EscapedDocumentError,
+    UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
@@ -8794,9 +8795,10 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, a
-        ``ValueError`` from the parse or the splice, is a permanent :class:`NegativeAckError` instead,
-        since no retry could clear it (vault BACKLOG #2809)."""
+        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, an
+        :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError` from the parse or the
+        splice, is a permanent :class:`NegativeAckError` instead, since no retry could clear it (vault
+        BACKLOG #2809). Any other ``ValueError`` propagates to the outbound's internal-error policy."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8816,15 +8818,15 @@ class RegistryRunner:
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
-        except ValueError as exc:
-            # Below the DocRefError arm on purpose, since DocRefError is a ValueError. Every other
-            # ValueError here is the MESSAGE's: the payload does not parse, or a stored value cannot be
-            # set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The reader raises none, since a
-            # store fault arrives as _StoreReadFault. The same payload fails the same way on every
-            # attempt, so a retry could never succeed and the internal-error arm could stop the lane:
-            # refuse it permanently, which dead-letters this row alone. Raised after the handler ends,
-            # so a parse error that quotes the payload is on neither chain (see IngressGuardError).
-            refused = f"document re-attach failed: {safe_exc(exc)}"
+        except UnreattachableDocumentError as exc:
+            # Only the two failures the MESSAGE causes: the payload does not parse, or a stored value
+            # cannot be set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The same payload fails
+            # the same way on every attempt, so a retry could never succeed: refuse it permanently,
+            # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
+            # fault in the re-attach still reaches the outbound's internal-error policy, and STOP
+            # still stops the lane. Raised after the handler ends, so a parse error that quotes the
+            # payload is on neither chain (see IngressGuardError).
+            refused = f"document re-attach failed: {safe_exc(exc.__cause__ or exc)}"
         raise NegativeAckError(refused, code="reattach", permanent=True)
 
     async def _pace_outbound(self, name: str) -> None:

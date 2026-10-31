@@ -441,6 +441,65 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
     assert stats.get(OutboxStatus.DONE.value, 0) == 1
 
 
+def _engine_value_error(*_args: object, **_kwargs: object) -> str:
+    """Stands in for an engine bug in the re-attach: a ``ValueError`` the payload did not cause."""
+    raise ValueError("engine bug in the re-attach")
+
+
+async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #2809: only the failures the payload causes are permanent refusals. Any other
+    # ValueError is a possible engine fault, so it reaches the internal-error policy, and STOP stops
+    # the lane, as before the permanent refusal existed. Never dead-letters it row by row.
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(Message, "encode", _engine_value_error)
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The batch twin: a member whose re-attach raises an engine ValueError is not refused alone; the
+    # whole batch takes the internal-error policy, and STOP stops the lane (vault BACKLOG #2809).
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(Message, "encode", _engine_value_error)
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
 # --- end-to-end Shape A: doc present at ingress → detach → pass-through → delivery hydrates --------
 
 
