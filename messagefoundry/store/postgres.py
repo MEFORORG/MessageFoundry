@@ -5412,8 +5412,7 @@ class PostgresStore:
                         # An unrecoverable token: dead-letter it + ERROR the origin in THIS
                         # transaction and CONSUME it (return True ⇒ the conn.transaction() commits)
                         # — never re-loop (NOT the _Noop rollback, which would leave the token live).
-                        # `erased` (the reply is gone, erased or missing) blanks the token too, so
-                        # `_REPLAYABLE_BODY` refuses it from then on rather than re-queue a dead end.
+                        # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
                         blank = ", payload=''" if erased else ""
                         await self._exec_terminal(
                             conn,
@@ -5454,14 +5453,13 @@ class PostgresStore:
                     )
                     # A missing row is a corrupt reference. A NULL body means retention erased the
                     # reply (BACKLOG #1560; the SQLite twin says how a token reaches here), and it
-                    # must never become a child message. Either way the reply is gone, so the token
-                    # is blanked.
+                    # must never become a child message. A missing row is damage, not an erasure,
+                    # so that token is not blanked: its sealed reference is the evidence.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
                             "re-ingress work-row reference is corrupt/unparseable",
                             "re-ingress ref corrupt",
-                            erased=True,
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -5653,16 +5651,17 @@ class PostgresStore:
         ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
+            seq = int(seq_s)
         except ValueError:
-            return None
+            return None  # `ingress_handoff` dead-letters it as a corrupt reference
         art = await self._pool.fetchrow(
             "SELECT body FROM response WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
             mid,
             dest,
-            int(seq_s),
+            seq,
         )
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -10532,6 +10531,11 @@ class PostgresStore:
         ``metadata`` is blanked in the SAME statement as the body (ASVS 14.2.7), guarded on
         ``raw <> '' OR metadata IS NOT NULL`` so rows purged by a pre-upgrade engine are swept — and
         counted — on the first pass after upgrade. Returns the number of messages purged.
+
+        In the same transaction it blanks the ``done``/``cancelled`` outbound payloads and their
+        ``last_error``, blanks a dead ``Stage.RESPONSE`` work-row's reference before the reply it
+        names is erased (BACKLOG #1560, the SQLite twin says why), and nulls event details and the
+        captured replies. Other ``dead`` rows are left to :meth:`purge_dead_letters`.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to

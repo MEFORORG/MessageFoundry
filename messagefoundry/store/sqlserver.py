@@ -7878,8 +7878,7 @@ class SqlServerStore:
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
         would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
-        dead-lettered (and the token still consumed; one whose reply is erased or missing is also
-        blanked). The
+        dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed."""
@@ -7939,9 +7938,8 @@ class SqlServerStore:
                     label: str, error: str, event_detail: str, *, erased: bool = False
                 ) -> bool:
                     # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
-                    # and CONSUME it (status flipped), never re-loop. `erased` (the reply is gone,
-                    # erased or missing) blanks the token too, so `_REPLAYABLE_BODY` refuses it from
-                    # then on rather than re-queue a dead end.
+                    # and CONSUME it (status flipped), never re-loop. `erased` blanks the token too,
+                    # so `_REPLAYABLE_BODY` refuses it from then on.
                     blank = ", payload=''" if erased else ""
                     await self._exec_terminal(
                         cur,
@@ -7991,14 +7989,13 @@ class SqlServerStore:
                 # A missing row is a corrupt reference. A NULL body means retention erased the reply
                 # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
                 # materialized once, so a replay can commit between that read and the erasure. It
-                # must never become a child message. Either way the reply is gone, so the token is
-                # blanked.
+                # must never become a child message. A missing row is damage, not an erasure, so
+                # that token is not blanked: its sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
                         "re-ingress work-row reference is corrupt/unparseable",
                         "re-ingress ref corrupt",
-                        erased=True,
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8214,16 +8211,15 @@ class SqlServerStore:
         ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
+            seq = int(seq_s)
         except ValueError:
-            return None
+            return None  # `ingress_handoff` dead-letters it as a corrupt reference
         art = await self._fetchone(
             "SELECT body FROM response WHERE message_id=? AND destination_name=? AND response_seq=?",
-            (mid, dest, int(seq_s)),
+            (mid, dest, seq),
         )
         return (
-            self._cipher.decrypt(
-                art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s))
-            )
+            self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"])
             else ""
         )
@@ -8945,8 +8941,11 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank message bodies (and terminal outbound payloads + event details) for messages received
-        before ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Bodies are
+        """Blank message bodies (and done/cancelled outbound payloads with their ``last_error``, a dead
+        ``Stage.RESPONSE`` work-row's reference to the reply erased here (BACKLOG #1560, the SQLite
+        twin says why), event details and captured replies) for messages received before
+        ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Other ``dead`` rows
+        are left to :meth:`purge_dead_letters`. Bodies are
         blanked to '' (not deleted) so the cipher re-encrypt scans skip them and the FK to messages
         stays intact. The eligible set is materialized ONCE so all three tables purge exactly the same
         messages. ``metadata`` is NULLed in the SAME statement as the body (ASVS 14.2.7) — NULL is

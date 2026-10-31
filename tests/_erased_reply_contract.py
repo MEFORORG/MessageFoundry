@@ -248,21 +248,30 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     store: Any, fetch: RawFetch, raw: RawSql
 ) -> None:
     """Retention keeps the ``response`` row and NULLs its body, so a row that is gone is damage, not
-    an erasure. It dead-letters as a corrupt reference, and is blanked like an erased one, because a
-    replay could only re-queue a token that dead-letters again."""
+    an erasure. It dead-letters as a corrupt reference and is NOT blanked: its sealed reference is
+    the evidence of which row went missing. A later replay re-queues it into the same dead end once,
+    and the worker does not loop on it."""
     mid, token = await dead_token(store, now=0.0, control="ER-MISSING")
     assert await store.replay(mid, now=1.0) == 1
+    reference = (await token_row(fetch, token))["payload"]
     await raw("DELETE FROM response WHERE message_id=?", (mid,))
 
     assert await run_reingress(store, now=2.0)
 
     row = await token_row(fetch, token)
-    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == ""
+    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == reference != ""
     assert await status_of(store, mid) == MessageStatus.ERROR.value
     events = await store.events_for(mid)
     assert [e for e in events if e["event"] == "dead" and "corrupt" in str(e["detail"])]
     assert await children(fetch) == []
-    assert await store.replay(mid, now=3.0) == 0  # no churn: nothing to re-queue
+
+    # One dead end per replay, not a loop.
+    assert await store.replay(mid, now=3.0) == 1
+    assert await run_reingress(store, now=4.0)
+    assert await run_reingress(store, now=5.0) is False
+    row = await token_row(fetch, token)
+    assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == reference
+    assert await children(fetch) == []
 
 
 async def assert_dead_letter_purge_clears_the_blanked_token(

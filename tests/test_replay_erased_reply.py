@@ -96,6 +96,32 @@ async def test_the_real_worker_step_never_ingresses_an_erased_reply(store: Messa
     assert len(await contract.children(fetch)) == 1
 
 
+async def test_a_reference_with_a_malformed_sequence_dead_letters(tmp_path: pathlib.Path) -> None:
+    """A keyless claim checks no tag, so a damaged reference reaches the worker. A sequence that is
+    not an integer must reach ``ingress_handoff``'s corrupt-reference branch, not raise out of the
+    peek read and re-pend the token at the head of the loopback lane forever."""
+    store = await MessageStore.open(tmp_path / "malformed.db")
+    try:
+        fetch, raw = _fetch(store), _raw(store)
+        mid, token = await contract.dead_token(store, now=0.0, control="ER-SEQ")
+        assert await store.replay(mid, now=1.0) == 1
+        await raw(
+            "UPDATE queue SET payload=? WHERE id=?", (f"{mid}\x1fOB_X\x1fnot-a-number", token)
+        )
+
+        assert await store.response_body_for_work_row(token) is None
+        runner = _runner(store)
+        item = await store.claim_next_fifo(contract.LOOP, now=2.0, stage=Stage.RESPONSE.value)
+        assert item is not None
+        await runner._process_response_item(contract.LOOP, item)
+
+        assert (await contract.token_row(fetch, token))["status"] == OutboxStatus.DEAD.value
+        assert await contract.status_of(store, mid) == MessageStatus.ERROR.value
+        assert await contract.children(fetch) == []
+    finally:
+        await store.close()
+
+
 async def test_a_later_capture_does_not_revive_an_erased_token(store: MessageStore) -> None:
     """Why the reference is blanked rather than joined. The artifact's destination and sequence exist
     only inside the sealed reference, so a SQL join could bind on ``message_id`` alone. A message that
@@ -238,3 +264,31 @@ def test_every_backend_dead_letters_a_missing_artifact(module: str) -> None:
     ]
     assert len(calls) == 1
     assert [kw.arg for kw in calls[0].keywords] == ["erased"]
+    # Only the erased branch blanks: a missing row is damage, and its reference is the evidence.
+    blanking = [c for c in call_sites(fn, "_consume_dead") if c.keywords]
+    assert blanking == calls
+
+
+@pytest.mark.parametrize("module", _BACKENDS)
+def test_every_backend_parses_the_whole_reference_inside_its_guard(module: str) -> None:
+    """``response_body_for_work_row`` returns None for a malformed reference, so the sequence's
+    ``int`` sits inside the same ``try`` as the split. Outside it, a bad sequence raised out of the
+    worker's peek and blocked the loopback lane."""
+    fn = named_func(
+        parse_source((_STORE_DIR / module).read_text(encoding="utf-8")),
+        "response_body_for_work_row",
+    )
+    guarded = {
+        id(node)
+        for t in ast.walk(fn)
+        if isinstance(t, ast.Try)
+        for stmt in t.body
+        for node in ast.walk(stmt)
+    }
+    ints = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "int"
+    ]
+    assert ints  # the control: the walk found the parse
+    assert all(id(node) in guarded for node in ints)

@@ -934,20 +934,24 @@ class MessageOrigin(StrEnum):
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
-#: negation — ``payload = '' AND body_ref IS NULL`` — is exactly what retention leaves behind, and
-#: three facts make that an exact discriminator rather than a heuristic:
+#: negation, ``payload = '' AND body_ref IS NULL``, means "nothing left to re-queue". It is not proof
+#: that retention erased the row, because at least these write that blank:
 #:
 #: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
 #:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins), and that includes a dead
 #:    ``Stage.RESPONSE`` work-row, whose payload is a reference and not a body: the purge that erases
 #:    the ``response`` artifact blanks the reference with it. A SQL join could not decide that row,
 #:    because the artifact's destination and sequence exist only inside the sealed reference;
-#: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
-#:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
-#: 3. a store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the
-#:    purge releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing
-#:    for a row the store wrote. It is harmless for any other row: a blank payload is never
-#:    delivered, because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
+#: 2. ``ingress_handoff`` on each backend, which is not a purge: it dead-letters and blanks a token
+#:    whose reply retention erased (:data:`REINGRESS_ARTIFACT_ERASED`);
+#: 3. a keyless store's empty body, because ``IdentityCipher.encrypt('')`` is ``''``. On a keyed store
+#:    a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
+#:    through ``_enc``, so it is a ``mfenc:`` cell and can never be ``''``.
+#:
+#: A store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the purge
+#: releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing for a row the
+#: store wrote. It is harmless for any other row: a blank payload is never delivered on a keyed store,
+#: because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
 #:
 #: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
 #: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
@@ -12577,8 +12581,9 @@ class MessageStore:
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
-        whose reply retention erased, or whose ``response`` row is missing, is dead-lettered, consumed
-        and blanked (BACKLOG #1560), so it produces no child and cannot be replayed."""
+        whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
+        produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
+        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12627,8 +12632,7 @@ class MessageStore:
             async def _consume_dead(error: str, event_detail: str, *, erased: bool = False) -> bool:
                 # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction and
                 # CONSUME it (return True) — never re-loop forever on a row that can't be used.
-                # `erased` (the reply is gone, erased or missing) blanks the token too, so
-                # `_REPLAYABLE_BODY` refuses it from then on rather than re-queue a dead end.
+                # `erased` blanks the token too, so `_REPLAYABLE_BODY` refuses it from then on.
                 blank = ", payload=''" if erased else ""
                 await self._db.execute(
                     f"UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?{blank}"
@@ -12663,8 +12667,9 @@ class MessageStore:
             #    backend the blank and the erasure read the eligible set apart, so a replay or a
             #    sibling's completion between them can leave a token naming an erased reply. It must
             #    never become a child message, so dead-letter the token. Retention keeps the
-            #    `response` row, so a row that is missing altogether is a corrupt reference. Its reply
-            #    is gone all the same, so it is blanked too.
+            #    `response` row, so a row that is missing altogether is damage, not an erasure. That
+            #    token is dead-lettered and NOT blanked: its sealed reference is the evidence of which
+            #    row went missing. A replay re-queues it into the same dead end once per replay.
             cur = await self._db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
@@ -12673,9 +12678,7 @@ class MessageStore:
             art = await cur.fetchone()
             if art is None:
                 return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable",
-                    "re-ingress ref corrupt",
-                    erased=True,
+                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
                 )
             if art["body"] is None:
                 return await _consume_dead(
@@ -12838,7 +12841,7 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff) or its reference does not split, and ``""`` if the artifact is gone, which
+        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
         ``ingress_handoff`` then dead-letters. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
@@ -12853,16 +12856,17 @@ class MessageStore:
             ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
             try:
                 mid, dest, seq_s = ref.split("\x1f")
+                seq = int(seq_s)
             except ValueError:
-                return None
+                return None  # `ingress_handoff` dead-letters it as a corrupt reference
             cur = await db.execute(
                 "SELECT body FROM response"
                 " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                (mid, dest, int(seq_s)),
+                (mid, dest, seq),
             )
             art = await cur.fetchone()
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
