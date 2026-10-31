@@ -2078,16 +2078,26 @@ def _pool_closing(pool: Any) -> asyncio.Future[None]:
     key = _pool_key(pool)
     try:
         closing = _CLOSING.get(key)
-    except TypeError:  # cannot be weakly keyed: each close waits on its own
-        closing = None
+    except TypeError:
+        # Logged, not swallowed: a retried close of such a pool waits on a second wait_closed.
+        logger.warning("DATABASE: a pool close could not be tracked against its pool")
+        closing, key = None, None
     if closing is not None and not closing.done():
         return closing
     fresh: asyncio.Task[None] = asyncio.ensure_future(pool.wait_closed())
     _DETACHED_SETTLES.add(fresh)
     fresh.add_done_callback(_DETACHED_SETTLES.discard)
-    with contextlib.suppress(TypeError):
+    if key is not None:
         _CLOSING[key] = fresh
+        # Dropped once done: a failed close's traceback holds the pool, which would keep the weak
+        # key alive through its own value.
+        fresh.add_done_callback(partial(_forget_close, key))
     return fresh
+
+
+def _forget_close(key: Any, closing: asyncio.Future[None]) -> None:
+    if _CLOSING.get(key) is closing:
+        del _CLOSING[key]
 
 
 def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:

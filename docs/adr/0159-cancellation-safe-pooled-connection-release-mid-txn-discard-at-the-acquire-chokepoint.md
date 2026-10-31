@@ -581,8 +581,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
     and `DatabaseSource.aclose()`, the ordinary `stop()` included. It stops waiting at the bound
     only while that count is above zero. The count is read at the end of each tick of
     `_POOL_CLOSE_TIMEOUT_S`, so a close that starts with a connection held back waits one tick, and
-    a borrow cancelled after the close began stops it at the end of the tick it lands in, up to two
-    ticks after it. With the count at zero an in-flight call is an ordinary one, and the close waits
+    a borrow cancelled after the close began stops it at the end of the tick the cancel lands in,
+    at most one tick after the cancel. With the count at zero an in-flight call is an ordinary one, and the close waits
     for it without a bound, as before this amendment. `DatabaseSource.stop()` after a cancel keeps
     its BACKLOG #1620 bound whatever the count. The bound only stops the wait: the close goes on by
     itself, never cancelled part-way, and the held connection is released only once its statement

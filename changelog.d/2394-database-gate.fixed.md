@@ -5,7 +5,8 @@
   still runs, which on a real driver frees the handle the statement returns to and can crash the
   process. The cursor now closes once the statement returns, on the statement's own thread, and the
   same step rolls back what the cancelled statement left open, so a destination's connection no
-  longer goes back holding a cancelled INSERT for the next send to commit. The connection then goes
+  longer goes back holding a cancelled INSERT for the next send to commit, unless that rollback
+  fails while the session is still alive; the failure is logged. The connection then goes
   back to its pool. The cancelled task does not wait for the statement, but the connection keeps
   its pool slot until the statement returns, which nothing in the engine bounds. While a pool holds
   such a connection back, its close waits at most 2 s for it, then goes on by itself: the

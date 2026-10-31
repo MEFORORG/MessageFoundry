@@ -505,6 +505,7 @@ async def test_a_retried_close_waits_on_the_close_already_in_flight(
     assert await asyncio.wait_for(sending, WAIT) is None
     await asyncio.wait_for(retry, WAIT)
     assert destination._pool is None and rig.pools[0].waits == 1
+    assert rig.pools[0] not in database._CLOSING, "a finished close is still tracked"
 
 
 class _FailingClose:
@@ -547,6 +548,8 @@ async def test_a_lookup_close_reports_every_failure_and_keeps_a_pool_opened_mean
         await executor.aclose()
     assert "DatabaseLookup pool close failed" in caplog.text
     assert executor._pools == {"a": first, "b": second, "c": reopened}
+    # A failed close's traceback holds its pool, so a tracked entry would never be evicted.
+    assert first not in database._CLOSING and second not in database._CLOSING
 
 
 async def test_after_a_cancelled_send_a_new_pool_opens_beside_the_closing_one(
