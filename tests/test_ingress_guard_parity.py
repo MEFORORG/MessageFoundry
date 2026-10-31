@@ -550,7 +550,9 @@ def _stall_validate(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[tuple[st
 
     Returns the release event and, per call, the name of the thread it ran on and whether that thread
     is a daemon. The stall is bounded, so on the unfixed dry-run, which validates inline, the call
-    returns valid after it and the test fails on the RECEIVED it then previews rather than hanging."""
+    goes on to hl7apy after it rather than hanging, and the test fails on the ERROR hl7apy then
+    previews ("Missing required child ADT_A01.PV1", since the fixture has no PV1) rather than on the
+    timeout's text."""
     import threading
 
     from messagefoundry.parsing import validate as real
@@ -575,7 +577,8 @@ async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_side
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, listener: str
 ) -> None:
     """The listener refuses a validate that outruns ``validation.strict_timeout_s`` (#89); a dry-run
-    that validated un-timed previewed the same body as RECEIVED. Both must now say the same words."""
+    that validated un-timed waited it out and previewed hl7apy's own refusal of the body instead
+    ("Missing required child ADT_A01.PV1"). Both must now say the same words."""
     release, threads = _stall_validate(monkeypatch)
     ic = _strict_inbound(0.05)
     try:
@@ -612,14 +615,14 @@ def test_a_timeout_too_long_for_a_thread_wait_still_validates(
     monkeypatch: pytest.MonkeyPatch, timeout: float
 ) -> None:
     """The listener's ``wait_for`` takes ``inf`` and any large timeout; ``Thread.join`` raises
-    ``OverflowError`` past ``threading.TIMEOUT_MAX``, so the preview must not hand it one."""
+    ``OverflowError`` past ``threading.TIMEOUT_MAX``, so the preview validates such a one inline."""
     release, threads = _stall_validate(monkeypatch)
     release.set()
 
     result = dry_run(_registry(_strict_inbound(timeout)), ADT_UTF8)
 
     assert result.error == "Missing required child ADT_A01.PV1"
-    assert threads == [("dryrun-strict-validate", True)]
+    assert [daemon for _, daemon in threads] == [False]  # inline on the caller's thread, no worker
 
 
 def test_an_invalid_result_with_empty_error_text_is_still_an_error(
@@ -676,3 +679,56 @@ def test_a_streaming_body_over_its_threshold_is_not_whole_body_validated(
 
     assert result.disposition is MessageStatus.RECEIVED, result.error
     assert threads == []
+
+
+def test_expired_validates_past_the_thread_cap_are_refused_not_crashed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired worker runs on, so ``check`` over many slow fixtures stacked threads with no bound.
+    The workers are capped; once every slot is held past the timeout the next validate is not run,
+    and the preview says so as an ERROR rather than passing the body or raising."""
+    import threading
+
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(dryrun, "STRICT_VALIDATE_MAX_THREADS", 2)
+    monkeypatch.setattr(dryrun, "_validate_slots", threading.BoundedSemaphore(2))
+    release, threads = _stall_validate(monkeypatch)
+    registry = _registry(_strict_inbound(0.05))
+    try:
+        errors = [dry_run(registry, ADT_UTF8).error for _ in range(3)]
+    finally:
+        release.set()
+
+    assert errors == [
+        "strict-validation timed out after 0.05s",
+        "strict-validation timed out after 0.05s",
+        "strict-validation not run: 2 earlier validations were still running after 0.05s",
+    ]
+    assert len(threads) == 2  # the third never started a worker
+    # The released workers hand their slots back, so the next validate runs again; given time to
+    # wait for them, since each goes on into hl7apy once released.
+    again = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+    assert again.error == "Missing required child ADT_A01.PV1"
+
+
+def test_a_validate_with_no_thread_to_run_on_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``Thread.start`` raises ``RuntimeError`` when the process is out of threads; that is a refusal
+    of this preview, never an escape from ``dry_run`` and never a pass. The slot it took is freed."""
+    import threading
+
+    from messagefoundry.pipeline import dryrun
+
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(dryrun, "_validate_slots", slots)
+
+    def no_thread(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+
+    result = dry_run(_registry(_strict_inbound(30.0)), ADT_UTF8)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == "strict-validation not run: no thread could be started"
+    assert slots.acquire(blocking=False)  # released, not leaked

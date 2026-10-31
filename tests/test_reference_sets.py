@@ -658,19 +658,23 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "category"),
     [
-        pytest.param(None, id="missing"),
-        pytest.param("", id="malformed"),
-        pytest.param("code,npi\nMRN999SECRET,1\nMRN999SECRET,2\n", id="duplicate-key"),
+        pytest.param(None, "missing", id="missing"),
+        pytest.param("", "malformed or unreadable", id="malformed"),
+        pytest.param(
+            "code,npi\nMRN999SECRET,1\nMRN999SECRET,2\n",
+            "malformed or unreadable",
+            id="duplicate-key",
+        ),
     ],
 )
 def test_dryrun_logs_a_reference_file_it_skips(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str | None
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str | None, category: str
 ) -> None:
     """A file that will not load is left out of the preview's view (vault BACKLOG #3340 item 5). It
     was left out with no log line, so a later read reported the set missing with no word on why. The
-    line names the set and the error class only, as the live sync's does: a duplicate-key error
+    line names the set and a fixed category only, never the loader's text: a duplicate-key error
     quotes the key, which may be PHI for a patient-keyed set."""
     csv = tmp_path / "npi.csv"
     if body is not None:
@@ -685,7 +689,7 @@ def test_dryrun_logs_a_reference_file_it_skips(
     [record] = [r for r in caplog.records if "skipped" in r.getMessage()]
     assert record.levelname == "WARNING"
     assert "'provider_npi'" in record.getMessage()
-    assert "(CodeSetError)" in record.getMessage()
+    assert record.getMessage().endswith(f"its file is {category}")
     assert "MRN999SECRET" not in caplog.text
 
 
