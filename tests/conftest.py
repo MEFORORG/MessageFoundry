@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 pytest.register_assert_rewrite("tests._content_free")
 # The same for the request-deadline helper the cut-off tests share (vault BACKLOG #3871).
 pytest.register_assert_rewrite("tests._deadline_capture")
+# The same for the held-head claim helpers the live claim tests share (BACKLOG #1270).
+pytest.register_assert_rewrite("tests._claim_lock_helpers")
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
