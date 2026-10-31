@@ -135,6 +135,30 @@ def test_the_gate_refuses_a_split_value_at_load(proxy_url: str) -> None:
     assert "2965" in str(lookup.value)
 
 
+@pytest.mark.parametrize(
+    "proxy_url", [*SPLIT_SHAPES, f"socks5://{LISTED}:1080", f"http://{LISTED}:0"]
+)
+def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> None:
+    """``[egress].proxy_url`` takes the same parse, at settings load, so the fault names the
+    setting and is caught even when no connection inherits the value. The refusal names no part
+    of it, and pydantic does not echo the input."""
+    with pytest.raises(ValueError) as refused:
+        EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED])
+    assert "2965" in str(refused.value) and "proxy_url" in str(refused.value)
+    _assert_names_no_part(str(refused.value))
+    assert LISTED not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [PLAIN, PLAIN + "/", "default", "DEFAULT", "", f"http://u:p@{LISTED}:3128"],
+)
+def test_control_a_site_proxy_url_the_parse_accepts_loads(proxy_url: str) -> None:
+    """A userinfo is the parse's to accept: each inheriting connection's build refuses a user and
+    password (vault BACKLOG #3007), and the static-credential report still lists it."""
+    assert EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED]).proxy_url == proxy_url
+
+
 @pytest.mark.parametrize("proxy_url", SPLIT_SHAPES)
 @pytest.mark.parametrize("credential", [False, True])
 def test_no_split_value_is_dialled_anywhere(
