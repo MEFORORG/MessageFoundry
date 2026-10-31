@@ -8,11 +8,10 @@ and either returns normally (delivered) or raises :class:`DeliveryError` (the pi
 then reschedules per the channel's retry policy).
 
 Connectors are keyed by :class:`~messagefoundry.config.models.ConnectorType` in a small
-registry, and the pipeline builds them through it. ``ConnectorType`` is a closed enum, though.
-Adding a transport means at least a new member in ``config/models.py``, a builder registered
-here, and the per-type arms elsewhere (the egress allow-list, the authoring factory). Nothing
-outside this repository can add a new type (``ConnectorType("kafka")`` raises), so transports
-have no plugin path. Opening the enum to plugins would be new work.
+registry, and the pipeline builds them through it. ``ConnectorType`` is a closed enum today:
+``ConnectorType("kafka")`` raises, and adding a transport means at least a new member in
+``config/models.py``, a builder registered here, and the per-type arms elsewhere (the egress
+allow-list, the authoring factory).
 
 The registry holds one builder per type. :func:`register_source` and
 :func:`register_destination` refuse a type that already has one unless the caller passes
@@ -40,6 +39,10 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 
+# Re-exported beside the connector contract it belongs to; :mod:`messagefoundry.connection_events`
+# says why it is defined in a leaf (BACKLOG #1624).
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
+
 # Re-exported, not defined here: the matcher moved to the neutral, stdlib-only
 # ``messagefoundry.netaddr`` so the operator-surface allow-list
 # ([security].allowed_client_networks, enforced in API middleware) can share ONE matcher and one
@@ -50,6 +53,7 @@ from messagefoundry.netaddr import peer_ip_allowed
 
 __all__ = [
     "InboundHandler",
+    "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
     "IntakeAuditSink",
     "IntakeRateLimiter",
@@ -404,10 +408,13 @@ def poll_interval(settings: Mapping[str, Any], *, default: float, transport: str
 InboundHandler = Callable[[bytes], Awaitable[str | None]]
 
 # A source emits connection-lifecycle / transport events (Corepoint-style log, #46) to this OPTIONAL,
-# store-agnostic sink: ``(kind, peer_host, reason)``. The runner injects it after build and binds the
-# connection name + transport + direction; the source only knows the wire-level facts. ``None`` (the
-# default) makes every emit site a no-op (byte-identical when off). Metadata only — never a raw frame
-# or message body; the source passes a ``safe_exc``-scrubbed reason and the store scrubs again (#120).
+# store-agnostic sink: ``(kind, peer_host, reason)``, where ``kind`` is a member of
+# :data:`CONNECTION_EVENT_KINDS` (:class:`SourceConnector` says what happens to any other). The
+# runner injects it after build and binds the connection name + transport + direction; the source
+# only knows the wire-level facts.
+# ``None`` (the default) makes every emit site a no-op (byte-identical when off). Metadata only —
+# never a raw frame or message body; the source passes a ``safe_exc``-scrubbed reason and the store
+# scrubs again (#120).
 ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
 # A source reports an intake-authentication refusal to this OPTIONAL, store-agnostic sink (ADR 0154
@@ -1114,7 +1121,52 @@ class SourceConnector(abc.ABC):
     cluster, since two nodes polling it would ingest the same file/row twice. It is ``False`` by
     default (a **listen** source like MLLP/TCP, which has its own per-node endpoint and no
     double-read problem) and set ``True`` on the poll sources. It is documentation + lets a caller
-    log/identify poll sources; the actual single-node gating is done by ``leader_gate`` below."""
+    log/identify poll sources; the actual single-node gating is done by ``leader_gate`` below.
+
+    **Never accept and drop** (CLAUDE.md section 1: every message a connection takes in is counted
+    and logged). Here "the inbound handler" is the :data:`InboundHandler` callable :meth:`start`
+    receives, the engine's intake, not a code-first ``@handler``. A source hands every message it
+    reads to the inbound handler, and only after it returns does the source tell the sender the
+    message was accepted or remove it from where it came from: an ACK or ``202``, a file moved or
+    deleted, a row marked. The inbound handler is what counts and logs the message, as a
+    ``RECEIVED`` ingress row or an ``ERROR`` row. Any outcome that does not hand a message over must
+    leave it with the sender or keep the item. Those outcomes include at least these:
+
+    * a **refusal before ingress** (a peer not on the allow-list, an oversize frame, a failed
+      intake authentication, a method the listener does not take) is answered or closed, so the
+      sender knows nothing was accepted and keeps the message;
+    * a **quarantine** (a file the source cannot read, moved to its error directory; a row it
+      cannot decode, left unmarked) keeps the item and logs why;
+    * a **deferral** (a per-poll ceiling, an intake pause, a file not yet settled) leaves the item
+      unread where it is, with the sender or in its directory or table, for a later read.
+
+    Some sources also report some refusals and quarantines through :attr:`on_connection_event`,
+    where capture is on; no source reports a deferral there. Each kind passed there must be a
+    member of :data:`CONNECTION_EVENT_KINDS`. While the runner's connection-event queue exists, it
+    drops any other with a throttled WARNING, and the store refuses one as a backstop. At least one
+    configuration has no queue, and there every event is discarded with no row and no warning
+    (``RegistryRunner._enqueue_connection_event`` names it).
+
+    **When the inbound handler raises.** The inbound handler records every message-level outcome
+    itself (a parse or validation failure is an ``ERROR`` row, and it returns). An exception
+    escaping it is therefore an infrastructure failure, most often a store write that did not
+    commit, and the message may not be recorded anywhere. A source must then:
+
+    1. **not acknowledge it**: send no ACK or ``202``, and do not move, delete or mark the item.
+       A listener whose sender waits for an answer sends a negative acknowledgement or an error
+       status, or closes the connection, so that sender resends. A poll source leaves the item in
+       place, so the next tick reads it again (at-least-once);
+    2. **log it scrubbed**: ``safe_exc`` on the exception, never the message body;
+    3. **stay alive**: catch it in the per-connection task or the poll loop, so one failed message
+       cannot stop intake while the connection still reports running. ``CancelledError`` is not an
+       inbound-handler failure and propagates.
+
+    The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
+    examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
+    answer. A sender that waits for none cannot be told to resend, and at least one shipped
+    listener loses a message that was not committed in that case: the MLLP listener records
+    ``handler_error`` and keeps the connection. It may not be the only one. That is a gap in the
+    shipped code, not a pattern to copy."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
@@ -1273,6 +1325,16 @@ class DestinationConnector(abc.ABC):
     only when :attr:`consumes_metadata` is set, so the default path is byte-identical and pays no read.
     A connector interprets it for a per-message transport knob (the REST/FHIR destinations project
     ``http.header.*`` entries onto per-message request headers); every other connector ignores it.
+
+    **Never accept and drop** (CLAUDE.md section 1: every message a connection puts out is counted
+    and logged). The delivery worker records the outcome of every ``send``, so a destination
+    reports what happened rather than hiding it. Returning means the payload was delivered, and the
+    worker marks the row done. A failure raises: :class:`DeliveryError` for a transport fault the
+    worker retries under the outbound's policy, :class:`NegativeAckError` for a partner refusal.
+    Any other exception is a connector defect, which the outbound's internal-error policy handles
+    (dead-letter the row and move on, or stop the lane for an operator). A ``send`` must never
+    catch a failure and return as if it had delivered: the row would be marked done for a message
+    the partner never received.
     """
 
     #: Whether this connector wants the per-message user-metadata bag passed to :meth:`send` (#68). Left

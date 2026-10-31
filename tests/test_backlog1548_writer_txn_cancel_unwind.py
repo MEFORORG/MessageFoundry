@@ -173,7 +173,7 @@ async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
     and the probe shows the connection is usable afterwards."""
     assert not store._db.in_transaction, "the failed writer left its transaction open"
     await store.record_connection_event(
-        connection=probe, transport="mllp", direction="inbound", kind="probe"
+        connection=probe, transport="mllp", direction="inbound", kind="established"
     )
     assert len(await store.list_connection_events(connection=probe, allowed_channels=None)) == 1
 
