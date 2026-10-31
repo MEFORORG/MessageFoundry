@@ -23,17 +23,15 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 :func:`carry_binary_ingress`. So the listener carries no copy of these guards, and
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
-**The two callers still differ in at least these places.** The declared-type sniff, which the
-dry-run does not run: ``messagefoundry check`` sends each fixture to every inbound, so adding the
-sniff there would fail an HL7 fixture on every X12 or FHIR inbound of a mixed config, and that
-choice is not this module's to make. The HL7 parse step, which each caller runs itself: the stored
-``parse error`` text differs, and the dry-run catches only ``HL7PeekError`` where the listener
-catches every peek-read fault. The detach's refusal of an escaped ``OBX-5.5`` document
-(:class:`~messagefoundry.parsing.binary.EscapedDocumentError`, ``ERROR`` + ``AR`` on a streaming
-inbound), which the dry-run never raises because it never detaches. How a slow strict validate is
-cut off, in the next paragraph. And the live guards after it. The codec NAME is not among them: both
-callers resolve it through :func:`ingress_encoding`, which defers to
-:func:`~messagefoundry.transports.framing.declared_encoding` (BACKLOG #2431).
+**The two callers still differ in at least these places.** The HL7 parse step, which each caller
+runs itself: the stored ``parse error`` text differs, and the dry-run catches only ``HL7PeekError``
+where the listener catches every peek-read fault. The detach's refusal of an escaped ``OBX-5.5``
+document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`, an ``ERROR`` row on a
+streaming inbound), which the dry-run never raises because it never detaches. A ``str`` body, which
+only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
+name, and a name that would refuse every received byte body passes. Bytes go through the one name
+rule on both, :func:`ingress_encoding` (BACKLOG #2431). How a slow strict validate is cut off, in
+the next paragraph. And the live guards after it.
 
 **The strict-validation timeout is mirrored by measurement.** The listener runs ``hl7apy`` off the
 event loop under :func:`strict_validate_timeout` and records ``ERROR`` + ``AE`` on expiry. The
@@ -45,7 +43,9 @@ timeout, so a slow fixture still takes its full validate time. The operator rese
 
 **At least these live guards are deliberately NOT mirrored for the dry-run, each by design:**
 
-* **the declared-type magic-byte sniff** (:func:`check_declared_type`), for the reason given above.
+* **the declared-type magic-byte sniff** (:func:`check_declared_type`). ``messagefoundry check``
+  sends each fixture to every inbound, so adding the sniff there would fail an HL7 fixture on every
+  X12 or FHIR inbound of a mixed config, and that choice is not this module's to make.
 * **document detach** (``_detach_documents``, #149 / ADR 0105). It is ``async`` and it *writes*
   attachment rows, so there is no honest pure mirror of it. A dry-run consequently previews the
   whole body where a streaming inbound would have detached its documents.
@@ -496,8 +496,9 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     transport-fed listener never does.
 
     The codec name is resolved the listener's way too, inside :func:`decode_body`, so an absent or
-    ``None`` declaration decodes as ``utf-8`` on both and a name naming no codec is the same
-    ``decode`` refusal on both (BACKLOG #2431)."""
+    ``None`` declaration decodes as ``utf-8`` on both and, for a ``bytes`` body, a name naming no
+    codec is the same ``decode`` refusal on both (BACKLOG #2431). A ``str`` body never reaches the
+    codec, so it does not test the name."""
     text = decode_body(raw, ic)
     check_decoded(text, ic)
     return text
