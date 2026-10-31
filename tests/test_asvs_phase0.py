@@ -198,7 +198,7 @@ def test_webhook_allows_plaintext_http_with_insecure_escape(
 
 
 def test_webhook_rejects_host_outside_allowlist() -> None:
-    t = WebhookTransport("https://evil.example/hook", allowed_hosts=("ok.example",))
+    t = WebhookTransport("https://evil.example/hook", allowed_hosts=("ok.example",), posture=_WARN)
     with pytest.raises(ValueError):
         t._post({"type": "t", "connection": "c"})
 

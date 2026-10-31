@@ -31,7 +31,7 @@ import string
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -48,12 +48,16 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
+    RevocationHopGuard,
     TrustAnchorPolicy,
     build_asserted_https_handler,
     build_smtp_tls_context,
+    current_hop_posture,
+    hop_url_host,
     smtp_login_approved,
 )
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
@@ -345,6 +349,196 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
 # The shared opener, reused for every webhook POST.
 _NO_REDIRECT_OPENER = _build_no_redirect_opener()
 
+#: The webhook hop's OWN way across its revocation refusal (BACKLOG #2193). The connection-shaped
+#: default names ``[tls].crl_file`` and a connection's attestation, and neither reaches this hop: it
+#: dials through :data:`_NO_REDIRECT_OPENER`, built at import before any config loads, so no CRL can
+#: reach its context, and it is not a connection. So the attestation pair is the only lever, as on
+#: the Vault hops (ADR 0173 section 12).
+_WEBHOOK_WAYS_ACROSS = (
+    "No CRL can reach this hop. Set [alerts].webhook_tls_revocation_attested = true with an "
+    "[alerts].webhook_tls_revocation_attested_reason that says what covers revocation of the "
+    "webhook host's certificate."
+)
+
+#: The alerts SMTP login's OWN way across its revocation refusal (BACKLOG #2193). ``[tls].crl_file``
+#: does reach this hop's context, through the trust anchor :func:`send_plain_email` resolves, so it
+#: is offered beside the ``[alerts]`` pair; a connection's attestation is not, as this is no
+#: connection.
+_ALERT_SMTP_WAYS_ACROSS = (
+    "Configure [tls].crl_file so the engine checks a CRL on this hop (it is instance-wide: every "
+    "non-loopback hop it reaches then needs its issuer's CRL in that file, or its handshake "
+    "fails), or set [alerts].email_tls_revocation_attested = true with an "
+    "[alerts].email_tls_revocation_attested_reason. Or remove [alerts].email_username and the "
+    "password to send unauthenticated, which takes no revocation guard."
+)
+
+
+def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
+    """The posture both ``[alerts]`` revocation guards judge on: the one passed, else the ambient
+    one, else enforcing. **An unknown posture counts as enforcing**, by ADR 0173 section 12, as on
+    the Vault hops and the AI broker, though those two do not read the stamped posture first; it
+    cannot relax a hop. This differs from at least the LDAPS bind, the OIDC legs and the FTPS hops,
+    where :meth:`RevocationHopGuard.enforce_construction` no-ops with no posture."""
+    if posture is not None:
+        return posture
+    ambient = current_hop_posture()
+    return ambient if ambient is not None else HopPosture.fail_closed(enforcing=None)
+
+
+def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) -> bool:
+    """Whether an ``[alerts]`` revocation attestation counts, refusing one that cannot be recorded.
+
+    The settings load refuses a flag with no reason, a blank one, or one holding a control
+    character or a lone surrogate; a transport built directly skips that load, so the guard
+    refuses them here too, as the AI broker does. The reason is written into the attested-crossing
+    WARNING, where a CR or LF could forge a log line. Only the value ``True`` counts."""
+    if attested is not True:
+        return False
+    if not (reason and reason.strip()):
+        raise ValueError(
+            f"[alerts].{flag}=true requires an [alerts].{flag}_reason that says what covers "
+            "revocation of the hop's certificate"
+        )
+    if has_control_char(reason) or has_lone_surrogate(reason):
+        raise ValueError(
+            f"[alerts].{flag}_reason must not contain control characters or lone surrogates"
+        )
+    return True
+
+
+def _refuse_webhook_revocation(
+    url: str,
+    *,
+    allowed_hosts: tuple[str, ...],
+    posture: HopPosture | None,
+    attested: bool,
+    attested_reason: str | None,
+) -> None:
+    """Apply the ADR 0173 revocation-hop guard to the https alert webhook (BACKLOG #2193 slice (d)).
+
+    The POST carries the webhook's path token, which Slack and Teams treat as the credential, over
+    https the engine verifies. Stdlib ssl checks no OCSP or CRL there, so a revoked but unexpired
+    certificate would be accepted with no refusal and no record.
+
+    ``context=None``: the hop dials through :data:`_NO_REDIRECT_OPENER`, built at import, and no
+    CRL reaches it, so the owner ruling of 2026-10-27 gave it an attestation pair on the pattern of
+    ADR 0173 section 12, and no CRL lever. ``posture`` is PASSED, because the sink is built in the
+    API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, and
+    where none is stamped it counts as enforcing (:func:`_alert_hop_posture`), not as the no-op the
+    LDAPS bind keeps. A cleartext ``http`` URL takes no revocation guard: there is no certificate,
+    and the cleartext refusal owns that hop.
+
+    A host outside ``allowed_hosts`` is left to :meth:`WebhookTransport._post`, which refuses it at
+    every POST, for the reason :func:`_refuse_alert_smtp_revocation` gives for its relay: judging
+    its revocation first would send the operator to attest a hop the egress policy forbids."""
+    split = urllib.parse.urlsplit(url)
+    if split.scheme.lower() != "https":
+        return
+    # The same host test _post applies, so the two cannot disagree on which host is listed.
+    if allowed_hosts and (split.hostname or "").lower() not in (h.lower() for h in allowed_hosts):
+        return
+    RevocationHopGuard.capture(
+        # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
+        # refused before this runs (refuse_url_credentials).
+        host=hop_url_host(url, cell="[alerts].webhook_url"),
+        cell="[alerts] webhook POST (verified TLS, no revocation check)",
+        description=(
+            "carries the alert webhook's path token over verified https but performs no "
+            "certificate revocation checking"
+        ),
+        attested=_attested_with_a_reason(
+            attested, attested_reason, flag="webhook_tls_revocation_attested"
+        ),
+        context=None,
+        posture=_alert_hop_posture(posture),
+        ways_across=_WEBHOOK_WAYS_ACROSS,
+        attested_reason=attested_reason,
+        connection=None,  # the alerts sink, not a connection
+    ).enforce_construction()
+
+
+def _alerts_smtp_context(
+    *,
+    host: str,
+    verify: bool,
+    ca_file: str | None,
+    trust_anchor_policy: TrustAnchorPolicy | None,
+) -> Any:  # an ssl.SSLContext; this module never imports ssl (the crypto inventory gate)
+    """The ``[alerts]`` SMTP hop's TLS context: the one recipe :func:`send_plain_email` sends on
+    and :func:`_refuse_alert_smtp_revocation` judges (BACKLOG #2193), so the two cannot drift."""
+    return build_smtp_tls_context(
+        host=host,
+        cell=ALERTS_SMTP_CELL,
+        verify=verify,
+        ca_file=ca_file,
+        trust_anchor_policy=trust_anchor_policy,
+        ca_setting="[alerts].email_tls_ca_file",
+    )
+
+
+def _refuse_alert_smtp_revocation(
+    *,
+    host: str,
+    allowed_hosts: tuple[str, ...],
+    use_tls: bool,
+    username: str | None,
+    tls_verify: bool,
+    tls_ca_file: str | None,
+    trust_anchor_policy: TrustAnchorPolicy | None,
+    posture: HopPosture | None,
+    attested: bool,
+    attested_reason: str | None,
+) -> None:
+    """Apply the ADR 0173 revocation-hop guard to the ``[alerts]`` SMTP login (BACKLOG #2193 slice
+    (c)). Called where :class:`EmailTransport` and the security notifier are built.
+
+    With ``username`` set, every send runs SMTP AUTH, so the login password crosses a STARTTLS hop
+    the engine verifies. Stdlib ssl checks no OCSP or CRL, so a revoked but unexpired relay
+    certificate would be accepted with no refusal and no record. The owner ruling of 2026-10-27
+    guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
+
+    **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
+    credential, and an alert body carries no PHI. A hop with ``use_tls`` or ``tls_verify`` off
+    builds no verifying context, and a login over one is refused at load and again at each send,
+    so there is nothing for this guard to judge.
+
+    A host outside ``allowed_hosts`` is left to :func:`send_plain_email`, which refuses it before
+    any other work at every send; judging its revocation first would send the operator to fix a
+    hop the egress policy forbids.
+
+    The context is built by :func:`_alerts_smtp_context`, the recipe :func:`send_plain_email` runs
+    for every send, from the same arguments, so a ``[tls].crl_file`` that really loads there relaxes the refusal, and the guard
+    never reads the setting. A CRL that cannot be loaded refuses here, and so at the build.
+
+    ``posture`` is PASSED, because both callers are built outside every ``active_hop_posture``
+    scope. ``None`` reads the ambient posture, and where none is stamped it counts as enforcing
+    (:func:`_alert_hop_posture`), as for the webhook."""
+    if username is None or not use_tls or not tls_verify:
+        return
+    if allowed_hosts and host.lower() not in (h.lower() for h in allowed_hosts):
+        return
+    RevocationHopGuard.capture(
+        host=host,
+        cell="[alerts] SMTP login to the relay (verified TLS, no revocation check)",
+        description=(
+            "carries the [alerts] SMTP login password over verified STARTTLS but performs no "
+            "certificate revocation checking"
+        ),
+        attested=_attested_with_a_reason(
+            attested, attested_reason, flag="email_tls_revocation_attested"
+        ),
+        context=_alerts_smtp_context(
+            host=host,
+            verify=True,
+            ca_file=tls_ca_file,
+            trust_anchor_policy=trust_anchor_policy,
+        ),
+        posture=_alert_hop_posture(posture),
+        ways_across=_ALERT_SMTP_WAYS_ACROSS,
+        attested_reason=attested_reason,
+        connection=None,  # the alerts sink and the security notifier, not a connection
+    ).enforce_construction()
+
 
 class WebhookTransport:
     """POST the event as JSON to a configured URL (fronts Slack/Teams/PagerDuty/custom webhooks)."""
@@ -356,6 +550,8 @@ class WebhookTransport:
         timeout: float = 10.0,
         allowed_hosts: tuple[str, ...] = (),
         posture: HopPosture | None = None,
+        revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
     ) -> None:
         # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
         # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
@@ -401,6 +597,14 @@ class WebhookTransport:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
         # added between here and the wire.
         enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+        # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
+        _refuse_webhook_revocation(
+            url,
+            allowed_hosts=allowed_hosts,
+            posture=posture,
+            attested=revocation_attested,
+            attested_reason=revocation_attested_reason,
+        )
         self.url = url
         self.timeout = timeout
         # Optional egress allowlist (lower-cased); empty = any host. SSRF defense-in-depth (1.3.6).
@@ -554,13 +758,11 @@ def send_plain_email(
     # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
     # function and depends on a disallowed host raising before ANY other work happens.
     tls_context = (
-        build_smtp_tls_context(
+        _alerts_smtp_context(
             host=host,
-            cell=ALERTS_SMTP_CELL,
             verify=tls_verify,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
-            ca_setting="[alerts].email_tls_ca_file",
         )
         if use_tls
         else None
@@ -644,10 +846,27 @@ class EmailTransport:
         tls_verify: bool = True,
         tls_ca_file: str | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
+        posture: HopPosture | None = None,
+        revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
     ) -> None:
         # send_plain_email checks the addresses at every send. Checking here too means a bad
         # [alerts].email_from or email_to refuses at startup, not at the first alert (#2870).
         checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
+        # BACKLOG #2193 slice (c): the login's revocation guard, at the build rather than per send,
+        # so an enforcing instance refuses the start, not the first alert.
+        _refuse_alert_smtp_revocation(
+            host=host,
+            allowed_hosts=allowed_hosts,
+            use_tls=use_tls,
+            username=username,
+            tls_verify=tls_verify,
+            tls_ca_file=tls_ca_file,
+            trust_anchor_policy=trust_anchor_policy,
+            posture=posture,
+            attested=revocation_attested,
+            attested_reason=revocation_attested_reason,
+        )
         self.host = host
         self.port = port
         self.sender = sender
@@ -867,6 +1086,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
         self._store = store
         self._state_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #3756: the state-write tasks now waiting out a resolve's retry backoff, so
+        # drain_state can stop them at its deadline without cancelling a write in flight. Once
+        # drain_state has run, no write starts a retry: the store is about to close.
+        self._retrying: set[asyncio.Task[Any]] = set()
+        self._retries_closed = False
         # BACKLOG #2272 defect 8: a FIFO lock per "<type>:<connection>" instance key. Each state write
         # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
         # stay concurrent. An entry is dropped once no write holds or awaits it.
@@ -1210,8 +1434,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
         # for approval_too_early, so each request is its own instance. A resolution's lost
         # provenance row uses `approval:<id>:resolve`, its own instance (vault BACKLOG #3438). An
-        # inline config reload uses `config_reload:inline` (vault BACKLOG #2254). The action name
-        # lands in the reason column.
+        # inline config reload uses `config_reload:inline` (vault BACKLOG #2254), and the IdP
+        # step-up return audit budget's backstop `step_up_return:audit_budget:<action>` (BACKLOG
+        # #3965). The
+        # action name lands in the reason column.
         # The ERROR log line beside it carries the row's detail on some paths and only the exception
         # on others (docs/SECURITY.md). No PHI.
         self._emit(
@@ -1729,6 +1955,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
+    # BACKLOG #3756: the waits between an inverse's resolve attempts, so it is tried one more time
+    # than there are waits before the sink gives up and logs an ERROR. Each wait runs while the
+    # retry holds the key's lock, so a later write for that key waits it out. Only the waits are
+    # bounded here: each attempt also takes as long as the store takes to fail, which on SQLite
+    # can be its whole busy timeout. Once drain_state runs, no further retry starts, and
+    # test_alert_state pins that the waits alone fit inside engine._ALERT_STATE_DRAIN_SECONDS.
+    _INVERSE_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+
     def _record_state(
         self,
         event: dict[str, Any],
@@ -1741,15 +1975,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
         store. A no-op when no store is wired (state tracking off). The store write never raises into the
         ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker.
-        ``on_settled`` is called once: True when the write lands, False when it fails, is cancelled, or
-        never runs (no loop, or cancelled before its first step)."""
+        An inverse's resolve is retried there a bounded number of times (BACKLOG #3756); an upsert is
+        tried once. ``on_settled`` is called once: True when the write lands, False when its last
+        attempt fails, it is cancelled, or it never runs (no loop, or cancelled before its first
+        step)."""
         store = self._store
         if store is None:
             return
         etype = str(event.get("type", ""))
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
-        coro: Coroutine[Any, Any, Any]
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
         # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
@@ -1763,21 +1998,29 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # escalation_tier were on the now-resolved row and never return via list_active).
             self._suspended.pop(key, None)
             self._occurrences.pop(key, None)
-            coro = store.resolve_alert_instances_for(
-                event_type=inverse_of, connection=connection, now=now
-            )
+
+            # A factory, not a built coroutine: a coroutine can be awaited only once, and a retry
+            # needs a fresh one. Nothing is built until the background task runs.
+            def write() -> Awaitable[Any]:
+                return store.resolve_alert_instances_for(
+                    event_type=inverse_of, connection=connection, now=now
+                )
+
         else:
             # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
             raw_reason = event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
-            coro = store.upsert_alert_instance(
-                event_type=etype,
-                connection=connection,
-                severity=severity,
-                reason=reason,
-                escalation_tier=escalation_tier,
-                now=now,
-            )
+
+            def write() -> Awaitable[Any]:
+                return store.upsert_alert_instance(
+                    event_type=etype,
+                    connection=connection,
+                    severity=severity,
+                    reason=reason,
+                    escalation_tier=escalation_tier,
+                    now=now,
+                )
+
         settle: Callable[[bool], None] | None = None
         if on_settled is not None:
             settled = False
@@ -1791,15 +2034,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     except Exception:
                         log.exception("alert-instance settle callback failed")
 
-        wrapper = self._run_state(coro, key, settle)
+        wrapper = self._run_state(write, key, settle, resolves=inverse_of, connection=connection)
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
             # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
-            # so drop it rather than raise into the caller. The notification path is unaffected.
-            # Close both coroutines so neither warns "never awaited".
+            # so drop it rather than raise into the caller. The notification path is unaffected, and
+            # no retry can help: there is no loop to run one on. Close the wrapper so it does not
+            # warn "never awaited"; the store coroutine was never built.
             wrapper.close()
-            coro.close()
             if settle is not None:
                 settle(False)
             return
@@ -1810,30 +2053,77 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if settle is not None:
                 # A no-op once _run_state settled; this covers a cancel before its first step.
                 settle(False)
-            # A task cancelled before its first step never reached the await; close the store
-            # coroutine so it does not warn "never awaited". Closing a finished coroutine is a no-op.
-            coro.close()
 
         task.add_done_callback(_done)
 
     async def _run_state(
         self,
-        coro: Coroutine[Any, Any, Any],
+        write: Callable[[], Awaitable[Any]],
         key: str,
         on_settled: Callable[[bool], None] | None = None,
+        *,
+        resolves: str | None = None,
+        connection: str = "",
     ) -> None:
+        """Run one alert-instance write under its key's lock. ``resolves`` names the alert type an
+        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not."""
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
         # they queue on the lock in emit order, and a waiter cancelled mid-queue keeps the rest in order.
+        # The retries and their waits run INSIDE the lock, so a write emitted later for the same key
+        # cannot land between a failed attempt and the retry that follows it.
+        delays = () if resolves is None else self._INVERSE_RETRY_DELAYS
+        attempts = len(delays) + 1
         landed = False
+        tried = 0
+        task = asyncio.current_task()
         try:
             async with hold_keyed_lock(self._state_locks, key):
-                await coro
-            landed = True
+                for tried in range(1, attempts + 1):
+                    try:
+                        await write()
+                    except Exception as exc:
+                        # The alert-instance write is a side observer: a store error must never wedge
+                        # a delivery worker or drop the notification. Log metadata only (no event body):
+                        # every attempt's exception type, and the traceback once, on the last attempt.
+                        last = tried == attempts or self._retries_closed
+                        log.warning(
+                            "alert-instance state write failed (%s)",
+                            type(exc).__name__,
+                            exc_info=last,
+                        )
+                        if last:
+                            break
+                        # Only the wait is cancellable by drain_state, never a write in flight.
+                        if task is not None:
+                            self._retrying.add(task)
+                        try:
+                            await asyncio.sleep(delays[tried - 1])
+                        finally:
+                            self._retrying.discard(task)
+                    else:
+                        landed = True
+                        break
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve gave up after %d attempt(s): any open %s alert for %r "
+                    "stays open",
+                    tried,
+                    resolves,
+                    connection,
+                )
+        except asyncio.CancelledError:
+            if resolves is not None and not landed:
+                log.error(
+                    "alert-instance resolve was cancelled before it landed: any open %s alert for "
+                    "%r stays open",
+                    resolves,
+                    connection,
+                )
+            raise
         except Exception:
-            # The alert-instance write is a side observer: a store error must never wedge a delivery
-            # worker or drop the notification. Log metadata only (no event body).
+            # Outside the write itself (the key lock's bookkeeping): still never raise.
             log.warning("alert-instance state write failed", exc_info=True)
         finally:
             # A cancel, too, is settled as not landed: the row is most likely still open.
@@ -1843,11 +2133,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     async def drain_state(self, timeout: float) -> None:
         """Wait up to ``timeout`` seconds for the alert-instance writes already scheduled. The engine
         calls it before it closes the store, so a clear raised on the way out (an unpinned cluster
-        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write
-        still running at the deadline is left to fail as before; this never raises."""
-        pending = set(self._state_tasks)
-        if pending:
-            await asyncio.wait(pending, timeout=timeout)
+        node's intake_resumed, BACKLOG #2272) is written rather than lost to the close. A write in
+        flight at the deadline is left to fail as before. When the wait ends, or is itself
+        cancelled, no write starts a retry any more (BACKLOG #3756), and a resolve then waiting
+        out its retry backoff is cancelled and logged at ERROR, so none goes on retrying against
+        the store being closed. This never raises and does not wait for the cancelled writes to
+        finish."""
+        try:
+            pending = set(self._state_tasks)
+            if pending:
+                await asyncio.wait(pending, timeout=timeout)
+        finally:
+            self._retries_closed = True
+            retrying = [t for t in self._retrying if not t.done()]
+            for task in retrying:
+                task.cancel()
+            if retrying:
+                log.error(
+                    "%d alert-instance resolve(s) waiting to retry when the alert-state drain "
+                    "ended were cancelled",
+                    len(retrying),
+                )
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
@@ -2051,7 +2357,13 @@ def notifier_from_settings(
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback to the
     SMTP hop when ``[alerts].email_tls_ca_file`` names none of its own (#323 layer 3). It only chooses
-    WHICH roots verify the relay — it never turns verification off."""
+    WHICH roots verify the relay — it never turns verification off.
+
+    ``posture`` keys the webhook's cleartext refusal (#329) and both transports' revocation guards
+    (BACKLOG #2193): an off-box https webhook, and an SMTP login to an off-box relay, are refused on
+    an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
+    ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
+    enforcing (ADR 0173 section 12)."""
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,
@@ -2067,7 +2379,10 @@ def notifier_from_settings(
                 allowed_hosts=tuple(alerts.webhook_allowed_hosts),
                 # #329: thread the derived instance posture so the cleartext-http refusal is clamped on
                 # an enforcing-PHI instance (the escape can no longer re-permit a plaintext alert POST).
+                # The same posture keys the https hop's revocation guard (BACKLOG #2193).
                 posture=posture,
+                revocation_attested=alerts.webhook_tls_revocation_attested,
+                revocation_attested_reason=alerts.webhook_tls_revocation_attested_reason,
             )
         )
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
@@ -2091,6 +2406,10 @@ def notifier_from_settings(
                 tls_verify=alerts.email_tls_verify,
                 tls_ca_file=alerts.email_tls_ca_file,
                 trust_anchor_policy=trust_anchor_policy,
+                # BACKLOG #2193: the login's revocation guard reads the same posture.
+                posture=posture,
+                revocation_attested=alerts.email_tls_revocation_attested,
+                revocation_attested_reason=alerts.email_tls_revocation_attested_reason,
             )
         )
     # Fail loud at config time if a rule routes to a transport that isn't configured (a typo or a

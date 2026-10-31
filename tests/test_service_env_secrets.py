@@ -26,6 +26,7 @@ from messagefoundry import serviceenv
 from messagefoundry.config.settings import (
     _FILE_SECRET_KEYS,
     ENFORCEABLE_SECRET_EXPIRY_CLASSES,
+    AiSettings,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -370,6 +371,7 @@ def _registry_names(service_env: ServiceEnvPosture | None) -> list[str]:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
+            ai=AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

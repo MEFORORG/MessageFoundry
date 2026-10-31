@@ -3,6 +3,13 @@
 - **Status:** **Accepted (2026-07-02) — building (M1).** Implements [BACKLOG #75](../BACKLOG.md) "option
   b" (the scheduled zero-install browser ops dashboard). This ADR settles the M1 (read-only) design; the
   safe-action + CSRF work is M2 and the full desktop-console port ("option c") stays gated per #75.
+  > **Amended by [ADR 0215](0215-the-web-console-calls-the-json-routes-in-process-through-the-asgi-app-so-one-gate-family-authorizes-both-planes.md)
+  > (accepted 2026-10-30):** `/ui` routes will call the JSON routes in-process through the
+  > engine's ASGI app, and stop calling engine handlers and re-applying their gates. That replaces
+  > the handler reuse and the console-side gates wherever this ADR describes them, at least in
+  > section 6 and the M2a, M2b, M3 and M-ws addenda, and the engine accessor section 1 names.
+  > Section 1's in-process mount and section 3's cookie confinement stand. Nothing here is rewritten:
+  > ADR 0215's build slices 4 to 6 each add a dated amendment section as they land.
 - **Builds on (must not redesign):** the API is the engine's only external boundary and every route
   resolves the live engine from `app.state` ([api/app.py](../../messagefoundry/api/app.py)); the opaque-
   token session store + RBAC + hash-chain audit ([auth/](../../messagefoundry/auth/),

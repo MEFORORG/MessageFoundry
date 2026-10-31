@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import AlertRule, AlertsSettings, load_settings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
@@ -19,6 +20,10 @@ from messagefoundry.pipeline.alert_sinks import (
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+
+#: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
+#: off-box hop built here to test something else is built on a warn posture.
+_NOT_ENFORCING = HopPosture(enforcing=False)
 
 
 class _RecordingTransport:
@@ -254,7 +259,7 @@ def test_webhook_transport_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
     # The transport now sends via the shared no-redirect opener (WP-7a, ASVS 15.3.2), not
     # urllib.request.urlopen, so patch the opener's open().
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks._NO_REDIRECT_OPENER.open", fake_open)
-    t = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    t = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     asyncio.run(t.send({"type": "queue_buildup", "connection": "OB_X", "depth": 3}))
     assert captured["url"] == "https://hooks.example/x"
     assert captured["method"] == "POST"
@@ -321,6 +326,7 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
         recipients=["ops@example", "oncall@example"],
         username="mf",
         password="secret",
+        posture=_NOT_ENFORCING,
     )
     asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "boom"}))
     assert sent["host"] == "smtp.example"
@@ -364,7 +370,8 @@ def test_notifier_builds_configured_transports() -> None:
             email_smtp_host="smtp.example",
             email_from="mf@example",
             email_to=["ops@example"],
-        )
+        ),
+        posture=_NOT_ENFORCING,
     )
     assert sink is not None
     assert sorted(t.name for t in sink._transports) == ["email", "webhook"]
@@ -403,4 +410,7 @@ def test_webhook_url_length_is_bounded_at_construction() -> None:
 
 def test_webhook_ordinary_url_still_constructs() -> None:
     """Byte-identity control. Mutation: drop MAX_OUTBOUND_URL_LEN to 8 -> this reds."""
-    assert WebhookTransport("https://hooks.example/x", timeout=5.0).name == "webhook"
+    assert (
+        WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING).name
+        == "webhook"
+    )
