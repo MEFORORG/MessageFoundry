@@ -91,7 +91,7 @@ from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import prints_a_codec_error, safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
@@ -108,6 +108,12 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
     resolve_poll_ceiling,
+)
+from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_PORT,
+    generic_hop_endpoint,
+    odbc_keyword_name,
+    odbc_param,
 )
 from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -245,7 +251,7 @@ def _build_dsn(
         )
     parts = [
         f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
-        f"SERVER={server},{int(s.get('port', 1433))}",
+        f"SERVER={server},{int(s.get('port', SQLSERVER_DEFAULT_PORT))}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
         f"APP={odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
@@ -270,7 +276,7 @@ def _build_dsn(
 _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 
 # The ONLY keywords ``odbc_params`` may set on the generic dialect (vault BACKLOG #2577), in the form
-# :func:`_odbc_keyword_name` compares them in.
+# :func:`odbc_keyword_name` compares them in.
 #
 # WHY A LIST OF WHAT IS ACCEPTED. ``[egress].allowed_db`` is checked against the ``server`` setting, so
 # that check means something only while a keyword cannot hand the driver another host. Every ODBC
@@ -456,19 +462,9 @@ def _odbc_keyword(key: str, *, what: str, connection: str | None = None) -> str:
     return key
 
 
-def _odbc_keyword_name(key: str) -> str:
-    """``key`` in the form the keyword lists are compared in: lower case. ODBC keywords are
-    case-insensitive, so two spellings a driver reads as the same keyword must not get two answers.
-    Blanks are folded too, which matters only for a key :func:`_odbc_keyword` has not seen.
-
-    A refusal prints this form and not the operator's spelling. The log scrub reads two capitalised
-    words as a name and blanks them, which would leave a two-word keyword out of its own refusal."""
-    return " ".join(key.split()).lower()
-
-
 def generic_odbc_param(settings: Mapping[str, Any], keyword: str) -> object | None:
     """The value a generic-dialect connection's ``odbc_params`` gives ``keyword``, a name in the
-    form :func:`_odbc_keyword_name` gives, or ``None`` (vault BACKLOG #3090, step 7).
+    form :func:`odbc_keyword_name` gives, or ``None`` (vault BACKLOG #3090, step 7).
 
     ``None`` too for the SQL Server preset, which sends no ``odbc_params``, and for a table that is
     not a mapping, which the build refuses. The keyword is matched in any case and spacing, as the
@@ -477,12 +473,7 @@ def generic_odbc_param(settings: Mapping[str, Any], keyword: str) -> object | No
     if str(settings.get("dialect", "sqlserver")).lower() != "generic":
         return None
     params = settings.get("odbc_params")
-    return _odbc_param(params, keyword) if isinstance(params, Mapping) else None
-
-
-def _odbc_param(params: Mapping[str, Any], keyword: str) -> object | None:
-    """The value ``params`` gives ``keyword``, matched as the build matches it, or ``None``."""
-    return next((v for k, v in params.items() if _odbc_keyword_name(str(k)) == keyword), None)
+    return odbc_param(params, keyword) if isinstance(params, Mapping) else None
 
 
 def generic_odbc_tls_off(settings: Mapping[str, Any]) -> bool:
@@ -499,7 +490,7 @@ def _odbc_credential_keyword(
     """The keyword ``setting`` names for a credential, or a ValueError when it is not one of
     ``allowed`` (vault BACKLOG #2577). Returned as the operator spelled it."""
     key = _odbc_keyword(str(value), what=setting, connection=connection)
-    name = _odbc_keyword_name(key)
+    name = odbc_keyword_name(key)
     if name not in allowed:
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {setting} must be one of "
@@ -582,7 +573,7 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     loaders do. An encrypted key with no ``sslpassword`` is refused too: libpq would otherwise fall
     back to OpenSSL's terminal prompt.
 
-    ``named`` maps each keyword, in the form :func:`_odbc_keyword_name` gives, to its value. The
+    ``named`` maps each keyword, in the form :func:`odbc_keyword_name` gives, to its value. The
     builder has already refused a keyword given twice, so the copy read here is the copy the driver
     reads. This binds only a driver that reads ``sslkey`` itself. psqlODBC takes a client key only
     through ``pqopt``, which the builder refuses, so there libpq finds the key on its own (at least
@@ -912,7 +903,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     named: dict[str, Any] = {}
     for key, value in params.items():
         k = _odbc_keyword(str(key), what="odbc_params key", connection=connection)
-        name = _odbc_keyword_name(k)
+        name = odbc_keyword_name(k)
         if name not in _ODBC_PARAM_ALLOWLIST:
             raise ValueError(
                 # `;` after the keyword, never `:` or `=`: the log scrub reads `<credential word>: x`
@@ -1008,45 +999,6 @@ def _warn_generic_tls_unenforced(
 # refuses today, which is a loosening.
 
 
-def _port_or_zero(text: str) -> int:
-    """``text`` as a port number, or 0 when it is not one — the ONE definition of "is this a port",
-    used at both places :func:`_generic_hop_endpoint` looks for one.
-
-    The five-digit bound is what a port is, and it also keeps ``int()`` away from CPython's
-    string-to-int digit limit on an absurd operator value, which would turn a log detail into a crash."""
-    text = text.strip()
-    return int(text) if text.isdigit() and len(text) <= 5 else 0
-
-
-def _generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, int]:
-    """Split a generic-dialect ``server`` setting into ``(host, port)`` for the hop guard.
-
-    The loopback carve-out is decided on the HOST alone and
-    :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` never resolves DNS, so a
-    ``host,port`` / ``host:port`` / ``[v6]:port`` suffix has to come off first: left on,
-    ``"127.0.0.1,5432"`` parses as a name rather than an address, is treated as remote, and a genuinely
-    on-box dev hop is refused.
-
-    A port the ``server`` string does not carry is read from the documented generic ``PORT`` keyword,
-    and falls back to 0 when neither says. The port is REPORT-ONLY — it never changes the disposition —
-    so an unknown port is a cosmetic gap in one log line, never a gap in the gate."""
-    host = server.strip()
-    port_text = ""
-    if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
-        close = host.find("]")
-        if close != -1:
-            host, rest = host[1:close], host[close + 1 :]
-            port_text = rest[1:] if rest.startswith(":") else ""
-    elif "," in host:  # the SQL-Server-style "host,port"
-        host, _, port_text = host.partition(",")
-    elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
-        host, _, port_text = host.partition(":")
-    # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
-    # said" value, so `or` reads correctly here — a port is never legitimately 0.
-    keyword = str(_odbc_param(params, "port") or "")
-    return host.strip(), _port_or_zero(port_text) or _port_or_zero(keyword)
-
-
 def generic_cleartext_hop_guard(
     settings: Mapping[str, Any],
     *,
@@ -1088,7 +1040,7 @@ def generic_cleartext_hop_guard(
     reason = generic_odbc_tls_unenforced(params)
     if reason is None:
         return None
-    host, port = _generic_hop_endpoint(str(settings.get("server") or ""), params)
+    host, port = generic_hop_endpoint(str(settings.get("server") or ""), params)
     return InsecureHopGuard.capture(
         host=host,
         port=port,
@@ -1397,6 +1349,20 @@ def _sqlstate(exc: BaseException) -> str | None:
     return None
 
 
+def _log_sqlstate(exc: BaseException) -> str | None:
+    """The SQLSTATE a log line may name for ``exc``, or ``None`` when it is not read as a driver
+    error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
+
+    Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
+    argument is the codec name, and ``ascii`` is five alphanumerics, so it would read as one."""
+    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+        return None
+    state = getattr(exc, "sqlstate", None)
+    if isinstance(state, str) and len(state) == 5 and state.isalnum():
+        return state
+    return _sqlstate(exc)
+
+
 def _safe_db_error(exc: BaseException) -> str:
     """A PHI-free rendering of a failure for a LOG line, the log-side twin of
     :func:`_classify_db_error` (BACKLOG #1661).
@@ -1405,14 +1371,74 @@ def _safe_db_error(exc: BaseException) -> str:
     quoted. ``safe_exc`` is NOT enough on its own here and the difference is measured: fed the SQL
     Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
     because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
-    identifier in the middle rather than removing it. Anything without a SQLSTATE is not a driver
-    error, carries no embedded column value by construction, and keeps the ``safe_exc`` rendering —
-    which is the more useful text for a bug or an unreachable host."""
-    state = _sqlstate(exc)
-    if state is None:
-        return safe_exc(exc)
-    code = _driver_code(str(exc))
+    identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
+    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. Anything else with no
+    SQLSTATE (:func:`_log_sqlstate`) keeps the ``safe_exc`` rendering, which is the more useful text
+    for a bug or an unreachable host. That is a bound, not a guarantee: an error from another driver
+    that quotes a value and carries no SQLSTATE in either place is printed as ``safe_exc`` prints it.
+
+    A Unicode error, or an exception holding one, always takes ``safe_exc``, so this never prints a
+    codec error's text; ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers
+    for that reason.
+
+    It never raises. Its callers are error arms and helpers documented never to raise, and an
+    exception whose ``__str__`` raises renders as its type and a fixed note instead."""
+    try:
+        state = _log_sqlstate(exc)
+        if state is None:
+            return safe_exc(exc)
+        code = _driver_code(str(exc))
+    except Exception as failure:  # noqa: BLE001 - see docstring
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
+
+
+class RedactedDbError(Exception):
+    """Stands in for one exception of a logged chain: the original's frames, and
+    :func:`_safe_db_error`'s line as its message (BACKLOG #1661). Never raised. Unprefixed because
+    its name prints on every line it stands in for."""
+
+
+def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
+    """An ``exc_info`` for ``exc`` that keeps every frame and cause but no driver message.
+
+    ``logger.exception`` ends each exception of the chain with its ``str()``, and a driver error's
+    ``str()`` is the text that embeds the offending value: a 2627 duplicate key, a 245 conversion.
+    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_safe_db_error`'s
+    line, with the original's traceback and its cause, context and suppression wired the same way.
+    The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
+    ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
+
+    What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
+    (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and ``safe_exc``'s
+    200-character bound applies to every non-driver line.
+
+    It never raises, because it runs in the poll loop's error arm, which must not kill the poller.
+    A copy that fails gives one :class:`RedactedDbError` with no frames, whose message names the
+    failure, as ``prepare_log_record`` names its own."""
+    try:
+        return _redacted_copy(exc, {})
+    except Exception as failure:  # noqa: BLE001 - see docstring: the poller outlives a failed render
+        return RedactedDbError(
+            f"[traceback withheld: {type(failure).__name__} while rendering {type(exc).__name__}]"
+        )
+
+
+def _redacted_copy(exc: BaseException, made: dict[int, RedactedDbError]) -> RedactedDbError:
+    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle."""
+    found = made.get(id(exc))
+    if found is not None:
+        return found
+    copy = RedactedDbError(_safe_db_error(exc)).with_traceback(exc.__traceback__)
+    made[id(exc)] = copy
+    if exc.__cause__ is not None:
+        copy.__cause__ = _redacted_copy(exc.__cause__, made)
+    if exc.__context__ is not None:
+        copy.__context__ = _redacted_copy(exc.__context__, made)
+    copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
+    return copy
 
 
 class _DriverMissingError(RuntimeError):
@@ -1797,7 +1823,7 @@ async def _close_cursor(cur: Any) -> None:
     try:
         await cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
@@ -1853,7 +1879,7 @@ def _close_raw_cursor(raw_cur: Any) -> None:
     try:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _probe_db(
@@ -2352,7 +2378,7 @@ class DatabaseSource(SourceConnector):
             if self._task is task:
                 self._task = None
                 if fault is not None:
-                    logger.warning("DATABASE source poll task failed: %s", safe_exc(fault))
+                    logger.warning("DATABASE source poll task failed: %s", _safe_db_error(fault))
         if task is not None and self._task is not None and self._task is not task:
             return  # a later start() made a new poll task, and the pool is now that task's
         try:
@@ -2360,7 +2386,9 @@ class DatabaseSource(SourceConnector):
         except Exception as exc:
             if not interrupted:
                 raise
-            logger.warning("DATABASE source pool close failed during a cancel: %s", safe_exc(exc))
+            logger.warning(
+                "DATABASE source pool close failed during a cancel: %s", _safe_db_error(exc)
+            )
 
     async def _join_poll(self, task: asyncio.Task[None]) -> None:
         """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
@@ -2411,7 +2439,9 @@ class DatabaseSource(SourceConnector):
         try:
             return self._leads()
         except Exception as exc:  # noqa: BLE001 - the cancel in flight is the outcome that matters
-            logger.warning("DATABASE source leader gate failed; cutting the row step: %s", exc)
+            logger.warning(
+                "DATABASE source leader gate failed; cutting the row step: %s", _safe_db_error(exc)
+            )
             return False
 
     async def _get_pool(self) -> Any:
@@ -2437,11 +2467,17 @@ class DatabaseSource(SourceConnector):
                     await self._poll_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A poll error (connection drop, a bad poll_statement, an unserializable column) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
-                logger.exception("DATABASE source poll failed; retrying next interval")
+                # Not logger.exception: its traceback ends in the driver's text, which quotes the
+                # offending value, such as a 245 conversion error naming the column value it could not
+                # convert. The frames are kept and each exception line is _safe_db_error's (#1661).
+                logger.error(
+                    "DATABASE source poll failed; retrying next interval",
+                    exc_info=_safe_db_exc_info(exc),
+                )
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
             except TimeoutError:
@@ -2481,7 +2517,7 @@ class DatabaseSource(SourceConnector):
         try:
             await sink(kind, None, reason)
         except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
-            logger.warning("DATABASE connection-event emit failed: %s", safe_exc(exc))
+            logger.warning("DATABASE connection-event emit failed: %s", _safe_db_error(exc))
 
     async def _poll_once(self) -> None:
         assert self._handler is not None
@@ -2528,9 +2564,12 @@ class DatabaseSource(SourceConnector):
             # returns, so an exception here is an infrastructure failure (the durable store write
             # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
             # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # _safe_db_error: on a server store the handler's write is itself a driver call, and a
+            # rejection quotes the value it refused, as SQL Server's 2628 truncation and asyncpg's
+            # DETAIL line do (#1661).
             logger.warning(
                 "DATABASE source handler failed (row left unmarked, will retry): %s",
-                safe_exc(exc),
+                _safe_db_error(exc),
             )
             return
         try:
@@ -2741,7 +2780,7 @@ def _lookup_connect_failure(connection: str, exc: Exception) -> str:
     prefix = f"db_lookup on {connection!r}: could not open a connection"
     if isinstance(exc, _DriverMissingError):
         return f"{prefix}; the 'sqlserver' extra is not installed"
-    detail = _safe_db_error(exc) if _sqlstate(exc) else type(exc).__name__
+    detail = _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
     return f"{prefix} ({detail})"
 
 
