@@ -7359,6 +7359,7 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -7451,6 +7452,10 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
             )
         except open_refusals:
             raise  # each has its own message and exit code below
+        except InsecureHopRefused as exc:
+            # The posture refused the store hop at the OPEN (#2532): could not start, exit 2. Only
+            # the open, so a hop refusal raised by the write is not reported as a failed open.
+            raise _StoreOpenRefused(codec_safe_str(exc)) from exc
         except store_errors as exc:
             # A path that is not a database (#1670), or a server backend that cannot be reached or
             # refuses the login, fails here: "cannot open the store" (exit 2), not a refused write.
@@ -7483,12 +7488,13 @@ def _store_transit_bound(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        InsecureHopRefused,
+        _StoreOpenRefused,
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except key_errors as exc:
-        _emit_error(f"{unchanged}: {exc}", as_json=args.json)
+        # Through `codec_safe_str`: a key source's codec error quotes a byte of what it decoded.
+        _emit_error(f"{unchanged}: {codec_safe_str(exc)}", as_json=args.json)
         return 2
     except _StoreConnectFailed as exc:
         return _emit_store_open_error(
@@ -7981,7 +7987,9 @@ def _offline_security_notifier(
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
     (BACKLOG #2193) reads ``posture`` too, and where it is ``None`` it reads the instance's own,
     derived from ``settings``. That guard would count no posture as enforcing, so on a ``warn``
-    instance the derived posture is what lets it warn rather than refuse.
+    instance the derived posture is what lets it warn rather than refuse. Every caller in this
+    module passes its posture (``admin-reset-totp`` since BACKLOG #2532), so at ``warn`` its Vault
+    read crosses an unattested off-box Vault with a WARNING, as ``serve``'s does.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -8028,11 +8036,11 @@ def _offline_security_notifier(
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
             # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
-            # every build failure here is: the notice is dropped and the recovery goes on. A
-            # caller with no posture (admin reset-totp) gets the instance's own, derived from
-            # these settings, so a warn instance warns rather than taking the guard's enforcing
-            # default for no posture. The Vault read above keeps the caller's posture, where None
-            # counts as enforcing.
+            # every build failure here is: the notice is dropped and the recovery goes on. Every
+            # caller passes its posture (admin-reset-totp since BACKLOG #2532). A caller with none
+            # would get the instance's own, derived from these settings, so a warn instance warns
+            # rather than taking the guard's enforcing default for no posture. The Vault read above
+            # keeps the caller's posture, where None counts as enforcing.
             posture=(
                 posture
                 if posture is not None
@@ -9479,6 +9487,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -9521,12 +9530,18 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     def open_refused(exc: Exception, *, hint: str = "") -> int:
         """The exit for a refusal raised while a store was opened or checked: nothing written.
         ``hint`` follows the message once the key has been shown. The texts of the first two
-        families are the engine's own and name settings, files, tables or key ids, never a value."""
+        families are the engine's own and name settings, files, tables or key ids, never a value.
+        Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
+        decoded (BACKLOG #2532)."""
         if isinstance(exc, could_not_start):
-            _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
+            _emit_error(
+                f"{_sentence(codec_safe_str(exc))} Nothing was written.{hint}", as_json=args.json
+            )
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
-            return _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
+            return _emit_error(
+                f"{_sentence(codec_safe_str(exc))} Nothing was written.{hint}", as_json=args.json
+            )
         if isinstance(exc, sqlite3.DatabaseError) and not hint:  # #1670: not a database
             return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
         # After the key was shown the store had already opened once, so this is no "cannot open".
@@ -10741,10 +10756,12 @@ def _backup(args: argparse.Namespace) -> int:
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
     except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
+        # A backstop only: the open's key error now arrives wrapped (below), and the runner turns
+        # its own key resolution's error into a BackupError, exit 1.
         return _emit_key_unresolved(exc, as_json=args.json)
     except _StoreOpenRefused as exc:
-        # The open's key error is wrapped (#2532); it prints as the runner's own key error above
-        # does (#3471), through `codec_safe_str`, so a key byte never reaches the line.
+        # The open's key error arrives wrapped (#2532). It prints as #3471 printed it before the
+        # wrap, through `codec_safe_str`, so a key byte never reaches the line.
         if isinstance(exc.__cause__, _key_unresolved()):
             return _emit_key_unresolved(exc.__cause__, as_json=args.json)
         _emit_error(str(exc), as_json=args.json)

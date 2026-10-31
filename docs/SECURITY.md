@@ -1205,6 +1205,12 @@ named it as still open, waiting on engine PR 1877.
   `store provision-schema` and `check-privileges`, pass one and keep the escape at `warn`. A site
   that needs `support-bundle` or `verify` on a dev store gives it a verifying certificate, or the
   command is changed to pass its posture.
+- `support-bundle` and `verify` would also cross an off-loopback PostgreSQL store hop with no
+  revocation check on a first deployment, at `enforcement = enforce` too, because they pass no
+  posture, no CLI process stamps one, and `RevocationHopGuard` does nothing with neither. `serve`
+  and the commands that pass
+  their posture refuse that hop. BACKLOG #2532 left this open: the fix is a guard that fails
+  closed with no posture, in the store files, rather than another call site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 

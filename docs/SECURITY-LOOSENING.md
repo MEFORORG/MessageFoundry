@@ -1400,8 +1400,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
   and wherever a client is built without a known posture, which counts as enforcing.
 - **Which callers know the posture:** at least `serve`, `check-privileges`, `provision-admin`,
-  `rotate-key`, `backup` and `audit-verify` hand it to the guard (BACKLOG #2532 added the last
-  three). On an instance at `enforcement = warn` they cross an
+  `rotate-key`, `backup`, `audit-verify`, `audit-anchor`, `admin-unlock`,
+  `admin-set-notify-email`, `admin-reset-totp` (its store open and its security notice's
+  `[secrets]` read), `store attest-transit-bound` and `store withdraw-transit-bound` hand it to the
+  guard (BACKLOG #2532 added every one from `rotate-key` on). On an instance at
+  `enforcement = warn` they cross an
   unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
   Vault even on a `warn` instance.** That includes at least `support-bundle`, `restore` and
   `restore-verify`, at least today.

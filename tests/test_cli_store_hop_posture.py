@@ -160,14 +160,25 @@ def test_warn_crosses_the_same_hop(
 
 @pytest.mark.parametrize("command", _COMMANDS)
 def test_a_weakened_hop_is_refused(
-    command: str, shell: Path, asyncpg: _RefusingAsyncpg, monkeypatch: pytest.MonkeyPatch
+    command: str,
+    shell: Path,
+    asyncpg: _RefusingAsyncpg,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The escape is inert at ``enforce``, with a posture as it was with none. The exit is not
-    pinned: this refusal is a bare ``ValueError``, so it reaches the dispatch floor's 1."""
+    pinned: this refusal is a bare ``ValueError``, so it reaches the dispatch floor's 1. The reason
+    is pinned, so a refusal for any other cause before the dial does not pass for this one."""
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     code = main(_argv(command, shell, server=_REMOTE, enforcement="enforce", weakened=True))
+    captured = capsys.readouterr()
     assert not asyncpg.pool_kwargs, "the command crossed a hop serve refuses"
     assert code != 0
+    assert "weakened" in (captured.out + captured.err + caplog.text).lower(), (
+        captured.out,
+        captured.err,
+    )
 
 
 @pytest.mark.parametrize("command", _COMMANDS)
@@ -203,3 +214,32 @@ def test_the_open_refusal_quotes_no_key_byte() -> None:
         asyncio.run(_open_store_or_refuse(opening()))  # type: ignore[arg-type]
     assert "xe9" not in str(caught.value).lower()
     assert isinstance(caught.value.__cause__, KeyProviderError)
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_no_command_prints_a_key_byte_from_its_open(
+    command: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review R2-7 and its round-3 follow-up: a key source's codec error at the open is "could not
+    start", exit 2, and no command prints the byte it quotes. ``store withdraw-transit-bound`` and
+    ``admin-reset-totp`` classify their open refusals by hand, so each is driven here too.
+
+    Mutation: print ``str(exc)`` in any of their key arms, or in ``_open_store_or_refuse``."""
+    from messagefoundry.store import base
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        try:
+            b"\xe9".decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise KeyProviderError(exc) from exc
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(base, "open_store", refusing)
+    code = main(_argv(command, shell, server=_REMOTE, enforcement="enforce"))
+    captured = capsys.readouterr()
+    assert code == 2, (captured.out, captured.err)
+    assert "xe9" not in (captured.out + captured.err).lower(), (captured.out, captured.err)
