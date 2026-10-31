@@ -41,7 +41,6 @@ from messagefoundry.config.wiring import (
     StateValue,
     handler_item_fault,
     handler_result_items,
-    inbound_with_resolved_encoding,
 )
 from messagefoundry.parsing import (
     HL7PeekError,
@@ -991,7 +990,6 @@ def dry_run(
     inbound: str | None = None,
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = False,
-    env_values: Mapping[str, Any] | None = None,
 ) -> DryRunResult:
     """Decode → guard → parse → (strict-validate) → route one message; return disposition + payloads.
 
@@ -1038,9 +1036,7 @@ def dry_run(
     Under a CLI command whose stdout carries its result, a ``print()`` the Router or a Handler runs
     goes to stderr: :func:`~messagefoundry.author_output.runs_author_code` (vault BACKLOG #3474).
     """
-    # An env() encoding decodes by its resolved value, as on the listener (BACKLOG #2431). With no
-    # values a ref resolves only to its default, and one with no value stays the refused reference.
-    ic = inbound_with_resolved_encoding(select_inbound(registry, inbound), env_values or {})
+    ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
         return _dry_run_raw(registry, ic, raw, tracer=tracer, snapshot_on_send=snapshot_on_send)
 

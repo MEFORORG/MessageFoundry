@@ -1,0 +1,12 @@
+- **An inbound connection's `encoding` must be a literal codec name; an `env()` reference is
+  refused when the config loads.** The ingress decode reads the inbound's own settings, where an
+  `env()` reference is never resolved, so such a connection would have refused every message. The
+  refusal names the connection and the reference's key and resolves nothing, so it covers a
+  not-deployed inbound and `connections.toml` too. Set an inbound encoding per environment by
+  editing the connection. An outbound connection, a lookup and a reference set still take an `env()`
+  encoding. (`BACKLOG #2431`)
+- **An `encoding` of `None` is refused everywhere but on an inbound connection.** An inbound reads
+  `None` as `utf-8`; most outbound connectors read the value as the codec name, so `None`, or an
+  `env()` value resolving to `None` or an empty string, would have failed every send. Config load
+  refuses a literal `None`, and the build check that `messagefoundry check`, a reload and a
+  connection upsert run refuses an `env()` value resolving to one. (`BACKLOG #2431`)
