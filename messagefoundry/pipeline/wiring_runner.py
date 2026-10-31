@@ -28,7 +28,6 @@ import functools
 import json
 import logging
 import math
-import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
@@ -887,10 +886,6 @@ class _StreamBudgetExceeded(Exception):
     backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
     ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
 
-
-#: The openings ``Message.parse`` accepts, after the whitespace it strips: a payload without one is
-#: not HL7, so it cannot carry a detached document (vault BACKLOG #2809).
-_HL7_LEAD = re.compile(r"\s*(?:MSH|FHS|BHS)")
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
@@ -8791,12 +8786,6 @@ class RegistryRunner:
         since no retry could clear it (vault BACKLOG #2809)."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
-        if _HL7_LEAD.match(payload) is None:
-            # Only an HL7 body is ever detached, so a JSON, XML or X12 payload that merely quotes the
-            # marker carries no handle: deliver it as written, never refuse it as a re-attach the
-            # permanent arm below would dead-letter (vault BACKLOG #2809). The lead is the one
-            # Message.parse accepts, so every body the re-attach could read still reaches it.
-            return payload
 
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces

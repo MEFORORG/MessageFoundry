@@ -332,14 +332,29 @@ async def test_hydrate_a_reattach_the_payload_breaks_is_a_permanent_refusal(
     assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
-async def test_hydrate_passes_a_non_hl7_payload_that_quotes_the_marker_through(
+async def test_a_non_hl7_payload_carrying_a_real_handle_is_never_delivered(
     store: MessageStore,
 ) -> None:
-    # Only an HL7 body is ever detached, so JSON that merely quotes a handle is delivered as written,
-    # not refused as a re-attach the permanent arm would dead-letter (vault BACKLOG #2809).
-    quoted = '{"note": "' + make_doc_ref(hashlib.sha256(b"x").hexdigest(), "application/pdf") + '"}'
+    # ADR 0105: a handle never reaches the wire. A Handler can copy a real handle into a JSON body,
+    # which the re-attach cannot read, so the row must fail closed rather than deliver the handle
+    # unhydrated and be marked DONE (vault BACKLOG #2809).
+    ref = await _store_doc(store, _big_b64(600))
+    payload = '{"note": "' + make_doc_ref(ref, "application/pdf") + '"}'
+    await store.enqueue_message(
+        channel_id="c1", raw=payload, deliveries=[(DEST, payload)], now=100.0
+    )
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    assert await runner._hydrate_payload(quoted) == quoted
+    col = _Collector()
+    runner._destinations[DEST] = col
+
+    with pytest.raises((NegativeAckError, DeliveryError)):
+        await runner._hydrate_payload(payload)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DONE.value, 0) == 0
 
 
 async def test_a_reattach_the_payload_breaks_dead_letters_the_row(store: MessageStore) -> None:
