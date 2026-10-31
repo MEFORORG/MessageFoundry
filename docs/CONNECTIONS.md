@@ -1668,7 +1668,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
-| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on the **SQL Server preset only**, where it reaches ODBC Driver 18 as pyodbc's `timeout=` (the driver ignores a DSN keyword for it). `generic` gets no login timeout from the engine and uses its driver's default |
+| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on both dialects as pyodbc's `timeout=`, never as a DSN keyword (ODBC Driver 18 ignores one). On `generic` since BACKLOG #2705: measured on 2026-10-30, `timeout=5` bounded a psqlODBC and a MySQL connect to an unreachable host at about 5 s, against about 21 s without it. A driver that ignores the attribute keeps its own default |
 | `app_name` | `messagefoundry` | ODBC `APP` name |
 | `pool_max` | `5` | max pooled connections |
 
@@ -1678,7 +1678,7 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 `NegativeAckError` → **dead-letter** (a retry can't fix it).
 
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
-string brace-quotes every value (no connection-string injection); TLS is **on by default** and a
+string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect sends them plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a
 weakened posture (`encrypt=false` / `trust_server_certificate=true`, `dialect="sqlserver"` only) is
 **refused at construction** — `MEFOR_ALLOW_INSECURE_TLS` is **clamped** and cannot relax it while
 `[security].enforcement = enforce`, which is the shipped default, so on a stock instance there is **no
@@ -1723,7 +1723,7 @@ differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_d
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are sent **without braces** (see [*Values*](#values-on-the-generic-dialect)). Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
@@ -1865,14 +1865,42 @@ Two limits follow from this:
 
 ##### Values on the generic dialect
 
-Every value is sent inside braces and must be printable ASCII. A value that breaks its rule is
-refused when the connection is built, and the error names the setting and never the value:
+**On the generic dialect, values are sent WITHOUT braces** (BACKLOG #2705). Only the
+`odbc_driver` name is braced, and a password needs braces in the one case the table names. Every
+value must be printable ASCII. A value that breaks its rule is refused when the connection is
+built, and the error names the setting and never the value:
 
-| Setting | Rule |
-|---|---|
-| `odbc_driver`, `database`, `username`, every `odbc_params` value | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | printable ASCII, and none of `;`, `{`, `}`, `=` |
-| `password` | printable ASCII. A `}` is sent with the ODBC `}}` escape, which the driver must read |
+| Setting | Sent as | Rule |
+|---|---|---|
+| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`; not empty or blank; no leading or trailing space |
+| `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=` |
+| `password` | plain, unless it needs braces | printable ASCII. See below |
+
+Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
+psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each connected with no TLS
+at all, with no CA file, with an untrusted CA, with a hostname mismatch, and against a server with
+TLS off. psqlODBC also kept the braces as part of `UID` and `DATABASE`, and both psqlODBC and MySQL
+Connector/ODBC refused a braced port. The same values sent plain behaved correctly. A plain value
+cannot be quoted, so the characters that would end it or start another keyword are refused
+instead. An empty value is refused because the driver would read it as its default, and libpq's
+default `prefer` falls back to plaintext. A padded value is refused because one driver may trim it
+and another may not.
+
+**The password.** A password holding none of `;`, `{` or `}`, with no leading or trailing space,
+is sent plain to any driver. Any other password needs braces and the ODBC `}}` escape, and is
+accepted only when `odbc_driver` names a driver measured to read that escape. The name is read by
+its words, in any case and spacing, the way [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds) reads it:
+
+- psqlODBC: a name holding `postgres` or `psqlodbc`, such as `PostgreSQL Unicode`;
+- MySQL Connector/ODBC: a name holding `mysql`;
+- Microsoft's SQL Server drivers: a name holding `sql server` or `msodbcsql`.
+
+For any other driver name, MariaDB's included, such a password is refused when the connection is
+built, so change the password. The engine reads the driver name as written, never the library it
+loads. The Microsoft Access
+driver (ACE) is one that does not read the escape: it refused even a braced password with no brace
+in it, and a `}` let password text set another keyword.
 
 ASCII only, because a driver manager may convert the string for the driver, and some
 conversions turn a non-ASCII character into a delimiter.
@@ -2165,7 +2193,7 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 is **refused at construction** through the same cell as the `Database(...)` destination, and the
 `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the
 shipped default). The connection
-string brace-quotes every value; secrets go through `env()`. The polled `server` is gated by the same
+string checks every value, as for the destination; secrets go through `env()`. The polled `server` is gated by the same
 fail-closed `[egress].allowed_db` allowlist as the destination — although the source pulls data *in*, it
 still dials out to a host, so the allowlist guards against polling an arbitrary server.
 
@@ -3839,8 +3867,8 @@ Facts that are easy to get wrong, stated plainly first:
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the
   `RetryPolicy` path. It never waits indefinitely.
 - **The DATABASE connector has no per-statement timeout.** It exposes `connect_timeout` (default
-  15 s, a **login** timeout only, passed to the driver as pyodbc's `timeout=`, SQL Server preset
-  only), `pool_max` and
+  15 s, a **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects),
+  `pool_max` and
   `acquire_timeout`, and there is **no** `timeout_seconds` on this connector. A long-running
   statement is therefore unbounded; keep lookup/write statements indexed and narrow. (The *store's*
   own SQL Server / Postgres connections do apply `[store].command_timeout`, default 30 s.)
@@ -4173,7 +4201,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent | `RetryPolicy` |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL | `RetryPolicy` |
-| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, SQL Server preset) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
+| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
 | Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
