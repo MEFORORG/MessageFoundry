@@ -3238,18 +3238,16 @@ class _ScanShare:
     the one place the added pass's budgets and costs are written down; :class:`_Scan`,
     :func:`_added_pass` and :func:`safe_traceback` point here.
 
-    BUDGETS. A link is each exception in the chain :func:`safe_traceback` walks, group members
-    included; the passes below are those of a link it scans. Each link's first pass has a whole
+    BUDGETS. These rules apply to every scan, with or without a share. A link is each exception
+    :func:`safe_traceback` walks. Each link's first pass has a whole
     :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan with no share runs its added
     pass on what its first pass left. In a traceback, a link's added pass runs on the smaller of
     that and what is left of ``added``, one more budget the added passes of every link share, so a
     long chain whose scans each run out is not read once per link. The first passes never draw on
     ``added``. Any pass, first or added, with or without a share, can end up to two units past what
     it was given (a dict read at an odd limit). ``added`` is charged what a link's added pass
-    spent, at most what it was given. One link's added reads of a single large object, such as an exception group in its chain, can spend
-    all of it, even on a two-link chain. A later link's added reads are then left unmade, and an
-    error only they would reach prints raw. That link prints as it did before this change, except at
-    least where a verdict was handed on to it (below), which it then uses without a scan of its own.
+    spent, at most what it was given. One link's added reads can spend most of ``added`` (each link
+    is charged at most ``_ATTRIBUTE_BUDGET - 1`` of it), leaving less of ``added`` for later links.
 
     COSTS IN THE ADDED PASS (:func:`_added_pass`). It reads an object at most twice: once the plain
     way, and once the deep way, beneath or as an exception whose own code renders it. Each read
@@ -3404,7 +3402,7 @@ class _Scan:
                     nodes[id(child)] = (child, [], "")
                     seeds.append(id(child))
             charged.extend(reversed(follow))  # popped in the order read: .args before attributes
-        # The first pass ends above; a negative remainder gives the added pass nothing (_ScanShare).
+        # The first pass ends above; a negative remainder gives the added pass nothing.
         room = max(budget, 0) if share is None else min(max(budget, 0), share.added)
         budget, opened, widest = _added_pass(nodes, seeds, read, order, room)
         if share is not None:
