@@ -1761,9 +1761,7 @@ or an attribute of an exception it holds, a codec error there would print raw. T
 each method's `id()`, an address, so a method object that later takes the address of a freed
 trusted one would be trusted too. Some of a class's answers are kept from the first time an
 instance of it is scanned, so a `__str__` or `__repr__` assigned to the class later can be judged
-as the one it replaced. An exception group whose `__str__` is the builtin one is not scanned as the
-exception being rendered, so its own message prints as the builtin renders it; the walk still
-reads it when it reaches it as a held object.
+as the one it replaced.
 When the budget runs out the filter leaves the rest as it is, and which objects those are is not defined.
 So a large dataclass, or one beside a large list, can still print an error it holds. A plain
 list or dict passed directly as the argument is read whole, with no limit. A `ChainMap` is read
