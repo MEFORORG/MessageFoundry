@@ -2026,7 +2026,7 @@ class _ProxyDigestRecipe:
     """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
     opener (a urllib handler binds to its opener, so it is never shared across openers)."""
 
-    proxy_url: str = field(repr=False)  # may carry user:password@ (#1182)
+    proxy_url: str = field(repr=False)  # may carry a user; a password there fails the build (#3007)
     user: str
     password: str = field(repr=False)
 
@@ -2044,7 +2044,8 @@ class ProxyConfig:
     target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
     or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
-    # Kept out of the repr, as the digest recipe's fields are: the URL may carry user:password@.
+    # Kept out of the repr, as the digest recipe's fields are: the URL may carry a user. A user and
+    # password in an explicit proxy_url fail the build (vault BACKLOG #3007); the repr stays hidden.
     proxies: tuple[tuple[str, str], ...] = field(repr=False)  # () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
     bypass: tuple[str, ...]
@@ -2267,6 +2268,10 @@ def proxy_auth_handler_from_settings(
         raise ValueError(
             f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
         )
+    if result[0] or result[1] is not None:
+        # Keyed on what this returns, which is what the proxy handler admits a caller-set header
+        # on, and run before the guard for the same reason as the type (vault BACKLOG #3443, #3007).
+        _refuse_a_static_proxy_header(s.get("headers"))
     proxy_host = _hop_guard_host(proxy_url, cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL)
     credential = (
         "web-proxy credential"
@@ -2430,11 +2435,6 @@ def proxy_config_from_settings(
     # judged (vault BACKLOG #2965). It refuses every value on which urlsplit and urllib read another
     # host, so the loopback test in the proxy_user guard below judges the host urllib dials.
     proxy_url = parse_proxy_url(proxy_url).url
-    if s.get("proxy_user") and s.get("proxy_password"):
-        # Before the handler, whose guard writes the acceptance audit record: a build this refuses
-        # leaves no record of a crossing (vault BACKLOG #3007). These are the settings on which the
-        # handler returns a header or a digest recipe, or refuses for the type.
-        _refuse_a_static_proxy_header(s.get("headers"))
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,

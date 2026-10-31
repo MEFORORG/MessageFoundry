@@ -151,12 +151,19 @@ def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> 
 
 @pytest.mark.parametrize(
     "proxy_url",
-    [PLAIN, PLAIN + "/", "default", "DEFAULT", "", f"http://u:p@{LISTED}:3128"],
+    [PLAIN, PLAIN + "/", "default", "DEFAULT", f"http://u:p@{LISTED}:3128"],
 )
 def test_control_a_site_proxy_url_the_parse_accepts_loads(proxy_url: str) -> None:
     """A userinfo is the parse's to accept: each inheriting connection's build refuses a user and
     password (vault BACKLOG #3007), and the static-credential report still lists it."""
     assert EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED]).proxy_url == proxy_url
+
+
+@pytest.mark.parametrize("proxy_url", ["", "   "])
+def test_a_blank_site_proxy_url_reads_as_unset(proxy_url: str) -> None:
+    """Kept as written, a blank value is truthy, so every connection would inherit it and fail its
+    build for a missing scheme."""
+    assert EgressSettings(proxy_url=proxy_url).proxy_url is None
 
 
 @pytest.mark.parametrize("proxy_url", SPLIT_SHAPES)

@@ -5414,7 +5414,11 @@ class EgressSettings(_Section):
         if value is None:
             return None
         proxy = value.strip()
-        if not proxy or proxy.lower() == "default":
+        if not proxy:
+            # Blank reads as unset. Kept as written it would be truthy, so each connection would
+            # inherit it and fail its build for a scheme it does not have.
+            return None
+        if proxy.lower() == "default":
             return value
         # Lazy, as config/static_credentials.py does: the transport owns how a proxy URL is read,
         # and importing the transports package when this module loads would tie the two together.
