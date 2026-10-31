@@ -3145,6 +3145,11 @@ def _serve(args: argparse.Namespace) -> int:
     # reaches its handlers, and only by serve, so other commands that resolve settings stay quiet.
     if (_breaker_note := settings.auth.breaker_budget_warning()) is not None:
         logging.getLogger("messagefoundry.config.settings").warning("%s", _breaker_note)
+    # BACKLOG #1497 (Manager decision d20261030T213636115-0af931, "a warning, not a refusal"): on
+    # SQL Server a renew can land up to about twice the clamp after it is issued. Logged here for
+    # the same reason as the breaker note above.
+    if (_renew_note := settings.sqlserver_renew_bound_warning()) is not None:
+        logging.getLogger("messagefoundry.config.settings").warning("%s", _renew_note)
     # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
     # as soon as logging reaches its handlers, before the first hop that could use it.
     from messagefoundry.transports.ambient_proxy import warn_ambient_proxy

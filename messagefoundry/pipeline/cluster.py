@@ -2132,6 +2132,8 @@ def build_coordinator(
             leader_fence_timeout_seconds=getattr(
                 cluster_settings, "leader_fence_timeout_seconds", 20.0
             ),
+            # ADR 0157 Inc 0, as for DbCoordinator below: the claim/renew statement's own timeout.
+            lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
             alert_sink=alert_sink,  # #145: failover-transition alerts (lockstep with DbCoordinator)
@@ -2146,9 +2148,8 @@ def build_coordinator(
         leader_fence_timeout_seconds=getattr(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
-        # ADR 0157 Inc 0. Threaded to this coordinator ALONE: SqlServerCoordinator above has no
-        # per-statement seam to apply it through (its renew still inherits [store].command_timeout
-        # via the ODBC connection), so passing it there would name a bound that does not bind.
+        # ADR 0157 Inc 0. Threaded to both coordinators; SqlServerCoordinator applies it as the
+        # claim/renew statement's own ODBC timeout (SqlServerStore._fetchone_clamped).
         #
         # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
         # validator, so a real settings object always hands over a concrete float and the derivation
