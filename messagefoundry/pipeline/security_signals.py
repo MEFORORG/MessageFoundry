@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from messagefoundry.config.settings import AlertsSettings
+from messagefoundry.log_backoff import FailureRun
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.store.audit_tee import add_audit_observer, remove_audit_observer
@@ -102,8 +103,6 @@ _SWITCH_LIST_LIMIT: Final = 200
 #: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
 #: longer window, which counts more strictly, must not also hold a second attack back for as long.
 _REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
-#: The least time between two log lines for a failed sink call.
-_SINK_FAILURE_LOG_SECONDS: Final = 60.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -183,17 +182,20 @@ class _Window:
         del self._seen[subject]
         return total[0]
 
-    def named(self, subject: str, now: float) -> bool:
+    def may_name(self, subject: str, now: float) -> bool:
         """Whether ``subject`` may raise under its own name: it already did this window, or fewer
-        than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. Records it when it may."""
+        than :data:`MAX_SUBJECT_ALERTS` distinct subjects have. Records nothing; a caller records a
+        name with :meth:`record_name` once the sink took the alert, so a refused raise, or a retry
+        of one, spends no slot."""
         cutoff = now - self.window_seconds
         while self._named and next(iter(self._named.values())) <= cutoff:
             self._named.popitem(last=False)
-        if subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS:
-            self._named.pop(subject, None)
-            self._named[subject] = now
-            return True
-        return False
+        return subject in self._named or len(self._named) < MAX_SUBJECT_ALERTS
+
+    def record_name(self, subject: str, now: float) -> None:
+        """Record that ``subject`` raised under its own name at ``now``."""
+        self._named.pop(subject, None)
+        self._named[subject] = now
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,8 +304,9 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
         self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
-        #: When a failed sink call may next be logged; see :meth:`_notify`.
-        self._sink_failure_log_after = float("-inf")
+        #: One failure run per (event type, subject) whose sink call is failing; see
+        #: :meth:`_notify`. Trimmed past :data:`MAX_SUBJECTS`, oldest first.
+        self._sink_failures: OrderedDict[tuple[str, str], FailureRun] = OrderedDict()
         self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
@@ -400,8 +403,9 @@ class SecuritySignalDetector:
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
         """Count ``weight`` for ``key``; True when that raised an alert and the sink call
         returned. False when the sink call raised, so a caller that goes quiet after a raise does
-        not go quiet on that alert. A sink that takes the alert and loses it later, as the
-        notifier does on a full queue or a store fault, still returns, so the caller goes quiet."""
+        not go quiet on that alert. A sink that takes the alert and then loses part of it still
+        returns, so the caller goes quiet: the notifier's full queue drops only the page, after the
+        ``alert_instance`` row is already scheduled, and a store fault loses that row."""
         key = key or "unknown"
         now = self._clock()
         total = window.hit(key, now, weight)
@@ -412,10 +416,14 @@ class SecuritySignalDetector:
         sentence = burst.sentence.format(
             total=total, window=self._window_label, quiet=self._quiet_label
         )
-        if not window.named(subject, now):
+        own_name = window.may_name(subject, now)
+        if not own_name:
             subject = f"{burst.prefix}:*"
             sentence += f"; {MAX_SUBJECT_ALERTS} other subjects already raised this window"
-        return self._raise(burst.signal, subject, total, sentence)
+        raised = self._raise(burst.signal, subject, total, sentence)
+        if raised and own_name:
+            window.record_name(subject, now)
+        return raised
 
     def _on_level(self, actor: str | None, detail: str | None, key: str, sentence: str) -> None:
         if str(_detail_of(detail).get(key, "")).upper() == "DEBUG":
@@ -445,42 +453,58 @@ class SecuritySignalDetector:
         )
 
     def release(self) -> None:
-        """Resolve the ``posture_loosened`` this detector raised, on a clean stop. For a
-        process whose identity changes on every start, an unpinned cluster node: its next start
-        reports under a new subject, so nothing could resolve the old one later."""
+        """Resolve the ``posture_loosened`` this detector raised. When it runs, and when it does
+        not, is stated once on :func:`install_security_signals`'s ``resolve_on_stop``."""
         if self._posture_raised is not None:
             self._restore(self._posture_raised)
 
     def _restore(self, subject: str) -> None:
         self._posture_raised = None
-        self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
+        self._notify("posture_restored", subject, lambda: self._sink.posture_restored(subject))
 
     def _raise(self, signal: str, subject: str, count: int, detail: str) -> bool:
         return self._notify(
             signal,
+            subject,
             lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
         )
 
-    def _notify(self, event: str, call: Callable[[], None]) -> bool:
-        """Run one sink call; False when the sink raised. The failure is logged at most once per
-        :data:`_SINK_FAILURE_LOG_SECONDS`: a sink that keeps raising no longer starts the refusal
-        quiet period, so a peer refused at no cost to itself could otherwise write a line per
-        refusal."""
+    def _notify(self, event: str, subject: str, call: Callable[[], None]) -> bool:
+        """Run one sink call; False when the sink raised.
+
+        A sink that keeps raising no longer starts the refusal quiet period, so a refused peer,
+        which costs itself nothing, could otherwise write a line per ``peer_refusals`` refusals.
+        So each (event type, subject) keeps its own :class:`~messagefoundry.log_backoff.FailureRun`:
+        one key's failures never silence another's line, each line carries the run's count, and
+        the first success after a run writes one recovery line. The record carries the sink
+        exception's type name only, as before, never its message, which a sink may build from the
+        alert's subject or detail."""
+        key = (event, subject)
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            now = self._clock()
-            if now >= self._sink_failure_log_after:
-                self._sink_failure_log_after = now + _SINK_FAILURE_LOG_SECONDS
-                log.warning(
-                    "security-signal alert %s could not be raised: %s; further failures are "
-                    "logged at most once every %gs",
-                    event,
-                    type(exc).__name__,
-                    _SINK_FAILURE_LOG_SECONDS,
-                )
+            run = self._sink_failures.pop(key, FailureRun())
+            self._sink_failures[key] = run.record(
+                log,
+                _SinkFault(f"{type(exc).__module__}.{type(exc).__qualname__}"),
+                "security-signal alert %s could not be raised",
+                event,
+                level=logging.WARNING,
+            )
+            if len(self._sink_failures) > MAX_SUBJECTS:
+                self._sink_failures.popitem(last=False)
             return False
+        if key in self._sink_failures:
+            self._sink_failures.pop(key).clear(
+                log, "security-signal alert %s", event, level=logging.WARNING
+            )
         return True
+
+
+class _SinkFault(Exception):
+    """Stands in for a sink's exception in a :class:`~messagefoundry.log_backoff.FailureRun`
+    record. Its message is the original's qualified type name, so the run keys on the type and
+    the record carries no text the sink built from an alert."""
 
 
 def install_security_signals(
@@ -495,10 +519,15 @@ def install_security_signals(
     observers while it counts refusals; returns the function that removes it.
 
     ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
-    cluster node: removing the detector, on a clean stop, resolves the ``posture_loosened`` it
-    raised (after a crash nothing does), as
+    cluster node, whose next start could not resolve the ``posture_loosened`` it raised. The
+    function this returns then resolves it, as
     :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts. The
-    removal must run on ``loop``'s thread, before the store closes.
+    managed lifespan calls that function from the ``finally`` block around its whole span, so the
+    alert is resolved on any shutdown that reaches that block, a failed startup or a cancelled
+    lifespan among them. A process killed outright never reaches it, and its alert stays open
+    under the dead node's id until an operator resolves it. This is the one statement of that
+    boundary; the docs point here. The removal must run on ``loop``'s thread, before the store
+    closes.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
     onto ``loop``, so the detector's state and the sink are only touched from one thread."""

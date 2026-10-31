@@ -899,9 +899,9 @@ class AlertSink(Protocol):
         **auto-resolves** the open ``posture_loosened`` instance for the same ``name``, which is
         ``posture:start`` with this process's ``@node:<id>`` or ``@shard:<id>`` suffix where several
         engine processes share the store, so one process's clean start never clears another's. An
-        unpinned cluster node's id changes on every start, so it raises this for its own alert on a
-        clean stop; its next start could not, and after a crash the alert stays open. A start that
-        could not read its list raises neither. No PHI."""
+        unpinned cluster node's id changes on every start, so it raises this for its own alert as
+        it shuts down; ``install_security_signals`` in ``pipeline/security_signals.py`` says when
+        that runs. A start that could not read its list raises neither. No PHI."""
         ...
 
     # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------
@@ -1412,7 +1412,7 @@ class LoggingAlertSink:
 
     def posture_restored(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the start logged its posture.
-        # Raised by a clean start, or by an unpinned cluster node on a clean stop: either way the
+        # Raised by a clean start, or by an unpinned cluster node as it shuts down: either way the
         # loosened posture no longer runs under this subject.
         log.debug("ALERT posture_restored: %r no loosened posture runs under this subject", name)
 

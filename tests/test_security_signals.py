@@ -620,22 +620,79 @@ def test_a_refusal_alert_the_sink_refused_starts_no_quiet_period() -> None:
     assert det.refusal_quiet("IB_ACME_ADT")
 
 
-def test_a_sink_that_keeps_failing_is_logged_once_a_minute_under_a_refusal_flood(
+class _Switchable(_Sink):
+    """A sink whose calls raise while ``down`` holds; records what it took otherwise."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = True
+        self.restored: list[str] = []
+
+    def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+        if self.down:
+            raise RuntimeError("sink down for " + name)
+        super().security_signal(name, signal=signal, count=count, detail=detail)
+
+    def posture_restored(self, name: str) -> None:
+        if self.down:
+            raise RuntimeError("sink down for " + name)
+        self.restored.append(name)
+
+
+def _failed_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "could not be raised" in r.getMessage()]
+
+
+def test_a_sink_that_keeps_failing_backs_off_and_counts_under_a_refusal_flood(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class _Down(_Sink):
-        def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
-            raise RuntimeError("sink down")
-
-    clock = _Clock()
-    det = SecuritySignalDetector(_Down(), _thresholds(peer_refusals=1), clock=clock)
+    sink = _Switchable()
+    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=1), clock=_Clock())
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
         for _ in range(500):
             det.observe_refusal("IB_ACME_ADT")
-        clock.now += 61  # the control: a later failure is logged again
+        lines = _failed_lines(caplog)
+        # The 1st, 2nd, 4th ... 256th failure, each with the run's count; never a sink message.
+        assert len(lines) == 9 and lines[-1].endswith("(consecutive failures: 256)")
+        assert not any("IB_ACME_ADT" in line for line in lines)
+        sink.down = False
         det.observe_refusal("IB_ACME_ADT")
-    failed = [r for r in caplog.records if "could not be raised" in r.getMessage()]
-    assert len(failed) == 2
+    assert any("recovered after 500 consecutive failures" in r.getMessage() for r in caplog.records)
+
+
+def test_one_events_failing_run_does_not_silence_another_events_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink = _Switchable()
+    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=1), clock=_Clock())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        for _ in range(3):
+            det.observe_refusal("IB_ACME_ADT")
+        before = len(_failed_lines(caplog))
+        _start(det, ["security.allow_x"])  # a different event fails inside the run
+        det.release()
+        lines = _failed_lines(caplog)[before:]
+    assert [line.split(" could")[0] for line in lines] == [
+        "security-signal alert posture_loosened",
+        "security-signal alert posture_restored",
+    ]
+    # The control: the refusal key's third failure was held back by its own backoff.
+    assert before == 2
+
+
+def test_failed_raises_spend_no_named_slot() -> None:
+    sink = _Switchable()
+    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=1), clock=_Clock())
+    for i in range(MAX_SUBJECT_ALERTS + 2):
+        det.observe_refusal(f"IB_{i}")
+        det.observe_refusal(f"IB_{i}")  # a retry of the same failing subject
+    sink.down = False
+    det.observe_refusal("IB_NEW")
+    assert [n for _s, n, _c, _d in sink.signals] == ["inbound:IB_NEW"]
+    # The control: delivered raises do spend slots, so the sixth distinct one collapses.
+    for i in range(MAX_SUBJECT_ALERTS):
+        det.observe_refusal(f"IB_LATER_{i}")
+    assert sink.signals[-1][1] == "inbound:*"
 
 
 def test_the_refusal_sentence_states_the_quiet_period() -> None:

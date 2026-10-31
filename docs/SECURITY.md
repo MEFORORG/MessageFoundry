@@ -6417,8 +6417,8 @@ With the layer off, every detector stops but the posture one, so that start stil
 `posture_loosened` naming the switch. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
 process and pages nobody. An unpinned cluster node's identity changes on every start, so that
-node resolves its own alert on a clean stop instead. After a crash or a kill the alert stays
-open under the dead node's id, for an operator to resolve. `posture_loosened` does not fire, and nothing resolves, on a start whose
+node resolves its own alert as it shuts down instead; `install_security_signals` in `messagefoundry/pipeline/security_signals.py` says when that runs, and when it
+does not. `posture_loosened` does not fire, and nothing resolves, on a start whose
 `config_loaded` row records its loosenings as unknown, such as one whose config snapshot could not
 be taken.
 
