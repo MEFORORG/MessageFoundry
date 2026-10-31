@@ -12184,7 +12184,8 @@ def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
     At ``warn`` it is ``None``, as these commands passed before. At least these read ``None`` as
     enforcing: the Vault hops, and the weakened-TLS check and the SQL Server pin's anchor checks,
     which read the ambient posture for ``None`` and find none stamped on any CLI path. So a weakened
-    store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an unattested off-box Vault stays
+    store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an escape ``serve`` honours only at
+    ``[security].enforcement = warn``, and an unattested off-box Vault stays
     refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn`` posture
     would relax each of them, and no command may loosen (Manager decision 2026-10-31, under the
     owner's delegation of 2026-10-22). The revocation guard then does nothing, so each command calls
