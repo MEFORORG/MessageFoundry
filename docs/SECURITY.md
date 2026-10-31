@@ -2370,6 +2370,31 @@ as `params_no_requester` writes an `approval.params_no_requester` row against th
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
+**A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
+listing, on `GET /approvals` or on the console's `/ui/approvals`, that marks at least one request
+with that value writes one `approval.standing_shown` row against the caller. The row carries the
+caller's `client` address (ADR 0150), then `count` and those requests' ids in `approval_ids`, in
+that order. The off-box copy of the row holds `detail` to 200 characters, so from about five
+requests it is cut: it keeps `count`, may lose the ids past about the fourth, and is no longer valid
+JSON. The on-box row keeps every id, so read the ids there. A listing that
+shows no such value writes no row. Repeats are not folded together, because a held request may have
+no expiry, so a de-dup key or a throttle would hide months of views. Nothing paces the listing, so
+a client that polls it while such a request is held writes one row per poll. On the console this
+row is the listing's only record, because the console's gates write no grant row. On the JSON route
+it sits beside `auth.permission_granted` while `[security].audit_all_authorization_decisions` is on, and it does
+not depend on that switch. A failed write of this row leaves the listing answering 200, and is
+logged and paged, as below. That covers this row alone. While that switch is on, the JSON route
+writes its grant row first, so a store that refuses every audit write answers that route 500 before
+this row is reached, with no page. The write has no time bound of its own, so a write that stalls
+rather than fails holds the listing until the request timeout, with no row and no page. The value
+itself still needs no step-up.
+
+This row records what that listing disclosed, and only that. It does not record every route to the
+fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
+and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope. The
+console's user pages write no grant row. So a missing `approval.standing_shown` row does not show
+that a caller never learned a requester's standing.
+
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
 together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
@@ -2542,8 +2567,20 @@ Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
 request moves to `failed`, and `approval.failed` names the error type. A released purge does the
 same with its `connection_purge` row, which names the outbound, the scope and the count and is
-attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
-is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
+attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
+makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
+least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
+engine shard. It cancels nothing, writes no
+`connection_purge` row, and its `approval.approved` row records the route's refusal text as the
+skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
+off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail
+puts the request id, the operation, the requester and the count before the reason. So the copy may
+lose the reason. The requester's name is the field that can use up the bound, so a long requester
+name can leave no reason at all. Read the reason on-box. A held purge whose stored scope
+is neither `top` nor `all`, or whose stored name the route would not admit, cancels nothing either.
+No request files one and no operator act clears it, so it answers 422, moves to `failed`, and
+`approval.failed` names the error type; a WARNING in the engine log says why. The queue does not predict this refusal: `release_blocked` stays `null`, as
+for the operation's other own refusals, and the request is claimed first.
 At least one case does not fail closed: a COMMIT the server applied whose reply was lost, the same
 exception the claim has. The re-queue or the cancel and its row are then committed, and the gate
 still tries to move the request to `failed`. That row is not forwarded off-box, and no alert says
@@ -2560,10 +2597,14 @@ error, as stated for the claim above.
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name. A
 resolution's lost `approval.approver_provenance` row is keyed `approval:<id>:resolve` instead, so it
-cannot fold into a lost release flag on the same request (vault BACKLOG #3438).
+cannot fold into a lost release flag on the same request (vault BACKLOG #3438). A lost
+`approval.standing_shown` row is keyed `approval:listing`, because it belongs to a listing rather
+than to one request.
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
+- the `approval.standing_shown` row a listing writes. The log line carries the row's detail, the
+  caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
 - the request or repeat write, including one that reads back as held, as below. The log line names

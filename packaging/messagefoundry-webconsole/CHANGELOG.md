@@ -125,6 +125,13 @@ this line.**
   is another session to end. Seam change: `AuthService` gains `count_other_sessions`, and
   `AdminHandlers.disable_my_mfa` is now the disable past the JSON route's gate, which takes
   `token` and `client` and returns `other_sessions`. (BACKLOG #3393)
+- **`/ui/approvals` now leaves a record when it shows that a requester lost their authority.** A
+  listing that marks at least one request `requester_not_authorized` writes one
+  `approval.standing_shown` audit row, naming the caller, their address and those requests. The
+  page's gates write no grant row, so this row is the listing's only record. The row covers this
+  listing, not every route to the fact; [`docs/SECURITY.md`](../../docs/SECURITY.md) says what it
+  leaves out. Seam change: `list_approvals` takes `request`, which the handshake does not check, so
+  this console and an engine without that change raise TypeError on the page. (BACKLOG #3747)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 
