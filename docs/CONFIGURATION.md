@@ -1955,7 +1955,7 @@ the instance on the alert list. A later start that records an empty list resolve
 `posture_restored` inverse, which pages nobody and no rule can name. Its key carries `@node:<id>` or
 `@shard:<id>` where several engine processes share the store, so one process's clean start never
 resolves another's; an unpinned cluster node's id changes on every start, so that node resolves its
-own alert as it stops.
+own alert on a clean stop, and after a crash or a kill the alert stays open for an operator.
 `log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
 resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a

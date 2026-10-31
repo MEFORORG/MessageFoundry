@@ -225,7 +225,7 @@ _REFUSED = _Burst(
     PEER_REFUSED_BURST,
     "inbound",
     "{total} connections refused by this inbound's source allowlist or connection caps "
-    "within {window}; once raised, it is quiet for the rest of the window",
+    "within {window}; once raised, it is quiet for {quiet} from now",
 )
 
 
@@ -298,6 +298,9 @@ class SecuritySignalDetector:
         self._sink = sink
         t = thresholds
         self._window_label = f"{t.window_seconds:g} s"
+        #: How long a listener stays quiet after its refusal burst raised.
+        self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
+        self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
         #: The posture_loosened subject this detector last raised and has not seen resolved.
@@ -378,8 +381,7 @@ class SecuritySignalDetector:
                 return  # raised lately: not even counted, which is the cheap path
             self._refusals_quiet.pop(connection, None)
             if self._on_burst(_REFUSED, self._refused, connection, 1):
-                quiet_for = min(self._refused.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
-                self._refusals_quiet[connection] = now + quiet_for
+                self._refusals_quiet[connection] = now + self._refusal_quiet_seconds
                 if len(self._refusals_quiet) > MAX_SUBJECTS:
                     self._refusals_quiet.popitem(last=False)
         except Exception as exc:  # noqa: BLE001 - a detector fault must not reach the listener
@@ -392,7 +394,9 @@ class SecuritySignalDetector:
         return until is not None and until > (self._clock() if now is None else now)
 
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
-        """Count ``weight`` for ``key``; True when that raised the alert."""
+        """Count ``weight`` for ``key``; True when that raised an alert the sink took. False when
+        the sink refused it, so a caller that goes quiet after a raise does not go quiet on an
+        alert nobody received."""
         key = key or "unknown"
         now = self._clock()
         total = window.hit(key, now, weight)
@@ -400,12 +404,13 @@ class SecuritySignalDetector:
             return False
         # A checksum keeps two long keys with one head apart, where a plain cut would merge them.
         subject = shorten_with_checksum(f"{burst.prefix}:{key}", _SUBJECT_LIMIT)
-        sentence = burst.sentence.format(total=total, window=self._window_label)
+        sentence = burst.sentence.format(
+            total=total, window=self._window_label, quiet=self._quiet_label
+        )
         if not window.named(subject, now):
             subject = f"{burst.prefix}:*"
             sentence += f"; {MAX_SUBJECT_ALERTS} other subjects already raised this window"
-        self._raise(burst.signal, subject, total, sentence)
-        return True
+        return self._raise(burst.signal, subject, total, sentence)
 
     def _on_level(self, actor: str | None, detail: str | None, key: str, sentence: str) -> None:
         if str(_detail_of(detail).get(key, "")).upper() == "DEBUG":
@@ -445,20 +450,23 @@ class SecuritySignalDetector:
         self._posture_raised = None
         self._notify("posture_restored", lambda: self._sink.posture_restored(subject))
 
-    def _raise(self, signal: str, subject: str, count: int, detail: str) -> None:
-        self._notify(
+    def _raise(self, signal: str, subject: str, count: int, detail: str) -> bool:
+        return self._notify(
             signal,
             lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
         )
 
     @staticmethod
-    def _notify(event: str, call: Callable[[], None]) -> None:
+    def _notify(event: str, call: Callable[[], None]) -> bool:
+        """Run one sink call; False, logged, when the sink raised."""
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
             log.warning(
                 "security-signal alert %s could not be raised: %s", event, type(exc).__name__
             )
+            return False
+        return True
 
 
 def install_security_signals(

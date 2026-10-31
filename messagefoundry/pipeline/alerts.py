@@ -899,8 +899,8 @@ class AlertSink(Protocol):
         **auto-resolves** the open ``posture_loosened`` instance for the same ``name``, which is
         ``posture:start`` with this process's ``@node:<id>`` or ``@shard:<id>`` suffix where several
         engine processes share the store, so one process's clean start never clears another's. An
-        unpinned cluster node's id changes on every start, so it raises this for its own alert as it
-        stops; its next start could not. A start that could not read its list raises neither. No
+        unpinned cluster node's id changes on every start, so it raises this for its own alert on a
+        clean stop; its next start could not, and after a crash the alert stays open. A start that could not read its list raises neither. No
         PHI."""
         ...
 

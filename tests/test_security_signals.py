@@ -596,6 +596,39 @@ def test_a_long_window_holds_a_listener_quiet_for_at_most_five_minutes() -> None
     assert len(sink.signals) == 2
 
 
+def test_a_refusal_alert_the_sink_refused_starts_no_quiet_period() -> None:
+    class _Flaky(_Sink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = True
+
+        def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+            if self.down:
+                raise RuntimeError("sink down")
+            super().security_signal(name, signal=signal, count=count, detail=detail)
+
+    sink, clock = _Flaky(), _Clock()
+    det = SecuritySignalDetector(sink, _thresholds(peer_refusals=2), clock=clock)
+    for _ in range(2):
+        det.observe_refusal("IB_ACME_ADT")
+    assert not det.refusal_quiet("IB_ACME_ADT")  # nobody received it, so nothing is held back
+    sink.down = False
+    for _ in range(2):
+        det.observe_refusal("IB_ACME_ADT")
+    assert [n for _s, n, _c, _d in sink.signals] == ["inbound:IB_ACME_ADT"]
+    # The control: the alert the sink took does start the quiet period.
+    assert det.refusal_quiet("IB_ACME_ADT")
+
+
+def test_the_refusal_sentence_states_the_quiet_period() -> None:
+    det, sink, _ = _detector(peer_refusals=1, window_seconds=3600)
+    det.observe_refusal("IB_ACME_ADT")
+    assert "quiet for 300 s" in sink.signals[0][3]
+    det, sink, _ = _detector(peer_refusals=1, window_seconds=60)
+    det.observe_refusal("IB_ACME_ADT")
+    assert "quiet for 60 s" in sink.signals[0][3]
+
+
 def test_the_refusal_subject_is_spelled_as_an_inbound_record_name() -> None:
     det, sink, _ = _detector(peer_refusals=1)
     det.observe_refusal("IB_ACME_ADT")

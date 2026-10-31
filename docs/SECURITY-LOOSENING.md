@@ -833,7 +833,8 @@ Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_s
 - **What stays:** the posture detector. With the layer off it still runs, so a start that records
   its loosenings raises `posture_loosened` naming this one.
 - **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
-  does not see refused connections, so keep `security_peer_refusals` at its default.
+  does not see refused connections, and with the layer off nothing counts them, so a site that
+  turns the layer off accepts losing that alert.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating

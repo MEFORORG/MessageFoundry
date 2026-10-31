@@ -6410,13 +6410,15 @@ time. A refusal at a connection cap counts too, so a listener held full by ordin
 it as well.
 
 **Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
-a detector count of `0` or above its default, or a window shorter than its default, is named in
+a detector count of `0` or above its default, or a window shorter than its default while any
+count is above `0`, is named in
 `GET /security/posture` and in the start's `config_loaded` row.
 With the layer off, every detector stops but the posture one, so that start still raises
 `posture_loosened` naming the switch. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
 process and pages nobody. An unpinned cluster node's identity changes on every start, so that
-node resolves its own alert as it stops instead. `posture_loosened` does not fire, and nothing resolves, on a start whose
+node resolves its own alert on a clean stop instead. After a crash or a kill the alert stays
+open under the dead node's id, for an operator to resolve. `posture_loosened` does not fire, and nothing resolves, on a start whose
 `config_loaded` row records its loosenings as unknown, such as one whose config snapshot could not
 be taken.
 
