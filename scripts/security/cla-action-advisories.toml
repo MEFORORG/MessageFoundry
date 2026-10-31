@@ -263,8 +263,9 @@ package = "deepmerge"
 # carrying this chain unminified reds there. The first patched release is 11.0.1, outside the
 # ^3.0.4 both parents ask for, and it cannot be applied, because the bundle cannot be rebuilt here.
 # This reading bears on minimatch's three earlier entries, but they were not triaged on it and stay
-# recorded as found. THE OWNER HAS NOT RULED ON THIS ENTRY as of this triage. It rests on the
-# reviewed pull request this file's header names; record a ruling here if one is made.
+# recorded as found. ACCEPTED BY THE OWNER on 2026-10-31 in the Lander's chat, as the Lander relayed
+# it to the Builder writing this. Asked: "Accept minimatch in the CLA action's baseline (PR 2697)".
+# Answer: "accept".
 
 [[advisory]]
 id = "GHSA-g3hv-75wg-m249"
