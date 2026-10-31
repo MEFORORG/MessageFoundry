@@ -878,10 +878,11 @@ SITES: dict[str, Site] = {
     "messagefoundry/tray/iconset.py::icon_path": Site(
         1, INTERNAL, "An icon name built from fixed state and theme values."
     ),
-    "messagefoundry/uploads.py::UploadStore._paths": Site(
+    "messagefoundry/uploads.py::UploadStore._paths_unfollowed": Site(
         2,
         INTERNAL,
-        "A 32-hex id the store generated, refused by regex if malformed, then a parent check.",
+        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a parent "
+        "check; the reseal instead opens only a regular file, by lstat.",
     ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
