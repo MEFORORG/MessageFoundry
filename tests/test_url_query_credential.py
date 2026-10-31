@@ -538,6 +538,12 @@ _LOOKUP_URL = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
 _UNREAD = "did not resolve, so the URL query-credential check could not read it"
 
 
+def _real_fhir_lookup_settings() -> Any:
+    from messagefoundry.pipeline import wiring_runner
+
+    return wiring_runner._fhir_lookup_settings
+
+
 def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records]
 
@@ -706,7 +712,7 @@ async def test_a_start_and_an_operator_start_still_warn_once(
 
 
 @pytest.mark.parametrize("warn", [True, False])
-async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_start(
+async def test_a_lookup_whose_url_resolved_warns_once_unless_the_caller_already_did(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture, warn: bool
 ) -> None:
     """Two lookups fail to resolve, so the whole-graph build is skipped, each lookup that resolved
@@ -745,6 +751,46 @@ async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_s
         await runner.stop()
 
 
+async def test_a_defect_in_one_lookups_settings_isolates_it_loudly_and_the_rest_start(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control is ADR 0031 / vault BACKLOG #3008 isolation, as on main: a non-WiringError from
+    resolving one lookup's settings (a defect, not a configuration fault) costs that lookup only.
+    It is logged at ERROR with its traceback, so the defect is loud, and the start completes with
+    ``LK_A`` and ``LK_Z`` built. Catching only WiringError there unwinds the start and fails this
+    test."""
+    real = _real_fhir_lookup_settings()
+
+    def settings_or_raise(spec: Any, env_values: Any, egress: Any) -> dict[str, Any]:
+        if spec.name == "LK_DEFECT":
+            raise TypeError("synthetic defect in settings resolution")
+        return real(spec, env_values, egress)
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.wiring_runner._fhir_lookup_settings", settings_or_raise
+    )
+    reg = Registry()
+    for name in ("LK_A", "LK_DEFECT", "LK_Z"):
+        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": _LOOKUP_URL}))
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await runner.start()
+        assert runner._running
+        assert list(runner.degraded_fhir_lookups()) == ["LK_DEFECT"]
+        assert runner.fhir_lookup_failed("LK_A") is None
+        assert runner.fhir_lookup_failed("LK_Z") is None
+        errors = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "settings failed to resolve" in r.getMessage()
+        ]
+        assert len(errors) == 1 and "'LK_DEFECT'" in errors[0].getMessage()
+        assert errors[0].exc_info is not None
+    finally:
+        await runner.stop()
+
+
 async def test_a_raising_warning_step_isolates_its_lookup_and_the_rest_start(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -777,6 +823,13 @@ async def test_a_raising_warning_step_isolates_its_lookup_and_the_rest_start(
         assert runner.fhir_lookup_failed("LK_Z") is None
         assert _warned(caplog, "FhirLookup 'LK_A'") == 1
         assert _warned(caplog, "FhirLookup 'LK_Z'") == 1
+        loud = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "query-credential check failed" in r.getMessage()
+        ]
+        assert len(loud) == 1 and "'LK_BOOM'" in loud[0].getMessage()
+        assert loud[0].exc_info is not None
     finally:
         await runner.stop()
 

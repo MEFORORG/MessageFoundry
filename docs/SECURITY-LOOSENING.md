@@ -1819,9 +1819,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
 > parameter named like a credential: `key`, `sig`, `signature`, most names ending in `token`,
 > `secret`, `password` or `credential` (as `access_token` or `accessToken`), and the rest of the
-> engine's credential vocabulary. A few such names are known not to be credentials and are left
-> alone, at least `page_token` and `next_token`; `secretscrub.py` `_QUERY_NOT_CREDENTIAL_TAILS` is the
-> list. ASVS 14.2.1.
+> engine's credential vocabulary. A few such names are not named, at least `page_token` and
+> `next_token`, because they usually carry a paging cursor; the detector never reads what a
+> parameter carries, so a credential under one of them is missed. `secretscrub.py`
+> `_QUERY_NOT_CREDENTIAL_TAILS` is the list. ASVS 14.2.1.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole
@@ -1868,7 +1869,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
   URL on such a lane appears nowhere meanwhile.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
-  know, and it will name a parameter that only looks like one, such as `csrf_token`. OIDC's
+  know, and it will name a parameter that only looks like one, such as `primary_key`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced

@@ -2546,8 +2546,13 @@ class RegistryRunner:
                 )
 
         # Settings resolve once, with no I/O, so the warning has one call site and comes before any
-        # build: a lookup that then fails to build keeps its record. Resolution raises WiringError
-        # for a configuration fault; anything else is a defect and is let out.
+        # build: a lookup that then fails to build keeps its record.
+        #
+        # Both steps isolate one lookup's failure as its build does (ADR 0031, vault BACKLOG #3008),
+        # so it costs that lookup only and never unwinds the start. WiringError is a configuration
+        # fault, recorded and alerted with the lookup. Anything else is a defect, so it is also
+        # logged at ERROR with its traceback. A lookup whose security warning step raises is
+        # degraded rather than started without its record, which fails safe.
         settled: dict[str, dict[str, Any]] = {}
         errors: dict[str, Exception] = {}
         for name in specs:
@@ -2555,14 +2560,19 @@ class RegistryRunner:
                 settled[name] = resolve(name)
             except WiringError as exc:
                 errors[name] = exc
+            except Exception as exc:
+                log.error("FhirLookup %r settings failed to resolve", name, exc_info=True)
+                errors[name] = exc
             if not warn_query_credentials:
                 continue
             try:
                 warn(name, settled.get(name))
             except Exception as exc:
-                # Broad on purpose, as the build's isolation below is (ADR 0031, vault BACKLOG
-                # #3008): a failure in one lookup's warning step costs that lookup only, so it is
-                # isolated, recorded and alerted rather than unwinding the start.
+                log.error(
+                    "FhirLookup %r URL query-credential check failed, so it is not started",
+                    name,
+                    exc_info=True,
+                )
                 errors.setdefault(name, exc)
                 settled.pop(name, None)
         if not errors:
