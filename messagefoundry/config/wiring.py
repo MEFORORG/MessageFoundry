@@ -6372,7 +6372,7 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 
 
 def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+    """The generic-ODBC ``DATABASE`` connections the TLS classifier flags, as
     ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
 
     On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
@@ -6383,9 +6383,9 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This remains the INVENTORY of delegated hops — a hop can appear here and still be
-    crossed legitimately, on-box or under a declared attestation or acceptance — so read it as "who
-    owns TLS on this hop", never as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one with a TLS mode set
+    to a value outside the no-TLS deny-list is absent. A hop can appear here and still be crossed legitimately, on-box or under a declared
+    attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so

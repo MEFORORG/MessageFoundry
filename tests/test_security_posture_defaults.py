@@ -3014,6 +3014,10 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
     assert "OB_PG_RESULTS" in risk and "inbound:IB_PG_ORDERS" in risk
     # The DSN credential rides the same hop as the rows; an operator weighing the risk needs both.
     assert "credential" in risk and "plaintext" in risk
+    # Since BACKLOG #1178 these hops are gated. The text must say an enforcing instance refuses them,
+    # or an operator reading it would add an attestation to "fix" a hop the engine already blocks.
+    assert "An enforcing instance refuses each one" in risk
+    assert "the weakened-TLS refusal does not apply" not in risk
 
 
 def test_revocation_attestation_is_a_named_loosening() -> None:
@@ -3248,6 +3252,18 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     )
     reg.add_outbound(
         build_outbound_connection(
+            "OB_PG_CERT_ONLY",
+            Database(
+                server="cert.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"sslcert": "client.pem"},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
             "OB_SQLSERVER",
             Database(
                 server="ss.example",
@@ -3272,8 +3288,10 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     hops = dict(unverified_generic_db_hops(reg))
     # The sqlserver dialect is NOT here: it keeps the byte-identical posture-keyed refusal, so it is
     # gated rather than merely reported, and listing it would be noise.
-    assert set(hops) == {"OB_PG_BARE", "inbound:IB_PG_ORDERS"}
+    assert set(hops) == {"OB_PG_BARE", "OB_PG_CERT_ONLY", "inbound:IB_PG_ORDERS"}
     assert "no TLS keyword" in hops["OB_PG_BARE"]
+    # BACKLOG #2483: a certificate path sets no mode, so it is reported beside the bare hop.
+    assert "no TLS mode has a usable value" in hops["OB_PG_CERT_ONLY"]
     # The value-blind detector fixed in step 1 is what makes this arm real: `SSLmode=disable` used to
     # read as "the operator has taken TLS ownership".
     assert "SSLmode=disable" in hops["inbound:IB_PG_ORDERS"]

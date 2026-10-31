@@ -1967,7 +1967,7 @@ def _posture_loosenings(
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
-    # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+    # being honoured, a generic DB hop has no TLS mode or one pinned to no TLS, a hop is attested secure, or a
     # revocation refusal is attested away, and a stale or absent list would understate the
     # posture. An engine with no
     # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
