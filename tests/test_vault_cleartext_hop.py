@@ -555,11 +555,11 @@ def test_provision_admin_shows_the_cleartext_refusal_not_the_canned_text(
     import messagefoundry.auth.service as service
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.transports.strict_requests import _CLEARTEXT_VAULT_HOP
+    from messagefoundry.transports.strict_requests import _CLEARTEXT_VAULT_HOP, VaultHopRefused
 
     def _raise(*args: object, **kwargs: object) -> None:
         if cleartext:
-            refusal = InsecureHopRefused(f"Vault KV secret provider: {_CLEARTEXT_VAULT_HOP}")
+            refusal = VaultHopRefused(f"Vault KV secret provider: {_CLEARTEXT_VAULT_HOP}")
             raise SecretProviderError(str(refusal)) from refusal
         raise SecretProviderError("synthetic: unresolved reference")
 

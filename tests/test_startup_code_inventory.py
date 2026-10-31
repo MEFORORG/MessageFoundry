@@ -930,6 +930,7 @@ from messagefoundry.config.settings import (
     BackupSettings,
     CertMonitorSettings,
     SecretsSettings, StoreSettings, security_loosenings,
+    AiSettings,
 )
 from messagefoundry.remotedebug import install_remote_debug_guard, remote_debug_posture
 from messagefoundry.startupcode import read_startup_posture
@@ -944,6 +945,7 @@ names = [name for name, _ in security_loosenings(
     cert_monitor=CertMonitorSettings(),
     backup=BackupSettings(),
     secrets=SecretsSettings(),
+    ai=AiSettings(),
     store_privilege=None, audit_chain_unkeyed=None, remote_debug=remote_debug_posture(),
     startup=startup,
     service_env=None,

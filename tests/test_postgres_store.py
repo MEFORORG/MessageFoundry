@@ -1704,6 +1704,59 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+    """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
+    rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
+    False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
+    ``events_for``, which decrypts ``detail``."""
+    detail = "HTTP 200; reply body over the 64-byte bound"
+
+    async def _to_outbound(now: float):
+        mid, routed_item = await _route_and_claim_routed(store, "IB", now)
+        assert routed_item is not None
+        assert await store.transform_handoff(
+            routed_id=routed_item.id,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB1", "transformed")],
+            now=now,
+        )
+        out = await store.claim_next_fifo("OB1", now=now)
+        assert out is not None and out.stage == Stage.OUTBOUND.value
+        return mid, out
+
+    def _tail(events):
+        return [
+            (e["event"], e["destination"], e["detail"] if e["event"] == "reply_dropped" else None)
+            for e in events
+            if e["event"] in ("delivered", "reply_dropped")
+        ]
+
+    mid, out = await _to_outbound(100.0)
+    assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
+    after_drop = await store.events_for(mid)
+    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+    async def _dropped_anywhere():
+        # A count over every message, so a stray write against another message would show. It
+        # reads no detail, so no ciphertext comes back.
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM message_events WHERE event = 'reply_dropped'"
+        )
+        return int(rows[0]["n"])
+
+    assert await _dropped_anywhere() == 1
+    assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
+    assert await store.events_for(mid) == after_drop
+    assert await _dropped_anywhere() == 1  # the vanished row wrote nothing anywhere
+
+    plain, other = await _to_outbound(120.0)
+    assert await store.mark_done(other.id, now=130.0) is True
+    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert await _dropped_anywhere() == 1
+
+
 async def test_routed_to_filtered_collapse(store) -> None:
     """A routed message whose only handler transforms to ZERO deliveries collapses to FILTERED."""
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)

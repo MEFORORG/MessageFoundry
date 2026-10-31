@@ -19,9 +19,8 @@ Everything here runs before ingress, so no message is read, persisted or acknowl
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
 nothing, and the sender retries.
 
-**TLS is not in the helper.** The MLLP listener is the only one that upgrades a socket to TLS itself,
-after admission, so that step stays in its accept handler. The HTTP listener's handshake is run by the
-event loop before admission; that is a separate item.
+**TLS is not in the helper.** The MLLP and HTTP listeners upgrade a socket to TLS themselves, after
+admission, on the stdlib loop (BACKLOG #1606, #2479), so that step stays in their accept handlers.
 """
 
 from __future__ import annotations

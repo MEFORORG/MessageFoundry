@@ -38,6 +38,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
+    vault_hop_refusal_text,
 )
 from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
 
@@ -211,8 +212,9 @@ def _build_client(
         # BACKLOG #2317: the mount refuses an address that would send the token in cleartext,
         # before any I/O. Vault BACKLOG #2983: it also refuses an off-box https:// Vault whose
         # revocation nothing checks and nobody attested. Raised as this provider's own
-        # fail-closed type, which every caller handles, with the refusal's fixed text kept whole.
-        raise SecretProviderError(str(exc)) from exc
+        # fail-closed type, which every caller handles. Only the hop's own marked refusal keeps
+        # its fixed text whole; any other hop refusal keeps its type name (BACKLOG #3471).
+        raise SecretProviderError(vault_hop_refusal_text(exc, _VAULT_KV_CONNECTOR)) from exc
     return client
 
 
