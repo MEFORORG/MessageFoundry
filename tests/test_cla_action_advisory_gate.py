@@ -16,7 +16,7 @@ only entry that moved is minimatch, whose ``via`` gains the advisory and whose `
 The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
 deepmerge GHSA-gcqx-w48m-w2h4. Those two differ by exactly that one finding, plus seven
 ``vulnerabilities`` entries, deepmerge and six packages that reach it, with the low and total counts
-up by seven. The 2026-10-24 reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2,
+up by seven; every entry the 2026-10-24 reading held is unchanged. The 2026-10-24 reading had itself replaced the 2026-10-07 one, taken with npm 11.5.2,
 after GitHub withdrew two advisories. Those two readings' findings differed by exactly the two withdrawn
 ids. Other fields differed too: some followed from the withdrawals, such as the braces and js-yaml
 ranges and js-yaml's ``via``, and the rest, such as some ``effects`` and ``fixAvailable`` values,
@@ -397,8 +397,9 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: - minimatch, read 2026-10-31: what that reading settles is stated in the triage comment above
 #:   minimatch's GHSA-g3hv-75wg-m249 entry. These three cover minimatch by name, an identifier of
 #:   its own, and glob, its runtime parent. "Toolkit" above covers actions-toolkit, the top of that
-#:   chain. The rest of what it measured is not re-run; these are enough to red a re-vendored bundle
-#:   that carries the chain unminified.
+#:   chain. The bare name is kept although other packages' names can hold it, such as
+#:   @types/minimatch: a false red only sends someone to redo the reading. The other two still fire
+#:   if that name is gone from the file but these identifiers survive.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -437,6 +438,23 @@ def test_the_recorded_bundle_reading_still_holds() -> None:
     assert _ABSENT_FROM_BUNDLE, "no probes left, so the absence below would check nothing"
     present = [probe.pattern for probe in _ABSENT_FROM_BUNDLE if probe.search(bundle)]
     assert not present, f"recorded as absent from the bundle, now present: {present}"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "planted"),
+    [
+        # Lines read 2026-10-31 at the upstream tags of the locked versions: minimatch v3.1.2's
+        # minimatch.js and glob v7.1.6's sync.js.
+        ("minimatch", "minimatch.Minimatch = Minimatch"),
+        ("twoStarNoDot", "var twoStarNoDot ="),
+        ("GlobSync", "globSync.GlobSync = GlobSync"),
+    ],
+)
+def test_the_minimatch_chain_probes_fire_on_the_locked_source(pattern: str, planted: str) -> None:
+    """A zero from a probe that could not fire is no reading, so plant real source and require a hit."""
+    probe = next(p for p in _ABSENT_FROM_BUNDLE if p.pattern == pattern)
+
+    assert probe.search(planted), f"{pattern} no longer finds the source it was measured against"
 
 
 def test_the_advice_matches_the_kind_of_failure(

@@ -235,26 +235,33 @@ package = "deepmerge"
 # 2695 (scheduled Security run 41198026900, job cla-action-audit). minimatch GHSA-g3hv-75wg-m249,
 # GitHub severity medium, npm moderate, no CVSS score: a glob pattern an attacker supplies can
 # amplify preprocessing into excessive CPU and memory use. GitHub's range is below 11.0.1, which
-# covers the locked 3.1.2. The advisory's text names 10.2.6 and firstPhasePreProcess(). 3.1.2's
-# source is not in this repository and was not read, so this does not claim 3.1.2 lacks that path.
+# covers the locked 3.1.2. The advisory's text names 10.2.6 and firstPhasePreProcess(). That name
+# returned 0 in minimatch.js at the upstream git tag v3.1.2, which is a reading of the tag and not
+# of the npm tarball. It does not show that 3.1.2 is safe from every amplification.
 # THIS IS NOT A DEV-ONLY PACKAGE. The lockfile marks minimatch 3.1.2 neither `dev`, `peer` nor
 # `optional`. Searching the lockfile's `dependencies`, `peerDependencies` and
 # `optionalDependencies` finds two packages naming it: test-exclude, marked `dev`, and glob 7.1.6,
 # not marked. That chain runs glob, rimraf 2.6.3, flat-cache 2.0.1, actions-toolkit 2.2.0, and
 # actions-toolkit is a root runtime dependency. So the lockfile alone does not rule it out.
-# NOT REACHABLE in what cla.yml runs, on the bundle reading instead. action.yml's main is
-# dist/index.js, the action's only JavaScript file, and the file is not minified. "minimatch" and
-# "Minimatch" each returned 0 there, as did firstPhasePreProcess, GLOBSTAR, braceExpand, nonegate,
-# flipNegate, twoStarNoDot and makeRe; GlobSync, nodir and realpathCache for glob; rimraf and
-# maxBusyTries; flatCache and removeCacheFile for flat-cache; and actions-toolkit and Toolkit. The
-# @actions/core control returned 2. The bundle's literal require() calls name only Node built-ins.
-# A wildcard in the `allowlist` input goes through lodash escapeRegExp and a RegExp in
-# isUserNotInAllowList, not a glob library. The first patched release is 11.0.1, outside the ^3.0.4 both parents
-# ask for, and it cannot be applied, because the bundle cannot be rebuilt here.
+# NOT PRESENT UNDER THESE IDENTIFIERS in what cla.yml runs, so not reachable on this reading.
+# action.yml's main is dist/index.js, the action's only JavaScript file. Each of these returned 0
+# there. For minimatch: minimatch, Minimatch, GLOBSTAR, braceExpand, nonegate, flipNegate,
+# twoStarNoDot, makeRe. For glob: GlobSync, nodir, realpathCache. For rimraf: rimraf, maxBusyTries.
+# For actions-toolkit: actions-toolkit, Toolkit. Each name for minimatch, glob and rimraf returned
+# at least 1 in that package's source at the upstream tag of its locked version (minimatch.js,
+# glob's sync.js, rimraf.js), so these zeros can discriminate. flat-cache's tag was not found, so
+# flatCache and removeCacheFile also returned 0 but are not offered as evidence. The @actions/core
+# control returned 2. The bundle's literal require() calls name only Node built-ins, and it also
+# holds one eval("require")("encoding"), which is not a glob library and which the action directory
+# ships nothing to satisfy. A wildcard in the `allowlist` input goes through lodash escapeRegExp and
+# a RegExp in isUserNotInAllowList. LIMIT OF THIS READING: identifier counts do not see code
+# minified or renamed inside another package's pre-built file, today or after a re-vendor.
 # tests/test_cla_action_advisory_gate.py re-runs some of these probes, so a re-vendored bundle
-# carrying this chain unminified reds there. It does NOT see that code minified or renamed inside
-# another package's pre-built file. This reading bears on minimatch's three earlier entries, but
-# they were not triaged on it and stay recorded as found.
+# carrying this chain unminified reds there. The first patched release is 11.0.1, outside the
+# ^3.0.4 both parents ask for, and it cannot be applied, because the bundle cannot be rebuilt here.
+# This reading bears on minimatch's three earlier entries, but they were not triaged on it and stay
+# recorded as found. THE OWNER HAS NOT RULED ON THIS ENTRY as of this triage. It rests on the
+# reviewed pull request this file's header names; record a ruling here if one is made.
 
 [[advisory]]
 id = "GHSA-g3hv-75wg-m249"
