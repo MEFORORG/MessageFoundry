@@ -12188,7 +12188,7 @@ def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
     refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn`` posture
     would relax each of them, and no command may loosen (Manager decision 2026-10-31, under the
     owner's delegation of 2026-10-22). The revocation guard then does nothing, so each command calls
-    :func:`_warn_on_an_unrevoked_store_hop` just before its open. Imported here, not at module
+    :func:`_warn_on_an_unrevoked_store_hop` before its open, which says when that logs. Imported here, not at module
     level, so the CLI's import cost stays where it is."""
     from messagefoundry.config.settings import hop_posture_from_ai
 
@@ -12201,8 +12201,11 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
     store's open runs it for ``serve``, so the command logs the same WARNING (BACKLOG #2532). At
     ``enforce`` it does nothing: the open's own guard refuses there.
 
-    Called just before the open, so a command that refuses earlier, on its input or its key, logs
-    no crossing. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
+    Called just before each open, and so BEFORE it: the WARNING is logged even when that open then
+    refuses for its key, its cipher or its driver, and no connection is made. ``serve`` runs the
+    guard inside the open, after the cipher, so it logs nothing in that case. Only a refusal of the
+    command's input or arguments, before this call, logs nothing. A command that opens twice, as
+    ``admin-reset-totp`` does, logs it once per open. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
     open before the guard would run, so it is skipped here. A context that cannot be built is
     skipped too: the open builds the same context and reports the error itself. At a non-enforcing
     posture the guard warns or allows and does not refuse."""
