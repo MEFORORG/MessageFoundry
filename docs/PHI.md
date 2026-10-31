@@ -1697,10 +1697,15 @@ stores an error on an attribute keeps its message, except where the same excepti
 beneath one whose own code renders it: the walk then reads it the deep way, and it prints as the
 fixed note wherever it appears in that argument. Some builtin exceptions define their own, at
 least `OSError` and `KeyError`, and one of those that stores an error on an attribute gets the
-fixed note even where its own `__str__` would not print it. A builtin's `__str__` never prints
-the chain, so a builtin exception raised from a codec error keeps its message, except where the
-same exception is also reached beneath one whose own code renders it, as above: in that argument
-it prints as the fixed note too. The rule applies
+fixed note even where its own `__str__` would not print it. The line between builtin and own code
+is drawn at the `builtins` namespace: a `__str__` or `__repr__` that a class defined there
+carries never prints the chain, so such an exception raised from a codec error keeps its message,
+except where the same exception is also reached beneath one whose own code renders it, as above:
+in that argument it prints as the fixed note too. A `__str__` or `__repr__` that a class defined
+anywhere else carries, the standard library included, counts as own code even when it is C code,
+so an exception such as `ssl.SSLError`, whose class defines its own `__str__`, raised from a codec
+error or while one was being handled, gets the fixed note.
+The rule applies
 in a traceback, as a log argument, in
 `safe_exc()`, and in the error text a sandboxed Handler reports across the process boundary.
 `codec_safe_str()` returns the note alone, with no class.
@@ -1720,8 +1725,11 @@ against one budget per argument (`_ATTRIBUTE_BUDGET` in `redaction.py`; read the
 The walk reads by attribute in two passes (vault BACKLOG #3340). **The first pass reads what the
 walk read before that change, on the same budget per log argument and per traceback link, and it
 finishes before the added pass starts.** It differs at least where the class of an exception puts
-another descriptor under `__dict__`: that read used to raise, so the exception printed the note,
-and now its real `__dict__` is read. The added pass then
+something other than the builtin getset under `__dict__`, such as a property, `__dict__ = None`
+or another class's getset: the first pass now reads the instance dict through the builtin
+`BaseException` descriptor, so none of that class's code runs. That is a tightening. Where the
+walk before that change skipped that dict, or withheld the whole argument because the read
+raised, a codec error held in the dict now prints as the fixed note. The added pass then
 reads at least the dunder-named slots, the `__cause__` and `__context__` chain links, and what an
 exception's own `__str__` or `__repr__` reaches. It runs on the budget the first pass left, and in
 a traceback within one more budget that the added passes of every link share. **It only adds: it

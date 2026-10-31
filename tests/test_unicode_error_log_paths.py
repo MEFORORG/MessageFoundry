@@ -1774,6 +1774,39 @@ def test_the_stdlibs_note_for_unreadable_notes_is_not_kept() -> None:
         assert spelling not in out
 
 
+class _CollidesWithNotes:
+    """A dict key with the hash of ``"__notes__"`` whose ``__eq__`` raises once armed, so a lookup
+    of that name in a dict holding it raises. Unarmed, it can be inserted beside the real key."""
+
+    armed = False
+
+    def __hash__(self) -> int:
+        return hash("__notes__")
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            raise RuntimeError("no compare")
+        return False
+
+
+def test_a_notes_lookup_that_raises_drops_the_notes_and_does_not_crash() -> None:
+    # Review of vault BACKLOG #3340: _own_notes looked "__notes__" up in the instance dict outside
+    # its try, so a colliding key made safe_traceback raise, and logging_setup calls it directly.
+    error = UnicodeDecodeError("utf-8", b"ok" + _BYTE, 2, 3, "invalid start byte")
+    key = _CollidesWithNotes()
+    error.__dict__[key] = 1  # type: ignore[index]  # first, so a lookup of "__notes__" compares against it
+    error.add_note("decoding with 'utf-8' codec failed")  # a note the scan would otherwise keep
+    key.armed = True
+    with pytest.raises(RuntimeError):  # control: the lookup itself raises
+        dict.get(error.__dict__, "__notes__")
+    out = safe_traceback((type(error), error, None))
+    _assert_decode_safe(out)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert "codec failed" not in out  # the notes the read could not vouch for are dropped
+    assert "Ignored error getting __notes__" not in out
+
+
 def test_a_kept_codec_note_names_only_a_codec_safe_exc_would_name() -> None:
     # Review of vault BACKLOG #3340: the stdlib's "decoding with '<name>' codec failed" quotes the
     # name as the caller wrote it, which _names_a_codec declines to print.
@@ -2218,7 +2251,9 @@ class _NoDictOwner:
 
 
 class _ForeignDictError(Exception):
-    """Its ``__dict__`` reader is another class's, so reading it raises ``TypeError``."""
+    """Its class puts another class's ``__dict__`` getset under ``__dict__``, so ``exc.__dict__``
+    raises ``TypeError``. The scan reads the instance dict through the builtin ``BaseException``
+    reader instead, so the foreign one is never called."""
 
     __dict__ = _NoDictOwner.__dict__["__dict__"]
 

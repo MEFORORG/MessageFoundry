@@ -2660,9 +2660,10 @@ def _own_notes(exc: BaseException) -> Any:
     the caller's code runs; a list another object returned in its place is not this one."""
     try:
         storage = _EXC_DICT.__get__(exc)
-    except Exception:  # noqa: BLE001 -- a class with no instance dict keeps no notes there
+        # A key with the same hash runs its own __eq__ here, and that can raise.
+        notes = dict.get(storage, "__notes__") if type(storage) is dict else None
+    except Exception:  # noqa: BLE001 -- fail closed: notes the read cannot vouch for are dropped
         return None
-    notes = dict.get(storage, "__notes__") if type(storage) is dict else None
     return notes if type(notes) is list else None
 
 
