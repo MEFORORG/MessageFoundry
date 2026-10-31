@@ -320,9 +320,10 @@ def check_fhir_lookup_allowed(
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
     refusal. The runner's live builds pass it and log the line themselves (vault BACKLOG #2910)."""
-    _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
+    # ASVS 14.2.1, before every refusal, so a lookup a refusal takes down is still recorded.
     if warn_query_credentials:
-        warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
+        warn_url_query_credentials(f"FhirLookup {name!r}", settings)
+    _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
             f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
@@ -370,7 +371,7 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
     least check, start, operator start and test), from :func:`check_fhir_lookup_allowed`, its
     FhirLookup twin, and from the runner's ``_build_fhir_lookup_executor``, which logs it once per
-    lookup whose settings resolved, however many builds it makes. All run on env-resolved
+    lookup however many builds it makes. All run on env-resolved
     settings, so this sees a URL that ``env()`` supplied. A reload skips it on the builds that
     follow its build check, which has already warned; :func:`check_egress_allowed` says how.
     docs/SECURITY-LOOSENING.md is the source of record for where it fires.
@@ -409,15 +410,16 @@ def check_egress_allowed(
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
     refusal. A reload passes it for the builds that follow its build check, which has already
     logged the warning for this reload (vault BACKLOG #2910)."""
+    # ASVS 14.2.1: a recorded loosening, never a silent one. Before every refusal, so a lane a
+    # refusal takes down is still recorded.
+    if warn_query_credentials:
+        warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
     # ADR 0126 forward proxy: an http-family destination may dial through an operator-chosen proxy that
     # receives a Proxy-Authorization credential. Gated by its OWN [egress].allowed_proxy list, BEFORE
     # and independently of the per-transport destination chain below — an empty allowed_http says
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
-    # ASVS 14.2.1: a recorded loosening, never a silent one
-    if warn_query_credentials:
-        warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

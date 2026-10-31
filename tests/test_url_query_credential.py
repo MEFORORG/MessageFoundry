@@ -700,31 +700,33 @@ async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_s
 ) -> None:
     """The whole-graph build fails at ``LK_BAD``, then each lookup builds alone, then the survivors
     build again. Each build used to warn for every lookup it was given: three lines for a survivor
-    and two for ``LK_BAD``. Now each lookup whose settings resolved logs one line.
+    and two for ``LK_BAD``. Now each lookup whose ``url`` resolved logs one line.
 
     The control this pins is the ASVS 14.2.1 record for a lookup that is down: ``LK_BAD``'s
-    settings resolved and its build failed, and it keeps its one WARNING, so an ``env()`` URL with a
-    query credential is named while the lookup is isolated. Warning only for the survivors fails
-    the ``LK_BAD`` count. ``LK_UNSET``'s ``env()`` URL never resolved, so there is no URL to read
-    and it logs none. The ``warn=False`` case is the start ``Engine.reload_detail`` makes after its
-    build check: every count is zero there, on the isolation path as on the healthy one."""
+    settings resolved and its build failed, and ``LK_TOKEN``'s URL resolved while another setting
+    did not. Each keeps its one WARNING, so an ``env()`` URL with a query credential is named while
+    the lookup is isolated. Warning only for the survivors fails the ``LK_BAD`` count, and warning
+    only for fully resolved settings fails the ``LK_TOKEN`` count. ``LK_UNSET``'s ``env()`` URL
+    never resolved, so there is no URL to read and it logs none. The ``warn=False`` case is the
+    start ``Engine.reload_detail`` makes after its build check: every count is zero there, on the
+    isolation path as on the healthy one."""
     reg = Registry()
-    urls: dict[str, str | EnvRef] = {
-        "LK_A": _LOOKUP_URL,
-        "LK_BAD": "ftp://fhir.example.invalid/R4?api_key=PLACEHOLDER",  # not http or https
-        "LK_UNSET": EnvRef("MEFOR_UNSET_LOOKUP_URL"),
-        "LK_Z": _LOOKUP_URL,
+    lookups: dict[str, dict[str, str | EnvRef]] = {
+        "LK_A": {"url": _LOOKUP_URL},
+        "LK_BAD": {"url": "ftp://fhir.example.invalid/R4?api_key=PLACEHOLDER"},  # not http(s)
+        "LK_TOKEN": {"url": _LOOKUP_URL, "bearer_token": EnvRef("MEFOR_UNSET_LOOKUP_TOKEN")},
+        "LK_UNSET": {"url": EnvRef("MEFOR_UNSET_LOOKUP_URL")},
+        "LK_Z": {"url": _LOOKUP_URL},
     }
-    for name, url in urls.items():
-        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings={"url": url}))
+    for name, settings in lookups.items():
+        reg.add_fhir_lookup(FhirLookupSpec(name=name, settings=settings))
     runner = _reload_runner(reload_store, reg)
     try:
         with caplog.at_level(logging.WARNING):
             await runner.start(warn_query_credentials=warn)
-        assert sorted(runner.degraded_fhir_lookups()) == ["LK_BAD", "LK_UNSET"]
-        assert _warned(caplog, "FhirLookup 'LK_A'") == int(warn)
-        assert _warned(caplog, "FhirLookup 'LK_Z'") == int(warn)
-        assert _warned(caplog, "FhirLookup 'LK_BAD'") == int(warn)
+        assert sorted(runner.degraded_fhir_lookups()) == ["LK_BAD", "LK_TOKEN", "LK_UNSET"]
+        for name in ("LK_A", "LK_Z", "LK_BAD", "LK_TOKEN"):
+            assert _warned(caplog, f"FhirLookup {name!r}") == int(warn), name
         assert _warned(caplog, "FhirLookup 'LK_UNSET'") == 0
     finally:
         await runner.stop()
@@ -753,12 +755,12 @@ async def test_a_reload_of_an_unstarted_runner_warns_and_its_later_start_warns_a
         await runner.stop()
 
 
-async def test_an_unlisted_forward_proxy_logs_none_for_an_outbound_and_one_for_a_lookup(
+async def test_an_unlisted_forward_proxy_still_logs_one_warning_for_an_outbound_and_a_lookup(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """docs/SECURITY-LOOSENING.md states both halves. An outbound's egress check refuses the proxy
-    before it reaches the warning, so a lane that fails there logs none. A ``FhirLookup`` with the
-    same proxy has resolved settings, so its start still logs one line while it is isolated."""
+    """docs/SECURITY-LOOSENING.md states it: the egress check logs the WARNING before any of its
+    refusals, so a lane or a lookup it refuses over an unlisted forward proxy is still recorded
+    while it is down. Before, the proxy refusal came first and both logged none."""
     proxy = {"proxy_url": "http://proxy.example.invalid:3128"}
     reg = Registry()
     spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1), **proxy})
@@ -772,7 +774,7 @@ async def test_an_unlisted_forward_proxy_logs_none_for_an_outbound_and_one_for_a
         assert list(runner.degraded_fhir_lookups()) == ["LK"]
         messages = [r.getMessage() for r in caplog.records]
         assert any("forward proxy set with an empty" in m for m in messages)
-        assert _warned(caplog, "outbound 'OB_KEYED'") == 0
+        assert _warned(caplog, "outbound 'OB_KEYED'") == 1
         assert _warned(caplog, "FhirLookup 'LK'") == 1
     finally:
         await runner.stop()

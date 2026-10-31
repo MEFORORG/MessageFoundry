@@ -2488,10 +2488,10 @@ class RegistryRunner:
         single lookup's build reproduces is graph-wide, and raises either way.
 
         ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
-        settings resolved, a lookup whose build then failed included, so an ``env()`` URL carrying a
-        query credential is recorded while its lookup is down (ASVS 14.2.1). A lookup whose
-        settings did not resolve has no URL to read and logs none. A caller whose build check has
-        already warned passes False (vault BACKLOG #2910)."""
+        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
+        recorded while its lookup is down, whether its build or another setting failed (ASVS
+        14.2.1). A lookup whose ``url`` did not resolve has no URL to read and logs none. A caller
+        whose build check has already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -2500,10 +2500,19 @@ class RegistryRunner:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
 
-        def warn(resolved: Mapping[str, Mapping[str, Any]]) -> None:
-            if warn_query_credentials:
-                for name, lookup_settings in resolved.items():
-                    warn_url_query_credentials(f"FhirLookup {name!r}", lookup_settings)
+        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
+            # ``resolved`` is None when a setting failed to resolve. The url alone is then
+            # resolved, so an env() URL is still named while the lookup is down.
+            if resolved is None:
+                try:
+                    resolved = resolve_env_settings(
+                        {"url": specs[name].settings.get("url")},
+                        self._env_values,
+                        connection=fhir_lookup_record_name(name),
+                    )
+                except Exception:  # its failure is recorded and alerted with the lookup's own
+                    return
+            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
 
         def build(
             resolved: Mapping[str, Mapping[str, Any]],
@@ -2524,7 +2533,7 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    # warn() logs it once per lookup; this method may build one three times.
+                    # Logged once per lookup below; this method may build one three times.
                     warn_query_credentials=False,
                 )
 
@@ -2537,7 +2546,8 @@ class RegistryRunner:
                 settled[name] = resolve(name)
             except Exception as exc:
                 errors[name] = exc
-        warn(settled)
+            if warn_query_credentials:
+                warn(name, settled.get(name))
         if not errors:
             try:
                 return build(settled)  # a healthy graph builds once, as it always did
