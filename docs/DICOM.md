@@ -71,7 +71,7 @@ in the order the SCP applies them.
 | `calling_ae_allowlist` and `require_called_ae_title` | when the association request is read | the association is rejected. No object is sent |
 | `max_pdu_size` | for each PDU after the association request, on the length the PDU declares, before its body is read | an A-ABORT, and the association ends |
 | twice the effective `max_object_bytes` | for each object, as its fragments arrive, before pynetdicom holds them | an A-ABORT, and the association ends. No status is sent for that object |
-| `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
+| the effective `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
 
 The 10 second handshake bound is a deadline for the whole handshake. It is the same constant the
 MLLP listener uses, and it is not a setting.
@@ -121,9 +121,11 @@ other PDU may be as long as an association request, 256 KiB. A longer one gets a
 body is not read, so a peer cannot have the SCP read the 4 GiB a PDU can declare.
 
 The SCP then counts each object's fragments as they arrive, before pynetdicom holds them, which it
-does until the object's last fragment arrives. An object over `max_object_bytes` but not past twice
-the effective `max_object_bytes` is held, and then refused with the final status `0xC010`. One past
-twice that gets an A-ABORT instead, so what the SCP holds of one object stays bounded: 32 MiB at the
+does until the object's last fragment arrives. An object over the effective `max_object_bytes` but
+not past twice it is held, and then refused with the final status `0xC010`. The effective cap is the smaller of `max_object_bytes` and the engine's 16 MiB binary ingress
+ceiling, so at the shipped 128 MiB it is 16 MiB, and a 20 MiB object, under the configured value,
+is still over it. One past
+twice the effective cap gets an A-ABORT instead, so what the SCP holds of one object stays bounded: 32 MiB at the
 shipped default, where the effective cap is 16 MiB, plus the one PDU being read. The count starts
 again at each object's last fragment, so a long association of objects under the cap is never
 charged as one. A command set past 64 KiB is ended the same way; a real one is a few hundred bytes.
@@ -204,7 +206,7 @@ The SCP answers at least these statuses:
 | Status | Class | When the SCP answers it |
 |---|---|---|
 | `0x0000` | Success | the object is durably committed to the ingress stage |
-| `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, but not past twice it, where the association is aborted instead; or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
+| `0xC010` | Cannot Understand, final | the object is over the effective `max_object_bytes`, the smaller of `max_object_bytes` and the 16 MiB ingress ceiling, raw or re-encoded, but not past twice that, where the association is aborted instead; or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
 | `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect, including running out of memory |
 | `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; or the engine's loop is not running |
 | `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist`. This is a second check behind the one at accept, which closes such a peer's connection before any association forms, so a sender should not see this status. Each one is logged |

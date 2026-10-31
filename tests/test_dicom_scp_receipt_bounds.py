@@ -128,7 +128,13 @@ def _c_echo_rsp() -> bytes:
     return pdu.encode()
 
 
-def _c_store_command(*, message_id: int = 1, priority: int = 0x0000) -> bytes:
+def _c_store_command(
+    *,
+    message_id: int = 1,
+    priority: int = 0x0000,
+    data_set_type: int = 0x0000,
+    instance_uid: bytes | None = b"1.2.826.0.1.3680043.2.1\x00",
+) -> bytes:
     """A whole C-STORE-RQ command set, implicit VR little endian, that says a data set follows."""
 
     def element(tag: tuple[int, int], value: bytes) -> bytes:
@@ -139,8 +145,8 @@ def _c_store_command(*, message_id: int = 1, priority: int = 0x0000) -> bytes:
         + element((0x0000, 0x0100), struct.pack("<H", 0x0001))
         + element((0x0000, 0x0110), struct.pack("<H", message_id))
         + element((0x0000, 0x0700), struct.pack("<H", priority))
-        + element((0x0000, 0x0800), struct.pack("<H", 0x0000))
-        + element((0x0000, 0x1000), b"1.2.826.0.1.3680043.2.1\x00")
+        + element((0x0000, 0x0800), struct.pack("<H", data_set_type))
+        + (b"" if instance_uid is None else element((0x0000, 0x1000), instance_uid))
     )
     return element((0x0000, 0x0000), struct.pack("<I", len(rest))) + rest
 
@@ -330,6 +336,12 @@ _INVALID_MESSAGES = {
     "a-value-pynetdicom-refuses": _p_data(0x03, _c_store_command(priority=5))
     + _p_data(0x02, b"\x00" * 16),
     "a-pdu-type-ps3-8-does-not-define": b"\x09\x00" + (4).to_bytes(4, "big") + bytes(4),
+    # pynetdicom answers such a request with nothing and a WARNING, and keeps the association, so a
+    # peer could stream them as fast as it can send: three in a row here.
+    "a-stream-of-requests-that-lack-a-field": _p_data(
+        0x03, _c_store_command(data_set_type=0x0101, instance_uid=None)
+    )
+    * 3,
 }
 
 
@@ -449,6 +461,20 @@ async def test_a_command_set_past_its_bound_ends_the_association() -> None:
             assert answer == _ABORT_OVER_LIMIT, answer
         finally:
             sock.close()
+
+
+def test_a_request_with_every_field_it_needs_gets_past_the_tally() -> None:
+    # The CONTROL for the stream of requests that lack a field: the same command set with its
+    # instance UID is a request pynetdicom would serve, and the tally lets it through.
+    whole = dicom_module._ReceiptTally(max_data_set_bytes=1000)
+    command = _c_store_command(data_set_type=0x0101)
+    assert whole.take(_p_data(0x03, command)[6:]) is None
+    lacking = dicom_module._ReceiptTally(max_data_set_bytes=1000)
+    command = _c_store_command(data_set_type=0x0101, instance_uid=None)
+    assert lacking.take(_p_data(0x03, command)[6:]) == (
+        dicom_module._ABORT_INVALID_MESSAGE,
+        "a request that lacks a field it must carry",
+    )
 
 
 def test_the_tally_splits_items_as_pynetdicom_does() -> None:
@@ -666,6 +692,9 @@ def test_the_pynetdicom_seams_the_receipt_bounds_rely_on_are_still_there() -> No
 
     assert _MESSAGE_TYPES[0x0001][0] == "C-STORE-RQ" and _MESSAGE_TYPES[0x0030][0] == "C-ECHO-RQ"
     assert "self.dimse.get_msg(block=False)" in inspect.getsource(Association._run_reactor)
+    # A request that is not valid is answered with nothing, which is why the tally ends it.
+    serve = inspect.getsource(Association._serve_request)
+    assert "if not msg.is_valid_request:" in serve
     assert "cast(BytesIO, self.data_set).write(data[1:])" in decode
     assert "if control_header_byte & 2 != 0:" in decode
     # The replaced send does what the stock one does on success and on failure.

@@ -386,18 +386,28 @@ def _drain_readable(sock: socket.socket) -> None:
 _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 
 
-def _read_command_set(command_set: bytes) -> tuple[int, bool] | None:
-    """A whole command set read as pynetdicom reads it: its ``CommandField``, and whether the message
-    is complete without a data set. ``None`` when pynetdicom would fail on it.
+def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
+    """A whole command set read as pynetdicom reads it: its ``CommandField``, whether the message is
+    complete without a data set, and whether pynetdicom would serve it as a request. ``None`` when
+    pynetdicom would fail on it.
 
     ``DIMSEMessage.decode_msg`` decodes the command set with ``dsutils.decode``, implicit VR little
     endian, looks its ``CommandField`` up in ``_MESSAGE_TYPES``, and compares its
     ``CommandDataSetType`` to 0x0101. Once the message is whole, ``message_to_primitive`` sets each
-    element on the command's primitive, whose setters refuse a value out of range. These are the
-    same steps, on a message built the same way. A raise in the first three happens on the DUL thread
-    there and kills it with a traceback, and one in the last is logged at ERROR with a traceback, so
-    here either is a reason to end the association instead. The primitive's setters log a WARNING of
-    their own before they raise, and that line is left as it is."""
+    element on the command's primitive, whose setters refuse some values, and
+    ``Association._serve_request`` serves it only if ``is_valid_request`` holds. These are the same
+    steps, on a message built the same way. A raise in the first three happens on the DUL thread
+    there and kills it with a traceback, and one in ``message_to_primitive`` is logged at ERROR with
+    a traceback, so here either is a reason to end the association instead. A request that is not
+    valid gets no response there, only a WARNING, and the association goes on, so a peer could
+    stream such requests; the caller ends the association on one.
+
+    Running ``message_to_primitive`` here means pynetdicom's own log lines from it are written here
+    first, and then again when pynetdicom runs it on the whole message. At least these: a setter that
+    refuses a UID logs it at ERROR before it raises; one that finds a UID non-conformant logs a
+    WARNING and does not raise; the Move Originator AE title setter logs an ERROR and does not raise;
+    and ``message_to_primitive`` itself logs a WARNING for an element with more than one value. Some
+    of those lines name the peer's UID value. They are left as they are."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
 
@@ -408,11 +418,12 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool] | None:
         field = int(command.CommandField)
         message.__class__ = _MESSAGE_TYPES[field][1]
         completes = bool(command.CommandDataSetType == 0x0101)
-        message.message_to_primitive()
+        # C_CANCEL has no is_valid_request; it is not a served command, so the caller ends it as one.
+        valid = bool(getattr(message.message_to_primitive(), "is_valid_request", False))
     except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
         logger.debug("A DICOM command set did not decode: %s", safe_exc(exc))
         return None
-    return field, completes
+    return field, completes, valid
 
 
 def _chunked_receipt_on() -> bool:
@@ -444,7 +455,8 @@ class _ReceiptTally:
     fail on, take out of that order, or serve outside the hold ``ready`` puts on a waiting message,
     ends the association instead of reaching it. At least these: an item too short for its length,
     context and control byte, or longer than the PDU holds; a command set that does not decode, or
-    whose values pynetdicom refuses; a command the SCP does not serve; a second command set in one
+    whose values pynetdicom refuses; a command the SCP does not serve; a request that lacks a field
+    pynetdicom needs to serve it, which it would answer with nothing; a second command set in one
     message; a data set fragment before its command set is whole; and anything in a PDU after the
     item that completes a message, which pynetdicom drops unread. pynetdicom would log each at ERROR
     with a traceback, or lose its DUL thread to it, or count it apart from what is counted here. The
@@ -501,9 +513,11 @@ class _ReceiptTally:
         read = _read_command_set(bytes(self.command_set))
         if read is None:
             return _ABORT_INVALID_MESSAGE, "a command set does not decode"
-        field, completes = read
+        field, completes, valid = read
         if field not in _SERVED_COMMANDS:
             return _ABORT_INVALID_MESSAGE, "a command the SCP does not serve"
+        if not valid:
+            return _ABORT_INVALID_MESSAGE, "a request that lacks a field it must carry"
         if completes:
             self._next_message()
         else:
