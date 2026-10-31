@@ -4,11 +4,11 @@
 message into the error text.
 
 The template here names the file after PID-3.1 and PID-5.1, so the rendered name holds a synthetic
-MRN. The runner test checks that it reaches none of at least these: the outbox row's
-``last_error``, the ``connection_lost`` event, the ``connection_error`` alert detail and the
-general log. The FILE case uses
-a real OS error: a directory sits at the target name, so the publish's replace fails, and the OS
-quotes the path, name included. Synthetic data only (CLAUDE.md section 9).
+MRN. The runner test checks that it reaches none of these four: the outbox row's ``last_error``,
+the stored ``connection_lost`` event, the ``connection_error`` alert detail and the general log; it
+forces the failure with a ``PermissionError`` the test raises itself. The first FILE test uses a
+real OS error instead: a directory sits at the target name, so the publish's replace fails, and
+the OS quotes the path, name included. Synthetic data only (CLAUDE.md section 9).
 """
 
 from __future__ import annotations

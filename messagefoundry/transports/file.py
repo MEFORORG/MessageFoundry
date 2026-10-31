@@ -583,8 +583,9 @@ class FileDestination(DestinationConnector):
             self._write_as(name, target, payload)
         except OSError as exc:
             # An OS error quotes the path it failed on, and its last part is this name, rendered
-            # from message fields, or a bumped name-1.ext of it. The error text is stored and sent
-            # on, at least as last_error, so it keeps the type, errno and OS text only
+            # from message fields, or a bumped name-1.ext of it. The error text goes at least to
+            # last_error and to the alert detail a notifier sends off-box, so it keeps the type,
+            # errno and OS text only
             # (BACKLOG #2814). An OSError with no errno keeps its type alone, unless it is one of
             # this module's own, whose fixed message never names a file.
             fixed_message = isinstance(exc, (_Unconfined, _Replaced))
