@@ -2154,7 +2154,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id` |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the `db_lookup` read-only test is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
@@ -2171,8 +2171,14 @@ just runs whatever statement you declare, bound from the row.
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
-**unmarked** so it retries — never marked-and-dropped. A poll error is **logged, not fatal** — a bad
-`poll_statement` or a dropped connection never kills the poller; it retries next interval.
+**unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
+`poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
+`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
+advances the cursor past the failed one, so the failed row is never read again. Where that matters,
+mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
+run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
+kills the poller; it retries next interval.
 
 **Security.** TLS is **on by default**; weakening it (`encrypt=false` / `trust_server_certificate=true`)
 is **refused at construction** through the same cell as the `Database(...)` destination, and the
@@ -2653,10 +2659,15 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
   and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
-  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
-  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  agree on what a delivery takes, no occurrence of a key repeated three or more times differs from
+  both its first and last value, and no occurrence of a repeated key reads two ways itself at any
+  depth below it (vault BACKLOG #3796), the reply is judged as above. Values are compared as JSON
+  values, so `1` differs from `true` and `1.0`. Otherwise the update is a permanent
   refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
-  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  as delivered, as with a reply over the byte bound below. A reply whose repeated occurrences and
+  compared values (the resource type, the judgment, `etag`, `location` and `lastModified`) are
+  too large to judge within the bound the ADR states is refused the same way; only those count
+  toward it. The full rule, with what counts as
   agreement and its costs, is in
   [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
   the 2026-10-17 entry.
@@ -4055,14 +4066,17 @@ text that is not a number are refused when the connection is built, before it st
 is cut down to a whole number.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
-the poll does not fetch is still in the table, unmarked. The next tick takes it. On `DatabasePoll(...)`
+the poll does not fetch is still in the table, unmarked. The next tick takes it. That holds only while
+`poll_statement` does not write, and the read-only test on it misses at least one writing shape; see
+the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
 least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
 the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. Nothing is quarantined,
-errored, or accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never
-read was never received, and there is no disposition to record.
+reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
+never received, and there is no disposition to record. A poll that writes and passes the read-only
+test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
 
 **Why these three default on when the MLLP message pacer ships off.** On a listen socket a rate bound
 has to refuse or stall a sender mid-conversation, and the right number comes from a real feed profile

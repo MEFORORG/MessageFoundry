@@ -5531,7 +5531,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
         # `approval:<id>`, which no connection can be named. A resolution's lost provenance row is
-        # keyed `approval:<id>:resolve` (vault BACKLOG #3438). Since vault BACKLOG #2254 also an
+        # keyed `approval:<id>:resolve` (vault BACKLOG #3438), and a queue listing's lost row
+        # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
