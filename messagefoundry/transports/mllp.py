@@ -1817,9 +1817,12 @@ class MLLPSource(SourceConnector):
         # interfaces (0.0.0.0) by accident, since MLLP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
-        # the runner decoded the body with, and a non-str name reaches frame_reply's fallback as a
-        # str rather than as a TypeError that would leave the reply unsent (BACKLOG #2431).
+        # The rule ingress_guards.ingress_encoding reads too, so a non-str name reaches frame_reply's
+        # fallback as a str rather than as a TypeError that would leave the reply unsent (BACKLOG
+        # #2431). For a literal setting the reply is encoded in the charset the runner decoded the
+        # body with. Not for an env() one: this source is built from the resolved settings, while the
+        # runner decodes from the unresolved ref, so that inbound refuses every body (see
+        # resolved_encoding_problems in config/wiring.py).
         self.encoding: str = declared_encoding(s.get("encoding"))
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
         # The runner builds every other ACK itself.

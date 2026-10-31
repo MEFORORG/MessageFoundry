@@ -5342,8 +5342,9 @@ def inbound_binding_conflicts(
 # --- declared text-encoding validation (BACKLOG #1613) -----------------------
 # A connection's `encoding` names a Python text codec. It is read once when the connector is built
 # and then used PER MESSAGE, so a name Python cannot resolve is invisible at load and at connection
-# start and would first fail on the first real message — where the ingress decode catches only
-# UnicodeDecodeError, so the LookupError escapes uncaught instead of dead-lettering that one message.
+# start and would first fail on the first real message. The ingress decode (`ingress_guards.
+# decode_body`) refuses that message as a `decode` ERROR row since BACKLOG #2431, so it is no longer
+# an escape, but every message on the connection would be refused the same way.
 # Registry.encoding_problems catches it statically; the probe below is how.
 
 
@@ -5445,8 +5446,9 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
             continue  # no value here — reported loud by resolve_env_settings at connector build
         if resolved is None or resolved == "":
             # `env("charset", default=None)` is a DECLARED opt-out, not a bad codec name: an explicit
-            # None means "not declared" and falls back to utf-8, which `ingress_guards.ingress_encoding`
-            # states as its own rule (`str(declared) if declared else "utf-8"`). Refusing it here would
+            # None means "not declared" and falls back to utf-8, the rule `transports.framing.
+            # declared_encoding` states (`str(declared) if declared else "utf-8"`) and the listeners,
+            # their replies and `ingress_guards.ingress_encoding` all read. Refusing it here would
             # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that
             # runs correctly — a per-environment override that this environment declines to set. Empty
             # string falls the same way, being the same falsy "unset" spelling out of a TOML value.
