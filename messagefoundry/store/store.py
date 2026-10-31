@@ -17880,7 +17880,10 @@ class MessageStore:
         replay must still be able to HYDRATE the ``mfdoc:v1:ref:`` handle — releasing the attachment now
         would GC the document out from under that replay (permanent PHI-document loss). That message's
         attachment is released instead by :meth:`purge_dead_letters` when it blanks the last ``dead`` row
-        (the per-MESSAGE analogue of the ``shared_body`` done/cancelled-vs-dead split).
+        (the per-MESSAGE analogue of the ``shared_body`` done/cancelled-vs-dead split). A dead
+        ``Stage.RESPONSE`` token is not such a row: its payload is blanked above, so it stops holding
+        the attachment, and a message whose only remaining dead row is a token has its attachment
+        released in this same pass.
 
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{channel_id -> cutoff}`` map of
         per-connection retention overrides: a message received by a connection in the map is purged at
