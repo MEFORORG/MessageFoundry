@@ -427,6 +427,47 @@ async def test_a_killed_runs_leftover_on_a_server_owner_share_is_freed_before_sp
     assert not any(p.name.startswith("mefor-owner-probe-") for p in data.iterdir())
 
 
+async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_the_run_fit(
+    tmp_path, monkeypatch
+) -> None:
+    """A probe sweep that empties a killed run's leftover but cannot remove its directory counts
+    nothing, yet the space is free. The space check runs again after that sweep whatever it
+    counted, so the run proceeds instead of refusing with `space`."""
+    import shutil
+
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    dead = _abandoned(data, "mefor-backup-")
+    heavy = dead / "archive.tar"
+    _share_owner_for(data, monkeypatch)
+    real_teardown = dr_backup._teardown_staging
+
+    def emptied_not_removed(path: Path) -> str | None:
+        # The seam: the files go, the directory removal is refused, so the sweep counts 0.
+        if Path(path).name == dead.name:
+            heavy.unlink(missing_ok=True)
+            return None
+        return real_teardown(path)
+
+    monkeypatch.setattr(dr_backup, "_teardown_staging", emptied_not_removed)
+
+    class _Usage:
+        def __init__(self, free: int) -> None:
+            self.free = free
+
+    # The leftover's file is what fills the volume: while it exists there is no room.
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _path: _Usage(1 if heavy.exists() else 1 << 40)
+    )
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert not heavy.exists()
+    assert dead.exists()  # emptied, not removed: the sweep counted nothing
+
+
 async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
     tmp_path, monkeypatch
 ) -> None:

@@ -565,19 +565,23 @@ class BackupRunner:
             # On a share whose server sets the owner, or where the early read failed, the early sweep
             # missed what this account's killed run left, and it would refuse every later run until
             # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
-            # removed before this returns, sweep by it, and check once more. No run directory is open
-            # yet, so a refusal still leaves no lock or marker.
+            # removed before this returns, sweep by it, and check once more whatever the sweep
+            # counted: a leftover it emptied but could not remove is not counted, yet frees the
+            # space. No run directory is open yet, so a refusal still leaves no lock or marker.
+            # Residuals, at least: the probe is a write, so on a volume full to the last block
+            # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
+            # live probe before its owner is read, which answers None and skips this sweep.
             probed = await asyncio.to_thread(_probe_owner, staging_root)
             if probed is not None and probed not in swept_by:
                 swept_by.append(probed)
-                if await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None):
-                    shortfall = await asyncio.to_thread(
-                        self._space_shortfall,
-                        staging_root,
-                        dest_dir,
-                        config_only=config_only,
-                        config_dir=config_dir,
-                    )
+                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+                shortfall = await asyncio.to_thread(
+                    self._space_shortfall,
+                    staging_root,
+                    dest_dir,
+                    config_only=config_only,
+                    config_dir=config_dir,
+                )
         if shortfall is not None:
             raise BackupError(
                 "space", f"not enough free space to stage this backup: it {shortfall}"
