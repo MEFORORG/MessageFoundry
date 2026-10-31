@@ -2512,8 +2512,10 @@ class RegistryRunner:
                     )
                 except WiringError:  # names the key, never a value
                     # The lookup's own failure may name another setting, so say this one too.
+                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
+                    # as a secret, and a lookup name may end in a credential word.
                     log.info(
-                        "FhirLookup %r: its url did not resolve, so the URL query-credential "
+                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
                         "check could not read it",
                         name,
                     )
@@ -2585,9 +2587,10 @@ class RegistryRunner:
         errors = {name: errors[name] for name in specs if name in errors}  # in graph order
         failed = {name: safe_exc(err) for name, err in errors.items()}
         survivors = {name: s for name, s in settled.items() if name not in errors}
-        executor = build(survivors, failed)
+        # Before the final build, so a graph-wide failure there still leaves each lookup's own
+        # failure for the start's backstop to log.
         isolated.update(errors)
-        return executor
+        return build(survivors, failed)
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`

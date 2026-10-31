@@ -535,7 +535,7 @@ _KEYED = "https://p.example.invalid/x?key=PLACEHOLDER&v={v}"
 _LOOKUP_URL = "https://fhir.example.invalid/R4?api_key=PLACEHOLDER"
 
 
-_UNREAD = "its url did not resolve, so the URL query-credential check could not read it"
+_UNREAD = "did not resolve, so the URL query-credential check could not read it"
 
 
 def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -739,8 +739,8 @@ async def test_a_failed_fhir_lookup_keeps_one_warning_and_each_survivor_one_at_s
             assert _warned(caplog, f"FhirLookup {name!r}") == int(warn), name
         assert _warned(caplog, "FhirLookup 'LK_UNSET'") == 0
         # The INFO line says why LK_UNSET has no WARNING, and only for it.
-        unread = [m for m in _messages(caplog) if "its url did not resolve" in m]
-        assert unread == ["FhirLookup 'LK_UNSET': " + _UNREAD] * int(warn)
+        unread = [m for m in _messages(caplog) if _UNREAD in m]
+        assert unread == ["the url of FhirLookup 'LK_UNSET' " + _UNREAD] * int(warn)
     finally:
         await runner.stop()
 
