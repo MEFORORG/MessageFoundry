@@ -102,6 +102,8 @@ _SWITCH_LIST_LIMIT: Final = 200
 #: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
 #: longer window, which counts more strictly, must not also hold a second attack back for as long.
 _REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
+#: The least time between two log lines for a failed sink call.
+_SINK_FAILURE_LOG_SECONDS: Final = 60.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -200,7 +202,7 @@ class _Burst:
 
     signal: str
     prefix: str
-    sentence: str  # formatted with {total} and {window}
+    sentence: str  # formatted with {total}, {window} and {quiet}, the refusal quiet period
     by_address: bool = False
 
 
@@ -225,7 +227,7 @@ _REFUSED = _Burst(
     PEER_REFUSED_BURST,
     "inbound",
     "{total} connections refused by this inbound's source allowlist or connection caps "
-    "within {window}; once raised, it is quiet for {quiet} from now",
+    "within {window}; this inbound's refusals are not counted for {quiet} after this alert",
 )
 
 
@@ -300,6 +302,8 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
         self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
+        #: When a failed sink call may next be logged; see :meth:`_notify`.
+        self._sink_failure_log_after = float("-inf")
         self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
@@ -394,9 +398,10 @@ class SecuritySignalDetector:
         return until is not None and until > (self._clock() if now is None else now)
 
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
-        """Count ``weight`` for ``key``; True when that raised an alert the sink took. False when
-        the sink refused it, so a caller that goes quiet after a raise does not go quiet on an
-        alert nobody received."""
+        """Count ``weight`` for ``key``; True when that raised an alert and the sink call
+        returned. False when the sink call raised, so a caller that goes quiet after a raise does
+        not go quiet on that alert. A sink that takes the alert and loses it later, as the
+        notifier does on a full queue or a store fault, still returns, so the caller goes quiet."""
         key = key or "unknown"
         now = self._clock()
         total = window.hit(key, now, weight)
@@ -440,7 +445,7 @@ class SecuritySignalDetector:
         )
 
     def release(self) -> None:
-        """Resolve the ``posture_loosened`` this detector raised, as its process stops. For a
+        """Resolve the ``posture_loosened`` this detector raised, on a clean stop. For a
         process whose identity changes on every start, an unpinned cluster node: its next start
         reports under a new subject, so nothing could resolve the old one later."""
         if self._posture_raised is not None:
@@ -456,15 +461,24 @@ class SecuritySignalDetector:
             lambda: self._sink.security_signal(subject, signal=signal, count=count, detail=detail),
         )
 
-    @staticmethod
-    def _notify(event: str, call: Callable[[], None]) -> bool:
-        """Run one sink call; False, logged, when the sink raised."""
+    def _notify(self, event: str, call: Callable[[], None]) -> bool:
+        """Run one sink call; False when the sink raised. The failure is logged at most once per
+        :data:`_SINK_FAILURE_LOG_SECONDS`: a sink that keeps raising no longer starts the refusal
+        quiet period, so a peer refused at no cost to itself could otherwise write a line per
+        refusal."""
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            log.warning(
-                "security-signal alert %s could not be raised: %s", event, type(exc).__name__
-            )
+            now = self._clock()
+            if now >= self._sink_failure_log_after:
+                self._sink_failure_log_after = now + _SINK_FAILURE_LOG_SECONDS
+                log.warning(
+                    "security-signal alert %s could not be raised: %s; further failures are "
+                    "logged at most once every %gs",
+                    event,
+                    type(exc).__name__,
+                    _SINK_FAILURE_LOG_SECONDS,
+                )
             return False
         return True
 
@@ -481,7 +495,8 @@ def install_security_signals(
     observers while it counts refusals; returns the function that removes it.
 
     ``resolve_on_stop`` is for a process whose ``identity`` changes on every start, an unpinned
-    cluster node: removing the detector then resolves the ``posture_loosened`` it raised, as
+    cluster node: removing the detector, on a clean stop, resolves the ``posture_loosened`` it
+    raised (after a crash nothing does), as
     :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts. The
     removal must run on ``loop``'s thread, before the store closes.
 

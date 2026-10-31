@@ -620,13 +620,31 @@ def test_a_refusal_alert_the_sink_refused_starts_no_quiet_period() -> None:
     assert det.refusal_quiet("IB_ACME_ADT")
 
 
+def test_a_sink_that_keeps_failing_is_logged_once_a_minute_under_a_refusal_flood(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _Down(_Sink):
+        def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
+            raise RuntimeError("sink down")
+
+    clock = _Clock()
+    det = SecuritySignalDetector(_Down(), _thresholds(peer_refusals=1), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        for _ in range(500):
+            det.observe_refusal("IB_ACME_ADT")
+        clock.now += 61  # the control: a later failure is logged again
+        det.observe_refusal("IB_ACME_ADT")
+    failed = [r for r in caplog.records if "could not be raised" in r.getMessage()]
+    assert len(failed) == 2
+
+
 def test_the_refusal_sentence_states_the_quiet_period() -> None:
     det, sink, _ = _detector(peer_refusals=1, window_seconds=3600)
     det.observe_refusal("IB_ACME_ADT")
-    assert "quiet for 300 s" in sink.signals[0][3]
+    assert "not counted for 300 s" in sink.signals[0][3]
     det, sink, _ = _detector(peer_refusals=1, window_seconds=60)
     det.observe_refusal("IB_ACME_ADT")
-    assert "quiet for 60 s" in sink.signals[0][3]
+    assert "not counted for 60 s" in sink.signals[0][3]
 
 
 def test_the_refusal_subject_is_spelled_as_an_inbound_record_name() -> None:

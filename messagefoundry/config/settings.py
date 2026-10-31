@@ -10002,7 +10002,8 @@ def security_loosenings(
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)).
 
     **The security-signal layer (vault BACKLOG #2613).** ``[alerts].security_signals = false``, or
-    with it on a count at ``0`` or above its default, or a window below its default
+    with it on a count at ``0`` or above its default, or a window below its default while
+    some count is above ``0``
     (:func:`_security_signal_loosenings`).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these

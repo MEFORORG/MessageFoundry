@@ -834,7 +834,9 @@ Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_s
   its loosenings raises `posture_loosened` naming this one.
 - **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
   does not see refused connections, and with the layer off nothing counts them, so a site that
-  turns the layer off accepts losing that alert.
+  turns the layer off accepts losing that alert. With the layer on, a SIEM on the audit stream is
+  no reason to zero or raise `security_peer_refusals`, since that detector covers what the SIEM
+  cannot see.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
