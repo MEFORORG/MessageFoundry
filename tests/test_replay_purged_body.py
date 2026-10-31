@@ -43,6 +43,7 @@ import pytest
 from messagefoundry.store import MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStatus
+from tests._store_audit import no_operator_audit
 
 DAY = 86_400.0
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -140,13 +141,13 @@ async def test_replay_refuses_an_erased_delivered_body_and_keeps_the_disposition
     assert (await _row(store, kept_row))["payload"] != ""
 
     # Purged arm: nothing requeued, nothing changed.
-    assert await store.replay(purged_mid, now=60 * DAY) == 0
+    assert await store.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
     assert (await _row(store, purged_row))["status"] == OutboxStatus.DONE.value
     assert await _status(store, purged_mid) == MessageStatus.PROCESSED.value
     assert await _has_delivery_key(store, purged_row) is True
 
     # Unpurged control: replay still works exactly as before.
-    assert await store.replay(kept_mid, now=60 * DAY) == 1
+    assert await store.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
     assert (await _row(store, kept_row))["status"] == OutboxStatus.PENDING.value
     assert await _status(store, kept_mid) == MessageStatus.ROUTED.value
     assert await _has_delivery_key(store, kept_row) is False  # re-send drops its own ledger entry
@@ -161,7 +162,7 @@ async def test_replay_logs_no_replayed_event_for_a_fully_erased_message(
     mid, _ = await _delivered(store, now=0.0, body=BODY, control="CID-EVT")
     await store.purge_message_bodies(older_than=10 * DAY, now=50 * DAY)
 
-    assert await store.replay(mid, now=60 * DAY) == 0
+    assert await store.replay(mid, now=60 * DAY, audit=no_operator_audit) == 0
 
     cur = await store._db.execute(
         "SELECT COUNT(*) AS n FROM message_events WHERE message_id=? AND event='replayed'", (mid,)
@@ -201,7 +202,7 @@ async def test_replay_of_a_mixed_message_requeues_the_kept_row_and_skips_the_era
     assert (await _row(store, rows["d_old"]))["payload"] == ""
     assert (await _row(store, rows["d_new"]))["payload"] != ""
 
-    requeued = await store.replay(mid, now=110 * DAY)
+    requeued = await store.replay(mid, now=110 * DAY, audit=no_operator_audit)
 
     assert requeued == 1  # the kept row only — no exception, no all-or-nothing abort
     assert (await _row(store, rows["d_old"]))["status"] == OutboxStatus.DEAD.value
@@ -222,8 +223,8 @@ async def test_replay_resend_keeps_the_delivery_key_of_the_row_it_did_not_requeu
     kept_mid, kept_row = await _delivered(store, now=100 * DAY, body=BODY, control="CID-DK-K")
     await store.purge_message_bodies(older_than=10 * DAY, now=50 * DAY)
 
-    await store.replay(purged_mid, now=60 * DAY)
-    await store.replay(kept_mid, now=60 * DAY)
+    await store.replay(purged_mid, now=60 * DAY, audit=no_operator_audit)
+    await store.replay(kept_mid, now=60 * DAY, audit=no_operator_audit)
 
     assert await _has_delivery_key(store, purged_row) is True  # untouched
     assert await _has_delivery_key(store, kept_row) is False  # deliberately cleared for the re-send
@@ -249,7 +250,7 @@ async def test_replay_dead_skips_erased_rows_and_leaves_their_message_in_error(
     assert await _status(store, purged_mid) == MessageStatus.ERROR.value
     assert await _status(store, kept_mid) == MessageStatus.ERROR.value
 
-    requeued = await store.replay_dead(now=110 * DAY)
+    requeued = await store.replay_dead(now=110 * DAY, audit=no_operator_audit)
 
     assert requeued == 1  # the control only
     assert (await _row(store, purged_row))["status"] == OutboxStatus.DEAD.value
@@ -264,7 +265,7 @@ async def test_replay_dead_returns_zero_when_every_dead_row_is_erased(store: Mes
     mid, row_id = await _dead(store, now=0.0, body=BODY, control="CID-DL-ALL")
     await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY)
 
-    assert await store.replay_dead(now=60 * DAY) == 0
+    assert await store.replay_dead(now=60 * DAY, audit=no_operator_audit) == 0
     assert (await _row(store, row_id))["status"] == OutboxStatus.DEAD.value
     assert await _status(store, mid) == MessageStatus.ERROR.value
     cur = await store._db.execute(
@@ -318,7 +319,7 @@ async def test_a_store_once_row_still_replays_until_it_is_purged(
         assert state["payload"] != "" and state["body_ref"] is not None  # the sealed reference
 
     # Unpurged: both store-once rows are still replayable.
-    assert await store.replay(mid, now=1.0) == 2
+    assert await store.replay(mid, now=1.0, audit=no_operator_audit) == 2
     for outbox_id in rows.values():
         assert (await _row(store, outbox_id))["status"] == OutboxStatus.PENDING.value
 
@@ -330,7 +331,7 @@ async def test_a_store_once_row_still_replays_until_it_is_purged(
     for outbox_id in rows.values():
         state = await _row(store, outbox_id)
         assert state["payload"] == "" and state["body_ref"] is None  # ref released by the purge
-    assert await store.replay(mid, now=60 * DAY) == 0
+    assert await store.replay(mid, now=60 * DAY, audit=no_operator_audit) == 0
 
 
 # --- encryption: the discriminator survives a keyed store ---------------------
@@ -358,8 +359,8 @@ async def test_encrypted_store_keeps_a_legitimately_empty_body_replayable(
 
     # Both are erased now, so both are refused. The discriminator is proven by the pre-purge state
     # above: before the purge the empty body was ciphertext and therefore replayable.
-    assert await enc_store.replay(empty_mid, now=60 * DAY) == 0
-    assert await enc_store.replay(purged_mid, now=60 * DAY) == 0
+    assert await enc_store.replay(empty_mid, now=60 * DAY, audit=no_operator_audit) == 0
+    assert await enc_store.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
 
 
 async def test_encrypted_store_replays_an_empty_body_that_retention_has_not_touched(
@@ -370,7 +371,7 @@ async def test_encrypted_store_replays_an_empty_body_that_retention_has_not_touc
     empty body — and on a keyed store it holds for replay too, not only for the first delivery."""
     empty_mid, empty_row = await _delivered(enc_store, now=0.0, body="", control="CID-EMPTY-OK")
 
-    assert await enc_store.replay(empty_mid, now=1.0) == 1
+    assert await enc_store.replay(empty_mid, now=1.0, audit=no_operator_audit) == 1
     assert (await _row(enc_store, empty_row))["status"] == OutboxStatus.PENDING.value
     assert await _status(enc_store, empty_mid) == MessageStatus.ROUTED.value
 
@@ -403,7 +404,7 @@ async def test_purge_concurrent_with_replay_yields_one_of_the_two_serial_orders(
 
     purged, requeued = await asyncio.gather(
         store.purge_message_bodies(older_than=10 * DAY, now=50 * DAY),
-        store.replay(mid, now=60 * DAY),
+        store.replay(mid, now=60 * DAY, audit=no_operator_audit),
     )
 
     state = await _row(store, outbox_id)
@@ -449,9 +450,11 @@ class TestPostgresParity:
         kept_mid, kept_row = await _delivered(pg, now=100 * DAY, body=BODY, control="PG-K")
         assert await pg.purge_message_bodies(older_than=10 * DAY, now=50 * DAY) == 1
 
-        assert await pg.replay(purged_mid, now=60 * DAY) == 0
+        assert await pg.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
         assert (await pg.get_message(purged_mid))["status"] == MessageStatus.PROCESSED.value
-        assert await pg.replay(kept_mid, now=60 * DAY) == 1  # unpurged control
+        assert (
+            await pg.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
+        )  # unpurged control
         assert (await pg.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value
         assert purged_row and kept_row  # ids are bound for symmetry with the SQLite arm
 
@@ -462,7 +465,7 @@ class TestPostgresParity:
         kept_mid, _ = await _dead(pg, now=100 * DAY, body=BODY, control="PG-DL-K")
         assert await pg.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
 
-        assert await pg.replay_dead(now=110 * DAY) == 1
+        assert await pg.replay_dead(now=110 * DAY, audit=no_operator_audit) == 1
         assert (await pg.get_message(purged_mid))["status"] == MessageStatus.ERROR.value
         assert (await pg.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value
 
@@ -495,9 +498,11 @@ class TestSqlServerParity:
         kept_mid, _ = await _delivered(ss, now=100 * DAY, body=BODY, control="SS-K")
         assert await ss.purge_message_bodies(older_than=10 * DAY, now=50 * DAY) == 1
 
-        assert await ss.replay(purged_mid, now=60 * DAY) == 0
+        assert await ss.replay(purged_mid, now=60 * DAY, audit=no_operator_audit) == 0
         assert (await ss.get_message(purged_mid))["status"] == MessageStatus.PROCESSED.value
-        assert await ss.replay(kept_mid, now=60 * DAY) == 1  # unpurged control
+        assert (
+            await ss.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
+        )  # unpurged control
         assert (await ss.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value
 
     async def test_replay_dead_skips_erased_rows_and_leaves_their_message_in_error(
@@ -507,6 +512,6 @@ class TestSqlServerParity:
         kept_mid, _ = await _dead(ss, now=100 * DAY, body=BODY, control="SS-DL-K")
         assert await ss.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
 
-        assert await ss.replay_dead(now=110 * DAY) == 1
+        assert await ss.replay_dead(now=110 * DAY, audit=no_operator_audit) == 1
         assert (await ss.get_message(purged_mid))["status"] == MessageStatus.ERROR.value
         assert (await ss.get_message(kept_mid))["status"] == MessageStatus.ROUTED.value

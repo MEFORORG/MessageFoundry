@@ -1069,14 +1069,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
-    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
+    # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
+    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
+    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
+    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
     async def replay(
         self,
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None: ...
@@ -1090,7 +1093,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome: ...
 
@@ -1101,7 +1104,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome: ...
 
@@ -1111,7 +1114,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def cancel_queued(

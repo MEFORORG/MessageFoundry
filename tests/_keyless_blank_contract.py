@@ -29,6 +29,7 @@ from messagefoundry.store.crypto import MARKER_PREFIX
 from messagefoundry.store.queue_tag import QUEUE_TAG_SELECT, open_queue_cell
 from tests._erased_reply_contract import status_of
 from tests._queue_tag_contract import RawFetch, RawSql
+from tests._store_audit import no_operator_audit
 
 OpenKeyed = Callable[[], Awaitable[Any]]
 
@@ -103,7 +104,7 @@ async def assert_first_keyed_open_seals_a_live_empty_row(
         # A terminal blank stays blank, and both refuse it as an erasure.
         for mid in (done, dead):
             assert (await row_of(fetch, mid))["payload"] == ""
-            assert await keyed.replay(mid) == 0
+            assert await keyed.replay(mid, audit=no_operator_audit) == 0
 
         # Its disposition: still owed work, delivered as an empty body, finalized PROCESSED.
         item = await keyed.claim_next_fifo("OB_KB_LIVE")
