@@ -17,8 +17,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A generic DATABASE file keyword is refused on Windows when it leads to another host.** An
   `SSLCA`, `SSLCAPATH`, `SSLCERT` or `SSLKEY` path on a mapped network drive, or behind a link, a
   chain of links or a `subst` drive that ends at a share, now fails the build as a share spelling
-  already did. So does a path the check cannot read through. A CA path that leads to another host
-  is refused with TLS off too. The Generic ODBC section of [CONNECTIONS.md](docs/CONNECTIONS.md)
+  already did. So does a path the check cannot read through, judged at its trimmed spelling: a
+  padded spelling it could not read through is still read when the trimmed one clears, as before.
+  A CA path that leads to another host is refused with TLS off too. The Generic ODBC section of [CONNECTIONS.md](docs/CONNECTIONS.md)
   says what is still left to the driver with TLS off, and what is still not caught.
   (`BACKLOG #2705`)
 

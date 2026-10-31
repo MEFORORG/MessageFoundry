@@ -1751,8 +1751,11 @@ A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local
 letter, or one leading separator. A path that starts with two separators, or with a device
 prefix, is refused, because it can name another host. On Windows, so is a path that leads to
 another host: a mapped network drive, or a link, a chain of links or a `subst` drive that ends
-at a share. So is a path the check cannot read through. The check reads links without following
-them and asks a drive's type rather than opening it. A missing folder, or a drive letter with no
+at a share. So is a path the check cannot read through, judged at its trimmed spelling. That
+leaves at least one exception: a padded spelling the check could not read through, such as
+`' C:\certs\ca.pem'`, would still be read and checked when its trimmed spelling clears, as
+before this check existed. The check reads links without following them and asks a drive's type
+rather than opening it. A missing folder, or a drive letter with no
 volume on this host, is left to the driver. These refusals hold in every SSL mode: an `SSLCA`
 or `SSLCAPATH` that leads to another host is refused even with TLS off, as under
 `SSLmode=disable`, although the driver then reads no CA. There is at least one exception: under
