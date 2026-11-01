@@ -73,6 +73,10 @@ _USER = "synth-user"
 #: Two destinations on one body put it in ``shared_body`` on SQLite and inline on the server backends.
 _SHARED = ("OB_SHARED_A", "OB_SHARED_B")
 _QUEUED, _DEAD, _REPLIED = "OB_QUEUED", "OB_DEAD", "OB_REPLIED"
+#: A kind the store accepts: connection_event kinds are a closed vocabulary
+#: (messagefoundry.connection_events.CONNECTION_EVENT_KIND_ORDER), refused outside it. An MLLP
+#: listener records this one for a bad frame, so it carries a reason like the one written here.
+_EVENT_KIND = "framing_error"
 
 #: The cells every open decrypts to warm a cache, through the strict cipher. A plaintext value left in
 #: one fails a keyed open itself, and a sealed one fails a keyless open.
@@ -208,7 +212,7 @@ async def write_every_cell(store: Any) -> Written:
         connection=_CHANNEL,
         transport="mllp",
         direction="inbound",
-        kind="error",
+        kind=_EVENT_KIND,
         reason=plain(("connection_event", "reason")),
     )
     await store.upsert_alert_instance(
@@ -285,7 +289,9 @@ async def _connection_reason(store: Any) -> Any:
     events = await store.list_connection_events(connection=_CHANNEL, allowed_channels=None)
     # Selected by the written row's own identity rather than by list order, so a refusal some other
     # reader records cannot stand in for it.
-    ours = [e for e in events if (e.transport, e.direction, e.kind) == ("mllp", "inbound", "error")]
+    ours = [
+        e for e in events if (e.transport, e.direction, e.kind) == ("mllp", "inbound", _EVENT_KIND)
+    ]
     if not ours:
         raise LookupError(f"no connection event for {_CHANNEL}")
     return ours[0].reason
