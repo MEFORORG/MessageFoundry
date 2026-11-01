@@ -763,9 +763,9 @@ and the attestation, where the line was the only record of the attestation.
 **CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
 time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
 line. A guard handed a context that skips time validity keeps it, because that context's CRL is no
-real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: since §13,
-MLLP and the DICOM SCU hand the guard no context there, so such a hop crosses on its attestation
-alone. The over-statement stands there only in part, since a certificate the CRL lists is still
+real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: at least
+MLLP and the DICOM SCU (since §13) and the REST, SOAP, FHIR and FTPS hops (§4.3 above) hand the
+guard no context there, so such a hop crosses on its attestation alone. The over-statement stands there only in part, since a certificate the CRL lists is still
 refused at the handshake. This correction changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
@@ -1506,7 +1506,8 @@ on first deployment, with no attestation.
   §4.3's sentence that the MLLP hop "is not changed here" carries the pointer instead. And the reason §4.3's *One audit line still over-states* gives
   for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
   `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
-  so the fix would not silence it. This amendment does not revisit that fix.
+  so the fix would not silence it. This amendment does not revisit that fix. *(Note 2026-10-31:
+  §4.3's CORRECTED 2026-10-30 paragraph records it applied since, as `crl_is_a_check`.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
