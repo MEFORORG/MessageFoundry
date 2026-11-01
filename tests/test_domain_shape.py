@@ -299,12 +299,15 @@ def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -
     assert _external._is_ipv4(value) is is_canonical_ipv4(value)
 
 
-@pytest.mark.parametrize("entry", ["Korp.example", " korp.example", "korp.example "])
+@pytest.mark.parametrize(
+    "entry",
+    [chr(0x212A) + "orp.example", chr(0xA0) + "korp.example", "korp.example" + chr(0x2003)],
+)
 def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
     """BACKLOG #3765, the class of item 9 on the console's side. ``str.lower()`` turned the Kelvin
     sign into an ASCII ``k`` and a plain ``strip()`` removed a non-ASCII space, so such an entry,
     which settings would refuse or strip at load, covered an ASCII host if it reached the console
-    another way. Control: an ASCII entry's padding and capitals still go.
+    another way.
 
     Mutation: put ``domain.strip().lower()`` back in ``_matches_domain``. Red: every case.
     Mutation: ``_entry_key`` lower-cases every entry. Red: the first case.
@@ -312,11 +315,21 @@ def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
     url = "https://korp.example/"
     assert is_external(url, (entry,))
     assert not is_allowlisted(url, (entry,))
-    assert not is_external(url, (" KORP.example\t",))
+
+
+def test_an_ascii_entry_still_loses_its_padding_and_capitals() -> None:
+    # The control for the test above.
+    assert not is_external("https://korp.example/", (" KORP.example\t",))
 
 
 @pytest.mark.parametrize(
-    "value", [" Corp.Example\t", "Korp.example", " corp.example", "MÜLLER.example"]
+    "value",
+    [
+        " Corp.Example\t",
+        chr(0x212A) + "orp.example",
+        chr(0xA0) + "corp.example",
+        "M" + chr(0xDC) + "LLER.example",
+    ],
 )
 def test_the_console_and_the_engine_agree_on_the_compare_form(value: str) -> None:
     # The console's _entry_key is a copy of upn_suffix_key, kept for the reason _is_ipv4's docstring
