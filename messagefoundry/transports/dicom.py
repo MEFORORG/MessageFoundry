@@ -1707,6 +1707,8 @@ class DicomScpSource(SourceConnector):
         The calling AE title is not part of this: it is not known until the association request is
         read. ``calling_ae_allowlist`` is applied at that point, by pynetdicom, from
         ``require_calling_aet``, and an unlisted title is rejected before any object is sent.
+
+        Every refusal, logged or not, also reaches :func:`notify_refusal` (vault BACKLOG #2613).
         """
         reason = _NOT_IN_ALLOWLIST
         try:
@@ -1714,6 +1716,7 @@ class DicomScpSource(SourceConnector):
                 return True
         except Exception as exc:  # noqa: BLE001 - on the accept loop: fail closed, never raise
             reason = f"the source_ip_allowlist check failed ({safe_exc(exc)})"
+        notify_refusal(self._refusal_name)
         self._log_refused_peer(_address_host(client_address), "a connection", reason)
         return False
 
@@ -1737,10 +1740,7 @@ class DicomScpSource(SourceConnector):
         refused at accept never holds a connection, so it has no episode to end. The window throttle is
         :class:`~messagefoundry.transports.admission.RefusalLog`, which the socket listeners use for
         their allowlist refusals too (vault BACKLOG #2606).
-
-        Every refusal, logged or not, also reaches :func:`notify_refusal` (vault BACKLOG #2613).
         """
-        notify_refusal(self._refusal_name)
         self._throttled_warning(
             self._refusal_log, peer_ip, f"refused {what} from {peer_ip}", reason, "refused"
         )

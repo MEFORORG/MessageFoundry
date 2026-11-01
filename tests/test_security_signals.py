@@ -879,12 +879,24 @@ def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
         Source(
             type=ConnectorType.DIMSE,
             name="IB_PACS",
-            settings={"ae_title": "MEFOR_SCP", "host": "127.0.0.1", "port": 0},
+            settings={
+                "ae_title": "MEFOR_SCP",
+                "host": "127.0.0.1",
+                "port": 0,
+                "source_ip_allowlist": ["10.0.0.0/8"],
+            },
         )
     )
     add_refusal_observer(seen.append)
     try:
-        scp._log_refused_peer("203.0.113.9", "a connection", "peer IP not in source_ip_allowlist")
+        assert scp._admit_connection(("203.0.113.9", 40000)) is False
+        # The controls: an admitted peer, and a refusal past admission that is neither an
+        # allowlist nor a cap refusal (a first PDU that is not an association request), are not
+        # counted.
+        assert scp._admit_connection(("10.1.1.1", 40000)) is True
+        scp._log_refused_peer(
+            "203.0.113.9", "a connection", "the first PDU is not an A-ASSOCIATE-RQ"
+        )
     finally:
         remove_refusal_observer(seen.append)
     assert seen == ["IB_PACS"]
