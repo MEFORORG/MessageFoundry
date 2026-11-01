@@ -525,28 +525,67 @@ async def test_a_stray_byte_behind_a_request_does_not_delay_the_association_chec
             for _ in range(40):
                 held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
 
-            # Every peer over the limit is answered first, so what is counted below is the settled
-            # state, not one read while the last connections still sat in the listen backlog.
-            rejected = [await asyncio.to_thread(_closed_within, sock, 0.2) for sock in held]
-            assert rejected.count(True) >= 38, "a peer over max_associations was not closed at once"
+            def only_the_two_accepted_are_left() -> bool:
+                return len(scp._server.active_associations) <= 2
 
-            def counts() -> tuple[int, int]:
-                added = len(_threads_outside_the_test()) - baseline
-                return len(scp._server.active_associations), added
+            await _until(only_the_two_accepted_are_left)  # well inside the 30 s deadline
+            # Every peer over the limit is answered before the threads are counted, so the count is
+            # the settled state, not one read while the last connections sat in the listen backlog.
+            rejected = [await asyncio.to_thread(_closed_within, sock, 0.2) for sock in held]
+            assert rejected.count(True) >= 38, f"{rejected.count(True)} of 40 peers closed at once"
 
             # Awaited, not read once: a rejected peer's own connection thread outlives the close
             # its peer reads by a moment. Measured on Windows: a lone process_request_thread as a
             # fifth thread. The wait is well inside the 30 s deadline a delayed check would take.
+            last: list[tuple[int, int]] = []
+
+            def settled() -> bool:
+                reading = (
+                    len(scp._server.active_associations),
+                    len(_threads_outside_the_test()) - baseline,
+                )
+                last[:] = [reading]
+                return reading[0] <= 2 and reading[1] <= 4
+
             try:
-                await _until(lambda: counts()[0] <= 2 and counts()[1] <= 4)
+                await _until(settled)
             except AssertionError:
-                associations, added = counts()
+                associations, added = last[0]
                 raise AssertionError(
                     f"{associations} associations and {added} threads for two associations"
                 ) from None
         finally:
             for sock in held:
                 sock.close()
+
+
+#: The most a shrunk send buffer may read back as. Linux doubles the 4096 asked for; Windows does not.
+_SMALL_SEND_BUFFER_CEILING = 65536
+
+
+def _shrink_accepted_send_buffers(scp: Any, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Make the send buffer of each connection ``scp`` accepts from now on small, and return the
+    list each one's size, as read back, is appended to.
+
+    A test that floods requests at a peer that never reads relies on the SCP's sends blocking. On
+    Linux loopback the stock send buffer grows to megabytes, and the SCP answers each C-ECHO slower
+    than the peer sends them, so the SCP could go on answering for longer than such a test waits
+    with no send ever blocked. Measured as a red on ubuntu-latest."""
+    accept = scp._server.get_request
+    shrunk: list[int] = []
+
+    def accept_with_a_small_send_buffer() -> tuple[socket.socket, Any]:
+        conn, address = accept()
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            shrunk.append(conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
+        except BaseException:
+            conn.close()
+            raise
+        return conn, address
+
+    monkeypatch.setattr(scp._server, "get_request", accept_with_a_small_send_buffer)
+    return shrunk
 
 
 def _c_echo_rq(message_id: int) -> bytes:
@@ -575,24 +614,9 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
     request = await asyncio.to_thread(_a_real_association_request)
     settings: dict[str, object] = {"max_associations": 2, "timeout_seconds": 1.0}
     async with _running_scp(settings) as scp:
-        # The SCP's own send buffer is made small too. On Linux loopback it grows to megabytes, and
-        # the SCP answers each C-ECHO slower than the peer sends them, so with the stock buffer the
-        # SCP could go on answering for longer than this test waits without a send ever blocking:
-        # measured as a red on ubuntu-latest, where the association outlived the 15 s wait below.
-        accept = scp._server.get_request
-        shrunk: list[int] = []
-
-        def accept_with_a_small_send_buffer() -> tuple[socket.socket, Any]:
-            conn, address = accept()
-            try:
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-            except BaseException:
-                conn.close()
-                raise
-            shrunk.append(conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
-            return conn, address
-
-        monkeypatch.setattr(scp._server, "get_request", accept_with_a_small_send_buffer)
+        # A red on ubuntu-latest, where the association outlived the 15 s wait below: see
+        # _shrink_accepted_send_buffers.
+        shrunk = _shrink_accepted_send_buffers(scp, monkeypatch)
         baseline = await _thread_baseline()
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -601,7 +625,7 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
         try:
             sock.sendall(request)
             assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
-            assert len(shrunk) == 1, "the SCP did not accept through the patched get_request"
+            assert len(shrunk) == 1 and shrunk[0] <= _SMALL_SEND_BUFFER_CEILING, shrunk
 
             def flood() -> None:
                 # Far more responses than the two socket buffers hold, and none of them read.

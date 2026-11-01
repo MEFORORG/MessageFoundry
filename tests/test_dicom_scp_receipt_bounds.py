@@ -33,11 +33,13 @@ from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import _SCP_AE, _build_scp, _scu_cstore  # noqa: E402
 from tests.test_dicom_scp_admission import _LOG, _running_scp, _until, _warnings  # noqa: E402
 from tests.test_dicom_scp_pre_association import (  # noqa: E402
+    _SMALL_SEND_BUFFER_CEILING,
     _a_held_association,
     _a_real_association_request,
     _c_echo_rq,
     _closed_within,
     _rj,
+    _shrink_accepted_send_buffers,
     _stall,
     _thread_baseline,
     _threads_outside_the_test,
@@ -345,6 +347,16 @@ _INVALID_MESSAGES = {
 }
 
 
+#: The pynetdicom loggers that write a traceback, or one of the lines the quiet-end test looks for.
+_PYNETDICOM_LOGGERS = (
+    "pynetdicom",
+    "pynetdicom.acse",
+    "pynetdicom.association",
+    "pynetdicom.dimse",
+    "pynetdicom.dul",
+)
+
+
 @pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 @pytest.mark.parametrize("sends", list(_INVALID_MESSAGES.values()), ids=list(_INVALID_MESSAGES))
 async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
@@ -359,9 +371,11 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
         try:
             # WARNING: pynetdicom's 'Received unexpected ... service message' line is one.
             with caplog.at_level(logging.WARNING):
-                # A planted pynetdicom line, so the absence lists below are known to read a capture
-                # pynetdicom's records reach. It names none of the strings they look for.
-                logging.getLogger("pynetdicom").warning("planted capture control")
+                # A planted line on each pynetdicom logger that writes what the absence lists below
+                # look for, so they are known to read a capture those records reach. It names none
+                # of the strings they look for.
+                for name in _PYNETDICOM_LOGGERS:
+                    logging.getLogger(name).warning("planted capture control")
                 sock.sendall(sends)
                 answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
                 assert answer == _ABORT_INVALID, answer
@@ -371,12 +385,8 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
     # The bare assert stays although the next lines imply it: it is the guard
     # tests/test_vacuous_absence_assert_lint.py reads for the two absence asserts below.
     assert caplog.records
-    planted = [
-        r
-        for r in caplog.records
-        if r.name == "pynetdicom" and r.getMessage() == "planted capture control"
-    ]
-    assert len(planted) == 1, caplog.text
+    planted = sorted(r.name for r in caplog.records if r.getMessage() == "planted capture control")
+    assert planted == sorted(_PYNETDICOM_LOGGERS), caplog.text
     # The SCP's own end of this association, so the abort the peer read came from that path and not
     # from pynetdicom's own AA-8, which sends the same bytes.
     ended = [
@@ -573,11 +583,14 @@ async def test_a_send_to_a_slow_reader_is_bounded_as_a_whole(
     assert any("a send did not finish within 1s" in m for m in _warnings(caplog)), _warnings(caplog)
 
 
-async def test_stop_does_not_wait_out_a_send_the_peer_never_reads() -> None:
+async def test_stop_does_not_wait_out_a_send_the_peer_never_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Limb 1 bounded each send by timeout_seconds but never looked at the stop, so a stop waited for
     # a DUL blocked here for up to that long. 30 s is the shipped default.
     request = await asyncio.to_thread(_a_real_association_request)
     async with _running_scp({"timeout_seconds": 30.0, "max_associations": 2}) as scp:
+        shrunk = _shrink_accepted_send_buffers(scp, monkeypatch)  # so a send does block
         baseline = await _thread_baseline()
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -586,6 +599,7 @@ async def test_stop_does_not_wait_out_a_send_the_peer_never_reads() -> None:
         try:
             sock.sendall(request)
             assert await asyncio.to_thread(sock.recv, 1) == b"\x02"
+            assert len(shrunk) == 1 and shrunk[0] <= _SMALL_SEND_BUFFER_CEILING, shrunk
 
             def flood() -> None:
                 pending = memoryview(b"".join(_c_echo_rq(n) for n in range(1, 40000)))
