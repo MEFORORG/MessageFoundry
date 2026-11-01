@@ -2778,10 +2778,11 @@ class RevocationHopGuard:
         # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
         # real check crossed on that check, so this line would be a false record there and it is
         # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
-        # the CRL flag and accepts a lapsed CRL, and rest.py and remotefile.py do not let such a CRL
-        # relax a refusal, so that hop keeps this line. MLLP and the DICOM SCU hand such a context
-        # to capture() as None (skips_validity_period), so neither CRL field is set there. It is ALLOW on its CRL flag, not on the
-        # attestation, and that is a disposition this line does not move.
+        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
+        # disposition is ALLOW on that CRL flag, which this line does not move. The callers named
+        # here do not hand the guard such a CRL: rest.py and remotefile.py do not let it relax a
+        # refusal, and MLLP and the DICOM SCU pass no context (skips_validity_period, ADR 0173
+        # §13), so those hops cross on the attestation and keep the line for that reason.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (

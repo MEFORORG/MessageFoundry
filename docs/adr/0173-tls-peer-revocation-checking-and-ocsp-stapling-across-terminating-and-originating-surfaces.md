@@ -762,9 +762,11 @@ and the attestation, where the line was the only record of the attestation.
 
 **CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
 time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
-line. A hop with `tls_allow_expired`, a CRL and the attestation, at least MLLP and DICOM SCU, keeps
-it, and the over-statement stands there: that hop is admitted on its CRL flag, and a certificate the
-CRL lists is still refused. Neither hop's disposition changed. Where the line no longer fires, the
+line. A guard handed a context that skips time validity keeps it, because that context's CRL is no
+real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: since §13,
+MLLP and the DICOM SCU hand the guard no context there, so such a hop crosses on its attestation
+alone. The over-statement stands there only in part, since a certificate the CRL lists is still
+refused at the handshake. This correction changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
 

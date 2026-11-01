@@ -532,8 +532,10 @@ def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_
     with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
     saying it crossed without one would be false. ``tls_allow_expired`` sets
     ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
-    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. Either
-    way the hop is admitted by the same arm: this limb moves a log line, never a disposition."""
+    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. The
+    relaxed SCU hands the guard no context (ADR 0173 §13), so it crosses on its attestation, not its
+    CRL, and this half does not reach ``crl_is_a_check``; the guard-level test above pins that
+    field. This limb moves a log line, never a disposition."""
     with active_hop_posture(ENFORCING), _guard_log() as checked:
         kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
     assert context_checks_revocation(kept._ssl) is True
