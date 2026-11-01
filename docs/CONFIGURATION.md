@@ -515,6 +515,14 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   a setting before `env()` resolves, so they see the reference and not its value. A cast you write
   yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
   `cast=bool`, or a real `True`/`False` literal.
+- **A `default=` is static.** Only one `env()` link is resolved, so a default that holds another
+  `env()` reference, directly or inside a table or list, would never resolve. Such a default stops
+  the load, in a code-first module and in `connections.toml`, and the error names the key and
+  withholds the default (vault BACKLOG #2519). The scan reads a few levels into the default, not
+  without limit. A table holding only `env`, `default` or `cast` keys counts as a reference inside a
+  default, because `connections.toml` spells the two alike, so a default header table with one
+  header named `env` is refused too. Write that header directly in `headers`, or use a different
+  default.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with
