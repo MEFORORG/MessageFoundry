@@ -258,23 +258,20 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
 
 # BACKLOG #2526 and #2685, the second amendment, applied BEFORE the one above. A
 # ``<List>``/``<Actions>`` wrapper carrying ``@Disabled`` was flattened, so the statements an
-# operator switched off came back as live code, and the scan walked them to agree. It is now
-# commented out as one disabled step, and the scan skips it. A step that runs nothing (a disabled
-# one, a line with no statement, a ``MsgLog``, an empty label) stands between no construct and
-# the sibling branch written after it. And a branch left with no construct renders its body
-# under a dead placeholder, where main ran it for every message. Written apart from the head:
-# here the adoption looks back past such steps, where the head holds them out of the list until
-# a step that runs follows them. A bare branch marker inside a disabled wrapper opened its branch
-# while the wrapper was flattened, so the steps after the wrapper in its construct's own list,
-# up to the next marker, become that marker's orphan, and never run, where the construct renders
-# that marker as a branch. Written apart from the head too: here the run is gathered as the list
-# is walked, at the call that splits it, and the marker found from the back. Every test of where
-# a live step lands reads a disabled wrapper as main flattened it: whether a marker opens its
-# branch, what the adoption looks back past, which construct adopts a bare marker, and whether a
-# body makes a branch group. Written apart from the head, which reads one generator: here the
-# wrapper is flattened into a list from a stack, and each test widens main's own by a disjunct.
+# operator switched off came back as live code, and the scan walked them to agree. It is still
+# flattened, exactly as main flattened it, so every test of where a step lands sees what main saw;
+# each step it held is marked, and once the whole list is placed, the marked steps are switched
+# off. The scan skips the wrapper. A step that runs nothing (a disabled one, a marked one, a line
+# with no statement, a ``MsgLog``, an empty label) stands between no construct and the sibling
+# branch written after it. And a branch left with no construct renders its body under a dead
+# placeholder, where main ran it for every message. Written apart from the head: here the mark
+# is a tuple field the steps carry, set on the steps the flatten appended to the list; the
+# adoption looks back past the steps that run nothing, where the head holds them out of the list
+# until a step that runs follows them; and the switch-off is one function over the finished
+# list that returns each step's replacement and what to place after it.
 _LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
 _WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
+_WRAPPER_DONE = "            continue\n        # EVERY other child is a statement position"
 _PARSE_LIST_DEF = "def _parse_list(\n"
 _ADOPTED_FROM_LAST = (
     "            and steps\n"
@@ -284,6 +281,12 @@ _ADOPTED_FROM_LAST = (
     "            previous = steps[-1]\n"
     "            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))\n"
 )
+_HANDLER_STEPS = "        steps = tuple(_container_steps(action_list, subject, held, False))\n"
+# The mark, a field on each of the three step types: ``(wrapper tag, wrapper label)``, or empty.
+_ACTION_LAST = "    keywords: tuple[tuple[str, str], ...] = ()\n"
+_UNMAPPED_LAST = "    source_class: str\n    detail: str\n"
+_CONTROL_LAST = '    refusal: str = ""\n'
+_MARK_FIELD = "    wrapped_off: tuple[str, ...] = ()\n"
 _LOOK_BACK = """\
 _OPENS = {"if", "try", "case", "choosefrom"}
 
@@ -296,12 +299,28 @@ def _chained(step: Step) -> bool:
     return name in _OPENS or any(_chained(s) for s in (*step.body, *step.branches))
 
 
+def _label(step: Step) -> bool:
+    # The label amendment's marker, a subclass, when that amendment is loaded too.
+    return isinstance(step, UnmappedAction) and type(step) is not UnmappedAction
+
+
+def _bare(step: Step) -> bool:
+    # Main's own test of a marker that opens its branch, with label markers read as nothing.
+    return (
+        isinstance(step, Control)
+        and step.kind in _BRANCH_PARENT
+        and not [s for s in step.body if not _label(s)]
+    )
+
+
 def _off(step: Step) -> bool:
+    if step.wrapped_off:
+        # Commented out, unless it holds a construct that may own the branch after it, or is a
+        # bare marker, which stands where main had it and opens its branch.
+        return not _chained(step) and not _bare(step)
     if isinstance(step, Control):
         if step.kind == "disabled":
-            # One that holds a construct may own the branch after it. A wrapper holding a bare
-            # marker stood there as that marker when it was flattened.
-            return not _chained(step) and _left_open(step) is None
+            return not _chained(step)
         # A label over nothing that runs. The label amendment's demoted call keeps its kind.
         return (
             step.kind == "block"
@@ -321,159 +340,100 @@ def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
     # A marker holding nothing but label markers takes the steps after it in its own
     # construct's list, and a branch with branches of its own would lose them in a chain. Either
-    # looks back past label markers alone, and past a disabled wrapper main flattened to them.
-    skip = _off if not marker.branches and not _bare(marker) else _hollow_step
+    # looks back past label markers alone.
+    skip = _off if not marker.branches and not _bare(marker) else _label
     while at >= 0 and skip(steps[at]):
         at -= 1
     return at
 
 
-def _wrapper(step: Step) -> bool:
-    # A disabled wrapper carries no ``args``, where a disabled statement carries its kind.
-    return isinstance(step, Control) and step.kind == "disabled" and not step.args
+def _wrapped(step: Step, mark: tuple[str, ...]) -> Step:
+    if isinstance(step, Control):
+        return replace(
+            step,
+            wrapped_off=mark,
+            body=tuple(_wrapped(s, mark) for s in step.body),
+            branches=tuple(_wrapped(b, mark) for b in step.branches),
+        )
+    return replace(step, wrapped_off=mark)
 
 
-def _flat(steps: tuple[Step, ...]) -> list[Step]:
-    # The steps as main had them, every disabled wrapper flattened, at any depth.
-    out: list[Step] = []
-    pending = list(reversed(steps))
-    while pending:
-        step = pending.pop()
-        if _wrapper(step):
-            pending.extend(reversed(step.body))
-        else:
-            out.append(step)
-    return out
-
-
-def _label(step: Step) -> bool:
-    # The label amendment's marker, a subclass, when that amendment is loaded too.
-    return isinstance(step, UnmappedAction) and type(step) is not UnmappedAction
-
-
-def _hollow_step(step: Step) -> bool:
-    return _label(step) or _wrapper(step) and all(map(_label, _flat((step,))))
-
-
-def _bare(step: Step) -> bool:
-    if not (isinstance(step, Control) and step.kind in _BRANCH_PARENT):
-        return False
-    # Read through disabled wrappers, as main flattened them. A bare marker there was split
-    # off the marker's own list, so what follows it was never in the marker's body.
-    for inner in _flat(step.body):
-        if _bare(inner):
-            return True
-        if not _label(inner):
-            return False
-    return True
-
-
-def _opened(steps: list[Step]) -> list[Step]:
-    # A marker whose body main flattened bare stands bare here, and what its body holds leads
-    # its branch, after the runs are sealed. Main's own test of a marker then opens it.
-    out: list[Step] = []
-    for step in steps:
-        if _bare(step) and step.body:
-            out.append(replace(step, body=()))
-            out.extend(step.body)
-        else:
-            out.append(step)
-    return out
-
-
-@dataclass(frozen=True)
-class _Note(Control):
-    pass
-
-
-def _closed(steps: list[Step], produced: list[Step]) -> list[Step]:
-    # A sibling branch main adopted onto a construct it flattened out of a disabled wrapper, or
-    # onto the chain such a branch closed before it, has no construct now. A note leads it, so
-    # it opens no branch of the construct around it, and it renders as an orphan.
-    if len(produced) != 1 or not isinstance(branch := produced[0], Control):
-        return produced
-    if branch.kind not in _BRANCH_PARENT:
-        return produced
-    at = len(steps) - 1
-    while at >= 0 and _hollow_step(steps[at]):
-        at -= 1
-    if at < 0:
-        return produced
-    before, want = steps[at], _BRANCH_PARENT[branch.kind]
-    if isinstance(before, Control) and _BRANCH_PARENT.get(before.kind) == want:
-        if before.body and type(before.body[0]) is _Note:
-            return [replace(branch, body=(before.body[0], *branch.body))]
-    if not _wrapper(before):
-        return produced
-    live = [s for s in _flat((before,)) if not _label(s)]
-    if not (live and isinstance(live[-1], Control) and live[-1].kind == want):
-        return produced
-    why = f"its {live[-1].source_verb} is in a @Disabled {before.source_verb}, so it never runs"
-    return [replace(branch, body=(_Note("block", "Comment", why), *branch.body))]
-
-
-def _grouped(step: Step, kind: str) -> bool:
-    # A disabled wrapper holding the construct a branch-group wrapper repeats.
-    return _wrapper(step) and any(
-        getattr(s, "was", s.kind) == kind
-        for s in _flat((step,))
-        if isinstance(s, Control)
-    )
-
-
-def _left_open(step: Step) -> Control | None:
-    # A wrapper's last bare marker, at any depth of disabled wrappers, is the one whose branch
-    # the steps after it ran in.
-    if not _wrapper(step):
-        return None
-    for inner in reversed(step.body):
-        if _bare(inner):
-            return inner
-        if (deeper := _left_open(inner)) is not None:
-            return deeper
-    return None
-
-
-def _settle(marker: Control, tag: str, run: list[Step]) -> list[Step]:
-    # A run that renders no code stays where it is.
-    if not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
-        return run
-    why = "its marker is in a @Disabled " + tag
-    detail = "; ".join(filter(None, (why, marker.detail)))
-    return [replace(marker, detail=detail, body=tuple(run), branches=())]
-
-
-def _sealed(steps: list[Step]) -> list[Step]:
-    out: list[Step] = []
-    held: tuple[Control, str, list[Step]] | None = None
-    for step in steps:
-        # The next bare marker ends the run, and so does the next wrapper leaving one open.
-        if held is not None and not _bare(step) and _left_open(step) is None:
-            held[2].append(step)
+def _turned_off(step: Step) -> tuple[Step, list[Step]]:
+    # ``step`` with what the operator switched off taken out of the code, and the orphans to
+    # place after it. A branch whose marker was switched off, or adopted by a construct that
+    # was, has nothing to continue; in a Try, neither has any Catch after a switched-off one.
+    if not isinstance(step, Control) or step.kind == "disabled":
+        return step, []
+    if step.wrapped_off:
+        whose = "its " + step.source_verb + " is in a @Disabled " + step.wrapped_off[0]
+        after: list[Step] = []
+        for b in step.branches:
+            if not b.wrapped_off:
+                after.extend(_orphaned(b, whose))
+        return replace(step, branches=tuple(b for b in step.branches if b.wrapped_off)), after
+    kept: list[Control] = []
+    after = []
+    shut = ""
+    for b in step.branches:
+        if b.wrapped_off:
+            after.extend(_orphaned(b, "its marker is in a @Disabled " + b.wrapped_off[0]))
+            if step.kind == "try" and b.kind == "except" and not shut:
+                shut = "a {} before it on this {} is in a @Disabled {}".format(
+                    b.source_verb, step.source_verb, b.wrapped_off[0]
+                )
             continue
-        if held is not None:
-            out.extend(_settle(*held))
-            held = None
-        out.append(step)
-        if (marker := _left_open(step)) is not None:
-            held = (marker, step.source_verb, [])
-    if held is not None:
-        out.extend(_settle(*held))
-    return out
+        if shut:
+            after.extend(_orphaned(b, shut))
+            continue
+        b, below = _turned_off(b)
+        kept.append(b)
+        after.extend(below)
+    return replace(step, body=_off_list(step.body), branches=tuple(kept)), after
+
+
+def _orphaned(branch: Control, why: str) -> list[Step]:
+    if branch.wrapped_off and not [s for s in branch.body if not s.wrapped_off]:
+        return [branch]
+    note = why + "; " + branch.detail if branch.detail else why
+    head, after = _turned_off(replace(branch, wrapped_off=(), detail=note))
+    return [head, *after]
+
+
+def _off_list(steps: list[Step] | tuple[Step, ...]) -> tuple[Step, ...]:
+    flat: list[Step] = []
+    for step in steps:
+        head, after = _turned_off(step)
+        flat.append(head)
+        flat.extend(after)
+    # Each run of steps marked from one wrapper is one disabled step, as a disabled statement is.
+    out: list[Step] = []
+    i = 0
+    while i < len(flat):
+        mark = flat[i].wrapped_off
+        j = i + 1
+        while mark and j < len(flat) and flat[j].wrapped_off == mark:
+            j += 1
+        if mark:
+            out.append(Control("disabled", mark[0], mark[1], body=tuple(flat[i:j])))
+        else:
+            out.append(flat[i])
+        i = j
+    return tuple(out)
 
 
 """
-_SPLIT_CALL = "    inner, branches = _split_branches(body)\n"
 _ORPHAN_INLINE = (
     '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
 )
-_GROUP_TEST = "    if not data and any("
 _SCAN_SKIP_PAIR = (_LIVE_SKIP, "        if _is_disabled(elem):\n")
 _DISABLED_RETURN_STEP = '        return [Control("disabled", source, label, body=tuple(body))]\n'
 _STRAY_TAIL = "    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))\n"
 _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     _SCAN_SKIP_PAIR,
+    (_ACTION_LAST, _ACTION_LAST + _MARK_FIELD),
+    (_UNMAPPED_LAST, _UNMAPPED_LAST + _MARK_FIELD),
+    (_CONTROL_LAST, _CONTROL_LAST + _MARK_FIELD),
     # A disabled statement keeps the kind it would have had, for the look-back below.
     (
         _DISABLED_RETURN_STEP,
@@ -495,23 +455,22 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         '    out = [f"{pad}if False:  # TODO: Corepoint {ctrl.source_verb}{never}"]\n'
         "    out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))\n",
     ),
+    # A disabled wrapper is flattened as before, and what it appended to the list is marked.
     (
         _WRAPPER_NOTE,
-        _WRAPPER_NOTE + "            if _is_disabled(child):\n"
+        _WRAPPER_NOTE + "            first = len(steps)\n",
+    ),
+    (
+        _WRAPPER_DONE,
+        "            if _is_disabled(child):\n"
         '                said = strip_markup(_attr(child, "Data")) or strip_markup(\n'
         '                    _attr(child, "Comment")\n'
         "                )\n"
-        "                inner = tuple(_parse_list(child, subject, held, in_control, depth + 1))\n"
-        "                steps.append(\n"
-        '                    Control("disabled", _local(child.tag), said or _local(child.tag), '
-        "body=inner)\n"
-        "                )\n"
-        "                continue\n",
+        "                mark = (_local(child.tag), said or _local(child.tag))\n"
+        "                steps[first:] = [_wrapped(s, mark) for s in steps[first:]]\n"
+        + _WRAPPER_DONE,
     ),
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
-    # A bare marker switched off in a wrapper leaves the steps after it dead, not live. And a
-    # marker whose body main flattened bare opens its branch.
-    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_opened(_sealed(body)))")),
     (
         _ADOPTED_FROM_LAST,
         "            and (at := _construct_at(steps, produced[0])) >= 0\n"
@@ -521,13 +480,8 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "            previous = steps[at]\n"
         "            steps[at] = replace(previous, branches=(*previous.branches, produced[0]))\n",
     ),
-    # A bare marker main adopted onto a construct it flattened out of a disabled wrapper opens
-    # nothing. Below the label amendment's lift, which it inserts just under the parse.
-    (_SIBLING_PARSE, _SIBLING_PARSE + "        produced = _closed(steps, produced)\n"),
-    # Main flattened a disabled wrapper, so a wrapper holding the construct a branch-group
-    # wrapper repeats made that a group. A disjunct ahead of main's test, so the label amendment
-    # still finds that test's text once.
-    (_GROUP_TEST, _GROUP_TEST + "_grouped(s, kind) for s in body) or not data and any("),
+    # Once the whole list is placed, what was marked is switched off.
+    (_HANDLER_STEPS, _HANDLER_STEPS.replace("tuple(", "_off_list(")),
 )
 #: Every amendment the baseline carries, in the order it loads them.
 _STEP1_AMENDMENTS = (*_FAIL_CLOSED_AMENDMENTS, *_LABEL_AMENDMENTS)
@@ -1996,6 +1950,54 @@ def _open_shapes(seed: int, count: int) -> Iterator[Shape]:
 _ADT, _OUT, _NEW, _P, _ERR = H("%ADT"), H("%OUT"), H("%NEW"), H("%P"), H("%ERR")
 
 
+def _switched_off_wrapper_repros() -> Iterator[Shape]:
+    """The shapes each review round of BACKLOG #2526 found, where a disabled wrapper commented out
+    whole moved a live step onto a path that runs more often than main's. The last of them, a
+    nested wrapper whose inner list closed a sibling, then an ``ElseIf`` and a send, ran the send
+    after a loop for every message. A gate-closed list, so the head must render each as the
+    baseline does, and the fail-closed amendment adds no live code to any."""
+    after = _line("ItemClear %ADT/PID-19") + _line("MsgSend %ADT [OB_FLAT]")
+    loop = '<Line Data="ForEach %ADT/OBX $o"><List>{x}</List></Line>'
+    in_else = '<Line Data="If (a)"><List/></Line><Line Data="Else"><List>{x}</List></Line>'
+    closed_if = (
+        '<List Disabled="1"><List Disabled="1"><Line Data="If (a)"><List/></Line></List>'
+        '<Line Data="Else"/></List>'
+    )
+    closed_try = (
+        '<List Disabled="1"><List Disabled="1"><Line Data="Try"><List/></Line></List>'
+        '<Line Data="Catch"/></List>'
+    )
+    grouped = (
+        '<List Disabled="1"><Try><List Disabled="1"><Line Data="Try"><List/></Line></List>'
+        '<Line Data="Catch"/></Try></List>'
+    )
+    repros = {
+        "nested-closure-in-a-loop": loop.replace("{x}", closed_if + _line("ElseIf (b)") + after),
+        "nested-closure-in-a-try": "<Try><List>"
+        + _line("ItemClear %ADT/PID-3")
+        + closed_if
+        + _line("ElseIf (b)")
+        + after
+        + "</List></Try>",
+        "nested-closure-in-an-else": in_else.replace("{x}", closed_try + _line("Catch") + after),
+        "group-closure-in-a-loop": loop.replace("{x}", grouped + _line("Catch") + after),
+        "two-catches-the-first-off": "<Try><List>"
+        + _line("ItemClear %ADT/PID-3")
+        + '<List Disabled="1">'
+        + _line("Catch")
+        + "</List>"
+        + after
+        + _line("Catch")
+        + _line("MsgSend %ADT [OB_TWO]")
+        + "</List></Try>",
+        "else-in-a-loop": loop.replace(
+            "{x}", '<List Disabled="1">' + _line("Else") + "</List>" + after
+        ),
+    }
+    for name, xml in repros.items():
+        yield Shape(f"2526-{name}", "%ADT", (Raw(xml),))
+
+
 def _seed_shapes() -> Iterator[Shape]:
     """Each review's repros, in the review's own words where the comment gives them."""
     clone = Clone(_ADT, _OUT, 1)
@@ -2280,6 +2282,7 @@ def _seed_shapes() -> Iterator[Shape]:
             f"review-r3-{name}-after-a-bind", "%ADT", (Clone(_ADT, _OUT, 1), stop, *new_sent)
         )
     yield Shape("review-r3-disabled-list", "%ADT", (Log(_ADT), OffList(new_sent)))
+    yield from _switched_off_wrapper_repros()
     yield Shape("review-r3-flat-open-body", "%ADT", (Log(_ADT), FlatOpen(new_sent)))
     yield Shape(
         "review-r3-block-span-label",
@@ -3271,11 +3274,21 @@ def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
         return found
     was_lines, now_lines = Counter(was[0].splitlines()), Counter(now[0].splitlines())
     changed = (was_lines - now_lines) + (now_lines - was_lines)
-    if now[1] != was[1]:
+    if now[1] != was[1] and not _only_more_disabled(xml, was, now):
         found.append("(counts) the counts change, and no more is unmapped")
     if not all(map(_QUIET_LINE.match, changed)):
         found.append("(code) more than comment lines and refusals change")
     return found
+
+
+def _only_more_disabled(xml: str, was: _Out, now: _Out) -> bool:
+    """Whether the counts differ only by more steps counted disabled, in a list holding a disabled
+    wrapper. A statement the rule marks inside one is switched off with the rest of it, so it is
+    counted disabled rather than unmapped (BACKLOG #2526): with nothing of the wrapper beside it,
+    it is a disabled step of its own."""
+    if not _holds_a_disabled_wrapper(xml) or len(was[1]) != len(now[1]):
+        return False
+    return all(a[:2] == b[:2] and a[2] <= b[2] for a, b in zip(was[1], now[1], strict=True))
 
 
 def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
@@ -3347,6 +3360,22 @@ def _skeleton(module: Any, xml: str) -> tuple[Any, ...] | None:
         return None
     marker = getattr(module, "LabelMarker", ())
 
+    def wrapper_of(step: Any) -> tuple[Any, ...] | None:
+        # The disabled wrapper a step is marked from, by the head's field or the baseline's.
+        if (off := getattr(step, "off", None)) is not None:
+            return off.source, off.label
+        return tuple(getattr(step, "wrapped_off", ())) or None
+
+    def left_out(step: Any) -> bool:
+        # A label marker, or the run a disabled wrapper's label markers make with nothing beside
+        # them, which names that wrapper as a disabled statement never does.
+        if isinstance(step, module.Control) and step.kind == "disabled" and step.body:
+            return all(
+                isinstance(inner, marker) and wrapper_of(inner) == (step.source_verb, step.detail)
+                for inner in step.body
+            )
+        return isinstance(step, marker)
+
     def shape(steps: Sequence[Any]) -> tuple[Any, ...]:
         return tuple(
             (
@@ -3357,7 +3386,7 @@ def _skeleton(module: Any, xml: str) -> tuple[Any, ...] | None:
             if isinstance(step, module.Control)
             else "."
             for step in steps
-            if not isinstance(step, marker)
+            if not left_out(step)
         )
 
     return tuple(shape(handler.steps) for handler in channel.handlers)
@@ -3706,6 +3735,193 @@ def test_the_scan_half_of_the_fail_closed_amendment_changes_its_seeds() -> None:
     )
     assert all(map(_holds_a_disabled_wrapper, seeds))
     assert changed >= _SCAN_FLOOR
+
+
+# --- no step is more live than main under a disabled wrapper (BACKLOG #2526) ----------------------
+#
+# Each review round of the first cut of BACKLOG #2526 found a shape in which a step main ran
+# conditionally ran on every message once a disabled wrapper was commented out. The property the
+# repair holds to: every line of the head that writes a field or sends runs on a path no more
+# live than the one main put it on. A line is DEAD under an ``if False:``/``elif False:``,
+# ``for _item in []:`` or ``while False:``, runs in an EXCEPT when an ``except`` is the nearest
+# opener that is not dead, and is LIVE otherwise. A line the head comments out never runs.
+# Main is the vendored tree with the scan half of the amendment alone (``step1_scan_skips``),
+# which flattens a disabled wrapper as main did.
+
+_RANK = {"dead": 0, "except": 1, "live": 2}
+_NEVER = re.compile(r"\s*(?:(?:el)?if False|for _item in \[\]|while False):")
+_EFFECT = re.compile(r"set_field\(|Send\(")
+
+
+def _liveness(src: str) -> dict[str, list[str]]:
+    """Each line of the handler that writes a field or sends, and how live each copy of it runs,
+    most live first. The closing ``return`` is read apart (:func:`_trailing_sends`)."""
+    lines = _code_lines(src)
+    found: dict[str, list[str]] = {}
+    for at, line in enumerate(lines):
+        if line.lstrip().startswith("return ") or not _EFFECT.search(line):
+            continue
+        depth, rank = len(line) - len(line.lstrip()), "live"
+        for opener in reversed(lines[:at]):
+            indent = len(opener) - len(opener.lstrip())
+            if indent >= depth:
+                continue
+            depth = indent
+            if _NEVER.match(opener):
+                rank = "dead"
+                break
+            if opener.lstrip().startswith("except "):
+                rank = "except"
+        found.setdefault(line.strip(), []).append(rank)
+    return {
+        text: sorted(ranks, key=_RANK.__getitem__, reverse=True) for text, ranks in found.items()
+    }
+
+
+def _more_live_than_main(was: str, now: str) -> list[str]:
+    """Every effect line of ``now`` on a path more live than ``was`` gives it: copy by copy, most
+    live first. A copy ``was`` does not hold at all may only be dead.
+
+    The closing ``return`` delivers for every message, and it may name no destination ``was``
+    does not name somewhere. Main already ends a handler that has a send in a branch no chain
+    renders (a branch of a branch) with such a ``return``, wherever it has no inline send left;
+    switching an inline send off can leave a list there, and that is main's defect, not this
+    one's. So the destinations it names are held to the ones ``was`` names, not to its own
+    ``return``."""
+    before = _liveness(was)
+    named = set(_RETURNED_SEND.findall(was))
+    worse = [
+        f"the closing return delivers to {name}, which main names nowhere"
+        for name in sorted(set(_trailing_sends(now)) - named)
+    ]
+    for text, ranks in _liveness(now).items():
+        main = before.get(text, [])
+        for k, rank in enumerate(ranks):
+            limit = main[k] if k < len(main) else "dead"
+            if _RANK[rank] > _RANK[limit]:
+                worse.append(f"{text} runs {rank} where main runs it {limit}")
+    return worse
+
+
+# What a disabled wrapper may hold, and what a construct's list may hold around it: every shape
+# the placement tests of BACKLOG #2526 name, and the probes of its review rounds.
+_OFF_HELD = (
+    "",
+    _line("Else"),
+    _line("ElseIf (b)"),
+    _line("Catch"),
+    _line('Matching "M"'),
+    '<List Data="MsgLog %ADT"/>',
+    _line("MsgLog %ADT"),
+    '<Line Data="If (a)"><List/></Line>',
+    '<Line Data="If (a)"><List/></Line>' + _line("Else"),
+    "<Try><List/></Try>",
+    "<Try><List/></Try>" + _line("Catch"),
+    '<Case Data="ChooseFrom (a)"><List/></Case>',
+    '<List Disabled="1"><Line Data="If (a)"><List/></Line></List>' + _line("Else"),
+    '<List Disabled="1"><Line Data="Try"><List/></Line></List>' + _line("Catch"),
+    '<Try><List Disabled="1"><Line Data="Try"><List/></Line></List>' + _line("Catch") + "</Try>",
+    '<List Disabled="1"/>',
+    _line("Catch", _line("Else") + _line("MsgSend %ADT [OB_OFF]")),
+    _line("Else", _line("ItemClear %ADT/PID-90")),
+)
+_OFF_WRAPPINGS = (
+    '<List Disabled="1">{m}</List>',
+    '<Actions Disabled="1">' + _line("ItemClear %ADT/PID-91") + "{m}</Actions>",
+    '<List Disabled="1"><List>{m}</List></List>',
+    '<List><List Disabled="1">{m}</List></List>',
+    '<List Disabled="1"><List Disabled="1">{m}</List></List>',
+)
+_AROUND = (
+    "{x}",
+    '<Line Data="ForEach %ADT/OBX $o"><List>{x}</List></Line>',
+    "<Try><List>{x}</List></Try>",
+    '<Line Data="Try"><List>{x}</List></Line>',
+    '<Line Data="If (a)"><List>{x}</List></Line>',
+    '<Case Data="ChooseFrom (a)"><List>{x}</List></Case>',
+    '<Line Data="If (a)"><List/></Line><Line Data="Else"><List>{x}</List></Line>',
+    '<Line Data="Try"><List/></Line><Line Data="Catch"><List>{x}</List></Line>',
+)
+_THEN = ("", _line("Else"), _line("ElseIf (b)"), _line("Catch"), _line('Matching "M"'))
+
+
+def _off_wrapper_battery() -> list[str]:
+    """Each wrapping of each held shape, then each marker main might adopt or split there, then
+    a write and a send, in each construct. Plus the seeds of :func:`_switched_off_wrapper_repros`
+    and one drawn list per ten of these, mixing wrappers, markers and constructs at random."""
+    lists: list[str] = []
+    for held in _OFF_HELD:
+        for wrapping in _OFF_WRAPPINGS:
+            off = wrapping.replace("{m}", held)
+            for then in _THEN:
+                tail = (
+                    _line("ItemClear %ADT/PID-3")
+                    + off
+                    + then
+                    + _line("ItemClear %ADT/PID-19")
+                    + _line("MsgSend %ADT [OB_FLAT]")
+                )
+                lists.extend(around.replace("{x}", tail) for around in _AROUND)
+    lists.extend(_render(s.nodes, s.inp) for s in _switched_off_wrapper_repros())
+    rng = random.Random(_SEED)
+    pieces = (*_OFF_HELD, *_THEN, _line("ItemClear %ADT/PID-19"), _line("MsgSend %ADT [OB_X]"))
+
+    def drawn(depth: int) -> str:
+        out = ""
+        for _ in range(rng.randint(1, 4)):
+            pick = rng.random()
+            if depth and pick < 0.35:
+                out += rng.choice(_OFF_WRAPPINGS).replace("{m}", drawn(depth - 1))
+            elif depth and pick < 0.55:
+                out += rng.choice(_AROUND).replace("{x}", drawn(depth - 1))
+            else:
+                out += rng.choice(pieces)
+        return out
+
+    lists.extend(drawn(3) for _ in range(len(lists) // 10))
+    return [xml for xml in lists if _holds_a_disabled_wrapper(xml)]
+
+
+_OFF_WRAPPER_LISTS = _off_wrapper_battery()
+#: Over one chunk of the battery: the fewest lists whose effect lines the head places otherwise
+#: than main, and the fewest the control reads the other way. About half the smallest chunk's
+#: count, measured 2026-11-01 over 3908 lists (43 and 5).
+_PLACED_OTHERWISE_FLOOR = 20
+_REVERSED_FLOOR = 2
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_no_step_is_more_live_than_main_under_a_disabled_wrapper(chunk: int) -> None:
+    """The property of BACKLOG #2526: over every list of the battery, no line of the head that
+    writes or sends runs on a path more live than main's. The control: read the other way, main
+    is more live than the head on many of them, so the reading is not blind."""
+    broken: list[str] = []
+    otherwise = reverse = 0
+    for xml in _OFF_WRAPPER_LISTS[chunk::_CHUNKS]:
+        was, now = _generate(step1_scan_skips, xml)[0], _generate(head, xml)[0]
+        if bool(was) != bool(now):
+            broken.append(f"{xml}: one of the two refuses the list")
+            continue
+        worse = _more_live_than_main(was, now)
+        broken.extend(f"{xml}: {line}" for line in worse)
+        otherwise += _liveness(was) != _liveness(now)
+        reverse += bool(_more_live_than_main(now, was))
+    assert not broken, "\n".join(broken[:10]) + f"\n... {len(broken)} in all"
+    assert otherwise >= _PLACED_OTHERWISE_FLOOR and reverse >= _REVERSED_FLOOR
+
+
+def test_the_liveness_reading_tells_the_three_paths_apart() -> None:
+    """The control for the reading itself, on main's own render: a send under a dead arm, in an
+    ``except`` and at the handler's own level."""
+    send = _line("MsgSend %ADT [OB_X]")
+    for xml, rank in (
+        (f'<Line Data="If (a)"><List>{send}</List></Line>', "dead"),
+        (f"<Try><List/></Try>{_line('Catch', send)}", "except"),
+        (send, "live"),
+        (f'<Line Data="ForEach %ADT/OBX $o"><List>{send}</List></Line>', "dead"),
+    ):
+        ranks = _liveness(_generate(step1_scan_skips, xml)[0])
+        assert ranks['sends.append(Send("OB_X", msg))  # Corepoint MsgSend'] == [rank], xml
 
 
 def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
