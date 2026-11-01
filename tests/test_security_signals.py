@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import socket
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -899,6 +900,34 @@ def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
         )
     finally:
         remove_refusal_observer(seen.append)
+    assert seen == ["IB_PACS"]
+
+
+async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers() -> None:
+    seen: list[str] = []
+    scp = DicomScpSource(
+        Source(
+            type=ConnectorType.DIMSE,
+            name="IB_PACS",
+            settings={"ae_title": "MEFOR_SCP", "host": "127.0.0.1", "port": 0},
+        )
+    )
+
+    async def handler(_data: bytes) -> str | None:
+        return None
+
+    await scp.start(handler)
+    try:
+        server = cast(Any, scp._server)
+        server._take_slot = lambda _host: "the pending-connection cap is full"
+        add_refusal_observer(seen.append)
+        try:
+            with socket.socket() as request:  # unconnected: the refusal only shuts it down
+                server.process_request(request, ("192.0.2.1", 40000))
+        finally:
+            remove_refusal_observer(seen.append)
+    finally:
+        await scp.stop()
     assert seen == ["IB_PACS"]
 
 

@@ -661,6 +661,7 @@ def _admitting_server_class() -> type[Any]:
             *args: Any,
             admit: Callable[[Any], bool],
             refused: Callable[[str, str, str], None],
+            refused_at_cap: Callable[[], None],
             ended: Callable[[str, str], None],
             handshake_failed: Callable[[str, str], None],
             stopping: threading.Event,
@@ -675,6 +676,9 @@ def _admitting_server_class() -> type[Any]:
             self.max_object_bytes = max_object_bytes
             self._admit = admit
             self._refused = refused
+            #: Called besides ``refused`` for a connection refused at a connection cap, the one
+            #: refusal here the refusal observers count (vault BACKLOG #2613).
+            self._refused_at_cap = refused_at_cap
             #: Called on the DUL thread with the peer address and the reason, when a read of an
             #: association that has started runs out its deadline. It is not a refusal: the SCP
             #: accepted that association and may have taken objects on it.
@@ -737,6 +741,7 @@ def _admitting_server_class() -> type[Any]:
             full = self._take_slot(host)
             if full is not None:
                 try:
+                    self._refused_at_cap()
                     self._refused(host, "a connection", full)
                 finally:
                     self.shutdown_request(request)
@@ -1649,6 +1654,7 @@ class DicomScpSource(SourceConnector):
             server_class=_admitting_server_class(),
             admit=self._admit_connection,
             refused=self._log_refused_peer,
+            refused_at_cap=functools.partial(notify_refusal, self._refusal_name),
             ended=self._log_ended_association,
             handshake_failed=self._note_tls_failure,
             stopping=self._stopping,
