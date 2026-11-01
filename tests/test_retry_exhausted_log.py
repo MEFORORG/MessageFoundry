@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -93,19 +93,6 @@ class _Fails:
         return None
 
 
-# Not this item's line: the DeliveryError arm's edge-triggered connection_lost alert logs
-# safe_exc(exc), which leaves _TRANSPORT_TEXT's token in place. That predates #3108 and is not filed
-# yet; the #3108 exit report hands it to the Manager. Skipped by its WHOLE message, so any other
-# record, that alert with any other text included, is still scanned.
-_PRE_EXISTING_ALERT = (
-    f"ALERT connection_error: outbound 'file_out' connection_lost: DeliveryError: {_TRANSPORT_TEXT}"
-)
-
-
-def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    assert_no_token(records, skip_message=_PRE_EXISTING_ALERT)
-
-
 def _exhausted_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
         r
@@ -167,7 +154,7 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     assert repr(OUT) in text and str(msg["id"]) in text
     assert "DeliveryError" in text and "code '?'" in text
     assert "dead-lettered at the retry cap, after 2 attempt(s)" in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 def _stepped_runner(
@@ -212,7 +199,7 @@ async def test_the_line_fires_on_the_attempt_that_dead_letters_and_not_one_soone
     assert "dead-lettered at the retry cap, after 3 attempt(s)" in text
     expected = "(NegativeAckError, code 'AE')" if transient_nak else "(DeliveryError, code '?')"
     assert expected in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 async def test_retry_forever_never_writes_the_line(
@@ -250,7 +237,7 @@ async def test_a_batch_that_runs_out_its_attempts_logs_one_line(
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_ids[-1] in text
     assert "DeliveryError" in text and "dead-lettered at the retry cap, after 2 attempt(s)" in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 def test_an_exhausted_line_does_not_share_a_window_with_a_permanent_refusal(
@@ -344,7 +331,7 @@ async def test_the_line_needs_no_status_read_after_the_write(
     await runner._process_delivery_item(OUT, await _claim(store))
     (line,) = _exhausted_lines(caplog)
     assert "unconfirmed" not in line.getMessage()
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 async def test_a_batch_whose_first_member_vanished_still_logs(

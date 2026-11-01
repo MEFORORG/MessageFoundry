@@ -784,7 +784,12 @@ class QueueStore(StoreLifecycle, Protocol):
         headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
-        ``response_get(dest).headers``)."""
+        ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
+
+        ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
+        every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -1273,14 +1278,12 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
-        inbound lifecycle (``established``/``closed``) + the pre-ingress failures
-        (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
-        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
-        cleanly, such as a store outage at the ingress commit)
-        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
-        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
-        + the outbound lane transitions (``connection_lost``/``connection_restored``).
+        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): a
+        listener's lifecycle and pre-ingress refusals, a poll source's rejects, and the outbound lane
+        transitions. ``kind`` must be one of
+        :data:`messagefoundry.connection_events.CONNECTION_EVENT_KINDS`, the one vocabulary the
+        connectors, this store and the web console's filter share; an undeclared kind raises
+        :class:`ValueError` on every backend (BACKLOG #1624).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
         row and calling no finalizer, so it can never pin a message's disposition or inflate received

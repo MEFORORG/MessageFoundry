@@ -732,10 +732,10 @@ def test_a_credential_typed_into_a_proxy_authorization_key_is_not_echoed(
 
 # --- Lander finding 2 on engine PR 2576: a proxy_url this hop does not use -----------------------
 #
-# The static Proxy-Authorization is left to the send-time proxy rule only when the request goes
-# to a proxy. A hop the proxy bypasses goes direct, where that rule refuses the header on every
-# send, retryably, until the message dead-letters. So such a hop counts the header and refuses at
-# build, as a hop with no proxy does.
+# The static Proxy-Authorization is left to the send-time proxy rule only when the connection's
+# own proxy setting takes the request. A hop that setting bypasses can go direct, where that rule
+# refuses the header on every send, retryably, until the message dead-letters. So such a hop
+# counts the header and refuses at build, as a hop with no proxy does.
 
 _PROXY = "http://127.0.0.1:3128"
 
@@ -769,7 +769,9 @@ def _pin_system_proxy(
     monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: bypass)
 
 
-#: Each way a configured proxy_url leaves this hop direct.
+#: Ways a configured proxy_url does not take this hop, at least. A loopback target is another,
+#: which builds, since loopback lifts the cleartext refusal; test_proxy_credential_legs.py pins
+#: its refusal at send.
 _BYPASSED: dict[str, dict[str, Any]] = {
     "proxy_no_proxy names the host": {"proxy_url": _PROXY, "proxy_no_proxy": ["*"]},
     "urllib's own bypass list names the host": {"proxy_url": _PROXY},

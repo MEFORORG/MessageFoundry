@@ -110,7 +110,7 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 
 #: ``connection_event`` kind -> ``audit_log`` action for an intake-auth refusal (ADR 0154 D6). The
 #: kinds double as the connection_event vocabulary, which CI derives from these literal call sites and
-#: asserts against ``docs/PHI.md`` §7 and the console's filter tuple as an exact set — so adding a kind
+#: asserts against ``docs/PHI.md`` §7 and ``CONNECTION_EVENT_KINDS`` as an exact set — so adding a kind
 #: here without those two is a build failure, by design.
 _INTAKE_AUDIT_ACTIONS = {
     "intake_auth_failed": "intake.auth_failed",
@@ -1099,8 +1099,8 @@ class HttpSource(SourceConnector):
         Takes an already-built refusal rather than its parts so every ``kind=`` stays a literal at a
         visible ``HttpRequestError(...)`` call site. CI derives the whole ``connection_event``
         vocabulary by AST-walking for exactly that shape, so a kind hidden behind a helper's parameter
-        would silently drop out of ``docs/PHI.md`` §7 and the console's filter — the drift this
-        codebase spends real effort preventing.
+        would escape the check that it is declared in ``CONNECTION_EVENT_KINDS`` and ``docs/PHI.md``
+        §7. An undeclared kind is then refused by the store at write time, and the event is lost.
         """
         if self.intake_rate_limiter is not None:
             self.intake_rate_limiter.charge_failure(peer)
@@ -1584,7 +1584,7 @@ class HttpSource(SourceConnector):
         A timeout raises, and is handled by ``_on_client``'s existing ``OSError`` arm (``TimeoutError``
         subclasses ``OSError``), which emits ``peer_reset`` and drops the connection. Deliberately not a
         new ``connection_event`` kind: the vocabulary is asserted in CI against ``docs/PHI.md`` §7 and
-        the console's filter tuple as an exact set, so minting one is a three-file change, and
+        ``CONNECTION_EVENT_KINDS`` as an exact set, so minting one is a three-file change, and
         "the peer stopped reading" is what ``peer_reset`` already means to an operator.
 
         The message is unaffected either way — it was recorded before this write (ACK-on-receipt),
