@@ -388,11 +388,12 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     hides the input from ``str`` and ``repr`` only, and only on the outermost model.
 
     Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
-    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
-    and ``ctx`` are written by the validator, and a validator that quotes the value it refused
-    still shows it there. :func:`settings_error_detail` keeps the list of those that do. None is
-    meant to hold a secret, but a URL
-    can carry one, so a validator message must name the setting, never quote a secret value.
+    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT
+    ONLY. The message and ``ctx`` stay as raised, and they can quote the value: a validator that
+    quotes what it refused still shows it there, and so does at least one error a library raised
+    inside a validator. :func:`settings_error_detail` names at least the ones known. None is meant
+    to hold a secret, but a URL can carry one, so a validator message must name the setting, never
+    quote a secret value.
     """
     try:
         return handler(value)
@@ -6964,9 +6965,11 @@ _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
 
 def _looks_like_url(value: str) -> bool:
-    """Whether ``value`` starts with a ``<scheme>://``. Any scheme of two or more characters: these
-    settings take a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or
-    ``s3a://`` load as a bogus local path (vault BACKLOG #2600).
+    """Whether ``value``, stripped and lower-cased, starts with ``<scheme>://``, where the scheme is
+    a letter and then at least one more letter, digit, ``+``, ``.`` or ``-``. These settings take a
+    LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as a
+    bogus local path (vault BACKLOG #2600). A value of any other shape is not detected, and can
+    load as a path.
 
     It hands back no text, because a refusal quotes no part of the value: see
     :func:`settings_error_detail`."""
@@ -10716,7 +10719,9 @@ def security_loosenings(
 
 
 def settings_error_detail(exc: Exception) -> str:
-    """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
+    """Return a :func:`load_settings` failure as text, WITHOUT pydantic's ``input``.
+
+    Each message is returned as written, so what a message quotes is still in the text.
 
     WHY ``str(exc)`` WAS NOT SAFE. Pydantic gives every error an ``input``, and for an ``after``-mode
     model validator that is the whole section's input mapping. The secrets in ``_FILE_SECRET_KEYS``
@@ -10741,23 +10746,23 @@ def settings_error_detail(exc: Exception) -> str:
     rule``) and ``security show``'s read of the file's own ``[security]`` table: none of those
     reads the environment.
 
-    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
+    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION RETURNS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
-    refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
-    message must name the setting and never quote a secret value. This function prints it to at
-    least stderr, a service log and ``security show``'s JSON. At least the ``[backup]`` and ``[dr]``
-    URL refusals quote no part of the URL for that reason, the text in front of ``://`` included,
-    because that text is the value's own and not a known word (vault BACKLOG #2850,
+    refusals do, several path and enum refusals, and the ``[auth]`` ``oidc_allowed_endpoints``
+    refusal, which quotes the host and the allow-list. A URL can carry a credential, so a validator
+    message must name the setting and never quote a secret value. Callers print the returned text
+    to at least stderr, a service log and ``security show``'s JSON. At least the ``[backup]`` and
+    ``[dr]`` URL refusals quote no part of the URL for that reason, the text in front of ``://``
+    included, because that text is the value's own and not a known word (vault BACKLOG #2850,
     :func:`_looks_like_url`).
 
     NOT COVERED: A MESSAGE NO VALIDATOR WROTE. At least the ``AuthSettings`` OIDC endpoint loop lets
     the ``ValueError`` from ``urlsplit`` pass, and that message quotes the URL's netloc, its
-    userinfo included. The same loop's ``oidc_allowed_endpoints`` refusal quotes the host and the
-    allow-list.
+    userinfo included.
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
-    is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
-    not a settings model, such as an ``[[alerts.rules]]`` rule.
+    is capped at ``_ERROR_DETAIL_ROWS``, and drops the ``input`` of a ``ValidationError`` from a model
+    that is not a settings model, such as an ``[[alerts.rules]]`` rule.
     """
     from pydantic import ValidationError
 
@@ -10773,8 +10778,8 @@ def settings_error_detail(exc: Exception) -> str:
             else f" (+{len(errors) - _ERROR_DETAIL_ROWS} more)"
         )
         return "; ".join(rows) + extra
-    # Our own model validators raise plain ValueError with hand-authored text naming the key, and
-    # FileNotFoundError/OSError carry a path. Neither reflects a configured value back.
+    # Any other exception is returned as its own text: at least a plain ValueError from the loader,
+    # with whatever text it was raised with, and FileNotFoundError/OSError, which carry a path.
     return str(exc)
 
 
