@@ -42,7 +42,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -2141,8 +2141,9 @@ class _LoadedConfig:
     registry: Registry | None
     #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
     #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
-    #: ``None`` when the snapshot did not take them, as a reload's row does not.
-    env_values: Mapping[str, Any] | None = None
+    #: ``None`` when the snapshot did not take them, as a reload's row does not. They include
+    #: secret values, so they are kept out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def _of(
