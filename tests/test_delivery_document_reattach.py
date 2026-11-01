@@ -410,11 +410,24 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
     assert [Message.parse(m).field("OBX-5.5") for m in members] == [a, b]  # both hydrated verbatim
 
 
+class _FramingCollector(_Collector):
+    """A collector that frames (defines ``check_frame``), so the batch takes the framing branch,
+    where re-attach refusals join the frame split's. It refuses nothing, and counts its checks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked = 0
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        self.checked += 1
+
+
+@pytest.mark.parametrize("framing", [False, True], ids=["no-frame", "frame"])
 async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
-    store: MessageStore, caplog: pytest.LogCaptureFixture
+    store: MessageStore, caplog: pytest.LogCaptureFixture, framing: bool
 ) -> None:
     # Vault BACKLOG #2809: the permanent re-attach refusal is the one member's, as a frame refusal
-    # is, so its healthy sibling still goes out in the envelope.
+    # is, so its healthy sibling still goes out in the envelope, on both branches of the batch.
     from messagefoundry.parsing.split import split_batch
 
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
@@ -426,7 +439,7 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
     await store.enqueue_message(channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0)
 
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    col = _Collector()
+    col = _FramingCollector() if framing else _Collector()
     runner._destinations[DEST] = col
     runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
     runner._retry[DEST] = RetryPolicy()
@@ -438,6 +451,8 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
 
     assert len(col.deliveries) == 1
     assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
+    if isinstance(col, _FramingCollector):
+        assert col.checked == 1  # only the survivor reached the frame split
     stats = await store.stats()
     assert stats.get(OutboxStatus.DEAD.value, 0) == 1
     assert stats.get(OutboxStatus.DONE.value, 0) == 1

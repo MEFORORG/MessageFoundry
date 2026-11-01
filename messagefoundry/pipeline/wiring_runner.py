@@ -266,9 +266,9 @@ type _LaneFault = Literal["credential", "configuration"]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
-"""A batch member its frame check refused: its outbox row id, the content-free error the store
-keeps, and the refusal, with no traceback, whose class name and code the log line reads (BACKLOG
-#3043)."""
+"""A batch member its frame check or the batch re-attach refused: its outbox row id, the
+content-free error the store keeps, and the refusal, with no traceback, whose class name and code
+the log line reads (BACKLOG #3043)."""
 
 #: The :class:`NegativeAckError` code of a payload whose detached document cannot be re-attached
 #: (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
@@ -9298,9 +9298,10 @@ class RegistryRunner:
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
         The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
-        carry, or that holds more than one message (ADR 0209), is taken out before the envelope is
-        built and dead-lettered alone, and "all N" above means the rest. The envelope's head is then
-        the first member that survived.
+        carry, that holds more than one message (ADR 0209), or whose detached document cannot be
+        re-attached (vault BACKLOG #2809), is taken out before the envelope is built and
+        dead-lettered alone, and "all N" above means the rest. The envelope's head is then the
+        first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
         ``seq`` order (``reset_stale_inflight``). The members are the lane's oldest contiguous rows in
@@ -9608,9 +9609,10 @@ class RegistryRunner:
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
         """Dead-letter each batch member :meth:`_split_unframeable_members` or the batch re-attach
-        refused, alone, then log it. The line used to be written in the split, before any write, so a member a later
-        refusal sent back with the whole batch was logged as dead-lettered when it was not. It goes
-        through the same throttle as the other permanent-refusal lines (BACKLOG #3043). Its reason
+        refused, alone, then log it. The line used to be written in the split, before any write, so
+        a member a later refusal sent back with the whole batch was logged as dead-lettered when it
+        was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
+        #3043). Its reason
         follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
         frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
         message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one carries

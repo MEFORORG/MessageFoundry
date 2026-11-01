@@ -769,7 +769,7 @@ from typing import Any
 #: the type rather than by any 503. A newer console on an older engine would raise ImportError at
 #: mount, so it forces a bump. Re-derived with ``--write`` (from b634db50214474e2).
 #:
-#: Vault BACKLOG #3747:``list_approvals`` now takes ``request``, for the caller's address on the
+#: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
 #: which the handshake does not catch: an older console omits ``request``, and a newer console

@@ -335,6 +335,7 @@ _REASONS = {
     FRAMING_CODE: "its frame cannot carry it",
     MULTIPLE_MESSAGES_CODE: "it holds more than one message",
     ENCODING_CODE: "its charset cannot encode it",
+    "reattach": "its document cannot be re-attached",
 }
 
 
