@@ -4,7 +4,7 @@
 
 Shared by the doc-drift tests that bind a blockquote to an executed measurement, at least
 ``tests/test_monitoring_scope_doc_drift.py``, ``tests/test_single_route_data_rules_doc_drift.py``
-and ``tests/test_retention_override_gate.py``, so a lesson learned about locating or planting fixes
+and ``tests/test_security_doc_drift.py``, so a lesson learned about locating or planting fixes
 all of them at once.
 """
 

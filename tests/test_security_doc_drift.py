@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -41,9 +42,22 @@ from messagefoundry.auth.permissions import (
     Permission,
     Role,
 )
-from messagefoundry.config.settings import AuthSettings, ServiceSettings
+from messagefoundry.config.retention_classification import (
+    BODY_ACKNOWLEDGEMENT_SETTING,
+    evaluate_retention_gate,
+)
+from messagefoundry.config.settings import (
+    AuthSettings,
+    SecurityEnforcement,
+    SecuritySettings,
+    ServiceSettings,
+    security_loosenings,
+)
+from messagefoundry.config.wiring import WiringError
 from scripts.security.route_gates import gate_of, route_rows
 from tests._ast_sites import call_sites, callee_name, calls_to, find_funcs, named_func
+from tests._doc_blockquote import blockquote_lines, plant_in_blockquote
+from tests._retention_override_graph import override_graph, override_guard
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -1756,6 +1770,11 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "verdict is _retention_gate_findings' AST read. The doc plants mutate CONFIGURATION.md "
         "prose and the verdict is _retention_doc_findings' text read, a prose claim (BACKLOG #1186)"
     ),
+    ("test_security_doc_drift.py", "test_the_override_prose_readers_detect_a_planted_violation"): (
+        "reads finding strings about prose. Each plant mutates a document and the verdict is "
+        "_override_note_findings' or _gate_audit_prose_findings' text read, a prose claim; the "
+        "code each claim describes is driven in the two tests beside it (vault BACKLOG #2368)"
+    ),
     ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
     ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
         "locates the anchor for a planted mutation, and fails loudly if it moves; the verdict is "
@@ -3297,7 +3316,7 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
 #: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
 #: `reference_snapshot_days`. The row's third claim, that a per-outbound override of 0 meets its
 #: own gate (vault BACKLOG #2368), is read here as a sentence, in `_retention_doc_findings`. The note
-#: it points to is read in `tests/test_retention_override_gate.py`, beside the guard's behaviour.
+#: it points to is read below too, in `_override_note_findings`, beside the guard's behaviour.
 
 _CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
 _RETENTION_HEADING = "### `[retention]`"
@@ -3885,6 +3904,320 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
         assert planted != section, f"doc plant {name!r} matched nothing; re-point it at the doc"
         found = _retention_doc_findings(planted, days, auto_bounded)
         assert any(expected in f for f in found), f"doc plant {name!r} was not detected: {found}"
+
+
+# --- The per-connection override note, and what the docs say the gates audit (BACKLOG #2368) ------
+#: These read documents, so they live in this module, which the docs-only leg runs (`DOC_GUARDS` in
+#: `.github/workflows/ci.yml`). In `tests/test_retention_override_gate.py`, which that leg does not
+#: run, a docs-only pull request could change the sentences, merge green and red `main`.
+
+_OVERRIDE_NOTE = "**Per-connection overrides ("
+_BODY_WINDOW = "[security].delete_message_bodies_after_days"
+_OVERRIDE_LOG = logging.getLogger("tests.security_doc_drift.retention_override")
+_OVERRIDE_AUDITED = "logs a WARNING-level `AUDIT:` line naming each connection"
+#: Each arm's bullet, in the note's order: how it opens, and at least what else it must say.
+_OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        f"- Without `{BODY_ACKNOWLEDGEMENT_SETTING} = true`, under `enforce`,",
+        ("refuses the graph and names each connection",),
+    ),
+    (
+        "- Without it, under `warn`, the gate passes the graph",
+        (_OVERRIDE_AUDITED, "with the remedy", "those bodies are kept forever"),
+    ),
+    ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
+)
+#: At least what the note must say outside the bullets.
+_OVERRIDE_NOTE_FACTS = (
+    "each time it passes such a graph",
+    "A dry-run reload counts",
+    "each engine shard writes its own",
+    # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
+    # global tiers are not in this claim: an acknowledged one writes its line on either dial.
+    "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
+    "`enforce`.",
+)
+_LOOSENING_DOC = _ROOT / "docs" / "SECURITY-LOOSENING.md"
+_PHI_DOC = _ROOT / "docs" / "PHI.md"
+_LOOSENING_RETENTION_ENTRY = "### `delete_message_bodies_after_days = 0`"
+
+
+def _override_note_findings(doc: str) -> list[str]:
+    """What the *Per-connection overrides* note in CONFIGURATION.md no longer says.
+
+    Reads prose, and only checks that at least these phrases are PRESENT. A contradicting sentence
+    added beside them is not caught."""
+    quoted = blockquote_lines(doc, _OVERRIDE_NOTE)
+    text = "\n".join(line.removeprefix(">").strip() for line in quoted)
+    # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
+    entries = [entry.replace("\n", " ") for entry in re.split(r"\n\n|\n(?=- )", text)]
+    bullets = [entry for entry in entries if entry.startswith("- ")]
+    if len(bullets) != len(_OVERRIDE_ARMS):
+        return [f"expected {len(_OVERRIDE_ARMS)} bullets in the note, found {len(bullets)}"]
+    findings: list[str] = []
+    for bullet, (opening, phrases) in zip(bullets, _OVERRIDE_ARMS, strict=True):
+        if not bullet.startswith(opening):
+            findings.append(f"no bullet in its place opens {opening!r}")
+        findings += [f"bullet {opening!r} no longer says {p!r}" for p in phrases if p not in bullet]
+    whole = " ".join(entries)
+    findings += [f"the note no longer says {p!r}" for p in _OVERRIDE_NOTE_FACTS if p not in whole]
+    return findings
+
+
+def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[str]:
+    """Where a document says the global body-window gate audits at ``warn``, which it does not.
+
+    Reads prose: each site's retired words must be gone and its corrected words present. A
+    reworded return of the old claim is not caught."""
+    entry = _section(loosening, _LOOSENING_RETENTION_ENTRY)
+    findings: list[str] = []
+    for where, text, retired, corrected in (
+        (
+            "the CONFIGURATION.md `enforcement` row",
+            config,
+            "`warn` logs + audits + continues",
+            (
+                "at least the global body-window gate in [`[retention]`](#retention) writes none "
+                "at `warn`",
+                "whose list the start's `config_loaded` audit row records",
+            ),
+        ),
+        (
+            "the SECURITY-LOOSENING.md dial paragraph",
+            loosening,
+            "downgrades them all to loud, audited warnings",
+            (
+                "at least the global body-window retention gate writes none at `warn`",
+                "whose list the start's `config_loaded` audit row records; at least some of those "
+                "rows record no list",
+            ),
+        ),
+        (
+            "the SECURITY-LOOSENING.md retention entry",
+            entry,
+            "(e.g. 30 days); a startup **AUDIT** line",
+            (
+                "Under `enforcement = warn` the gate writes no **AUDIT** line for it",
+                "the list the start's `config_loaded` audit row records carry them",
+                "It reads no other window",
+            ),
+        ),
+        (
+            "the PHI.md retention section",
+            phi,
+            "The explicit, **audited** opt-out is",
+            (
+                "Under `warn` the gate writes no `AUDIT:` line for an auto-bounded window at `0`",
+                "the start's `config_loaded` audit row records that list",
+                "The list names no window but the message-body one",
+            ),
+        ),
+    ):
+        flat = " ".join(text.split())
+        if retired in flat:
+            findings.append(f"{where} says again: {retired!r}")
+        findings += [f"{where} no longer says {c!r}" for c in corrected if c not in flat]
+    return findings
+
+
+def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The note's bullets are read, then each arm is driven and does what its bullet says."""
+    findings = _override_note_findings(_CONFIG_DOC.read_text(encoding="utf-8"))
+    assert not findings, f"the *Per-connection overrides* note drifted from the guard: {findings}"
+    registry = override_graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+
+    with pytest.raises(WiringError, match="IB_FEED"):
+        override_guard(_OVERRIDE_LOG, acknowledged=False, enforcing=True)(registry)
+    for acknowledged in (False, True):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_OVERRIDE_LOG.name):
+            override_guard(_OVERRIDE_LOG, acknowledged=acknowledged, enforcing=False)(registry)
+        (record,) = [r for r in caplog.records if r.name == _OVERRIDE_LOG.name]
+        assert record.levelno == logging.WARNING
+        assert record.getMessage().startswith("AUDIT:") and "IB_FEED" in record.getMessage()
+
+
+def test_the_docs_say_the_body_window_gate_audits_only_under_enforce() -> None:
+    """The prose is read, then the gate is driven on each arm the prose describes."""
+    findings = _gate_audit_prose_findings(
+        _CONFIG_DOC.read_text(encoding="utf-8"),
+        _LOOSENING_DOC.read_text(encoding="utf-8"),
+        _PHI_DOC.read_text(encoding="utf-8"),
+    )
+    assert not findings, f"the docs drifted from the retention gate: {findings}"
+
+    def body_lines(*, acknowledged: bool, enforcing: bool) -> list[tuple[bool, str]]:
+        """The gate's lines about the bodies, on a start it lets through."""
+        settings = ServiceSettings()
+        settings.retention.allow_unbounded_phi = acknowledged
+        settings.retention.messages_days = 0
+        # The tiers with no default of their own, or the enforcing start below would be refused.
+        settings.security.allow_keeping_transform_state_indefinitely = True
+        settings.security.allow_keeping_search_presets_indefinitely = True
+        outcome = evaluate_retention_gate(
+            settings, enforcing=enforcing, production=True, env_name="prod"
+        )
+        assert outcome.refusal is None
+        return [
+            (line.audit, line.text)
+            for line in outcome.lines
+            if _BODY_WINDOW in line.text or "INDEFINITELY" in line.text
+        ]
+
+    (audit, warning) = body_lines(acknowledged=True, enforcing=True)
+    assert audit[0] and audit[1].startswith("AUDIT:") and not warning[0]
+    # With the switch set under warn the gate says nothing about the bodies.
+    assert body_lines(acknowledged=True, enforcing=False) == []
+    # Without it, a plain stderr warning and no AUDIT line.
+    (plain,) = body_lines(acknowledged=False, enforcing=False)
+    assert not plain[0] and plain[1].startswith("warning:")
+
+    def loosenings(security: SecuritySettings) -> set[str]:
+        """What the start's ``config_loaded`` row records: `tests/test_start_config_loaded_row.py`
+        pins that row to the posture list this registry feeds."""
+        defaults = ServiceSettings()
+        names = security_loosenings(
+            security,
+            defaults.store,
+            defaults.auth,
+            defaults.alerts,
+            defaults.secret_rotation,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            path_form_fhir_hops=(),
+            api=defaults.api,
+            approvals=defaults.approvals,
+            cert_monitor=defaults.cert_monitor,
+            backup=defaults.backup,
+            secrets=defaults.secrets,
+            ai=defaults.ai,
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+            remote_debug=None,
+            startup=None,
+            service_env=None,
+        )
+        return {name for name, _risk in names}
+
+    named = loosenings(
+        SecuritySettings(enforcement=SecurityEnforcement.WARN, allow_keeping_phi_indefinitely=True)
+    )
+    assert {"enforcement", "allow_keeping_phi_indefinitely"} <= named
+    assert "delete_message_bodies_after_days" not in named
+    assert "delete_message_bodies_after_days" in loosenings(
+        SecuritySettings(delete_message_bodies_after_days=0)
+    )
+
+
+def test_the_override_prose_readers_detect_a_planted_violation() -> None:
+    """Each reader fails on a planted wrong sentence, so a clean result above means something.
+
+    Each plant checks that it changed its text, so a moved anchor fails loudly instead of mutating
+    nothing."""
+    config = _CONFIG_DOC.read_text(encoding="utf-8")
+    assert not _override_note_findings(config), "the real note must read clean before planting"
+    note_plants = {
+        # The refusal stops naming who it refused.
+        "refusal-names-nobody": (
+            "graph and names each connection. At startup",
+            "graph. At startup",
+            "names each connection",
+        ),
+        # The retired warn arm: a plain warning and no AUDIT line.
+        "warn-arm-unaudited": (
+            "the gate passes the graph and logs a WARNING-level `AUDIT:` line naming\n"
+            ">   each connection, with the remedy",
+            "the engine logs a warning naming each connection",
+            "Without it, under `warn`",
+        ),
+        # A warn arm that reads as if nothing is lost.
+        "bodies-not-kept": ("and those bodies are kept forever", "", "kept forever"),
+        "acknowledged-arm-unaudited": (
+            "the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each "
+            "connection.\n",
+            "the gate passes the graph.\n",
+            _OVERRIDE_AUDITED,
+        ),
+        # A whole arm gone. The bullet count fails before any bullet is read.
+        "bullet-dropped": (
+            "> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming "
+            "each connection.\n",
+            "",
+            "expected 3 bullets",
+        ),
+        "dry-run-dropped": ("A dry-run reload counts, and", "And", "A dry-run reload counts"),
+        # The claim this row corrected: the global gate audits on either dial.
+        "global-gate-unconditional": (
+            "its `AUDIT:` line only under `enforce`.",
+            "its `AUDIT:` line on either dial.",
+            "The startup gate for the global body windows differs",
+        ),
+    }
+    for name, (old, new, expected) in note_plants.items():
+        found = _override_note_findings(plant_in_blockquote(config, _OVERRIDE_NOTE, old, new))
+        assert any(expected in f for f in found), f"plant {name!r} was not detected: {found}"
+
+    docs = {
+        "config": config,
+        "loosening": _LOOSENING_DOC.read_text(encoding="utf-8"),
+        "phi": _PHI_DOC.read_text(encoding="utf-8"),
+    }
+    assert not _gate_audit_prose_findings(**docs), "the real docs must read clean before planting"
+    prose_plants = {
+        "enforcement-row": (
+            "config",
+            "`warn` logs + continues",
+            "`warn` logs + audits + continues",
+        ),
+        "enforcement-row-exception": ("config", "writes none at `warn`", "writes one"),
+        "dial-paragraph": (
+            "loosening",
+            "downgrades them all to loud warnings",
+            "downgrades them all to loud, audited warnings",
+        ),
+        "dial-paragraph-exception": ("loosening", "retention gate writes none at `warn`", "gate"),
+        "compensating-control": (
+            "loosening",
+            "(e.g. 30 days). Under `enforcement = enforce`, a startup\n  **AUDIT** line",
+            "(e.g. 30 days); a startup\n  **AUDIT** line",
+        ),
+        "phi-opt-out": ("phi", "The explicit opt-out is", "The explicit, **audited** opt-out is"),
+        "phi-exception": (
+            "phi",
+            "the gate writes no `AUDIT:` line",
+            "the gate writes an `AUDIT:` line",
+        ),
+        # What stands in for the retired word: each site says where the switch is recorded, and
+        # what that record cannot show.
+        "row-unnamed-in-config": (
+            "config",
+            "whose list the start's `config_loaded` audit row records",
+            "whose list no row records",
+        ),
+        "row-always-has-a-list": (
+            "loosening",
+            "; at least some of those rows record no list, such as a start whose snapshot step",
+            ". A start whose snapshot step",
+        ),
+        "other-windows-read-as-shown": ("loosening", "It reads no other window, so", "So"),
+        "phi-list-names-every-window": (
+            "phi",
+            "The list names no window but the message-body one.",
+            "The list names every window.",
+        ),
+    }
+    for name, (key, old, new) in prose_plants.items():
+        planted = docs[key].replace(old, new, 1)
+        assert planted != docs[key], f"plant {name!r} matched nothing; re-point it at the doc"
+        found = _gate_audit_prose_findings(**{**docs, key: planted})
+        assert found, f"plant {name!r} was not detected"
 
 
 def test_the_password_re_bind_role_test_is_documented_and_built() -> None:

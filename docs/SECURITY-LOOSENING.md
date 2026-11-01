@@ -309,7 +309,11 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
 **decoupled** from `production_instance` — a PHI *staging* box is now strict by default too. `enforcement`
-gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud, audited warnings.
+gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud warnings. The
+dial itself is audited through `security_loosenings()`, whose list the start's `config_loaded` audit row
+records; at least some of those rows record no list, such as a start whose snapshot step failed. A gate's
+own `AUDIT:` line is per gate: at least the global body-window retention gate writes none at `warn`, as
+its entry below says.
 
 `production_instance` defaults to the value **derived from the active environment name** (`dev` →
 non-prod, `staging` → non-prod, `prod` → prod); a custom-named environment must declare it or `serve`
@@ -509,7 +513,13 @@ false premise.
 - **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).
 - **When acceptable:** a documented retention requirement that genuinely needs keep-forever, accepted in
   writing.
-- **Compensating controls:** a bounded window (e.g. 30 days); a startup **AUDIT** line records the override.
+- **Compensating controls:** a bounded window (e.g. 30 days). Under `enforcement = enforce`, a startup
+  **AUDIT** line records the override. Under `enforcement = warn` the gate writes no **AUDIT** line for it:
+  with no opt-out it prints a plain `warning:` line to stderr, and with `allow_keeping_phi_indefinitely = true`
+  it prints nothing about the window. `security_loosenings()` names that switch and an explicit
+  `delete_message_bodies_after_days = 0`, so the start's posture warning, `GET /security/posture` and the
+  list the start's `config_loaded` audit row records carry them. It reads no other window, so none of
+  those shows that `dead_letter_days`, `reference_snapshot_days` or `processed_archive_days` is at `0`.
 - **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
   **strict enforcement** (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true`
   (which downgrades the refusal to a loud audited warning). This bullet used to say the 30-day auto-bound of

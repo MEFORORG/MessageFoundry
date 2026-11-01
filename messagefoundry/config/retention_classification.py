@@ -571,10 +571,13 @@ def _keep_forever_remedy() -> str:
     return (
         "Set each override to a positive number of days, or remove it to inherit the global "
         "window where that window is bounded; or, to deliberately retain forever, set "
-        f"{BODY_ACKNOWLEDGEMENT_SETTING}=true "
-        "(audited). That switch covers the whole instance: it also turns off the default bound "
-        f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
-        "explicit number of days first"
+        f"{BODY_ACKNOWLEDGEMENT_SETTING}=true and restart each engine, which reads that switch "
+        "only when it starts, so a reload does not pick it up. With it set, an engine writes an "
+        "AUDIT line naming these connections for each graph its guard passes. That switch covers "
+        "the whole instance: it also turns off the default bound on each of these windows that "
+        f"is unset: {auto_bounded}. The start gate writes an AUDIT line for such a window at 0 "
+        "only under "
+        "enforcement = enforce, so set each of them to an explicit number of days first"
     )
 
 

@@ -15,7 +15,6 @@ import dataclasses
 import json
 import logging
 import os
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -26,52 +25,28 @@ from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
     auto_bounded_windows,
-    evaluate_retention_gate,
     judge_keep_forever_overrides,
     keep_forever_overrides,
-    make_retention_override_guard,
 )
-from messagefoundry.config.settings import EgressSettings, ServiceSettings, StoreBackend
-from messagefoundry.config.wiring import Registry, WiringError, load_config
+from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
-from tests._doc_blockquote import blockquote_lines
 from tests._phi_gate_provisions import (
     make_syslog_ca_and_crl,
     setenv_declared_egress,
     setenv_verified_log_forwarding,
 )
+from tests._retention_override_graph import override_graph as _graph
+from tests._retention_override_graph import override_guard
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
 
-_ROOT = Path(__file__).resolve().parent.parent
 _LOG = logging.getLogger("tests.retention_override_gate")
 _ACK = "[security].allow_keeping_phi_indefinitely"
 
 
-def _graph(cfg: Path, *, inbound_days: int | None, outbound_days: int | None) -> Registry:
-    """A two-connection graph; ``None`` leaves that connection's override unset (inherit)."""
-    cfg.mkdir()
-    ib = "" if inbound_days is None else f", messages_days={inbound_days}"
-    ob = "" if outbound_days is None else f", dead_letter_days={outbound_days}"
-    (cfg / "feed.py").write_text(
-        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
-        f"inbound('IB_FEED', MLLP(port=2611), router='r'{ib})\n"
-        f"outbound('OB_FEED', MLLP(host='127.0.0.1', port=2612){ob})\n"
-        "@router('r')\n"
-        "def route(msg):\n"
-        "    return ['h']\n"
-        "@handler('h')\n"
-        "def handle(msg):\n"
-        "    return Send('OB_FEED', msg)\n",
-        encoding="utf-8",
-    )
-    return load_config(cfg)
-
-
 def _guard(*, acknowledged: bool, enforcing: bool) -> Callable[[Registry], None]:
-    return make_retention_override_guard(
-        acknowledged=acknowledged, enforcing=enforcing, env_name="prod", log=_LOG
-    )
+    return override_guard(_LOG, acknowledged=acknowledged, enforcing=enforcing)
 
 
 def _guard_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -180,39 +155,6 @@ def test_a_graph_with_no_keep_forever_override_is_silent(
     assert _guard_records(caplog) == []
 
 
-def _override_note() -> list[str]:
-    """The *Per-connection overrides* blockquote, unquoted, one entry per paragraph or bullet."""
-    doc = (_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-    quoted = blockquote_lines(doc, "**Per-connection overrides (")
-    text = "\n".join(line.removeprefix(">").strip() for line in quoted)
-    # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
-    return [entry.replace("\n", " ") for entry in re.split(r"\n\n|\n(?=- )", text)]
-
-
-def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Each bullet is read beside the arm it describes. At least the phrases below are bound."""
-    enforce, warn, acknowledged = [e for e in _override_note() if e.startswith("- ")]
-    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
-
-    assert enforce.startswith(f"- Without `{_ACK} = true`, under `enforce`,")
-    assert "refuses the graph and names each connection" in enforce
-    with pytest.raises(WiringError):
-        _guard(acknowledged=False, enforcing=True)(registry)
-
-    assert warn.startswith("- Without it, under `warn`, the gate passes the graph")
-    assert "with the remedy" in warn and "those bodies are kept forever" in warn
-    assert acknowledged.startswith("- With it, the gate passes the graph")
-    for bullet, ack in ((warn, False), (acknowledged, True)):
-        assert "logs a WARNING-level `AUDIT:` line naming each connection" in bullet
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger=_LOG.name):
-            _guard(acknowledged=ack, enforcing=False)(registry)
-        (record,) = _guard_records(caplog)
-        assert record.getMessage().startswith("AUDIT:") and "IB_FEED" in record.getMessage()
-
-
 @pytest.mark.parametrize("acknowledged", [True, False])
 def test_the_audit_line_names_no_environment_when_none_is_active(
     tmp_path: Path, acknowledged: bool
@@ -235,27 +177,24 @@ def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_pat
     assert "inherit the global window where that window is bounded" in verdict.report
 
 
-def test_the_configuration_doc_keeps_the_guard_apart_from_the_global_gate() -> None:
-    note = " ".join(_override_note())
-    assert "each time it passes such a graph" in note and "A dry-run reload counts" in note
-    assert "each engine shard writes its own" in note
-    # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
-    # global tiers are not in this claim: an acknowledged one writes its line on either dial.
-    assert (
-        "The startup gate for the global body windows differs: it writes its `AUDIT:` line only "
-        "under `enforce`." in note
+@pytest.mark.parametrize("enforcing", [True, False])
+def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
+    tmp_path: Path, enforcing: bool
+) -> None:
+    # Both arms that give the remedy. The AUDIT line under warn is written on a reload too, and an
+    # operator who reads it there must not expect a reload to pick the switch up.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=False, enforcing=enforcing, env_name="prod"
     )
-    settings = ServiceSettings()
-    settings.retention.allow_unbounded_phi = True
-    settings.retention.messages_days = 0
-
-    def audit_lines(*, enforcing: bool) -> int:
-        outcome = evaluate_retention_gate(
-            settings, enforcing=enforcing, production=True, env_name="prod"
-        )
-        return sum(line.audit and "retained INDEFINITELY" in line.text for line in outcome.lines)
-
-    assert audit_lines(enforcing=False) == 0 and audit_lines(enforcing=True) == 1
+    remedy = verdict.refusal if enforcing else verdict.report
+    assert remedy is not None
+    assert "which reads that switch only when it starts, so a reload does not" in remedy
+    # A bare "(audited)" is false of the global windows this switch also reaches. The docs guard
+    # in tests/test_security_doc_drift.py drives the gate this sentence describes.
+    assert "(audited)" not in remedy
+    assert "an engine writes an AUDIT line naming these connections" in remedy
+    assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
 
 
 def test_chained_guards_run_in_order_and_the_first_refusal_wins() -> None:
