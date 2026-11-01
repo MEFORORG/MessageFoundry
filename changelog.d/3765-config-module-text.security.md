@@ -28,11 +28,9 @@
   included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
   no output on a module that failed. An exact `WiringError` also stands only while its arguments
   are exact text, because a caller's `str()` of an object there would run the module's code past
-  that guard. A refusal that stands, and the exception kept as the cause of a rebuilt one, have
-  their tracebacks cleared, and the loader's frame drops the module, so what leaves no longer holds
-  the module's own frames or its namespace. An exception's text counts as engine wording only when
-  its frame is in the package's own files, so a module that sets `__name__` to look like the engine
-  is withheld, and so is vendored code. It also does not count when a `raise` statement outside the
+  that guard. An exception's text counts as engine wording only when its frame is in the package's
+  own files, so a module that sets `__name__` to look like the engine is withheld, and so is
+  vendored code. It also does not count when a `raise` statement outside the
   engine put it onto an existing traceback, so `raise X(text).with_traceback(exc.__traceback__)` in
   a module is withheld. So, at a small cost to the author, is `raise exc` of a refusal the module
   caught, which the traceback cannot tell from that idiom, and `raise Cls` whose constructor was
@@ -43,6 +41,7 @@
   `WiringError` itself; one that builds a class whose name holds a value; one that compiles code
   under an engine file name to forge a frame; a `SystemExit` raised while the loader reads a helper
   left to its `ImportError` guard, which leaves as raised; the frames on an interrupt's traceback,
-  which still hold the withheld exception; the loader's own frames on a refusal, which hold the
-  load's snapshot of the config files' bytes; and the traceback of an engine exception a standing
-  refusal was raised from, which can hold a module's frame.
+  which still hold the withheld exception; and the traceback of a refusal, whose module frames hold
+  that module's globals. That traceback is kept, because a logged start failure reads it to name the
+  module and line, and because the loader's own frames on it would still reach those values through
+  the load's snapshot of the files and through its registry.

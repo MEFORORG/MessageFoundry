@@ -34,7 +34,11 @@ from messagefoundry.__main__ import main
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
-from messagefoundry.exception_origin import raised_by_the_engine, worded_by_the_engine
+from messagefoundry.exception_origin import (
+    raised_by_the_engine,
+    raised_only_by_the_engine,
+    worded_by_the_engine,
+)
 from messagefoundry.pipeline import Engine
 
 #: Assembled at run time: the text a config module raises, which must never be echoed.
@@ -1111,31 +1115,6 @@ def test_no_loader_frame_on_an_interrupt_holds_the_original(tmp_path: Path) -> N
 _REFUSED_FACTORY = "Http(port=8080, reply_from='OB_X', reply_on_timeout='500')"
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        f"from messagefoundry import Http\n\n{_REFUSED_FACTORY}\n",
-        "import {probe} as probe\n\nprobe.words_its_own()\n",
-    ],
-    ids=["refusal", "engine-wording"],
-)
-def test_a_standing_refusal_holds_no_module_frame(
-    tmp_path: Path, engine_probe: str, body: str
-) -> None:
-    # A frame holds the module's globals, so an inline value, for a locals-capturing reporter.
-    _write(tmp_path, "feed.py", body.replace("{probe}", engine_probe))
-    err = _load_error(tmp_path)
-    assert "its message is withheld" not in str(err)
-    files = [
-        frame.f_code.co_filename
-        for link in (err, err.__cause__)
-        for frame, _line in traceback.walk_tb(link.__traceback__ if link else None)
-    ]
-    assert any(name.endswith("wiring.py") for name in files)  # a floor: an empty walk reads clean
-    assert not [name for name in files if name.endswith("feed.py")]
-    assert _frames_holding(err, ModuleType) == []
-
-
 def test_what_a_read_queues_is_not_drained_by_the_next_module(tmp_path: Path) -> None:
     # A read can import a helper, which queues its own body imports. The next module must not run
     # them, or a clean file is blamed for another's helper.
@@ -1635,6 +1614,22 @@ def test_who_raised_an_exception(
     exc = _raised_in(module, file, source)
     assert raised_by_the_engine(exc) is raised
     assert worded_by_the_engine(exc) is worded
+
+
+def test_a_raise_outside_the_engine_counts_only_for_the_loaders_rule() -> None:
+    # The CLI and the probes keep the frame rule: a library raising an engine exception again must
+    # not cost them its text.
+    engine: dict[str, object] = {"__name__": "messagefoundry.x"}
+    exec(compile(f"def boom():\n    {_RAISE}\n", str(_IN_THE_ENGINE), "exec"), engine)
+    outside = "try:\n    boom()\nexcept ValueError as exc:\n    raise exc\n"
+    with pytest.raises(ValueError) as ei:  # noqa: PT011 - no text to match
+        exec(
+            compile(outside, str(_IN_A_CONFIG_DIR), "exec"),
+            {**engine, "__name__": "mefor_config_a"},
+        )
+    assert raised_by_the_engine(ei.value)
+    assert not raised_only_by_the_engine(ei.value)
+    assert not worded_by_the_engine(ei.value)
 
 
 def test_an_exception_never_raised_has_no_origin() -> None:

@@ -9747,10 +9747,6 @@ def _refusal_for(
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
             if text is None:
-                # ``exc`` leaves the load from here, or stays as a cause. The module's frames on its
-                # traceback hold the module's globals, and only the withheld diagnostic reads them.
-                # By the builtin method: a module's class or instance can define its own.
-                BaseException.with_traceback(exc, None)
                 # The real type: ``__class__`` can answer WiringError, and a ``raise`` of that would
                 # leave ``validate_config``, which catches only the real one. Only text: a caller
                 # reads ``str()``, past this guard, and that runs an object in ``args``.
@@ -9827,8 +9823,6 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # helper -- is never drained by the next module, whose diagnostic would then name the wrong
         # file.
         helpers.drop_pending()
-    # This frame is on whatever leaves, and the module's namespace is what must not stay reachable.
-    del module
     if refusal is None:
         raise failure
     withheld, cause = refusal
