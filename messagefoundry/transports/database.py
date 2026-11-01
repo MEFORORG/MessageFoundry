@@ -460,8 +460,9 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when a mode keyword has a value
-    the deny-list does not name.
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
+    finds a usable mode value and no TLS keyword holds a no-TLS word. A blank, padded or non-string
+    mode value is not usable, so it does not clear the hop.
 
     Three ways to be at risk, and they read differently to an operator, so they are reported
     differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
@@ -985,7 +986,7 @@ def _warn_generic_tls_unenforced(
 
     So at construction we log the delegation: a **WARNING** when :func:`generic_odbc_tls_unenforced`
     says the hop may cross in plaintext — no TLS mode in ``odbc_params``, or one pinned to a no-TLS
-    value like ``SSLmode=disable`` — dropped to **DEBUG** when a mode keyword has any other value.
+    value like ``SSLmode=disable`` — dropped to **DEBUG** when that function returns ``None``.
 
     **This line is visibility, not the control.** It never gates or changes the connection, and until
     BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
@@ -1056,8 +1057,7 @@ def generic_cleartext_hop_guard(
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
     Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
-    connection whose ``odbc_params`` set a TLS mode the deny-list does not name returns ``None`` because
-    :func:`generic_odbc_tls_unenforced` found no reason to think the hop crosses in plaintext; the
+    connection returns ``None`` when :func:`generic_odbc_tls_unenforced` does, because it found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
     written down above :data:`_ODBC_NO_TLS_VALUES`.
 

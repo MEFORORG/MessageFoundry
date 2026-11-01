@@ -6500,7 +6500,8 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     posture-keyed weakened-TLS refusal does not apply and TLS is delegated to the operator's own driver
     keyword. ADR 0092 accepted that exemption on the strength of ONE mitigation — construction logs it —
     and a log line emitted once at startup is not the surface anyone queries three months later. This is
-    that surface.
+    that surface for the hops the classifier flags only. A hop whose mode it cannot judge is logged at
+    DEBUG and listed on no surface, so this is not an inventory of delegated hops.
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
