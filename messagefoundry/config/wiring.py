@@ -9434,6 +9434,10 @@ _SHORTEST_QUOTATION: Final = 3
 #: What the runtime raises at a limit, in the loader's own compile as well as in author code.
 _RUNTIME_LIMITS: Final = (MemoryError, RecursionError)
 
+#: The builtin descriptors, read past whatever a config module's exception class defines.
+_NAME_OF_A_TYPE: Final[Any] = type.__dict__["__name__"]
+_CAUSE_OF: Final[Any] = BaseException.__dict__["__cause__"]
+
 #: How the loader names a config file's module (:func:`_config_module_name`): the prefix, then the
 #: stem, then ``_`` and 12 hex digits. An ImportError naming a helper carries this mangled name.
 _CONFIG_MODULE_PREFIX: Final = "mefor_config_"
@@ -9457,14 +9461,39 @@ def _module_failure(
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary.
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
-    withheld diagnostic, so the fault cannot escape with ``exc`` chained as its context."""
+    withheld diagnostic, so the fault cannot escape with ``exc`` chained as its context. That
+    absorbs an interrupt landing in the read too: this runs inside a handler, so any raise from
+    here would carry ``exc``. The module is refused, which ends a load, and a ``validate`` run goes
+    on to its next module."""
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
     except BaseException as fault:  # noqa: BLE001 - see the docstring
-        if _is_an_interrupt(fault):
-            raise
-        detail = type(exc).__name__
+        _log_a_read_fault(path, fault)
+        detail = _type_name(exc)
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
+
+
+def _log_a_read_fault(path: Path, fault: BaseException) -> None:
+    """Say that reading a failed module's exception faulted: the file and the fault's type, never
+    its text, which is the module's, so ``exc_info`` stays off too."""
+    _logger.warning(
+        "config module %s: reading its failure raised %s, so the diagnostic is reduced",
+        safe_name(path.name),
+        _type_name(fault),
+    )
+
+
+def _type_name(exc: BaseException) -> str:
+    """``exc``'s class name, by the builtin descriptor: ``type(exc).__name__`` reads a metaclass's
+    own ``__name__`` or ``__getattribute__`` when a config module's class has one."""
+    name: str = _NAME_OF_A_TYPE.__get__(type(exc))
+    return name
+
+
+def _is_a(exc: BaseException | None, kinds: type[BaseException] | tuple[type, ...]) -> bool:
+    """``isinstance`` by ``exc``'s real type. ``isinstance`` itself falls back to ``exc.__class__``,
+    which runs a config module's class's ``__getattribute__``; ``issubclass`` reads no attribute."""
+    return issubclass(type(exc), kinds)
 
 
 def _failure_detail(
@@ -9493,7 +9522,7 @@ def _failure_detail(
                 seen[name] = _in_dir(name, config_dir)
             if seen[name]:
                 located = (name, frame_line)
-    detail = type(exc).__name__
+    detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
         return detail
@@ -9606,11 +9635,11 @@ def _in_dir(filename: str, directory: Path) -> bool:
         return False
 
 
-def _textless_import_error(exc: ImportError) -> ImportError:
+def _textless_import_error(exc: BaseException) -> ImportError:
     """A stand-in for ``exc`` that keeps only its type: no text, and no ``name``, which can hold a
     run-time value (``import_module(value)``) the diagnostic withholds. The engine-shard preflight
     (:mod:`messagefoundry.pipeline._config_preflight`) reads only the cause's type."""
-    return ModuleNotFoundError() if isinstance(exc, ModuleNotFoundError) else ImportError()
+    return ModuleNotFoundError() if _is_a(exc, ModuleNotFoundError) else ImportError()
 
 
 def _keeps_engine_wording(exc: BaseException) -> bool:
@@ -9620,11 +9649,9 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
     this package's own helper finder whoever wrote the import. A builtin such as ``int()`` failing
     in engine code is not engine wording, so it is withheld like a module's own text, except at a
     runtime limit, whose fixed text quotes nothing: the parser wall in the loader's ``compile``."""
-    if isinstance(exc, _NAMED_EXCEPTIONS):
+    if _is_a(exc, _NAMED_EXCEPTIONS):
         return False
-    return worded_by_the_engine(exc) or (
-        isinstance(exc, _RUNTIME_LIMITS) and raised_by_the_engine(exc)
-    )
+    return worded_by_the_engine(exc) or (_is_a(exc, _RUNTIME_LIMITS) and raised_by_the_engine(exc))
 
 
 def _foreign_links(exc: BaseException) -> list[BaseException]:
@@ -9635,23 +9662,20 @@ def _foreign_links(exc: BaseException) -> list[BaseException]:
     ]
 
 
-def _is_an_interrupt(exc: BaseException) -> bool:
-    """Whether ``exc`` is what a real interrupt raises: no text, and nothing chained that has any.
-    Code that raises one with either is not an interrupt."""
-    return (
-        type(exc) is KeyboardInterrupt
-        and not exc.args
-        and exc.__cause__ is None
-        and exc.__context__ is None
-    )
+def _carries_a_note(exc: BaseException) -> bool:
+    """Whether ``exc`` or anything it wraps has a note. A printed traceback shows a note, and
+    ``add_note`` works on a refusal a config module caught, so the frame rule says nothing of it."""
+    return any(hasattr(link, "__notes__") for link in exception_chain(exc))
 
 
 def _rewritten_refusal(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str | None:
-    """The diagnostic for ``exc``, an engine refusal, with the text it quotes from each of its
-    :func:`_foreign_links` replaced by that exception's type name, or ``None`` when it has none
-    and stands as raised (vault BACKLOG #3765 item 1).
+    """The diagnostic for ``exc``, an engine refusal, with the whole text it quotes from each of its
+    :func:`_foreign_links` replaced by that exception's type name, or ``None`` when it has none and
+    no note, and stands as raised (vault BACKLOG #3765 item 1). The caller builds a new, plain
+    ``WiringError`` from this text, so a subclass, every note and the whole chain go with it,
+    engine links included.
 
     A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
     ``int()`` or a library said, and either can quote the value it was given. A quotation in any
@@ -9660,13 +9684,14 @@ def _rewritten_refusal(
     with it, which is the cheaper failure.
 
     Reading a foreign exception runs its own code (``__str__``, ``__repr__``, a ``reason``
-    property), and that can raise anything, so a fault here withholds the whole refusal."""
+    property), and that can raise anything, so a fault here withholds the whole refusal, and
+    absorbs an interrupt as :func:`_module_failure` says."""
     try:
         foreign = _foreign_links(exc)
-        if not foreign:
+        if not foreign and not _carries_a_note(exc):
             return None
         quoted = {
-            quotation: type(link).__name__
+            quotation: _type_name(link)
             for link in foreign
             for quotation in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
             if len(quotation) >= _SHORTEST_QUOTATION
@@ -9676,12 +9701,9 @@ def _rewritten_refusal(
         for quotation in sorted(quoted, key=len, reverse=True):
             text = text.replace(quotation, f"[{quoted[quotation]} text withheld]")
     except BaseException as fault:  # noqa: BLE001 - see the docstring
-        if _is_an_interrupt(fault):
-            raise
+        _log_a_read_fault(path, fault)
         return _module_failure(path, exc, source_of)
-    return (
-        text if isinstance(exc, WiringError) else f"error loading config module {path.name}: {text}"
-    )
+    return text if _is_a(exc, WiringError) else f"error loading config module {path.name}: {text}"
 
 
 def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -> None:
@@ -9689,9 +9711,12 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     not an :class:`Exception`. ``_exec_module`` handles only that class, so anything else would
     leave the loader with its text (vault BACKLOG #3765 item 4). ``SystemExit`` is not handled here.
 
-    A bare ``KeyboardInterrupt`` still propagates: it is what a real interrupt raises, and it has no
-    text. One that carries arguments was raised by code, so it is refused like the rest."""
+    A ``KeyboardInterrupt`` stops the load, whatever is on it. A real interrupt raised during a
+    handler has a context, and code raising one looks the same, so neither can be judged by what it
+    carries; refusing one would make Ctrl-C a config error. What leaves is a new, bare one, so the
+    original's arguments, notes and chain stay behind. A subclass is not what a signal raises."""
     refused: WiringError | None = None
+    interrupted = False
     try:
         helpers.run(module, path)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
@@ -9699,11 +9724,14 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except (Exception, SystemExit):
         raise
     except BaseException as exc:
-        if _is_an_interrupt(exc):
-            raise
-        refused = WiringError(_module_failure(path, exc, helpers.source_of))
+        if type(exc) is KeyboardInterrupt:
+            interrupted = True
+        else:
+            refused = WiringError(_module_failure(path, exc, helpers.source_of))
+    # Raised AFTER the handler, for the reason _exec_module gives.
+    if interrupted:
+        raise KeyboardInterrupt
     if refused is not None:
-        # Raised AFTER the handler, for the reason _exec_module gives.
         raise refused
 
 
@@ -9724,21 +9752,23 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
             # setting -- which is the diagnostic an author needs, so it keeps its text. That relies
             # on engine raise sites not quoting a value; tests/test_config_module_error_withheld.py
             # sweeps the factories for one, and reaches no refusal that sits behind another. What
-            # it was raised from that the engine did not word can hold a value: such text is taken
-            # out of the refusal, and off the chain.
+            # it was raised from that the engine did not word can hold a value: the whole text of
+            # such an exception is taken out of the refusal, and the chain goes. A slice of that
+            # text, or a copy made before the raise, stays.
             rewritten = _rewritten_refusal(path, exc, helpers.source_of)
             if rewritten is None:
-                if isinstance(exc, WiringError):
+                if _is_a(exc, WiringError):
                     raise
                 raise WiringError(f"error loading config module {path.name}: {exc}") from exc
             withheld = WiringError(rewritten)
-            if isinstance(exc.__cause__, ImportError):
-                cause = _textless_import_error(exc.__cause__)
+            kept_cause = _CAUSE_OF.__get__(exc)
+            if _is_a(kept_cause, ImportError):
+                cause = _textless_import_error(kept_cause)
         else:
             withheld = WiringError(_module_failure(path, exc, helpers.source_of))
         # An import failure keeps a textless stand-in of its type as the cause, because the
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
-        if isinstance(exc, ImportError):
+        if _is_a(exc, ImportError):
             cause = _textless_import_error(exc)
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
@@ -9801,8 +9831,9 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
             except WiringError as exc:
                 # Not scrubbed, because the scrub would mangle the engine's own fix advice, which
                 # spells `credential_password=env(...)`. `_exec_module` has already withheld a
-                # module's own text (vault BACKLOG #3249) and any text an engine refusal wraps
-                # (vault BACKLOG #3765 item 1); it cannot reach a value a raise site interpolates.
+                # module's own text (vault BACKLOG #3249) and the whole text of a foreign exception
+                # an engine refusal wraps (vault BACKLOG #3765 item 1). It cannot reach a slice of
+                # that text, or a value a raise site interpolates.
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the

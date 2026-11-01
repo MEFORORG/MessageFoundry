@@ -9,12 +9,16 @@ can still print from the other two. A leaf that imports only the standard librar
 ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``, and
 ``__main__`` without loading anything else.
 
-The rule reads the innermost frame's module name. A config module and its helpers run as
-``mefor_config_*``, never under ``messagefoundry``."""
+The rule reads the innermost frame's compiled file name, then its module name. A module can rebind
+``__name__``, so the name alone is a claim, and a config module and its helpers run as
+``mefor_config_*`` from a file outside this package. The file name is fixed when code is compiled,
+so a module that compiles text under an engine path, and sets the name to match, still passes. This
+tells accident from engine wording: it does not stop code that sets out to forge a frame."""
 
 from __future__ import annotations
 
 import opcode
+import os
 from collections.abc import Iterator
 from types import TracebackType
 from typing import Any, Final
@@ -26,11 +30,18 @@ _RAISE_STATEMENT: Final = opcode.opmap["RAISE_VARARGS"]
 #: The builtin descriptor. A config module's exception class can define its own ``__traceback__``.
 _TRACEBACK_OF: Final[Any] = BaseException.__dict__["__traceback__"]
 
+#: This package's directory, as every module of it was imported from. Not resolved: a code object
+#: holds the path it was imported by, and this file's ``__file__`` holds the same prefix.
+_ENGINE_DIR: Final = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+#: Third-party code shipped inside the package. A ``raise`` there is not the engine's wording.
+_VENDORED_DIR: Final = f"{_ENGINE_DIR}_vendor{os.sep}"
+
 
 def exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    """``exc`` and at least these it wraps: its cause and context, and the exceptions urllib3 and
-    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once. An exception
-    group's members are not among them."""
+    """``exc`` and at least these it wraps: its cause and context, an exception group's members, and
+    the exceptions urllib3 and requests keep in ``args``, ``reason`` and ``original_error``. Each is
+    visited once."""
     seen: set[int] = set()
     todo: list[BaseException] = [exc]
     while todo:
@@ -41,17 +52,24 @@ def exception_chain(exc: BaseException) -> Iterator[BaseException]:
         yield e
         inner: list[object] = [e.__cause__, e.__context__, *e.args]
         inner += [getattr(e, "reason", None), getattr(e, "original_error", None)]
+        if isinstance(e, BaseExceptionGroup):
+            inner += e.exceptions
         todo += [i for i in inner if isinstance(i, BaseException)]
 
 
 def _engine_frame(exc: BaseException) -> TracebackType | None:
-    """The innermost entry of ``exc``'s traceback when it is in a ``messagefoundry`` module. An
-    exception that was never raised has no traceback, so it has no such entry."""
+    """The innermost entry of ``exc``'s traceback when it is in a ``messagefoundry`` module and not
+    a vendored one. An exception that was never raised has no traceback, so it has no such entry."""
     tb: TracebackType | None = _TRACEBACK_OF.__get__(exc)
     if tb is None:
         return None
     while tb.tb_next is not None:
         tb = tb.tb_next
+    file = tb.tb_frame.f_code.co_filename
+    if not file.startswith(_ENGINE_DIR) or file.startswith(_VENDORED_DIR):
+        return None
+    # The file alone is not enough: a config directory can sit inside the package, and its modules
+    # run under their own names.
     module = tb.tb_frame.f_globals.get("__name__", "")
     return tb if isinstance(module, str) and module.split(".")[0] == "messagefoundry" else None
 

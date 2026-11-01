@@ -8,13 +8,15 @@ text is author code's, and can carry any value the module held, and it reaches a
 ``messagefoundry validate`` and ``check`` output (so CI logs), the reload WARNING and the
 ``POST /connections/{name}/flag`` 409. The loader now names the exception TYPE and the line in the
 config module instead. A ``WiringError`` raised inside ``messagefoundry`` is the engine's own wording
-and keeps its text, less any text it wraps from elsewhere (vault BACKLOG #3765).
+and keeps its text, less the whole text of any foreign exception it wraps (vault BACKLOG #3765).
 
 Every planted string is assembled at run time, so no committed literal looks like a secret."""
 
 from __future__ import annotations
 
 import inspect
+import logging
+import signal
 import sys
 import textwrap
 from collections.abc import AsyncIterator, Callable
@@ -505,16 +507,42 @@ def wraps_its_own():
         words_its_own()
     except ValueError as exc:
         raise WiringError(f"wrapped: {exc}") from exc
+
+def refuses():
+    raise WiringError("engine refusal 3765")
+
+def wraps_a_group_member(value):
+    try:
+        int(value)
+    except ValueError as exc:
+        member = exc
+    raise WiringError(f"wrapped: {member}") from ExceptionGroup("several", [member])
+
+def wraps_a_noted_one(note):
+    try:
+        try:
+            refuses()
+        except WiringError as inner:
+            inner.add_note(note)
+            raise
+    except WiringError as exc:
+        raise WiringError(f"wrapped: {exc}") from exc
+
+def raises_this_type(kind):
+    raise kind()
 """
+
+#: Where the frame rule looks. The probe has no file on disk: only its code's file name is read.
+_ENGINE_DIR = Path(messagefoundry.__file__).parent
 
 
 @pytest.fixture
 def engine_probe(monkeypatch: pytest.MonkeyPatch) -> str:
-    """A module whose frames count as the engine's, to call with a planted value. Its name is what
-    the rule reads, so it needs no file under ``messagefoundry``."""
+    """A module whose frames count as the engine's, to call with a planted value. The rule reads
+    its compiled file name and its module name, so it needs no file under ``messagefoundry``."""
     name = "messagefoundry._probe_3765"
     module = ModuleType(name)
-    exec(compile(_ENGINE_SOURCE, name, "exec"), module.__dict__)
+    exec(compile(_ENGINE_SOURCE, str(_ENGINE_DIR / "_probe_3765.py"), "exec"), module.__dict__)
     monkeypatch.setitem(sys.modules, name, module)
     return name
 
@@ -802,6 +830,103 @@ def test_an_inner_error_a_library_holds_as_an_attribute_is_foreign_too(
     assert str(_load_error(tmp_path)) == "wrapped: [ValueError text withheld]"
 
 
+def test_a_refusal_quoting_an_exception_group_member_loses_its_text(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_group_member({NEEDLE!r})"))
+    err = _load_error(tmp_path)
+    assert str(err) == "wrapped: [ValueError text withheld]"
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_note_a_module_adds_to_a_refusal_does_not_ride_out(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # A printed traceback shows a note and str() does not, so a check of the text alone would pass.
+    body = (
+        "try:\n    probe.refuses()\n"
+        f"except Exception as e:\n    e.add_note({NEEDLE!r})\n    raise\n"
+    )
+    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
+    err = _load_error(tmp_path)
+    assert str(err) == "engine refusal 3765"
+    assert not hasattr(err, "__notes__")
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_note_on_a_link_of_a_kept_chain_does_not_ride_out(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_noted_one({NEEDLE!r})"))
+    err = _load_error(tmp_path)
+    assert str(err) == "wrapped: engine refusal 3765"
+    assert err.__cause__ is None and err.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "bad_class",
+    [
+        "class Bad(Exception):\n    def __getattribute__(self, name):\n"
+        f"        raise RuntimeError({NEEDLE!r})\n",
+        "class Bad(Exception):\n    @property\n    def __class__(self):\n"
+        f"        raise RuntimeError({NEEDLE!r})\n",
+        "class Bad(ImportError):\n    def __getattribute__(self, name):\n"
+        f"        raise RuntimeError({NEEDLE!r})\n",
+        "class Meta(type):\n    def __getattribute__(cls, name):\n"
+        f"        raise RuntimeError({NEEDLE!r})\n\n"
+        "class Bad(Exception, metaclass=Meta):\n    pass\n",
+        "class Meta(type):\n    @property\n    def __name__(cls):\n"
+        f"        return {NEEDLE!r}\n\n"
+        "class Bad(Exception, metaclass=Meta):\n    pass\n",
+    ],
+    ids=["getattribute", "class-property", "import-error", "metaclass", "metaclass-name"],
+)
+@pytest.mark.parametrize("raiser", ["raise Bad()", "probe.raises_this_type(Bad)"])
+def test_a_class_that_faults_when_read_cannot_escape_the_loader(
+    tmp_path: Path, engine_probe: str, bad_class: str, raiser: str
+) -> None:
+    # isinstance() falls back to the instance's __class__, and that runs the class's own code.
+    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{bad_class}\n{raiser}\n")
+    err = _load_error(tmp_path)
+    assert NEEDLE not in str(err)
+    if raiser == "raise Bad()":
+        assert "feed.py: Bad" in str(err) and "withheld" in str(err)
+    assert err.__context__ is None or NEEDLE not in str(err.__context__)
+    assert err.__cause__ is None or NEEDLE not in repr(err.__cause__)
+
+
+def test_a_fault_reading_a_failure_is_logged_with_no_text(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    body = (
+        "class Bad(Exception):\n    def __getattr__(self, name):\n"
+        f"        raise BaseException({NEEDLE!r})\n\nraise Bad()\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        (msg,) = _messages(tmp_path)
+    assert NEEDLE not in msg
+    records = [r for r in caplog.records if "reading its failure raised" in r.getMessage()]
+    assert records and "BaseException" in records[0].getMessage()
+    assert NEEDLE not in caplog.text
+    assert all(r.exc_info is None for r in records)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"__name__ = 'messagefoundry.x'\nraise ValueError({NEEDLE!r})\n",
+        "from messagefoundry.config.wiring import WiringError\n"
+        f"__name__ = 'messagefoundry.x'\nraise WiringError({NEEDLE!r})\n",
+    ],
+    ids=["value-error", "wiring-error"],
+)
+def test_a_module_that_renames_itself_is_not_engine_wording(tmp_path: Path, body: str) -> None:
+    _write(tmp_path, "feed.py", body)
+    (msg,) = _messages(tmp_path)
+    assert NEEDLE not in msg and "withheld" in msg
+
+
 # Item 4: whatever else a config module raises is a failed module, and carries no text.
 
 
@@ -813,9 +938,9 @@ def test_an_inner_error_a_library_holds_as_an_attribute_is_foreign_too(
         (f"asyncio.CancelledError({NEEDLE!r})", "CancelledError"),
         (f"Mine({NEEDLE!r})", "Mine"),
         (f"BaseExceptionGroup({NEEDLE!r}, [KeyboardInterrupt()])", "BaseExceptionGroup"),
-        (f"KeyboardInterrupt({NEEDLE!r})", "KeyboardInterrupt"),
+        (f"Stop({NEEDLE!r})", "Stop"),
     ],
-    ids=["plain", "generator-exit", "cancelled", "subclass", "group", "interrupt-with-text"],
+    ids=["plain", "generator-exit", "cancelled", "subclass", "group", "interrupt-subclass"],
 )
 def test_a_base_exception_is_a_refused_module_with_no_text(
     tmp_path: Path, raised: str, name: str
@@ -823,12 +948,13 @@ def test_a_base_exception_is_a_refused_module_with_no_text(
     _write(
         tmp_path,
         "feed.py",
-        f"import asyncio\n\nclass Mine(BaseException):\n    pass\n\nraise {raised}\n",
+        "import asyncio\n\nclass Mine(BaseException):\n    pass\n\n"
+        f"class Stop(KeyboardInterrupt):\n    pass\n\nraise {raised}\n",
     )
     before = set(sys.modules)
     err = _load_error(tmp_path)
     assert NEEDLE not in str(err)
-    assert f"feed.py: {name} at line 6" in str(err) and "withheld" in str(err)
+    assert f"feed.py: {name} at line 9" in str(err) and "withheld" in str(err)
     assert err.__cause__ is None and err.__context__ is None
     added = (sys.modules[m] for m in set(sys.modules) - before)
     assert not [m for m in added if getattr(m, "__file__", None) == str(tmp_path / "feed.py")]
@@ -853,8 +979,6 @@ def test_a_base_exception_does_not_stop_validate_reading_the_next_module(tmp_pat
 @pytest.mark.parametrize(
     "body",
     [
-        f"raise KeyboardInterrupt from ValueError({NEEDLE!r})\n",
-        f"try:\n    raise ValueError({NEEDLE!r})\nexcept ValueError:\n    raise KeyboardInterrupt\n",
         "class Bad(Exception):\n"
         f"    def __getattr__(self, name):\n        raise BaseException({NEEDLE!r})\n\n"
         "raise Bad()\n",
@@ -862,7 +986,7 @@ def test_a_base_exception_does_not_stop_validate_reading_the_next_module(tmp_pat
         f"    @property\n    def __traceback__(self):\n        raise RuntimeError({NEEDLE!r})\n\n"
         "raise Bad()\n",
     ],
-    ids=["interrupt-from", "interrupt-in-handler", "getattr-base-exception", "traceback-property"],
+    ids=["getattr-base-exception", "traceback-property"],
 )
 def test_a_module_cannot_carry_text_out_past_the_loaders_own_reads(
     tmp_path: Path, body: str
@@ -872,11 +996,46 @@ def test_a_module_cannot_carry_text_out_past_the_loaders_own_reads(
     assert NEEDLE not in msg and "withheld" in msg
 
 
-def test_a_real_interrupt_still_propagates(tmp_path: Path) -> None:
-    # What a signal raises: no arguments, so no text. Refusing it would make Ctrl-C a config error.
-    _write(tmp_path, "feed.py", "raise KeyboardInterrupt\n")
-    with pytest.raises(KeyboardInterrupt):
+def _assert_bare(exc: BaseException) -> None:
+    assert not exc.args and not hasattr(exc, "__notes__")
+    assert exc.__cause__ is None and exc.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "raise KeyboardInterrupt\n",
+        f"raise KeyboardInterrupt({NEEDLE!r})\n",
+        f"raise KeyboardInterrupt from ValueError({NEEDLE!r})\n",
+        f"try:\n    raise ValueError({NEEDLE!r})\nexcept ValueError:\n    raise KeyboardInterrupt\n",
+        f"e = KeyboardInterrupt()\ne.add_note({NEEDLE!r})\nraise e\n",
+    ],
+    ids=["bare", "with-text", "from", "in-handler", "with-note"],
+)
+def test_an_interrupt_stops_the_load_with_nothing_on_it(tmp_path: Path, body: str) -> None:
+    # Code cannot be told from a signal, so all of these stop, and none of them carries its text.
+    _write(tmp_path, "feed.py", body)
+    with pytest.raises(KeyboardInterrupt) as ei:
         load_config(tmp_path)
+    _assert_bare(ei.value)
+
+
+def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> None:
+    # Python sets a signal's KeyboardInterrupt's __context__ to whatever was being handled.
+    body = (
+        "import signal\n\n"
+        f"try:\n    raise ValueError({NEEDLE!r})\n"
+        "except ValueError:\n    signal.raise_signal(signal.SIGINT)\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    # A pytest-xdist worker can run with SIGINT ignored.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt) as ei:
+            load_config(tmp_path)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    _assert_bare(ei.value)
 
 
 # Item 3: a harness graph's knob refusal reaches its reader, through the node's captured output.
@@ -903,27 +1062,58 @@ def test_a_harness_knob_refusal_is_printed_while_the_loader_withholds_it(
 # Item 5: one rule, in one place.
 
 
-def _raised_in(module_name: str, source: str) -> BaseException:
+def _raised_in(module_name: str, file: Path, source: str) -> BaseException:
     namespace: dict[str, object] = {"__name__": module_name}
     with pytest.raises(Exception) as ei:  # noqa: PT011 - each caller's source picks the type
-        exec(compile(source, module_name, "exec"), namespace)
+        exec(compile(source, str(file), "exec"), namespace)
     return ei.value
 
 
+_IN_THE_ENGINE = _ENGINE_DIR / "x.py"
+_IN_A_CONFIG_DIR = _ENGINE_DIR.parent / "config" / "feed.py"
+
+
 @pytest.mark.parametrize(
-    ("module", "source", "raised", "worded"),
+    ("module", "file", "source", "raised", "worded"),
     [
-        ("messagefoundry.x", "raise ValueError('ours')", True, True),
-        ("messagefoundry", "raise ValueError('ours')", True, True),
-        ("messagefoundry.x", "int('x')", True, False),
-        ("messagefoundry.x", "{}['k']", True, False),
-        ("mefor_config_feed_abc", "raise ValueError('theirs')", False, False),
-        ("messagefoundry_lookalike", "raise ValueError('theirs')", False, False),
+        ("messagefoundry.x", _IN_THE_ENGINE, "raise ValueError('ours')", True, True),
+        ("messagefoundry", _ENGINE_DIR / "__init__.py", "raise ValueError('ours')", True, True),
+        ("messagefoundry.x", _IN_THE_ENGINE, "int('x')", True, False),
+        ("messagefoundry.x", _IN_THE_ENGINE, "{}['k']", True, False),
+        ("mefor_config_feed_abc", _IN_A_CONFIG_DIR, "raise ValueError('theirs')", False, False),
+        (
+            "messagefoundry_lookalike",
+            _ENGINE_DIR.parent / "messagefoundry_lookalike" / "x.py",
+            "raise ValueError('theirs')",
+            False,
+            False,
+        ),
+        ("messagefoundry.x", _IN_A_CONFIG_DIR, "raise ValueError('theirs')", False, False),
+        ("mefor_config_feed_abc", _IN_THE_ENGINE, "raise ValueError('theirs')", False, False),
+        (
+            "messagefoundry._vendor.x",
+            _ENGINE_DIR / "_vendor" / "x.py",
+            "raise ValueError('theirs')",
+            False,
+            False,
+        ),
     ],
-    ids=["raise", "package", "builtin", "lookup", "config-module", "lookalike-package"],
+    ids=[
+        "raise",
+        "package",
+        "builtin",
+        "lookup",
+        "config-module",
+        "lookalike-package",
+        "a-module-named-like-the-engine",
+        "a-config-dir-inside-the-package",
+        "vendored",
+    ],
 )
-def test_who_raised_an_exception(module: str, source: str, raised: bool, worded: bool) -> None:
-    exc = _raised_in(module, source)
+def test_who_raised_an_exception(
+    module: str, file: Path, source: str, raised: bool, worded: bool
+) -> None:
+    exc = _raised_in(module, file, source)
     assert raised_by_the_engine(exc) is raised
     assert worded_by_the_engine(exc) is worded
 

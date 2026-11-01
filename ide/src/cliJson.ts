@@ -36,9 +36,9 @@
 // module <file>: <type> ..." without the text of what the author's code raised; `_module_failure`
 // in config/wiring.py is the rule (vault BACKLOG #3249). Unvetted fact-path text remains, at least
 // a refusal a `raise` statement in the engine wrote while the module ran, which keeps its own text
-// but not text it wraps from elsewhere (vault BACKLOG #3765), and the identifier an import or name
-// error or a bad call argument names. Every command that imports config modules can print them,
-// `connection upsert` and `remove` included.
+// but not the whole text of a foreign exception it wraps (vault BACKLOG #3765), and the identifier
+// an import or name error or a bad call argument names. Every command that imports config modules
+// can print them, `connection upsert` and `remove` included.
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {
