@@ -989,9 +989,8 @@ async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers(
         rejected = await asyncio.to_thread(_verification_association, scp.sockport)
         assert rejected.is_rejected and _rj(rejected) == (0x02, 0x03, 0x02)  # local limit
         # The requestor can read the RJ before the SCP's thread fires EVT_REJECTED, so poll.
-        for _ in range(100):
-            if seen:
-                break
+        deadline = time.monotonic() + 5.0
+        while not seen and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.2)  # and give a second notify the chance to show
         assert seen == ["IB_PACS"]
