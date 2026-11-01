@@ -410,8 +410,9 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 
 # A source emits connection-lifecycle / transport events (Corepoint-style log, #46) to this OPTIONAL,
 # store-agnostic sink: ``(kind, peer_host, reason)``, where ``kind`` is a member of
-# :data:`CONNECTION_EVENT_KINDS` (the store refuses any other). The runner injects it after build
-# and binds the connection name + transport + direction; the source only knows the wire-level facts.
+# :data:`CONNECTION_EVENT_KINDS` (:class:`SourceConnector` says what happens to any other). The
+# runner injects it after build and binds the connection name + transport + direction; the source
+# only knows the wire-level facts.
 # ``None`` (the default) makes every emit site a no-op (byte-identical when off). Metadata only —
 # never a raw frame or message body; the source passes a ``safe_exc``-scrubbed reason and the store
 # scrubs again (#120).
@@ -1065,13 +1066,23 @@ class DeliveryResponse:
       frame **was received** but its content could not be parsed — **never** "no reply was received",
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
-    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest.
+    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest
+      only when a store key is configured. The store passes it through ``safe_text(detail,
+      limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
+      knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
+      every identifier: at least a lone surname such as ``Smith``, an identifier such as
+      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
+      ``response_get(dest).detail``, so a connector author keeps partner free text out of
+      ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
-      ever captured (PHI gate: a partner reply header could carry sensitive data, so it is opt-in by
-      name — never all headers). This is a **captured external value** (like the ``fhir_lookup``
-      read-only carve-out): it is read off the wire at delivery and, unlike a pure transform output,
+      ever captured: a partner reply header could carry sensitive data, so it is opt-in by name,
+      never all headers. The allow-list bounds which names are captured, not their values;
+      ``docs/PHI.md`` section 3 says what covers a captured value (BACKLOG #2984). This is a
+      **captured external value** (like the ``fhir_lookup`` read-only carve-out): it is read off
+      the wire at delivery and, unlike a pure transform output,
       reflects the partner's reply at that pass — the capture itself is deterministic per reply
       (the same names off the same reply → the same dict), so it re-ingresses re-run-stably from the
       immutable stored copy. Surfaced to a re-ingressed answer's Handler via
@@ -1146,7 +1157,10 @@ class SourceConnector(abc.ABC):
 
     Some sources also report some refusals and quarantines through :attr:`on_connection_event`,
     where capture is on; no source reports a deferral there. Each kind passed there must be a
-    member of :data:`CONNECTION_EVENT_KINDS`; the store refuses any other.
+    member of :data:`CONNECTION_EVENT_KINDS`. While the runner's connection-event queue exists, it
+    drops any other with a throttled WARNING, and the store refuses one as a backstop. At least one
+    configuration has no queue, and there every event is discarded with no row and no warning
+    (``RegistryRunner._enqueue_connection_event`` names it).
 
     **When the inbound handler raises.** The inbound handler records every message-level outcome
     itself (a parse or validation failure is an ``ERROR`` row, and it returns). An exception
@@ -1164,10 +1178,10 @@ class SourceConnector(abc.ABC):
 
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
-    answer. A sender that waits for none cannot be told to resend: there the MLLP listener records
-    ``handler_error`` and keeps the connection, and a message that was not committed is lost. That
-    is a gap in the
-    shipped listener, not a pattern to copy."""
+    answer. A sender that waits for none cannot be told to resend, and at least one shipped
+    listener loses a message that was not committed in that case: the MLLP listener records
+    ``handler_error`` and keeps the connection. It may not be the only one. That is a gap in the
+    shipped code, not a pattern to copy."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False

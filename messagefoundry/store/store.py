@@ -12241,8 +12241,13 @@ class MessageStore:
         KEY). Runs through :meth:`_run_grouped` (a single ``BEGIN`` … ``commit`` inline when group-commit
         is off; enrolled in the committer's batch when on); **no** intermediate commit. The ``response``
         table is invisible to :meth:`_maybe_finalize_message` (it scans ``queue`` only), so disposition
-        is unaffected — a delivered row finalizes ``PROCESSED`` exactly as a non-capturing one does."""
+        is unaffected — a delivered row finalizes ``PROCESSED`` exactly as a non-capturing one does.
+
+        ``detail`` is scrubbed and bounded here, as :meth:`record_ack_sent` does for its row, whatever the
+        connector put in it (BACKLOG #2984), and before the writer is taken, so the scan never holds it."""
         now = time.time() if now is None else now
+        # Whole: a slice cuts its note (#1797).
+        detail = safe_text(detail, limit=200) if detail else detail
 
         async def _body() -> None:
             cur = await self._db.execute(
@@ -12899,9 +12904,11 @@ class MessageStore:
         # touches no queue row and calls no _maybe_finalize (response is finalizer-invisible). PHI
         # fail-safe: a NAK passes ack_body=None → body NULL; an AA body is stored ONLY when the store is
         # encrypted, else NULL — default-on never persists raw ACK PHI on an unencrypted store. detail
-        # is safe_text-scrubbed (#120) + encrypted.
+        # is safe_text-scrubbed (#120) + encrypted, and scrubbed before the writer lock (BACKLOG #2984).
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
+        # Whole: a slice cuts its note (#1797).
+        scrubbed = safe_text(detail, limit=200) if detail else None
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
@@ -12917,11 +12924,8 @@ class MessageStore:
                 else None
             )
             enc_detail = (
-                self._enc(
-                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
-                    aad=cell_aad("response", "detail", message_id, dest, seq),
-                )
-                if detail
+                self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                if scrubbed is not None
                 else None
             )
             await self._db.execute(

@@ -6978,8 +6978,11 @@ class SqlServerStore:
         stable; the ``response`` table is invisible to the finalizer (it scans ``queue`` only). When
         ``reingress_to`` is set the same transaction also inserts the drainable ``Stage.RESPONSE`` work-
         row (which holds the origin non-terminal until ``ingress_handoff`` consumes it). body + detail
-        are ciphertext; outcome is plaintext."""
+        are ciphertext; outcome is plaintext. ``detail`` is scrubbed before a connection is taken
+        (BACKLOG #2984), as on SQLite."""
         now = time.time() if now is None else now
+        # Whole: a slice cuts its note (#1797).
+        detail = safe_text(detail, limit=200) if detail else detail
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -7197,6 +7200,9 @@ class SqlServerStore:
         # opens the txn; single commit. NAK body NULL; AA body only when encrypted; detail scrubbed+enc.
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
+        # Scrubbed before a pooled connection and its transaction are held (BACKLOG #2984).
+        # Whole: a slice cuts its note (#1797).
+        scrubbed = safe_text(detail, limit=200) if detail else None
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -7212,11 +7218,8 @@ class SqlServerStore:
                     else None
                 )
                 enc_detail = (
-                    self._enc(
-                        safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
-                        aad=cell_aad("response", "detail", message_id, dest, seq),
-                    )
-                    if detail
+                    self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                    if scrubbed is not None
                     else None
                 )
                 await cur.execute(

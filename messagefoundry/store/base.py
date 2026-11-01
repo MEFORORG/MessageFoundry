@@ -782,7 +782,12 @@ class QueueStore(StoreLifecycle, Protocol):
         headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
-        ``response_get(dest).headers``)."""
+        ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
+
+        ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
+        every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:

@@ -18,18 +18,22 @@ from __future__ import annotations
 
 import abc
 import ast
+import codecs
 import collections
 import collections.abc
 import configparser
 import dataclasses
 import functools
+import gc
 import io
 import itertools
 import logging
+import random
 import struct
 import sys
 import traceback
 import types
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1733,6 +1737,96 @@ def test_a_holder_traceback_drops_its_notes_and_a_syntax_errors_line_number() ->
     assert safe_traceback(ei) == logging.Formatter().formatException(ei)  # a clean one keeps them
 
 
+def test_a_bare_unicode_error_keeps_only_the_codecs_own_note() -> None:
+    # Vault BACKLOG #3340 item 7 is not restored: a caller's text note can be built from the
+    # failing input, so only the stdlib's codec note survives, as origin/main dropped the rest.
+    try:
+        codecs.decode(b"ok" + _BYTE, "utf-8")
+    except UnicodeDecodeError as exc:
+        error = exc
+    error.add_note(f"segment caf{_CHAR!r}")
+    error.add_note("while reading feed.csv")
+    error.__notes__.append(_encode_error())  # type: ignore[arg-type]
+    out = safe_traceback((type(error), error, None))
+    _assert_decode_safe(out)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert "feed.csv" not in out
+    assert out.endswith("invalid start byte\ndecoding with 'utf-8' codec failed"), out
+
+
+class _NotesRaise(UnicodeDecodeError):
+    """Its ``__notes__`` raises a Unicode error, whose ``repr()`` the stdlib puts in a note."""
+
+    @property
+    def __notes__(self) -> list[str]:  # type: ignore[override]
+        raise _encode_error()
+
+
+def test_the_stdlibs_note_for_unreadable_notes_is_not_kept() -> None:
+    # Review of vault BACKLOG #3340: "Ignored error getting __notes__: <repr>" is plain text the
+    # stdlib built, and the repr of the Unicode error it names prints the whole input.
+    error = _NotesRaise("utf-8", b"ok" + _BYTE, 2, 3, "invalid start byte")
+    ei = (type(error), error, None)
+    raw = logging.Formatter().formatException(ei)
+    assert "Ignored error getting __notes__" in raw  # control: the stdlib prints it
+    assert any(spelling in raw for spelling in _CHAR_SPELLINGS)
+    out = safe_traceback(ei)
+    assert "Ignored error getting __notes__" not in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _CollidesWithNotes:
+    """A dict key with the hash of ``"__notes__"`` whose ``__eq__`` raises once armed, so a lookup
+    of that name in a dict holding it raises. Unarmed, it can be inserted beside the real key."""
+
+    armed = False
+
+    def __hash__(self) -> int:
+        return hash("__notes__")
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            raise RuntimeError("no compare")
+        return False
+
+
+def test_a_notes_lookup_that_raises_drops_the_notes_and_does_not_crash() -> None:
+    # Review of vault BACKLOG #3340: _own_notes looked "__notes__" up in the instance dict outside
+    # its try, so a colliding key made safe_traceback raise, and logging_setup calls it directly.
+    error = UnicodeDecodeError("utf-8", b"ok" + _BYTE, 2, 3, "invalid start byte")
+    key = _CollidesWithNotes()
+    error.__dict__[key] = 1  # type: ignore[index]  # first, so a lookup of "__notes__" compares against it
+    error.add_note("decoding with 'utf-8' codec failed")  # a note the scan would otherwise keep
+    key.armed = True
+    with pytest.raises(RuntimeError):  # control: the lookup itself raises
+        dict.get(error.__dict__, "__notes__")
+    out = safe_traceback((type(error), error, None))
+    _assert_decode_safe(out)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert "codec failed" not in out  # the notes the read could not vouch for are dropped
+    assert "Ignored error getting __notes__" not in out
+
+
+def test_a_kept_codec_note_names_only_a_codec_safe_exc_would_name() -> None:
+    # Review of vault BACKLOG #3340: the stdlib's "decoding with '<name>' codec failed" quotes the
+    # name as the caller wrote it, which _names_a_codec declines to print.
+    for name, expected in (
+        ("utf-8", "decoding with 'utf-8' codec failed"),
+        ("UTF_8", "decoding with a codec failed"),
+    ):
+        try:
+            codecs.decode(b"ok" + _BYTE, name)
+        except UnicodeDecodeError as exc:
+            error = exc
+        assert error.__notes__ == [f"decoding with {name!r} codec failed"]  # control
+        out = safe_traceback((type(error), error, None))
+        assert out.endswith(f"invalid start byte\n{expected}"), out
+        assert ("'UTF_8'" in out) is False
+
+
 def _elements_read(scan: Any) -> int:
     """How many elements a scan copied out of containers and attributes: its own record of it."""
     return sum(len(elements or ()) for _arg, elements, _why in scan.nodes.values())
@@ -1860,6 +1954,906 @@ def test_a_chain_map_given_as_the_single_mapping_argument_still_answers_by_key(c
     whole = _record("%s", (held,))  # the stdlib unwraps a lone mapping; "%s" prints it whole
     _chain_filter(chain).filter(whole)
     assert whole.getMessage() == "[_Fallback holding a codec error, not rendered]"
+
+
+# --- the three gaps engine PR 2207 left (vault BACKLOG #3340, items 1 to 3) ----------------------
+
+
+class _DunderSlotError(Exception):
+    """Keeps the error in a slot whose name is a dunder, which Python does not mangle."""
+
+    __slots__ = ("__payload__",)
+
+    def __init__(self, payload: object) -> None:
+        super().__init__("bad frame")
+        self.__payload__ = payload
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.__payload__}"
+
+
+class _InnerAttributeError(Exception):
+    """Prints an attribute of a plain exception it holds, which the plain one never prints."""
+
+    def __init__(self, inner: BaseException) -> None:
+        super().__init__("bad frame")
+        self.inner = inner
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.inner.original}"  # type: ignore[attr-defined]
+
+
+class _InnerArgError(Exception):
+    """The same, with the plain exception in ``.args``."""
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.args[0].original}"
+
+
+class _CauseError(Exception):
+    """Prints its own ``__cause__``, or its ``__context__`` when it has no cause."""
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.__cause__ or self.__context__}"
+
+
+def _holding_inner(kind: type[BaseException]) -> BaseException:
+    inner = RuntimeError("failed")
+    inner.original = _encode_error()  # type: ignore[attr-defined]
+    return kind(inner)
+
+
+def _caused() -> BaseException:
+    error = _CauseError("bad frame")
+    error.__cause__ = _encode_error()
+    return error
+
+
+def _in_context() -> BaseException:
+    try:
+        try:
+            raise _encode_error()
+        except UnicodeEncodeError:
+            raise _CauseError("bad frame") from None  # suppressed in a traceback, still printed
+    except _CauseError as exc:
+        return exc
+    raise AssertionError("nothing was raised")
+
+
+_GAPS = {
+    "dunder-slot": lambda: _DunderSlotError(_encode_error()),
+    "inner-attribute": lambda: _holding_inner(_InnerAttributeError),
+    "inner-in-args": lambda: _holding_inner(_InnerArgError),
+    "cause": _caused,
+    "context": _in_context,
+}
+
+
+@pytest.mark.parametrize("make", list(_GAPS.values()), ids=list(_GAPS))
+@pytest.mark.parametrize("chain", ["engine", "tray"])
+def test_an_exception_printing_a_unicode_error_by_its_own_code_is_a_note(
+    chain: str, make: Any
+) -> None:
+    error = make()
+    assert "\\xe9" in str(error)  # control: its own __str__ prints the character
+    name = type(error).__name__
+    assert redaction.prints_a_codec_error(error)
+    assert redaction.safe_exc(error) == f"{name}: {_HOLDER}"
+    assert codec_safe_str(error) == _HOLDER
+    out = safe_traceback((type(error), error, error.__traceback__))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out.endswith(f"{name}: {_HOLDER}")
+    note = f"[{name} holding a codec error, not rendered]"
+    record = _record("got %s and %r", (error, [error]))
+    _chain_filter(chain).filter(record)
+    assert record.getMessage() == f"got {note} and [{note}]"
+
+
+class _PayloadError(Exception):
+    """Prints an attribute it holds, which origin/main read by attribute."""
+
+    def __init__(self, payload: object) -> None:
+        super().__init__("bad frame")
+        self.payload = payload
+
+    def __str__(self) -> str:
+        return f"bad frame: {self.payload}"
+
+
+class _LinkError(Exception):
+    """Has a ``__str__`` of its own, so the scan reads its chain."""
+
+    def __str__(self) -> str:
+        return "failed"
+
+
+def test_a_large_chain_cannot_starve_what_origin_main_read() -> None:
+    # Review of vault BACKLOG #3340: reading a sibling's chain spent the budget first, so a holder
+    # origin/main found by attribute printed raw. What origin/main read is read before any of it.
+    first = _LinkError("failed")
+    first.__context__ = ExceptionGroup("many", [ValueError(str(n)) for n in range(5000)])
+    held = _PayloadError(_encode_error())
+    note = "[_PayloadError holding a codec error, not rendered]"
+    record = _record("got %r", ([first, held],))
+    _chain_filter("engine").filter(record)
+    assert record.getMessage() == f"got [_LinkError('failed'), {note}]"
+
+
+def test_a_long_chain_is_read_about_once_per_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review of vault BACKLOG #3340: each link's scan read the rest of the chain, so a 900-link
+    # chain read about 400,000 objects. Counted, not timed, so a slow runner cannot flake it.
+    links = 900
+    error: BaseException = _LinkError("failed")
+    for _ in range(links - 1):
+        outer = _LinkError("failed")
+        outer.__cause__ = error
+        error = outer
+    calls = 0
+    real = redaction._attribute_values
+
+    def counted(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return real(arg, readers, limit)
+
+    monkeypatch.setattr(redaction, "_attribute_values", counted)
+    out = safe_traceback((type(error), error, None))
+    assert out.count("_LinkError: failed") == links
+    assert calls <= 4 * links, calls
+
+
+def test_a_long_chain_ending_in_a_unicode_error_is_a_note_on_every_link() -> None:
+    error: BaseException = _CauseError("bad frame")
+    error.__cause__ = _encode_error()
+    for _ in range(899):
+        outer = _CauseError("bad frame")
+        outer.__cause__ = error
+        error = outer
+    out = safe_traceback((type(error), error, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out.count(f"_CauseError: {_HOLDER}") == 900
+
+
+def test_a_plain_exception_holding_an_error_by_attribute_keeps_its_message_on_its_own() -> None:
+    # Its own __str__ prints .args alone, so it is read deeply only beneath one that may print more.
+    inner = RuntimeError("failed")
+    inner.original = _encode_error()  # type: ignore[attr-defined]
+    assert redaction.safe_exc(inner) == "RuntimeError: failed"
+    record = _record("got %s", ([inner],))
+    args = record.args
+    prepare_log_record(record)
+    assert record.args is args
+
+
+def test_a_builtin_exception_raised_from_a_unicode_error_keeps_its_own_message() -> None:
+    # A builtin __str__, an OSError's or a KeyError's included, never prints the chain.
+    for error in (OSError(2, "cannot open"), KeyError("k"), ValueError("bad")):
+        error.__cause__ = _encode_error()
+        assert not redaction.prints_a_codec_error(error)
+        assert redaction.codec_safe_str(error) == str(error)
+
+
+class _Batch(Exception):
+    """Its own ``__str__``, so what it holds is read the deep way beneath it."""
+
+    def __str__(self) -> str:
+        return "batch failed"
+
+
+@dataclasses.dataclass
+class _Held:
+    err: object
+
+
+def test_a_deep_re_read_does_not_spend_the_budget_a_later_argument_needs() -> None:
+    # Review of vault BACKLOG #3340: re-following a list's scalars beneath an exception's own code
+    # charged the budget for each one, so a codec error held by attribute later printed raw.
+    batch = _Batch("bad", [f"seg{i}" for i in range(5000)])
+    record = _record("got %r", ([batch, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def test_an_object_read_twice_is_charged_only_for_what_the_second_read_adds() -> None:
+    # Read plainly, then again beneath a holder whose own code renders it: the second read charged
+    # every attribute again, so a codec error held after both printed raw.
+    shared = types.SimpleNamespace(**{f"a{i}": i for i in range(1900)})
+    record = _record("got %r", ([_Held(shared), _Batch("bad", shared), _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+@pytest.mark.parametrize(
+    "element", [types.SimpleNamespace, _Held], ids=["simple-namespace", "dataclass"]
+)
+def test_an_object_beneath_an_exceptions_own_code_is_charged_once(element: Any) -> None:
+    # Review of vault BACKLOG #3340: the first walk met each element plainly, and the second walk
+    # charged it again to read it the deep way, so the budget ran out before an error a sibling
+    # held was read, and it printed raw where origin/main printed the note.
+    batch = _Batch("bad", [element(err=i) for i in range(1400)])
+    record = _record("got %r", ([batch, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _OwnStrError(Exception):
+    """A ``__str__`` of its own and nothing else: no slot, no attribute, no chain."""
+
+    def __str__(self) -> str:
+        return "own"
+
+
+def test_a_crowd_of_own_str_exceptions_with_no_chain_leaves_a_siblings_held_error_found() -> None:
+    # Review of vault BACKLOG #3340: each read charged both chain links even when both were None,
+    # so 1,500 such exceptions cost three units each where origin/main charged one, and an error a
+    # sibling held by attribute printed raw. Sized from the budget: one unit each fits, three do not.
+    crowd = [_OwnStrError() for _ in range(redaction._ATTRIBUTE_BUDGET // 2)]
+    record = _record("got %r", ([crowd, _Held(_encode_error())],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_Held holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+@pytest.mark.parametrize("extra", [-2000, 1000], ids=["under-budget", "over-budget"])
+def test_plain_exceptions_beneath_an_exceptions_own_code_leave_a_siblings_held_error_found(
+    extra: int,
+) -> None:
+    # Review of vault BACKLOG #3340: beneath _Batch each RuntimeError is read the deep way. Its two
+    # empty chain links were charged, and then the read itself, so more of them than the budget
+    # spent it, where origin/main never read a plain exception and printed the note.
+    batch = _Batch("bad", [RuntimeError(i) for i in range(redaction._ATTRIBUTE_BUDGET + extra)])
+    held = _Held(_encode_error())
+    # The scan's own verdict: the rendered line is cut short by its length bound before _Held.
+    assert id(held) in redaction._Scan([batch, held]).holds
+
+
+class _PrintsInnerCause(Exception):
+    """Its own ``__str__`` prints the cause of the exception it keeps on ``.inner``."""
+
+    inner: BaseException
+
+    def __str__(self) -> str:
+        return f"wrapped: {self.inner.__cause__}"
+
+    __repr__ = __str__  # a list prints its elements' repr()
+
+
+def test_a_deep_re_read_reads_the_chain_links_a_large_dict_would_crowd_out() -> None:
+    # Review of vault BACKLOG #3340: the deep re-read read the whole __dict__ again up to the
+    # budget, dropped what the plain read had found, and never reached the chain links after it.
+    shared = OSError("cannot open")
+    for i in range(3000):
+        setattr(shared, f"a{i}", i)
+    shared.__cause__ = _encode_error()
+    holder = _PrintsInnerCause("bad")
+    holder.inner = shared
+    assert "\\xe9" in repr([shared, holder])  # control: its own code prints the character
+    record = _record("got %s", ([shared, holder],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "[_PrintsInnerCause holding a codec error, not rendered]" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _NoDictOwner:
+    pass
+
+
+class _ForeignDictError(Exception):
+    """Its class puts another class's ``__dict__`` getset under ``__dict__``, so reading the
+    instance dict through it raises ``TypeError``, and the scan fails closed on it."""
+
+    __dict__ = _NoDictOwner.__dict__["__dict__"]
+
+    def __str__(self) -> str:
+        return "h"
+
+
+def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -> None:
+    # Review of vault BACKLOG #3340: the large-__dict__ check read the reader outside the try,
+    # so its TypeError ended the scan and the whole argument was withheld, not one element.
+    record = _record("got %s", ([_ForeignDictError(), _encode_error()],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert "position 3" in out  # the codec error's safe text: its sibling did not take it down
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+class _ForeignDictPrintsVars(_ForeignDictError):
+    """Its own ``__str__`` reads ``vars(self)``, which raises through the foreign reader."""
+
+    def __str__(self) -> str:
+        return f"ctx {vars(self)!r}"
+
+
+def test_a_foreign_dict_reader_still_fails_closed_rather_than_rendering() -> None:
+    # Review of vault BACKLOG #3340: reading such a dict through BaseException's own reader let
+    # safe_exc reach str(exc), which raised, where origin/main returned the fixed note.
+    error = _ForeignDictPrintsVars("bad")
+    with pytest.raises(TypeError):  # control: its own str() raises
+        str(error)
+    assert redaction.safe_exc(error) == f"_ForeignDictPrintsVars: {redaction._HOLDER_TEXT}"
+    assert codec_safe_str(error) == redaction._HOLDER_TEXT
+
+
+@dataclasses.dataclass
+class _ForeignDictData:
+    """A dataclass whose ``__dict__`` reader is another class's, so reading it raises."""
+
+    value: int = 0
+    __dict__ = _NoDictOwner.__dict__["__dict__"]
+
+
+def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review of vault BACKLOG #3340: the added pass's own fail-closed arm needs an unreadable object
+    # that only it reaches. The dataclass sits behind a __cause__ link, which only the added pass
+    # reads.
+    data = _ForeignDictData()
+    inner = RuntimeError("inner")
+    inner.payload = data  # type: ignore[attr-defined]
+    holder = _PrintsInnerCause("bad")
+    holder.__cause__ = inner
+    scan = redaction._Scan(holder, charged_root=True)
+    assert scan.nodes[id(data)][1:] == (None, "TypeError")  # marked unreadable
+    assert id(holder) in scan.holds
+    assert redaction.prints_a_codec_error(holder)
+    # Control: with no added pass, nothing reaches it, so the mark above is the added pass's own.
+    monkeypatch.setattr(redaction, "_added_pass", lambda *args: (args[-1], [], 0))
+    assert id(data) not in redaction._Scan(holder, charged_root=True).nodes
+
+
+# --- the added pass never undoes the first (vault BACKLOG #3340) -------------------------------
+# Five review rounds each found an ordering of the scan's reads under which a codec error the first
+# pass found printed raw. The added pass now runs after the first pass, on what it left, and only
+# adds, so each scenario below must hold at least where the first pass alone holds. The expected
+# sets are the verdicts of the scan with no added pass, at engine commit 68820faf03 (origin/main
+# when this was written), computed once by running that commit's redaction.py on these builders.
+
+
+@dataclasses.dataclass
+class _Big:
+    data: object
+
+
+class _SlotThenAttribute(Exception):
+    """A slot read before the attribute its own ``__str__`` prints."""
+
+    __slots__ = ("payload",)
+    payload: object
+
+    def __str__(self) -> str:
+        return f"bad: {self.ctx}"  # type: ignore[attr-defined]
+
+
+class _PrintsTail(Exception):
+    """Prints one attribute that sits at the end of a large ``__dict__``."""
+
+    def __str__(self) -> str:
+        return f"bad: {self.z!r}"  # type: ignore[attr-defined]
+
+
+class _HoldsData(Exception):
+    """Prints its own ``__cause__``, and keeps a list of dataclasses on ``.data``."""
+
+    def __str__(self) -> str:
+        return f"bad: {self.__cause__}"
+
+
+type _Scenario = tuple[str, object, dict[str, object]]
+
+
+def _with_attributes(error: BaseException, count: int, prefix: str = "a") -> BaseException:
+    for n in range(count):
+        setattr(error, f"{prefix}{n}", n)
+    return error
+
+
+def _repeated_dataclass() -> _Scenario:
+    held = _Held(_encode_error())
+    arg = [held, _Big(list(range(3000))), _Big(list(range(3000))), held]
+    return "arg", arg, {"held": held, "arg": arg}
+
+
+def _slot_then_attribute(mode: str) -> _Scenario:
+    error = _SlotThenAttribute("x")
+    error.payload = list(range(5000))
+    error.ctx = [_encode_error()]  # type: ignore[attr-defined]
+    return mode, ([error] if mode == "arg" else error), {"error": error}
+
+
+def _dict_tail() -> _Scenario:
+    error = _with_attributes(_PrintsTail("x"), 4093)
+    error.z = _encode_error()  # type: ignore[attr-defined]
+    _with_attributes(error, 50, "b")
+    error.__context__ = ValueError("ctx")
+    error.__cause__ = ValueError("cause")
+    return "exc", error, {"error": error}
+
+
+def _args_and_large_dict() -> _Scenario:
+    error = _with_attributes(_CauseError(*range(10)), 4090)
+    error.__cause__ = _encode_error()
+    return "exc", error, {"error": error}
+
+
+def _large_dict_hides_cause() -> _Scenario:
+    error = _with_attributes(_CauseError("bad frame"), redaction._ATTRIBUTE_BUDGET + 10)
+    error.__cause__ = _encode_error()
+    return "exc", error, {"error": error}
+
+
+def _dataclass_crowd(then_error: bool) -> _Scenario:
+    error = _HoldsData("x")
+    data: list[object] = [_Held(i) for i in range(1300)]
+    if then_error:
+        data.append(_encode_error())
+    error.data = data  # type: ignore[attr-defined]
+    error.__cause__ = RuntimeError(_encode_error())
+    return "exc", error, {"error": error}
+
+
+def _group_context() -> _Scenario:
+    first = _LinkError("failed")
+    first.__context__ = ExceptionGroup("many", [ValueError(str(n)) for n in range(5000)])
+    held = _PayloadError(_encode_error())
+    arg = [first, held]
+    return "arg", arg, {"first": first, "held": held, "arg": arg}
+
+
+def _outer_link_starves() -> _Scenario:
+    inner = RuntimeError(_encode_error())
+    prints = _CauseError("x")
+    prints.__cause__ = inner
+    large = RuntimeError(list(range(10000)))
+    large.__cause__ = prints
+    outer = _LinkError("r")
+    outer.__cause__ = large
+    # In the order safe_traceback scans them: each link, then its cause.
+    return "chain", outer, {"outer": outer, "large": large, "prints": prints, "inner": inner}
+
+
+def _shared_beneath(payload: bool) -> _Scenario:
+    if payload:
+        shared: BaseException = _PayloadError(_encode_error())
+    else:
+        shared = RuntimeError("x")
+        shared.original = _encode_error()  # type: ignore[attr-defined]
+    plain, own = _Held(shared), _Batch(shared)
+    arg = [[plain, own]]
+    return "arg", arg, {"plain": plain, "own": own, "shared": shared, "arg": arg}
+
+
+def _hidden_dict_beside_a_holder() -> _Scenario:
+    # The first pass reads no instance dict the class hides behind `__dict__ = None`, as on
+    # origin/main, so a large one cannot spend the budget a sibling holder needs.
+    hidden = _with_attributes(_ShadowedDict("x"), 5000)
+    held = _Held(_encode_error())
+    error = RuntimeError(hidden, held)
+    return "exc", error, {"error": error, "hidden": hidden, "held": held}
+
+
+_DIFFERENTIAL: dict[str, Any] = {
+    "repeated-dataclass": _repeated_dataclass,
+    "large-slot-before-dict-value": functools.partial(_slot_then_attribute, "exc"),
+    "large-slot-before-dict-value-logged": functools.partial(_slot_then_attribute, "arg"),
+    "dict-tail-the-first-pass-reads": _dict_tail,
+    "args-and-a-large-dict": _args_and_large_dict,
+    "large-dict-hides-cause": _large_dict_hides_cause,
+    "1300-dataclasses": functools.partial(_dataclass_crowd, False),
+    "1300-dataclasses-then-an-error": functools.partial(_dataclass_crowd, True),
+    "group-context-before-a-holder": _group_context,
+    "outer-link-starves-a-later-one": _outer_link_starves,
+    "shared-by-plain-and-own-code-holder": functools.partial(_shared_beneath, True),
+    "shared-plain-exception-holding-by-attribute": functools.partial(_shared_beneath, False),
+    "hidden-dict-beside-a-holder": _hidden_dict_beside_a_holder,
+}
+
+#: Which targets the scan with no added pass found holding an error (engine commit 68820faf03).
+_FIRST_PASS_HOLDS: dict[str, frozenset[str]] = {
+    "repeated-dataclass": frozenset({"arg", "held"}),
+    "large-slot-before-dict-value": frozenset({"error"}),
+    "large-slot-before-dict-value-logged": frozenset({"error"}),
+    "dict-tail-the-first-pass-reads": frozenset({"error"}),
+    "args-and-a-large-dict": frozenset(),
+    "large-dict-hides-cause": frozenset(),
+    "1300-dataclasses": frozenset(),
+    "1300-dataclasses-then-an-error": frozenset({"error"}),
+    "group-context-before-a-holder": frozenset({"arg", "held"}),
+    "outer-link-starves-a-later-one": frozenset({"inner"}),
+    "shared-by-plain-and-own-code-holder": frozenset({"arg", "own", "plain", "shared"}),
+    "shared-plain-exception-holding-by-attribute": frozenset(),
+    "hidden-dict-beside-a-holder": frozenset({"error", "held"}),
+}
+
+
+def _verdicts(build: Any) -> set[str]:
+    mode, root, targets = build()
+    if mode == "chain":  # as safe_traceback asks, one share for the whole traceback
+        share = redaction._ScanShare()
+        return {
+            name
+            for name, exc in targets.items()
+            if redaction.prints_a_codec_error(exc, share=share)
+        }
+    holds = redaction._Scan(root, charged_root=mode == "exc").holds
+    return {name for name, obj in targets.items() if id(obj) in holds}
+
+
+@pytest.mark.parametrize("name", list(_DIFFERENTIAL))
+def test_the_added_pass_holds_wherever_the_first_pass_alone_holds(name: str) -> None:
+    assert _verdicts(_DIFFERENTIAL[name]) >= _FIRST_PASS_HOLDS[name]
+
+
+def test_the_added_pass_reaches_what_only_it_reads() -> None:
+    # A control for the test above: the added pass does find what the first pass never reads.
+    assert {"own", "arg"} <= _verdicts(_DIFFERENTIAL["shared-plain-exception-holding-by-attribute"])
+
+
+class _SlotOnly(Exception):
+    """A slot of its own and the builtin ``__str__`` and ``__repr__``."""
+
+    __slots__ = ("code",)
+    code: object
+
+
+def _fuzz_graph(seed: int) -> _Scenario:
+    """One random graph of containers, dataclasses and exceptions, some large enough to spend the
+    budget, with codec errors among them. Every non-scalar is a target, named in creation order."""
+    rng = random.Random(seed)
+    named: dict[str, object] = {}
+
+    def keep[T](obj: T) -> T:
+        named[f"n{len(named)}"] = obj
+        return obj
+
+    def pad(error: BaseException) -> BaseException:
+        return _with_attributes(error, rng.choice((0, 0, 3, 2000, 4100)))
+
+    def exc(depth: int) -> BaseException:
+        child = value(depth)
+        return child if isinstance(child, BaseException) else keep(RuntimeError(child))
+
+    def value(depth: int) -> object:
+        roll = rng.random()
+        if depth >= 4 or roll < 0.25:
+            leaf = rng.random()
+            if leaf < 0.3:
+                return keep(_encode_error())
+            if leaf < 0.6:
+                return rng.randrange(100)
+            return keep(list(range(rng.choice((3, 60, 3000, 5000)))))
+        return node(depth + 1)
+
+    def node(depth: int) -> object:
+        kind = rng.randrange(12)
+        kids = [value(depth) for _ in range(rng.randrange(1, 4))]
+        if kind == 0:
+            return keep(kids)
+        if kind == 1:
+            return keep({f"k{i}": kid for i, kid in enumerate(kids)})
+        if kind == 2:
+            return keep(_Held(kids[0] if kids else None))
+        if kind == 3:
+            return keep(pad(RuntimeError(*kids)))
+        if kind == 4:
+            error = keep(pad(RuntimeError("x")))
+            error.original = value(depth)  # type: ignore[attr-defined]
+            return error
+        if kind == 5:
+            return keep(pad(_PayloadError(kids[0] if kids else None)))
+        if kind == 6:
+            return keep(pad(_Batch(*kids)))
+        if kind == 7:
+            error = keep(pad(_CauseError("x")))
+            error.__cause__ = exc(depth)
+            return error
+        if kind == 8:
+            hidden = keep(_ShadowedDict("x"))
+            pad(hidden)
+            hidden.payload = kids[0] if kids else None
+            return hidden
+        if kind == 9:
+            slotted = keep(_Slotted("x"))
+            slotted.payload = kids[0] if kids else None
+            return slotted
+        if kind == 10:
+            only = keep(_SlotOnly("x"))
+            only.code = kids[0] if kids else None
+            return only
+        error = keep(pad(_LinkError("x")))
+        error.__context__ = exc(depth)
+        return error
+
+    mode = rng.choice(("arg", "arg", "exc", "chain"))
+    if mode == "arg":
+        root = node(0)
+        return "arg", root, named
+    root = exc(0)
+    if mode == "exc":
+        return "exc", root, named
+    # The links in the order safe_traceback scans them: each link, then its context, then its
+    # cause, each once.
+    links: dict[str, object] = {}
+    pending: list[BaseException | None] = [root]
+    seen: set[int] = set()
+    while pending:
+        link = pending.pop()
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        links[f"n{list(map(id, named.values())).index(id(link))}"] = link
+        pending.append(link.__cause__)
+        pending.append(link.__context__)
+    return "chain", root, links
+
+
+_FUZZ_SEED = 3340
+_FUZZ_GRAPHS = 300
+#: For each graph whose verdicts on engine commit 68820faf03 hold anything, the targets they hold,
+#: worked out by running that commit's redaction.py on the same graphs. A graph not listed holds none.
+_FUZZ_MAIN_HOLDS: dict[int, frozenset[str]] = {
+    4: frozenset({"n0", "n21", "n22"}),
+    5: frozenset({"n31", "n32", "n86"}),
+    6: frozenset({"n15"}),
+    10: frozenset({"n18"}),
+    26: frozenset({"n0"}),
+    27: frozenset({"n0", "n1", "n2", "n3", "n8", "n9", "n32", "n33"}),
+    41: frozenset({"n0"}),
+    52: frozenset({"n3"}),
+    59: frozenset({"n37"}),
+    68: frozenset({"n0", "n5"}),
+    69: frozenset({"n0", "n3", "n4"}),
+    77: frozenset({"n8", "n9"}),
+    82: frozenset({"n0", "n2", "n3", "n12", "n25", "n26"}),
+    83: frozenset({"n0", "n1", "n22"}),
+    86: frozenset({"n0", "n11", "n12", "n13"}),
+    101: frozenset({"n0", "n2", "n5", "n19", "n20"}),
+    104: frozenset({"n0"}),
+    110: frozenset({"n0"}),
+    112: frozenset({"n4"}),
+    121: frozenset({"n0"}),
+    130: frozenset({"n1", "n2", "n7", "n8", "n32"}),
+    131: frozenset({"n0", "n17"}),
+    133: frozenset({"n23", "n24", "n43", "n44"}),
+    134: frozenset({"n11"}),
+    135: frozenset({"n4", "n5", "n6", "n7"}),
+    137: frozenset({"n8", "n9", "n12"}),
+    149: frozenset({"n0", "n21"}),
+    158: frozenset({"n0", "n34", "n47", "n48", "n49"}),
+    163: frozenset({"n0", "n29", "n30", "n31"}),
+    171: frozenset({"n10", "n11", "n18", "n19", "n21", "n22"}),
+    180: frozenset({"n36"}),
+    184: frozenset({"n0", "n1"}),
+    193: frozenset({"n24"}),
+    198: frozenset({"n25", "n26", "n27", "n28"}),
+    208: frozenset({"n0", "n3", "n16", "n29", "n30", "n31"}),
+    213: frozenset({"n0", "n2", "n15", "n16"}),
+    221: frozenset({"n0", "n6"}),
+    229: frozenset({"n10", "n11"}),
+    237: frozenset({"n0", "n1"}),
+    241: frozenset({"n54", "n62", "n63", "n71", "n72"}),
+    245: frozenset({"n5"}),
+    246: frozenset({"n3", "n4", "n5", "n6", "n14", "n19"}),
+    251: frozenset({"n52"}),
+    255: frozenset({"n9"}),
+    256: frozenset({"n0", "n1", "n20", "n21"}),
+    264: frozenset({"n0", "n1", "n2"}),
+    267: frozenset({"n0", "n1"}),
+    273: frozenset({"n51"}),
+    274: frozenset({"n0"}),
+    285: frozenset({"n31"}),
+    291: frozenset({"n0", "n2", "n10", "n13", "n15", "n32", "n48", "n49"}),
+    293: frozenset({"n0", "n2", "n3", "n4", "n5", "n20", "n40"}),
+    295: frozenset({"n0", "n1", "n2", "n4", "n8", "n9", "n32", "n33"}),
+    297: frozenset({"n30"}),
+}
+
+
+@pytest.mark.parametrize("index", range(_FUZZ_GRAPHS))
+def test_the_added_pass_holds_wherever_the_first_pass_alone_holds_on_random_graphs(
+    index: int,
+) -> None:
+    graph = functools.partial(_fuzz_graph, _FUZZ_SEED * 1000 + index)
+    assert _verdicts(graph) >= _FUZZ_MAIN_HOLDS.get(index, frozenset())
+
+
+def test_the_random_graphs_reach_both_verdicts() -> None:
+    # A control for the test above: the graphs are neither all holding nor all empty.
+    assert 0 < len(_FUZZ_MAIN_HOLDS) < _FUZZ_GRAPHS
+
+
+def _scanned_class() -> weakref.ref[type[BaseException]]:
+    class Slotted(Exception):
+        __slots__ = ("code",)
+        code: object
+
+    error = Slotted("y")
+    error.code = 1
+    redaction.safe_exc(error)
+    redaction.prints_a_codec_error(error)
+    safe_traceback((Slotted, error, None))
+    return weakref.ref(Slotted)
+
+
+def test_a_scanned_exception_class_is_not_kept_alive_past_the_scan() -> None:
+    # Review of vault BACKLOG #3340: the added pass's readers were cached with the first pass's,
+    # and a slot's descriptor holds its class, so an exception class origin/main let go stayed
+    # alive until the cache filled.
+    alive = _scanned_class()
+    gc.collect()
+    assert alive() is None
+
+
+class _CountedRow(collections.namedtuple("_CountedRow", "value")):  # noqa: PYI024 - a subclass
+    """Counts each time its own ``__repr__`` runs."""
+
+    calls = 0
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        return "row"
+
+
+def test_an_exception_holder_renders_none_of_what_it_holds() -> None:
+    # Review of vault BACKLOG #3340: a holder exception's elements, now including what the added
+    # pass read from its attributes, were each rendered, a container subclass by its own __repr__,
+    # and the text thrown away for the fixed note.
+    plain = ValueError("x")
+    plain.row = _CountedRow(_encode_error())  # type: ignore[attr-defined]
+    own = _LinkError("y")
+    own.inner = plain  # type: ignore[attr-defined]
+    _CountedRow.calls = 0
+    record = _record("got %r", ([plain, own],))
+    RedactionFilter().filter(record)
+    out = record.getMessage()
+    assert out == f"got [[ValueError {_HOLDER[1:]}, [_LinkError {_HOLDER[1:]}]"
+    assert _CountedRow.calls == 0
+
+
+class _Slotted(Exception):
+    """Prints its last slot; the slots before it are never assigned."""
+
+    __slots__ = ("a", "b", "c", "d", "payload")
+    payload: object
+
+    def __str__(self) -> str:
+        return f"slotted: {self.payload}"
+
+
+@pytest.mark.parametrize("pad", [4085, 4086, 4087, 4088])
+def test_a_verdict_is_not_handed_on_from_a_read_cut_short_by_unassigned_slots(pad: int) -> None:
+    # Review of vault BACKLOG #3340: the outer link's scan tried the four unassigned slots, ran
+    # out of limit before .payload, still had budget left, and handed on "holds none" to the
+    # inner link, whose own first pass reads .payload and finds the error.
+    inner = _Slotted("x")
+    inner.payload = _encode_error()
+    outer = _with_attributes(_LinkError("failed"), pad)
+    outer.__cause__ = inner
+    out = safe_traceback((type(outer), outer, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert f"_Slotted: {_HOLDER}" in out
+
+
+def test_a_long_chain_with_a_large_payload_is_not_read_once_per_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review of vault BACKLOG #3340: each link's scan ran out on the payload and handed nothing on,
+    # so 900 links each read the rest of the chain. Counted, not timed.
+    links = 900
+    error: BaseException = _LinkError("failed")
+    error.payload = list(range(5000))  # type: ignore[attr-defined]
+    for _ in range(links - 1):
+        outer = _LinkError("failed")
+        outer.__cause__ = error
+        error = outer
+    calls = 0
+    real = redaction._children
+
+    def counted(arg: Any, kind: type[Any], limit: int | None = None) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return real(arg, kind, limit)
+
+    monkeypatch.setattr(redaction, "_children", counted)
+    out = safe_traceback((type(error), error, None))
+    assert out.count("_LinkError: failed") == links
+    assert calls <= 8 * links, calls
+
+
+class _ManySlots(Exception):
+    """Its own ``__str__`` and 200 slots it never assigns, beside the one it prints."""
+
+    __slots__ = (*(f"s{i}" for i in range(200)), "payload")
+    payload: object
+
+    def __str__(self) -> str:
+        return f"many: {self.payload}"
+
+
+def test_the_added_readers_are_worked_out_once_per_class_not_once_per_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review of vault BACKLOG #3340: the readers each added read takes beyond the reads before it
+    # were worked out twice for every object, in time quadratic in the slots, though they depend
+    # only on the class. Counted, not timed.
+    calls = 0
+    real = redaction._added_readers
+
+    def counted(had: tuple[Any, ...], target: tuple[Any, ...]) -> tuple[Any, ...]:
+        nonlocal calls
+        calls += 1
+        return real(had, target)
+
+    monkeypatch.setattr(redaction, "_added_readers", counted)
+    crowd = []
+    for i in range(500):
+        one = _ManySlots("x")
+        one.payload = i
+        crowd.append(one)
+    held = _ManySlots("y")
+    held.payload = _encode_error()
+    scan = redaction._Scan([crowd, held])
+    assert id(held) in scan.holds  # the verdict the cache must not change
+    assert not any(id(one) in scan.holds for one in crowd)
+    assert calls <= 3, calls  # the three a class's record holds, whatever the instance count
+
+
+class _ShadowedDict(Exception):
+    """A class attribute named ``__dict__`` hides the descriptor, not the instance dict."""
+
+    __dict__ = None  # type: ignore[assignment]
+    payload: object
+
+    def __str__(self) -> str:
+        return f"bad: {self.payload}"
+
+
+def test_a_class_attribute_named_dict_does_not_hide_an_exceptions_attributes() -> None:
+    # Review of vault BACKLOG #3340: the instance dict's reader was looked up by name on the
+    # class, so `__dict__ = None` made the walk skip every instance attribute.
+    exc = _ShadowedDict("x")
+    exc.payload = _encode_error()
+    assert "payload" in redaction._EXC_DICT.__get__(exc)  # the control: it really holds it
+    out = redaction.safe_exc(exc)
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert out == f"_ShadowedDict: {_HOLDER}"
+
+
+class _UnreadableClass:
+    """Reading its ``__class__``, as ``isinstance`` does for an object that is not a class, raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type[Any]:
+        raise RuntimeError("no class")
+
+
+def test_a_builtins_value_whose_class_raises_is_skipped_not_raised() -> None:
+    # Review of vault BACKLOG #3340: built with isinstance(), a value put into builtins whose
+    # __class__ raises would have made `import messagefoundry.redaction` raise.
+    odd = _UnreadableClass()
+    with pytest.raises(RuntimeError):
+        isinstance(odd, type)  # the control: the old comprehension's test raises on it
+    found = redaction._builtin_exc_renders({"odd": odd, "KeyError": KeyError})
+    assert found == {id(KeyError.__dict__["__str__"])}
 
 
 async def test_an_unreadable_trust_anchor_refusal_names_no_byte(

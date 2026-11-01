@@ -1310,7 +1310,9 @@ class _RecordingAlertSink:
     ) -> None:
         self.saturations.append((name, stage, depth, depth_start, growth_per_second))
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
         self.errors.append((name, kind))
 
     def connection_restored(self, name: str) -> None: ...

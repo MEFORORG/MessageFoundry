@@ -5250,8 +5250,11 @@ class PostgresStore:
         ``conn.transaction()``). ``response_seq`` is ``1 + MAX(seq)`` per ``(message_id,
         destination_name)`` so it is replay-stable, and the ``response`` table is invisible to the
         finalizer (it scans ``queue`` only). When ``reingress_to`` is set (Increment 2) the same
-        transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite)."""
+        transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite).
+        ``detail`` is scrubbed before a connection is taken (BACKLOG #2984), as on SQLite."""
         now = time.time() if now is None else now
+        # Whole: a slice cuts its note (#1797).
+        detail = safe_text(detail, limit=200) if detail else detail
         guard, guard_args = self._resolve_guard(4)
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
@@ -5741,6 +5744,9 @@ class PostgresStore:
         # (seq SELECT + INSERT); finalizer-invisible; NAK body NULL; AA body only when encrypted.
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
+        # Scrubbed before a pooled connection and its transaction are held (BACKLOG #2984).
+        # Whole: a slice cuts its note (#1797).
+        scrubbed = safe_text(detail, limit=200) if detail else None
         async with self._timed_acquire() as conn, conn.transaction():
             seq = await conn.fetchval(
                 "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -5755,11 +5761,8 @@ class PostgresStore:
                 else None
             )
             enc_detail = (
-                self._enc(
-                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
-                    aad=cell_aad("response", "detail", message_id, dest, seq),
-                )
-                if detail
+                self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                if scrubbed is not None
                 else None
             )
             await conn.execute(

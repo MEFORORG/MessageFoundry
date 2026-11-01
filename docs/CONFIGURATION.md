@@ -1592,7 +1592,10 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > operating system's own proxy settings, `[egress].proxy_url` and a per-connection `proxy` alike, and
 > no `NO_PROXY` entry is needed. A proxy setting that a loopback destination makes inert is logged at
 > INFO when the connection is built, and the static-credential report lists no proxy credential for
-> a connection whose every target is loopback. An off-box hop still uses the proxy.
+> a connection whose every target is loopback. An off-box hop still uses the proxy. Which spellings
+> of a host count as loopback is stated on
+> [`is_loopback_hop_host`](../messagefoundry/config/tls_policy.py). The proxy rule reads it through
+> `bounded_read.is_never_proxied_host`, which reads an empty host as off-box.
 >
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
 > endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
