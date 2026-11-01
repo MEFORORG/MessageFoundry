@@ -34,11 +34,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
-from messagefoundry.exception_origin import (
-    exception_chain,
-    raised_by_the_engine,
-    worded_by_the_engine,
-)
+from messagefoundry.exception_origin import raised_by_the_engine, worded_by_the_engine
 from messagefoundry.pipeline import Engine
 
 #: Assembled at run time: the text a config module raises, which must never be echoed.
@@ -1120,27 +1116,24 @@ _REFUSED_FACTORY = "Http(port=8080, reply_from='OB_X', reply_on_timeout='500')"
     [
         f"from messagefoundry import Http\n\n{_REFUSED_FACTORY}\n",
         "import {probe} as probe\n\nprobe.words_its_own()\n",
-        "from messagefoundry import Http\n"
-        "from messagefoundry.config.wiring import WiringError\n\n"
-        f"try:\n    {_REFUSED_FACTORY}\nexcept WiringError:\n"
-        "    import {probe} as probe\n    probe.refuses()\n",
     ],
-    ids=["refusal", "engine-wording", "refusal-in-a-handler"],
+    ids=["refusal", "engine-wording"],
 )
 def test_a_standing_refusal_holds_no_module_frame(
     tmp_path: Path, engine_probe: str, body: str
 ) -> None:
-    # A frame holds the module's globals, so an inline credential, for a locals-capturing reporter.
+    # A frame holds the module's globals, so an inline value, for a locals-capturing reporter.
     _write(tmp_path, "feed.py", body.replace("{probe}", engine_probe))
     err = _load_error(tmp_path)
     assert "its message is withheld" not in str(err)
     files = [
         frame.f_code.co_filename
-        for link in exception_chain(err)
-        for frame, _line in traceback.walk_tb(link.__traceback__)
+        for link in (err, err.__cause__)
+        for frame, _line in traceback.walk_tb(link.__traceback__ if link else None)
     ]
     assert any(name.endswith("wiring.py") for name in files)  # a floor: an empty walk reads clean
     assert not [name for name in files if name.endswith("feed.py")]
+    assert _frames_holding(err, ModuleType) == []
 
 
 def test_what_a_read_queues_is_not_drained_by_the_next_module(tmp_path: Path) -> None:
@@ -1468,33 +1461,55 @@ def test_no_exit_leaves_the_loaders_read(
     assert err.__cause__ is None and err.__context__ is None
 
 
+def _assert_a_gate_refuses_feed(
+    d: Path, capsys: pytest.CaptureFixture[str], command: str, expected: str
+) -> None:
+    # The file and the refusal, because an empty graph alone also exits non-zero.
+    extra = ["--no-lint"] if command == "check" else []
+    assert main([command, "--config", str(d), *extra]) != 0
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "feed.py" in output and expected in output
+
+
 @pytest.mark.parametrize("command", ["validate", "check"])
 def test_a_gate_refuses_a_module_whose_read_exits_zero(
-    tmp_path: Path, fails_in_the_read: Callable[[str], Path], command: str
+    tmp_path: Path,
+    fails_in_the_read: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+    command: str,
 ) -> None:
     fails_in_the_read("raise SystemExit(0)")
-    extra = ["--no-lint"] if command == "check" else []
-    assert main([command, "--config", str(tmp_path), *extra]) != 0
+    _assert_a_gate_refuses_feed(tmp_path, capsys, command, "withheld")
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "class Bad:\n    def __str__(self):\n        raise SystemExit(0)\n",
+        "class Later(str):\n    def __str__(self):\n        raise SystemExit(0)\n\n"
+        "class Bad:\n    def __str__(self):\n        return Later('rewritten')\n",
+    ],
+    ids=["object", "text-subclass"],
+)
 @pytest.mark.parametrize("command", ["validate", "check"])
 def test_a_gate_refuses_a_refusal_rewritten_to_exit_when_it_is_read(
-    tmp_path: Path, command: str
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, bad: str
 ) -> None:
-    # Reading an exact WiringError's text runs an object put in its args, so the guard reads it.
+    # Reading an exact WiringError's text runs an object put in its args, so the guard reads it,
+    # and what leaves is exact text.
     body = (
         "from messagefoundry import Http\n"
-        "from messagefoundry.config.wiring import WiringError\n\n"
-        "class Bad:\n    def __str__(self):\n        raise SystemExit(0)\n\n"
+        f"from messagefoundry.config.wiring import WiringError\n\n{bad}\n"
         "try:\n"
-        "    Http(port=8080, reply_from='OB_X', reply_on_timeout='500')\n"
+        f"    {_REFUSED_FACTORY}\n"
         "except WiringError as exc:\n"
         "    exc.args = (Bad(),)\n"
         "    raise\n"
     )
     _write(tmp_path, "feed.py", body)
-    extra = ["--no-lint"] if command == "check" else []
-    assert main([command, "--config", str(tmp_path), *extra]) != 0
+    expected = "rewritten" if "Later" in bad else "withheld"
+    _assert_a_gate_refuses_feed(tmp_path, capsys, command, expected)
 
 
 @pytest.mark.parametrize("stop", ["KeyboardInterrupt", "SystemExit"], ids=["interrupt", "exit"])

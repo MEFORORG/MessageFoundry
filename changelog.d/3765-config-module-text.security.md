@@ -27,18 +27,22 @@
   that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
   included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
   no output on a module that failed. An exact `WiringError` also stands only while its arguments
-  are text, because a caller's `str()` of an object there would run the module's code past that
-  guard. A refusal that stands, and the exception kept as the cause of a rebuilt one, leave with
-  no traceback, so their frames do not keep the module's globals. An exception's text counts as
-  engine wording only when its frame is in the package's own files, so a module that sets
-  `__name__` to look like the engine is withheld, and so is vendored code. It also counts only when
-  code outside the engine did not raise it onto an existing traceback, so
-  `raise X(text).with_traceback(exc.__traceback__)` in a module is withheld, and so, at a small
-  cost to the author, is `raise exc` of a refusal the module caught, which the traceback cannot
-  tell from it; a bare `raise` keeps the text. At least these are not caught: a module that catches
-  a refusal and rewrites its `args`, with text or with an object whose own `__str__` returns a
-  value; one that changes a refusal's class while the loader reads it, or patches `WiringError`
-  itself; one that builds a class whose name holds a value; one that compiles code under an engine
-  file name to forge a frame; a `SystemExit` raised while the loader reads a helper left to its
-  `ImportError` guard, which leaves as raised; and the frames on an interrupt's traceback, which
-  still hold the withheld exception.
+  are exact text, because a caller's `str()` of an object there would run the module's code past
+  that guard. A refusal that stands, and the exception kept as the cause of a rebuilt one, have
+  their tracebacks cleared, and the loader's frame drops the module, so what leaves no longer holds
+  the module's own frames or its namespace. An exception's text counts as engine wording only when
+  its frame is in the package's own files, so a module that sets `__name__` to look like the engine
+  is withheld, and so is vendored code. It also does not count when a `raise` statement outside the
+  engine put it onto an existing traceback, so `raise X(text).with_traceback(exc.__traceback__)` in
+  a module is withheld. So, at a small cost to the author, is `raise exc` of a refusal the module
+  caught, which the traceback cannot tell from that idiom, and `raise Cls` whose constructor was
+  refused; a bare `raise` keeps the text. At least these are not caught: a module that catches a
+  refusal and rewrites its `args`, with text or with an object whose own `__str__` returns a value;
+  one that puts text on a refusal's traceback with `gen.throw`, or by assigning `__traceback__`
+  before a bare `raise`; one that changes a refusal's class while the loader reads it, or patches
+  `WiringError` itself; one that builds a class whose name holds a value; one that compiles code
+  under an engine file name to forge a frame; a `SystemExit` raised while the loader reads a helper
+  left to its `ImportError` guard, which leaves as raised; the frames on an interrupt's traceback,
+  which still hold the withheld exception; the loader's own frames on a refusal, which hold the
+  load's snapshot of the config files' bytes; and the traceback of an engine exception a standing
+  refusal was raised from, which can hold a module's frame.

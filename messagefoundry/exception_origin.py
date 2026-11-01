@@ -114,8 +114,11 @@ def raised_only_by_the_engine(exc: BaseException) -> bool:
     it already had.
 
     Every traceback entry but the innermost normally stopped on a call. A bare ``raise`` adds no
-    entry, so one that stopped on a ``raise`` is ``raise exc`` or ``raise X().with_traceback(tb)``,
-    whose instance need not be the one the frames below it raised."""
+    entry, so one that stopped on a ``raise`` is usually ``raise exc`` or ``raise
+    X().with_traceback(tb)``, whose instance need not be the one the frames below it raised. It can
+    also be ``raise Cls`` whose constructor failed, which is withheld too. This reads only that
+    instruction, so it does not see a traceback put on by ``gen.throw`` or by assigning
+    ``__traceback__`` before a bare ``raise``."""
     return raised_by_the_engine(exc) and not any(
         _stopped_on_a_raise(tb) and not _in_the_engine(tb) for tb in _entries(exc)[:-1]
     )

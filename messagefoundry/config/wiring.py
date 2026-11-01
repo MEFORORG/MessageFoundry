@@ -9461,13 +9461,13 @@ def _module_failure(
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
     withheld diagnostic: :func:`_read_fault` says what happens to one. The module is refused, which
-    ends a load, and a ``validate`` run goes on to its next module, unless the fault is a stop,
-    which ends either. Call this outside any handler of ``exc``, so a stop leaving through here
-    does not carry ``exc`` as its context."""
+    ends a load, and a ``validate`` run goes on to its next module, unless the fault is an interrupt,
+    which ends either. Call this outside any handler of ``exc``, so an interrupt leaving through
+    here does not carry ``exc`` as its context."""
     fault: BaseException | None = None
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
-    except BaseException as caught:  # noqa: BLE001 - _read_fault lets the stops through
+    except BaseException as caught:  # noqa: BLE001 - _read_fault lets an interrupt through
         fault = caught
     if fault is not None:
         _read_fault(path, fault)
@@ -9718,15 +9718,6 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
     return f"error loading config module {path.name}: {text}"
 
 
-def _drop_tracebacks(exc: BaseException) -> None:
-    """Clear the traceback of ``exc``, an engine refusal that leaves the load, and of everything it
-    wraps. Its frames hold the config module's globals, and nothing reads them: only the withheld
-    diagnostic reads a traceback. By the builtin method, because a module's class or instance can
-    define its own."""
-    for link in exception_chain(exc):
-        BaseException.with_traceback(link, None)
-
-
 def _refusal_for(
     path: Path, exc: Exception, source_of: Callable[[str], bytes | None]
 ) -> tuple[WiringError, BaseException | None] | None:
@@ -9756,25 +9747,28 @@ def _refusal_for(
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
             if text is None:
+                # ``exc`` leaves the load from here, or stays as a cause. The module's frames on its
+                # traceback hold the module's globals, and only the withheld diagnostic reads them.
+                # By the builtin method: a module's class or instance can define its own.
+                BaseException.with_traceback(exc, None)
                 # The real type: ``__class__`` can answer WiringError, and a ``raise`` of that would
                 # leave ``validate_config``, which catches only the real one. Only text: a caller
                 # reads ``str()``, past this guard, and that runs an object in ``args``.
                 if type(exc) is WiringError and all(type(arg) is str for arg in exc.args):
-                    _drop_tracebacks(exc)
                     return None
                 if not issubclass(type(exc), WiringError):
                     # ``!s``, or the f-string would run a ``__format__`` of the class's own.
-                    rebuilt = WiringError(f"error loading config module {path.name}: {exc!s}")
-                    _drop_tracebacks(exc)
-                    return rebuilt, exc
+                    return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
                 text = str(exc)
             imported = exc.__cause__
         else:
             text = _module_failure(path, exc, source_of)
             imported = exc
         cause = _textless_import_error(imported) if isinstance(imported, ImportError) else None
-        return WiringError(text), cause
-    except BaseException as caught:  # noqa: BLE001 - _read_fault lets the stops through
+        # An exact ``str``: ``str()`` can return a subclass, whose own ``__str__`` a caller would run
+        # past this guard.
+        return WiringError(str.__str__(text)), cause
+    except BaseException as caught:  # noqa: BLE001 - _read_fault lets an interrupt through
         fault = caught
     _read_fault(path, fault)
     return WiringError(_module_failure(path, exc, source_of)), None
@@ -9833,6 +9827,8 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # helper -- is never drained by the next module, whose diagnostic would then name the wrong
         # file.
         helpers.drop_pending()
+    # This frame is on whatever leaves, and the module's namespace is what must not stay reachable.
+    del module
     if refusal is None:
         raise failure
     withheld, cause = refusal
