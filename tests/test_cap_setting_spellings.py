@@ -1104,11 +1104,11 @@ def _sql_server_dsn(over: dict[str, Any]) -> str:
     return database._build_dsn({"server": "db.example.org", "database": "d", **over})
 
 
-def _ftp(over: dict[str, Any]) -> Any:
+def _ftp_client(over: dict[str, Any]) -> Any:
     return remotefile._FtpClient({"host": "h", **over}, tls=False)
 
 
-def _sftp(over: dict[str, Any]) -> Any:
+def _sftp_client(over: dict[str, Any]) -> Any:
     return remotefile._SftpClient({"host": "h", **over})
 
 
@@ -1128,8 +1128,8 @@ _PORT_READS = [
     pytest.param(_SCP, "_port", id="dicom-scp"),
     pytest.param(_SCU, "_port", id="dicom-scu"),
     pytest.param(_email, "port", id="email"),
-    pytest.param(_ftp, "_port", id="ftp"),
-    pytest.param(_sftp, "_port", id="sftp"),
+    pytest.param(_ftp_client, "_port", id="ftp"),
+    pytest.param(_sftp_client, "_port", id="sftp"),
     pytest.param(_anon_guard, "port", id="anon-ftp-guard"),
 ]
 
