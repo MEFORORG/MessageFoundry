@@ -261,9 +261,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   separators. Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
-  batch goes out, provided every other member hydrates; a whole-batch failure in the same pass takes
-  that member with the batch. A stored document that holds a CR or LF is **not** the payload's: the
-  ingress detach refuses an escaped `OBX-5.5` (`EscapedDocumentError`) and a raw LF ends the segment,
+  batch goes out, provided every other member hydrates; a failure while the members hydrate, or a
+  refusal the frame check re-raises for the whole batch, takes that member with the batch. A stored
+  document that holds a CR or LF is **not** the payload's: the ingress detach refuses an escaped
+  `OBX-5.5` (`EscapedDocumentError`) and a raw LF ends the segment,
   so no payload can leave one, and one there points at the store or the engine. The re-attach raises
   it as a plain `ValueError`, so the outbound's [`internal_error`](../CONFIGURATION.md#delivery)
   policy judges it, as it judges a parser fault: `continue` dead-letters, and `stop` stops the
