@@ -69,7 +69,7 @@ from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.remotefile import RemoteFileSource
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.smart import token_provider_from_settings
-from messagefoundry.transports.tcp import TcpDestination, TcpSource
+from messagefoundry.transports.tcp import TcpDestination, TcpSource, _codec_from_settings
 from messagefoundry.transports.timer import TimerSource
 from messagefoundry.transports.x12 import X12Destination, X12Source
 from tests._ast_sites import callee_name, parse_source
@@ -1198,9 +1198,34 @@ def test_an_uncast_env_port_reaches_the_connector_as_a_number() -> None:
             _MLLP_IN(resolve_env_settings({"port": env("p")}, {"p": bad}))
 
 
+@pytest.mark.parametrize("bad", [True, 2.5, "SENTINEL-1650", 300, -1])
+def test_a_tcp_delimiter_refuses_what_is_not_a_byte_withholding_the_value(bad: object) -> None:
+    """The delimiters take the count rule, and the codec's own range refusal quotes the number, so
+    ``_opt_byte`` checks the range first. A number in range still reaches the codec.
+
+    Red mutation: drop the range check. ``300`` reaches the codec's message."""
+    with pytest.raises(ValueError, match="value withheld") as caught:
+        _codec_from_settings({"start": bad, "end": 3})
+    message = str(caught.value)
+    assert message.startswith("TCP framing misconfigured: TCP start")
+    assert "SENTINEL-1650" not in message and "300" not in message
+    assert _codec_from_settings({"start": 2.0, "end": 3}).start == 2
+
+
+def test_a_listener_port_preflight_reads_a_port_as_the_connector_does() -> None:
+    """A whole float binds, so the pre-flight must not skip it. What a connector refuses, the
+    pre-flight leaves to the connector's own refusal. Red mutation: restore the ``int`` test."""
+    from messagefoundry.config.wiring import _resolve_port
+
+    assert _resolve_port(env("p"), {"p": 2575.0}) == 2575
+    assert _resolve_port(" 2575 ", {}) == 2575
+    for skipped in (True, 2575.9, "x", None, 70000):
+        assert _resolve_port(skipped, {}) is None, repr(skipped)
+
+
 def _bare_numeric_reads(source: str) -> list[int]:
     """The line of each ``int()`` or ``float()`` called on a settings read: a constant key taken by
-    ``.get`` or a subscript."""
+    ``.get`` or a subscript, inside the call. A read assigned to a name first is not seen."""
 
     def reads_a_setting(node: ast.AST) -> bool:
         if isinstance(node, ast.Subscript):

@@ -29,15 +29,21 @@ from messagefoundry.config.wiring import (
     Database,
     EnvRef,
     Ftp,
+    Http,
     Rest,
     WiringError,
     _bool_settings,
+    build_inbound_connection,
     build_outbound_connection,
     env,
     load_config,
     resolve_env_settings,
 )
-from messagefoundry.pipeline.wiring_runner import _dest_config, build_check_registry
+from messagefoundry.pipeline.wiring_runner import (
+    _dest_config,
+    build_check_registry,
+    check_http_sync_reply,
+)
 from messagefoundry.transports.http_auth import oauth2_auth_configured
 from messagefoundry.transports.smart import smart_auth_configured
 from tests._ast_sites import calls_to, parse_source
@@ -628,10 +634,36 @@ def test_an_env_out_params_flag_that_resolves_false_does_not_force_capture(tmp_p
         "Database(server='db.example.org', database='d', statement='EXEC p', "
         "capture_out_params=env('flag'))",
     )
-    assert _dest(reg, "OB_X", {"flag": "false"})["capture_response"] is False
-    assert _dest(reg, "OB_X", {"flag": "true"})["capture_response"] is True
+    off = _dest(reg, "OB_X", {"flag": "false"})
+    assert off["capture_response"] is False and off["capture_out_params"] is False
     forced = Database(server="s", database="d", statement="EXEC p", capture_out_params=True)
     assert build_outbound_connection("OB_Y", forced).spec.settings["capture_response"] is True
+
+
+@pytest.mark.parametrize(
+    ("spec", "key"),
+    [
+        (Rest(url="https://partner.example.org/in"), "capture_response"),
+        (
+            Database(server="db.example.org", database="d", statement="EXEC p"),
+            "capture_out_params",
+        ),
+    ],
+    ids=["capture_response", "capture_out_params"],
+)
+def test_a_reply_from_target_is_read_by_its_resolved_flag(spec: Any, key: str) -> None:
+    # An EnvRef was truthy here, so an outbound that captures nothing passed, and every HTTP call
+    # would have blocked until reply_timeout. The control: the flag resolving True.
+    settings = {**spec.settings, key: env("flag")}
+    registry = wiring.Registry()
+    registry.outbound["OB_X"] = build_outbound_connection(
+        "OB_X", dataclasses.replace(spec, settings=settings)
+    )
+    listener = Http(port=0, reply_from="OB_X", reply_content_type="application/json")
+    inbound = build_inbound_connection("IB_X", listener, router="r")
+    with pytest.raises(WiringError, match="does not set capture_response=True"):
+        check_http_sync_reply(inbound, registry, env_values={"flag": "false"})
+    check_http_sync_reply(inbound, registry, env_values={"flag": "true"})
 
 
 def test_a_set_capture_response_stays_beside_an_env_out_params_flag(tmp_path: Path) -> None:

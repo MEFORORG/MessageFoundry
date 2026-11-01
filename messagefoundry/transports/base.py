@@ -144,8 +144,9 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     """Read one integer setting as a whole count, or refuse it naming the key (BACKLOG #3431).
 
     **This docstring holds the rule; the readers that use it point here.** They are at least every
-    ``int`` cap read through :func:`cap_setting`, every ``port`` read through :func:`port_setting`,
-    plus the setting reads that call this directly. ``int()`` turns ``True`` into 1 and ``1.9`` into
+    ``int`` cap read through :func:`cap_setting`, each connector's ``port`` through
+    :func:`port_setting`, plus the setting reads that call this directly. Not every integer read in
+    the engine uses it yet. ``int()`` turns ``True`` into 1 and ``1.9`` into
     1, so either one used to build a live cap of one byte or one connection, from a value nobody
     meant as that number. So:
 
@@ -272,7 +273,8 @@ def port_setting(value: Any, *, transport: str) -> int:
     check before this one has seen it. A bare ``int()`` read a ``true`` in ``environments/<env>.toml``
     as port 1 and ``2575.9`` as port 2575, so a delivery would have dialled a port nobody named, and
     its own refusal of bad text quoted the value. A number outside the range used to surface only
-    when the socket opened; here it surfaces at wiring and in ``messagefoundry check``.
+    when the socket opened; here it surfaces when the connector is built, which ``serve`` and
+    ``messagefoundry check`` both do.
 
     Zero passes, because it asks a listener for an ephemeral port. What a dial to port 0 does is the
     socket's own refusal."""

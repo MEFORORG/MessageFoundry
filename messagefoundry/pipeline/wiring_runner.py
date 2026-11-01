@@ -2173,6 +2173,7 @@ class RegistryRunner:
                 # so the inherited max_attempts is that default policy's — not a separate scalar.
                 retry_max_attempts=self._delivery_defaults.max_attempts,
             ),
+            env_values=self._env_values,
         )
         settings = ic.spec.settings
         metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
@@ -11809,7 +11810,7 @@ def _build_check_connectors(
         source_cfg = _source_config(ic, inbound_bind_host, env_values, trust_anchor_policy)
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
-        check_http_sync_reply(ic, registry, delivery=delivery)
+        check_http_sync_reply(ic, registry, delivery=delivery, env_values=env_values)
         # Vault BACKLOG #2622 item 1: the four inbound exposure gates, through the one function
         # _start_inbound_unsafe also calls. Before this they ran only at start, so
         # `messagefoundry check` passed a cleartext off-loopback listener that serve then refused.
@@ -12412,6 +12413,7 @@ def check_http_sync_reply(
     registry: Registry,
     *,
     delivery: DeliverySettings | None = None,
+    env_values: Mapping[str, Any] | None = None,
 ) -> None:
     """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
 
@@ -12459,7 +12461,12 @@ def check_http_sync_reply(
             f"inbound connection {name!r}: reply_from names {target!r}, which is declared "
             "deployed=False — it will never run, so every HTTP turn could only time out"
         )
-    if not oc.spec.settings.get("capture_response"):
+    # BACKLOG #3724: read once resolved, as refuse_capture_conflicts reads them. An env() ref is truthy
+    # whatever it resolves to, and the connector captures on either flag.
+    capture_flags = {
+        key: oc.spec.settings.get(key) for key in ("capture_response", "capture_out_params")
+    }
+    if not any(resolve_env_settings(capture_flags, env_values or {}, connection=target).values()):
         raise WiringError(
             f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
             "capture_response=True — with no captured reply there is nothing to return, and every "

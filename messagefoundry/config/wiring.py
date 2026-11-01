@@ -826,7 +826,9 @@ def refuse_capture_conflicts(
     undecided there: a reference is truthy whatever it resolves to, so reading one as on would refuse
     a graph whose flag resolves False, and reading one as satisfying ``expect_reply`` would pass a
     capture with no reply to capture (BACKLOG #3724). The connection's resolved settings then come
-    through here once more, at start, check and dry run alike, so nothing is left undecided."""
+    through here once more when its connector is built, which ``serve`` and ``messagefoundry check``
+    both do, so nothing is left undecided. ``messagefoundry dryrun`` builds no connector, so it
+    does not reach this second pass."""
 
     def on(key: str) -> bool:
         value = settings.get(key)
@@ -835,8 +837,8 @@ def refuse_capture_conflicts(
     def off(key: str) -> bool:
         return not settings.get(key)
 
-    # An out-params flag still an env() reference has not forced capture_response on. Resolved, the
-    # connector reads either flag as capture, so this does too. A forced capture is a literal True.
+    # A resolved out-params flag never forced capture_response on, and the connector reads either
+    # flag as capture, so this does too.
     capturing = on("capture_response") or on("capture_out_params")
     # BACKLOG #117 (ADR 0124): fire-and-forward MLLP outbound. no_ack skips the ACK read entirely, so
     # there is nothing to capture, and it is MLLP-only (the generic Tcp()/X12() fire-and-forget is
@@ -5470,9 +5472,13 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
     """Resolve a connector ``port`` setting to an ``int`` when possible, else ``None`` (uncheckable).
 
     Handles a literal ``int``, a string literal (``"2575"`` from ``connections.toml``), and an
-    :func:`env` ref (resolved against ``env_values``, applying its cast). A ``bool`` (an ``int``
-    subclass) or an unresolved/unparseable value yields ``None`` so the caller simply skips it — a
-    missing ``env()`` value is reported loud elsewhere (when the connector is built), not doubled here."""
+    :func:`env` ref (resolved against ``env_values``, applying its cast), and reads the number by the
+    connectors' own rule (``transports.base.port_setting``), so this cannot skip a listener that
+    binds. A value that rule refuses, or an unresolved one, yields ``None`` so the caller simply
+    skips it — a missing ``env()`` value is reported loud elsewhere (when the connector is built),
+    not doubled here. Imported here: ``messagefoundry.transports`` imports this module."""
+    from messagefoundry.transports.base import port_setting
+
     if isinstance(raw, EnvRef):
         if raw.key not in env_values:
             return None
@@ -5483,16 +5489,10 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
             except (ValueError, TypeError):
                 return None
         raw = value
-    if isinstance(raw, bool):
+    try:
+        return port_setting(raw, transport="listener")
+    except ValueError:
         return None
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return int(raw.strip())
-        except ValueError:
-            return None
-    return None
 
 
 def resolve_listener_binding(
@@ -7624,12 +7624,11 @@ def build_outbound_connection(
         spec.settings["capture_response"] = True
     # #67 (ADR 0013 amendment): capturing a stored-proc's OUT params + scalar return value IMPLIES
     # capture, so the capture-validity guards (and the connector) treat it as a capturing outbound.
-    # BACKLOG #3724: the flag is copied rather than forced True, so capture follows an env() ref that
-    # resolves False. A capture_response already set stays; the connector and
-    # refuse_capture_conflicts OR the two.
+    # BACKLOG #3724: an env() ref does not force it, or capture would stay on after the ref resolves
+    # False. Each reader of the flags ORs the two once resolved.
     out_params = spec.settings.get("capture_out_params")
-    if out_params and not spec.settings.get("capture_response"):
-        spec.settings["capture_response"] = out_params
+    if out_params and not isinstance(out_params, EnvRef):
+        spec.settings["capture_response"] = True
     # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
     # rejects an unsupportable config before any store is opened.
     if batch is not None and spec.type is not ConnectorType.MLLP:

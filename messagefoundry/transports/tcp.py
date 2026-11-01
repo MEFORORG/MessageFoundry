@@ -118,9 +118,15 @@ def _codec_from_settings(settings: dict[str, object]) -> FrameCodec:
 def _opt_byte(settings: dict[str, object], knob: str) -> int | None:
     """Read an optional delimiter setting (``None`` passes through) by the rule in
     :func:`~messagefoundry.transports.base.count_setting`, so a mistyped delimiter fails loud at
-    construction with the value withheld. The codec holds it to 0..255."""
+    construction with the value withheld. The range is checked here too, because the codec's own
+    range refusal quotes the number, and this one may have come from the environment."""
     value = settings.get(knob)
-    return None if value is None else count_setting(value, knob=knob, transport="TCP")
+    if value is None:
+        return None
+    byte = count_setting(value, knob=knob, transport="TCP")
+    if not 0 <= byte <= 255:
+        raise ValueError(f"TCP {knob} must be a byte value in 0..255 (value withheld)")
+    return byte
 
 
 # --- destination -------------------------------------------------------------
