@@ -8,6 +8,7 @@ import {
   preflightOutcome,
   promoteOutcomeMessage,
   reloadConfig,
+  type PromoteMessage,
   type ReloadResult,
 } from "../../promoteOutcome";
 
@@ -92,6 +93,46 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
         "4 handlers, running.",
     );
   });
+
+  const promoteReplying = async (restart: unknown): Promise<PromoteMessage> => {
+    replyBody = { ...live, restart_required: restart };
+    return promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
+  };
+
+  test("a changed trust anchor is a WARNING that names each anchor and still reports the swap", async () => {
+    const msg = await promoteReplying(["[auth].ad_tls_ca_cert_file", "[api].tls_client_ca_file"]);
+    assert.strictEqual(msg.level, "warning");
+    assert.strictEqual(
+      msg.text,
+      "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
+        "4 handlers, running. Restart the engine at PROD to apply a changed trust anchor. This " +
+        "reload checked the new file but does not load it, so the engine still trusts the old CA " +
+        "for: [auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
+    );
+  });
+
+  for (const [name, restart] of [
+    ["an empty list", []],
+    ["null, which a reload that did not check sends", null],
+  ] as const) {
+    test(`${name} in restart_required says nothing about a restart`, async () => {
+      const msg = await promoteReplying(restart);
+      assert.strictEqual(msg.level, "info");
+      assert.ok(msg.text.includes("promoted to PROD"), msg.text);
+      assert.ok(!/restart/i.test(msg.text), msg.text);
+    });
+  }
+
+  for (const [name, restart] of [
+    ["a bare string", "[auth].ad_tls_ca_cert_file"],
+    ["a list holding a non-string", [1]],
+  ] as const) {
+    test(`a restart_required of ${name} is an ERROR, never a clean promote`, async () => {
+      const msg = await promoteReplying(restart);
+      assert.strictEqual(msg.level, "error");
+      assert.ok(msg.text.includes("unknown whether the new config is live"), msg.text);
+    });
+  }
 
   test("the dry-run pre-flight still decodes as a normal result the promote confirms", async () => {
     replyStatus = 200;

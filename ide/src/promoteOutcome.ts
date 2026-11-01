@@ -10,6 +10,7 @@ import { isRecord } from "./engineTrustModel";
 /**
  * The fields of messagefoundry/api/models.py:ReloadResult (the /config/reload response) that the
  * promote reads. The engine also sends `degraded` and `failures`; reporting those is BACKLOG #2259.
+ * `restart_required` is null where the engine did not check, as on a dry run, so null is no finding.
  */
 export interface ReloadResult {
   inbound: number;
@@ -18,6 +19,7 @@ export interface ReloadResult {
   handlers: number;
   running: boolean;
   dry_run: boolean;
+  restart_required?: string[] | null;
 }
 
 /**
@@ -45,11 +47,18 @@ export interface PromoteMessage {
 }
 
 /** Whether a finished reply really is a reload result, so its counts can be printed. A reply that is
- *  not (an empty body, a proxy's page) must not be announced as a promote with undefined counts. */
+ *  not (an empty body, a proxy's page) must not be announced as a promote with undefined counts. A
+ *  malformed `restart_required` fails too, so it can be printed, and a clean promote is never
+ *  announced for a list the extension could not read. */
 function isReloadResult(body: unknown): body is ReloadResult {
+  if (!isRecord(body)) {
+    return false;
+  }
+  const restart = body.restart_required ?? [];
   return (
-    isRecord(body) &&
-    ["inbound", "outbound", "routers", "handlers"].every((k) => typeof body[k] === "number")
+    ["inbound", "outbound", "routers", "handlers"].every((k) => typeof body[k] === "number") &&
+    Array.isArray(restart) &&
+    restart.every((name) => typeof name === "string")
   );
 }
 
@@ -86,9 +95,27 @@ export function preflightOutcome(
 }
 
 /**
+ * The sentences for a swap that is live but not finished, or none for a clean one. A list, because
+ * these facts are independent: one reload can report several, so none may hide another. The web
+ * console's `_reload_shortfall` has the same shape. A degraded apply (BACKLOG #2259) is one more
+ * sentence here.
+ */
+function reloadShortfall(targetName: string, r: ReloadResult): string[] {
+  const restart = r.restart_required ?? [];
+  return restart.length > 0
+    ? [
+        `Restart the engine at ${targetName} to apply a changed trust anchor. This reload checked ` +
+          "the new file but does not load it, so the engine still trusts the old CA for: " +
+          `${restart.join(", ")}.`,
+      ]
+    : [];
+}
+
+/**
  * The message for the apply step's outcome. A held reload is a warning that names the approval and
- * says the config is not live; it never prints graph counts, because no graph was swapped. Each
- * outcome is its own branch, so another one (a degraded apply, BACKLOG #2259) is one more case.
+ * says the config is not live; it never prints graph counts, because no graph was swapped. A live
+ * swap with a shortfall is a warning too, after the counts. Held, unreadable and live exclude each
+ * other, so each is its own branch.
  */
 export function promoteOutcomeMessage(
   targetName: string,
@@ -115,11 +142,13 @@ export function promoteOutcomeMessage(
         "result, so it is unknown whether the new config is live. Check the engine before retrying.",
     };
   }
+  const promoted =
+    `MessageFoundry: promoted to ${targetName} — live graph: ${r.inbound} inbound, ` +
+    `${r.outbound} outbound, ${r.routers} routers, ${r.handlers} handlers` +
+    `${r.running ? ", running" : ""}.`;
+  const shortfall = reloadShortfall(targetName, r);
   return {
-    level: "info",
-    text:
-      `MessageFoundry: promoted to ${targetName} — live graph: ${r.inbound} inbound, ` +
-      `${r.outbound} outbound, ${r.routers} routers, ${r.handlers} handlers` +
-      `${r.running ? ", running" : ""}.`,
+    level: shortfall.length > 0 ? "warning" : "info",
+    text: [promoted, ...shortfall].join(" "),
   };
 }
