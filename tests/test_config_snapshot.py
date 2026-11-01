@@ -591,12 +591,14 @@ def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
 
 
 def _share_fault(winerror: int = 53) -> OSError:
-    """The error Windows raises for a share it cannot reach. Python on Windows maps it to a
-    ``FileNotFoundError``, so that is what these tests refuse to read as absence. On POSIX the
-    constructor ignores the Windows code and this is a plain ``OSError``, so only a Windows leg
-    tells the fix from the old code, but for
-    :func:`test_a_share_fault_is_not_a_missing_directory`, which sets the code by hand."""
-    return OSError(None, "share unreachable", None, winerror)
+    """The error Windows raises for a share it cannot reach, which Python on Windows maps to a
+    ``FileNotFoundError``. POSIX ignores the code and builds a plain ``OSError``, which would
+    pass on the old code, so there the same error is built by hand."""
+    fault = OSError(None, "share unreachable", None, winerror)
+    if not isinstance(fault, FileNotFoundError):
+        fault = FileNotFoundError(2, "share unreachable")
+        fault.winerror = winerror  # type: ignore[attr-defined]
+    return fault
 
 
 def _lost_share(
@@ -642,11 +644,7 @@ def _config(directory: Path) -> Path:
 
 @pytest.mark.parametrize("winerror", [53, 67])
 def test_a_share_fault_is_not_a_missing_directory(winerror: int) -> None:
-    """Tested before the type, which Python sets from the code. Built by hand, so a POSIX leg can
-    fail this too."""
-    mapped = FileNotFoundError(2, "share unreachable")
-    mapped.winerror = winerror  # type: ignore[attr-defined]
-    assert not is_missing_directory(mapped)
+    assert not is_missing_directory(_share_fault(winerror))
     assert is_missing_directory(FileNotFoundError(2, "no such file"))  # the control
 
 
@@ -672,7 +670,7 @@ def test_a_strict_read_refuses_a_lost_share_rather_than_read_it_as_empty(
 
 
 @pytest.mark.parametrize("after", [0, 1], ids=["first-listing", "second-listing"])
-@pytest.mark.parametrize("folder", ["codesets", "environments"])
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
 def test_a_lax_read_names_a_folder_on_a_lost_share(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str, after: int
 ) -> None:
@@ -681,10 +679,12 @@ def test_a_lax_read_names_a_folder_on_a_lost_share(
     assert read_config_snapshot(cfg, strict=False).unreadable == (folder,)
 
 
-@pytest.mark.parametrize("folder", ["codesets", "environments"])
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
 def test_a_share_lost_after_the_first_listing_refuses_a_strict_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str
 ) -> None:
+    """The base's own second listing included, where a glob would raise nothing, and the modules
+    would drop out of a digest that gates."""
     cfg = _config(tmp_path / "cfg")
     _lost_share(monkeypatch, cfg / folder, after=1)
     with pytest.raises(OSError):
@@ -715,9 +715,9 @@ def test_a_module_whose_stat_meets_a_lost_share_is_not_dropped(
 def test_a_module_whose_read_meets_a_lost_share_is_not_dropped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``open`` carries no Windows error, so a share lost after the stat fails as a plain
-    file-not-found; the second stat tells it from a file removed since. That a removed file stays
-    gone is ``test_a_file_removed_mid_digest_is_gone_not_unreadable``."""
+    """``open`` carries no Windows error (measured on ``\\\\127.0.0.1\\nosuchshare``), so a share
+    lost after the stat fails as a plain file-not-found; the second stat tells it from a file
+    removed since, which is ``test_a_file_removed_mid_digest_is_gone_not_unreadable``."""
     cfg = _config(tmp_path / "cfg")
     real_stat, real_read = Path.stat, Path.read_bytes
     lost = False
@@ -760,8 +760,9 @@ def test_validate_config_reports_a_code_set_folder_on_a_lost_share(
 def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The load never reads ``environments/``. Its digest is partial, so it compares only with a
-    digest that left out the same folder."""
+    """A config load reads no file in ``environments/``, so this folder alone refuses no load. A
+    value provider reads that folder itself, and is not what this pins. The digest is partial, so
+    it compares only with a digest that left out the same folder."""
     cfg = _config(tmp_path / "cfg")
     whole = digest_coverage(config_fingerprint_detail(cfg))
     _lost_share(monkeypatch, cfg / "environments")

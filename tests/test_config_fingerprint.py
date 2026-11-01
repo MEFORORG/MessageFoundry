@@ -334,9 +334,27 @@ def test_a_file_removed_mid_digest_is_gone_not_unreadable(
 
     def _read(self: Path) -> bytes:
         if self.name == "cfg.py":
+            self.unlink()
             raise FileNotFoundError(2, "No such file", str(self))
         return real(self)
 
     monkeypatch.setattr(Path, "read_bytes", _read)
     detail = config_fingerprint_detail(d)
     assert UNREADABLE_FILES_KEY not in detail and detail["files"] == 4
+
+
+def test_a_file_a_read_called_missing_that_is_still_there_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its stat says it exists, so it is not gone, and the digest must not read as a whole one."""
+    d = tmp_path / "cfg"
+    _bundle(d)
+    real = Path.read_bytes
+
+    def _read(self: Path) -> bytes:
+        if self.name == "cfg.py":
+            raise FileNotFoundError(2, "No such file", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == ["cfg.py"]

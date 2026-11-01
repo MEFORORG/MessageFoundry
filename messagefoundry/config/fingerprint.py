@@ -11,8 +11,8 @@ later innocent reload/restart detonates). :func:`config_fingerprint` returns a s
 bytes* a given reload activated, diffable against a signed source-of-truth.
 
 By default this is **observational**: a fingerprint records, it does not gate — it never drops a
-message or changes a disposition. The one digest that gates is the ``strict`` one a dual-control
-release checks (:func:`config_fingerprint`), which refuses a reload and still touches no message.
+message or changes a disposition. At least the digest a dual-control release checks does gate
+(:func:`snapshot_fingerprint`): it refuses a reload, and still touches no message.
 It complements (does not replace) ADR 0036's load-time write-access refusal,
 which stops an *unauthorized* principal from writing the config dir; the fingerprint attributes an
 *authorized* change to a reviewed source.
@@ -123,10 +123,9 @@ def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     By default it is observational, as the module docstring says: a file it cannot read is left out,
     and a missing directory digests as an empty bundle. ``strict`` is for a digest that GATES, the
     one a dual-control approval binds (vault BACKLOG #2596). There a skipped file would leave bytes
-    the approval never covered, so ``strict`` raises instead: :class:`ConfigDirMissing` when
-    ``directory`` is not a directory at its first listing, and the ``OSError`` when a folder it
-    reads cannot be listed or a file it covers cannot be stat'ed or read. A directory removed after
-    that listing raises nothing and digests as the files still found, down to an empty bundle."""
+    the approval never covered, so ``strict`` raises instead.
+    :func:`~messagefoundry.config.snapshot.read_config_snapshot` says at which faults, and which
+    gone directory it does not refuse."""
     return snapshot_fingerprint(read_config_snapshot(directory, strict=strict))
 
 
