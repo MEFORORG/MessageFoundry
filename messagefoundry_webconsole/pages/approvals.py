@@ -347,6 +347,15 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
     return page("Approvals", el("div", *parts, class_="card"), active="approvals")
 
 
+def _reported_restart(result: dict[str, object]) -> list[str]:
+    """The ``restart_required`` names :func:`_shortfall` says in words, which is none on a skipped
+    operation or a value that is not a list."""
+    restart = result.get("restart_required")
+    if result.get("skipped") or not isinstance(restart, list):
+        return []
+    return [str(s) for s in restart]
+
+
 def _shortfall(result: dict[str, object]) -> list[str]:
     """The sentences for a release whose operation returned without doing all of its work, or an
     empty list.
@@ -362,11 +371,11 @@ def _shortfall(result: dict[str, object]) -> list[str]:
             f"The operation skipped its work: {skipped}. Nothing was changed, and this request is "
             "closed. Clear the cause, then request the operation again."
         ]
-    failures, restart = result.get("failures"), result.get("restart_required")
+    failures = result.get("failures")
     return _reload_shortfall(
         degraded=bool(result.get("degraded")),
         failures=[str(f) for f in failures] if isinstance(failures, list) else [],
-        restart_required=[str(s) for s in restart] if isinstance(restart, list) else None,
+        restart_required=_reported_restart(result),
     )
 
 
@@ -379,11 +388,12 @@ def approval_approved(result: ApprovalDecisionResult) -> Markup:
         ["Requested by", result.requested_by],
         ["Approved by", result.approved_by or "—"],
     ]
-    # restart_required stays out: _shortfall says it in words.
+    # restart_required stays out only when _shortfall says it in words.
+    reported = bool(_reported_restart(summary))
     facts += [
         [str(key), str(value)]
         for key, value in sorted(summary.items())
-        if key != "restart_required"
+        if key != "restart_required" or not reported
     ]
     body = el(
         "div",

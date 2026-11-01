@@ -293,6 +293,7 @@ def _reload_shortfall(
             "Restart the engine to apply a changed trust anchor. This reload checked the new file "
             "but does not load it, so the engine still trusts the old CA for: "
             f"{', '.join(restart_required)}. This list is not complete: see "
-            '"What a reload\'s restart_required list covers" in docs/SECURITY.md.'
+            '"What a reload\'s restart_required list covers" in docs/SECURITY.md in the '
+            "MessageFoundry repository."
         )
     return sentences

@@ -724,6 +724,21 @@ def test_a_released_reload_reads_as_the_inline_one_does() -> None:
     assert shown == set(ReloadResult.model_fields) - {"restart_required"}
 
 
+def test_the_restart_list_leaves_the_facts_only_when_a_banner_said_it() -> None:
+    """Vault BACKLOG #3746: a value no banner reported stays in the facts, or the page drops it."""
+
+    def in_facts(result: dict[str, object]) -> bool:
+        return "<td>restart_required</td><td>" in _page(result, operation="config_reload")
+
+    names = ["[auth].ad_tls_ca_cert_file"]
+    assert not in_facts({"inbound": 1, "restart_required": names})
+    assert in_facts({"inbound": 1, "restart_required": None})
+    assert in_facts({"inbound": 1, "restart_required": []})
+    assert in_facts({"inbound": 1, "restart_required": "not a list"})
+    # A skip returns before the restart sentence, so no banner says these names.
+    assert in_facts({"skipped": "no such outbound connection: OB", "restart_required": names})
+
+
 def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:
     # The nav links to the page on every render, so look only inside <main>.
     held = str(pages.purge_result("all", [("out1", "held for approval (" + "a" * 32 + ")")]))
