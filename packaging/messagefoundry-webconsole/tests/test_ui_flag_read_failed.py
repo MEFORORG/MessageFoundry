@@ -28,14 +28,16 @@ _APP_JS = Path(messagefoundry_webconsole.__file__).parent / "static" / "app.js"
 _NODE = shutil.which("node")
 
 #: Loads app.js against just enough of a browser for the connections filter and the toolbar, one row
-#: per given ``data-flagged`` value, then ticks select-all. Prints which values stayed visible and
-#: which select-all took.
+#: per given ``data-flagged`` value, then runs the steps: ``"click"`` clicks select-all, ``"swap"``
+#: replaces the table as a poll does, firing the observers in the order the page registered them, and
+#: ``{"tick": value}`` clicks that row's box, and ``{"query": text}`` types into the filter. Prints
+#: which values stayed visible and which are selected.
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
-const [appPath, valuesJson, flaggedOnlyJson] = process.argv.slice(2);
-const rows = JSON.parse(valuesJson).map((value) => {
-  const row = { value, style: {}, textContent: "" };
+const [appPath, valuesJson, flaggedOnlyJson, stepsJson, query] = process.argv.slice(2);
+const makeRows = () => JSON.parse(valuesJson).map((value) => {
+  const row = { value, style: {}, textContent: `row ${value}` };
   row.cb = {
     value,
     checked: false,
@@ -46,19 +48,22 @@ const rows = JSON.parse(valuesJson).map((value) => {
   row.querySelector = () => row.cb;
   return row;
 });
+let rows = makeRows();
 const all = {
   checked: false,
+  indeterminate: false,
   hasAttribute(name) { return name === "data-mf-conns-all"; },
 };
-let onChange = null;
+const listeners = {};
 const poll = {
   querySelectorAll(sel) {
     return sel === "tbody tr" ? rows : rows.map((r) => r.cb);
   },
   querySelector() { return all; },
-  addEventListener(_type, fn) { onChange = fn; },
+  addEventListener(type, fn) { listeners[type] = fn; },
+  dispatchEvent(event) { listeners[event.type]?.(event); },
 };
-const input = { value: "", addEventListener() {} };
+const input = { value: query, addEventListener(_type, fn) { input.onInput = fn; } };
 const flaggedOnly = { checked: JSON.parse(flaggedOnlyJson), addEventListener() {} };
 const toolbar = { querySelector() { return null; } };
 const hooks = {
@@ -74,7 +79,11 @@ const document = {
   addEventListener() {},
   body: { classList: { contains() { return false; } } },
 };
-class FakeObserver { observe() {} }
+const observers = [];
+class FakeObserver {
+  constructor(fn) { observers.push(fn); }
+  observe() {}
+}
 const sandbox = {
   document,
   window: { addEventListener() {}, location: {} },
@@ -85,6 +94,7 @@ const sandbox = {
   Math,
   JSON,
   Object,
+  Event: class { constructor(type) { this.type = type; } },
   parseInt,
   setInterval() { return 1; },
   clearInterval() {},
@@ -94,24 +104,54 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(appPath, "utf8"), sandbox);
-all.checked = true;
-onChange({ target: all });
+for (const step of JSON.parse(stepsJson)) {
+  if (step === "click") {
+    all.checked = !all.checked;
+    listeners.change({ target: all });
+  } else if (step === "swap") {
+    rows = makeRows();
+    all.checked = false;
+    all.indeterminate = false;
+    observers.forEach((fn) => fn());
+  } else if ("query" in step) {
+    input.value = step.query;
+    input.onInput();
+  } else {
+    const { cb } = rows.find((r) => r.value === step.tick);
+    cb.checked = !cb.checked;
+    listeners.change({ target: cb });
+  }
+}
 console.log(JSON.stringify({
   visible: rows.filter((r) => r.style.display !== "none").map((r) => r.value),
   selected: rows.filter((r) => r.cb.checked).map((r) => r.value),
   header: all.checked,
+  indeterminate: all.indeterminate,
 }));
 """
 
 
 def _run_app_js(
-    tmp_path: Path, *, flagged_only: bool, values: tuple[str, ...] = ("1", "0", "unknown")
+    tmp_path: Path,
+    *,
+    flagged_only: bool,
+    values: tuple[str, ...] = ("1", "0", "unknown"),
+    steps: tuple[str | dict[str, str], ...] = ("click",),
+    query: str = "",
 ) -> dict[str, Any]:
     harness = tmp_path / "harness.js"
     harness.write_text(_HARNESS, encoding="utf-8")
     assert _NODE is not None
     proc = subprocess.run(
-        [_NODE, str(harness), str(_APP_JS), json.dumps(values), json.dumps(flagged_only)],
+        [
+            _NODE,
+            str(harness),
+            str(_APP_JS),
+            json.dumps(values),
+            json.dumps(flagged_only),
+            json.dumps(steps),
+            query,
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -202,6 +242,7 @@ def test_select_all_with_flagged_only_off_takes_every_row(tmp_path: Path) -> Non
         "visible": ["1", "0", "unknown"],
         "selected": ["1", "0", "unknown"],
         "header": True,
+        "indeterminate": False,
     }
 
 
@@ -211,3 +252,62 @@ def test_a_select_all_that_took_nothing_leaves_its_box_clear(tmp_path: Path) -> 
     including those the operator ticked by hand."""
     run = _run_app_js(tmp_path, flagged_only=True, values=("unknown", "unknown"))
     assert run["selected"] == [] and run["header"] is False
+
+
+#: Each hides a row: Flagged only hides the ``"0"`` row and select-all skips ``"unknown"``, and the
+#: typed query hides everything but ``"1"``.
+_FILTERED = pytest.mark.parametrize(
+    "filtered",
+    [{"flagged_only": True}, {"flagged_only": False, "query": "row 1"}],
+    ids=["flagged-only", "typed-query"],
+)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+@_FILTERED
+def test_a_filtered_select_all_keeps_its_box_ticked_and_the_next_click_clears(
+    tmp_path: Path, filtered: dict[str, Any]
+) -> None:
+    """RED when the box counts every rendered row: it clears as soon as it is clicked, and the next
+    click selects again rather than clearing."""
+    once = _run_app_js(tmp_path, steps=("click",), **filtered)
+    assert once["selected"] == ["1"] and once["header"] is True and once["indeterminate"] is False
+    twice = _run_app_js(tmp_path, steps=("click", "click"), **filtered)
+    assert twice["selected"] == [] and twice["header"] is False
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+@_FILTERED
+def test_a_swap_leaves_a_filtered_select_all_ticked(
+    tmp_path: Path, filtered: dict[str, Any]
+) -> None:
+    """A poll replaces the table every few seconds, and the toolbar's observer runs before the
+    filter hides the fresh rows. RED when the box is judged only there: every row then counts as
+    takeable, so the box clears on the first tick and the next click selects again."""
+    swapped = _run_app_js(tmp_path, steps=("click", "swap"), **filtered)
+    assert swapped["selected"] == ["1"] and swapped["header"] is True
+    cleared = _run_app_js(tmp_path, steps=("click", "swap", "click"), **filtered)
+    assert cleared["selected"] == [] and cleared["header"] is False
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_a_part_selection_of_the_rows_it_can_take_reads_as_part(tmp_path: Path) -> None:
+    """The control: ticking the box is earned by every takeable row, not by any one of them."""
+    run = _run_app_js(tmp_path, flagged_only=False, steps=({"tick": "1"},))
+    assert run["header"] is False and run["indeterminate"] is True
+    run = _run_app_js(tmp_path, flagged_only=True, values=("1", "unknown"), steps=({"tick": "1"},))
+    assert run["header"] is True and run["indeterminate"] is False, "the only row it can take"
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_typing_a_filter_judges_the_box_again(tmp_path: Path) -> None:
+    """RED when only a click or a swap judges the box: it then reads the rows from before the
+    filter moved until the next poll. A selected row the filter hides stays selected, so the box
+    reads as part ticked rather than empty."""
+    steps: tuple[dict[str, str], ...] = ({"tick": "1"}, {"query": "row 1"})
+    run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
+    assert run["header"] is True and run["indeterminate"] is False
+    steps = ({"tick": "0"}, {"query": "row 1"})
+    run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
+    assert run["selected"] == ["0"] and run["visible"] == ["1"]
+    assert run["header"] is False and run["indeterminate"] is True

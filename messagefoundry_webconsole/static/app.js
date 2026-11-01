@@ -296,17 +296,37 @@
       if (applyBtn) applyBtn.disabled = eligible < 1;
     }
 
-    // Recompute the select-all header checkbox's checked/indeterminate from the live Set.
+    // Whether select-all takes this row. It takes the VISIBLE rows only (offsetParent is null for a
+    // display:none row), so the operator never sweeps in — and then Stop/Restart/Reset — connections
+    // they can't see. A failed flag read leaves every row on screen under Flagged only, and none of
+    // them is known to be flagged, so one transient error must not widen a selection scoped to
+    // flagged rows to every connection. The operator can still tick such a row by hand.
+    function selectAllTakes(cb) {
+      if (cb.offsetParent === null) return false;
+      var flaggedOnly = document.querySelector("[data-mf-conns-flagged]");
+      return !(flaggedOnly && flaggedOnly.checked) || cb.getAttribute("data-flagged") === "1";
+    }
+
+    // Recompute the select-all header checkbox's checked/indeterminate from the live Set. Ticked
+    // means every row a click can take is taken, not every rendered row: a filtered select-all must
+    // stay ticked, because its next click is the uncheck that clears the selection.
     function syncSelectAll() {
       var box = selectAllBox();
       if (!box) return;
       var cbs = rowCheckboxes();
       var checked = 0;
+      var takeable = 0;
+      var taken = 0;
       for (var i = 0; i < cbs.length; i++) {
-        if (selected.has(cbs[i].value)) checked++;
+        var isSelected = selected.has(cbs[i].value);
+        if (isSelected) checked++;
+        if (selectAllTakes(cbs[i])) {
+          takeable++;
+          if (isSelected) taken++;
+        }
       }
-      box.checked = cbs.length > 0 && checked === cbs.length;
-      box.indeterminate = checked > 0 && checked < cbs.length;
+      box.checked = takeable > 0 && taken === takeable;
+      box.indeterminate = checked > 0 && !box.checked;
     }
 
     // After every swap (poll tick AND ws push): re-apply cb.checked from the Set, recompute select-all,
@@ -363,17 +383,9 @@
         refresh();
       } else if (t.hasAttribute("data-mf-conns-all")) {
         var cbs = rowCheckboxes();
-        var flaggedOnly = document.querySelector("[data-mf-conns-flagged]");
-        var onlyFlagged = !!(flaggedOnly && flaggedOnly.checked);
         for (var i = 0; i < cbs.length; i++) {
-          // Select-all applies to the VISIBLE rows only: when checking, skip a row the filter has hidden
-          // (offsetParent is null for a display:none row) so the operator never sweeps in — and then
-          // Stop/Restart/Reset — connections they can't see. Unchecking still clears every row.
-          if (t.checked && cbs[i].offsetParent === null) continue;
-          // A failed flag read leaves every row on screen under Flagged only, and none of them is
-          // known to be flagged, so one transient error must not widen a selection scoped to flagged
-          // rows to every connection. The operator can still tick such a row by hand.
-          if (t.checked && onlyFlagged && cbs[i].getAttribute("data-flagged") !== "1") continue;
+          // Unchecking still clears every row.
+          if (t.checked && !selectAllTakes(cbs[i])) continue;
           cbs[i].checked = t.checked;
           if (t.checked) selected.add(cbs[i].value);
           else selected.delete(cbs[i].value);
@@ -415,6 +427,9 @@
     // Re-hydrate on every #conns swap (poll + ws), and once now (the fragment is already rendered).
     new MutationObserver(rehydrate).observe(poll, { childList: true, subtree: true });
     rehydrate();
+    // The filter's observer runs after that one, so fresh rows are not hidden yet when rehydrate
+    // judges the box. The filter says when they are.
+    poll.addEventListener("mf:conns-filtered", syncSelectAll);
   });
 
   // --- L5a: WebAuthn passkey ceremonies (ADR 0068 §6) -----------------------------------------
@@ -1059,6 +1074,7 @@
         var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") !== "0");
         rows[i].style.display = textHit && flagHit ? "" : "none";
       }
+      poll.dispatchEvent(new Event("mf:conns-filtered")); // select-all's box reads what is hidden
     }
     input.addEventListener("input", apply);
     if (flaggedOnly) flaggedOnly.addEventListener("change", apply);
