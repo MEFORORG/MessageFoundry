@@ -325,6 +325,7 @@ def test_a_default_turned_into_a_reference_after_it_was_made_is_refused_by_the_f
         LIST_SETTINGS[target](whole)
     message = str(excinfo.value)
     assert f"{factory} {setting} env() default may not be" in message, message
+    assert "with a static default" in message, message
     assert SENTINEL not in message, message
 
 
@@ -342,6 +343,18 @@ def test_a_reference_in_the_key_or_cast_slot_is_named_by_type(marker: dict[str, 
         wiring.parse_env_setting(marker)
     assert "dict" in str(excinfo.value), str(excinfo.value)
     assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+def test_a_cast_that_is_not_text_says_so() -> None:
+    """Type names of TOML scalars are valid cast names, so "unknown cast int" would contradict the
+    list of casts printed beside it."""
+    with pytest.raises(WiringError, match="it must be a string, got int"):
+        wiring.parse_env_setting({"env": "t", "cast": 5})
+
+
+def test_a_label_names_a_table_in_the_key_slot_by_type() -> None:
+    label = wiring._envref_label({"env": {"env": "inner", "default": SENTINEL}})
+    assert label == "env(<dict>)"
 
 
 def test_a_reference_inside_a_table_default_would_reach_the_partner() -> None:

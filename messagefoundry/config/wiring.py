@@ -341,7 +341,8 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``cast=lambda s: bool(s)`` still keeps the builtin's trap.
 
     A ``default=`` may not hold another reference, directly or inside a table or list: only one link
-    is resolved, so :class:`EnvRef` refuses it when the reference is made (vault BACKLOG #2519)."""
+    is resolved, so :class:`EnvRef` refuses it when the reference is made, down to its scan's depth
+    (vault BACKLOG #2519)."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -453,12 +454,13 @@ def _envref_label(value: Any) -> str:
     leak into the operator log, ``messagefoundry check`` output and the support bundle rather than
     closing it -- the shape BACKLOG #1183 is about. Only the env KEY is ever named."""
     key = value.key if isinstance(value, EnvRef) else value.get("env")
-    return f"env({key!r})"
+    # A raw marker can hold a table in this slot, and that table can carry a default=.
+    return f"env({key!r})" if isinstance(key, str) else f"env(<{type(key).__name__}>)"
 
 
 #: How far into a value :func:`_contains_envref` looks, for a header value or an ``env()`` default.
-#: The cap exists so a pathological or self-referential structure cannot spin the loader, not
-#: because a legitimate table is ever deep.
+#: The cap exists so a self-referential structure ends, not because a legitimate table is ever
+#: deep. The walk keeps no visited set, so its cost on such a structure still grows with fan-out.
 _MAX_ENVREF_SCAN_DEPTH = 6
 
 
@@ -651,7 +653,7 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
             f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
             "not env-resolved, so it would reach the connector unresolved, where a str() of it "
             "carries any default= inside it. Write the items as static values, or let one env() "
-            "reference stand for the whole setting."
+            "reference with a static default stand for the whole setting."
         )
 
 
@@ -675,12 +677,17 @@ def parse_env_setting(value: Any) -> Any:
         got = repr(key) if isinstance(key, str) else type(key).__name__
         raise WiringError(f"env reference must name a non-empty string key, got {got}")
     cast_name = value.get("cast")
-    # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
-    # a raw TypeError that no caller turns into a message naming the connection.
-    if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
-        got = repr(cast_name) if isinstance(cast_name, str) else type(cast_name).__name__
+    # Ahead of the lookup: a TOML array or table is unhashable, so the dict lookup would raise a raw
+    # TypeError that no caller turns into a message naming the connection. By type, as the key is.
+    if cast_name is not None and not isinstance(cast_name, str):
         raise WiringError(
-            f"env reference {key!r}: unknown cast {got} "
+            f"env reference {key!r}: unknown cast - it must be a string, got "
+            f"{type(cast_name).__name__} "
+            f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
+        )
+    if cast_name is not None and cast_name not in _NAMED_CASTS:
+        raise WiringError(
+            f"env reference {key!r}: unknown cast {cast_name!r} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
         )
     cast = _NAMED_CASTS[cast_name] if cast_name is not None else None
