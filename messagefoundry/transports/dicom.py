@@ -676,9 +676,8 @@ def _admitting_server_class() -> type[Any]:
             self.max_object_bytes = max_object_bytes
             self._admit = admit
             self._refused = refused
-            #: Called besides ``refused`` for a connection refused at a connection cap. The refusal
-            #: observers count that and the allowlist refusal ``_admit_connection`` notifies, and no
-            #: other ``refused`` call (vault BACKLOG #2613).
+            #: Called besides ``refused`` for a connection refused at a connection cap, which the
+            #: refusal observers count (vault BACKLOG #2613).
             self._refused_at_cap = refused_at_cap
             #: Called on the DUL thread with the peer address and the reason, when a read of an
             #: association that has started runs out its deadline. It is not a refusal: the SCP
