@@ -286,6 +286,122 @@ def test_the_guard_judges_only_graph_hops(tmp_path: Path) -> None:
     _guard(settings)(reg)
 
 
+def _env_dialect_graph() -> Registry:
+    """A DATABASE hop whose dialect is ``env("db_dialect")``, on Windows Integrated auth with a
+    username: delegated on the SQL Server preset, a static username/password on generic."""
+    from messagefoundry.config.wiring import Database, build_outbound_connection, env
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_DB",
+            Database(
+                server="db.example.invalid",
+                database="MFDB",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                auth="integrated",
+                odbc_driver="PostgreSQL Unicode",
+                username="svc",
+                password=env("pw"),
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_GENERIC_LOGIN",
+            Database(
+                server="pg.example.invalid",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                username="svc",
+                password=env("pw"),
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    return reg
+
+
+async def test_the_guard_resolves_an_env_dialect_against_the_graph_values(tmp_path: Path) -> None:
+    """The guard read every ``env()`` dialect as unresolved, listing the hop under either arm, so a
+    hop that resolves to sqlserver with integrated auth was refused under enforce: ``serve`` failed
+    to start and a reload was refused. It now judges the values the graph resolves against, which
+    the engine sets around the guard: its own at the first load, a reload's pending ones on a
+    reload. A generic static login is still refused."""
+    reg = _env_dialect_graph()
+    settings = _settings(gate=True, accepted={"OB_GENERIC_LOGIN": "vendor has no gMSA"})
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(settings),
+        env_values={"db_dialect": "sqlserver"},
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        eng.guard_registry(reg)  # the engine's own values: delegated, so nothing is refused
+        # A reload's pending values, which say generic: the username/password is static.
+        with pytest.raises(WiringError, match="OB_ENV_DB") as exc:
+            eng.guard_registry(reg, {"db_dialect": "generic"})
+        assert "OB_GENERIC_LOGIN" not in str(exc.value)  # opted out
+    finally:
+        await eng.stop()
+    # The control: the literal generic static login is still refused with no opt-out.
+    with pytest.raises(WiringError, match="OB_GENERIC_LOGIN"):
+        eng2 = await Engine.create(
+            tmp_path / "e2.db",
+            poll_interval=0.02,
+            registry_guard=_guard(_settings(gate=True)),
+            env_values={"db_dialect": "sqlserver"},
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        try:
+            eng2.guard_registry(reg)
+        finally:
+            await eng2.stop()
+
+
+async def test_a_reload_guards_with_the_values_it_will_apply(tmp_path: Path) -> None:
+    """A reload reads the values before it applies them, and the guard judges those, not the ones
+    the running graph was built with: a reload that moves the dialect to sqlserver is not refused
+    on the old generic value."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import Database, File, Send, env, handler, inbound, outbound, router\n"
+        f"inbound('IB', File(directory={str(tmp_path / 'in')!r}, pattern='*.hl7'), router='r')\n"
+        "outbound('OB_ENV_DB', Database(server='db.example.invalid', database='MFDB',\n"
+        "    dialect=env('db_dialect'), auth='integrated', odbc_driver='PostgreSQL Unicode',\n"
+        "    username='svc', statement='INSERT INTO r (a) VALUES (:a)'))\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_ENV_DB', msg)\n",
+        encoding="utf-8",
+    )
+    values = {"db_dialect": "generic"}
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(_settings(gate=True)),
+        env_values_provider=lambda: dict(values),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with pytest.raises(WiringError, match="OB_ENV_DB"):
+            eng.guard_registry(load_config(cfg))  # control: generic, a static username
+        values["db_dialect"] = "sqlserver"
+        try:
+            await eng.reload_detail(cfg, dry_run=True)
+        except WiringError as exc:
+            # A later build check may refuse for its own reason; the guard must not.
+            assert "require_nonstatic_credentials" not in str(exc)
+    finally:
+        await eng.stop()
+
+
 # --- the check and the posture surface ------------------------------------------------------------
 
 

@@ -56,6 +56,7 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     connector_secret_env_values,
+    guarding_with_env_values,
     load_config,
     read_trusted_snapshot,
 )
@@ -3246,13 +3247,22 @@ class Engine:
         self.loaded_config_fingerprint, reason = await self.fingerprint_bundle(self.config_dir)
         return reason
 
-    def guard_registry(self, registry: Registry) -> None:
+    def guard_registry(
+        self, registry: Registry, env_values: Mapping[str, Any] | None = None
+    ) -> None:
         """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
+
+        ``env_values`` defaults to the engine's own; :meth:`reload_detail` passes the values it has
+        read but not yet applied, as it does to :meth:`preflight_registry`. The guard reads them
+        through :func:`~messagefoundry.config.wiring.guarded_env_values`, so a guard that resolves
+        an ``env()`` setting judges the values this graph will run with.
 
         A no-op when no guard was configured. Public because the managed app calls it on the first
         load, which reaches ``add_registry`` directly rather than through :meth:`reload_detail`."""
         if self._registry_guard is not None:
-            self._registry_guard(registry)
+            values = self._env_values if env_values is None else env_values
+            with guarding_with_env_values(values):
+                self._registry_guard(registry)
 
     async def preflight_registry(
         self, registry: Registry, env_values: Mapping[str, Any] | None = None
@@ -3504,7 +3514,7 @@ class Engine:
                 failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
         # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
         # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
-        self.guard_registry(registry)
+        self.guard_registry(registry, env_values)
         if self._registry_filter is not None:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
