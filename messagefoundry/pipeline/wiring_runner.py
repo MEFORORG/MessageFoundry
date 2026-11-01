@@ -9044,12 +9044,9 @@ class RegistryRunner:
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
                 # member with rewrite=False and never rewrites the envelope. A retryable hydration
                 # failure (a DeliveryError) is not a refusal, so it stays what shadow made it before,
-                # a completed delivery. On a framing connector (MLLP, TCP), two kinds do not: one the
-                # payload itself caused is a permanent refusal and dead-letters, as live, and a stored
-                # document holding a CR or LF is a plain ValueError that takes the internal-error
-                # policy, as live (vault #2809). A shadow outbound that does not frame never hydrates,
-                # so it completes the row. A store read fault is not a hydration failure: it
-                # re-pends, as live (vault #2756).
+                # a completed delivery. A shadow outbound that does not frame never hydrates, so it
+                # completes the row. A store read fault is not a hydration failure: it re-pends, as
+                # live (vault #2756).
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))
