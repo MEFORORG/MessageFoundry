@@ -881,18 +881,38 @@ def test_a_note_on_a_link_of_a_kept_chain_does_not_ride_out(
     ],
     ids=["getattribute", "class-property", "import-error", "metaclass", "metaclass-name"],
 )
-@pytest.mark.parametrize("raiser", ["raise Bad()", "probe.raises_this_type(Bad)"])
+@pytest.mark.parametrize(
+    ("raiser", "reads"),
+    [
+        ("raise Bad()", "feed.py: Bad"),
+        # An engine `raise`, so a class that faults on nothing here keeps its empty engine wording.
+        ("probe.raises_this_type(Bad)", "error loading config module feed.py: "),
+    ],
+    ids=["module-raises", "engine-raises"],
+)
 def test_a_class_that_faults_when_read_cannot_escape_the_loader(
-    tmp_path: Path, engine_probe: str, bad_class: str, raiser: str
+    tmp_path: Path, engine_probe: str, bad_class: str, raiser: str, reads: str
 ) -> None:
     # isinstance() falls back to the instance's __class__, and that runs the class's own code.
     _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{bad_class}\n{raiser}\n")
     err = _load_error(tmp_path)
-    assert NEEDLE not in str(err)
-    if raiser == "raise Bad()":
-        assert "feed.py: Bad" in str(err) and "withheld" in str(err)
+    assert NEEDLE not in str(err) and reads in str(err)
     assert err.__context__ is None or NEEDLE not in str(err.__context__)
     assert err.__cause__ is None or NEEDLE not in repr(err.__cause__)
+
+
+def test_an_engine_raised_class_whose_str_faults_cannot_escape_the_loader(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # Text the engine would keep, so it is read outside any chain walk.
+    bad_class = (
+        f"class Bad(Exception):\n    def __str__(self):\n        raise OSError({NEEDLE!r})\n"
+    )
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert NEEDLE not in str(err) and "withheld" in str(err)
+    assert err.__cause__ is None and err.__context__ is None
 
 
 def test_a_fault_reading_a_failure_is_logged_with_no_text(
@@ -1071,43 +1091,41 @@ def _raised_in(module_name: str, file: Path, source: str) -> BaseException:
 
 _IN_THE_ENGINE = _ENGINE_DIR / "x.py"
 _IN_A_CONFIG_DIR = _ENGINE_DIR.parent / "config" / "feed.py"
+_RAISE = "raise ValueError('text')"
 
 
 @pytest.mark.parametrize(
     ("module", "file", "source", "raised", "worded"),
     [
-        ("messagefoundry.x", _IN_THE_ENGINE, "raise ValueError('ours')", True, True),
-        ("messagefoundry", _ENGINE_DIR / "__init__.py", "raise ValueError('ours')", True, True),
-        ("messagefoundry.x", _IN_THE_ENGINE, "int('x')", True, False),
-        ("messagefoundry.x", _IN_THE_ENGINE, "{}['k']", True, False),
-        ("mefor_config_feed_abc", _IN_A_CONFIG_DIR, "raise ValueError('theirs')", False, False),
-        (
+        pytest.param("messagefoundry.x", _IN_THE_ENGINE, _RAISE, True, True, id="raise"),
+        pytest.param(
+            "messagefoundry", _ENGINE_DIR / "__init__.py", _RAISE, True, True, id="package"
+        ),
+        pytest.param("messagefoundry.x", _IN_THE_ENGINE, "int('x')", True, False, id="builtin"),
+        pytest.param("messagefoundry.x", _IN_THE_ENGINE, "{}['k']", True, False, id="lookup"),
+        pytest.param("mefor_config_a", _IN_A_CONFIG_DIR, _RAISE, False, False, id="config-module"),
+        pytest.param(
             "messagefoundry_lookalike",
             _ENGINE_DIR.parent / "messagefoundry_lookalike" / "x.py",
-            "raise ValueError('theirs')",
+            _RAISE,
             False,
             False,
+            id="lookalike-package",
         ),
-        ("messagefoundry.x", _IN_A_CONFIG_DIR, "raise ValueError('theirs')", False, False),
-        ("mefor_config_feed_abc", _IN_THE_ENGINE, "raise ValueError('theirs')", False, False),
-        (
+        pytest.param(
+            "messagefoundry.x", _IN_A_CONFIG_DIR, _RAISE, False, False, id="named-like-the-engine"
+        ),
+        pytest.param(
+            "mefor_config_a", _IN_THE_ENGINE, _RAISE, False, False, id="config-dir-in-the-package"
+        ),
+        pytest.param(
             "messagefoundry._vendor.x",
             _ENGINE_DIR / "_vendor" / "x.py",
-            "raise ValueError('theirs')",
+            _RAISE,
             False,
             False,
+            id="vendored",
         ),
-    ],
-    ids=[
-        "raise",
-        "package",
-        "builtin",
-        "lookup",
-        "config-module",
-        "lookalike-package",
-        "a-module-named-like-the-engine",
-        "a-config-dir-inside-the-package",
-        "vendored",
     ],
 )
 def test_who_raised_an_exception(
