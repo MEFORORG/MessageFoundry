@@ -562,7 +562,8 @@ class PendingApprovalInfo(BaseModel):
     ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
     one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
-    does. The read can still report a requester account whose integrity seal fails, as any read
+    does. A listing that shows this value writes one ``approval.standing_shown`` row, naming the
+    caller and these requests (vault BACKLOG #3747). The read can still report a requester account whose integrity seal fails, as any read
     of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
     standing the listing could not read, a seal that fails after the listing and the operation's own refusals, such as a

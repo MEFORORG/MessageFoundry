@@ -539,9 +539,10 @@ the audit chain and the wipe do not apply. And the start-time age check does not
 
 **Section 7 recording, for this key.** On a store whose audit chain is keyed, `rotate-key` appends an
 `audit.key_epoch` row, MAC'd under the new key's audit sub-key. That records the move to a new active
-key. On a keyless audit chain it writes no such row. In both cases `rotate-key` and the start-time
-reconcile stamp the new key's id and date in the secret-rotation metadata, which records the change
-without auditing it. A key leaving the retired list is never recorded, because the engine sees only
+key. On a keyless audit chain it writes no such row. In both cases a `rotate-key` run that completes,
+or a start-time reconcile, stamps the new key's id and date in the secret-rotation metadata, which
+records the change without auditing it. Neither stamps a key an unfinished `rotate-key` run holds
+(BACKLOG #3737, [PHI.md](PHI.md)). A key leaving the retired list is never recorded, because the engine sees only
 the setting.
 
 **Found by this read, outside the mapping.** The rotation-fingerprint MAC key hung off the active
@@ -637,7 +638,8 @@ value.
 > - **Live-by-default DEK.** At first keyed start a **non-secret** stamp — the DEK's one-way key-id + an
 >   ISO *tracked-since* date — is persisted in store meta (`secret_rotation_meta`), so the DEK is watched
 >   without an operator setting `[secret_rotation].store_key_last_rotated` (which stays an override).
->   `messagefoundry rotate-key` re-stamps it, and a changed key-id is auto-detected on the next start.
+>   `messagefoundry rotate-key` re-stamps it, and a changed key-id is auto-detected on the next start,
+>   except one an unfinished `rotate-key` run is recorded against (BACKLOG #3737, [PHI.md](PHI.md)).
 > - **Widened enumeration.** Every configured secret class the engine holds (at least: store-DB / AD /
 >   SMTP passwords, both Vault tokens, the OIDC client secret and private_key_jwt key and passphrase,
 >   the TLS key passphrase, connector `env()` creds)

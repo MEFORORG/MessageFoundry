@@ -8,7 +8,9 @@ live sessions, and reports the pair it cleared -- all in one transaction.
 conditional on that pair still being there, so a login already in flight cannot outrun the unbind.
 One shared body each, run by the SQLite, PostgreSQL and SQL Server suites, so "the three backends
 agree" is an assertion rather than a reading of three separately-worded tests. The two server legs
-run only in CI, so that is where their bodies first execute.
+run only in CI, so that is where their bodies first execute. The bind-versus-delete lock-order body
+runs on the two server legs only: the SQLite store runs one writer at a time, so it has no lock
+order to test.
 
 Driven against the REAL store object on every leg. A fake would move in lockstep with a broken
 implementation and the test would see nothing.
@@ -16,6 +18,8 @@ implementation and the test would see nothing.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 ISSUER = "https://idp.example/tenant"
@@ -330,3 +334,97 @@ async def _assert_bind_sweeps_and_unbound_guard_contract(store: Any) -> None:
     assert (
         await store.set_user_federated_subject("fed-guard-quiet", ISSUER, "S-1-quiet", now=5.0) == 0
     )
+
+
+#: How long the lock-wait probe looks for the delete to queue behind the bind, in polls.
+_PROBE_POLLS = 400
+_PROBE_INTERVAL = 0.025
+#: A bound on each awaited step, so a hang fails the test rather than the leg's timeout.
+_STEP_TIMEOUT = 30.0
+
+
+async def _assert_bind_and_user_delete_take_one_lock_order(
+    store: Any,
+    *,
+    holder_of: Callable[[Any], Awaitable[object]],
+    is_blocking: Callable[[object], Awaitable[bool]],
+) -> None:
+    """A bind and ``delete_user`` against one account, interleaved on a server store (BACKLOG #2738).
+
+    Both must take the account's ``users`` row before its ``sessions`` rows. The bind is paused
+    right after its user write, holding the row, and ``delete_user`` is started. A delete that took
+    the sessions first holds the live session's row by the time it queues on ``users``. The bind's
+    sweep, released, then waits on that session row: a deadlock, and the server ends one of the two.
+    A delete that takes ``users`` first holds nothing yet, so the bind finishes and the delete
+    follows it.
+
+    ``holder_of`` names the bind's server session from the handle its user write was given.
+    ``is_blocking`` says whether a lock request is waiting on that session right now: the probe that
+    the delete really queued behind the bind. No timing decides it, so a pass is not a lucky
+    schedule. The interleaving is hooked rather than raced.
+    """
+    account = "fed-bind-delete"
+    await store.create_user(
+        user_id=account, username=account, auth_provider="ad", now=1.0, password_generated=False
+    )
+    await store.create_session(token_hash="bd-live", user_id=account, expires_at=_EXPIRES, now=1.0)
+
+    real_write = store._write_user
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    holder: list[object] = []
+
+    async def _paused_write(handle: Any, user_id: str, change: Any) -> Any:
+        written = await real_write(handle, user_id, change)
+        if not holder and user_id == account:  # the bind's write, the first to this account
+            holder.append(await holder_of(handle))
+            holding.set()
+            await release.wait()
+        return written
+
+    store._write_user = _paused_write
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        bind = asyncio.create_task(
+            store.set_user_federated_subject(account, ISSUER, "S-1-bind-delete", now=2.0)
+        )
+        held = asyncio.create_task(holding.wait())
+        tasks += [bind, held]
+        await asyncio.wait({bind, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+        if bind.done():
+            bind.result()  # a bind that failed before its pause raises its own error here
+        assert holding.is_set(), "the bind never reached its user write"
+
+        delete = asyncio.create_task(store.delete_user(account))
+        tasks.append(delete)
+        queued = False
+        for _ in range(_PROBE_POLLS):
+            if delete.done():
+                break
+            if await is_blocking(holder[0]):
+                queued = True
+                break
+            await asyncio.sleep(_PROBE_INTERVAL)
+        # The race actually exercised: without this the test would pass on a delete that never met
+        # the bind, which proves nothing about the order.
+        if delete.done():
+            delete.result()  # a delete that failed fast raises its own error here
+            raise AssertionError("delete_user finished while the bind held the account's row")
+        assert queued, "delete_user never queued behind the bind, so the interleaving did not run"
+
+        release.set()
+        swept = await asyncio.wait_for(bind, timeout=_STEP_TIMEOUT)
+        await asyncio.wait_for(delete, timeout=_STEP_TIMEOUT)
+    finally:
+        release.set()
+        del store._write_user  # the instance attribute only; the class method is untouched
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Neither was ended by the server: the bind swept the one live session, and the delete then
+    # removed the account and every session row, the revoked one included.
+    assert swept == 1, swept
+    assert await store.get_user(account) is None
+    assert await store.get_session("bd-live") is None

@@ -354,8 +354,8 @@ def run_checks(
         # ASVS 12.3.2: tls_check_hostname=false, the third per-connection TLS relaxation, which no
         # surface listed at all until 2026-10-01. Advisory, as tls_allow_expired is -- see the check.
         _check_hostname_unchecked(config_dir),
-        # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory, and a
-        # refusal was weighed and declined -- see the check and
+        # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory here; a
+        # build refuses it on some hops -- see the check and
         # transports.egress.warn_url_query_credentials.
         _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
@@ -2732,8 +2732,11 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
 
     Advisory (``required=False``): a query credential authenticates, unlike the userinfo shape
     ``refuse_url_credentials`` refuses, and some partner APIs take it nowhere else. The detection is
-    a heuristic over names. It reads a literal ``url`` only; an ``env()`` URL is read, resolved, by
-    the construction WARNING. SKIPs when the graph will not load, like its siblings."""
+    a heuristic over names. This line stays advisory on every hop. The ``build-check`` leg refuses
+    one on a hop the no-escape credential rule covers, but that leg can SKIP (its own detail says
+    why), so a passing ``check`` does not prove the hop was judged.
+    It reads a literal ``url`` only; an ``env()`` URL is read, resolved, by the construction
+    WARNING. SKIPs when the graph will not load, like its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
     name = "url-query-credential"
