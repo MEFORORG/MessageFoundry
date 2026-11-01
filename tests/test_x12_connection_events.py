@@ -204,7 +204,7 @@ def test_x12_emits_the_same_event_vocabulary_as_its_tcp_twin() -> None:
 
     A new *name* on either side is a separate failure, caught by
     ``test_connection_event_vocabulary_is_derived_from_the_emit_sites`` in the PHI inventory, which
-    checks the shipped kinds against the documented row and the console's filter tuple.
+    checks the shipped kinds against the documented row and ``CONNECTION_EVENT_KINDS``.
     """
     transports = Path(__file__).resolve().parents[1] / "messagefoundry" / "transports"
     tcp_kinds = _emitted_kinds(transports / "tcp.py")
@@ -244,7 +244,7 @@ async def test_an_idle_connection_closes_with_the_idle_timeout_reason() -> None:
 
 async def test_an_over_cap_interchange_is_recorded_as_frame_oversize() -> None:
     # Reuses TcpSource's kind name deliberately: X12's frame IS the interchange, and inventing
-    # `interchange_oversize` would red the documented-vocabulary guard, the console filter tuple
+    # `interchange_oversize` would red the documented-vocabulary guard, CONNECTION_EVENT_KINDS
     # and the docs/PHI.md row together.
     events = await _drive(_x12(max_interchange_bytes=64), _OnceThenSilent(EDI), _Peer())
     assert _kinds(events) == ["established", "frame_oversize"]

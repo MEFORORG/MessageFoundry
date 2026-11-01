@@ -638,16 +638,20 @@ def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
         {"Encrypt": "yes "},
     ],
 )
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI])
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
-def test_generic_blank_or_non_string_mode_refused_when_enforcing(
-    params: dict[str, object], connector: Callable[[Any], object], config: Callable[..., Any]
+def test_generic_blank_padded_or_non_string_mode_refused_at_build(
+    params: dict[str, object],
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    posture: HopPosture,
 ) -> None:
-    # The DSN would carry the keyword with no usable mode in it, which is no evidence of one. A
-    # padded value goes out padded, and a driver that does not trim reads another word.
-    with (
-        active_hop_posture(PROD_PHI),
-        pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
-    ):
+    # Such a value is no evidence of a mode, and a padded one would reach a driver that does not trim
+    # as another word. Since BACKLOG #2705 the DSN builder refuses every one of these values on any
+    # posture, before the cleartext-hop guard is reached, so the build fails whether or not the
+    # instance enforces. The classifier still flags them (no usable mode) for the posture readers,
+    # which judge specs that were never built.
+    with active_hop_posture(posture), pytest.raises(ValueError, match="odbc_params value for"):
         connector(config(odbc_params=params))
 
 
