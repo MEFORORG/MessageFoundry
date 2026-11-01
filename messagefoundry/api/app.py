@@ -1917,6 +1917,7 @@ def _posture_loosenings(
     runner: RegistryRunner | None,
     *,
     graph: Registry | None = None,
+    graph_env_values: Mapping[str, Any] | None = None,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
     service_env: ServiceEnvPosture,
@@ -1938,8 +1939,10 @@ def _posture_loosenings(
     The per-connection entries are read off ``graph``, or off ``runner``'s live graph when no
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
-    #3076). The settings-scoped entries are the same for either graph: a reload changes no
-    settings."""
+    #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
+    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
+    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
@@ -1999,10 +2002,16 @@ def _posture_loosenings(
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
     query_hops = hops(query_credential_hops)
-    # A DATABASE dialect given as env() is resolved against the values the runner builds with, so a
+    # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
     # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
     # the reader's marker beside its name, because this entry keeps names only and its text states
-    # that each named hop is generic.
+    # that each named hop is generic. A passed graph comes with its own values, which the start's
+    # snapshot took beside it; the live graph's are the runner's.
+    db_env_values = (
+        graph_env_values
+        if graph is not None
+        else (runner.env_values if runner is not None else None)
+    )
     db_hops = (
         []
         if registry is None
@@ -2010,9 +2019,7 @@ def _posture_loosenings(
             f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
             if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
             else name
-            for name, reason in unverified_generic_db_hops(
-                registry, env_values=runner.env_values if runner is not None else None
-            )
+            for name, reason in unverified_generic_db_hops(registry, env_values=db_env_values)
             # Narrowed on the bare name, before any marker is added.
             if visible is None or visible(name)
         ]
@@ -2132,6 +2139,10 @@ class _LoadedConfig:
     #: that; a reload's row does not, since an in-flight reload may still roll back (vault BACKLOG
     #: #2257; see :func:`_record_reload_audit`).
     registry: Registry | None
+    #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
+    #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
+    #: ``None`` when the snapshot did not take them, as a reload's row does not.
+    env_values: Mapping[str, Any] | None = None
 
     @classmethod
     def _of(
@@ -2139,9 +2150,10 @@ class _LoadedConfig:
         directory: Path | None,
         registry: Registry | None,
         fingerprint: Mapping[str, object] | None,
+        env_values: Mapping[str, Any] | None = None,
     ) -> _LoadedConfig:
         # A reload rebinds the fingerprint rather than editing it; the copy keeps the snapshot safe
-        # even if that changes.
+        # even if that changes. The values are copied for the same reason.
         return cls(
             directory=str(directory) if directory else None,
             shard=registry.shard_id if registry else None,
@@ -2149,6 +2161,7 @@ class _LoadedConfig:
             outbound=len(registry.outbound) if registry else 0,
             fingerprint=dict(fingerprint) if fingerprint is not None else None,
             registry=registry,
+            env_values=dict(env_values) if env_values is not None else None,
         )
 
     @classmethod
@@ -2159,6 +2172,7 @@ class _LoadedConfig:
             engine.running_config_dir,
             rr.registry if rr else None,
             engine.loaded_config_fingerprint,
+            rr.env_values if rr else None,
         )
 
     @classmethod
@@ -3175,6 +3189,7 @@ async def _record_start_audit(
                 engine,
                 None,
                 graph=loaded.registry,
+                graph_env_values=loaded.env_values,
                 remote_debug=remote_debug_posture(),
                 startup=await asyncio.to_thread(startup_posture),
                 service_env=await asyncio.to_thread(service_env_posture),

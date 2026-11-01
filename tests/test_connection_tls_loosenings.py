@@ -500,6 +500,59 @@ async def test_posture_route_resolves_an_env_dialect_from_the_runner(engine: Eng
     assert "OB_ENV_SS" not in static_names
 
 
+async def test_start_row_resolves_an_env_dialect_as_the_route_does(engine: Engine) -> None:
+    """The start's ``config_loaded`` row records the list ``GET /security/posture`` reports. It read
+    its graph with no ``env()`` values, so a dialect that resolves to sqlserver was recorded as
+    ``generic_odbc_tls_unenforced`` while the route, which resolves it, did not list it. The security
+    signal detector then raised a loosening on every start that nothing had loosened."""
+    import json
+
+    from messagefoundry.api import app as app_module
+    from messagefoundry.api import create_app
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_DB",
+            Database(
+                server="db.example.invalid",
+                database="MFDB",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    runner = engine.add_registry(reg)
+    app = create_app(engine, allow_no_auth=True)
+
+    async def start_row(values: dict[str, str]) -> list[str]:
+        runner.set_env_values(values)
+        before = len(await engine.store.list_audit(action="config_loaded"))
+        await app_module._record_start_audit(
+            app, engine, loaded=app_module._LoadedConfig.read(engine)
+        )
+        rows = await engine.store.list_audit(action="config_loaded")
+        assert len(rows) == before + 1
+        switches: list[str] = json.loads(rows[0]["detail"])["loosenings"]
+        return switches
+
+    route = {e["switch"] for e in _loosenings(await _posture(engine))}
+    assert "generic_odbc_tls_unenforced" in route, "control: no values, so possibly generic"
+    assert "generic_odbc_tls_unenforced" not in await start_row({"db_dialect": "sqlserver"})
+    assert "generic_odbc_tls_unenforced" not in {
+        e["switch"] for e in _loosenings(await _posture(engine))
+    }, "the route agrees with the row"
+    # The control: the same reader does list the hop once the value says generic.
+    assert "generic_odbc_tls_unenforced" in await start_row({"db_dialect": "generic"})
+
+
 async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
     """With no graph the route cannot see ANY per-connection declaration, and the marker must name
     each of them. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same

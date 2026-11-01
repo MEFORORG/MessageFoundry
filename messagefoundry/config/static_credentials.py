@@ -97,6 +97,7 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     _peer_label,
+    guarded_env_values,
     static_credential_db_hops,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
@@ -633,7 +634,10 @@ class StaticCredentialGateOutcome:
 
 
 def run_static_credential_gate(
-    settings: ServiceSettings, *, registry: Registry | None
+    settings: ServiceSettings,
+    *,
+    registry: Registry | None,
+    env_values: Mapping[str, Any] | None = None,
 ) -> StaticCredentialGateOutcome | None:
     """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set,
     logging nothing: the caller decides when the audit lines are logged.
@@ -641,13 +645,15 @@ def run_static_credential_gate(
     ``serve`` needs that choice (BACKLOG #1989). It judges the settings half before
     ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and
     never the log file or the forwarder; it holds the lines and logs them once logging is configured.
-    ``registry=None`` judges the settings half; a registry judges that graph's hops only. Returns
-    ``None`` without reading anything when the gate is off."""
+    ``registry=None`` judges the settings half; a registry judges that graph's hops only.
+    ``env_values`` are the values that graph resolves against, so a database hop's ``env()`` dialect
+    is judged as the build resolves it; with none it is read as unresolved (see
+    :func:`static_credential_hops`). Returns ``None`` without reading anything when the gate is off."""
     security = settings.security
     if not security.require_nonstatic_credentials:
         return None
     verdict = evaluate_static_credential_gate(
-        static_credential_hops(registry=registry, settings=settings),
+        static_credential_hops(registry=registry, settings=settings, env_values=env_values),
         security.static_credential_accepted,
         settings_half=registry is None,
     )
@@ -675,14 +681,18 @@ def run_static_credential_gate(
 
 
 def apply_static_credential_gate(
-    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
+    settings: ServiceSettings,
+    *,
+    registry: Registry | None,
+    log: logging.Logger,
+    env_values: Mapping[str, Any] | None = None,
 ) -> str | None:
     """:func:`run_static_credential_gate`, logging its audit lines at WARNING straight away.
 
     For a caller whose logging is already configured, such as the registry guard, which runs at every
     graph load. Returns the refusal message, or ``None``; the caller refuses or warns on
     ``[security].enforcement``."""
-    outcome = run_static_credential_gate(settings, registry=registry)
+    outcome = run_static_credential_gate(settings, registry=registry, env_values=env_values)
     if outcome is None:
         return None
     for line in outcome.audit:
@@ -703,12 +713,19 @@ def make_static_credential_guard(
     ``[security].static_credential_accepted`` reaches the guard only on a restart. That is by choice
     (BACKLOG #1989): re-reading ``[security]`` for this guard alone would let it disagree with the
     settings half, ``security_loosenings()`` and ``GET /security/posture``, which all keep the startup
-    values, and with every other ``[security]`` switch, which is read once at start."""
+    values, and with every other ``[security]`` switch, which is read once at start.
+
+    A database hop's ``env()`` dialect is judged against the values the graph resolves against,
+    which :meth:`~messagefoundry.pipeline.engine.Engine.guard_registry` sets around the call. Called
+    outside it, the guard has none and reads such a dialect as unresolved, listing the hop when
+    either arm would."""
     if not settings.security.require_nonstatic_credentials:
         return None
 
     def guard(registry: Registry) -> None:
-        reason = apply_static_credential_gate(settings, registry=registry, log=log)
+        reason = apply_static_credential_gate(
+            settings, registry=registry, log=log, env_values=guarded_env_values()
+        )
         if reason is None:
             return
         if enforcing:

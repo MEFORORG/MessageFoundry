@@ -49,6 +49,7 @@ import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -150,6 +151,8 @@ __all__ = [
     "ReferenceSpec",
     "ReferenceSourceSpec",
     "resolve_env_settings",
+    "guarding_with_env_values",
+    "guarded_env_values",
     "referenced_env_keys",
     "connector_secret_env_values",
     "display_settings",
@@ -1569,6 +1572,31 @@ def resolve_env_settings(
     if parts:
         raise WiringError("; ".join(parts))
     return resolved
+
+
+#: The ``env()`` values the graph a registry guard is judging resolves against, set only while
+#: :meth:`~messagefoundry.pipeline.engine.Engine.guard_registry` runs the guard. A guard takes the
+#: graph alone, and several are chained into one, so this carries the values to the one that reads
+#: them without changing what every other guard takes. ``None`` outside such a call.
+_GUARDED_ENV_VALUES: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "_GUARDED_ENV_VALUES", default=None
+)
+
+
+@contextmanager
+def guarding_with_env_values(values: Mapping[str, Any]) -> Iterator[None]:
+    """Make ``values`` what :func:`guarded_env_values` returns for the duration of the block."""
+    token = _GUARDED_ENV_VALUES.set(values)
+    try:
+        yield
+    finally:
+        _GUARDED_ENV_VALUES.reset(token)
+
+
+def guarded_env_values() -> Mapping[str, Any] | None:
+    """The values the graph being guarded resolves against, or ``None`` when the caller is not
+    inside :func:`guarding_with_env_values`, such as a guard called directly."""
+    return _GUARDED_ENV_VALUES.get()
 
 
 def referenced_env_keys(settings: Mapping[str, Any]) -> list[str]:
@@ -6520,6 +6548,17 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     return str(resolved["dialect"]).lower()
 
 
+def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
+    """Whether ``conn`` is ``deployed=False`` with an ``env()`` dialect, which both DATABASE readers
+    skip before :func:`_db_dialect` can resolve it.
+
+    ADR 0111 AC-1: a not-deployed connection's ``env()`` values are never resolved on any path, so an
+    operator's ``cast`` never runs for it, and the engine never builds it. Skipped rather than read as
+    unresolved, so neither reader lists a connection that is not built because of a value it never
+    reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
+    return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
 def unverified_generic_db_hops(
     registry: Registry, *, env_values: Mapping[str, Any] | None = None
 ) -> list[tuple[str, str]]:
@@ -6551,7 +6590,8 @@ def unverified_generic_db_hops(
     possibly generic, and its reason opens with :data:`POSSIBLY_GENERIC_DB_HOP` and names the
     reference's key, never its value. Comparing the reference's text with ``generic`` would never
     match, and would leave off every surface a hop the build then gates or, on a non-enforcing
-    instance, builds with only a WARNING.
+    instance, builds with only a WARNING. A ``deployed=False`` connection with an ``env()`` dialect is
+    skipped before anything is resolved (ADR 0111 AC-1, :func:`_dark_env_dialect`).
 
     ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
     than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
@@ -6591,7 +6631,7 @@ def unverified_generic_db_hops(
         (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
-            if conn.spec.type is not ConnectorType.DATABASE:
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
             reason = unenforced(conn.spec.settings)
             if reason is not None:
@@ -6665,7 +6705,9 @@ def static_credential_db_hops(
     **A ``dialect`` given as ``env()``** is resolved against ``env_values`` when the caller has them,
     as the build resolves it. With none, both arms are read and the hop is listed when either would
     list it, with a fixed reason saying the dialect is unresolved: an inventory that guessed the
-    SQL Server arm would drop a generic hop's static username/password.
+    SQL Server arm would drop a generic hop's static username/password. A ``deployed=False``
+    connection with an ``env()`` dialect is skipped before anything is resolved (ADR 0111 AC-1,
+    :func:`_dark_env_dialect`).
 
     Pure — it reads the loaded graph and touches nothing else."""
 
@@ -6705,7 +6747,7 @@ def static_credential_db_hops(
         (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
-            if conn.spec.type is not ConnectorType.DATABASE:
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
             reason = kind(conn.spec.settings)
             if reason is not None:

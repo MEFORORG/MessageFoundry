@@ -3413,6 +3413,79 @@ def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
     assert "possibly generic" in dict(unverified_generic_db_hops(reg))["OB_ENV"]
 
 
+def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:
+    """ADR 0111 AC-1: a ``deployed=False`` connection's ``env()`` values are never resolved on any
+    path. Both DATABASE readers resolved the dialect before anything skipped the connection, so an
+    operator's ``cast`` ran on a dark connection and the hop was listed as an active loosening of a
+    connection the engine never builds. A deployed twin is the control: same values, resolved, listed."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        env,
+        static_credential_db_hops,
+        unverified_generic_db_hops,
+    )
+
+    cast_ran: list[str] = []
+
+    def dialect_cast(value: object) -> str:
+        cast_ran.append(str(value))
+        return str(value)
+
+    def outbound(name: str, *, deployed: bool) -> None:
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                Database(
+                    server="db.example.invalid",
+                    dialect=env(f"{name.lower()}_dialect", cast=dialect_cast),  # type: ignore[arg-type]
+                    odbc_driver="PostgreSQL Unicode",
+                    username="svc",
+                    password=env("pw"),
+                    statement="INSERT INTO r (a) VALUES (:a)",
+                ),
+                deployed=deployed,
+            )
+        )
+
+    reg = Registry()
+    outbound("OB_DARK", deployed=False)
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_DARK",
+            DatabasePoll(
+                server="poll.example.invalid",
+                dialect=env("ib_dark_dialect", cast=dialect_cast),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT 1",
+                username="svc",
+            ),
+            router="r",
+            deployed=False,
+        )
+    )
+    values = {"ob_dark_dialect": "generic", "ib_dark_dialect": "generic", "pw": "x"}
+    assert unverified_generic_db_hops(reg, env_values=values) == []
+    assert static_credential_db_hops(reg, env_values=values) == []
+    assert unverified_generic_db_hops(reg) == []  # nor read as possibly generic with no values
+    assert static_credential_db_hops(reg) == []
+    assert cast_ran == [], "a not-deployed connection's env() cast must never run"
+
+    # The control: a deployed twin with the same kind of value is resolved and listed by both.
+    outbound("OB_LIVE", deployed=True)
+    values["ob_live_dialect"] = "generic"
+    tls = unverified_generic_db_hops(reg, env_values=values)
+    static = static_credential_db_hops(reg, env_values=values)
+    assert [n for n, _ in tls] == ["OB_LIVE"] and [n for n, _ in static] == ["OB_LIVE"]
+    # Resolved, not read as unresolved: the reasons are the generic arm's own.
+    assert tls[0][1].startswith("no TLS keyword")
+    assert static[0][1].startswith("generic-ODBC hop")
+    assert cast_ran and set(cast_ran) == {"generic"}
+
+
 def test_accepted_cleartext_hops_reads_the_graph() -> None:
     """The single shared reader — `messagefoundry check` and the API posture route both use it, so the
     two can never report different accepted sets."""
