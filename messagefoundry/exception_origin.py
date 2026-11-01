@@ -30,9 +30,9 @@ _RAISE_STATEMENT: Final = opcode.opmap["RAISE_VARARGS"]
 #: The builtin descriptor. A config module's exception class can define its own ``__traceback__``.
 _TRACEBACK_OF: Final[Any] = BaseException.__dict__["__traceback__"]
 
-#: This package's directory, as every module of it was imported from. Not resolved: a code object
-#: holds the path it was imported by, and this file's ``__file__`` holds the same prefix.
-_ENGINE_DIR: Final = os.path.dirname(os.path.abspath(__file__)) + os.sep
+#: This package's directory, spelled as it was imported, so not resolved or normalized: a code
+#: object holds that same spelling, which a ``sys.path`` entry such as ``a/b/..`` can leave unusual.
+_ENGINE_DIR: Final = os.path.dirname(__file__) + os.sep
 
 #: Third-party code shipped inside the package. A ``raise`` there is not the engine's wording.
 _VENDORED_DIR: Final = f"{_ENGINE_DIR}_vendor{os.sep}"

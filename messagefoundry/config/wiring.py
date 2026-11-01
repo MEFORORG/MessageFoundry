@@ -8347,7 +8347,7 @@ class _HelperImporter:
                 _logger.warning(
                     "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
                     safe_name(f"{name}.py"),
-                    type(exc).__name__,
+                    _type_name(exc),
                     safe_name(current.name),
                 )
 
@@ -9484,9 +9484,10 @@ def _log_a_read_fault(path: Path, fault: BaseException) -> None:
 
 def _type_name(exc: BaseException) -> str:
     """``exc``'s class name, by the builtin descriptor: ``type(exc).__name__`` reads a metaclass's
-    own ``__name__`` or ``__getattribute__`` when a config module's class has one."""
-    name: str = _NAME_OF_A_TYPE.__get__(type(exc))
-    return name
+    own ``__name__`` or ``__getattribute__`` when a config module's class has one. Made an exact
+    ``str``, because a class can be built with a ``str`` subclass as its name, whose ``__format__``
+    and ``__add__`` would run in the loader's own f-strings."""
+    return str.__str__(_NAME_OF_A_TYPE.__get__(type(exc)))
 
 
 def _failure_detail(
@@ -9727,10 +9728,12 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     not an :class:`Exception`. ``_exec_module`` handles only that class, so anything else would
     leave the loader with its text (vault BACKLOG #3765 item 4). ``SystemExit`` is not handled here.
 
-    A ``KeyboardInterrupt`` stops the load, whatever is on it. A real interrupt raised during a
-    handler has a context, and code raising one looks the same, so neither can be judged by what it
-    carries; refusing one would make Ctrl-C a config error. What leaves is a new, bare one, so the
-    original's arguments, notes and chain stay behind. A subclass is not what a signal raises."""
+    On the main thread, a ``KeyboardInterrupt`` stops the load, whatever is on it. A real interrupt
+    raised during a handler has a context, and code raising one looks the same, so neither can be
+    judged by what it carries; refusing one would make Ctrl-C a config error. What leaves is a new,
+    bare one, so the original's arguments, notes and chain stay behind. A subclass is not what a
+    signal raises. Python delivers a signal only to the main thread, so on any other, such as a
+    reload's worker, one is code, and it is refused rather than left to stop the event loop."""
     failure: BaseException | None = None
     try:
         helpers.run(module, path)
@@ -9739,7 +9742,7 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except (Exception, SystemExit):
         raise
     except BaseException as exc:
-        if type(exc) is KeyboardInterrupt:
+        if type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread():
             failure = KeyboardInterrupt()
         else:
             failure = WiringError(_module_failure(path, exc, helpers.source_of))

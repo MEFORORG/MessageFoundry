@@ -17,9 +17,11 @@ from __future__ import annotations
 import inspect
 import logging
 import signal
+import subprocess
 import sys
 import textwrap
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 
@@ -863,42 +865,88 @@ def test_a_note_on_a_link_of_a_kept_chain_does_not_ride_out(
     assert err.__cause__ is None and err.__context__ is None
 
 
+#: Classes whose instance faults when the loader reads it. isinstance() falls back to ``__class__``.
+_FAULTS_WHEN_READ = {
+    "getattribute": "class Bad(Exception):\n    def __getattribute__(self, name):\n"
+    f"        raise RuntimeError({NEEDLE!r})\n",
+    "class-property": "class Bad(Exception):\n    @property\n    def __class__(self):\n"
+    f"        raise RuntimeError({NEEDLE!r})\n",
+    "import-error": "class Bad(ImportError):\n    def __getattribute__(self, name):\n"
+    f"        raise RuntimeError({NEEDLE!r})\n",
+}
+
+#: Classes that fault, or hold text, only where ``type(exc).__name__`` or its result is used.
+_FAULTS_IN_THE_NAME = {
+    "metaclass": "class Meta(type):\n    def __getattribute__(cls, name):\n"
+    f"        raise RuntimeError({NEEDLE!r})\n\n"
+    "class Bad(Exception, metaclass=Meta):\n    pass\n",
+    "metaclass-name": "class Meta(type):\n    @property\n    def __name__(cls):\n"
+    f"        return {NEEDLE!r}\n\n"
+    "class Bad(Exception, metaclass=Meta):\n    pass\n",
+    "str-subclass-name": "class Name(str):\n"
+    f"    def __format__(self, spec):\n        raise RuntimeError({NEEDLE!r})\n"
+    f"    def __add__(self, other):\n        raise RuntimeError({NEEDLE!r})\n\n"
+    "Bad = type(Name('Bad'), (Exception,), {})\n",
+}
+
+
+def _assert_no_needle_on(err: WiringError) -> None:
+    assert NEEDLE not in str(err)
+    assert err.__context__ is None
+    assert err.__cause__ is None or not err.__cause__.args
+
+
 @pytest.mark.parametrize(
     "bad_class",
-    [
-        "class Bad(Exception):\n    def __getattribute__(self, name):\n"
-        f"        raise RuntimeError({NEEDLE!r})\n",
-        "class Bad(Exception):\n    @property\n    def __class__(self):\n"
-        f"        raise RuntimeError({NEEDLE!r})\n",
-        "class Bad(ImportError):\n    def __getattribute__(self, name):\n"
-        f"        raise RuntimeError({NEEDLE!r})\n",
-        "class Meta(type):\n    def __getattribute__(cls, name):\n"
-        f"        raise RuntimeError({NEEDLE!r})\n\n"
-        "class Bad(Exception, metaclass=Meta):\n    pass\n",
+    [*_FAULTS_WHEN_READ.values(), *_FAULTS_IN_THE_NAME.values()],
+    ids=[*_FAULTS_WHEN_READ, *_FAULTS_IN_THE_NAME],
+)
+def test_a_module_class_that_faults_when_read_cannot_escape_the_loader(
+    tmp_path: Path, bad_class: str
+) -> None:
+    _write(tmp_path, "feed.py", f"{bad_class}\nraise Bad()\n")
+    err = _load_error(tmp_path)
+    _assert_no_needle_on(err)
+    assert "feed.py: Bad" in str(err) and "withheld" in str(err)
+
+
+@pytest.mark.parametrize("bad_class", _FAULTS_WHEN_READ.values(), ids=_FAULTS_WHEN_READ.keys())
+def test_an_engine_raised_class_that_faults_when_read_cannot_escape_the_loader(
+    tmp_path: Path, engine_probe: str, bad_class: str
+) -> None:
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    _assert_no_needle_on(err)
+    assert "feed.py: Bad" in str(err) and "withheld" in str(err)
+
+
+@pytest.mark.parametrize("bad_class", _FAULTS_IN_THE_NAME.values(), ids=_FAULTS_IN_THE_NAME.keys())
+def test_an_engine_raised_class_keeps_its_wording_when_only_its_name_faults(
+    tmp_path: Path, engine_probe: str, bad_class: str
+) -> None:
+    # An engine `raise` of a class with no text: the loader keeps that, and never reads the name.
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    assert str(_load_error(tmp_path)) == "error loading config module feed.py: "
+
+
+def test_a_helper_left_to_its_guard_is_logged_by_its_real_type_name(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write(
+        tmp_path,
+        "_opt.py",
         "class Meta(type):\n    @property\n    def __name__(cls):\n"
         f"        return {NEEDLE!r}\n\n"
-        "class Bad(Exception, metaclass=Meta):\n    pass\n",
-    ],
-    ids=["getattribute", "class-property", "import-error", "metaclass", "metaclass-name"],
-)
-@pytest.mark.parametrize(
-    ("raiser", "reads"),
-    [
-        ("raise Bad()", "feed.py: Bad"),
-        # An engine `raise`, so a class that faults on nothing here keeps its empty engine wording.
-        ("probe.raises_this_type(Bad)", "error loading config module feed.py: "),
-    ],
-    ids=["module-raises", "engine-raises"],
-)
-def test_a_class_that_faults_when_read_cannot_escape_the_loader(
-    tmp_path: Path, engine_probe: str, bad_class: str, raiser: str, reads: str
-) -> None:
-    # isinstance() falls back to the instance's __class__, and that runs the class's own code.
-    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{bad_class}\n{raiser}\n")
-    err = _load_error(tmp_path)
-    assert NEEDLE not in str(err) and reads in str(err)
-    assert err.__context__ is None or NEEDLE not in str(err.__context__)
-    assert err.__cause__ is None or NEEDLE not in repr(err.__cause__)
+        "class Bad(ImportError, metaclass=Meta):\n    pass\n\nraise Bad()\n",
+    )
+    body = "def later():\n    try:\n        import _opt\n    except ImportError:\n        pass\n"
+    _write(tmp_path, "feed.py", body)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        assert _messages(tmp_path) == []
+    assert "failed to load (Bad)" in caplog.text
+    assert NEEDLE not in caplog.text
 
 
 def test_an_engine_raised_class_whose_str_faults_cannot_escape_the_loader(
@@ -1033,11 +1081,53 @@ def _assert_bare(exc: BaseException) -> None:
     ids=["bare", "with-text", "from", "in-handler", "with-note"],
 )
 def test_an_interrupt_stops_the_load_with_nothing_on_it(tmp_path: Path, body: str) -> None:
-    # Code cannot be told from a signal, so all of these stop, and none of them carries its text.
+    # On the main thread code cannot be told from a signal, so all of these stop, with no text.
     _write(tmp_path, "feed.py", body)
     with pytest.raises(KeyboardInterrupt) as ei:
         load_config(tmp_path)
     _assert_bare(ei.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["raise KeyboardInterrupt\n", f"raise KeyboardInterrupt({NEEDLE!r})\n"],
+    ids=["bare", "with-text"],
+)
+def test_an_interrupt_off_the_main_thread_is_a_refused_module(tmp_path: Path, body: str) -> None:
+    # No signal reaches a reload's worker thread, and one leaving it would stop the event loop.
+    _write(tmp_path, "feed.py", body)
+
+    def outcome() -> BaseException | None:
+        try:
+            load_config(tmp_path)
+        except BaseException as exc:  # noqa: BLE001 - what crosses the thread is the assertion
+            return exc
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        left = pool.submit(outcome).result()
+    assert isinstance(left, WiringError), repr(left)
+    assert NEEDLE not in str(left) and "KeyboardInterrupt at line 1" in str(left)
+
+
+def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:
+    # A code object keeps the sys.path entry's spelling, so a normalized prefix would miss it.
+    root = _ENGINE_DIR.parent
+    program = (
+        "import sys\n"
+        f"sys.path.insert(0, {f'{root}/docs/..'!r})\n"
+        "from messagefoundry.config import wiring\n"
+        "from messagefoundry.exception_origin import worded_by_the_engine\n"
+        "assert '..' in wiring.__file__, wiring.__file__\n"
+        "try:\n"
+        "    wiring._cast_bool('nope')\n"
+        "except ValueError as exc:\n"
+        "    print(worded_by_the_engine(exc))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert done.stdout.strip() == "True", done.stderr
 
 
 def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> None:

@@ -11,10 +11,12 @@
   `ws_password_type` refusals, an `intake_client_subjects` subject and an issuer that is not a DN no
   longer quote the value. A call with an unexpected or repeated keyword now reads `TypeError at line
   N naming 'keyword'`, when the source line spells that keyword. A config module that raises a
-  `BaseException` that is not an `Exception` is now refused as a failed module, with no text, except
-  `SystemExit` and an exact `KeyboardInterrupt`, which stops the load as a new, bare
-  `KeyboardInterrupt` that carries none of the original's arguments, notes or chain. An interrupt
-  that lands while the loader reads a failed module's exception is absorbed, and that module is
-  refused. An exception's text counts as engine wording only when its frame is in the package's own
-  files, so a module that sets `__name__` to look like the engine is withheld, and so is vendored
-  code.
+  `BaseException` that is not an `Exception` is now refused as a failed module, with no text, with
+  two exceptions. `SystemExit` is unchanged, and still leaves with its text. On the main thread, an
+  exact `KeyboardInterrupt` stops the load as a new, bare `KeyboardInterrupt` that carries none of
+  the original's arguments, notes or chain; on any other thread, where no signal can arrive, it is
+  refused like the rest. An interrupt that lands while the loader reads a failed module's exception
+  is absorbed, and that module is refused. An exception's text counts as engine wording only when
+  its frame is in the package's own files, so a module that sets `__name__` to look like the engine
+  is withheld, and so is vendored code. A module that catches a refusal and rewrites its `args`, or
+  that builds a class whose name holds a value, is not caught.
