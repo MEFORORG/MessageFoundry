@@ -270,8 +270,8 @@ type _RefusedMember = tuple[str, str, NegativeAckError]
 content-free error the store keeps, and the refusal, with no traceback, whose class name and code
 the log line reads (BACKLOG #3043)."""
 
-#: The :class:`NegativeAckError` code of a payload whose detached document cannot be re-attached
-#: (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
+#: The :class:`NegativeAckError` code of a payload that itself breaks the re-attach of its detached
+#: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
 _REATTACH_CODE = "reattach"
 
 #: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
@@ -8894,7 +8894,9 @@ class RegistryRunner:
         same retryable path. A failure the payload itself causes, an
         :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
-        other ``ValueError`` propagates to the outbound's internal-error policy."""
+        other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
+        holding a CR or LF included: no payload can cause one, so it is store corruption or an
+        engine bug."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8915,13 +8917,14 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only the two failures the MESSAGE causes: the payload does not parse, or a stored value
-            # cannot be set back into OBX-5.5 (a CR in it, vault BACKLOG #2809). The same payload fails
+            # Only the two failures the MESSAGE causes: the payload does not parse as HL7, or its
+            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809). The same payload fails
             # the same way on every attempt, so a retry could never succeed: refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
-            # fault in the re-attach still reaches the outbound's internal-error policy, and STOP
-            # still stops the lane. Raised after the handler ends, so a parse error that quotes the
-            # payload is on neither chain (see IngressGuardError).
+            # fault in the re-attach, a stored document holding a CR or LF included, still reaches
+            # the outbound's internal-error policy, and STOP still stops the lane. Raised after the
+            # handler ends, so a parse error that quotes the payload is on neither chain (see
+            # IngressGuardError).
             refused = f"document re-attach failed: {safe_exc(exc)}"
         raise NegativeAckError(refused, code=_REATTACH_CODE, permanent=True)
 
@@ -9298,8 +9301,8 @@ class RegistryRunner:
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
         The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
-        carry, that holds more than one message (ADR 0209), or whose detached document cannot be
-        re-attached (vault BACKLOG #2809), is taken out before the envelope is built and
+        carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
+        its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
         dead-lettered alone, and "all N" above means the rest. The envelope's head is then the
         first member that survived.
 
@@ -9615,8 +9618,8 @@ class RegistryRunner:
         #3043). Its reason
         follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
         frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
-        message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one carries
-        a document that cannot be re-attached (vault BACKLOG #2809), and any other reads as
+        message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one is a
+        payload that itself breaks its document's re-attach (vault BACKLOG #2809), and any other reads as
         refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)

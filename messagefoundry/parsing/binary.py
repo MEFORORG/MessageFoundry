@@ -125,14 +125,14 @@ class EscapedDocumentError(ValueError):
 
 
 class UnreattachableDocumentError(ValueError):
-    """The payload itself stops a re-attach (vault BACKLOG #2809). Three shapes only: the parser
-    refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), its
-    MSH-1 and MSH-2 do not name its separators, or a stored document holds a CR or LF (which a
-    detach that decoded ``\\X0D\\`` or ``\\X0A\\`` once left) and so cannot be set back into
-    ``OBX-5.5``. The same payload fails the same way on every attempt, so the delivery path refuses
-    it permanently. Every other ``ValueError`` in the re-attach, a parser fault included, may be an
-    engine fault and stays the outbound's internal-error policy to judge. The text names the step
-    and the OBX occurrence, never a byte of the payload."""
+    """The payload itself stops a re-attach (vault BACKLOG #2809). Two shapes only: the parser
+    refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), or its
+    MSH-1 and MSH-2 do not name its separators. The same payload fails the same way on every
+    attempt, so the delivery path refuses it permanently. Every other ``ValueError`` in the
+    re-attach may be an engine fault and stays the outbound's internal-error policy to judge: a
+    parser fault, and a stored document that holds a CR or LF. The ingress detach refuses an
+    escape and a raw LF ends the segment, so no payload can leave a stored CR or LF; one there means
+    store corruption or an engine bug. The text names the step, never a byte of the payload."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
@@ -562,9 +562,9 @@ async def reattach_documents_in_hl7(
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The three
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The two
     payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
-    ``ValueError`` propagates as it is."""
+    ``ValueError`` propagates as it is, a stored document holding a CR or LF included."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -622,9 +622,13 @@ async def reattach_documents_in_hl7(
                 "deliver an un-hydrated document handle"
             )
         if "\r" in verbatim or "\n" in verbatim:
-            # Message.set refuses a CR or LF in a field value. Checked here rather than caught from
-            # set, so any other ValueError set raises stays an engine fault.
-            raise UnreattachableDocumentError(
+            # Message.set refuses a CR or LF in a field value. No payload can leave one in the store:
+            # the ingress detach refuses an escaped OBX-5.5, and a raw LF ends the segment before the
+            # read. So a stored CR or LF is store corruption or an engine bug: a plain ValueError for
+            # the outbound's internal-error policy to judge (STOP stops the lane), never the
+            # payload's permanent refusal (vault BACKLOG #2809). Checked here rather than caught from
+            # set, so the text names the OBX occurrence and no byte of the value.
+            raise ValueError(
                 f"the stored document for OBX-5.5 occurrence {occ} holds a CR or LF, so it cannot "
                 "be set back"
             )
