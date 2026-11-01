@@ -2479,8 +2479,8 @@ with no connector charges each row it claims an attempt, and a finite `max_attem
 dead-letter it with nothing known against the CA.
 
 **That hold covers the operator control route only, and it ends at the lane's next start**, which
-an operator, a schedule or a rule can make. While a lane is held it sits in the paused set, which
-suppresses its buildup and stall pages. A lane that was not paused, such as one that failed at boot
+at least an operator, a schedule or a rule can make. While a lane is held it sits in the paused
+set, which suppresses its buildup and stall pages. A lane that was not paused, such as one that failed at boot
 on the same fault, is not held: it would keep claiming with no connector, unless a restart paused
 it.
 

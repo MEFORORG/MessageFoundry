@@ -3859,8 +3859,8 @@ _ANCHOR_STORE_DETAIL = (
 #: stopped only until the next start, which need not be an operator's (vault BACKLOG #3746).
 _ANCHOR_STORE_RESTART_DETAIL = (
     "the engine could not reach its store to check a trust anchor, so this restart left the "
-    "connection stopped until its next start, which an operator, a schedule or a rule can make; "
-    "see the engine log"
+    "connection stopped until its next start, which at least an operator, a schedule or a rule "
+    "can make; see the engine log"
 )
 
 

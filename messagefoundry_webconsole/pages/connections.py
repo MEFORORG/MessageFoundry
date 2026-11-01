@@ -344,10 +344,13 @@ _CONTROL_NOTICES: dict[str, str] = {
     ),
     "control_store_restart": (
         "the engine could not reach its store to check a trust anchor, so this restart left the "
-        "connection stopped until its next start, which an operator, a schedule or a rule can "
-        "make; see the engine log"
+        "connection stopped until its next start, which at least an operator, a schedule or a rule "
+        "can make; see the engine log"
     ),
-    "control_refused": "the engine refused that action; see the server log",
+    "control_refused": (
+        "the engine refused that action, and a restart may have stopped the connection; "
+        "see its status below"
+    ),
 }
 
 

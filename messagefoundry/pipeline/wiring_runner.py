@@ -4334,8 +4334,8 @@ class RegistryRunner:
         with no connector charges each row it claims an attempt, which under a finite
         ``max_attempts`` would dead-letter it.
 
-        **The hold ends at the lane's next start**, which an operator, a schedule or a rule can
-        make. With the default, every other caller resumes the lane as it always has. While a lane
+        **The hold ends at the lane's next start**, which at least an operator, a schedule or a
+        rule can make. With the default, every other caller resumes the lane as it always has. While a lane
         is held it sits in ``_outbound_paused``, which suppresses its buildup and stall pages. The
         raise pauses nothing: a lane that was not paused, such as one that failed at boot on the
         same fault, keeps claiming with no connector, unless a restart's stop half paused it.
