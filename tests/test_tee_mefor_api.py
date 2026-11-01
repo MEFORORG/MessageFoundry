@@ -298,6 +298,10 @@ def test_https_loopback_engine_is_direct_and_keeps_the_callers_tls_context(
         ("engine.example.invalid", False),
         ("localhost.example.invalid", False),  # never resolved, so never proven on-box
         ("127.0.0.1.example.invalid", False),
+        ("localhost.", False),  # read as written: the limit on is_loopback_hop_host
+        ("LOCALHOST.", False),
+        ("127.0.0.1.", False),
+        ("%6cocalhost", False),
         ("10.0.0.1", False),
         ("2001:db8::1", False),
         ("::", False),

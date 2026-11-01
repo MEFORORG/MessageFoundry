@@ -36,14 +36,41 @@ __all__ = [
     "split_by_obr",
 ]
 
-# Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. We match
-# ``\rMSH`` *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
-# ``MSH^...``) still splits per-message instead of being read as one giant message — after a ``\r`` a
-# segment id is always exactly three chars, so only an ``MSH`` segment starts with the literal "MSH".
-_MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
+# The one message boundary every reading in this module uses: a line that starts with ``MSH``. We
+# match it *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
+# ``MSH^...``) still splits per-message instead of being read as one giant message — after a line
+# break a segment id is always exactly three chars, so only an ``MSH`` segment starts with "MSH".
+# Normalized text ends a line with CR alone; a payload or file that is not normalized may use LF too.
+# The readings below share these literals, but each still reads its own lead and its own marks,
+# so keep them in step by hand. AC-7's test in tests/test_one_frame_one_message.py compares the
+# delivery reading with the ingress one on a handful of shapes, not every input, and
+# tests/test_msh_boundary_parity.py holds each reading to its answer before the BACKLOG #3759
+# refactor.
+_MSH = "MSH"
+_CR_MSH = "\r" + _MSH
+_LF_MSH = "\n" + _MSH
+_MSH_BYTES = _MSH.encode("ascii")
+_CR_MSH_BYTES = _CR_MSH.encode("ascii")
+_LF_MSH_BYTES = _LF_MSH.encode("ascii")
+
+# Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment.
+# ``_CR_MSH`` holds no regex metacharacter, so it goes in unescaped: the static ReDoS scanner in
+# tests/test_security_static.py resolves a pattern composed from constants, but not one passed
+# through ``re.escape``.
+_MSH_BOUNDARY = re.compile("(?=" + _CR_MSH + ")")
 
 #: The first character the parser keeps: it strips the whitespace around a body before it reads it.
 _FIRST_KEPT = re.compile(r"\S")
+
+
+def _boundary_scan_start[S: (str, bytes)](text: S, start: int, msh: S) -> int:
+    """Where a search for a boundary at ``start`` or later need begin, or -1 when ``text`` holds
+    none. Such a boundary's line break is at ``start`` or later, so its ``MSH`` is past it: one
+    scan for ``MSH`` settles a text holding none, rather than one scan per line end. Otherwise the
+    first ``MSH`` it finds is the earliest a boundary can end with, so the line-end searches begin
+    one before it and read nothing this scan already passed."""
+    first = text.find(msh, start + 1)
+    return -1 if first < 0 else first - 1  # first > start, so this is start or later
 
 
 def _holds_more_than_one_message(text: str) -> bool:
@@ -57,8 +84,11 @@ def _holds_more_than_one_message(text: str) -> bool:
     if first is None:
         return False
     start = first.start()
-    later = text.count("\rMSH", start)
-    return later > 1 or (later == 1 and text.startswith("MSH", start))
+    later = text.find(_CR_MSH, start)
+    if later < 0:
+        return False
+    # Led by MSH, one later MSH line makes two messages; otherwise it takes two.
+    return text.startswith(_MSH, start) or text.find(_CR_MSH, later + 1) >= 0
 
 
 #: The byte order mark, U+FEFF, named rather than written so the source stays ASCII.
@@ -67,11 +97,11 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 #: ``MSH`` after whitespace and any byte order mark. Wider than the parser's ``_LEADS_WITH_MSH`` by
 #: the mark alone, which :func:`split_batch` reads past too: a receiver that drops the mark reads
 #: the messages behind it.
-_LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + _BOM + r"]*MSH")
+_LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + _BOM + r"]*" + _MSH)
 
 #: A later ``MSH`` line that a byte order mark leads, as two texts read without stripping their
 #: marks would join. Searched only when the payload holds a mark, so a clean payload never pays it.
-_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + _BOM + r"+MSH")
+_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + _BOM + "+" + _MSH)
 
 
 def _sends_more_than_one_message(payload: str) -> bool:
@@ -79,12 +109,17 @@ def _sends_more_than_one_message(payload: str) -> bool:
     and holds another line that starts with ``MSH``, or with marks and then ``MSH`` (ADR 0209). The
     payload is not normalized, so a line break is a CR or an LF, and on an ``MSH``-led payload with
     no mark the answer is :func:`_holds_more_than_one_message`'s on the normalized text. A payload
-    not led by ``MSH`` answers False. Each search stops at its first hit and copies nothing."""
+    not led by ``MSH`` answers False. A payload with no ``MSH`` after its lead pays one scan; each
+    later search stops at its first hit, and none copies."""
     lead = _LEADS_WITH_MSH_PAST_BOM.match(payload)
     if lead is None:
         return False
     start = lead.end()
-    if payload.find("\rMSH", start) >= 0 or payload.find("\nMSH", start) >= 0:
+    # A marked boundary's MSH is past start + 1 too, so a payload with none there holds neither.
+    at = _boundary_scan_start(payload, start, _MSH)
+    if at < 0:
+        return False
+    if payload.find(_CR_MSH, at) >= 0 or payload.find(_LF_MSH, at) >= 0:
         return True
     return _BOM in payload and _LATER_MSH_PAST_BOM.search(payload, start) is not None
 
@@ -172,7 +207,7 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member of a
     batch is. Without this, one such message was an ``ERROR`` where the same message in a batch of
     two was recorded."""
-    if starts_with_msh(text) or not message.startswith("MSH"):
+    if starts_with_msh(text) or not message.startswith(_MSH):
         return raw
     return message.encode(encoding)
 
@@ -191,7 +226,8 @@ def _needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if name == "utf-8" and _LEADING_BOM.match(raw):
         return True
-    return b"\rMSH" in raw or b"\nMSH" in raw
+    at = _boundary_scan_start(raw, 0, _MSH_BYTES)
+    return at >= 0 and (raw.find(_CR_MSH_BYTES, at) >= 0 or raw.find(_LF_MSH_BYTES, at) >= 0)
 
 
 def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: str) -> str:

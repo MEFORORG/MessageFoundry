@@ -41,9 +41,10 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from enum import Enum, auto
 from pathlib import Path
-from stat import S_ISREG
-from typing import Any, NamedTuple, Protocol
+from stat import S_ISLNK, S_ISREG
+from typing import Any, Literal, NamedTuple, Protocol
 
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
@@ -612,8 +613,9 @@ class ResealResult:
     rotation stamp while it is non-zero (BACKLOG #3181). It includes a value no configured key opens,
     which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
     text is not counted here when its sidecar is readable: no key reads that body and no re-run
-    changes it (``unsealable``, ``body_lost``). At least a body too large for an upload, one that is
-    not a regular file, and a sidecar that is not text are still skips.
+    changes it (``unsealable``, ``body_lost``), and neither is anything that is not a file, such as
+    a FIFO or a directory (``not_regular``). At least a file too large for an upload, a symlink and a
+    sidecar that is not text are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -640,6 +642,30 @@ class ResealResult:
     #: any other, so retiring the prior key loses nothing. The upload stays listed with a body that
     #: cannot be read until an operator deletes it or the retention prune removes it at expiry.
     body_lost: int = 0
+    #: How many UPLOADS have a body or sidecar that is neither a regular file nor a symlink, such as
+    #: a FIFO or a directory (BACKLOG #3737). It holds no value, so it is not a skip, and an operator
+    #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
+    #: it is a skip.
+    not_regular: int = 0
+
+
+class _Half(Enum):
+    """What one reseal pass did with one half (body or sidecar) of an upload. The pair's single count
+    in :class:`ResealResult` is worked out from its two halves in one place."""
+
+    CURRENT = auto()  # already under the active key; nothing was written
+    RESEALED = auto()  # rewritten under the active key
+    SEALED_PLAINTEXT = auto()  # the same, and it was plaintext
+    LOST = auto()  # a body that is missing or is not text
+    UNSEALABLE = auto()  # a plaintext sidecar over a lost body
+    NOT_REGULAR = auto()  # no regular file or link, or a plaintext sidecar over one; left as is
+    SKIPPED = auto()  # it may still be under the prior key
+
+
+#: The halves this pass rewrote, each one value in :attr:`ResealResult.resealed`.
+_WRITTEN = frozenset({_Half.RESEALED, _Half.SEALED_PLAINTEXT})
+#: More characters than any ``mfenc:`` marker has before its ciphertext.
+_MARKER_READ_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -810,16 +836,23 @@ class UploadStore:
         reject any id that is not the exact 32-hex shape, then resolve and assert both paths sit
         **directly under** the canonical uploads root. Raises :class:`UploadPathError` on any mismatch —
         without touching the filesystem for a bad id."""
-        if not _FILE_ID_RE.match(file_id):
-            raise UploadPathError(f"malformed upload id: {file_id!r}")
-        root = self._root.resolve()
-        blob = (root / f"{file_id}{_BLOB_SUFFIX}").resolve()
-        meta = (root / f"{file_id}{_META_SUFFIX}").resolve()
+        blob, meta = self._paths_unfollowed(file_id)
+        root = blob.parent
+        blob, meta = blob.resolve(), meta.resolve()
         # Belt-and-suspenders: a validated 32-hex id cannot contain a separator, but verify the resolved
         # parent IS the root so no symlink/normalization trick lands the write elsewhere.
         if blob.parent != root or meta.parent != root:
             raise UploadPathError(f"upload id {file_id!r} resolves outside the uploads root")
         return blob, meta
+
+    def _paths_unfollowed(self, file_id: str) -> tuple[Path, Path]:
+        """The (blob, meta) paths of ``file_id`` under the canonical root, the id guard applied and
+        the final name not resolved, so the reseal sees a link as a link (BACKLOG #3737). Resolved, a
+        link out of the root raised :class:`UploadPathError` here, and that failed every run."""
+        if not _FILE_ID_RE.match(file_id):
+            raise UploadPathError(f"malformed upload id: {file_id!r}")
+        root = self._root.resolve()
+        return root / f"{file_id}{_BLOB_SUFFIX}", root / f"{file_id}{_META_SUFFIX}"
 
     # --- crypto helpers (bytes ride the str cipher via base64, NUL-safe) --------------------------
 
@@ -1023,6 +1056,12 @@ class UploadStore:
                     owner = d["uploader_id"]
         return _UnsealableUpload(file_id=fid, uploader_id=owner, size=size, modified=modified)
 
+    @property
+    def _stored_limit(self) -> int:
+        """The largest file a body or sidecar can be on disk: base64 of ``max_bytes``, plus a generous
+        allowance for the cipher's marker and tag."""
+        return 2 * self._max_bytes + 4096
+
     def _lost_body_size(self, blob: Path) -> int | None:
         """The bytes on disk of a body no key can read, or ``None`` when the body is readable text.
 
@@ -1039,8 +1078,7 @@ class UploadStore:
             return 0
         except OSError:
             return None
-        # base64 of max_bytes, plus a generous allowance for the cipher's marker and tag.
-        if not S_ISREG(stat.st_mode) or stat.st_size > 2 * self._max_bytes + 4096:
+        if not S_ISREG(stat.st_mode) or stat.st_size > self._stored_limit:
             _log.warning(
                 "uploaded file %s: not a regular file of a size an upload can be", blob.name
             )
@@ -2058,7 +2096,12 @@ class UploadStore:
         the body is missing or is not text, no re-run can change that, so the upload is counted in
         ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry. The same
         body under a SEALED sidecar is counted in ``body_lost``, also not a skip, and its sidecar is
-        re-sealed.
+        re-sealed. **That is a judgment about the body as it is now (BACKLOG #3737):** a missing body
+        that comes back under a key retired since then is unreadable, so the command's note tells
+        the operator to keep the prior key while one may.
+
+        **Only a regular file is opened (BACKLOG #3737),** no link is followed, and no file larger
+        than an upload can be is read whole. See :meth:`_reseal_half`.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -2068,14 +2111,12 @@ class UploadStore:
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             return ResealResult()  # identity / transit cipher — nothing this process can rotate
-        root = self._root
-        if not root.is_dir():
+        if not self._root.is_dir():
             return ResealResult()
-        active = cipher.active_marker_prefix
-        resealed = skipped = sealed_plaintext = unsealable = body_lost_count = 0
+        resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in self._iter_sidecars():
             try:
-                blob_path, meta_path = self._paths(fid)
+                blob_path, meta_path = self._paths_unfollowed(fid)
             except UploadPathError:
                 # Unreachable for an id that passed _FILE_ID_RE — the guard re-checks the same shape.
                 # Kept anyway, because `prune_expired` guards its unlink the same way: a path guard
@@ -2083,140 +2124,176 @@ class UploadStore:
                 skipped += 1
                 _log.warning("uploaded file %s: skipped, its id fails the path guard", fid)
                 continue
-            had_plaintext = pair_skipped = body_lost = False
             # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
-            # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
-            # Body FIRST, as save() writes it: the sidecar is the listing key, and a keyed store
-            # refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would let an
-            # interrupted pass list an upload whose body is still refused.
-            for path, kind in ((blob_path, "body"), (meta_path, "meta")):
-                try:
-                    # Read the MARKER first, not the file. The idempotency test is a prefix compare,
-                    # and a sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip
-                    # it made a re-run cost a full pass over every already-current file. The store's
-                    # own passes push this filter into SQL (`WHERE col NOT LIKE ...`) for the same
-                    # reason; on a filesystem the equivalent is a bounded read.
-                    with path.open(encoding="utf-8") as handle:
-                        if handle.read(len(active)) == active:
-                            continue  # already under the active key in the active format
-                    stored = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as exc:
-                    if kind == "body" and self._lost_body_size(path) is not None:
-                        # BACKLOG #3181: the body is missing or is not text, so no key reads it and
-                        # no re-run changes that. It holds nothing under the OLD key, so it is not a
-                        # skip; counting one would fail every later run for good. The sidecar is
-                        # still handled below, as the unsealable kind when it is plaintext.
-                        body_lost = True
-                        _log.warning(
-                            "uploaded file %s (body): missing or not text; no key can read it", fid
-                        )
-                        continue
-                    # An unreadable file. Counted and named, never silent: this file may still be
-                    # under the OLD key and the operator must not retire it yet.
-                    pair_skipped = True
-                    _log.warning(
-                        "uploaded file %s (%s): skipped, unreadable: %s",
-                        fid,
-                        kind,
-                        codec_safe_str(exc),
-                    )
-                    continue
-                plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
-                # The body is missing or is not text: the one test the prune and the quota use too.
-                # Asked even when the body pass succeeded, because that pass trusts a body whose
-                # first bytes are the active marker without reading the rest.
-                lost = (
-                    plaintext
-                    and kind == "meta"
-                    and (body_lost or self._lost_body_size(blob_path) is not None)
-                )
-                if plaintext and (pair_skipped or lost):
-                    # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is.
-                    # A keyed store refuses it, so the upload is unlisted; sealing it would list an
-                    # upload whose body is unusable, and would seal a planted lone sidecar too. A
-                    # sidecar under a retired key is listed already, so it is still re-sealed: left
-                    # behind, it would drop out of reach of prune_expired once that key goes.
-                    if lost:
-                        # No key reads either half and no re-run changes that, so it is not a skip.
-                        # It stays refused, and the prune removes it at expiry.
-                        pair_skipped = body_lost = False
-                        unsealable += 1
-                        _log.warning(
-                            "uploaded file %s (meta): left unsealed for good, its body is missing "
-                            "or is not text; retention removes it when it expires",
-                            fid,
-                        )
-                    else:
-                        _log.warning(
-                            "uploaded file %s (meta): left unsealed, its body was not", fid
-                        )
-                    continue
-                aad = cell_aad("uploaded_file", kind, fid)
-                try:
-                    sealed = _reencrypt_value(cipher, stored, aad)
-                except _UnopenableValueError as exc:
-                    # It could not be decrypted. The causes include at least a prior key that was
-                    # not supplied, a damaged value, and a marker this cipher does not read, so the
-                    # log names the class and not one cause. Nothing is written, so the file is left exactly as it was, and it is a
-                    # skip, which fails the command and withholds the rotation stamp (BACKLOG
-                    # #3181). One bad upload used to abort the whole pass, and the CLI then blamed
-                    # a missing prior key for what may be one damaged file. An encrypt-side refusal
-                    # is not caught here and still aborts. Only the cause's class is logged: a
-                    # malformed marker's key id is cut from the stored text up to the next ':', so
-                    # the cipher's message can carry a piece of a damaged or planted file.
-                    pair_skipped = True
-                    _log.warning(
-                        "uploaded file %s (%s): skipped, it could not be decrypted (%s)",
-                        fid,
-                        kind,
-                        type(exc.__cause__ or exc).__name__,
-                    )
-                    del stored  # the pass goes on now, so free the buffer as the write path does
-                    continue
-                # Drop each file-sized buffer before the next iteration allocates its own. Without
-                # this the previous file's plaintext stays reachable from the frame while the next
-                # one is read, roughly doubling peak memory for no reason.
-                del stored
-                try:
-                    _atomic_write_text(root, path, sealed)
-                except OSError as exc:
-                    # The write failed and the temp-and-replace left the file as it was. A skip, like
-                    # a read failure, so one file that cannot be written does not stop the pass.
-                    pair_skipped = True
-                    _log.warning(
-                        "uploaded file %s (%s): skipped, could not be written: %s",
-                        fid,
-                        kind,
-                        codec_safe_str(exc),
-                    )
-                    continue
-                finally:
-                    del sealed
-                had_plaintext |= plaintext
-                resealed += 1
+            # _encrypt_blob). Body FIRST, as save() writes it: the sidecar is the listing key, and a
+            # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
+            # let an interrupted pass list an upload whose body is still refused.
+            body = self._reseal_half(cipher, fid, blob_path, "body")
+            meta = self._reseal_half(cipher, fid, meta_path, "meta", over=(body, blob_path))
+            resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
             # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
             # already, and then no later run sees any plaintext in it to count.
-            skipped += pair_skipped
-            sealed_plaintext += had_plaintext
-            body_lost_count += body_lost and not pair_skipped
-        if resealed or skipped or unsealable or body_lost_count:
+            sealed_plaintext += _Half.SEALED_PLAINTEXT in (body, meta)
+            # One count per pair, the first that holds. UNSEALABLE comes first because a sidecar
+            # reports it only over a body no key reads, so nothing of the pair waits on a re-run.
+            if meta is _Half.UNSEALABLE:
+                unsealable += 1
+            elif _Half.SKIPPED in (body, meta):
+                skipped += 1
+            elif _Half.NOT_REGULAR in (body, meta):
+                not_regular += 1
+            elif body is _Half.LOST:
+                body_lost += 1
+        if resealed or skipped or unsealable or body_lost or not_regular:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost)",
+                "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost, "
+                "%d holding a file that is not regular)",
                 resealed,
                 sealed_plaintext,
                 skipped,
                 unsealable,
-                body_lost_count,
+                body_lost,
+                not_regular,
             )
         return ResealResult(
             resealed=resealed,
             skipped=skipped,
             sealed_plaintext=sealed_plaintext,
             unsealable=unsealable,
-            body_lost=body_lost_count,
+            body_lost=body_lost,
+            not_regular=not_regular,
         )
+
+    def _reseal_half(
+        self,
+        cipher: AesGcmCipher,
+        fid: str,
+        path: Path,
+        kind: Literal["body", "meta"],
+        *,
+        over: tuple[_Half, Path] | None = None,
+    ) -> _Half:
+        """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
+        the body half's result and its path, because a plaintext sidecar is sealed only over a body
+        that was. Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
+
+        ``lstat`` decides what is opened (BACKLOG #3737). A FIFO would block the open for good.
+        Anything that is neither a regular file nor a symlink holds no value, so it is reported and
+        left alone, and it is not a skip, like a missing body. A symlink is not followed, because that would re-seal or read a
+        file this store does not own. It is a skip, because its target may be a real upload still
+        under the prior key. This guards an offline command against what is on disk when it looks,
+        not against a writer racing it."""
+        try:
+            info = path.lstat()
+            if S_ISLNK(info.st_mode):
+                _log.warning(
+                    "uploaded file %s (%s): skipped, it is a symlink and was not followed",
+                    fid,
+                    kind,
+                )
+                return _Half.SKIPPED
+            if not S_ISREG(info.st_mode):
+                _log.warning("uploaded file %s (%s): not a file; left as it is", fid, kind)
+                return _Half.NOT_REGULAR
+            # Read the MARKER first, not the file. The idempotency test is a prefix compare, and a
+            # sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip it made a
+            # re-run cost a full pass over every already-current file. The store's own passes push
+            # this filter into SQL (`WHERE col NOT LIKE ...`) for the same reason; on a filesystem
+            # the equivalent is a bounded read. So an already-current file is never size-checked: a
+            # lowered max_upload_bytes must not turn one into a skip.
+            active = cipher.active_marker_prefix.encode("ascii")
+            with path.open("rb") as handle:
+                if handle.read(len(active)) == active:
+                    return _Half.CURRENT  # already under the active key in the active format
+            if info.st_size > self._stored_limit:
+                # BACKLOG #3737: a read of the whole file could raise MemoryError, which no handler
+                # takes, so a planted one would abort the pass. A skip and not a loss: it may be a
+                # real body from before a lowered max_upload_bytes, still under the prior key.
+                _log.warning(
+                    "uploaded file %s (%s): skipped, %d bytes is larger than an upload can be. If "
+                    "it is a real upload, raise [store].max_upload_bytes for this run",
+                    fid,
+                    kind,
+                    info.st_size,
+                )
+                return _Half.SKIPPED
+            stored = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
+                # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
+                # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
+                # counting one would fail every later run for good. The sidecar is still handled,
+                # as the unsealable kind when it is plaintext.
+                _log.warning(
+                    "uploaded file %s (body): missing or not text; no key can read it", fid
+                )
+                return _Half.LOST
+            # An unreadable file. Counted and named, never silent: this file may still be under
+            # the OLD key and the operator must not retire it yet.
+            _log.warning(
+                "uploaded file %s (%s): skipped, unreadable: %s", fid, kind, codec_safe_str(exc)
+            )
+            return _Half.SKIPPED
+        plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
+        if plaintext and over is not None:
+            body, blob = over
+            # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is. A keyed
+            # store refuses it, so the upload is unlisted; sealing it would list an upload whose body
+            # is unusable, and would seal a planted lone sidecar too. A sidecar under a retired key
+            # is listed already, so it is still re-sealed: left behind, it would drop out of reach of
+            # prune_expired once that key goes.
+            if body is _Half.NOT_REGULAR:
+                return _Half.NOT_REGULAR  # left as it is, for the same reason as its body
+            # The body is missing or is not text: the one test the prune and the quota use too.
+            # Asked of a CURRENT body, because that pass trusts a body whose first bytes are the
+            # active marker without reading the rest. Every other body was read whole just now.
+            if body is _Half.LOST or (
+                body is _Half.CURRENT and self._lost_body_size(blob) is not None
+            ):
+                # No key reads either half and no re-run changes that, so it is not a skip. It
+                # stays refused, and the prune removes it at expiry.
+                _log.warning(
+                    "uploaded file %s (meta): left unsealed for good, its body is missing or is "
+                    "not text; retention removes it when it expires",
+                    fid,
+                )
+                return _Half.UNSEALABLE
+            if body is _Half.SKIPPED:
+                _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
+                return _Half.SKIPPED
+        try:
+            sealed = _reencrypt_value(cipher, stored, cell_aad("uploaded_file", kind, fid))
+        except _UnopenableValueError:
+            # It could not be decrypted. Nothing is written, so the file is left exactly as it was,
+            # and it is a skip, which fails the command and leaves the rotation record open (BACKLOG
+            # #3181, #3737). One bad upload used to abort the whole pass, and the CLI then blamed a
+            # missing prior key for what may be one damaged file. An encrypt-side refusal is not
+            # caught here and still aborts. The cipher's own message is not logged: a malformed
+            # marker's key id is cut from the stored text up to the next ':', so it can carry a
+            # piece of a damaged or planted file. _unopened_cause names the cause without that.
+            _log.warning(
+                "uploaded file %s (%s): skipped, it could not be decrypted: %s",
+                fid,
+                kind,
+                _unopened_cause(cipher, stored),
+            )
+            return _Half.SKIPPED
+        del stored  # the write holds its own copy, so free this file-sized buffer before it
+        try:
+            _atomic_write_text(self._root, path, sealed)
+        except OSError as exc:
+            # The write failed and the temp-and-replace left the file as it was. A skip, like a read
+            # failure, so one file that cannot be written does not stop the pass.
+            _log.warning(
+                "uploaded file %s (%s): skipped, could not be written: %s",
+                fid,
+                kind,
+                codec_safe_str(exc),
+            )
+            return _Half.SKIPPED
+        return _Half.SEALED_PLAINTEXT if plaintext else _Half.RESEALED
 
     async def warn_if_unsealed(self) -> int:
         """Log, once at ``serve`` startup, how many uploads a keyed store holds as plaintext.
@@ -2853,6 +2930,24 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     except CipherError as exc:
         raise _UnopenableValueError(str(exc)) from exc
     return cipher.encrypt(opened, aad=aad)
+
+
+def _unopened_cause(cipher: AesGcmCipher, stored: str) -> str:
+    """Why no key opened ``stored``, for the log, telling a key to supply from a damaged file
+    (BACKLOG #3737). It reads only the marker. :meth:`AesGcmCipher.named_key_id` passes only the
+    shape of a whole key id, so a planted value of that shape does reach the log, and any other
+    text does not. Only the head of ``stored`` is passed, because parsing a marker copies what follows it, and that
+    can be a whole upload."""
+    head = stored[:_MARKER_READ_LIMIT]
+    key_id = cipher.named_key_id(head)
+    if key_id is None:
+        return (
+            "its marker names no key id this cipher reads. A prior key not supplied may still "
+            "open it, or it is damaged, planted or sealed by another cipher"
+        )
+    if cipher.holds_key_for(head):
+        return f"key {key_id} is configured and did not open it, so it is damaged or was moved"
+    return f"key {key_id} is not configured; supply it, unless the value is damaged"
 
 
 async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:

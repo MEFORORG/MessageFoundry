@@ -672,6 +672,61 @@ async def test_db_poll_below_the_ceiling_is_unchanged(caplog: pytest.LogCaptureF
     assert "poll_max_rows" not in caplog.text
 
 
+async def test_db_full_poll_with_no_mark_warns_once_per_run_of_full_polls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With no ``mark_statement``, a full poll does not defer the rest: nothing takes a handled row out
+    of the result, so the next poll selects the same first rows and the row past the ceiling is never
+    reached. The source says so at WARNING, not with the "deferred, not dropped" line, and only once
+    per run of full polls; a poll under the ceiling ends the run, and the next full one warns again
+    (BACKLOG #2178).
+
+    Red mutation: restore the unconditional INFO deferral line, and no WARNING is logged. Second red
+    mutation: drop the once-per-run flag, and three full polls warn three times."""
+    table = _FakeTable(3)
+    src = _db_source(mark_statement=None, poll_max_rows=2)
+    _attach(src, table)
+    handler = _RecordingHandler()
+    src._handler = handler
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        for _ in range(3):
+            await src._poll_once()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "no mark_statement" in warnings[0].getMessage()
+    assert "add a mark_statement" in warnings[0].getMessage()
+    assert "Do not disable poll_max_rows" in warnings[0].getMessage()
+    assert "deferred, not dropped" not in caplog.text
+    # The row past the ceiling was never handed off: the same first two rows came back each poll.
+    assert {b.decode() for b in handler.bodies} == {_ADT.format(n=0), _ADT.format(n=1)}
+    assert len(table.rows) == 3
+    # A poll under the ceiling ends the run, so the next full poll warns again.
+    table.rows = table.rows[:1]
+    await src._poll_once()
+    table.rows = [(n, _ADT.format(n=n)) for n in range(3)]
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert [r.levelno for r in caplog.records].count(logging.WARNING) == 1
+
+
+async def test_db_full_poll_with_a_mark_keeps_the_deferral_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Negative control: with a ``mark_statement`` the rows past the ceiling really are deferred, so a
+    full poll logs the INFO deferral line and no WARNING.
+
+    Red mutation: key the WARNING on the ceiling alone, and this reds."""
+    table = _FakeTable(3)
+    src = _db_source(poll_max_rows=2)
+    _attach(src, table)
+    src._handler = _RecordingHandler()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        await src._poll_once()
+    assert "deferred, not dropped" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 async def test_db_ceiling_is_on_by_default_and_the_opt_out_restores_fetchall() -> None:
     """Shipped on at ``DEFAULT_MAX_ITEMS_PER_POLL`` with no setting; ``poll_max_rows=0`` restores the
     unbounded ``fetchall``.
