@@ -207,16 +207,27 @@ def _matches_domain(host: str, domain: str) -> bool:
     An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
     an address has no subdomains (vault BACKLOG #2843). No leading dot is stripped: settings refuse
     one at load, so a dot-led entry from any other caller matches nothing, which shows the
-    interstitial rather than widening the match (BACKLOG #3075). An IPv4 entry that is not one
-    host's matches nothing for the same reason, and a host that is an IPv4 address takes only an
-    exact match, so a partial entry such as ``0.0`` covers no address (BACKLOG #3765).
+    interstitial rather than widening the match (BACKLOG #3075). A host that is an address gets the
+    same treatment, keyed on the host because a partial entry such as ``0.0`` is not one: only a
+    canonical IPv4 address can match, only exactly, and only if it is one host's (BACKLOG #3765).
+    Settings accept no other address, so this shows the interstitial for every other spelling.
     """
     domain = domain.strip().lower()
     if not domain or not host:
         return False
-    if _is_ipv4(domain) or _is_ipv4(host):
-        return host == domain and _is_one_host(domain)
+    if _reads_as_address(host):
+        return host == domain and _is_ipv4(host) and _is_one_host(host)
     return host == domain or host.endswith("." + domain)
+
+
+#: A label a browser's URL parser reads as a number, which makes the host an IPv4 address to it.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _reads_as_address(host: str) -> bool:
+    """Whether a browser reads the lowercase ``host`` as an address rather than a name: an IPv6
+    literal, or a host whose last label is numeric, such as ``0x7f.1`` or ``3758096385``."""
+    return _is_ipv6(host) or _NUMERIC_LABEL.fullmatch(host.rpartition(".")[2]) is not None
 
 
 def _is_ipv4(entry: str) -> bool:

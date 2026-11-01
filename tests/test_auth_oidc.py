@@ -317,10 +317,11 @@ _UPN_SUFFIXES = [
     ("\u212aorp.example", "korp.example", False),
     ("m\u00fcller.example", "M\u00dcLLER.EXAMPLE", False),
     ("M\u00fcller.example", "m\u00fcller.example", False),
-    # A plain strip() also removed a non-ASCII space, so this suffix passed as corp.example.
+    # A plain strip() also removed a non-ASCII space from a claim, so the first two passed as
+    # corp.example. An entry is operator text, so the last row's pasted padding still goes.
     ("corp.example", "corp.example\u00a0", False),
     ("corp.example", "\u2003corp.example", False),
-    ("corp.example\u00a0", "corp.example", False),
+    ("corp.example\u00a0", "corp.example", True),
 ]
 
 
@@ -336,9 +337,9 @@ def test_a_non_ascii_upn_suffix_is_compared_as_written(
     Mutation: ``upn_suffix_key`` lower-cases every suffix. Red: the four False rows before the
     white space ones.
     Mutation: the settings property calls ``d.strip().lower()`` in place of ``upn_suffix_key``.
-    Red: the capital non-ASCII True row, and the False rows whose entry is the Kelvin sign, mixed
-    case or padded.
-    Mutation: ``upn_suffix_key`` calls a plain ``strip()``. Red: the three white space False rows."""
+    Red: the capital non-ASCII True row, and the False rows whose entry is the Kelvin sign or mixed
+    case.
+    Mutation: ``upn_suffix_key`` calls a plain ``strip()``. Red: the two white space False rows."""
     allowed = AuthSettings(oidc_allowed_username_domains=[entry]).effective_oidc_username_domains
     jws = _mint(rsa_key, "k1", _good_claims(preferred_username=f"jdoe@{suffix}"))
     policy = _policy(allowed_username_domains=frozenset(allowed))

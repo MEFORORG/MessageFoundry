@@ -202,15 +202,44 @@ def test_the_console_refuses_an_entry_that_is_not_one_host_s_however_it_arrived(
         (_NOT_ONE_HOST[0], "0.0.0"),
         (_IPV4, "40"),
         (_IPV4, "30.40"),
+        ("0x0.0.0.0", "0.0"),
+        ("00.0.0.0", "0.0"),
+        ("0.0.0", "0.0"),
+        ("[::ffff:0.0.0.0]", "0.0"),
     ],
 )
 def test_a_partial_entry_covers_no_address(address: str, entry: str) -> None:
-    """BACKLOG #3765 item 8: the guard read only the entry, and ``0.0`` is no IPv4 entry, so it took
-    a label-boundary match and covered ``0.0.0.0``. An address has no parent domain, so a host that
-    is one takes only an exact match, whatever the entry looks like.
+    """BACKLOG #3765 item 8: ``0.0`` is no IPv4 entry, so it took a label-boundary match and covered
+    ``0.0.0.0``. An address has no parent domain, so a host a browser reads as one takes no such
+    match, whatever the entry looks like and however the host is spelled.
 
-    Mutation: test only the entry in ``_matches_domain``. Red: every case."""
+    Mutation: test only ``_is_ipv4(domain)`` in ``_matches_domain``. Red: every case."""
     url = f"https://{address}/"
+    assert is_external(url, (entry,))
+    assert not is_allowlisted(url, (entry,))
+
+
+#: Spellings a browser reads as addresses and settings refuse: octal, hexadecimal and integer forms
+#: of multicast and the limited broadcast, a short form, and IPv6 literals. Each entry is the host
+#: the URL names, so an exact match would cover it.
+_OTHER_SPELLINGS = [
+    ("0340.0.0.1", "0340.0.0.1"),
+    ("0xe0.0.0.1", "0xe0.0.0.1"),
+    ("3758096385", "3758096385"),
+    ("0xffffffff", "0xffffffff"),
+    ("0", "0"),
+    ("[::]", "::"),
+    ("[ff02::1]", "ff02::1"),
+]
+
+
+@pytest.mark.parametrize(("host", "entry"), _OTHER_SPELLINGS)
+def test_an_entry_covers_no_other_spelling_of_an_address(host: str, entry: str) -> None:
+    """BACKLOG #3765 item 8: ``_is_ipv4`` reads only the canonical form, so these fell to the exact
+    compare on the last line of ``_matches_domain`` and each entry covered its own spelling.
+
+    Mutation: return ``False`` from ``_reads_as_address``. Red: every case."""
+    url = f"https://{host}/"
     assert is_external(url, (entry,))
     assert not is_allowlisted(url, (entry,))
 
