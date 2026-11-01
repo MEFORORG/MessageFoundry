@@ -2585,10 +2585,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
-- on Windows, a network share the engine cannot reach can read as absent, not as a fault. At least
-  a share lost between the target check and the reload's read of the directory would answer
-  `not_found`, `validate_config`, which `messagefoundry check` runs, would report a config directory
-  on such a share as absent, and a value file read from disk would read as absent there;
+- a network share the engine cannot reach can read as absent, not as a fault. At least a share lost
+  between the target check and the reload's read of the directory would answer `not_found`, and
+  `validate_config`, which `messagefoundry check` runs, would report a config directory on such a
+  share as absent. A value file read from disk would read as absent there too, so an `env()`
+  reference with a default would take that default, with no refusal;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
   out what it cannot read and does not tell its caller, so it can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
