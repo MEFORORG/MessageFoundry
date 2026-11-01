@@ -243,15 +243,15 @@ try {
     # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
     # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
     # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
-    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. The
-    # number still stands as a floor while its reset is ahead, so usage.ps1 and the gate's rung keep a
-    # stale reading at the rung as a HIT, and only below the rung does the gate fall to REVIEW.
+    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. While
+    # its reset is ahead the number still stands as a floor: usage.ps1 publishes it as level_floor, and
+    # the gate's rung reads a stale reading at the rung as a HIT.
     #
-    # A READING WITH NO READABLE RESET CANNOT PROVE IT IS A NEW WINDOW. While the published reset is
-    # still ahead, one that is not higher is refused like any other, and a higher one keeps that reset,
-    # because this rule and the reader's gone-window check both need it. With no published reset ahead
-    # there is nothing to hold on to: the reading is taken, and the rule does not apply until a reading
-    # brings a reset.
+    # A READING WITH NO READABLE RESET CANNOT PROVE WHICH WINDOW IT BELONGS TO. So while the published
+    # reset is still ahead it is refused, higher or not. Taken bare, it would wipe the reset this rule
+    # and the reader's gone-window check both need. Given the published reset, it could set a floor no
+    # live reading could lower until that reset. With no published reset ahead there is nothing to hold
+    # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
@@ -270,11 +270,7 @@ try {
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
             ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
-        else { $notHigher -and $publishedEpoch -gt $nowEpoch }
-        if (-not $keepPublished -and -not $seenEpoch -and $publishedEpoch -gt $nowEpoch) {
-            $seven.resets_at_epoch = $published.resets_at_epoch
-            $seven.resets_at = $published.resets_at
-        }
+        else { $publishedEpoch -gt $nowEpoch }
     }
 
     # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new

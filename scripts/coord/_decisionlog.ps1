@@ -852,19 +852,23 @@ function Get-DecisionCostRung {
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      AGE BLOCKS CLEARING AND NEVER BLOCKS A HIT. An equal reading does not refresh its age, so a flat
-      pool goes stale, and a spent one cannot rise. A stale reading whose reset is ahead still proves
-      at least its level, which usage.ps1 publishes as level_floor, so at the level or the ceiling it
-      is HIT. Below them it is UNKNOWN, because a stale number cannot clear work.
+      AGE ALONE DOES NOT BLOCK A HIT WHILE THE RESET IS KNOWN AND AHEAD. An equal reading does not
+      refresh its age, so a flat pool goes stale, and a spent one cannot rise. A stale reading whose
+      reset is ahead still proves at least its level, which usage.ps1 publishes as level_floor, so at
+      the level or the ceiling it is HIT. It has no rate, since nothing is projected from a stale
+      reading, so the level decides even where a fresher reading's rate would have cleared it. Below
+      them it is UNKNOWN, because a stale number cannot clear work. At least a reading with no reset, a
+      future-dated one and an undateable one carry no floor, whatever their number.
 
-      UNKNOWN when the reading is missing, stale below the rung, refused, past its reset (it describes
-      a window that is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
+      UNKNOWN when the reading is missing, stale with no floor at the rung, refused, past its reset (it
+      describes a window that is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
       window's own state does not), unless the window grades HIT: a hit is never downgraded, since
       that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
       CRITICAL reading that this grades below the rung is UNKNOWN too: it may be another root's. A
       reader that does not finish within -TimeoutSeconds is UNKNOWN. A Desktop session that runs no
-      statusLine reads UNKNOWN here; the Steward's status.json fallback that
+      statusLine reads UNKNOWN here unless its root holds a level_floor at the rung; the Steward's
+      status.json fallback that
       usage-headroom-inject.ps1 prints is not read, because it would be a third copy of watch.py's
       pool rules.
     #>

@@ -457,11 +457,31 @@ def _stale(pct: float, **over: Any) -> dict[str, Any]:
 @pytest.mark.parametrize("pct", [90.0, 98.0, 100.0], ids=["at-the-level", "ceiling", "spent"])
 def test_a_stale_reading_at_the_rung_still_halts(sb: Sandbox, pct: float) -> None:
     """A stale reading whose reset is ahead proves at least that level: usage does not fall inside
-    a reset period. So age blocks clearing, and it never blocks a hit."""
+    a reset period. So age alone blocks clearing, not a hit."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), _stale(pct), code=20)
     code, doc = gate(sb)
     assert code == HALT and "at least" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    ("hold", "pct", "expected"),
+    [
+        pytest.param(70, 75.0, HALT, id="level-moved-down"),
+        pytest.param(95, 92.0, REVIEW, id="level-moved-up"),
+        pytest.param(99, 98.0, HALT, id="ceiling-under-a-higher-level"),
+    ],
+)
+def test_the_stale_floor_reads_the_level_and_the_ceiling_separately(
+    sb: Sandbox, hold: int, pct: float, expected: int
+) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(pct), code=20)
+    _thresholds(sb).write_text(
+        json.dumps({"levels": {"weekly": [hold, 99, 100]}}), encoding="utf-8"
+    )
+    code, doc = gate(sb)
+    assert code == expected, why(doc)
 
 
 def test_a_stale_reading_below_the_rung_does_not_clear(sb: Sandbox) -> None:
@@ -503,7 +523,8 @@ def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts
     seed_vault(sb, calibrated("manager"))
     real = sb.repo / "scripts" / "coord" / "usage.ps1"
     code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
-    assert code == HALT, why(doc)
+    # "at least" is the stale floor's own reason. A fresh 100 would also HALT, on the ceiling.
+    assert code == HALT and "at least" in why(doc), why(doc)
 
 
 def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(

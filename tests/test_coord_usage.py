@@ -332,29 +332,44 @@ def test_a_later_reading_with_an_earlier_reset_ahead_of_now_is_a_new_window(tmp_
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(3.0)
 
 
-def test_a_higher_reading_with_no_reset_keeps_the_published_reset(tmp_path: Path) -> None:
-    """Taken bare, it would wipe the reset, and the next idle reading would pass the floor."""
-    seven = window(99.0, 280000)
+def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
+    tmp_path: Path,
+) -> None:
+    """It cannot prove which window it belongs to. Taken bare, it would wipe the reset. Given the
+    published reset, a cached 95 would set a floor no live reading could lower until that reset."""
+    seven = window(3.0, 280000)
     collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
-    bare = {"used_percentage": 100.0}
+    bare = {"used_percentage": 95.0}
     collect(tmp_path, {"session_id": "odd", "rate_limits": {"seven_day": bare}})
     kept = latest(tmp_path)["seven_day"]
-    assert kept["used_percentage"] == pytest.approx(100.0), kept
+    assert kept["used_percentage"] == pytest.approx(3.0), kept
     assert kept["resets_at_epoch"] == seven["resets_at"], kept
-    assert history(tmp_path)[-1]["seven_reset"] == seven["resets_at"]
+    assert len(history(tmp_path)) == 1
 
-    idle = {**seven, "used_percentage": 60.0}
-    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+    # CONTROL: the next reading that carries the reset still moves the number.
+    live = {**seven, "used_percentage": 4.0}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": live}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(4.0)
 
 
 def test_with_no_published_reset_there_is_no_floor(tmp_path: Path) -> None:
     """The stated limit, pinned so a change to it is a decision: with no reset to compare, the rule
-    has nothing to hold on to, and a later reading replaces the number either way."""
+    has nothing to hold on to. A lower reading replaces, and an equal one refreshes the age."""
     for pct in (70.0, 40.0):
         seven = {"used_percentage": pct}
         collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
         assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+    first = captured_at(tmp_path)
+    time.sleep(1.1)
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": {"used_percentage": 40.0}}})
+    assert captured_at(tmp_path) > first
+
+
+def test_a_bare_reading_replaces_a_window_whose_reset_has_passed(tmp_path: Path) -> None:
+    """The floor ends with its window. Nothing is ahead to protect, so the reading is taken."""
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(95.0, -300)}})
+    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": {"used_percentage": 2.0}}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
 
 
 def test_a_gone_reading_on_an_empty_directory_is_published_and_read_as_unknown(
