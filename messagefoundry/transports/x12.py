@@ -50,6 +50,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     encode_wire_body,
     float_setting,
+    port_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -166,7 +167,7 @@ class X12Destination(DestinationConnector):
         if not isinstance(host, str) or not host:
             raise ValueError("X12 destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="X12 destination")
         self.encoding: str = str(s.get("encoding", "utf-8"))
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="X12 destination"
@@ -628,7 +629,7 @@ class X12Source(SourceConnector):
         # inbound); fall back to loopback for a missing/None value — never bind all interfaces by
         # accident, since raw TCP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = str(s.get("host") or "127.0.0.1")
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="X12 source")
         self.encoding: str = str(s.get("encoding", "utf-8"))
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).

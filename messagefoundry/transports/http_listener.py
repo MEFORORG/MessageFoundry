@@ -60,6 +60,7 @@ from messagefoundry.transports.base import (
     InboundReply,
     ReplyOutcome,
     SourceConnector,
+    port_setting,
     positive_cap,
     positive_seconds,
     register_source,
@@ -732,7 +733,7 @@ class HttpSource(SourceConnector):
         # interfaces (0.0.0.0) by accident. The runner's exposed-gate refuses a non-loopback bind
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="HTTP source")
         #: How this source names itself in a log line.
         self._log_name: str = config.name or f"{self.host}:{self.port}"
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"

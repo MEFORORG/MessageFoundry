@@ -17,11 +17,13 @@ range check, not a coercion asymmetry, and it has its own tests below.
 
 from __future__ import annotations
 
+import ast
 import math
 import operator
 from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -44,12 +46,13 @@ from messagefoundry.config.wiring import (
     env,
     resolve_env_settings,
 )
-from messagefoundry.transports import build_destination, build_source, database, mllp
+from messagefoundry.transports import build_destination, build_source, database, mllp, remotefile
 from messagefoundry.transports.base import (
     cap_setting,
     count_setting,
     float_setting,
     poll_interval,
+    port_setting,
     positive_cap,
     resolve_poll_ceiling,
 )
@@ -1078,3 +1081,172 @@ def test_an_empty_max_rows_is_refused_not_read_as_off(empty: str) -> None:
     over: dict[str, Any] = {"max_rows": empty}
     with pytest.raises(WiringError, match="DATABASE reference source max_rows is empty"):
         DatabaseRef(server="s", database="d", statement="SELECT a", key_column="a", **over)
+
+
+# --- a port is read by one rule (BACKLOG #1650 step 2) ----------------------------------------------
+
+
+def _direct(over: dict[str, Any]) -> DirectDestination:
+    base = {
+        **_EMAIL_BASE,
+        "signing_cert": "unused",
+        "signing_key": "unused",
+        "recipient_cert": "unused",
+        "trust_anchor": "unused",
+    }
+    return DirectDestination(
+        Destination(name="OB", type=ConnectorType.DIRECT, settings={**base, **over})
+    )
+
+
+def _sql_server_dsn(over: dict[str, Any]) -> str:
+    return database._build_dsn({"server": "db.example.org", "database": "d", **over})
+
+
+def _ftp(over: dict[str, Any]) -> Any:
+    return remotefile._FtpClient({"host": "h", **over}, tls=False)
+
+
+def _sftp(over: dict[str, Any]) -> Any:
+    return remotefile._SftpClient({"host": "h", **over})
+
+
+def _anon_guard(over: dict[str, Any]) -> Any:
+    return remotefile._anon_ftp_guard({"host": "h", "protocol": "ftp", **over}, connection="OB")
+
+
+#: One builder per ``port`` read in ``transports/``, because each read was its own bare ``int()``.
+#: ``_PORT_REFUSED_ONLY`` holds the two these tables cannot read an attribute back from.
+_PORT_READS = [
+    pytest.param(_MLLP_IN, "port", id="mllp-in"),
+    pytest.param(_MLLP_OUT, "port", id="mllp-out"),
+    pytest.param(_TCP_IN, "port", id="tcp-in"),
+    pytest.param(_TCP_OUT, "port", id="tcp-out"),
+    pytest.param(_X12_IN, "port", id="x12-in"),
+    pytest.param(_X12_OUT, "port", id="x12-out"),
+    pytest.param(_HTTP_IN, "port", id="http-in"),
+    pytest.param(_SCP, "_port", id="dicom-scp"),
+    pytest.param(_SCU, "_port", id="dicom-scu"),
+    pytest.param(_email, "port", id="email"),
+    pytest.param(_ftp, "_port", id="ftp"),
+    pytest.param(_sftp, "_port", id="sftp"),
+    pytest.param(_anon_guard, "port", id="anon-ftp-guard"),
+]
+
+#: The Direct destination loads key material after the port, and the DSN builder returns text.
+_PORT_REFUSED_ONLY = [
+    pytest.param(_direct, id="direct"),
+    pytest.param(_sql_server_dsn, id="sql-server-dsn"),
+]
+
+_PORT_REFUSALS = [
+    pytest.param(True, "not a valid int value", id="true"),
+    pytest.param(False, "not a valid int value", id="false"),
+    pytest.param(2575.9, "not a valid int value", id="fraction"),
+    pytest.param("2575.9", "not a valid int value", id="fraction-text"),
+    pytest.param("SENTINEL-1650", "not a valid int value", id="text"),
+    pytest.param(math.inf, "not a valid int value", id="infinity"),
+    pytest.param(None, "not a valid int value", id="none"),
+    pytest.param(-1, "must be from 0 to 65535", id="negative"),
+    pytest.param(65536, "must be from 0 to 65535", id="too-large"),
+    pytest.param("65536", "must be from 0 to 65535", id="too-large-text"),
+]
+
+
+@pytest.mark.parametrize(("build", "attr"), _PORT_READS)
+@pytest.mark.parametrize(("bad", "says"), _PORT_REFUSALS)
+def test_every_port_read_refuses_what_is_not_a_port(
+    build: Build, attr: str, bad: object, says: str
+) -> None:
+    """Each of these is reachable from an uncast ``env()`` on an ``int`` setting. A bare ``int()``
+    read ``True`` as port 1, truncated ``2575.9``, quoted bad text in its own message, and left a
+    number out of range to fail when the socket opened.
+
+    Red mutation: put a bare ``int(s["port"])`` back in any connector."""
+    with pytest.raises(ValueError, match=says) as caught:
+        build({"port": bad})
+    message = str(caught.value)
+    assert "port" in message and "value withheld" in message
+    assert "SENTINEL-1650" not in message
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("build", _PORT_REFUSED_ONLY)
+@pytest.mark.parametrize(("bad", "says"), _PORT_REFUSALS)
+def test_the_port_reads_with_no_attribute_to_read_back_refuse_too(
+    build: Build, bad: object, says: str
+) -> None:
+    with pytest.raises(ValueError, match=says):
+        build({"port": bad})
+
+
+@pytest.mark.parametrize(("build", "attr"), _PORT_READS)
+@pytest.mark.parametrize(
+    ("good", "want"), [(2575, 2575), ("2575", 2575), (" 2575 ", 2575), (2575.0, 2575)]
+)
+def test_every_port_read_takes_a_port_in_any_spelling_the_environment_gives(
+    build: Build, attr: str, good: object, want: int
+) -> None:
+    assert getattr(build({"port": good}), attr) == want
+
+
+def test_the_sql_server_dsn_writes_the_port_it_read() -> None:
+    assert "SERVER=db.example.org,2575;" in _sql_server_dsn({"port": " 2575 "})
+
+
+def test_port_zero_stays_the_ephemeral_port() -> None:
+    assert _TCP_IN({"port": "0"}).port == 0
+    assert port_setting(65535, transport="t") == 65535
+
+
+def test_an_uncast_env_port_reaches_the_connector_as_a_number() -> None:
+    """The route this guard exists for: the environment's value, through ``resolve_env_settings``."""
+    assert _MLLP_IN(resolve_env_settings({"port": env("p")}, {"p": "2575"})).port == 2575
+    for bad in (True, 2575.9, "x"):
+        with pytest.raises(ValueError, match="MLLP port is not a valid int value"):
+            _MLLP_IN(resolve_env_settings({"port": env("p")}, {"p": bad}))
+
+
+def _bare_numeric_reads(source: str) -> list[int]:
+    """The line of each ``int()`` or ``float()`` called on a settings read: a constant key taken by
+    ``.get`` or a subscript."""
+
+    def reads_a_setting(node: ast.AST) -> bool:
+        if isinstance(node, ast.Subscript):
+            return isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and bool(node.args)
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        )
+
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("int", "float")
+        and node.args
+        and any(reads_a_setting(part) for part in ast.walk(node.args[0]))
+    ]
+
+
+def test_no_connector_reads_a_numeric_setting_with_a_bare_int_or_float() -> None:
+    """A new connector's ``int(s["port"])`` fails here, not on a first deployment. The instrument is
+    run on its own positive and negative controls first.
+
+    ``remotefile.py`` reads the ``size`` fact of an FTP ``MLSD`` listing, which is wire data and not
+    a setting, so that one read is named here by its key rather than by a line number."""
+    assert _bare_numeric_reads('p = int(s["port"])\nq = float(s.get("rate", 1))\n') == [1, 2]
+    assert _bare_numeric_reads('p = port_setting(s["port"], transport="t")\n') == []
+    found: dict[str, list[int]] = {}
+    for path in sorted(Path(mllp.__file__).parent.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        hits = [n for n in _bare_numeric_reads(source) if 'facts.get("size"' not in lines[n - 1]]
+        if hits:
+            found[path.name] = hits
+    assert found == {}
