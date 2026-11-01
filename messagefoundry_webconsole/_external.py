@@ -207,13 +207,15 @@ def _matches_domain(host: str, domain: str) -> bool:
     An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
     an address has no subdomains (vault BACKLOG #2843). No leading dot is stripped: settings refuse
     one at load, so a dot-led entry from any other caller matches nothing, which shows the
-    interstitial rather than widening the match (BACKLOG #3075).
+    interstitial rather than widening the match (BACKLOG #3075). An IPv4 entry that is not one
+    host's matches nothing for the same reason, and a host that is an IPv4 address takes only an
+    exact match, so a partial entry such as ``0.0`` covers no address (BACKLOG #3765).
     """
     domain = domain.strip().lower()
     if not domain or not host:
         return False
-    if _is_ipv4(domain):
-        return host == domain
+    if _is_ipv4(domain) or _is_ipv4(host):
+        return host == domain and _is_one_host(domain)
     return host == domain or host.endswith("." + domain)
 
 
@@ -226,6 +228,19 @@ def _is_ipv4(entry: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: RFC 1122's "this network" block. ``ipaddress`` reads most of it as neither unspecified nor
+#: reserved, so neither flag can stand in for this.
+_THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
+
+
+def _is_one_host(entry: str) -> bool:
+    """Whether the IPv4 ``entry`` is one host's address. This console's copy of what settings
+    refuse at load, ``_not_a_host_address`` in ``config/settings.py``, kept here for the reason
+    :func:`_is_ipv4` gives; ``tests/test_domain_shape.py`` compares the two on a ``/16`` grid."""
+    address = ipaddress.IPv4Address(entry)
+    return not (address in _THIS_NETWORK or address.is_multicast or address.is_reserved)
 
 
 def is_external(url: str, organization_domains: list[str] | tuple[str, ...]) -> bool:

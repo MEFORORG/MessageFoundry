@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.oidc import claims as claims_mod
 from messagefoundry.config.models import SignatureAlgorithm
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.transports.signing import CompactJwtSigner
 
 # --- helpers ---------------------------------------------------------------------------------------
@@ -298,6 +299,79 @@ def test_federated_principal_carries_issuer(rsa_key: rsa.RSAPrivateKey) -> None:
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.issuer == "https://idp.example"
     assert principal.subject == "S-1-5-21-abc"
+
+
+#: (allow-list entry, the suffix a claim carries, whether the login gets past the suffix check).
+_UPN_SUFFIXES = [
+    # An ASCII suffix still matches without regard to case, and ASCII whitespace still trims.
+    ("corp.example", "corp.example", True),
+    ("Corp.Example", "CORP.example", True),
+    ("corp.example", " corp.example\t", True),
+    # A non-ASCII suffix matches as written. The second row is why settings changed with the claim:
+    # a fold on one side alone would stop this match.
+    ("m\u00fcller.example", "m\u00fcller.example", True),
+    ("M\u00dcLLER.Example", "M\u00dcLLER.Example", True),
+    # What a whole-string lower-casing let through, in the direction of each row: a claim the
+    # allow-list never named. The Kelvin sign lowers to an ASCII k.
+    ("korp.example", "\u212aorp.example", False),
+    ("\u212aorp.example", "korp.example", False),
+    ("m\u00fcller.example", "M\u00dcLLER.EXAMPLE", False),
+    ("M\u00fcller.example", "m\u00fcller.example", False),
+    # A plain strip() also removed a non-ASCII space, so this suffix passed as corp.example.
+    ("corp.example", "corp.example\u00a0", False),
+    ("corp.example", "\u2003corp.example", False),
+    ("corp.example\u00a0", "corp.example", False),
+]
+
+
+@pytest.mark.parametrize(("entry", "suffix", "accepted"), _UPN_SUFFIXES)
+def test_a_non_ascii_upn_suffix_is_compared_as_written(
+    rsa_key: rsa.RSAPrivateKey, entry: str, suffix: str, accepted: bool
+) -> None:
+    """BACKLOG #3765 item 9. Each entry goes through the settings property, so both sides of the
+    compare are the real ones, and the policy holds what the service would give it. The change only
+    tightens: every ``False`` row was accepted before it, and no row was refused before it. Docs:
+    ``docs/CONFIGURATION.md``, the ``oidc_allowed_username_domains`` row.
+
+    Mutation: ``upn_suffix_key`` lower-cases every suffix. Red: the four False rows before the
+    white space ones.
+    Mutation: the settings property calls ``d.strip().lower()`` in place of ``upn_suffix_key``.
+    Red: the capital non-ASCII True row, and the False rows whose entry is the Kelvin sign, mixed
+    case or padded.
+    Mutation: ``upn_suffix_key`` calls a plain ``strip()``. Red: the three white space False rows."""
+    allowed = AuthSettings(oidc_allowed_username_domains=[entry]).effective_oidc_username_domains
+    jws = _mint(rsa_key, "k1", _good_claims(preferred_username=f"jdoe@{suffix}"))
+    policy = _policy(allowed_username_domains=frozenset(allowed))
+    if accepted:
+        principal = oidc.validate_id_token(
+            jws, policy, _cache_for(rsa_key), clock=lambda: 1_000_100
+        )
+        assert principal.username == "jdoe"
+    else:
+        with pytest.raises(oidc.ClaimsError) as refused:
+            oidc.validate_id_token(jws, policy, _cache_for(rsa_key), clock=lambda: 1_000_100)
+        assert refused.value.reason == "username_domain_not_allowed"
+
+
+@pytest.mark.parametrize("blank", ["   ", chr(0xA0)])
+def test_a_blank_ad_domain_is_no_suffix_source(blank: str) -> None:
+    """The fallback had no blank filter, so ``ad_domain = "   "`` gave the empty suffix. That passed
+    the load refusal, and a claim of ``jdoe@`` then passed the check. BACKLOG #3765 review.
+
+    Mutation: test only ``self.ad_domain``. Red: both values."""
+    assert AuthSettings(ad_domain=blank).effective_oidc_username_domains == ()
+
+
+def test_the_ad_domain_fallback_keeps_a_non_ascii_suffix_as_written() -> None:
+    """The allow-list's other source goes through the same compare form, or a suffix written with
+    a capital non-ASCII letter would match neither its own spelling nor any other.
+
+    Mutation: put ``.lower()`` back on the ``ad_domain`` arm. Red: this test."""
+    written = "M\u00dcLLER.example"
+    assert AuthSettings(ad_domain=written).effective_oidc_username_domains == (written,)
+    assert AuthSettings(ad_domain=" Corp.Example ").effective_oidc_username_domains == (
+        "corp.example",
+    )
 
 
 @pytest.mark.parametrize(

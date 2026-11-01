@@ -31,6 +31,12 @@ this line.**
 
 ### Security
 
+- **An IPv4 entry that is not one host's address covers nothing.** Engine settings refuse such an
+  entry at load: at least all of `0.0.0.0/8`, a multicast address and the reserved class E range.
+  The console matched one that reached it another way, so a URL to that address skipped the
+  interstitial. It now shows the interstitial, as it does for a dot-led entry. A host that is an
+  IPv4 address also takes only an exact match now, so a partial entry such as `0.0` covers no
+  address. (BACKLOG #3765)
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its
   Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
   for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
