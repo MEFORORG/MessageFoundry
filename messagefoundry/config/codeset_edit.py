@@ -72,7 +72,7 @@ def list_code_sets(config_dir: str | Path) -> list[dict[str, Any]]:
     Raises :class:`WiringError` on a malformed file, a duplicate-key file, a stem collision, or an
     OSError reading the dir — the same fail-loud surface the loader gives."""
     codesets_dir = _codesets_dir(config_dir)
-    if not codesets_dir.is_dir():
+    if not atomic_edit.is_dir(codesets_dir, refused_error=WiringError):
         return []
     # load_code_sets is the authority for duplicate-stem / malformed-file errors; reuse it so `list`
     # fails loud exactly like a reload would, rather than papering over a broken table.
@@ -368,7 +368,7 @@ def _has_drive(name: str) -> bool:
 def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
     """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
     target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
-    if (codesets_dir / f"{name}.toml").exists():
+    if atomic_edit.is_file(codesets_dir / f"{name}.toml", refused_error=WiringError):
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -413,7 +413,9 @@ def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
         # Skip the #162 <name>.policy.toml sidecars — they are policy metadata, not code sets. Only a
         # TRUE sidecar (companion code set present) is skipped; a standalone x.policy.toml still lists
         # as a code set, mirroring the loader (code_sets.is_policy_sidecar).
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTS and not is_policy_sidecar(p)
+        if p.suffix.lower() in _SUPPORTED_EXTS
+        and atomic_edit.is_file(p, refused_error=WiringError)
+        and not is_policy_sidecar(p)
     ]
 
 
@@ -432,7 +434,7 @@ def _existing_path(codesets_dir: Path, name: str) -> Path:
 def _existing_path_or_none(codesets_dir: Path, name: str) -> Path | None:
     for ext in _SUPPORTED_EXTS:
         candidate = codesets_dir / f"{name}{ext}"
-        if candidate.is_file():
+        if atomic_edit.is_file(candidate, refused_error=WiringError):
             return candidate
     return None
 

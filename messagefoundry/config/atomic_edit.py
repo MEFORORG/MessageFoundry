@@ -56,7 +56,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
-from messagefoundry.config.snapshot import _is_file
+from messagefoundry.config.snapshot import is_missing_directory
 
 __all__ = [
     "CANDIDATE_DIR_SUFFIX",
@@ -66,6 +66,7 @@ __all__ = [
     "encode_text",
     "is_candidate_dir_name",
     "lock_path_for",
+    "is_dir",
     "is_file",
     "read_text",
     "read_text_if_present",
@@ -107,13 +108,17 @@ _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 #: ``errno`` values meaning the file system will not let this account read the file or write its
 #: directory: a root-owned one, or a read-only mount. Only these become an editor's
-#: ``refused_error``; a full disk or a missing directory keeps its own ``OSError``, so it is not
-#: reported as a permission.
+#: ``refused_error`` at a read or a write; a full disk or a missing directory keeps its own
+#: ``OSError``, so it is not reported as a permission. The stat gate has its own rule (:func:`is_file`).
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
 #: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
 #: directory refuses no read, so the write advice would send an operator to the wrong fix.
 _READ_STEP = "read it"
+
+#: The ``step`` of a stat that failed with no refusal in it: a broken link or a fault, which no
+#: change of account cures.
+_STAT_STEP = "stat it"
 
 #: Windows also answers ``EACCES`` when another program holds the file open, and for most of these
 #: steps nothing tells the two apart: ``open`` reports a sharing violation through the C runtime as
@@ -165,14 +170,41 @@ def read_text_if_present(
     return read_text(path, refused_error=refused_error)
 
 
-def is_file(path: Path, *, refused_error: Callable[[str], Exception]) -> bool:
-    """Whether ``path`` is a regular file, with a refused stat raised as ``refused_error(message)``.
+def is_file(path: Path, *, refused_error: Callable[[str], Exception] | None) -> bool:
+    """Whether ``path`` is a regular file, by the stat every config gate shares.
 
-    Not ``Path.is_file``, which answers ``False`` for a path it could not stat: a config file that
-    is a link into a directory this account cannot search would read as absent, and an edit would
-    start from an empty document and replace the link with it."""
-    with refused_as(path, refused_error, _READ_STEP):
-        return _is_file(path)
+    Not ``Path.is_file``, which answers ``False`` for every stat that fails: a config file that is a
+    link to an unmounted share, or into a directory this account cannot search, would read as absent,
+    and an edit would start from an empty document and replace the link with it.
+
+    ``False`` here means there is no file to lose: nothing at the path, or a name no file can have
+    (:func:`~messagefoundry.config.snapshot.is_missing_directory`). So a bad path lists as empty, as
+    ``Path.is_file`` answered. Every other failed stat is raised as ``refused_error(message)``, or as
+    itself with no ``refused_error``: a link at ``path`` that cannot be followed, and any fault that
+    does not say the file is gone. A link that ends at something other than a regular file answers
+    ``False``, and so does a broken link higher up the path, which leaves nothing an edit can write."""
+    return _is_a(path, stat.S_ISREG, refused_error)
+
+
+def is_dir(path: Path, *, refused_error: Callable[[str], Exception]) -> bool:
+    """:func:`is_file`, for whether ``path`` is a directory."""
+    return _is_a(path, stat.S_ISDIR, refused_error)
+
+
+def _is_a(
+    path: Path, kind: Callable[[int], bool], refused_error: Callable[[str], Exception] | None
+) -> bool:
+    try:
+        return kind(path.stat().st_mode)
+    except ValueError:  # an embedded NUL, which no path can hold
+        return False
+    except OSError as exc:
+        if is_missing_directory(exc) and not path.is_symlink():
+            return False
+        if refused_error is None:
+            raise
+        step = _READ_STEP if exc.errno in _REFUSED else _STAT_STEP
+        raise refused_error(_refusal(path, exc, step)) from exc
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -207,9 +239,12 @@ def edit_lock(
     # byte-range lock, and an exclusive one needs a writable handle or it fails EBADF (flock(2)), so
     # a read-only handle would fail every edit on NFS. Read-only on Windows, where msvcrt.locking
     # needs no more, and asking for write would be refused by a backup agent or scanner holding the
-    # file with read sharing only. Owner-only, like the files it guards: every edit leaves
-    # the edited file 0600, so an account that could not open this lock could not edit that file
-    # either, and root opens a 0600 file regardless. Wider access gains nothing.
+    # file with read sharing only. The cost, off Windows: a lock file this account cannot write, at
+    # 0444 or at 0644 under another account, refuses the edit where a read-only open would have
+    # locked it. The refusal names the lock file, and fixing its owner or mode cures it.
+    # Owner-only, like the files it guards: every edit leaves the edited file 0600, so an account
+    # that could not open a lock an editor created could not edit that file either, and root opens
+    # a 0600 file regardless. Wider access gains nothing.
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
     flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
@@ -281,7 +316,8 @@ def replace_validated(
                 handle.flush()
                 os.fsync(handle.fileno())
         for companion in companions:
-            if companion.is_file():
+            # The stat gate: a companion read as absent would validate the candidate without it.
+            if is_file(companion, refused_error=refused_error):
                 with refused_as(path, refused_error, f"copy {companion.name} to validate it"):
                     shutil.copyfile(companion, private / companion.name)
         validate(candidate)
@@ -316,7 +352,7 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
     operator through the API, where an absolute host path adds nothing the file name does not. The
     full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
     the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
-    _log.warning("the file system would not let this account %s, for %s: %s", step, path, exc)
+    _log.warning("this account could not %s, for %s: %s", step, path, exc)
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
     held = (
@@ -325,6 +361,12 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
         if _WINDOWS and exc.errno == errno.EACCES
         else ""
     )
+    if step == _STAT_STEP:
+        return (
+            f"{path.name} could not be read: {reason}. It may be a link whose target cannot be "
+            "reached, such as a file on an unmounted share, so it was not taken to be absent. "
+            "Restore the target or remove the link"
+        )
     if step == _READ_STEP:
         return (
             f"{path.name} could not be read: {reason}. {held}Another account owns the file or its "

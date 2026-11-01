@@ -253,6 +253,9 @@ def _refuse_reads(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) 
 
 
 def _refuse_stat(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -> None:
+    """What a real stat failure does: ``Path.stat`` raises and ``Path``'s predicates catch it and
+    answer ``False``. They go round ``Path.stat`` to ``os.path``, so patching that alone would leave
+    them answering for the real file on disk, and a gate that used them would look like it refused."""
     real_stat = Path.stat
 
     def fake_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
@@ -261,6 +264,13 @@ def _refuse_stat(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -
         return real_stat(self, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(Path, "stat", fake_stat)
+    for predicate in ("is_file", "is_dir", "exists"):
+        real = getattr(Path, predicate)
+
+        def fake(self: Path, *args: Any, real: Any = real, **kwargs: Any) -> bool:
+            return False if self.name == name else bool(real(self, *args, **kwargs))
+
+        monkeypatch.setattr(Path, predicate, fake)
 
 
 @REFUSALS
@@ -306,9 +316,16 @@ def _security_set(path: Path) -> Any:
     return security_edit.set_security(path, {"require_mfa": False}, validate=_noop)
 
 
-def _codeset_upsert(path: Path) -> Any:
+def _codeset_upsert(
+    path: Path, *, validate: Callable[[Path], None] = _noop, create: bool = False
+) -> Any:
     return codeset_edit.upsert_code_set(
-        path.parent.parent, "diets", ["key", "value"], [["a", "b"]], validate=_noop
+        path.parent.parent,
+        "diets",
+        ["key", "value"],
+        [["a", "b"]],
+        validate=validate,
+        create=create,
     )
 
 
@@ -516,6 +533,391 @@ def _code_set(tmp_path: Path) -> Path:
     path.parent.mkdir()
     path.write_text("key,value\nx,y\n", encoding="utf-8")
     return path
+
+
+def _code_set_create(path: Path) -> Any:
+    return _codeset_upsert(path, create=True)
+
+
+def _code_set_list(path: Path) -> Any:
+    return codeset_edit.list_code_sets(path.parent.parent)
+
+
+def _code_set_show(path: Path) -> Any:
+    return codeset_edit.show_code_set(path.parent.parent, "diets")
+
+
+def _code_set_remove(path: Path) -> Any:
+    return codeset_edit.remove_code_set(path.parent.parent, "diets", validate=_noop)
+
+
+def _code_set_rename_onto(path: Path) -> Any:
+    # ``meals`` is the source, so the path under test is the rename's destination.
+    (path.parent / "meals.csv").write_text("key,value\nx,y\n", encoding="utf-8")
+    return codeset_edit.rename_code_set(path.parent.parent, "meals", "diets", validate=_noop)
+
+
+def _link(link: Path, target: Path) -> None:
+    link.parent.mkdir(exist_ok=True)
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        # An account without the Windows symlink privilege; a Linux runner always reaches the test.
+        pytest.skip(f"this account cannot create a link: {exc}")
+
+
+# Every gate that answers whether a config path is there, and its refusal type.
+GATES = pytest.mark.parametrize(
+    ("relative", "edit", "refused"),
+    [
+        ("messagefoundry.toml", _alerts_add, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", _alerts_remove, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", alerts_edit.list_rules, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", _security_set, security_edit.SecurityEditError),
+        ("messagefoundry.toml", security_edit.read_security, security_edit.SecurityEditError),
+        ("connections.toml", _connection_upsert, WiringError),
+        ("connections.toml", _connection_remove, WiringError),
+        ("connections.toml", _connection_list, WiringError),
+    ],
+    ids=[
+        "alerts-add",
+        "alerts-remove",
+        "alerts-list",
+        "security-set",
+        "security-read",
+        "connection-upsert",
+        "connection-remove",
+        "connection-list",
+    ],
+)
+
+# The code-set gates, each with a table of the path's name the editor would otherwise miss.
+CODE_SET_GATES = pytest.mark.parametrize(
+    ("name", "edit"),
+    [
+        ("diets.csv", _code_set_create),
+        ("diets.toml", _code_set_create),
+        ("diets.toml", _codeset_upsert),
+        ("diets.csv", _code_set_list),
+        ("diets.csv", _code_set_show),
+        ("diets.csv", _code_set_remove),
+        ("diets.toml", _code_set_rename_onto),
+    ],
+    ids=["create-csv", "create-toml", "edit-toml", "list", "show", "remove", "rename-onto"],
+)
+
+# A name no file can have, or nothing under a parent that is no directory. Each reads as absent,
+# as Path.is_file answered, because no file is there to lose. The classifier is
+# snapshot.is_missing_directory; real paths for what each platform answers are in a test below.
+NO_SUCH_FILE = pytest.mark.parametrize(
+    "make_failure",
+    [
+        lambda: NotADirectoryError(errno.ENOTDIR, "Not a directory"),
+        lambda: OSError(errno.ENAMETOOLONG, "File name too long"),
+        lambda: OSError(errno.EINVAL, "The filename is incorrect", None, 123),
+        lambda: OSError(errno.EINVAL, "The path is bad", None, 161),
+        lambda: OSError(errno.EINVAL, "The name is too long", None, 206),
+    ],
+    ids=["enotdir", "enametoolong", "winerror-123", "winerror-161", "winerror-206"],
+)
+
+# Nothing in these says the file is not there: a link cycle, the Windows cycle, and a disk fault.
+UNKNOWN = pytest.mark.parametrize(
+    "make_failure",
+    [
+        lambda: OSError(errno.ELOOP, "Too many levels of symbolic links"),
+        lambda: OSError(errno.EINVAL, "The name cannot be resolved", None, 1921),
+        lambda: OSError(errno.EIO, "Input/output error"),
+    ],
+    ids=["eloop", "winerror-1921", "eio"],
+)
+
+
+@NO_SUCH_FILE
+def test_a_name_no_file_can_have_reads_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
+) -> None:
+    path = _live(tmp_path)
+    _refuse_stat(monkeypatch, make_failure(), path.name)
+
+    assert not atomic_edit.is_file(path, refused_error=WiringError)
+    assert not atomic_edit.is_dir(path, refused_error=WiringError)
+
+
+@GATES
+def test_every_gate_lets_a_name_no_file_can_have_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
+) -> None:
+    # Only the stat answers here, so an edit goes on to create the file, where a raw OSError
+    # escaped the gate. A remove finds nothing to remove, which is its own refusal.
+    path = tmp_path / relative
+    _refuse_stat(monkeypatch, NotADirectoryError(errno.ENOTDIR, "Not a directory"), path.name)
+
+    try:
+        edit(path)
+    except refused as exc:
+        assert "could not be read" not in str(exc)
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        # Each path is real on both platforms: WinError 123 on Windows and a plain absence on POSIX
+        # for the first, ENOENT or ENOTDIR for the second, WinError 123 or ENAMETOOLONG for the third.
+        ("sub?", "messagefoundry.toml"),
+        ("a-file", "messagefoundry.toml"),
+        ("n" * 300,),
+        # A NUL raises ValueError from the stat on both, not OSError.
+        ("a\0b",),
+    ],
+    ids=["invalid-name", "file-as-parent", "too-long", "nul"],
+)
+@pytest.mark.parametrize(
+    ("listing", "empty"),
+    [(alerts_edit.list_rules, []), (security_edit.read_security, {})],
+    ids=["alerts", "security"],
+)
+def test_a_real_path_no_file_can_have_lists_as_absent(
+    tmp_path: Path, parts: tuple[str, ...], listing: Callable[[Path], Any], empty: Any
+) -> None:
+    (tmp_path / "a-file").write_bytes(b"")
+
+    assert listing(tmp_path.joinpath(*parts)) == empty
+
+
+def test_a_real_code_set_name_no_file_can_have_is_no_such_code_set(tmp_path: Path) -> None:
+    (tmp_path / "codesets").mkdir()
+
+    with pytest.raises(WiringError, match="no such code set"):
+        codeset_edit.show_code_set(tmp_path, "sub?")
+
+
+@NO_SUCH_FILE
+def test_a_code_set_path_no_file_can_have_reads_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
+) -> None:
+    path = _code_set(tmp_path)
+    _refuse_stat(monkeypatch, make_failure(), path.name)
+
+    with pytest.raises(WiringError, match="no such code set"):
+        _code_set_show(path)
+
+
+@NO_SUCH_FILE
+def test_a_codesets_folder_no_directory_can_have_lists_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
+) -> None:
+    _refuse_stat(monkeypatch, make_failure(), "codesets")
+
+    assert codeset_edit.list_code_sets(tmp_path) == []
+
+
+@UNKNOWN
+def test_a_stat_that_cannot_say_the_file_is_gone_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
+) -> None:
+    path = _live(tmp_path)
+    failure = make_failure()
+    _refuse_stat(monkeypatch, failure, path.name)
+
+    for gate in (atomic_edit.is_file, atomic_edit.is_dir):
+        with pytest.raises(WiringError, match="could not be read") as caught:
+            gate(path, refused_error=WiringError)
+
+        assert caught.value.__cause__ is failure
+
+
+@GATES
+def test_every_gate_refuses_a_stat_fault_and_leaves_the_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
+) -> None:
+    path = tmp_path / relative
+    before = b"x = 1\n"
+    path.write_bytes(before)
+    _refuse_stat(monkeypatch, OSError(errno.EIO, "Input/output error"), path.name)
+
+    with pytest.raises(refused, match="could not be read"):
+        edit(path)
+
+    assert path.read_bytes() == before
+
+
+def test_a_stat_fault_does_not_blame_another_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A permission is not the cause of a disk fault or a broken link, so the advice must not say so.
+    path = _live(tmp_path)
+    _refuse_stat(monkeypatch, OSError(errno.EIO, "Input/output error"), path.name)
+
+    with pytest.raises(WiringError) as caught:
+        connections_edit.list_connections(tmp_path)
+
+    assert "Another account" not in str(caught.value)
+    assert "EIO" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+
+
+@pytest.mark.parametrize("cycle", [False, True], ids=["dangling", "cycle"])
+@GATES
+def test_a_link_it_cannot_follow_is_refused_rather_than_replaced(
+    tmp_path: Path,
+    relative: str,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
+    cycle: bool,
+) -> None:
+    # As for a file linked to an unmounted share: the rest of its content is there, not here.
+    path = tmp_path / relative
+    _link(path, path if cycle else tmp_path / "unmounted" / relative)
+
+    with pytest.raises(refused, match="could not be read") as caught:
+        edit(path)
+
+    assert "link" in str(caught.value)
+    assert path.is_symlink()
+    assert not (tmp_path / "unmounted").exists()
+
+
+def test_a_link_to_a_real_file_reads_through_it(tmp_path: Path) -> None:
+    # The positive control: the refusals above are for a link that cannot be followed.
+    target = tmp_path / "elsewhere.toml"
+    target.write_bytes(CONNECTIONS_TOML.encode("utf-8"))
+    _link(tmp_path / "connections.toml", target)
+
+    assert [entry["name"] for entry in connections_edit.list_connections(tmp_path)] == ["OB_TOML"]
+
+
+def test_a_stat_failure_with_no_refusal_type_is_the_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same contract as refused_as, for a caller of replace_validated that names no type.
+    path = _live(tmp_path)
+    failure = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_stat(monkeypatch, failure, path.name)
+
+    with pytest.raises(PermissionError) as caught:
+        atomic_edit.is_file(path, refused_error=None)
+
+    assert caught.value is failure
+
+
+def test_is_dir_answers_for_a_directory_and_nothing_else(tmp_path: Path) -> None:
+    (tmp_path / "a-file").write_bytes(b"")
+
+    assert atomic_edit.is_dir(tmp_path, refused_error=WiringError)
+    assert not atomic_edit.is_dir(tmp_path / "a-file", refused_error=WiringError)
+    assert not atomic_edit.is_dir(tmp_path / "missing", refused_error=WiringError)
+    assert not atomic_edit.is_dir(tmp_path / "a-file" / "under", refused_error=WiringError)
+
+
+@CODE_SET_GATES
+def test_a_code_set_it_cannot_stat_is_refused_rather_than_read_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    edit: Callable[[Path], Any],
+) -> None:
+    # The create row is the one that matters most: read as absent, the unstattable table would
+    # pass the create-collision refusal and be overwritten.
+    path = tmp_path / "codesets" / name
+    path.parent.mkdir()
+    path.write_bytes(b"key,value\nx,y\n" if name.endswith(".csv") else b"x = 'y'\n")
+    before = path.read_bytes()
+    failure = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_stat(monkeypatch, failure, path.name)
+
+    with pytest.raises(WiringError, match="could not be read") as caught:
+        edit(path)
+
+    assert caught.value.__cause__ is failure
+    assert path.read_bytes() == before
+
+
+@CODE_SET_GATES
+def test_a_dangling_code_set_link_is_refused_rather_than_read_as_absent(
+    tmp_path: Path, name: str, edit: Callable[[Path], Any]
+) -> None:
+    # In the codesets folder, because a .csv link out of it fails _validate_name first.
+    path = tmp_path / "codesets" / name
+    _link(path, path.with_name("gone" + path.suffix))
+
+    with pytest.raises(WiringError, match="could not be read"):
+        edit(path)
+
+    assert path.is_symlink()
+
+
+def test_a_codesets_folder_it_cannot_stat_is_refused_rather_than_listed_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _code_set(tmp_path)
+    failure = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_stat(monkeypatch, failure, "codesets")
+
+    with pytest.raises(WiringError, match="could not be read") as caught:
+        codeset_edit.list_code_sets(tmp_path)
+
+    assert caught.value.__cause__ is failure
+
+
+def test_a_dangling_codesets_folder_is_refused_rather_than_listed_empty(tmp_path: Path) -> None:
+    _link(tmp_path / "codesets", tmp_path / "unmounted")
+
+    with pytest.raises(WiringError, match="could not be read"):
+        codeset_edit.list_code_sets(tmp_path)
+
+
+def test_a_codesets_folder_that_is_not_there_still_lists_empty(tmp_path: Path) -> None:
+    assert codeset_edit.list_code_sets(tmp_path) == []
+
+
+def test_a_listing_is_not_refused_over_a_file_it_never_reads(tmp_path: Path) -> None:
+    # The positive control for the listing's gate: it must look at code sets only.
+    path = _code_set(tmp_path)
+    _link(path.with_name("notes.txt"), path.with_name("gone.txt"))
+
+    assert [entry["name"] for entry in codeset_edit.list_code_sets(tmp_path)] == ["diets"]
+
+
+def test_a_policy_sidecar_it_cannot_stat_is_never_left_out_of_the_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Left out, the candidate would validate with no policy and the edit would land on that proof.
+    path = _code_set(tmp_path)
+    before = path.read_bytes()
+    (path.parent / "diets.policy.toml").write_text("", encoding="utf-8")
+    failure = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_stat(monkeypatch, failure, "diets.policy.toml")
+    ran: list[Path] = []
+
+    with pytest.raises(WiringError, match=r"diets\.policy\.toml could not be read") as caught:
+        _codeset_upsert(path, validate=ran.append)
+
+    assert caught.value.__cause__ is failure
+    assert ran == []
+    assert path.read_bytes() == before
+    assert _leftovers(path.parent) == []
+
+
+def test_a_dangling_policy_sidecar_is_never_left_out_of_the_candidate(tmp_path: Path) -> None:
+    path = _code_set(tmp_path)
+    before = path.read_bytes()
+    _link(path.with_name("diets.policy.toml"), tmp_path / "unmounted.toml")
+    ran: list[Path] = []
+
+    with pytest.raises(WiringError, match=r"diets\.policy\.toml could not be read"):
+        _codeset_upsert(path, validate=ran.append)
+
+    assert ran == []
+    assert path.read_bytes() == before
 
 
 def test_a_code_set_rename_it_is_refused_is_a_wiring_error(
