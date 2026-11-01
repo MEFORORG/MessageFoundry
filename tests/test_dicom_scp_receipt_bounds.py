@@ -365,6 +365,10 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
                 await _until(lambda: len(_threads_outside_the_test()) <= baseline)
         finally:
             sock.close()
+    # The capture saw the SCP's own line for this end, so the two empty lists below are read from a
+    # capture that works, not from one that caught nothing.
+    assert caplog.records
+    assert any("ended an association" in r.getMessage() for r in caplog.records), caplog.text
     tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
     assert tracebacks == [], [r.getMessage() for r in tracebacks]
     unthrottled = [

@@ -526,11 +526,13 @@ async def test_a_stray_byte_behind_a_request_does_not_delay_the_association_chec
                 held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
 
             def only_the_two_accepted_are_left() -> bool:
-                return len(scp._server.active_associations) <= 2
+                # Both halves are awaited, not read once: the last peers' own connection threads
+                # can still be running, about to answer or just after it, when the association
+                # count first reads two. Measured: a lone process_request_thread as a fifth thread.
+                added = len(_threads_outside_the_test()) - baseline
+                return len(scp._server.active_associations) <= 2 and added <= 4
 
             await _until(only_the_two_accepted_are_left)  # well inside the 30 s deadline
-            added = len(_threads_outside_the_test()) - baseline
-            assert added <= 4, f"{added} threads for two associations"
             rejected = [await asyncio.to_thread(_closed_within, sock, 0.2) for sock in held]
             assert rejected.count(True) >= 38, "a peer over max_associations was not closed at once"
         finally:
@@ -555,13 +557,27 @@ def _c_echo_rq(message_id: int) -> bytes:
     return b"\x04\x00" + struct.pack(">I", len(item)) + item
 
 
-async def test_a_peer_that_never_reads_cannot_block_the_association_for_good() -> None:
+async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The DUL sends on its own thread, so a blocked send stops it reaching anything else. Review of
     # this row's second build measured it still blocked 12 s on at timeout_seconds 1, and alive
     # after stop().
     request = await asyncio.to_thread(_a_real_association_request)
     settings: dict[str, object] = {"max_associations": 2, "timeout_seconds": 1.0}
     async with _running_scp(settings) as scp:
+        # The SCP's own send buffer is made small too. On Linux loopback it grows to megabytes, and
+        # the SCP answers each C-ECHO slower than the peer sends them, so with the stock buffer the
+        # SCP could go on answering for longer than this test waits without a send ever blocking:
+        # measured as a red on ubuntu-latest, where the association outlived the 15 s wait below.
+        accept = scp._server.get_request
+
+        def accept_with_a_small_send_buffer() -> tuple[socket.socket, Any]:
+            conn, address = accept()
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            return conn, address
+
+        monkeypatch.setattr(scp._server, "get_request", accept_with_a_small_send_buffer)
         baseline = await _thread_baseline()
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -579,9 +595,13 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good() -
                     while pending:
                         pending = pending[sock.send(pending[:65536]) :]
 
-            await asyncio.to_thread(flood)
-            await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=15.0)
+            with caplog.at_level(logging.WARNING, logger=_LOG):
+                await asyncio.to_thread(flood)
+                await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=15.0)
             assert scp._server.active_associations == []
+            # The send's own deadline ended it, not an idle timer after every request was served.
+            ended = [m for m in _warnings(caplog) if "a send did not finish within 1s" in m]
+            assert ended, _warnings(caplog)
         finally:
             sock.close()
 
