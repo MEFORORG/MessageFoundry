@@ -14,9 +14,15 @@ module can rebind ``__name__``, so the name alone is a claim. A config directory
 package, and its modules and helpers run as ``mefor_config_*``, so the file alone is not enough. The
 file name is fixed when code is compiled, so a module that compiles text under an engine path, and
 sets the name to match, still passes. This tells most accidents from engine wording: it does not
-stop code that sets out to forge a frame, and it does not read a module that raises its own
-exception under a refusal's traceback, with ``with_traceback``, which keeps the engine's frame
-innermost and is an ordinary idiom rather than a forgery.
+stop code that sets out to forge a frame.
+
+The innermost frame says where a traceback ends, not who raised what is on it. ``raise
+X(text).with_traceback(exc.__traceback__)``, an ordinary idiom rather than a forgery, keeps the
+engine's frame innermost. So the loader also reads where the raise happened:
+:func:`raised_again_outside_the_engine`. That cannot tell the idiom from a module's ``raise exc`` of
+the refusal it caught, so that is withheld too, which is the cheaper failure. The other two callers
+keep the frame rule alone, because a library raising an engine exception again, as
+``concurrent.futures`` does, must not cost them an engine refusal's text.
 
 A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
 ``__class__``, which leaves the engine's frame on it and prints through that class's ``__str__``, so
@@ -32,7 +38,12 @@ from collections.abc import Iterator
 from types import TracebackType
 from typing import Any, Final
 
-__all__ = ["exception_chain", "raised_by_the_engine", "worded_by_the_engine"]
+__all__ = [
+    "exception_chain",
+    "raised_again_outside_the_engine",
+    "raised_by_the_engine",
+    "worded_by_the_engine",
+]
 
 _RAISE_STATEMENT: Final = opcode.opmap["RAISE_VARARGS"]
 
@@ -66,19 +77,42 @@ def exception_chain(exc: BaseException) -> Iterator[BaseException]:
         todo += [i for i in inner if isinstance(i, BaseException)]
 
 
+def _in_the_engine(tb: TracebackType) -> bool:
+    """Whether this traceback entry's frame is a ``messagefoundry`` module and not a vendored one."""
+    file = tb.tb_frame.f_code.co_filename
+    if not file.startswith(_ENGINE_DIR) or file.startswith(_VENDORED_DIR):
+        return False
+    module = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+
+
+def _stopped_on_a_raise(tb: TracebackType) -> bool:
+    return tb.tb_frame.f_code.co_code[tb.tb_lasti] == _RAISE_STATEMENT
+
+
 def _engine_frame(exc: BaseException) -> TracebackType | None:
-    """The innermost entry of ``exc``'s traceback when it is in a ``messagefoundry`` module and not
-    a vendored one. An exception that was never raised has no traceback, so it has no such entry."""
+    """The innermost entry of ``exc``'s traceback when it is in the engine. An exception that was
+    never raised has no traceback, so it has no such entry."""
     tb: TracebackType | None = _TRACEBACK_OF.__get__(exc)
     if tb is None:
         return None
     while tb.tb_next is not None:
         tb = tb.tb_next
-    file = tb.tb_frame.f_code.co_filename
-    if not file.startswith(_ENGINE_DIR) or file.startswith(_VENDORED_DIR):
-        return None
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return tb if isinstance(module, str) and module.split(".")[0] == "messagefoundry" else None
+    return tb if _in_the_engine(tb) else None
+
+
+def raised_again_outside_the_engine(exc: BaseException) -> bool:
+    """Whether code outside the engine raised ``exc`` onto a traceback it already had.
+
+    Every traceback entry but the innermost normally stopped on a call. A bare ``raise`` adds no
+    entry, so one that stopped on a ``raise`` is ``raise exc`` or ``raise X().with_traceback(tb)``,
+    whose instance need not be the one the frames below it raised."""
+    tb: TracebackType | None = _TRACEBACK_OF.__get__(exc)
+    while tb is not None and tb.tb_next is not None:
+        if _stopped_on_a_raise(tb) and not _in_the_engine(tb):
+            return True
+        tb = tb.tb_next
+    return False
 
 
 def raised_by_the_engine(exc: BaseException) -> bool:
@@ -94,8 +128,9 @@ def worded_by_the_engine(exc: BaseException) -> bool:
     wrote its text.
 
     It reads the instruction the innermost frame stopped on, because a builtin called from engine
-    code leaves the same frame with a call there instead. It proves who wrote the text, not what the
-    text holds: a ``raise`` can interpolate a value or another exception's text. Nor does it prove
-    what prints: the module docstring says why."""
+    code leaves the same frame with a call there instead. It also reads where the raise happened,
+    by :func:`raised_again_outside_the_engine`. It proves who wrote the text, not what the text
+    holds: a ``raise`` can interpolate a value or another exception's text. Nor does it prove what
+    prints: the module docstring says why."""
     tb = _engine_frame(exc)
-    return tb is not None and tb.tb_frame.f_code.co_code[tb.tb_lasti] == _RAISE_STATEMENT
+    return tb is not None and _stopped_on_a_raise(tb) and not raised_again_outside_the_engine(exc)

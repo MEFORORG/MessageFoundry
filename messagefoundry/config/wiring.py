@@ -105,6 +105,7 @@ from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.exception_origin import (
     exception_chain,
+    raised_again_outside_the_engine,
     raised_by_the_engine,
     worded_by_the_engine,
 )
@@ -9490,17 +9491,14 @@ def _read_fault(path: Path, fault: BaseException) -> None:
     """Act on ``fault``, which reading a failed module's exception raised.
 
     Called after the ``except`` that caught it, so neither ``fault`` nor the module's exception is
-    chained to what this raises, though the frames on its traceback still hold them. A read runs the module's code, so a real Ctrl-C can land in it: that
-    stops the load as a new, bare interrupt, by the rule :func:`_run_author_code` gives. An exact
-    ``SystemExit`` leaves as a new one with its code, which the loader does not handle, except on a
-    worker, where it would stop the event loop as an interrupt would. Exact, because a subclass can
-    also be an ``Exception``, which a module's own raise of it is refused as. Anything else is
-    absorbed, and logged: the file and the fault's type, never its text, which is the module's, so
-    ``exc_info`` stays off too."""
+    chained to what this raises, though the frames on its traceback still hold them. A read runs
+    the module's code, so a real Ctrl-C can land in it: that stops the load as a new, bare interrupt,
+    by the rule :func:`_run_author_code` gives. Anything else is absorbed, ``SystemExit`` included
+    on every thread: the module has failed, and ``SystemExit(0)`` leaving here would end ``validate``
+    or ``check`` with exit 0 and no output. It is logged: the file and the fault's type, never its
+    text, which is the module's, so ``exc_info`` stays off too."""
     if _is_a_signal(fault):
         raise KeyboardInterrupt
-    if type(fault) is SystemExit and _on_the_main_thread():
-        raise SystemExit(fault.code)
     _logger.warning(
         "config module %s: reading its failure raised %s, so the diagnostic is reduced",
         safe_name(path.name),
@@ -9686,7 +9684,11 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
         return True
     # The exact class: only the runtime's own has fixed text, and a subclass can write its own. By
     # identity, because ``in`` would run a metaclass's ``__eq__``.
-    return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_by_the_engine(exc)
+    return (
+        any(type(exc) is limit for limit in _RUNTIME_LIMITS)
+        and raised_by_the_engine(exc)
+        and not raised_again_outside_the_engine(exc)
+    )
 
 
 def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
@@ -9725,6 +9727,15 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
     return f"error loading config module {path.name}: {text}"
 
 
+def _drop_tracebacks(exc: BaseException) -> None:
+    """Clear the traceback of ``exc``, an engine refusal that leaves the load, and of everything it
+    wraps. Its frames hold the config module's globals, and nothing reads them: only the withheld
+    diagnostic reads a traceback. By the builtin method, because a module's class or instance can
+    define its own."""
+    for link in exception_chain(exc):
+        BaseException.with_traceback(link, None)
+
+
 def _refusal_for(
     path: Path, exc: Exception, source_of: Callable[[str], bytes | None]
 ) -> tuple[WiringError, BaseException | None] | None:
@@ -9755,12 +9766,16 @@ def _refusal_for(
             text = _rewritten_refusal(path, exc)
             if text is None:
                 # The real type: ``__class__`` can answer WiringError, and a ``raise`` of that would
-                # leave ``validate_config``, which catches only the real one.
-                if type(exc) is WiringError:
+                # leave ``validate_config``, which catches only the real one. Only text: a caller
+                # reads ``str()``, past this guard, and that runs an object in ``args``.
+                if type(exc) is WiringError and all(type(arg) is str for arg in exc.args):
+                    _drop_tracebacks(exc)
                     return None
                 if not issubclass(type(exc), WiringError):
                     # ``!s``, or the f-string would run a ``__format__`` of the class's own.
-                    return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
+                    rebuilt = WiringError(f"error loading config module {path.name}: {exc!s}")
+                    _drop_tracebacks(exc)
+                    return rebuilt, exc
                 text = str(exc)
             imported = exc.__cause__
         else:

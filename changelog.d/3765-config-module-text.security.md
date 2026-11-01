@@ -17,20 +17,28 @@
   subject and an issuer that is not a DN no longer quote the value. A call with an unexpected or
   repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
   that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
-  refused as a failed module, with no text, with two exceptions. `SystemExit` is unchanged, on any
-  thread, and still leaves with its text and whatever it was raised from. On the main thread, an exact `KeyboardInterrupt` stops the load as a
-  new, bare `KeyboardInterrupt` that carries none of the original's arguments, notes or chain; on
-  any other thread, where no signal can arrive, it is refused like the rest. The loader's read of a
-  failed module's exception runs the module's code, so a real Ctrl-C can land in it. On the main
-  thread an interrupt there stops the load the same way, and an exact `SystemExit` there leaves as a
-  new one with the same code, neither with an exception chained to it. Any other fault in that read,
-  and either of those off the main thread, is absorbed, and that module is refused. An exception's
-  text counts as engine wording only when its frame is in the package's own files, so a module that
-  sets `__name__` to look like the engine is withheld, and so is vendored code. At least these are
-  not caught: a module that catches a refusal and rewrites its `args`, with text or with an object
-  whose own `__str__` returns a value; one that raises its own exception under a refusal's traceback
-  with `with_traceback`, an ordinary idiom, which is kept as engine wording; one that changes a
-  refusal's class while the loader reads it, or patches `WiringError` itself; one that builds a
-  class whose name holds a value; one that compiles code under an engine file name to forge a frame;
-  a `SystemExit` raised while the loader reads a helper left to its `ImportError` guard, which
-  leaves as raised; and the frames on a stop's traceback, which still hold the withheld exception.
+  refused as a failed module, with no text, with two exceptions. A `SystemExit` the module raises
+  directly is unchanged here, on any thread, and still leaves with its text and whatever it was
+  raised from. On the main thread, an exact `KeyboardInterrupt` stops the load as a new, bare
+  `KeyboardInterrupt` that carries none of the original's arguments, notes or chain; on any other
+  thread, where no signal can arrive, it is refused like the rest. The loader's read of a failed
+  module's exception runs the module's code, so a real Ctrl-C can land in it. On the main thread an
+  interrupt there stops the load the same way, with no exception chained to it. Any other fault in
+  that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
+  included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
+  no output on a module that failed. An exact `WiringError` also stands only while its arguments
+  are text, because a caller's `str()` of an object there would run the module's code past that
+  guard. A refusal that stands, and the exception kept as the cause of a rebuilt one, leave with
+  no traceback, so their frames do not keep the module's globals. An exception's text counts as
+  engine wording only when its frame is in the package's own files, so a module that sets
+  `__name__` to look like the engine is withheld, and so is vendored code. It also counts only when
+  code outside the engine did not raise it onto an existing traceback, so
+  `raise X(text).with_traceback(exc.__traceback__)` in a module is withheld, and so, at a small
+  cost to the author, is `raise exc` of a refusal the module caught, which the traceback cannot
+  tell from it; a bare `raise` keeps the text. At least these are not caught: a module that catches
+  a refusal and rewrites its `args`, with text or with an object whose own `__str__` returns a
+  value; one that changes a refusal's class while the loader reads it, or patches `WiringError`
+  itself; one that builds a class whose name holds a value; one that compiles code under an engine
+  file name to forge a frame; a `SystemExit` raised while the loader reads a helper left to its
+  `ImportError` guard, which leaves as raised; and the frames on an interrupt's traceback, which
+  still hold the withheld exception.
