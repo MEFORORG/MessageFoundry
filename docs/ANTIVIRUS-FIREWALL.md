@@ -137,7 +137,7 @@ Listener ports are **per-connection** — the admin assigns them in config; ther
 
 ### Outbound (the engine *connects out*)
 
-Outbound destinations are gated **at the application layer** by the `[egress]` allowlists — `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`, and `allowed_remote`. **Every outbound firewall rule you open should be mirrored by the matching `[egress]` allowlist entry** (and vice-versa), so the two layers agree on exactly which partners are reachable.
+Outbound destinations are gated **at the application layer** by the `[egress]` allowlists, at least the ones the *App-layer gate* column below names. [CONFIGURATION.md](CONFIGURATION.md#egress) says what each list gates. **Every outbound firewall rule you open for one of those flows should be mirrored by the matching allowlist entry** (and vice-versa, apart from the exceptions the rows below note), so the two layers agree on which partners are reachable.
 
 | Outbound flow | Port | App-layer gate | Notes |
 |---|---|---|---|
@@ -146,8 +146,12 @@ Outbound destinations are gated **at the application layer** by the `[egress]` a
 | **X12 raw-TCP outbound** | Per-connection (partner host:port) | `[egress].allowed_tcp` | ISA/IEA-framed sender. |
 | **DICOM SCU / C-ECHO** (outbound DIMSE) | Per-connection (partner host:port; conventionally 104) | `[egress].allowed_tcp` | `[dicom]` extra. |
 | **DICOMweb (STOW-RS) / REST / SOAP / FHIR / SMART** | HTTPS **443** (host:port from each URL) | `[egress].allowed_http` | HTTPS to each service base URL. **FHIR** is a distinct REST-sibling destination; **SMART** Backend Services adds a token endpoint (often a *different* host) — open both. |
-| **REMOTEFILE** (SFTP / FTP / FTPS) | **SFTP TCP 22** (default), **FTP TCP 21** (default), **FTPS = explicit TLS over the FTP control port (21 by default; `PROT P` encrypts the data channel)** | `[egress]` + per-connection host:port | Behind the `[sftp]` extra (paramiko, for SFTP). **Also an inbound *polling source* — but it has no listener; it dials *out* to poll**, so it needs only **outbound** openings to each configured remote file server. |
+| **REMOTEFILE** (SFTP / FTP / FTPS) | **SFTP TCP 22** (default), **FTP TCP 21** (default), **FTPS = explicit TLS over the FTP control port (21 by default; `PROT P` encrypts the data channel)** | `[egress].allowed_remote` | Behind the `[sftp]` extra (paramiko, for SFTP). **Also an inbound *polling source* — but it has no listener; it dials *out* to poll**, so it needs only **outbound** openings to each configured remote file server. |
 | **DATABASE connector** (partner DB poll/write) | TCP **1433** (partner SQL Server, `aioodbc`, `[sqlserver]` extra) | `[egress].allowed_db` | **Distinct from the message-store backend.** `DatabaseSource` polls a partner table (leader-gated, no listener — it dials out); `DatabaseDestination` writes to it. Open a *separate* rule from any store-backend rule below. |
+| **Email** (SMTP relay, `Email()` outbound) | Per-connection (relay host:port; 587 by default) | `[egress].allowed_smtp` | Open to the relay only. `[egress].allowed_recipient_domains` bounds the recipient and sender domains and needs no firewall rule of its own. The alert notifier's SMTP dial is separate: `[alerts].smtp_allowed_hosts` gates it, not `allowed_smtp`. |
+| **Direct** (S/MIME over SMTP, `Direct()` outbound) | Per-connection (HISP relay host:port; 587 by default) | `[egress].allowed_direct` | Separate from `allowed_smtp`: an entry on one list does not permit the other connector. |
+| **Forward proxy** *(only if the engine's traffic goes through one)* | Port from the proxy address | `[egress].allowed_proxy` | Open to the proxy host. A destination sent through the proxy stays on `[egress].allowed_http` but needs no firewall rule of its own; one that goes direct does. `allowed_proxy` gates a proxy that `proxy_url` names. It does not gate `proxy_url = "default"`, or a proxy the engine takes from `HTTP_PROXY`, `HTTPS_PROXY` or the operating system's settings, so those have no entry to mirror. |
+| **Syslog / SIEM forwarder** *(only if you set `[logging].forward_host`)* | `[logging].forward_port` (**514** by default, whatever the protocol), over `forward_protocol` (`udp` by default, or `tcp` or `tls`) | `[egress].allowed_syslog` | Use `-Protocol UDP` for `udp`, and `-Protocol TCP` for `tcp` and `tls`. |
 | **AD / LDAP outbound** *(only if you use AD auth)* | **636** for `ldaps://`. A plain `ldap://` bind on **389** is refused at every posture (vault BACKLOG #3533) | — | Port comes from the `ad_server` URL (e.g. `ldaps://dc1.example.com:636`); it is **not** hard-coded. **Kerberos (88) is *not* an engine outbound** — the engine validates a SPNEGO ticket the *client* already obtained from the KDC (server-side validation), so do **not** open outbound 88 from the engine box. |
 | **Message-store backend** *(only if you use a remote store)* — SQL Server **1433** / PostgreSQL **5432** | 1433 / 5432 | — | Open only if the **store** itself is a remote SQL Server / Postgres rather than the default local SQLite. |
 | **NSSM download** — `nssm.cc`, then `web.archive.org` if `nssm.cc` fails (HTTPS 443) | 443 | — | **🔧 INSTALL-TIME ONLY.** One-time download of the wrapper; close after install. The installer checks either copy against its SHA-256 pin. |
@@ -194,7 +198,7 @@ New-NetFirewallRule `
 Separate the **one-time install** from **steady-state operation**:
 
 - **Install-time only (close afterward):** outbound HTTPS 443 to **`nssm.cc`** (NSSM download, with **`web.archive.org`** as its fallback) and to **PyPI** (`pypi.org` / `files.pythonhosted.org`) for package install. These are the only install-time openings, for two purposes, and are marked 🔧 in the outbound table.
-- **Steady state:** the per-connection inbound listeners, the per-partner outbound connections, and (if configured) AD/LDAPS and a remote store backend. No PyPI, `nssm.cc` or `web.archive.org` access is required once installed.
+- **Steady state:** the per-connection inbound listeners, the per-partner outbound connections, and at least the flows the outbound table marks *only if*. No PyPI, `nssm.cc` or `web.archive.org` access is required once installed.
 
 ---
 
@@ -207,7 +211,7 @@ After applying exclusions and firewall rules:
 - [ ] **MLLP round-trip** — send a synthetic test message to a configured inbound port and confirm an `AA` ACK and a `PROCESSED` disposition.
 - [ ] **DB sidecars intact** — `messagefoundry.db`, `messagefoundry.db-wal`, and `messagefoundry.db-shm` all present and untouched; no `-journal` file (expected — WAL mode).
 - [ ] **Clean quarantine log** — AV/EDR quarantine history shows **no** MessageFoundry DB, sidecar, key/cert, or interpreter detections.
-- [ ] **Outbound reaches partners** — a test delivery to each configured downstream succeeds, and each is covered by both a firewall rule **and** the matching `[egress]` allowlist entry.
+- [ ] **Outbound reaches partners** — a test delivery to each configured downstream succeeds, and each is covered by the firewall rule **and** the `[egress]` allowlist entry its row in the outbound table calls for.
 
 ---
 

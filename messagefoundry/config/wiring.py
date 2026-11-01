@@ -6605,10 +6605,12 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
       generic connection is reported as static, because that is what the DSN does with it.
 
     **One residual, written down rather than implied:** a generic hop that sets no top-level
-    ``username``/``password`` is NOT reported, even though its ``odbc_params`` may carry a credential
-    under an arbitrary driver keyword. The engine cannot enumerate an arbitrary driver's keywords —
-    the same limit :func:`unverified_generic_db_hops` records for TLS — so classifying that case would
-    be guessing, and a reader that guessed would put a wrong name in a security report.
+    ``username``/``password`` is NOT reported. ``odbc_params`` takes a fixed keyword list
+    (:data:`~messagefoundry.transports.database._ODBC_PARAM_ALLOWLIST`), and the only credential that
+    list can carry is a client certificate: ``sslcert`` and ``sslkey``, with ``sslpassword`` for the
+    key's passphrase. Such a hop may sign in with that certificate, on a driver that reads those
+    keywords, or as the service's own account, and this reader classifies neither (docs/CONNECTIONS.md,
+    *Static database credentials*).
 
     Pure — it reads the loaded graph and touches nothing else."""
 

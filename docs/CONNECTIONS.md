@@ -2053,7 +2053,7 @@ opt-out. That is expected, and the table says which they are.
 | `Sftp(...)` | `<name>` or `inbound:<name>` | yes: SSH private key |
 | `Ftp(...)` | `<name>` or `inbound:<name>` | **no** |
 | `File(...)` alternate-share credential | `<name>` or `inbound:<name>` | **no** (drop it to run as the service identity) |
-| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` |
+| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` on the SQL Server preset; on `dialect="generic"`, a client certificate, on a driver that reads those keywords |
 | `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
 | Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
 | `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
