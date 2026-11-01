@@ -238,6 +238,8 @@ async def test_verified_seed_but_empty_store_aborts(tmp_path: Path) -> None:
             await coord.activate(actor="bob")
         assert exc.value.kind == "seed"
         assert "never restored" in str(exc.value)
+        # BACKLOG #2614: a seed past restore's age limit needs the flag, so the command names it.
+        assert "add --allow-old-archive for a seed taken more than 7 days ago" in str(exc.value)
         assert not coord.active and not state["active"]
         actions = await _actions(dr_store)
         assert "dr_activation_aborted" in actions
@@ -334,6 +336,7 @@ async def test_config_only_seed_on_sqlite_aborts(tmp_path: Path) -> None:
             await coord.activate(actor="bob")
         assert exc.value.kind == "seed"
         assert "NO store row counts" in str(exc.value)
+        assert "--allow-old-archive" in str(exc.value)  # BACKLOG #2614
         assert not coord.active and not state["active"]
         # Exactly ONE refusal, and it is this gate's: the reason names the missing store counts, not
         # the zero-message wording the count compare would have produced had it been reached.

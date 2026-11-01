@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Protocol
 
@@ -29,6 +30,7 @@ __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
+    "STORE_RESTORED_SUBJECT",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -38,6 +40,8 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "store_restored_detail",
+    "utc_or_unknown",
 ]
 
 log = logging.getLogger(__name__)
@@ -204,6 +208,47 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
         f"{cause} Until then every message on this inbound fails at routing or transform: "
         'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
         '"stop". A WARNING line in the engine log names what differs.'
+    )
+
+
+#: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
+#: named this: the name grammar has no colon.
+STORE_RESTORED_SUBJECT = "store:restored"
+
+
+def utc_or_unknown(ts: float | None) -> str:
+    """``ts`` as ISO 8601 UTC to the second, or ``unknown`` for ``None`` or a value the platform
+    cannot render (an archive's time is not always authenticated, BACKLOG #2614)."""
+    if ts is None:
+        return "unknown"
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return "unknown"
+
+
+def store_restored_detail(
+    *,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    restored_at: float,
+    revoked: int,
+) -> str:
+    """The one-line description of a ``store_restored`` alert both sinks show (BACKLOG #2614).
+    A time in UTC, an age in days and a count: nothing read from a row's content.
+
+    The alert instance's reason column keeps only about the first 200 characters, and the store's
+    redaction turns the time in it into ``[redacted]``. So the age and the count lead, and the
+    line names the ``store_restored`` audit row, which carries the time whole."""
+    age = (
+        "of unknown age"
+        if archive_created_at is None
+        else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
+    )
+    return (
+        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
+        "Re-apply every disable, delete, role change and reset made after its newest audit row "
+        f"({utc_or_unknown(last_audit_at)}; also in the store_restored audit row)."
     )
 
 
@@ -954,6 +999,23 @@ class AlertSink(Protocol):
         Nothing resolves it automatically; an operator resolves the instance after the reload."""
         ...
 
+    # --- BACKLOG #2614: the first start after a restore -----------------------------------------
+
+    def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
+        """The engine started on a store that ``messagefoundry restore`` placed, and recorded it:
+        every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614). The
+        restored accounts, password hashes, roles and factors are the archive's, so every
+        disable, delete, role change and reset made after its newest audit row is undone until
+        an operator applies it again.
+
+        ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
+        :func:`store_restored_detail`: a time, an age and a count, no PHI. ``last_audit_at`` is
+        that time on its own, as ISO 8601 UTC or ``unknown``, because the store's redaction turns
+        a date in the alert instance's reason column into ``[redacted]``; the event carries it
+        whole. Raised once per restore, by the start that consumed the marker. Nothing resolves
+        it automatically."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -1442,6 +1504,9 @@ class LoggingAlertSink:
             name,
             remote_debug_refused_detail(count=count, total=total),
         )
+
+    def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
+        log.warning("ALERT store_restored: %r %s", name, detail)
 
     def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
         log.warning(
