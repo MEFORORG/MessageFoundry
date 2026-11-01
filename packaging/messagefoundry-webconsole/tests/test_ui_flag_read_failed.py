@@ -221,6 +221,8 @@ def test_the_page_says_why_the_flags_are_missing() -> None:
     answers."""
     failed = str(connection_pages.connections_fragment([_row(flagged=None)]))
     assert connection_pages.FLAGS_UNREAD_NOTICE in failed
+    # A failed read leaves select-all with no row to take, so its one click clears (BACKLOG #2623).
+    assert "one click on select-all clears the whole selection" in failed
     answered = str(connection_pages.connections_fragment([_row(flagged=False)]))
     assert connection_pages.FLAGS_UNREAD_NOTICE not in answered
     assert connection_pages.FLAGS_UNREAD_NOTICE not in str(

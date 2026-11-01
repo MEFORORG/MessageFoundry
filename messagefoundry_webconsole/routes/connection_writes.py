@@ -198,8 +198,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # not flag_rejected's. By type: any other 503 is re-raised below (BACKLOG #3811).
             return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
         except HTTPException as exc:
-            # The running graph has no such connection.
             if exc.status_code == 409:
+                # The running graph has no such connection.
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)

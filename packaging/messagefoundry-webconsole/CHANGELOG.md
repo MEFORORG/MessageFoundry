@@ -179,8 +179,9 @@ this line.**
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. No other 503 reaches it today, so nothing an operator sees changes; a 503
-  a later handler change adds is no longer named as the store's refusal. The console now catches the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine
-  seam that carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+  a later handler change adds is no longer named as the store's refusal. The console now catches
+  the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
+  carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

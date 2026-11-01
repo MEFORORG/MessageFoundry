@@ -212,10 +212,10 @@ def _flag_cell(r: ConnectionRow) -> Markup:
 #: every marker and toggle gone and Flagged only showing rows that may not be flagged, with no reason.
 FLAGS_UNREAD_NOTICE = (
     "The connection flags could not be read, so no row shows a flag or offers the toggle. Flagged "
-    "only shows every connection, and while Flagged only is ticked select-all takes none of them "
-    "and a click on it clears any row you ticked by hand. This clears when the read recovers. If "
-    "it does not, see the engine log: a stored flag row that cannot be decoded stops every read "
-    "until it is deleted from the database by hand."
+    "only shows every connection, and while Flagged only is ticked select-all takes none of them, "
+    "and one click on select-all clears the whole selection, hidden rows included. This clears "
+    "when the read recovers. If it does not, see the engine log: a stored flag row that cannot be "
+    "decoded stops every read until it is deleted from the database by hand."
 )
 
 
