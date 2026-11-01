@@ -8,6 +8,7 @@ import {
   preflightOutcome,
   promoteOutcomeMessage,
   reloadConfig,
+  type PromoteMessage,
   type ReloadResult,
 } from "../../promoteOutcome";
 
@@ -36,7 +37,10 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     handlers: 4,
     running: true,
     dry_run: false,
+    restart_required: [],
   };
+  // The swap's report for `live`, which follows "promoted" on every outcome of a live swap.
+  const graph = "to PROD — live graph: 2 inbound, 3 outbound, 1 routers, 4 handlers, running.";
 
   setup(async () => {
     replyStatus = 200;
@@ -80,29 +84,109 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.ok(!/live graph/.test(msg.text), msg.text);
   });
 
-  test("control: a 200 result still reports success with the live graph counts", async () => {
+  test("control: a 200 result with an empty restart_required reports plain success", async () => {
     replyStatus = 200;
     replyBody = live;
     const msg = promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
     assert.deepStrictEqual(sent, { config_dir: null, dry_run: false });
     assert.strictEqual(msg.level, "info");
+    assert.strictEqual(msg.text, `MessageFoundry: promoted ${graph}`);
+  });
+
+  const promoteReplying = async (restart: unknown): Promise<PromoteMessage> => {
+    replyBody = { ...live, restart_required: restart };
+    return promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
+  };
+
+  // The anchors the engine can report: the ones whose consumer loaded its bytes at start.
+  test("a changed trust anchor is a WARNING that leads with the restart and still reports the swap", async () => {
+    const msg = await promoteReplying([
+      "[auth].oidc_tls_ca_cert_file",
+      "[auth].ad_tls_ca_cert_file",
+      "[api].tls_client_ca_file",
+    ]);
+    assert.strictEqual(msg.level, "warning");
     assert.strictEqual(
       msg.text,
-      "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers, running.",
+      "MessageFoundry: restart the engine for [auth].oidc_tls_ca_cert_file, " +
+        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file: this reload checked each changed " +
+        `CA file but does not load it, so the engine still trusts the old CA. Promoted ${graph} ` +
+        'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
+        "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
+        '"What a reload\'s restart_required list covers".',
     );
   });
 
+  for (const [name, names] of [
+    [
+      "the settings anchor names, as a check of the name shape",
+      [
+        "[auth].oidc_tls_ca_cert_file",
+        "[auth].ad_tls_ca_cert_file",
+        "[api].tls_client_ca_file",
+        "[tls].internal_ca_file",
+        "[alerts].email_tls_ca_file",
+        "[logging].forward_tls_ca_file",
+        "[store].ssl_root_cert",
+      ],
+    ],
+    ["a 64-character key", [`[auth].${"k".repeat(64)}`]],
+    ["a 64-character section", [`[${"s".repeat(64)}].x`]],
+  ] as const) {
+    test(`a restart_required of ${name} is printed`, async () => {
+      const msg = await promoteReplying(names);
+      assert.strictEqual(msg.level, "warning");
+      assert.ok(
+        msg.text.startsWith(`MessageFoundry: restart the engine for ${names.join(", ")}: `),
+        msg.text,
+      );
+    });
+  }
+
+  for (const [name, restart] of [
+    // The engine sends a list on every apply; null is a dry run's value, and undefined drops the
+    // key from the reply. On an apply, either says the anchors went unchecked, not that none did.
+    ["null", null],
+    ["no value at all", undefined],
+    ["a bare string", "[auth].ad_tls_ca_cert_file"],
+    ["a list holding a non-string", [1]],
+    ["a list holding an empty name", [""]],
+    ["a list holding a link", ["[Finish](command:workbench.action.reloadWindow)"]],
+    ["a good name beside a bad one", ["[auth].ad_tls_ca_cert_file", "[x](command:y)"]],
+    // The anchors and the length bound: each of these holds a well-formed name, or nearly one.
+    ["a good name with a link after it", ["[auth].x [y](command:z)"]],
+    ["a link with a good name after it", ["[y](command:z) [auth].x"]],
+    ["a good name with a trailing newline", ["[auth].x\n"]],
+    ["a name in the wrong case", ["[AUTH].X"]],
+    ["a key past the length bound", [`[auth].${"x".repeat(65)}`]],
+    ["a section past the length bound", [`[${"s".repeat(65)}].x`]],
+    // Falsy values, which a truthiness test would read as clean.
+    ["an empty string", ""],
+    ["zero", 0],
+    ["false", false],
+    ["an object", {}],
+  ] as const) {
+    test(`a restart_required of ${name} keeps the counts, warns, and prints none of it`, async () => {
+      const msg = await promoteReplying(restart);
+      assert.strictEqual(msg.level, "warning");
+      assert.strictEqual(
+        msg.text,
+        "MessageFoundry: check the engine's log for trust anchors that take a restart: the " +
+          `engine's list of them could not be read. Promoted ${graph}`,
+      );
+      // The pre-flight prints no restart list, so the same reply must not stop it.
+      assert.ok(preflightOutcome(await reloadConfig(url, "/cfg", true, "tok")).ok);
+    });
+  }
+
   test("the dry-run pre-flight still decodes as a normal result the promote confirms", async () => {
+    const dryRun = { ...live, dry_run: true, restart_required: null };
     replyStatus = 200;
-    replyBody = { ...live, dry_run: true };
+    replyBody = dryRun;
     const outcome = await reloadConfig(url, "/cfg", true, "tok");
     assert.deepStrictEqual(sent, { config_dir: "/cfg", dry_run: true });
-    assert.deepStrictEqual(outcome, { kind: "done", body: { ...live, dry_run: true } });
-    assert.deepStrictEqual(preflightOutcome(outcome), {
-      ok: true,
-      result: { ...live, dry_run: true },
-    });
+    assert.deepStrictEqual(outcome, { kind: "done", body: dryRun });
+    assert.deepStrictEqual(preflightOutcome(outcome), { ok: true, result: dryRun });
   });
 
   test("a held pre-flight stops the promote with an ERROR naming the approval to reject", async () => {

@@ -60,8 +60,8 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   only whether an off-loopback listener has an effective peer control, which a narrow
   ``source_ip_allowlist`` with no credential satisfies, and never whether a credential is static.
 * Plugin connector types this module does not know. They are not guessed at.
-* A generic-ODBC database hop that sets no top-level ``username``/``password``: the credential, if
-  any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
+* A generic-ODBC database hop that sets no top-level ``username``/``password``. The database arm
+  does not read ``odbc_params``; ``static_credential_db_hops`` says what those keywords can carry.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
   reference, whose value is resolved only when the connector is built, and ``proxy_url='default'``,
   where the operating system's proxy settings carry any credential. Userinfo in either is sent and
@@ -423,8 +423,10 @@ def _graph_hops(
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
         inbound_record_name(ic.name) for ic in registry.inbound.values() if not ic.deployed
     }
-    # The database arm is the shipped reader, reused rather than restated. Every database hop has a
-    # compliant kind: auth='integrated'/'entra' on the SQL Server preset, a driver keyword on generic.
+    # The database arm is the shipped reader, reused rather than restated. compliant_kind is True for
+    # every database hop and is not judged per driver: auth='integrated'/'entra' on the SQL Server
+    # preset; on generic, which only Database and DatabasePoll take, a client certificate on a driver
+    # that reads those odbc_params keywords, or the service's own account.
     out = [
         StaticCredentialHop(name, "static", reason, True)
         for name, reason in static_credential_db_hops(registry, env_values=env_values)

@@ -13,6 +13,7 @@ import re
 import shlex
 import ssl
 import subprocess
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -1858,6 +1859,142 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
             assert r.json()["restart_required"] is None  # not checked
         rows = await _rows(app.state.engine.store, "ad")
     assert len(_events(rows, "restart_required")) == 2
+
+
+# --- a reload that answers no list still reports the anchor (vault BACKLOG #3746) ------------------
+#
+# docs/CONFIGURATION.md and docs/SECURITY.md say where a changed anchor is reported when no response
+# carries the list. Each test swaps the anchor after its consumer loaded it and drives one such
+# reload, and test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart is the control: a reload
+# that applies and answers in time names the setting.
+
+
+@pytest.fixture
+async def rotated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> AsyncIterator[tuple[Any, AnchorSpec, Path]]:
+    """A live engine whose AD anchor's consumer holds the old bytes, with new bytes on disk."""
+    p = tmp_path / "ad-ca.pem"
+    p.write_bytes(_block(b"good"))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    spec = _settings_spec("ad", p)
+    ta.verified_anchor_cadata(spec, enforcing=True)  # the consumer's load, as each one makes it
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        await engine.reload_detail(cfg)
+        p.write_bytes(_block(b"rotated"))
+        caplog.set_level("WARNING", logger=ta.__name__)
+        yield engine, spec, cfg
+    finally:
+        await engine.stop()
+
+
+def _refuse_after_the_check(cfg: Path) -> None:
+    """Leave a graph the load refuses, which it reaches only after the anchor check passed."""
+    (cfg / "feed.py").write_text("x = 1  # declares no connections\n", encoding="utf-8")
+
+
+async def _reported_once(caplog: pytest.LogCaptureFixture, engine: Any, spec: AnchorSpec) -> None:
+    """One restart WARNING naming the setting, and one audit row, which names no node."""
+    warned = [r.getMessage() for r in caplog.records if "Restart the engine" in r.getMessage()]
+    assert len(warned) == 1 and spec.setting in warned[0]
+    (row,) = _events(await _rows(engine.store, spec.label), "restart_required")
+    assert set(row) == {"label", "setting", "event", "fingerprint", "in_use", "algorithm"}
+
+
+async def test_a_reload_refused_after_the_anchor_check_answers_no_list_and_still_reports(
+    rotated: tuple[Any, AnchorSpec, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The check runs first, so its WARNING and row stand when a later step refuses the reload."""
+    import httpx
+
+    from messagefoundry.api import create_app
+
+    engine, spec, cfg = rotated
+    _refuse_after_the_check(cfg)
+    transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        r = await client.post("/config/reload", json={})
+    assert r.status_code == 422, r.text
+    assert list(r.json()) == ["detail"]
+    await _reported_once(caplog, engine, spec)
+
+
+async def test_a_reload_past_its_deadline_answers_no_list_and_still_reports(
+    rotated: tuple[Any, AnchorSpec, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller gets the deadline's 503, and the reload it left behind goes on to swap."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from tests._deadline_capture import capture_deadlines, expect_cut_off
+
+    engine, spec, _cfg = rotated
+    app = create_app(engine, allow_no_auth=True)
+    capture = capture_deadlines(monkeypatch, app)
+    real_reload = engine.reload_detail
+
+    async def reload_past_the_deadline(*args: Any, **kwargs: Any) -> Any:
+        outcome = await real_reload(*args, **kwargs)
+        await capture.cut_off()
+        return outcome
+
+    monkeypatch.setattr(engine, "reload_detail", reload_past_the_deadline)
+    transport = httpx.ASGITransport(app=app)
+    client = httpx.AsyncClient(transport=transport, base_url="http://t")
+    async with client, capture.held():
+        # Pins the whole answer: the middleware's own 503, which carries no list.
+        await expect_cut_off(capture, client.post("/config/reload", json={}))
+        await _reported_once(caplog, engine, spec)
+    assert "config_reload" in [r["action"] for r in await engine.store.list_audit(limit=50)]
+
+
+async def test_a_convergence_reload_reports_a_changed_anchor_only_in_its_own_log(
+    rotated: tuple[Any, AnchorSpec, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """No route calls a follower's convergence reload, so no response carries the list, and the row
+    names no node: the node's own log is the only place that says which node."""
+    engine, spec, cfg = rotated
+    await _convergence(engine, cfg)
+    await _reported_once(caplog, engine, spec)
+
+
+async def test_a_convergence_reload_refused_after_the_check_has_reported_too(
+    rotated: tuple[Any, AnchorSpec, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    from messagefoundry.config.wiring import WiringError
+
+    engine, spec, cfg = rotated
+    _refuse_after_the_check(cfg)
+    with pytest.raises(WiringError):
+        await _convergence(engine, cfg)
+    await _reported_once(caplog, engine, spec)
+
+
+def test_the_section_the_restart_required_pointers_cite_is_there() -> None:
+    """A bold run-in title has no anchor, so nothing else fails when a rename strands a pointer."""
+    root = Path(__file__).resolve().parents[1]
+    title = "restart_required list covers"  # past the apostrophe, which _common.py escapes
+
+    def text(rel: str) -> str:
+        return " ".join((root / rel).read_text(encoding="utf-8").replace("`", "").split())
+
+    assert f"**What a reload's {title}" in text("docs/SECURITY.md")
+    for pointer in (
+        "docs/CONFIGURATION.md",
+        "ide/src/promoteOutcome.ts",
+        "messagefoundry/api/models.py",
+        "messagefoundry/pipeline/engine.py",
+        "messagefoundry_webconsole/pages/_common.py",
+    ):
+        assert title in text(pointer), pointer
+    # The two operator-facing pointers name the real heading first, since the title has no anchor.
+    assert "### Outbound TLS trust anchor" in text("docs/SECURITY.md")
+    for pointer in ("ide/src/promoteOutcome.ts", "messagefoundry_webconsole/pages/_common.py"):
+        assert '"Outbound TLS trust anchor"' in text(pointer), pointer
 
 
 # --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------
