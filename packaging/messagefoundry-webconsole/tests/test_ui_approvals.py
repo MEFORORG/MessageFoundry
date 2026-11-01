@@ -719,9 +719,9 @@ def test_a_released_reload_reads_as_the_inline_one_does() -> None:
     banner = re.compile(r'<p class="banner">(.*?)</p>')
     assert len(banner.findall(released)) == 2
     assert banner.findall(released) == banner.findall(str(pages.reload_result(reload)))
-    body = released.split("<main>", 1)[1]
-    assert "restart_required" not in body  # the banner says it, in words
-    assert all(fact in body for fact in ("inbound", "routers", "handlers", "running", "dry_run"))
+    shown = set(re.findall(r"<td>(\w+)</td><td>", released)) & set(ReloadResult.model_fields)
+    # The banner says the list, in words.
+    assert shown == set(ReloadResult.model_fields) - {"restart_required"}
 
 
 def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:

@@ -379,8 +379,7 @@ def approval_approved(result: ApprovalDecisionResult) -> Markup:
         ["Requested by", result.requested_by],
         ["Approved by", result.approved_by or "—"],
     ]
-    # restart_required stays out: _shortfall says it in words, and a raw [] would read as an
-    # all-clear the list does not give.
+    # restart_required stays out: _shortfall says it in words.
     facts += [
         [str(key), str(value)]
         for key, value in sorted(summary.items())

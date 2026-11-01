@@ -6964,14 +6964,14 @@ response says that no settings anchor with a recorded load changed in the engine
 answered, including when none is configured. It does not say that no restart is needed. At least
 these sit outside the list:
 
-- the dialling CAs `[tls].internal_ca_file`, `[alerts].email_tls_ca_file` and
-  `[logging].forward_tls_ca_file`. Their hops load the file by path and record no fingerprint to
-  compare with, so a changed one is never listed, and it can still need a restart or a rebuild of
-  the connections that use it, as above;
-- another engine shard. A reload is per process with no fleet coordination (ADR 0073), so a shard
-  reports only once a reload reaches its own API;
-- a cluster node. It has no response to carry a list, and the `auth.trust_anchor` row names no
-  node, so it says so only in its own log, and only once its convergence reload reaches this check.
+- the dialling settings CAs named above. Their hops load the file by path and record no fingerprint
+  to compare with, so a changed one is never listed, and it can still need a restart or a rebuild
+  of the connections that use it;
+- another engine shard. A reload is per process with no fleet coordination (ADR 0073), so an engine
+  shard reports only once a reload reaches its own API;
+- another cluster node, converging on the reload. It has no response to carry a list, and the
+  `auth.trust_anchor` row names no node, so it says so only in its own log, and only once its
+  convergence reload reaches this check.
 
 **The hops built before that check take the same checks first (BACKLOG #3470).** At least four
 are covered:
