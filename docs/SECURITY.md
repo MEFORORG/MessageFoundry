@@ -2478,23 +2478,18 @@ such a lane that was paused would leave it paused with its rows pending, because
 with no connector charges each row it claims an attempt, and a finite `max_attempts` would
 dead-letter it with nothing known against the CA.
 
-**That hold is not durable, and it covers the operator control route only.** The lane would stay
-paused only until the next start, and a start need not be an operator's. An in-window schedule tick
-reads a held lane as not running and starts it, and the `connection_stopped` alert can fire a
-rule's restart. Either would resume it with no connector and charge its rows, as would a calendar
-resume after a reload. While a lane is held it sits in the paused set, which suppresses its buildup
-and stall pages. A lane that was not paused, such as one that failed at boot on the same fault,
-would keep claiming with no connector and charging its rows through the 503, unless a restart
-paused it first. Its `connection_control` row would then record `running` true. These gaps are
-known and open.
+**That hold covers the operator control route only, and it ends at the lane's next start**, which
+an operator, a schedule or a rule can make. While a lane is held it sits in the paused set, which
+suppresses its buildup and stall pages. A lane that was not paused, such as one that failed at boot
+on the same fault, is not held: it would keep claiming with no connector, unless a restart paused
+it.
 
 A connection test the store stopped would report `success: false` with one fixed line, and the row
 the route writes to `audit_log.detail` would carry that line and the same `reason`. The
 `connection_control` row of a start or restart answered this way is fail-soft, as is that row for
-any refused inbound start, and so is the `connection_test` row of a test that ended at its CA
-check, whatever stopped it, because nothing was dialled. A store that also refuses the row would
-leave the answer standing, and the row's loss would be logged at ERROR. The row of a test that
-reached its dial stays required.
+any refused inbound start, and so is the `connection_test` row of a test stopped in its CA check
+step, before its connector is built. A store that also refuses the row would leave the answer
+standing, and the row's loss would be logged at ERROR. Any other test's row stays required.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,

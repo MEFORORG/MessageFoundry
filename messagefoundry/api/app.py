@@ -3859,7 +3859,7 @@ _ANCHOR_STORE_DETAIL = (
 #: stopped only until the next start, which need not be an operator's (vault BACKLOG #3746).
 _ANCHOR_STORE_RESTART_DETAIL = (
     "the engine could not reach its store to check a trust anchor, so this restart left the "
-    "connection stopped until the next start, which a schedule or an alert rule can also make; "
+    "connection stopped until its next start, which an operator, a schedule or a rule can make; "
     "see the engine log"
 )
 
@@ -3871,8 +3871,8 @@ def _anchor_store_detail(action: str) -> str:
 
 class _ConnectionTestRun(ConnectionTestResult):
     """A :class:`ConnectionTestResult`, plus what the route's audit row needs and the reply does
-    not carry (vault BACKLOG #3746). ``_check_stopped`` is True when the test ended at its CA
-    check, whatever stopped it, so nothing was dialled. ``_reason`` is the row's ``reason``, set
+    not carry (vault BACKLOG #3746). ``_check_stopped`` is True when the test ended in
+    ``check_test_anchor``, before its connector was built. ``_reason`` is the row's ``reason``, set
     only for a check the store stopped. Private attributes, so neither reaches the response."""
 
     _check_stopped: bool = PrivateAttr(default=False)
@@ -5496,9 +5496,11 @@ def create_app(
                     await rr.stop_outbound(name)
                 else:
                     await rr.restart_outbound(name, hold_on_store_fault=True)
-            except TrustAnchorError:
-                # Vault BACKLOG #3746: only a store fault raises this here, and the lane was not
+            except TrustAnchorError as exc:
+                # Vault BACKLOG #3746: the store stopped the lane's CA check, and the lane was not
                 # resumed. Answered below, outside this handler, as the inbound arm does.
+                if explicit_cause(exc, AnchorStoreUnavailable) is None:
+                    raise
                 held = True
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a

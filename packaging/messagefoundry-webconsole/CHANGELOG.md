@@ -37,6 +37,8 @@ this line.**
   that ships that module, which no published engine does yet, so the release that carries this
   raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
   cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
+- **A refused start, stop or restart on the dashboard redirects back with a notice.** A 409 or a
+  503 from the per-name control routes used to show as raw JSON. (BACKLOG #3746)
 
 ### Security
 

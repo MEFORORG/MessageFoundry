@@ -4334,16 +4334,11 @@ class RegistryRunner:
         with no connector charges each row it claims an attempt, which under a finite
         ``max_attempts`` would dead-letter it.
 
-        **The hold is not durable.** It lasts only until the next start, and a start need not be
-        an operator's. With the default, every other caller resumes the lane as it always has. An
-        in-window scheduler tick reads a held lane as not running and starts it, and the
-        ``connection_stopped`` alert :meth:`_record_failed` raises can fire a rule's restart, so
-        either would resume the lane with no connector and charge its rows. While a lane is held
-        it sits in ``_outbound_paused``, which suppresses its buildup and stall pages. The raise
-        pauses nothing either: a lane that was not paused, such as one that failed at boot on the
-        same fault, keeps claiming with no connector and would charge its rows the same way,
-        unless a restart's stop half paused it first. That gap is known and open, and its fix
-        belongs at the claim, not at this door.
+        **The hold ends at the lane's next start**, which an operator, a schedule or a rule can
+        make. With the default, every other caller resumes the lane as it always has. While a lane
+        is held it sits in ``_outbound_paused``, which suppresses its buildup and stall pages. The
+        raise pauses nothing: a lane that was not paused, such as one that failed at boot on the
+        same fault, keeps claiming with no connector, unless a restart's stop half paused it.
 
         REFUSES a DR-parked lane with :class:`DrParkedError`, which its public doors raise first;
         this one is the backstop for an internal caller that forgot to ask.
