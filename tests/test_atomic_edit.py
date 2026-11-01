@@ -355,7 +355,7 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
             entry = next(
                 e for e in connections_edit.list_connections(tmp_path) if e["name"] == "OB_TOML"
             )
-            entry["flagged"] = True
+            entry["deployed"] = False
             connections_edit.upsert_connection(tmp_path, entry, validate=_noop)
         finished.set()
 
@@ -363,7 +363,7 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
     thread.start()
     thread.join(_JOIN_S)
     assert finished.is_set()
-    assert "flagged = true" in path.read_text(encoding="utf-8")
+    assert "deployed = false" in path.read_text(encoding="utf-8")
 
 
 def test_one_hidden_lock_file_per_directory(tmp_path: Path) -> None:

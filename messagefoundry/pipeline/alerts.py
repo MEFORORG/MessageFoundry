@@ -820,8 +820,8 @@ class AlertSink(Protocol):
         comparison: str = "compared",
     ) -> None:
         """This process started with a config whose ADR 0041 D1 fingerprint differs from the store's
-        baseline (vault BACKLOG #2597). The baseline is the newest usable ``config_loaded``,
-        ``config_reload`` or ``connection_flag_set`` audit row from any node or engine shard, since
+        baseline (vault BACKLOG #2597). The baseline is the newest usable ``config_loaded`` or
+        ``config_reload`` audit row from any node or engine shard, since
         every one of them shares one config directory; a row whose digest its process never checked
         is passed over, so the baseline can be older than the newest row. So an edit applied first by ``POST
         /config/reload`` and then restarted does not fire it, and an edit that only a restart picked

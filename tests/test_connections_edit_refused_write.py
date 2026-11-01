@@ -43,7 +43,7 @@ ENTRY: dict[str, Any] = {
     "direction": "outbound",
     "name": "OB_TOML",
     "transport": "mllp",
-    "flagged": True,
+    "deployed": False,
     "settings": {"host": "127.0.0.1", "port": 2700},
 }
 

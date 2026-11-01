@@ -65,9 +65,6 @@ _SCALAR_FIELDS = (
     # itself the first time an operator edited it in the editor.
     "auto_start",
     "deployed",
-    # Operator "object of interest" flag (#131, ADR 0007 amendment) — the FIRST console-settable key
-    # written through this seam. Absent from this whitelist it would be silently dropped on the next save.
-    "flagged",
     # Cosmetic "Waiting for Reply" pre-display delay (#136, ADR 0065 amendment) — outbound-only, seconds.
     "waiting_display_delay",
     # --- #234: every key below was in the READ schema but not written — a GUI/CLI save silently
@@ -137,11 +134,11 @@ def locked(config_dir: str | Path) -> Iterator[None]:
     """Hold the cross-process edit lock on ``config_dir``'s ``connections.toml`` for the ``with`` body.
 
     :func:`upsert_connection` and :func:`remove_connection` take it themselves. A caller whose
-    read-modify-write starts earlier, as the engine's flag toggle does with :func:`list_connections`,
-    wraps the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event
-    loop. A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
-    directory the file system will not let this account write (root-owned or read-only), which the
-    API answers 409 rather than 500 (vault BACKLOG #3106)."""
+    read-modify-write starts earlier, such as one that begins with :func:`list_connections`, wraps
+    the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event loop.
+    A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
+    directory the file system will not let this account write (root-owned or read-only) (vault
+    BACKLOG #3106)."""
     with atomic_edit.edit_lock(
         _path(config_dir), busy_error=WiringError, refused_error=WiringError
     ):

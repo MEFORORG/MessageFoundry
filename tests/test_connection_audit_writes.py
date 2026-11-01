@@ -19,10 +19,10 @@ scaffolding that neither of those files carries.
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -40,7 +40,9 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import AuditAppend
 from tests._admin_account import create_local_user_chosen
+from tests._operator_audit_atomic_contract import failing_append
 
 PW = "Correct-Horse-Battery-Staple-9"
 
@@ -118,8 +120,8 @@ async def _login(c: httpx.AsyncClient) -> dict[str, str]:
 
 @pytest.fixture
 async def toml_engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    """An engine whose graph is connections.toml-managed -- the flag route's precondition. A
-    code-first connection has no TOML home and is refused 409 before the audit write is reached."""
+    """An engine with a graph, the flag route's precondition: an unknown name is refused 409 before
+    the audit write is reached."""
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     (cfg / "logic.py").write_text(LOGIC_PY, encoding="utf-8")
@@ -143,10 +145,8 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
 ) -> None:
     """BACKLOG #1643: a successful flag write leaves a ``connection_flag_set`` row naming the caller.
 
-    RED when the ``record_audit`` call in ``Engine.write_baseline_config`` is deleted, or when the
-    route stops passing ``actor=identity.username`` to ``Engine.set_connection_flag``. The row moved
-    into that engine helper with vault BACKLOG #2945; before that it lived in the ROUTE, where no
-    engine-level flag test could see it go.
+    RED when the audit argument in ``Engine.set_connection_flag`` is renamed or dropped, or when the
+    route stops passing ``actor=identity.username`` to it.
 
     The 409 arm below is the negative control: it proves the row is written by the SUCCESS path and
     not unconditionally on entry, which a write hoisted above the ``set_connection_flag`` call would
@@ -164,7 +164,7 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
         assert r.status_code == 200, r.text
         assert r.json() == {"name": "OB_TOML", "direction": "outbound", "flagged": True}
 
-        # Negative control: an unknown / non-TOML-managed name is refused 409 and must audit nothing.
+        # Negative control: an unknown name is refused 409 and must audit nothing.
         refused = await c.post(
             "/connections/OB_NOPE/flag",
             json={"direction": "outbound", "flagged": True},
@@ -179,35 +179,75 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
     assert "OB_TOML" in str(rows[0]["detail"])
 
 
-async def test_flag_route_answers_503_when_the_audit_row_fails(
-    toml_engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """vault BACKLOG #2945: a toggle whose ``connection_flag_set`` row fails is refused and undone,
-    and the route answers 503, the audit log being at fault, not the request. It used to pass the
-    store's own error up as a 500, which said nothing of whether the toggle was still on disk."""
+async def test_flag_route_answers_503_when_the_audit_row_fails(toml_engine: Engine) -> None:
+    """BACKLOG #2623: the flag and its ``connection_flag_set`` row are one transaction, so a row that
+    fails leaves the flag as it was, and the route answers 503, the store being at fault, not the
+    request. The fault's own text stays in the log."""
     service = await _deployer(toml_engine)
-    real_record = toml_engine.store.record_audit
-
-    async def _flag_row_refused(action: str, **kwargs: Any) -> None:
-        if action == "connection_flag_set":
-            raise RuntimeError("synthetic: the audit store refused the row")
-        await real_record(action, **kwargs)
-
-    assert toml_engine.config_dir is not None
-    toml_path = Path(toml_engine.config_dir) / "connections.toml"
-    before = toml_path.read_bytes()
     transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c)
-        monkeypatch.setattr(toml_engine.store, "record_audit", _flag_row_refused)
-        r = await c.post(
-            "/connections/OB_TOML/flag",
-            json={"direction": "outbound", "flagged": True},
-            headers=h,
-        )
+        with failing_append(toml_engine.store, "connection_flag_set"):
+            r = await c.post(
+                "/connections/OB_TOML/flag",
+                json={"direction": "outbound", "flagged": True},
+                headers=h,
+            )
     assert r.status_code == 503, r.text
-    assert "was undone" in r.json()["detail"]
-    assert toml_path.read_bytes() == before
+    assert r.json()["detail"].startswith("the store did not record this toggle")
+    assert await toml_engine.store.list_connection_flags() == set()
+
+
+async def test_the_dashboard_shows_the_flag_on_each_direction_and_a_code_first_row(
+    toml_engine: Engine,
+) -> None:
+    """``GET /connections`` joins the store's flags to its rows by direction and name. RED if the
+    join reads the wrong side: a source row and a destination row are told apart here."""
+    service = await _deployer(toml_engine)
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        for name, direction in (("OB_TOML", "outbound"), ("IB_TOML", "inbound")):
+            r = await c.post(
+                f"/connections/{name}/flag",
+                json={"direction": direction, "flagged": True},
+                headers=h,
+            )
+            assert r.status_code == 200, r.text
+        rows = (await c.get("/connections", headers=h)).json()
+    flagged = {
+        (row["role"], row["channel_id"], row["destination"]) for row in rows if row["flagged"]
+    }
+    assert ("source", "IB_TOML", None) in flagged
+    assert any(role == "destination" and dest == "OB_TOML" for role, _, dest in flagged)
+    assert rows, "control: the page has rows"
+    assert all("toml_managed" not in row for row in rows)
+
+
+async def test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page(
+    toml_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A database writer with no key can plant bytes that are not text. The flag decides nothing, so
+    the page still answers, with no markers and a WARNING. RED without the read's guard: a 500 on
+    the dashboard, from a value that was never allowed to refuse anything."""
+    service = await _deployer(toml_engine)
+    await toml_engine.store.set_connection_flag(
+        "OB_TOML", "outbound", flagged=True, audit=AuditAppend("connection_flag_set")
+    )
+    db = toml_engine.store._db  # type: ignore[attr-defined]
+    await db.execute(
+        "INSERT INTO connection_flag (connection, direction) VALUES (CAST(X'FF' AS TEXT), 'inbound')"
+    )
+    await db.commit()
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+            r = await c.get("/connections", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json(), "control: the page has rows"
+    assert not any(row["flagged"] for row in r.json())
+    assert "the connection flags could not be read" in caplog.text
 
 
 async def test_credential_test_route_audits_under_the_acting_user(

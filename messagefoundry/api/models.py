@@ -766,16 +766,11 @@ class ConnectionRow(PhiGatedModel):
     # Lets an operator watching a backlog on one shard's view see WHICH shard is responsible for
     # draining it (controls/purge for a non-owned lane 409 with the same owner).
     owner_shard: str | None = None
-    # #131 (ADR 0007 amendment): the operator "object of interest" flag for the Flagged Objects filter.
-    # Display-only (no runtime effect); True when the connection is marked flagged. Console-settable via
-    # POST /connections/{name}/flag on a connections.toml-managed connection only. Additive + defaulted
-    # so an older client deserializes /connections unchanged.
+    # #131, BACKLOG #2623: the operator "object of interest" flag for the Flagged Objects filter.
+    # Display-only (no runtime effect), and read from the store. Console-settable via
+    # POST /connections/{name}/flag. Additive + defaulted so an older client deserializes /connections
+    # unchanged.
     flagged: bool = False
-    # #131: whether this connection is authored in connections.toml (vs code-first). The console shows
-    # the flag TOGGLE only on TOML-managed rows (the write seam persists there); a code-first row shows a
-    # read-only flag indicator. The API refuses the toggle on a non-TOML connection regardless (the guard
-    # of record). Additive + defaulted.
-    toml_managed: bool = False
     # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
     # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY
     # ONLY (no delivery effect); False for source rows, non-ACK-waiting connectors, and no-ack mode.
@@ -784,9 +779,8 @@ class ConnectionRow(PhiGatedModel):
 
 
 class ConnectionFlagRequest(RequestModel):
-    """Body for ``POST /connections/{name}/flag`` (#131, ADR 0007 amendment) — the FIRST
-    console→connections.toml write seam. ``direction`` disambiguates a name declared as both an inbound
-    and an outbound. Display-only; the write is refused (409) on a code-first connection (no TOML home)."""
+    """Body for ``POST /connections/{name}/flag`` (#131, BACKLOG #2623). ``direction`` disambiguates
+    a name declared as both an inbound and an outbound. Display-only."""
 
     flagged: bool
     direction: Literal["inbound", "outbound"]

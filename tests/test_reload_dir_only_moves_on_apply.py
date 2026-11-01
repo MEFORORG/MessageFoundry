@@ -2,10 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``Engine.last_reload_dir`` moves only when a reload is applied (vault BACKLOG #2598).
 
-Two readers trust that field to name the directory the running graph came from: the drift check
-behind ``GET /config/provenance``, and ``Engine.set_connection_flag``, which writes
-``connections.toml`` there. A dry run applies nothing and a failed reload applies nothing, so
-neither may move it. Each refusal below sits beside a control that does move it, so an unchanged
+At least two readers trust that field to name the directory the running graph came from: the
+drift check behind ``GET /config/provenance``, and a DR activation's disk drift check. A dry run
+applies nothing and a failed reload applies nothing, so neither may move it. Each refusal below sits beside a control that does move it, so an unchanged
 field is a reading of the rule and never of a reload that did not run.
 """
 

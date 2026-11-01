@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Two connection-bearing routes answer a channel-scoped caller by its scope (BACKLOG #1152, ASVS 8.2.2).
 
-* ``POST /connections/{name}/flag`` writes into ``connections.toml``. Before this, its only gate was
-  ``config:deploy``, so a DEPLOYMENT account scoped to one channel could flag any TOML-managed
-  connection, and a 200 against a 409 told it which names were TOML-managed. It now gives the one
+* ``POST /connections/{name}/flag`` writes the store. Before this, its only gate was
+  ``config:deploy``, so a DEPLOYMENT account scoped to one channel could flag any connection, and a
+  200 against a 409 told it which names exist. It now gives the one
   refusal the per-name routes give (BACKLOG #2551, #2640) to every target outside the caller's scope.
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
   any rule that names a connection outside the caller's scope.
@@ -18,7 +18,6 @@ import asyncio
 import json
 import logging
 import sqlite3
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
@@ -64,17 +63,13 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
     toml_engine: Engine,  # noqa: F811
 ) -> None:
     """A scoped caller gets one answer, one body and one audit kind for every target it may not
-    reach: a TOML-managed inbound outside its scope, the outbound its scope lists, either name on
-    the other side, a name that exists nowhere, and one its scope lists that exists nowhere. None
-    writes the file or a ``connection_flag_set`` row."""
+    reach: an inbound outside its scope, the outbound its scope lists, either name on the other
+    side, a name that exists nowhere, and one its scope lists that exists nowhere. None writes a
+    flag or a ``connection_flag_set`` row."""
     service = await _service(toml_engine, admin_write_rate_limit=False)
     await _user(service, "scoped", Role.DEPLOYMENT, ["IB_GONE", "OB_TOML"])
     await _user(service, "own", Role.DEPLOYMENT, ["IB_TOML"])
     await _user(service, "wide", Role.DEPLOYMENT, [ALL_CHANNELS])
-    config_dir = toml_engine.running_config_dir
-    assert config_dir is not None
-    toml: Path = config_dir / "connections.toml"
-    before = toml.read_bytes()
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app(toml_engine, auth=service)),
@@ -82,7 +77,7 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
     ) as c:
         h = await _login(c, "scoped")
         targets = [
-            ("IB_TOML", "inbound"),  # exists and is TOML-managed: a 200 before the fix
+            ("IB_TOML", "inbound"),  # exists: a 200 before the fix
             ("OB_TOML", "outbound"),  # listed in the scope, but an outbound spans channels
             ("OB_TOML", "inbound"),
             ("IB_TOML", "outbound"),
@@ -97,7 +92,7 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
             assert ("auth.channel_denied", name) in audit, (name, direction, audit)
             answers.add(tuple(sorted(action for action, _ in audit)))
         assert len(answers) == 1, answers
-        assert toml.read_bytes() == before, "a refused flag must not touch connections.toml"
+        assert await toml_engine.store.list_connection_flags() == set()
         assert await toml_engine.store.list_audit(action="connection_flag_set") == []
 
         # The control: a caller scoped to the inbound flags it, and the write lands.
@@ -106,9 +101,9 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
         )
         assert status == 200, body
         assert ("connection_flag_set", None) in audit
-        assert toml.read_bytes() != before
+        assert await toml_engine.store.list_connection_flags() == {("IB_TOML", "inbound")}
 
-        # An all-channels caller is unchanged: 409 for a name with no TOML home, no denial row.
+        # An all-channels caller is unchanged: 409 for a name the graph lacks, no denial row.
         hw = await _login(c, "wide")
         status, _, audit = await _flag(c, toml_engine, hw, "IB_NOPE", "inbound")
         assert status == 409

@@ -608,7 +608,7 @@ async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: E
     assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
-    engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
+    engine.loaded_config_fingerprint = dict(loaded)  # what a later committed reload does
     assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]

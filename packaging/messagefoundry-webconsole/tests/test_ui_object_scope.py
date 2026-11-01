@@ -82,16 +82,16 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
     assert "data-poll" not in scoped_page and "data-mf-fragment" not in scoped_page
 
 
-async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
+async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_record(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """vault BACKLOG #2945: a toggle whose audit row failed is refused 503 and undone. The console
-    names that fix, not ``flag_rejected``'s code-first and cluster-node hints, which do not apply.
-    A 503 used to escape the route as an error page."""
-    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+    """BACKLOG #2623: a toggle the store did not commit is refused 503. The console names that fix,
+    not ``flag_rejected``'s hint, which does not apply. A 503 used to escape the route as an error
+    page."""
+    from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
 
     async def _not_recorded(*_args: object, **_kwargs: object) -> None:
-        raise ConfigWriteAuditTimeout(10.0, undone=True)
+        raise ConnectionFlagNotRecorded("the store did not record this toggle")
 
     monkeypatch.setattr(engine, "set_connection_flag", _not_recorded)
     service = await auth_service(engine)
@@ -104,6 +104,6 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
             headers=SAME_ORIGIN,
         )
     assert r.status_code == 200, r.text[:300]
-    assert "The audit log did not record the change, so the engine undid it" in r.text
-    assert "was not recorded within 10 s" in r.text
-    assert "code-first connection" not in r.text and "cluster node" not in r.text
+    assert "The store did not record the change, so the flag is as it was" in r.text
+    assert "the store did not record this toggle" in r.text
+    assert "running graph" not in r.text

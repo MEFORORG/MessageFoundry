@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Every code path that writes a config file, and whether it moves the config-change baseline
-(vault BACKLOG #2945).
+"""Every code path that writes a config file, and that none of them runs in the engine (vault
+BACKLOG #2945, BACKLOG #2623).
 
 A start compares the digest of its config directory with the newest baseline row in the store
-(vault BACKLOG #2597): a start, an applied reload, or an engine write of a file the digest covers.
-An engine write that recorded no row would leave the baseline behind, and the next start would
-raise ``config_changed`` for a change the engine made itself. So every engine write goes through
-``Engine.write_baseline_config``, which writes, takes the digest and records the row, and whose
-action names the start reads (``CONFIG_WRITE_ACTIONS``).
+(vault BACKLOG #2597): a start or an applied reload. The running engine writes no file in that
+directory, so it needs no write access to the directory it executes code from, and it has no write
+of its own to record. The one such write it had, the connection flag, moved to the store.
 
 :data:`CENSUS` is the record. Each call into a function that writes a config file is keyed by its
 file and the def it sits in, and must be listed with a verdict. A new call site fails
-:func:`test_every_config_write_call_site_is_in_the_census` until someone classifies it, and a site
-classified ``helper`` fails :func:`test_every_engine_config_write_goes_through_the_helper` unless
-it calls the helper.
+:func:`test_every_config_write_call_site_is_in_the_census` until someone classifies it, and
+:func:`test_only_the_cli_writes_config` refuses any site outside the CLI module: an engine write
+would bring back the write access, and a baseline row with it.
 
 Scope, stated rather than implied. The census finds references to the writer functions in
 :data:`WRITERS`, by name, whether called or handed on as a callable, across :data:`PACKAGES`. A
@@ -36,8 +34,6 @@ from typing import Literal
 import pytest
 
 from messagefoundry.api import app as app_module
-from messagefoundry.pipeline import engine as engine_module
-from tests._ast_sites import call_sites
 
 REPO = Path(__file__).resolve().parents[1]
 #: The packages that run in the engine process or ship beside it: the engine, the web console
@@ -46,9 +42,6 @@ PACKAGES = tuple(
     REPO / name
     for name in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
 )
-
-#: The helper every engine config write goes through.
-HELPER = "write_baseline_config"
 
 #: The functions that write a file in a config directory, matched by name at the call. The first
 #: group writes a file the config digest covers (``config/fingerprint.py``): config modules,
@@ -85,29 +78,15 @@ LIBRARY: frozenset[str] = frozenset(
     }
 )
 
-type Verdict = Literal["helper", "undo", "cli", "settings"]
+type Verdict = Literal["cli", "settings"]
 
-#: ``helper``: an engine write of a covered file; it moves the baseline through the helper.
 #: ``cli``: a CLI subcommand, which runs in its own process and records no row. Its edit does not
 #: move the baseline, by decision: no engine loaded it, and nothing in that process can say which
 #: engine would. A reload that loads it records a ``config_reload`` row with the new digest, which
 #: moves the baseline then. A start that loads it first raises ``config_changed``, and that alert is
 #: the record of an edit no engine made. ``settings``: writes the service settings file, which the
-#: config digest does not cover, so there is no baseline for it to move. ``undo``: the helper's own
-#: put-back of the bytes a write changed when its row fails, so it moves no baseline: the files go
-#: back to the bytes the newest row names, unless the store committed the failed row after all,
-#: which ``Engine.write_baseline_config`` says the next start reports. Only the helper may call it.
+#: config digest does not cover, so there is no baseline for it to move.
 CENSUS: dict[tuple[str, str], tuple[Verdict, str]] = {
-    ("messagefoundry/pipeline/engine.py", "Engine.set_connection_flag"): (
-        "helper",
-        "POST /connections/{name}/flag rewrites connections.toml in the running engine. Refused "
-        "on a cluster node (vault BACKLOG #2933).",
-    ),
-    ("messagefoundry/pipeline/engine.py", "_undo_write"): (
-        "undo",
-        "write_baseline_config puts back what a write changed when its row fails, times out or "
-        "is cancelled, so a refused write does not stay on disk (vault BACKLOG #2945)",
-    ),
     ("messagefoundry/__main__.py", "_connection"): (
         "cli",
         "the `connection` CLI upserts or removes a connections.toml entry, in its own process",
@@ -187,44 +166,6 @@ def _writer_sites(tree: ast.Module) -> set[str]:
     return sites
 
 
-def _unrouted_writer_refs(node: ast.AST) -> list[int]:
-    """The lines in def ``node`` that reference a writer outside every nested def handed to the
-    helper as its ``write`` argument, so a ``helper`` def cannot route one write through it and
-    make another beside it, or in what it hands over as ``reflect``. The helper takes ``write``
-    second, after ``action``, or by keyword."""
-    routed = {
-        arg.id
-        for call in call_sites(node, HELPER)
-        for arg in [*call.args[1:2], *(k.value for k in call.keywords if k.arg == "write")]
-        if isinstance(arg, ast.Name)
-    }
-    lines: list[int] = []
-
-    def walk(current: ast.AST) -> None:
-        for child in ast.iter_child_nodes(current):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in routed:
-                continue
-            if isinstance(child, ast.Call) and _is_writer_ref(child):
-                lines.append(child.lineno)
-            walk(child)
-
-    walk(node)
-    return lines
-
-
-def _def_node(tree: ast.Module, qualname: str) -> ast.AST:
-    """The def node at ``qualname`` in ``tree``."""
-    node: ast.AST = tree
-    for part in qualname.split("."):
-        node = next(
-            child
-            for child in ast.iter_child_nodes(node)
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and child.name == part
-        )
-    return node
-
-
 def _found_sites(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
     """Every ``(path, def)`` in ``trees`` (relative path to parsed module) that calls a writer."""
     return {
@@ -238,23 +179,10 @@ def _found_sites(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
 def _unlisted(trees: Mapping[str, ast.Module]) -> list[str]:
     """A writer call in a def the census does not list."""
     return [
-        f"{path}: {site} writes a config file and is not in CENSUS; classify it, and if it runs "
-        f"in the engine, route the write through Engine.{HELPER}"
+        f"{path}: {site} writes a config file and is not in CENSUS; the engine writes no config "
+        "file, so classify a CLI write or keep the value out of the config directory"
         for path, site in sorted(_found_sites(trees) - set(CENSUS))
     ]
-
-
-def _helper_bypasses(trees: Mapping[str, ast.Module]) -> list[str]:
-    """A census ``helper`` def, present in ``trees``, with a writer reference outside the defs it
-    hands to the helper (including one that never calls the helper at all)."""
-    problems: list[str] = []
-    for (path, site), (verdict, _why) in CENSUS.items():
-        if verdict != "helper" or path not in trees:
-            continue
-        lines = _unrouted_writer_refs(_def_node(trees[path], site))
-        if lines:
-            problems.append(f"{path}: {site} writes a config file without Engine.{HELPER}")
-    return problems
 
 
 @functools.cache
@@ -276,57 +204,16 @@ def test_every_config_write_call_site_is_in_the_census() -> None:
     )
 
 
-def test_every_engine_config_write_goes_through_the_helper() -> None:
-    assert _helper_bypasses(_package_trees()) == []
-
-
-def test_only_the_cli_writes_config_outside_the_helper() -> None:
+def test_only_the_cli_writes_config() -> None:
     """A ``cli`` or ``settings`` verdict says the write runs in its own process. Only the CLI
-    module's subcommands can earn one; engine code that writes a config file uses the helper, or is
-    the helper's own undo."""
-    for (path, site), (verdict, _why) in CENSUS.items():
-        if verdict in ("cli", "settings"):
-            assert path == "messagefoundry/__main__.py", (path, site)
-        elif verdict == "undo":
-            assert path == "messagefoundry/pipeline/engine.py", (path, site)
+    module's subcommands can earn one, so the engine writes no config file at all."""
+    for path, site in CENSUS:
+        assert path == "messagefoundry/__main__.py", (path, site)
 
 
-def _undo_callers(tree: ast.Module) -> set[str]:
-    """The defs in ``tree`` that name an ``undo`` site, charged to the outermost def as
-    :func:`_writer_sites` charges a writer call."""
-    undo = {site for (_path, site), (verdict, _why) in CENSUS.items() if verdict == "undo"}
-    callers: set[str] = set()
-
-    def walk(node: ast.AST, owner: list[str], in_function: bool) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if in_function:
-                    walk(child, owner, True)
-                else:
-                    walk(child, [*owner, child.name], not isinstance(child, ast.ClassDef))
-                continue
-            if isinstance(child, ast.Name) and child.id in undo:
-                callers.add(".".join(owner) or "<module>")
-            walk(child, owner, in_function)
-
-    walk(tree, [], False)
-    return callers
-
-
-def test_only_the_helper_calls_the_undo() -> None:
-    """The undo rewrites covered files and records no row. The helper calls it only once its own
-    row has failed; any other caller would be a config write with no baseline row."""
-    tree = _package_trees()["messagefoundry/pipeline/engine.py"]
-    assert _undo_callers(tree) == {"Engine.write_baseline_config"}
-    # Positive control: a second caller is seen.
-    rogue = ast.parse("def toggle(d):\n    _undo_write(d, {})\n")
-    assert _undo_callers(rogue) == {"toggle"}
-
-
-def test_the_guard_refuses_an_unlisted_writer_and_a_helper_bypass() -> None:
+def test_the_guard_refuses_an_unlisted_writer() -> None:
     """Positive controls, so the passes above are the census holding and not a scan that found
-    nothing. An unlisted engine function calling a writer is refused, and so is the real flag
-    toggle with its helper call taken out."""
+    nothing. An engine function calling a writer is refused, called or handed on."""
     for rogue in (
         "def toggle(d, obj):\n    connections_edit.upsert_connection(d, obj, validate=None)\n",
         # Handed on as a callable rather than called: the usual way off the event loop.
@@ -335,45 +222,15 @@ def test_the_guard_refuses_an_unlisted_writer_and_a_helper_bypass() -> None:
     ):
         assert _unlisted({"messagefoundry/pipeline/rogue.py": ast.parse(rogue)}) == [
             "messagefoundry/pipeline/rogue.py: toggle writes a config file and is not in CENSUS; "
-            f"classify it, and if it runs in the engine, route the write through Engine.{HELPER}"
+            "the engine writes no config file, so classify a CLI write or keep the value out of "
+            "the config directory"
         ]
 
-    engine_path = "messagefoundry/pipeline/engine.py"
-    real = (REPO / engine_path).read_text(encoding="utf-8")
-    refused = [
-        f"{engine_path}: Engine.set_connection_flag writes a config file without Engine.{HELPER}"
-    ]
-    assert f"self.{HELPER}(" in real
-    bypassed = ast.parse(real.replace(f"self.{HELPER}(", "self._not_the_helper("))
-    assert _helper_bypasses({engine_path: bypassed}) == refused
-    # Still calling the helper, but also writing beside it, outside the def it hands over.
-    anchor = "        def _reflect() -> None:\n"
-    assert anchor in real
-    beside = real.replace(
-        anchor,
-        "        connections_edit.remove_connection(cfg, name, validate=None)\n\n" + anchor,
-    )
-    assert _helper_bypasses({engine_path: ast.parse(beside)}) == refused
-    # Inside the def handed over as `reflect`, which runs outside the edit lock and after the digest.
-    reflect_anchor = "            rr = self._registry_runner\n"
-    assert reflect_anchor in real
-    in_reflect = real.replace(
-        reflect_anchor,
-        "            connections_edit.remove_connection(cfg, name, validate=None)\n"
-        + reflect_anchor,
-        1,
-    )
-    assert _helper_bypasses({engine_path: ast.parse(in_reflect)}) == refused
 
-
-def test_the_start_reads_every_action_the_helper_records() -> None:
-    """The start's baseline list is built from the helper's action names (``*CONFIG_WRITE_ACTIONS``),
-    so a write recorded under a new name is a baseline with no second list to keep in step."""
-    # Holds by construction today; it fails if the splat is ever replaced by a literal tuple.
-    assert set(engine_module.CONFIG_WRITE_ACTIONS) <= set(app_module._CONFIG_BASELINE_ACTIONS)
-    assert {"config_loaded", "config_reload"} <= set(app_module._CONFIG_BASELINE_ACTIONS)
-    # The helper marks an unchecked row with the key the start-row comparison skips.
-    assert engine_module.CONFIG_BASELINE_UNCHECKED_KEY == app_module._BASELINE_UNCHECKED
+def test_a_flag_row_is_no_start_baseline() -> None:
+    """A toggle's ``connection_flag_set`` row carries no digest (BACKLOG #2623). As a baseline it
+    would read as degraded, and the start after every toggle would compare nothing."""
+    assert app_module._CONFIG_BASELINE_ACTIONS == ("config_loaded", "config_reload")
 
 
 #: Names that, in a write's target expression, put the target in a config directory.

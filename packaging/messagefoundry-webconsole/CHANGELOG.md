@@ -29,6 +29,13 @@ this line.**
   sign-in lock that someone else's wrong passwords set. Needs the engine seam that carries
   `AuthService.begin_passkey_sign_in`. (BACKLOG #3373, ADR 0197 Amendment A wave 2)
 
+### Changed
+
+- **The flag toggle is on every row, and the store holds the flag.** A code-first connection takes
+  the flag like any other, and a cluster node no longer refuses it. The refused-toggle page now
+  has one hint, for a name the running graph does not have. Needs the engine seam without
+  `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
+
 ### Security
 
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its

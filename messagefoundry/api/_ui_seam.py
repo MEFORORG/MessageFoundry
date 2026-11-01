@@ -764,6 +764,10 @@ from typing import Any
 #: 9ad245683e8594e1; this branch at 75c4b3550c195a62). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #2623: the connection flag moved to the store, so ``ConnectionRow.toml_managed`` is gone
+#: and the console offers the toggle on every row. Re-derived with ``--write`` (from
+#: b634db50214474e2).
+#:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
@@ -775,7 +779,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b634db50214474e2"
+ENGINE_UI_SEAM: str = "f3c064fe186b81d4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -866,8 +870,8 @@ class CoreHandlers:
     # + the status-colored by-name data-flow graph, both read-only + monitoring:read.
     metrics_history: Callable[..., Awaitable[Any]]
     graph_edges: Callable[..., Awaitable[Any]]
-    # First console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment; seam v9): the
-    # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
+    # The object-flag toggle (BACKLOG #131, #2623; seam v9), config:deploy. Any connection in the
+    # running graph; the store holds the flag. An unknown name is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on

@@ -173,20 +173,11 @@ def _flag_name(r: ConnectionRow) -> tuple[str, str]:
 
 
 def _flag_cell(r: ConnectionRow) -> Markup:
-    """The Flag cell (#131, ADR 0007 amendment): a same-origin POST toggle form on a
-    ``connections.toml``-managed row (the write seam persists there), or a read-only indicator on a
-    code-first row (no TOML home for the flag). The glyph is filled (⚑) when flagged, outline (⚐)
-    otherwise; the button posts the DESIRED new value so a submit flips it (like the Alerts ack/resolve
-    POST forms). Every value is placed through the escaping builder."""
+    """The Flag cell (#131, BACKLOG #2623): a same-origin POST toggle form on every row. The glyph
+    is filled (⚑) when flagged, outline (⚐) otherwise; the button posts the DESIRED new value so a
+    submit flips it (like the Alerts ack/resolve POST forms). Every value is placed through the
+    escaping builder."""
     glyph = "⚑" if r.flagged else "⚐"
-    if not r.toml_managed:
-        # Code-first / draining: show the state but no toggle (it can't be persisted to connections.toml).
-        return el(
-            "span",
-            glyph if r.flagged else "",
-            class_="flag" + (" flagged" if r.flagged else ""),
-            title="Flagged (code-first — edit the .py module to change)" if r.flagged else "",
-        )
     name, direction = _flag_name(r)
     return el(
         "form",
@@ -512,12 +503,9 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
 
 
 def flag_rejected(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused (#131): the SCOPE FORK, where the connection is
-    code-first (no ``connections.toml`` home for the flag); a ``connections.toml`` the engine's
-    account cannot write (vault BACKLOG #3106); or a cluster node, which writes no config file
-    (vault BACKLOG #2933). ``detail`` says which; the two hints below each name the case they are
-    for, since nothing here should guess from the detail's wording. Both ``name`` and ``detail``
-    are escaped."""
+    """Shown when a flag toggle is refused (#131): the running graph has no such connection, as
+    for a removed outbound still draining (BACKLOG #2623). Both ``name`` and ``detail`` are
+    escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -525,17 +513,8 @@ def flag_rejected(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The object flag is settable here only on a connections.toml-managed connection, in a "
-            "config directory the engine can write. A code-first connection has no TOML home for "
-            "it, so edit its .py module to change the flag. A read-only or root-owned config "
-            "directory: change the flag in the config source itself.",
-            class_="muted",
-        ),
-        el(
-            "p",
-            "A cluster node refuses the toggle, because each node loads its own config directory. "
-            "Set flagged on the connection's entry in connections.toml on every node, then apply "
-            "it with a coordinated restart.",
+            "Only a connection in the running graph can be flagged. A connection removed from the "
+            "config stops being one when the reload that removed it applies.",
             class_="muted",
         ),
         el("p", el("a", "← Connections", href="/ui")),
@@ -545,10 +524,10 @@ def flag_rejected(name: str, detail: str) -> Markup:
 
 
 def flag_not_recorded(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused because the audit log did not record it (vault BACKLOG
-    #2945). The engine undoes such a toggle, and ``detail`` says when it could not. Its own page,
-    because :func:`flag_rejected`'s hints name fixes for other refusals. Both ``name`` and
-    ``detail`` are escaped."""
+    """Shown when a flag toggle is refused because the store did not commit it (BACKLOG #2623). The
+    flag and its audit row are one transaction, so neither landed. Its own page, because
+    :func:`flag_rejected`'s hint names a fix for another refusal. Both ``name`` and ``detail`` are
+    escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -556,9 +535,8 @@ def flag_not_recorded(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The audit log did not record the change, so the engine undid it, unless the "
-            "message above says it could not be fully undone. Then the next engine start "
-            "reports a config change, and the engine log names the file. Try again.",
+            "The store did not record the change, so the flag is as it was. Try again; if it "
+            "keeps failing, the engine log names the cause.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),
