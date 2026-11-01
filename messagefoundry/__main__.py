@@ -12363,17 +12363,13 @@ def _is_engine_refusal(exc: BaseException) -> bool:
     raised from engine code, as the store's refusal sites raise it. A plain one raised by a library,
     or a subclass from elsewhere such as ``NotImplementedError``, is not one. A refusal's text names
     its fix, so it is printed whole."""
+    from messagefoundry.exception_origin import raised_by_the_engine
+
     if not isinstance(exc, RuntimeError):
         return False
     if type(exc) is not RuntimeError:
         return type(exc).__module__.split(".")[0] == "messagefoundry"
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+    return raised_by_the_engine(exc)
 
 
 def _engine_refusal_text(exc: BaseException) -> str:

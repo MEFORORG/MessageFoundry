@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
+from messagefoundry.exception_origin import raised_by_the_engine
 from messagefoundry.privilege_check import vault_admin_paths
 from messagefoundry.transports.bounded_read import TruncatedResponseError
 
@@ -207,7 +208,7 @@ def _why(exc: BaseException) -> str:
     # innermost frame, not who wrote the text, so it does not catch a ValueError a C builtin such
     # as int() raises inside engine code, nor engine code that copies a library's text. An
     # exception never raised has no frame, and keeps its type name alone.
-    if type(exc) is ValueError and _raised_by_the_engine(exc):
+    if type(exc) is ValueError and raised_by_the_engine(exc):
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
 
@@ -224,20 +225,6 @@ def _ad_why(exc: BaseException) -> str:
     if isinstance(exc, InsecureHopRefused):
         return strip_control_chars(str(exc))
     return _why(exc)
-
-
-def _raised_by_the_engine(exc: BaseException) -> bool:
-    """Whether the innermost frame of ``exc``'s traceback is in a ``messagefoundry`` module (vault
-    BACKLOG #3454), the rule ``config.wiring`` and ``__main__._is_engine_refusal`` apply too. A
-    copy, not an import of ``config.wiring``'s, so the probe neither loads that module nor imports
-    anything inside its exception handlers, where a failed import would raise."""
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
 
 
 def _strings(value: object) -> tuple[str, ...]:
