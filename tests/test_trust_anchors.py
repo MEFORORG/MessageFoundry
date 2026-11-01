@@ -2895,47 +2895,32 @@ async def test_a_store_fault_in_the_lane_check_is_not_remembered_as_a_refusal(
     assert store.writes
 
 
-class _FullPageAuditStore(_FaultyAuditStore):
-    """An audit log whose every read is a full page of other anchors' rows ending in ``ts``."""
+class _KeysetAuditStore(_FaultyAuditStore):
+    """One full page of other anchors' rows above the ``ad`` baseline, all carrying ``ts``. It
+    honours ``before_id`` and ignores ``until``, as a read keyed on the ``ts`` would then show."""
 
-    def __init__(self, ts: object, first: dict[str, Any] | None = None) -> None:
+    def __init__(self, ts: object) -> None:
         super().__init__(None)
-        self.ts = ts
-        self.first = first
+        page = ta._FINGERPRINT_PAGE
+        other = json.dumps({"label": "oidc"})
+        self.rows: list[dict[str, Any]] = [
+            {"id": n, "detail": other, "ts": ts} for n in range(page + 1, 1, -1)
+        ]
+        baseline = json.dumps({"label": "ad", "fingerprint": "f1"})
+        self.rows.append({"id": 1, "detail": baseline, "ts": ts})
 
-    async def list_audit(self, **_kw: object) -> list[dict[str, Any]]:
-        other = {"detail": json.dumps({"label": "oidc"}), "ts": 1.0}
-        rows = [other] * (ta._FINGERPRINT_PAGE - 1) + [{"detail": None, "ts": self.ts}]
-        return rows if self.first is None else [self.first, *rows[1:]]
-
-
-@pytest.mark.parametrize("ts", ["not-a-time", None, "nan", "inf"])
-async def test_a_look_back_that_cannot_page_past_a_bad_ts_is_a_store_fault(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ts: object
-) -> None:
-    """Vault BACKLOG #3746 item 3: a page's oldest ``ts`` is what asks for the next page. One that
-    is not a finite number raised ValueError through a reload, or, for "nan" and "inf", ended the
-    look-back as a first observation. It is the store fault now, so the check stays refused and
-    reads as what it is. Red under: the ``float`` call unguarded, or the finite test removed."""
-    _judged_clean(monkeypatch)
-    store: Any = _FullPageAuditStore(ts)
-    with pytest.raises(ta.AnchorStoreUnavailable, match="a bad ts for 'ad'") as err:
-        await ta._last_fingerprint(store, "ad")
-    assert isinstance(err.value.__cause__, TypeError | ValueError)
-    from messagefoundry.config.wiring import WiringError
-
-    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
-    preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
-    assert preflight is not None
-    with pytest.raises(WiringError, match="a trust anchor could not be checked"):
-        await preflight()
+    async def list_audit(self, **kw: Any) -> list[dict[str, Any]]:
+        below = kw.get("before_id")
+        return [r for r in self.rows if below is None or r["id"] < below][: kw["limit"]]
 
 
-async def test_a_baseline_found_on_the_page_does_not_read_the_bad_ts() -> None:
-    """The control for the test above: only a look-back that must go on reads the ``ts``, so a
-    label found on the page still reads as found. Red under: the ``ts`` checked before the rows."""
-    row = {"detail": json.dumps({"label": "ad", "fingerprint": "f1"}), "ts": 2.0}
-    store: Any = _FullPageAuditStore("not-a-time", first=row)
+@pytest.mark.parametrize("ts", ["not-a-time", None, "nan", "inf", 1.0])
+async def test_the_look_back_pages_past_any_ts(ts: object) -> None:
+    """Vault BACKLOG #3746 item 3: the look-back pages on ``id``, so it reads no ``ts``. A
+    malformed one on a page's last row raised ValueError through a reload, and a whole page at one
+    instant, the ``1.0`` case, gave up and read as a first observation. The baseline below that
+    page is found in each case. Red under: the page's cursor taken from ``ts``."""
+    store: Any = _KeysetAuditStore(ts)
     assert (await ta._last_fingerprint(store, "ad")).found == (ta.ANCHOR_DIGEST, "f1")
 
 

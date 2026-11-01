@@ -637,7 +637,13 @@ async def test_the_control_route_answers_a_stopped_check_as_a_store_fault(
     assert rr is not None and not rr.inbound_running(_IB)
     assert "could not be checked" in (rr.inbound_failed(_IB) or "")
     assert await _rows(store, "connection_control") == [
-        {"connection": _IB, "action": action, "role": "source", "running": False}
+        {
+            "connection": _IB,
+            "action": action,
+            "role": "source",
+            "running": False,
+            "reason": "store_unavailable",
+        }
     ]
 
 
@@ -675,17 +681,19 @@ def _store_fault_line() -> TrustAnchorError:
 
 
 @pytest.mark.parametrize(
-    ("raised", "status", "detail"),
+    ("action", "raised", "status", "detail"),
     [
-        pytest.param(_store_fault_line(), 503, _STORE_START, id="store"),
-        pytest.param(TrustAnchorError("x"), 409, _ANCHOR_REFUSED_DETAIL, id="anchor"),
-        pytest.param(WiringError("x"), 409, f"{_IB!r}: start refused", id="start-gate"),
+        pytest.param("start", _store_fault_line(), 503, _STORE_START, id="store"),
+        pytest.param("restart", _store_fault_line(), 503, _STORE_RESTART, id="store-restart"),
+        pytest.param("start", TrustAnchorError("x"), 409, _ANCHOR_REFUSED_DETAIL, id="anchor"),
+        pytest.param("start", WiringError("x"), 409, f"{_IB!r}: start refused", id="start-gate"),
     ],
 )
 async def test_a_refused_start_keeps_its_answer_when_its_audit_row_fails(
     store: MessageStore,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    action: str,
     raised: Exception,
     status: int,
     detail: str,
@@ -704,16 +712,16 @@ async def test_a_refused_start_keeps_its_answer_when_its_audit_row_fails(
     async def refuse_start(_name: str, *, operator: bool) -> None:
         raise raised
 
-    async def refuse_control(action: str, **kwargs: Any) -> None:
-        if action == "connection_control":
+    async def refuse_control(audit_action: str, **kwargs: Any) -> None:
+        if audit_action == "connection_control":
             raise sqlite3.OperationalError("database is locked")
-        await real(action, **kwargs)
+        await real(audit_action, **kwargs)
 
-    monkeypatch.setattr(rr, "start_inbound", refuse_start)
+    monkeypatch.setattr(rr, f"{action}_inbound", refuse_start)
     monkeypatch.setattr(store, "record_audit", refuse_control)
     try:
         with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
-            r = await _control(engine, "start")
+            r = await _control(engine, action)
         assert r.status_code == status, r.text
         assert detail in r.json()["detail"]
         lost = [rec for rec in caplog.records if "connection_control row" in rec.getMessage()]
@@ -744,6 +752,45 @@ async def test_a_connection_test_reports_a_stopped_check_as_a_store_fault(
     with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
         await runner.check_test_anchor(name)
     assert isinstance(err.value.__cause__, AnchorStoreUnavailable)
+
+
+@pytest.mark.parametrize("row_lands", [True, False], ids=["row-written", "row-lost"])
+async def test_the_connection_test_route_keeps_the_store_line_when_its_row_fails(
+    store: MessageStore,
+    tmp_path: Path,
+    judged: None,
+    monkeypatch: pytest.MonkeyPatch,
+    row_lands: bool,
+) -> None:
+    """Vault BACKLOG #3746 item 2, through the route: the fixed line reaches the caller, and
+    ``audit_log.detail`` when the row lands. A store that stopped the check is likely to refuse
+    this row too, and the line stands then as well. Red under: the route's write left bare, which
+    answers 500 for ``row-lost``."""
+    faulty: Any = _FaultyAuditStore("list_audit")
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_poller_graph(_ca(tmp_path), None, auto_start=False))
+    await engine.start()
+    real = store.record_audit
+
+    async def refuse_test_row(action: str, **kwargs: Any) -> None:
+        if action == "connection_test":
+            raise sqlite3.OperationalError("database is locked")
+        await real(action, **kwargs)
+
+    if not row_lands:
+        monkeypatch.setattr(store, "record_audit", refuse_test_row)
+    try:
+        r = await _control(engine, "test")
+        assert r.status_code == 200, r.text
+        assert (r.json()["success"], r.json()["detail"]) == (False, _STORE_START)
+        rows = await _rows(store, "connection_test")
+        assert [row["detail"] for row in rows] == ([_STORE_START] if row_lands else [])
+    finally:
+        await engine.stop()
 
 
 async def test_a_connection_test_still_reports_a_failed_build_as_one(store: MessageStore) -> None:

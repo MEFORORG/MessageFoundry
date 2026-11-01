@@ -220,7 +220,6 @@ import errno
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import shlex
@@ -343,8 +342,7 @@ def trust_anchor_cause(exc: BaseException) -> TrustAnchorError | None:
 
 
 class AnchorStoreUnavailable(Exception):
-    """The store refused an audit read or write that a trust-anchor check needs (BACKLOG #3091),
-    or returned a row whose ``ts`` the look-back cannot page past (vault BACKLOG #3746).
+    """The store refused an audit read or write that a trust-anchor check needs (BACKLOG #3091).
 
     It is **not** a :class:`TrustAnchorError`. It is raised only for an anchor that passed its
     checks, or for the advisory ``restart_required`` row after every anchor passed, so a reload it
@@ -2115,19 +2113,16 @@ class _Baseline(NamedTuple):
 async def _last_fingerprint(store: Store, label: str) -> _Baseline:
     """The most-recently audited fingerprint for ``label``, with the digest it is in, or ``None`` if
     this anchor has never been observed. Reads the ``auth.trust_anchor`` audit rows
-    (most-recent-first), a page at a time, and reads the first matching label's row. Each page ends
-    at the oldest timestamp of the one before, inclusively, so a row at that instant is read twice
-    and never skipped.
+    (most-recent-first), a page at a time, and reads the first matching label's row. Each page
+    starts below the ``id`` the one before ended on, the store's keyset cursor, so no row's ``ts``
+    is read (vault BACKLOG #3746): a page all at one instant, or one ending in a malformed ``ts``,
+    cannot cost the baseline. Only :data:`_FINGERPRINT_PAGES` ends the look-back early, which still
+    reads as a first observation.
 
     A row with no ``algorithm`` was written before BACKLOG #3425 and is :data:`UNMARKED_DIGEST`. A
     row naming a digest this release does not compile in is skipped, with one WARNING per call,
     and the look-back goes on to an older row: the stored marker never selects a digest to compute,
-    and the anchor is still compared with the newest row it can read.
-
-    A page's oldest row with a ``ts`` that is not a finite number raises
-    :class:`AnchorStoreUnavailable`, because no older page can be asked for and a row like that
-    is not a log to trust (vault BACKLOG #3746). Its other give-ups, at least a whole page at one
-    instant and the page cap, still read as a first observation."""
+    and the anchor is still compared with the newest row it can read."""
     skipped: set[str] = set()
     try:
         return _Baseline(await _last_readable_fingerprint(store, label, skipped), bool(skipped))
@@ -2144,10 +2139,12 @@ async def _last_fingerprint(store: Store, label: str) -> _Baseline:
 async def _last_readable_fingerprint(
     store: Store, label: str, skipped: set[str]
 ) -> Fingerprint | None:
-    until: float | None = None
+    before_id: int | None = None
     for _page in range(_FINGERPRINT_PAGES):
         try:
-            rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+            rows = await store.list_audit(
+                action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, before_id=before_id
+            )
         except _STORE_CALL_DEFECTS:
             raise
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
@@ -2170,15 +2167,7 @@ async def _last_readable_fingerprint(
             return Fingerprint(algorithm, fp) if isinstance(fp, str) else None
         if len(rows) < _FINGERPRINT_PAGE:
             return None
-        try:
-            oldest = float(rows[-1]["ts"])
-            if not math.isfinite(oldest):
-                raise ValueError(f"a non-finite audit timestamp: {oldest}")
-        except (TypeError, ValueError) as exc:
-            raise _store_unavailable(label, "read of a row with a bad ts", exc) from exc
-        if until is not None and oldest >= until:
-            return None  # a whole page at one instant: nothing older can be reached this way
-        until = oldest
+        before_id = rows[-1]["id"]
     return None
 
 

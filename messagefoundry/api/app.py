@@ -3691,14 +3691,18 @@ async def _record_control_audit(
     role: str,
     running: bool,
     client: str | None,
+    reason: str | None = None,
 ) -> None:
     """Audit a start/stop/restart of a connection (BACKLOG #1642).
 
-    Written when the action completed, and for an inbound whose start or restart was refused
-    (:func:`_record_refused_control_audit`), where ``running`` is false. A refused restart has
-    already stopped the listener, so that row records something that happened. The denial paths
+    Written when the action completed, and for an inbound whose start or restart was attempted and
+    refused (:func:`_record_refused_control_audit`), where ``running`` is false. A refused restart
+    has already stopped the listener, so that row records something that happened. The denial paths
     write ``auth.channel_denied`` instead. At least a 404 and the 409 for a connection not deployed
-    write no row here: the lane never moved, so a row would assert an action that did not happen.
+    write no row here: nothing was attempted, so a row would assert an action that did not happen.
+
+    ``reason``, where set, joins the row's detail. Only a store fault sets it (vault BACKLOG #3746),
+    with the value a reload's row uses for one, so an audit reader can tell it from a refused CA.
 
     ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
     for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
@@ -3716,13 +3720,22 @@ async def _record_control_audit(
         "connection_control",
         actor=identity.username,
         channel_id=name if role == "source" else None,
-        detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
+        detail=json.dumps(
+            {"connection": name, "action": action, "role": role, "running": running}
+            | ({"reason": reason} if reason is not None else {})
+        ),
         client=client,
     )
 
 
 async def _record_refused_control_audit(
-    engine: Engine, identity: Identity, name: str, action: str, *, client: str | None
+    engine: Engine,
+    identity: Identity,
+    name: str,
+    action: str,
+    *,
+    store_fault: bool,
+    client: str | None,
 ) -> None:
     """:func:`_record_control_audit` for an inbound whose start or restart was refused.
 
@@ -3734,13 +3747,26 @@ async def _record_refused_control_audit(
     await write_audit_soft(
         lambda: _write_through_cancel(
             _record_control_audit(
-                engine, identity, name, action, role="source", running=False, client=client
+                engine,
+                identity,
+                name,
+                action,
+                role="source",
+                running=False,
+                client=client,
+                reason="store_unavailable" if store_fault else None,
             ),
             lambda: _lost_row("connection_control", actor, f"refused {action} of {name}"),
         ),
         log=_log,
-        message="a refused %s of inbound connection %s by %s: its connection_control row failed",
-        args=lambda: (action, scrub_log_argument(name), scrub_log_argument(actor)),
+        message="a refused %s of inbound connection %s by %s at %s: its connection_control row "
+        "failed",
+        args=lambda: (
+            action,
+            scrub_log_argument(name),
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+        ),
         # (), as write_audit_soft's docstring asks where a raise would replace the answer owed.
         defects=(),
     )
@@ -5397,7 +5423,14 @@ def create_app(
                     409, f"inbound connection {name!r}: {action} refused; see the server log"
                 )
             if refused is not None:
-                await _record_refused_control_audit(engine, identity, name, action, client=client)
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    store_fault=refused.status_code == 503,
+                    client=client,
+                )
                 raise refused
             running = rr.inbound_running(name)
             await _record_control_audit(
@@ -5606,20 +5639,35 @@ def create_app(
         # Scope before existence, so a scoped caller cannot probe for names (BACKLOG #2551).
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         result = await _run_connection_test(rr, name, direction)
-        await engine.store.record_audit(
-            "connection_test",
-            actor=identity.username,
-            channel_id=name if direction == "in" else None,
-            detail=json.dumps(
-                {
-                    "connection": name,
-                    "direction": direction,
-                    "supported": result.supported,
-                    "success": result.success,
-                    "detail": result.detail,
-                }
-            ),
-            client=client_ip(request),
+
+        async def write_row() -> None:
+            await engine.store.record_audit(
+                "connection_test",
+                actor=identity.username,
+                channel_id=name if direction == "in" else None,
+                detail=json.dumps(
+                    {
+                        "connection": name,
+                        "direction": direction,
+                        "supported": result.supported,
+                        "success": result.success,
+                        "detail": result.detail,
+                    }
+                ),
+                client=client_ip(request),
+            )
+
+        if result.detail != _ANCHOR_STORE_DETAIL:
+            await write_row()
+            return result
+        # Vault BACKLOG #3746: the store that stopped the check is likely to refuse this row too.
+        # Nothing was dialled, and a raise would replace the store line with a 500, so () defects.
+        await write_audit_soft(
+            write_row,
+            log=_log,
+            message="a connection test of %s by %s: its connection_test row failed",
+            args=lambda: (scrub_log_argument(name), scrub_log_argument(identity.username)),
+            defects=(),
         )
         return result
 
