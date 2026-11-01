@@ -2606,9 +2606,10 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         if understood is not None:
             steps = _Binder(understood[0], subject, held).run(understood[1])
         else:
-            steps = _lift_branch_branches(
-                _switch_off(_container_steps(action_list, subject, held, False))
-            )
+            steps = _switch_off(_container_steps(action_list, subject, held, False))
+        # On both paths, so no handler this builds holds a branch of a branch, which every walk
+        # of the tree reads nowhere (:func:`_live_controls`).
+        steps = _lift_branch_branches(steps)
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
             # commented-out pseudo-source, counted as disabled, and — because _collect_sends skips a
@@ -2925,11 +2926,12 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
         # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
         handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
-        refusals = {c.kind for c in _live_controls(ctrl.body) if _raises_a_refusal(c)}
-        if refusals:
+        first = next(filter(_raises_a_refusal, _live_controls(ctrl.body)), None)
+        if first is not None:
             # Every Catch renders as ``except Exception:``, which would swallow the refusal's raise
             # and run the Catch body instead: a delivery or a silent filter (BACKLOG #313).
-            what = "MsgSend" if "send" in refusals else "Catch"
+            sends = first.kind == "send" or _any_live_control(ctrl.body, _is_refused_send)
+            what = "MsgSend" if sends else "Catch"
             out.append(f"{pad}except NotImplementedError:  # a refused {what} above — never caught")
             out.append(f"{pad}    raise")
         # Set only on a ``try`` left with no Catch (:func:`_switch_off_control`).
@@ -3144,8 +3146,10 @@ def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list.
 
     A send in a Block's or a Call's ``@Data`` is refused and still a send
-    (:data:`_LABEL_SEND_REFUSAL`), so this
-    reads the tree as main does, and a handler ends on the ``return`` main gives it."""
+    (:data:`_LABEL_SEND_REFUSAL`), so a handler ends on the ``return`` main gives it, but for
+    one case: a send main left only in a branch of a branch now renders inline, dead, so the
+    handler ends on its ``sends`` list where main's closing ``return Send(...)`` delivered it for
+    every message (:func:`_lift_branch_branches`)."""
     return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
@@ -3153,7 +3157,12 @@ def _raises_a_refusal(ctrl: Control) -> bool:
     """Whether ``ctrl`` renders as a live ``raise NotImplementedError``: a refused ``MsgSend``
     (see :func:`_send_refusal`), or a ``try`` whose ``Catch`` is switched off
     (:attr:`Control.catch_off`). An enclosing ``try`` re-raises either past its handlers."""
-    return (ctrl.kind == "send" and bool(ctrl.refusal)) or bool(ctrl.catch_off)
+    return _is_refused_send(ctrl) or bool(ctrl.catch_off)
+
+
+def _is_refused_send(ctrl: Control) -> bool:
+    """Whether ``ctrl`` is a refused ``MsgSend`` (see :func:`_send_refusal`)."""
+    return ctrl.kind == "send" and bool(ctrl.refusal)
 
 
 def _any_live_control(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
@@ -3165,8 +3174,8 @@ def _live_controls(steps: tuple[Step, ...]) -> Iterator[Control]:
     """Every live (not ``@Disabled``) control in the tree, depth-first in source order: each
     construct, then its body, then each branch's body. The one walk the send walk
     (:func:`_collect_sends`) and every live test share, so they read what the render emits.
-    A branch's own branches are read nowhere: :func:`_lift_branch_branches` leaves none on the
-    step 1 path, and :class:`_Binder` builds no branch."""
+    A branch's own branches are read nowhere: :func:`_lift_branch_branches` leaves none in a
+    handler :func:`parse_package` builds."""
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
             continue

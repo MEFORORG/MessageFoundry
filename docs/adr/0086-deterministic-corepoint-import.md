@@ -824,8 +824,8 @@ not hold, at least.
 branch of that branch. No chain renders one, and neither the count nor the inline-send test read
 one, but the send walk did, so a send in it selected the handler's closing `return Send(...)`
 wherever the handler had no inline send left: a delivery for every message. That defect is main's,
-and switching off an inline send, from a wrapper or a `@Disabled` statement, reached it more
-often. Once placement and the switch-off pass are done, each branch of a branch moves to the end
+and main reached it already where the other send was a `@Disabled` statement; switching off a
+wrapper's inline send reached it more often. Once placement and the switch-off pass are done, each branch of a branch moves to the end
 of the body of the branch it was written in, where it is an orphan like any other: dead under its
 placeholder, its comment saying no construct continues it, its marker counted unmapped, its steps
 counted, and its send inline. The send walk and the inline-send test now share one walk of the
@@ -833,13 +833,20 @@ tree the render emits, so a send the walk names always renders inline, and no se
 closing `return Send(...)`. This changes main's output on lists with no wrapper too, in one
 direction only: a send main made for every message through that `return` now never runs.
 
-**What this changes that is not fail-closed in main's terms.** A send or a refusal main made from
-a disabled wrapper, or from an orphan's body, no longer runs. A refused send raised to ERROR on
-main: a `try` around it re-raised it past every `Catch`, so the steps after it in that body, and
-after that `try`, never ran. Switched off, it no longer raises, and those steps now run, so a
-message main sent to ERROR there may be delivered by a later step, or FILTERED. That is what the
-operator switched off, and it is a change of behaviour, not a quieter form of main's. "Never
-quieter than main" in §2(b.4) bounds that amendment. The differential guard loads this amendment
+**What this changes that is not fail-closed in main's terms.** A step main ran from a disabled
+wrapper, or from an orphan's body, no longer runs, and that holds for a step that raised. A
+refused send raised to ERROR on main: a `try` around it re-raised it past every `Catch`. A write
+that raised, such as a clear of a field the message lacks, went to the `Catch` of a `try` around
+it, or to ERROR. Switched off, or dead under a placeholder, neither raises, so the steps after it
+now run: a message main sent to ERROR or to a `Catch` there may be delivered by a later step, or
+FILTERED. At least these reach it: a switched-off step in a `try` body or after it; a `Catch`
+whose body is wholly switched off, which now catches a raise where main's body raised again; and
+a branch adopted across a step that runs nothing, or left an orphan, whose body main ran live at
+the handler's own level. The scan skips a disabled wrapper too, so a handle switched off there no
+longer counts: a send main refused because a copy or a second handle in the wrapper left `msg`
+uncertain now delivers, and a write main left as a TODO now maps. That is what the operator
+switched off, and it is a change of behaviour, not a quieter form of main's. "Never quieter than
+main" in §2(b.4) bounds that amendment. The differential guard loads this amendment
 first, written apart from the head (a tuple mark, a look-back adoption, one switch-off function),
 and bounds §2(b.4) against the tree it loads onto.
 
@@ -856,8 +863,10 @@ among them, with the review rounds' repros. It holds the closing `return` to the
 baseline's own closing `return` delivers to. Against the first cut of this amendment, which
 commented a wrapper out as one node, and against the cut before the branch-of-a-branch fix, it
 finds lists more live than the baseline; against this one it finds none. That is a reading of that
-battery, not a proof. It reads no `except` path: which `Catch` a raise reaches is held by the
-nested-`Try` tests, not by it.
+battery, not a proof. It reads nesting, not raises: a line after a step that raised on main
+scores as live as one after a step that did not, so it cannot see any change the paragraph above
+lists, and both bounds load the scan half into their baseline, so neither sees the scan change.
+Nor does it read which `Catch` a raise reaches; the nested-`Try` tests hold that.
 
 At least these limits remain:
 
@@ -865,7 +874,9 @@ At least these limits remain:
   gives a construct that cannot continue it, an element whose tag is not modelled, the steps after
   a bare marker standing at the handler's own level or in a `<Block>` body, and the steps after a
   bare marker adopted by a nested construct written directly before it.
-- A switched-off refusal no longer stops the steps after it, as the paragraph above says.
+- A switched-off or dead step that raised on main, a refused send among them, no longer stops
+  the steps after it, and the scan change delivers some sends main refused, as the paragraph
+  above says. No test bounds either.
 
 ## 3. Acceptance criteria
 

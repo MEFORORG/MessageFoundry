@@ -3754,8 +3754,9 @@ def test_a_branch_of_a_branch_renders_dead_and_never_selects_the_closing_return(
     """The branch-of-a-branch closing return. The send in a branch of a branch renders under the
     orphan's dead placeholder, counted unmapped, and the handler ends on its ``sends`` list, so
     nothing is sent. Main ended this handler on ``return Send("OB_B", msg)`` wherever it had no
-    inline send: a delivery for every message. With the If's send switched off, by a wrapper or
-    on its own line, main delivered nothing, and the re-cut delivered for every message."""
+    inline send: a delivery for every message, with the If's send on its own ``@Disabled`` line
+    too. With that send in a disabled wrapper instead, main delivered nothing, and the re-cut
+    delivered for every message."""
     body = f'<Line Data="If (x)"><List>{_IF_HOLDING[held]}</List></Line>{_BRANCH_OF_A_BRANCH}'
     src = _handler_source(body)
     handler = _handler_body(src)
