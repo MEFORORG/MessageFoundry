@@ -327,6 +327,43 @@ def test_control_the_mirrored_settings_attestation_alone_still_builds() -> None:
         )
 
 
+def _ftp_with_settings_reason(**reason: object) -> RemoteFileDestination:
+    """A ``Destination`` built directly with the attestation only in its settings, and no typed
+    declaration, built under an enforcing posture."""
+    settings = {k: v for k, v in _FTP_ATTESTED.items() if k != "tls_hop_attested_reason"}
+    settings.update(reason)
+    with active_hop_posture(HopPosture(enforcing=True)):
+        return RemoteFileDestination(
+            Destination(name="OB_FTP", type=ConnectorType.REMOTEFILE, settings=settings)
+        )
+
+
+@pytest.mark.parametrize(
+    ("reason", "refusal"),
+    [
+        pytest.param({}, "requires tls_hop_attested_reason", id="missing"),
+        pytest.param({"tls_hop_attested_reason": "   "}, "non-empty", id="blank"),
+        pytest.param(
+            {"tls_hop_attested_reason": "ok\nWARNING forged line"},
+            "control characters",
+            id="cr-lf",
+        ),
+    ],
+)
+def test_a_directly_built_destination_holds_its_settings_attestation_to_the_reason_rules(
+    reason: dict[str, Any], refusal: str
+) -> None:
+    """The anonymous-FTP guard crosses on a settings attestation, so the model holds it to the
+    rules the factories apply. Before, each of these built and crossed an enforcing hop, logging
+    no reason or a forged second line."""
+    with pytest.raises(ValueError, match=refusal):
+        _ftp_with_settings_reason(**reason)
+
+
+def test_control_a_settings_attestation_with_a_reason_builds() -> None:
+    _ftp_with_settings_reason(tls_hop_attested_reason="IPsec tunnel to the partner")
+
+
 _ACCEPTED: dict[str, Any] = {
     "cleartext_accepted": True,
     "cleartext_reason": "legacy partner listener has no TLS",

@@ -6124,8 +6124,22 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
     ]
+
+    def _pair_refused(name: str, accepted: bool) -> bool:
+        # outbound() refuses the pair, and the Destination model refuses an OutboundConnection
+        # built directly with it, so such an entry is a hop the engine never builds.
+        try:
+            _refuse_attested_and_accepted(name, True, accepted)
+        except WiringError:
+            return True
+        return False
+
     out += [
-        AttestedHop(oc.name, _attested_reason_text(oc.tls_hop_attested_reason), False)
+        AttestedHop(
+            oc.name,
+            _attested_reason_text(oc.tls_hop_attested_reason),
+            _pair_refused(oc.name, oc.cleartext_accepted),
+        )
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
