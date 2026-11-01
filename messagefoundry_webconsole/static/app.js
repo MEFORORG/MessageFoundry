@@ -310,7 +310,8 @@
 
     // Recompute the select-all header checkbox's checked/indeterminate from the live Set. Ticked
     // means every row a click can take is taken, not every rendered row: a filtered select-all must
-    // stay ticked, because its next click is the uncheck that clears the selection.
+    // stay ticked, because its next click is the uncheck that clears the selection. So a selection
+    // with no row to take reads ticked too, or no click on the box could clear it.
     function syncSelectAll() {
       var box = selectAllBox();
       if (!box) return;
@@ -326,7 +327,7 @@
           if (isSelected) taken++;
         }
       }
-      box.checked = takeable > 0 && taken === takeable;
+      box.checked = checked > 0 && taken === takeable;
       // A selection that holds a row select-all could not take keeps its mark, ticked or not, since
       // that row is still acted on. Ticked, the next click clears it too; unticked, it stays.
       box.indeterminate = box.checked ? checked > taken : checked > 0;
@@ -394,8 +395,7 @@
           if (t.checked) selected.add(cbs[i].value);
           else selected.delete(cbs[i].value);
         }
-        // At once, so a click that took nothing leaves the box clear: a ticked box's next click
-        // would be the uncheck that clears every row, those ticked by hand included.
+        // At once, so a click that took nothing does not leave the box ticked over no selection.
         syncSelectAll();
         refresh();
       }

@@ -29,9 +29,10 @@ _NODE = shutil.which("node")
 
 #: Loads app.js against just enough of a browser for the connections filter and the toolbar, one row
 #: per given ``data-flagged`` value, then runs the steps: ``"click"`` clicks select-all, ``"swap"``
-#: replaces the table as a poll does, firing the observers in the order the page registered them, and
-#: ``{"tick": value}`` clicks that row's box, and ``{"query": text}`` types into the filter. Prints
-#: which values stayed visible and which are selected.
+#: replaces the table as a poll does, firing the observers in the order the page registered them,
+#: ``"flip"`` flips Flagged only and fires its change event, ``{"tick": value}`` clicks that row's
+#: box, and ``{"query": text}`` types into the filter. Prints which values stayed visible and which
+#: are selected.
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -64,7 +65,10 @@ const poll = {
   dispatchEvent(event) { listeners[event.type]?.(event); },
 };
 const input = { value: "", addEventListener(_type, fn) { input.onInput = fn; } };
-const flaggedOnly = { checked: JSON.parse(flaggedOnlyJson), addEventListener() {} };
+const flaggedOnly = {
+  checked: JSON.parse(flaggedOnlyJson),
+  addEventListener(_type, fn) { flaggedOnly.onChange = fn; },
+};
 const toolbar = { querySelector() { return null; } };
 const hooks = {
   "[data-poll]": poll,
@@ -113,6 +117,9 @@ for (const step of JSON.parse(stepsJson)) {
     all.checked = false;
     all.indeterminate = false;
     observers.forEach((fn) => fn());
+  } else if (step === "flip") {
+    flaggedOnly.checked = !flaggedOnly.checked;
+    flaggedOnly.onChange();
   } else if ("query" in step) {
     input.value = step.query;
     input.onInput();
@@ -249,28 +256,47 @@ def test_select_all_with_flagged_only_off_takes_every_row(tmp_path: Path) -> Non
 
 @pytest.mark.skipif(_NODE is None, reason="node is not installed")
 def test_a_select_all_that_took_nothing_leaves_its_box_clear(tmp_path: Path) -> None:
-    """RED when the box stays ticked: the next click is then the uncheck, which clears every row,
-    including those the operator ticked by hand."""
+    """RED when the box stays ticked: it then claims a selection that holds no row."""
     run = _run_app_js(tmp_path, flagged_only=True, values=("unknown", "unknown"))
     assert run["selected"] == [] and run["header"] is False
 
 
-#: Each hides a row: Flagged only hides the ``"0"`` row and select-all skips ``"unknown"``, and the
-#: typed query hides everything but ``"1"``.
-_FILTERED = pytest.mark.parametrize(
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+@pytest.mark.parametrize(
+    ("flagged_only", "values", "steps"),
+    [
+        (False, ("1", "0"), ("click", {"query": "no such row"}, "click")),
+        (True, ("unknown", "0"), ({"tick": "unknown"}, "click")),
+    ],
+    ids=["every-row-hidden", "no-row-known-flagged"],
+)
+def test_a_click_with_no_row_to_take_clears_the_selection(
+    tmp_path: Path,
+    flagged_only: bool,
+    values: tuple[str, ...],
+    steps: tuple[str | dict[str, str], ...],
+) -> None:
+    """RED when the box reads unticked here: such a click takes nothing and lands in the same state.
+    With every row hidden, no box on the page could then clear the selection, and a bulk action
+    would still reach it. The second arm pins that the rule has no exception for a row on screen:
+    its own box could clear it, and the header clears it too."""
+    run = _run_app_js(tmp_path, flagged_only=flagged_only, values=values, steps=steps)
+    assert run["selected"] == []
+    assert run["header"] is False and run["indeterminate"] is False
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+@pytest.mark.parametrize(
     "filtered",
     [{"flagged_only": True}, {"flagged_only": False, "query": "row 1"}],
     ids=["flagged-only", "typed-query"],
 )
-
-
-@pytest.mark.skipif(_NODE is None, reason="node is not installed")
-@_FILTERED
 def test_a_filtered_select_all_keeps_its_box_ticked_and_the_next_click_clears(
     tmp_path: Path, filtered: dict[str, Any]
 ) -> None:
     """RED when the box counts every rendered row: it clears as soon as it is clicked, and the next
-    click selects again rather than clearing."""
+    click selects again rather than clearing. Each arm hides a row: Flagged only hides the ``"0"``
+    row and select-all skips ``"unknown"``, and the typed query hides everything but ``"1"``."""
     once = _run_app_js(tmp_path, steps=("click",), **filtered)
     assert once["selected"] == ["1"] and once["header"] is True and once["indeterminate"] is False
     twice = _run_app_js(tmp_path, steps=("click", "click"), **filtered)
@@ -278,17 +304,31 @@ def test_a_filtered_select_all_keeps_its_box_ticked_and_the_next_click_clears(
 
 
 @pytest.mark.skipif(_NODE is None, reason="node is not installed")
-@_FILTERED
-def test_a_swap_leaves_a_filtered_select_all_ticked(
-    tmp_path: Path, filtered: dict[str, Any]
-) -> None:
+def test_a_swap_leaves_a_filtered_select_all_ticked(tmp_path: Path) -> None:
     """A poll replaces the table every few seconds, and the toolbar's observer runs before the
     filter hides the fresh rows. RED when the box is judged only there: every row then counts as
-    takeable, so the box clears on the first tick and the next click selects again."""
-    swapped = _run_app_js(tmp_path, steps=("click", "swap"), **filtered)
+    takeable, so the box clears on the first tick and the next click selects again. Only a typed
+    query can show this. Select-all reads Flagged only itself, so under that filter the order
+    changes nothing, and the next test pins what that filter's own event does."""
+    steps: tuple[str | dict[str, str], ...] = ({"query": "row 1"}, "click", "swap")
+    swapped = _run_app_js(tmp_path, flagged_only=False, steps=steps)
     assert swapped["selected"] == ["1"] and swapped["header"] is True
-    cleared = _run_app_js(tmp_path, steps=("click", "swap", "click"), **filtered)
+    cleared = _run_app_js(tmp_path, flagged_only=False, steps=(*steps, "click"))
     assert cleared["selected"] == [] and cleared["header"] is False
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_flipping_flagged_only_judges_the_box_again(tmp_path: Path) -> None:
+    """RED when the filter's change event does not reach the box: it then reads the rows from
+    before the flip until the next poll. Turned on, the ``"1"`` row is the only one select-all can
+    take, and it is taken. Turned off, every row can be taken again."""
+    steps: tuple[str | dict[str, str], ...] = ({"tick": "1"}, "flip")
+    run = _run_app_js(tmp_path, flagged_only=False, steps=steps)
+    assert run["visible"] == ["1", "unknown"]
+    assert run["header"] is True and run["indeterminate"] is False
+    run = _run_app_js(tmp_path, flagged_only=False, steps=(*steps, "flip"))
+    assert run["visible"] == ["1", "0", "unknown"]
+    assert run["header"] is False and run["indeterminate"] is True
 
 
 @pytest.mark.skipif(_NODE is None, reason="node is not installed")
@@ -317,15 +357,12 @@ def test_typing_a_filter_judges_the_box_again(tmp_path: Path) -> None:
 @pytest.mark.skipif(_NODE is None, reason="node is not installed")
 def test_a_ticked_box_keeps_its_mark_for_a_selected_row_it_hides(tmp_path: Path) -> None:
     """RED when the box reads plainly ticked: the operator then has no sign that a bulk action, and
-    the next click, also reach a row the filter hides."""
+    the next click, also reach a row the filter hides. The mark covers two opposite clicks. The
+    first click here starts from it unticked, takes what it can and leaves the hidden row. The
+    second starts from it ticked and clears both."""
     steps = ({"tick": "0"}, {"query": "row 1"}, "click")
     run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
     assert run["selected"] == ["1", "0"] and run["visible"] == ["1"]
     assert run["header"] is True and run["indeterminate"] is True
     cleared = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=(*steps, "click"))
     assert cleared["selected"] == [] and cleared["header"] is False, "the hidden row goes too"
-    # Unticked, the same mark takes the rows it can and leaves the hidden one.
-    run = _run_app_js(
-        tmp_path, flagged_only=False, values=("1", "0"), steps=({"tick": "0"}, {"query": "row 1"})
-    )
-    assert run["header"] is False and run["indeterminate"] is True
