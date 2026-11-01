@@ -7,8 +7,8 @@ database writer can move a marker on the console and, through the Flagged-only f
 honours, shape a bulk action's target set. An operator still presses Go, and the owner accepted that
 reach on 2026-11-01 (ADR 0007, amendment of 2026-10-31). A reader that branched on it anywhere else
 would widen that reach without a word in any diff, and the seal question would be open again. So a
-new reader fails here until someone has looked at it. If the new reader acts on the value, seal it
-first.
+new reader this file can see fails here until someone has looked at it. If the new reader acts on
+the value, seal it first.
 
 ``auto_start`` and ``deployed`` sit beside where this flag used to, and both act. They stayed in
 ``connections.toml`` and this file says nothing about them.
@@ -176,7 +176,8 @@ def test_only_the_backends_name_the_table() -> None:
 def test_the_browser_reads_the_flag_in_the_filter_and_in_select_all_only() -> None:
     """The filter's read is the reach the owner accepted. Select-all's read did not exist then: it
     narrows that reach and accepts nothing further. A third branch on the value in ``app.js``, such
-    as preselecting flagged rows, would widen it, so it fails here until someone has looked at it."""
+    as preselecting flagged rows, would widen it, so a third read in this spelling fails here until
+    someone has looked at it. The module docstring says what this count cannot see."""
     source = (REPO / "messagefoundry_webconsole/static/app.js").read_text(encoding="utf-8")
     assert source.count('getAttribute("data-flagged")') == 2
 

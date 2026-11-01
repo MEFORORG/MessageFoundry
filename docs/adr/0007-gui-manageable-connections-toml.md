@@ -263,7 +263,7 @@ and an operator must press Go. Purge then adds a confirm page naming each outbou
 action has no such page, a row below the fold is still taken, and a selected row a later refresh
 hides stays selected, so it is still acted on. The header box shows the part-selected mark when the
 selection holds a row select-all could not take, and that mark covers opposite next clicks. Ticked,
-which it also is when a selection has no row left to take, a click clears the whole selection,
+which it also is for a selection when no row can be taken, a click clears the whole selection,
 hidden rows included. Unticked, a click adds every row it can take and leaves the rest selected.
 That states what the box does, and accepts nothing further. The toggle gives the same reach with an
 audit row: at least the Deployment role holds `config:deploy` and no bulk-action permission.

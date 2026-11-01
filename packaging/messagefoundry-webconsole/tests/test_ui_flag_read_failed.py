@@ -279,7 +279,11 @@ def test_a_click_with_no_row_to_take_clears_the_selection(
     """RED when the box reads unticked here: such a click takes nothing and lands in the same state.
     With every row hidden, no box on the page could then clear the selection, and a bulk action
     would still reach it. The second arm pins that the rule has no exception for a row on screen:
-    its own box could clear it, and the header clears it too."""
+    its own box could clear it, and the header clears it too. RED before the click when the box
+    drops its mark: no row selected would then show on screen, and nothing would say a click clears."""
+    held = _run_app_js(tmp_path, flagged_only=flagged_only, values=values, steps=steps[:-1])
+    assert held["selected"]
+    assert held["header"] is True and held["indeterminate"] is True
     run = _run_app_js(tmp_path, flagged_only=flagged_only, values=values, steps=steps)
     assert run["selected"] == []
     assert run["header"] is False and run["indeterminate"] is False

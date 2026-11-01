@@ -880,7 +880,8 @@ class AlertSink(Protocol):
     ) -> None:
         """A start found a config whose ADR 0041 D1 fingerprint differs from the store's baseline
         (vault BACKLOG #2597): the directory's just after the load, or that of the bytes the load
-        read, so either one differing raises it. The baseline is the newest usable
+        read, so either one differing raises it, and two digests that left out different files
+        differ. The baseline is the newest usable
         ``config_loaded`` or ``config_reload`` audit row from any node or engine shard, since
         every one of them shares one config directory; a row whose digest its process never checked
         is passed over, so the baseline can be older than the newest row. So an edit applied first by ``POST
