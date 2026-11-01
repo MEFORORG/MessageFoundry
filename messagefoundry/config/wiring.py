@@ -826,13 +826,16 @@ def refuse_capture_conflicts(
     undecided there: a reference is truthy whatever it resolves to, so reading one as on would refuse
     a graph whose flag resolves False, and reading one as satisfying ``expect_reply`` would pass a
     capture with no reply to capture (BACKLOG #3724). A ``statement`` behind ``env()`` is different:
-    this pass judges its repr, never its value, so ``capture_response=True`` is refused beside
-    ``env("sql")`` and passes beside ``env("output_sql")``.
+    this pass judges its repr, which holds the key and any default and never the resolved value. So
+    ``capture_response=True`` is refused beside ``env("sql")`` and passes beside
+    ``env("output_sql")``, and ``capture_out_params=True`` is refused beside ``env("proc")``.
 
-    The resolved settings come through here once more when the connector is built. ``serve`` always
-    reaches this second pass, ``messagefoundry check`` does unless its ``build-check`` leg skips a
-    config dir with no declared instance, and ``messagefoundry dryrun`` never does, since it builds
-    no connector. A conflict behind ``env()`` then waits for ``serve``."""
+    The resolved settings come through here once more when the connector is built. At least
+    ``messagefoundry check`` and a reload refuse there, ``check`` for the one environment it runs
+    under. At start the refusal fails that connection's lane (ADR 0031) rather than stopping the
+    engine, and a lane start skips, such as ``auto_start=False``, is judged when it is started.
+    ``check``'s ``build-check`` leg skips a config dir that declares no instance, and
+    ``messagefoundry dryrun`` builds no connector, so neither reaches this second pass."""
 
     def on(key: str) -> bool:
         value = settings.get(key)
@@ -2532,7 +2535,8 @@ def MLLP(
     (*at-most-once-confirmation*; a connect/drain failure is still charged + retried, so receivers must
     stay idempotent). ``False`` (the default) is **byte-identical** (read + validate one ACK). It
     composes with ``persistent=True`` (no handshake *and* no ACK wait) and is **incompatible** with
-    ``capture_response``/``reingress_to`` (there is no ACK to capture) — both rejected at ``check``.
+    ``capture_response``/``reingress_to`` (there is no ACK to capture) — both rejected at ``check``,
+    a flag behind ``env()`` only once it resolves (:func:`refuse_capture_conflicts`).
 
     ``encoding_characters`` (**outbound only**, Corepoint ``MsgSend -override component`` parity) makes
     this destination re-encode each outgoing message with a different set of HL7 delimiters before

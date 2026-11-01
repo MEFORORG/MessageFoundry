@@ -11853,7 +11853,8 @@ def _build_check_connectors(
         build_destination(dest, egress=egress)  # runs the fail-closed egress allowlist (WP-11c)
         # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
         # CROSS-registry fact (build_outbound_connection is registry-blind), enforced here so it
-        # fails at `check`/dry-run with no store, like every other connector validation.
+        # fails at `check` and in a reload's dry run with no store, like every other connector
+        # validation.
         target = oc.spec.settings.get("reingress_to")
         if target is not None:
             if str(target) not in loopbacks:
@@ -12419,8 +12420,8 @@ def check_http_sync_reply(
     """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
 
     These are the facts one ``Http()`` call cannot know, because they are about the *other*
-    connection. Runs with no store, so it fires at ``messagefoundry check`` and in dry-run exactly as
-    at serve.
+    connection. Runs with no store, so it fires at ``messagefoundry check`` and in a reload's dry run
+    exactly as at serve.
 
     The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
     warnings because together they make the feature's headline use case unserviceable.
@@ -12445,9 +12446,9 @@ def check_http_sync_reply(
     that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
     values always exist.
 
-    ``env_values`` is the same contract. Left ``None``, a target's ``env()`` capture flag is
-    undecided, so it passes rather than reads as a missing value; an empty mapping is an environment
-    that defines nothing, and that does read as missing.
+    ``env_values`` is the same contract. Left ``None``, a target's ``env()`` capture flag is not read
+    at all, default included, so it passes as undecided. A mapping resolves it, so an empty one reads
+    a ref with no default as missing.
     """
     settings = ic.spec.settings
     reply_from = settings.get("reply_from")
