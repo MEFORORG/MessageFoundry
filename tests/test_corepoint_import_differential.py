@@ -294,8 +294,9 @@ def _chained(step: Step) -> bool:
 def _off(step: Step) -> bool:
     if isinstance(step, Control):
         if step.kind == "disabled":
-            # One that holds a construct may own the branch after it.
-            return not _chained(step)
+            # One that holds a construct may own the branch after it. A wrapper holding a bare
+            # marker stood there as that marker when it was flattened.
+            return not _chained(step) and _left_open(step) is None
         # A label over nothing that runs. The label amendment's demoted call keeps its kind.
         return (
             step.kind == "block"
@@ -334,13 +335,10 @@ def _bare(step: Step) -> bool:
 
 
 def _left_open(step: Step) -> Control | None:
-    # A disabled wrapper keeps its tag as its source. Its last bare marker, at any depth of
-    # disabled wrappers, is the one whose branch the steps after it ran in.
-    if not (
-        isinstance(step, Control)
-        and step.kind == "disabled"
-        and step.source_verb.lower() in _LIST_TAGS
-    ):
+    # A disabled wrapper carries no ``args``, where a disabled statement carries its kind. Its
+    # last bare marker, at any depth of disabled wrappers, is the one whose branch the steps
+    # after it ran in.
+    if not (isinstance(step, Control) and step.kind == "disabled" and not step.args):
         return None
     for inner in reversed(step.body):
         if _bare(inner):
@@ -351,17 +349,18 @@ def _left_open(step: Step) -> Control | None:
 
 
 def _settle(marker: Control, tag: str, run: list[Step]) -> list[Step]:
-    if all(map(_off, run)):
+    if not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
         return run
     why = "its marker is in a @Disabled " + tag
-    return [replace(marker, detail="; ".join(filter(None, (marker.detail, why))), body=tuple(run))]
+    return [replace(marker, detail="; ".join(filter(None, (why, marker.detail))), body=tuple(run))]
 
 
 def _sealed(steps: list[Step]) -> list[Step]:
     out: list[Step] = []
     held: tuple[Control, str, list[Step]] | None = None
     for step in steps:
-        if held is not None and not _bare(step):
+        # The next bare marker ends the run, and so does the next wrapper leaving one open.
+        if held is not None and not _bare(step) and _left_open(step) is None:
             held[2].append(step)
             continue
         if held is not None:

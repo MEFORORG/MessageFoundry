@@ -797,13 +797,18 @@ a bare marker adopted by a nested construct written directly before it.
 
 A bare branch marker inside a disabled wrapper no longer opens its branch in the construct around
 the wrapper, as a disabled marker line never did. Main put the steps after the wrapper, up to the
-next marker, in that marker's branch: an `except` body, which runs whenever the `try` body raises,
-or an arm under a placeholder condition. Left in the construct's own body, a `try:` body or a
-`ChooseFrom` ahead of its first arm, they would run for every message. So they fail closed: they
-render as that marker's orphan, under an `if False:` that names the disabled wrapper, and the
-marker counts unmapped. A run of steps that runs nothing stays where it is. At the handler's own
-level main split no branch, so there the steps after the wrapper stay live, as after a bare marker
-written live there.
+next marker, in that marker's branch. That was at least an `except` body, which runs whenever the
+`try` body raises, an arm under a placeholder condition, or a stray branch a construct cannot
+continue. Left in the construct's own body, a `try:` body or a `ChooseFrom` ahead of its first
+arm, they would run for every message. So in a construct's own list they fail closed: they render
+as that marker's orphan, under an `if False:` that names the disabled wrapper, and the marker
+counts unmapped as well as disabled. Where main inlined a stray branch live, that is quieter than
+main. Such a wrapper is also no step that runs nothing, because the marker stood in its place, so
+no sibling branch is adopted across it. A run that renders no code stays where it is. In a list
+that is not split into branches, at least the handler's own level and a `<Block>` body, main
+opened no branch, so there the steps after the wrapper stay live, as after a bare marker written
+live there. The differential guard's baseline carries the same rule; its depth-only reading still
+cannot tell an `except` body from a `try:` body, so the unit tests are what pin this case.
 
 ## 3. Acceptance criteria
 

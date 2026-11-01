@@ -3026,8 +3026,50 @@ def test_a_switched_off_marker_seals_only_up_to_the_next_marker() -> None:
     assert _enclosing(handler, "OB_TWO").startswith(
         "    except Exception:  # TODO: Corepoint Catch"
     )
-    quiet = '<Try><List><List Disabled="1"><Line Data="Catch"/></List><Line Data="MsgLog %ADT"/>'
-    assert _ORPHAN not in _handler_body(_handler_source(quiet + "</List></Try>"))
+    off = '<List Disabled="1"><Line Data="Catch"/></List>'
+    for after in ('<Line Data="MsgLog %ADT"/>', '<Line Disabled="1" Data="If (b)"><List/></Line>'):
+        quiet = _handler_body(_handler_source(f"<Try><List>{off}{after}</List></Try>"))
+        assert _ORPHAN not in quiet, after
+    # Two such wrappers: each seals its own run, under its own marker.
+    two = (
+        f'<Try><List>{off}{_CLEAR}<List Disabled="1"><Line Data="Else"/></List>{second}'
+        "</List></Try>"
+    )
+    handler = _handler_body(_handler_source(two))
+    assert f"# TODO: Corepoint Catch {_ORPHAN}" in _enclosing(handler, "PID-19")
+    assert f"# TODO: Corepoint Else {_ORPHAN}" in _enclosing(handler, "OB_TWO")
+
+
+def test_no_branch_is_adopted_across_a_switched_off_marker(tmp_path: Path) -> None:
+    """Flattened, the marker stood between a construct and a sibling branch carrying its own
+    body, so that branch was an orphan in the marker's branch, and never ran. It must not pass
+    to the construct now, where its send would run whenever the ``try`` body raises. Code review
+    of this change, round 4."""
+    body = (
+        '<Case Data="ChooseFrom (a)"><List>'
+        '<Try><List><Line Data="ItemClear %ADT/PID-3"/></List></Try>'
+        '<List Disabled="1"><Line Data="Matching &quot;M&quot;"/></List>'
+        '<Line Data="Catch"><List><Line Data="MsgSend %ADT [OB_X]"/></List></Line>'
+        '<Line Data="MsgSend %ADT [OB_Y]"/></List></Case>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert "except Exception:  # TODO: Corepoint Catch" not in handler
+    assert f"Corepoint Catch {_ORPHAN}" in _enclosing(handler, "OB_X")
+    assert f"Corepoint Matching {_ORPHAN}" in _enclosing(handler, "OB_Y")
+    assert _run_handler(tmp_path, body) == []
+
+
+def test_a_disabled_statement_named_like_a_wrapper_seals_nothing() -> None:
+    """Only a ``<List>``/``<Actions>`` wrapper was flattened. A disabled ``<Line>`` whose verb
+    reads ``List`` never was, so a marker under it opened nothing on main, and the step after it
+    stays live in the ``try`` body. Code review of this change, round 4."""
+    body = (
+        '<Try><List><Line Data="List foo" Disabled="1"><List><Line Data="Catch"/></List></Line>'
+        '<Line Data="MsgSend %ADT [OB_Y]"/></List></Try>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert _ORPHAN not in handler
+    assert _enclosing(handler, "OB_Y") == "    try:"
 
 
 def test_a_switched_off_marker_at_the_handlers_own_level_changes_nothing() -> None:
