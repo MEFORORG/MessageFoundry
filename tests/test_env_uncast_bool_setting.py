@@ -666,6 +666,28 @@ def test_a_reply_from_target_is_read_by_its_resolved_flag(spec: Any, key: str) -
     check_http_sync_reply(inbound, registry, env_values={"flag": "true"})
 
 
+def test_a_reply_from_target_is_undecided_with_no_env_values() -> None:
+    # A caller holding no values cannot read the flag, so it must not report it as missing. The
+    # controls: a literal False is refused all the same, and an environment that defines nothing is
+    # a real miss.
+    spec = Rest(url="https://partner.example.org/in")
+    registry = wiring.Registry()
+    registry.outbound["OB_X"] = build_outbound_connection(
+        "OB_X", dataclasses.replace(spec, settings={**spec.settings, "capture_response": env("f")})
+    )
+    registry.outbound["OB_Y"] = build_outbound_connection("OB_Y", spec)
+
+    def replying_from(target: str) -> Any:
+        listener = Http(port=0, reply_from=target, reply_content_type="application/json")
+        return build_inbound_connection("IB_X", listener, router="r")
+
+    check_http_sync_reply(replying_from("OB_X"), registry)
+    with pytest.raises(WiringError, match="does not set capture_response=True"):
+        check_http_sync_reply(replying_from("OB_Y"), registry)
+    with pytest.raises(WiringError, match="missing: f"):
+        check_http_sync_reply(replying_from("OB_X"), registry, env_values={})
+
+
 def test_a_set_capture_response_stays_beside_an_env_out_params_flag(tmp_path: Path) -> None:
     # Capture is on either way, so which statement rule applies follows the flag. The connector ORs
     # the two, so the proc-call rule applies only when the flag resolves True.

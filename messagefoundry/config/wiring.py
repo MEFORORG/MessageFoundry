@@ -819,16 +819,22 @@ def refuse_capture_conflicts(
     type_: ConnectorType, settings: Mapping[str, Any], where: str, *, batched: bool
 ) -> None:
     """Refuse a capture or ``no_ack`` declaration that can never do what it asks (ADR 0013, ADR 0124),
-    before any store or socket.
+    before its connector is built.
 
     It runs twice. ``build_outbound_connection``, the choke point for BOTH the code-first factories
-    and the ``connections.toml`` desugar, passes the spec's literals, and :func:`env` references are
+    and the ``connections.toml`` desugar, passes the spec's literals, and an :func:`env` flag is
     undecided there: a reference is truthy whatever it resolves to, so reading one as on would refuse
     a graph whose flag resolves False, and reading one as satisfying ``expect_reply`` would pass a
-    capture with no reply to capture (BACKLOG #3724). The connection's resolved settings then come
-    through here once more when its connector is built, which ``serve`` and ``messagefoundry check``
-    both do, so nothing is left undecided. ``messagefoundry dryrun`` builds no connector, so it
-    does not reach this second pass."""
+    capture with no reply to capture (BACKLOG #3724). A ``statement`` behind ``env()`` is NOT
+    undecided on that first pass. The DATABASE arm reads ``str()`` of it, the reference's repr, so
+    with a literal capture flag on, that text is judged and never the value: ``capture_response=True``
+    is refused beside ``env("sql")`` however the value would read, and passes beside
+    ``env("output_sql")``. The connection's resolved settings then come through here once more when
+    its connector is built. ``serve`` does that, and so does
+    ``messagefoundry check``, unless its ``build-check`` leg skips a config dir with no declared
+    instance, which has no environment to resolve against. ``messagefoundry dryrun`` builds no
+    connector. Neither of those two reaches this second pass, so a conflict behind ``env()`` waits
+    for ``serve`` there."""
 
     def on(key: str) -> bool:
         value = settings.get(key)
@@ -863,7 +869,8 @@ def refuse_capture_conflicts(
                 "MSA-2 to match against the sent MSH-10 — verify_ack_control_id is incompatible with "
                 "no_ack (BACKLOG #117 + #82)."
             )
-    # ADR 0013: response capture must be wiring-valid at `check`/dry-run time (no store needed).
+    # ADR 0013: response capture must be wiring-valid with no store needed: a literal at load, an
+    # env() flag when its connector is built (the docstring says which commands reach that).
     if capturing:
         if type_ in (ConnectorType.FILE, ConnectorType.REMOTEFILE):
             raise WiringError(

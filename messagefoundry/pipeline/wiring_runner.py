@@ -11582,7 +11582,8 @@ def _dest_config(
     # Resolve env() first so any signing key/password ref is materialized here, then assemble the
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
-    # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
+    # is the single choke point feeding start, check and a reload's dry run, so a bad key fails loud at
+    # all three. `messagefoundry dryrun` builds no connector, so it never reaches here.
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
@@ -11592,8 +11593,8 @@ def _dest_config(
     refuse_capture_conflicts(
         oc.spec.type, settings, f"outbound connection {oc.name!r}", batched=oc.batch is not None
     )
-    # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
-    # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
+    # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This same choke
+    # point feeds start, check and a reload's dry run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
     # ADR 0153 / ADR 0173: the connectors read the typed Destination fields below, but the deep
     # settings-driven seams read a settings mapping, so the declarations and the name are mirrored.
@@ -12443,6 +12444,10 @@ def check_http_sync_reply(
     exists to catch. When ``delivery`` is not supplied the caller could not resolve them either, so
     that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
     values always exist.
+
+    ``env_values`` is the same contract. Left ``None``, a target's ``env()`` capture flag is
+    undecided, so it passes rather than reads as a missing value; an empty mapping is an environment
+    that defines nothing, and that does read as missing.
     """
     settings = ic.spec.settings
     reply_from = settings.get("reply_from")
@@ -12466,7 +12471,9 @@ def check_http_sync_reply(
     capture_flags = {
         key: oc.spec.settings.get(key) for key in ("capture_response", "capture_out_params")
     }
-    if not any(resolve_env_settings(capture_flags, env_values or {}, connection=target).values()):
+    if env_values is not None:
+        capture_flags = resolve_env_settings(capture_flags, env_values, connection=target)
+    if not any(capture_flags.values()):
         raise WiringError(
             f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
             "capture_response=True — with no captured reply there is nothing to return, and every "
