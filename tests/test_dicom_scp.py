@@ -137,11 +137,15 @@ async def test_scp_rejects_unlisted_peer_ip() -> None:
 
 async def test_scp_rejects_oversized_object() -> None:
     captured: list[bytes] = []
-    scp = _build_scp(captured, max_object_bytes=64)  # any real SR exceeds this
+    data = make_sr_part10()
+    # Over the cap but not past twice it: past twice the cap the SCP ends the association instead
+    # (owner ruling B462-R3; tests/test_dicom_scp_receipt_bounds.py). Half the Part-10 size is under
+    # the data set, which is most of the object, and twice it is over.
+    scp = _build_scp(captured, max_object_bytes=len(data) // 2)
     handler = await _capture_handler_factory(captured)
     await scp.start(handler)
     try:
-        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
+        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, data)
         assert established is True
         # Cannot Understand, over-cap: refused before commit, and a re-send is refused again.
         assert status == 0xC010

@@ -126,11 +126,22 @@ cluster coordinates the parts that must not double-run or interleave:
   down from the shipped `10 / 20 / 30`: the usable margin is smaller than `ttl - fence`, because the
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
-  checks the *ordering* `heartbeat < fence < ttl` only, never that any margin survives. On a clean stop
+  checks more than the *ordering* `heartbeat < fence < ttl`: it refuses a pair that leaves no
+  detection margin (`ttl - fence - the fence tick`), and a renew clamp that is not below that
+  margin. On a clean stop
   the leader expires its lease so a standby need not wait out the TTL: a preferred standby takes over
   on its next heartbeat and a delayed one after its `acquire_delay_seconds`. A node that has already self-fenced
   expires it too. If that write does not return within 2 seconds, the node stops anyway and the lease
   ages out at the TTL.
+
+  On SQL Server the claim/renew is clamped at `[cluster].lease_renew_timeout_seconds`, derived from
+  the margin unless set. There its wait for a pooled connection and its statement each get the full
+  clamp, rather than sharing one deadline as on Postgres, so a renew can land up to about twice the
+  clamp after it is issued, while the validator compares the clamp alone with the margin. The
+  statement timeout counts whole seconds, so a clamp under 1 s is refused on that backend. `serve`
+  logs a warning at start-up when twice the clamp reaches the margin, which the shipped `10 / 20 / 30`
+  does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
+  arithmetic and what the clamp leaves unbounded.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL
   elapses. As a **second, durable** backstop the `leader_lease` row also carries a monotonic

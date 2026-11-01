@@ -3882,13 +3882,13 @@ def DICOM(
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the object is decoded, and so before the durable commit (the X12
     # max_interchange_bytes analog; OOM/DoS guard, §9)
-    max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
+    max_associations: int = 10,  # cap concurrent associations
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
     # intakes' max_messages_per_second: this one makes a real modality wait.
     association_burst: float | None = None,  # SCP: tokens the bucket holds (default = the rate)
-    max_pdu_size: int = 16384,  # cap one PDU's bytes (0 = unbounded); DoS guard
-    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout
+    max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
+    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
@@ -3919,15 +3919,16 @@ def DICOM(
     ``max_associations_per_second`` bounds how fast this SCP ACCEPTS new associations;
     ``association_burst`` is how large a burst passes before the sustained rate applies (default: one
     second's worth). Over budget the SCP **waits before reading the association request**, so the peer
-    is back-pressured by TCP and then served in full — nothing is dropped, refused or answered
-    differently, and a rejected association charges nothing. **The unit is an association, not a
+    is back-pressured by TCP and then served in full — the wait itself drops, refuses and answers
+    nothing differently, and a rejected association charges nothing. **The unit is an association, not a
     message**, and that is a property of DIMSE rather than a shortcut: ``pynetdicom`` owns the read
     loop, so by the time a C-STORE reaches this engine the object has already been read and decoded,
     and pacing there would delay a message the count-and-log invariant has already obliged us to
     account for. So an established association is NOT bounded in the objects it may push — those are
     bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
-    guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
-    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace.
+    guessed rate throttles a real modality, so the number has to come from your own feed profile.
+    Choose a rate that keeps few peers waiting: a waiting peer holds one of the SCP's slots for
+    connections with no association yet, and a connection over those fixed caps is closed.
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the

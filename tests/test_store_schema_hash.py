@@ -62,6 +62,31 @@ def test_postgres_schema_hash_tracks_migration_rev(monkeypatch: pytest.MonkeyPat
     assert postgres._schema_hash() != h1
 
 
+def test_a_marker_from_before_the_live_schema_check_takes_the_slow_path() -> None:
+    """BACKLOG #1720: both server backends check the live schema before they write the marker, and
+    that check is Python the content hash cannot see. A marker written by a build without it must
+    not match, or the store takes the fast path past the check, and past the Postgres migration's
+    scoped catalog reads, forever. Each marker below is the hash as that earlier build wrote it."""
+    import hashlib
+
+    from messagefoundry.store import postgres, sqlserver
+
+    assert postgres._MIGRATION_REV == 8
+    rev7 = "\n".join(postgres._SCHEMA) + "\nmigration_rev=7"
+    assert hashlib.sha256(rev7.encode()).hexdigest() != postgres._schema_hash()
+    assert sqlserver._SCHEMA_CHECK_REV == 1
+    unchecked = "\n".join(sqlserver._SCHEMA)  # the hash input before the check revision joined it
+    assert hashlib.sha256(unchecked.encode()).hexdigest() != sqlserver._schema_hash()
+
+
+def test_sqlserver_schema_hash_tracks_the_check_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.store import sqlserver
+
+    h1 = sqlserver._schema_hash()
+    monkeypatch.setattr(sqlserver, "_SCHEMA_CHECK_REV", sqlserver._SCHEMA_CHECK_REV + 1)
+    assert sqlserver._schema_hash() != h1
+
+
 def test_processed_files_table_present_on_all_backends() -> None:
     # ADR 0129 / #142: the processed-file dedup ledger must exist in ALL THREE backend schemas
     # (3-backend parity). SQLite's _SCHEMA is one DDL string; the server backends are DDL-statement

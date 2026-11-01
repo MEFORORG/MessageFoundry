@@ -131,12 +131,16 @@ updates:
     # not `uvicorn[standard]`, so the bare name here matches it as written. Move each entry in the
     # same PR that moves its pin.
     #
-    # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
-    # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
-    # widened major cap holds that batch hostage too. `webauthn<4` is the major cap of the three.
-    # `pynetdicom<3.1` is a minor cap, like `pydicom<3.1`; it was `<4` until vault BACKLOG #2713.
-    # pyproject.toml's [dicom] comment says why those two hold, and what raising the pynetdicom cap
-    # requires. Its [webauthn] comment says why that one holds. `hvac<3` is a second major cap with
+    # `pynetdicom` is an exact `==` pin in the [dicom] extra too (vault BACKLOG #2712), so its entry
+    # also starts at the next minor. A 3.0.x patch release still gets a PR, and
+    # tests/test_dicom_scp_admission.py reds it until someone re-reads the server seams the SCP
+    # builds on and moves the pin. pyproject.toml's [dicom] comment says what that re-read covers.
+    #
+    # `pydicom` and `webauthn` are the same WIDENED-CAP case (BACKLOG #2505). A major cap needs its
+    # entry as much as a minor one: `python-deps-major` is one batch on `*`, so a widened major cap
+    # holds that batch hostage too. `webauthn<4` is the major cap of the two. `pydicom<3.1` is a
+    # minor cap. pyproject.toml's [dicom] comment says why it holds. Its [webauthn] comment says why
+    # that one holds. `hvac<3` is a second major cap with
     # an entry, so Dependabot cannot widen it (vault BACKLOG #2569; a seat decision under owner
     # delegation 2026-10-08, not an owner ruling). Its [vault] comment says why it holds and what
     # the entry costs. Lift each entry in the same PR that lifts its cap.
