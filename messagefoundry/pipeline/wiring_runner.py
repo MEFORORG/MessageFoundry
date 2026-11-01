@@ -183,7 +183,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_max_rows,
     reference_statement,
 )
-from messagefoundry.pipeline.refused_body import RefusedBodyAllowance
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -7725,7 +7725,12 @@ class RegistryRunner:
         return receipt_handler(on_request)
 
     async def _declared_content_mismatch(
-        self, ic: InboundConnection, raw: bytes, *, text: str | None = None
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        *,
+        text: str | None = None,
+        kind: RefusalKind | None = None,
     ) -> str | None:
         """Whether a NON-HL7 ingress body contradicts its inbound's declared ``content_type`` (ASVS
         5.2.2, BACKLOG #1109). A message id means the body was dead-lettered here, as that ``ERROR``
@@ -7759,6 +7764,7 @@ class RegistryRunner:
                 text,
                 error=exc.reason,
                 message_type=ic.content_type.value,
+                kind=kind,
             )
         return None
 
@@ -7794,7 +7800,7 @@ class RegistryRunner:
                 return await self._refuse_guarded(
                     ic, raw, None, exc, message_type=ic.content_type.value
                 )
-            mismatch = await self._declared_content_mismatch(ic, raw)
+            mismatch = await self._declared_content_mismatch(ic, raw, kind=RefusalKind.PERMANENT)
             if mismatch is not None:
                 # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
                 return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
@@ -7832,7 +7838,9 @@ class RegistryRunner:
             )
 
         if not hl7v2:
-            mismatch = await self._declared_content_mismatch(ic, raw, text=text)
+            mismatch = await self._declared_content_mismatch(
+                ic, raw, text=text, kind=RefusalKind.PERMANENT
+            )
             if mismatch is not None:
                 # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
                 return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
@@ -7965,7 +7973,7 @@ class RegistryRunner:
 
         The receipt is built from the id ``_record_refused`` returned, so it always names the row."""
         mid = await self._record_refused(
-            ic, raw, text, error=error, message_type=message_type, peek=peek
+            ic, raw, text, error=error, message_type=message_type, peek=peek, kind=kind
         )
         return IngressReceipt.refused(kind, mid)
 
@@ -8386,6 +8394,7 @@ class RegistryRunner:
         error: str,
         message_type: str | None = None,
         peek: Peek | None = None,
+        kind: RefusalKind | None = None,
     ) -> str:
         """Record a body refused before ingress as ``ERROR``. Every refusal phase lands here, so every
         one is counted and logged (CLAUDE.md section 2). ``wire`` is the body as received and
@@ -8393,7 +8402,14 @@ class RegistryRunner:
         after the parse passes ``peek`` so the row carries the header fields an operator searches by.
         The per-inbound refused-body allowance decides whether the whole body or its head is stored;
         its length always is, and a digest keyed from the store's audit key whenever the store holds
-        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it.
+
+        ``kind``, which a receipt source's refusal passes, leads the stored error as
+        ``[refusal kind: <kind>]``, so an operator can tell a temporary refusal from a final one
+        before resending the row (BACKLOG #2105). It goes first, as the allowance note does, because
+        the store's redaction cuts from a quoted segment id to the end of the text."""
+        if kind is not None:
+            error = with_refusal_note(f"[refusal kind: {kind.value}] ", error)
         bounded = self._refused_body.bound(
             ic.name,
             wire,

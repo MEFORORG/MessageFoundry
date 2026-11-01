@@ -11,8 +11,8 @@ routing/transform/delivery failure happens *after* the ``202`` and is **not** re
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
 as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
 no ingress row) is never answered ``202``: a temporary refusal is answered ``503`` with
-``Retry-After``, an over-size one ``413``, and any other ``422``, each carrying the ``ERROR`` row's
-``message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30).
+``Retry-After``, an over-size one ``413``, and any other ``422``, each naming the ``ERROR`` row as
+``refused_message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -1515,7 +1515,9 @@ class HttpSource(SourceConnector):
                 if receipt.refusal is RefusalKind.TEMPORARY
                 else None
             )
-            refused = json.dumps({"error": _NOT_ACCEPTED, "message_id": message_id})
+            # ``refused_message_id``, never ``message_id``: that key means a committed message on
+            # every other answer this listener writes, so a refusal must not read as one.
+            refused = json.dumps({"error": _NOT_ACCEPTED, "refused_message_id": message_id})
             await self._respond(
                 writer,
                 build_response(_refusal_status(receipt.refusal), refused, extra_headers=retry),

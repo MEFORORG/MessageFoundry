@@ -4,7 +4,7 @@
 
 Owner ruling 2026-09-30, recorded as ADR 0154's amendment of 2026-10-30: a TEMPORARY refusal is
 answered ``503`` with ``Retry-After``, an over-size one ``413`` on every over-size path, and any other
-``422``. Each carries the ``ERROR`` row's ``message_id``. The strict-validation timeout stays ``422``.
+``422``. Each names the ``ERROR`` row as ``refused_message_id``. The strict-validation timeout stays ``422``.
 
 Every case drives the real runner's receipt handler behind a real listener socket, so the answer is
 the one a partner would read. The engine-to-engine pair at the bottom sends from the engine's own REST
@@ -115,7 +115,11 @@ async def _the_one_error_row(store: MessageStore) -> dict[str, Any]:
 
 
 def _assert_names_the_row(resp: _Response, row: dict[str, Any]) -> None:
-    assert resp.json() == {"error": "message was not accepted", "message_id": row["id"]}
+    assert resp.json() == {"error": "message was not accepted", "refused_message_id": row["id"]}
+    # BACKLOG #2105: the row itself says which kind of refusal it was, so an operator can tell a
+    # temporary one, which the sender will re-send, from a final one before resending it.
+    kind = {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
+    assert row["error"].startswith(f"[refusal kind: {kind}] "), row["error"]
 
 
 # --- temporary: 503 + Retry-After -----------------------------------------------------------------

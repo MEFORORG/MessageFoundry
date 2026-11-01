@@ -82,7 +82,9 @@ class HttpDriver(Driver):
 
 
 def message_id_of(reply: bytes | None) -> str | None:
-    """The engine ``message_id`` in an ``Http`` inbound's ``202`` receipt, or None."""
+    """The engine ``message_id`` in an ``Http`` inbound's ``202`` receipt, or None.
+
+    A refusal names its ``ERROR`` row as ``refused_message_id``, which this never reads."""
     if not reply:
         return None
     try:

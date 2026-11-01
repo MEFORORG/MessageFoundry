@@ -290,7 +290,7 @@ async def test_a_declined_handler_gets_the_same_422_on_both_paths() -> None:
     receipt = await _serve(None, events=receipt_events, _decline=True)
     assert receipt == sync  # status, headers and body alike
     assert receipt[0] == 422
-    assert receipt[2] == b'{"error": "message was not accepted", "message_id": "err-1"}'
+    assert receipt[2] == b'{"error": "message was not accepted", "refused_message_id": "err-1"}'
     assert sync_events == receipt_events == ["established", "closed"]
 
 

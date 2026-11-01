@@ -206,7 +206,7 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     telling the caller a refused body was accepted. It now answers the sync path's 422. Only the
     answer changed: the ERROR row is still the count-and-log record, and no ingress row exists.
 
-    Amended 2026-10-30 (BACKLOG #2105): the body now names that ERROR row's message_id, and only a
+    Amended 2026-10-30 (BACKLOG #2105): the body now names that ERROR row as refused_message_id, and only a
     PERMANENT refusal answers 422. A body over the engine's ingress ceiling, the other cause this
     test used to carry, now answers 413; that case and the temporary 503 are pinned in
     ``tests/test_ingress_refusal_kinds.py``."""
@@ -229,7 +229,8 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     row_id = rows[0]["id"]
     assert (
-        resp.body == f'{{"error": "message was not accepted", "message_id": "{row_id}"}}'.encode()
+        resp.body
+        == f'{{"error": "message was not accepted", "refused_message_id": "{row_id}"}}'.encode()
     )
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
     fetched_row = await cur.fetchone()

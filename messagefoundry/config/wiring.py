@@ -2816,7 +2816,7 @@ def Http(
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
     is recorded with status ``ERROR`` and answered, in either mode, ``503`` with ``Retry-After`` for a
     temporary refusal, ``413`` over a size ceiling, and ``422`` otherwise; the body names that
-    ``ERROR`` row's ``message_id``. Which refusal gets which code is in ADR 0154's amendment of
+    ``ERROR`` row as ``refused_message_id``. Which refusal gets which code is in ADR 0154's amendment of
     2026-10-30. ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
     an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
     reply described below.
