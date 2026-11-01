@@ -17,18 +17,31 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import _ANCHOR_STORE_DETAIL, _ANCHOR_STORE_RESTART_DETAIL
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.trust_anchors import AnchorStoreUnavailable, TrustAnchorError
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import AuthSettings
-from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    Ftp,
+    InboundConnection,
+    Registry,
+    Rest,
+    build_inbound_connection,
+    build_outbound_connection,
+)
 from messagefoundry.pipeline import Engine
+from messagefoundry.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -121,6 +134,114 @@ async def _denials(engine: Engine) -> list[dict[str, object]]:
     # Filter in SQL, not in Python: `limit` applies BEFORE any client-side filter, so scanning a
     # window of all actions could push a denial row out of it as this file grows logins or targets.
     return [dict(r) for r in await engine.store.list_audit(limit=200, action=_ACTION)]
+
+
+def _refused_graph(ca: str) -> Registry:
+    """An inbound FTPS poller and an outbound with a CA, both left down at start with no connector."""
+    reg = Registry()
+    poller = Ftp(host="127.0.0.1", port=9, tls=True, remote_dir="/out", tls_ca_file=ca)
+    reg.add_inbound(build_inbound_connection("IB_POLL", poller, router="r", auto_start=False))
+    rest = Rest(url="https://partner.example.org/api", tls_ca_file=ca)
+    reg.add_outbound(build_outbound_connection("OB_REST", rest, auto_start=False))
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+@pytest.mark.parametrize(
+    ("name", "action", "raised", "code", "line"),
+    [
+        pytest.param(
+            "OB_REST",
+            "start",
+            AnchorStoreUnavailable,
+            "control_store",
+            _ANCHOR_STORE_DETAIL,
+            id="outbound-start",
+        ),
+        pytest.param(
+            "OB_REST",
+            "restart",
+            AnchorStoreUnavailable,
+            "control_store_restart",
+            _ANCHOR_STORE_RESTART_DETAIL,
+            id="outbound-restart",
+        ),
+        pytest.param(
+            "IB_POLL",
+            "start",
+            AnchorStoreUnavailable,
+            "control_store",
+            _ANCHOR_STORE_DETAIL,
+            id="inbound-start",
+        ),
+        pytest.param(
+            "IB_POLL",
+            "restart",
+            AnchorStoreUnavailable,
+            "control_store_restart",
+            _ANCHOR_STORE_RESTART_DETAIL,
+            id="inbound-restart",
+        ),
+        pytest.param(
+            "IB_POLL",
+            "start",
+            TrustAnchorError,
+            "control_refused",
+            "the engine refused that action",
+            id="inbound-refused",
+        ),
+    ],
+)
+async def test_a_refused_per_name_control_redirects_with_its_line(
+    tmp_path: Path, name: str, action: str, raised: type[Exception], code: str, line: str
+) -> None:
+    """Vault BACKLOG #3746: a 503 or a 409 escaping the per-name control rendered as JSON inside the
+    console. It keeps the redirect the action had, and the dashboard shows the fixed line, which
+    must match the engine's own answer. RED when: ``_ui_control`` lets either status through, or a
+    console line drifts from the engine's."""
+
+    async def check(_direction: str, _name: str, _settings: object) -> None:
+        raise raised("stopped")
+
+    store = await MessageStore.open(tmp_path / "ui.db")
+    engine = Engine(
+        store, lane_anchor_check=check, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    engine.add_registry(_refused_graph(str(tmp_path / "ca.pem")))
+    await engine.start()
+    try:
+        service = await _service(engine)
+        user_id = await create_local_user_chosen(
+            service,
+            username="op",
+            password=PW,
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="test",
+        )
+        user = await service.store.get_user(user_id)
+        assert user is not None and user.password_hash is not None
+        await service.store.set_password(
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
+        )
+        async with _client(engine, service) as c:
+            await _login(c)
+            r = await _post_pairs(c, f"/ui/connections/{name}/{action}", [])
+            assert r.status_code == 303, r.text
+            assert r.headers["location"] == f"/ui?m={code}"
+            page = await c.get(r.headers["location"])
+            assert page.status_code == 200, page.text
+            assert line in page.text
+            # The query string selects a sentence and never supplies one.
+            other = await c.get("/ui?m=not-a-code")
+            assert other.status_code == 200 and "not-a-code" not in other.text
+    finally:
+        await engine.stop()
+        await store.close()
 
 
 async def test_the_per_name_console_control_records_the_browser_address(engine: Engine) -> None:

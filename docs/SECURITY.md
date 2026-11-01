@@ -2468,6 +2468,32 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
 
+**The same store fault would not read as a refused anchor on an operator start or on a connection
+test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
+**503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
+carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
+its 503 would say the connection is left stopped until the next start. The lane would read
+`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
+checked. An outbound checks its CA at a start only when it has no connector. An operator start of
+such a lane that was paused would leave it paused with its rows pending, because a resumed lane
+with no connector charges each row it claims an attempt, and a finite `max_attempts` would
+dead-letter it with nothing known against the CA.
+
+**That hold covers the operator control route only, and it ends at the lane's next start**, which
+at least an operator, a schedule or a rule can make. While a lane is held it sits in the paused
+set, which suppresses its buildup and stall pages. A lane that was not paused, such as one that failed at boot
+on the same fault, is not held: it would keep claiming with no connector, unless a restart paused
+it.
+
+A connection test the store stopped would report `success: false` with one fixed line, and the row
+the route writes to `audit_log.detail` would carry that line and the same `reason`. The
+`connection_control` row of a start or restart answered this way is fail-soft, as is that row for
+any refused inbound start or restart, and so is the `connection_test` row of a test stopped in its
+CA check step, before its connector is built. A store that also refuses the row would leave the answer
+standing, and the row's loss would be logged at ERROR. Any other test's row stays required. A
+refused start's or restart's row carries `refused` true beside the lane's `running`, so it cannot
+read as a completed action.
+
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
 connection counts and the digest it took before the swap. The row is written after the swap, so a

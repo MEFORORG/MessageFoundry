@@ -64,6 +64,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
+from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -2537,7 +2538,7 @@ async def _answer_refused_reload(
 def _refused_by_trust_anchor(exc: WiringError) -> bool:
     """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
     cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
-    the shape the settings preflight and ``refused_connection_anchor`` raise.
+    the shape the settings preflight and ``connection_anchor_failure`` raise.
 
     A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
     factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
@@ -2678,8 +2679,7 @@ async def _audit_refused_reload(
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
         action, detail["reason"] = "config_reload_failed", "store_unavailable"
-        status = 503
-        answer = "the engine could not reach its store to check a trust anchor; see the engine log"
+        status, answer = 503, _ANCHOR_STORE_DETAIL
     elif isinstance(exc, WiringError):
         anchor_refused = _refused_by_trust_anchor(exc)
         warn(
@@ -3769,11 +3769,22 @@ async def _record_control_audit(
     role: str,
     running: bool,
     client: str | None,
+    reason: str | None = None,
+    refused: bool = False,
 ) -> None:
-    """Audit a completed start/stop/restart of a connection (BACKLOG #1642).
+    """Audit a start/stop/restart of a connection (BACKLOG #1642).
 
-    Written on the SUCCESS path only — the denial paths already write ``auth.channel_denied``, and a
-    409/404 means the lane never moved, so a row there would assert an action that did not happen.
+    Written when the action completed, and for at least an inbound's refused start or restart and
+    an outbound's the store stopped (:func:`_record_refused_control_audit`), where ``running`` is
+    the lane's state after the refusal. A refused restart has already stopped the lane, so that row
+    records something that happened. The denial paths write ``auth.channel_denied`` instead. At least a 404 and the 409 for a connection not deployed
+    write no row here: nothing was attempted, so a row would assert an action that did not happen.
+
+    ``reason``, where set, joins the row's detail. Only a store fault sets it (vault BACKLOG #3746),
+    with the value a reload's row uses for one, so an audit reader can tell it from a refused CA.
+
+    ``refused`` marks the row of a refused start or restart with ``refused: true``, so it cannot
+    read as a completed action when ``running`` is true (vault BACKLOG #3746).
 
     ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
     for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
@@ -3791,8 +3802,69 @@ async def _record_control_audit(
         "connection_control",
         actor=identity.username,
         channel_id=name if role == "source" else None,
-        detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
+        detail=json.dumps(
+            {"connection": name, "action": action, "role": role, "running": running}
+            | ({"refused": True} if refused else {})
+            | ({"reason": reason} if reason is not None else {})
+        ),
         client=client,
+    )
+
+
+async def _record_refused_control_audit(
+    engine: Engine,
+    identity: Identity,
+    name: str,
+    action: str,
+    *,
+    role: str,
+    running: bool,
+    store_fault: bool,
+    client: str | None,
+) -> None:
+    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
+    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    after the refusal, which is not always stopped: at least a lane that failed at boot on a store
+    fault stays unpaused through a start the store stopped.
+
+    Written fail-soft, as :func:`_audit_refused_reload`'s row is. The refusal's answer stands
+    whether or not the row lands, and a store that stopped the trust-anchor check is likely to
+    refuse this row too, which would turn that answer into a 500 (vault BACKLOG #3746). A failed
+    write is logged at ERROR, and a cancel waits a bounded time for the row."""
+    actor = identity.username
+    reason = "store_unavailable" if store_fault else None
+    await write_audit_soft(
+        lambda: _write_through_cancel(
+            _record_control_audit(
+                engine,
+                identity,
+                name,
+                action,
+                role=role,
+                running=running,
+                client=client,
+                reason=reason,
+                refused=True,
+            ),
+            lambda: _lost_row(
+                "connection_control",
+                actor,
+                f"refused {action} of {name} at {client or '-'}, reason {reason or '-'}",
+            ),
+        ),
+        log=_log,
+        message="a refused %s of %s connection %s by %s at %s, reason %s: its "
+        "connection_control row failed",
+        args=lambda: (
+            action,
+            role,
+            scrub_log_argument(name),
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+            reason or "-",
+        ),
+        # (), as write_audit_soft's docstring asks where a raise would replace the answer owed.
+        defects=(),
     )
 
 
@@ -3858,10 +3930,39 @@ async def _audit_alert_rules_withheld(
 #: What the connection-test routes return for a refused trust anchor, in place of its text.
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
+#: What a route answers for a trust-anchor check the store stopped, which says nothing against the
+#: anchor (BACKLOG #3091): at least a reload, an operator start of an inbound or an outbound, and a
+#: connection test. Fixed text, because a connection test's detail is written to
+#: ``audit_log.detail`` (vault BACKLOG #3746).
+_ANCHOR_STORE_DETAIL = (
+    "the engine could not reach its store to check a trust anchor; see the engine log"
+)
 
-async def _run_connection_test(
-    rr: RegistryRunner, name: str, direction: str
-) -> ConnectionTestResult:
+#: :data:`_ANCHOR_STORE_DETAIL` for a restart, whose stop half already ran. The connection stays
+#: stopped only until the next start, which need not be an operator's (vault BACKLOG #3746).
+_ANCHOR_STORE_RESTART_DETAIL = (
+    "the engine could not reach its store to check a trust anchor, so this restart left the "
+    "connection stopped until its next start, which at least an operator, a schedule or a rule "
+    "can make; see the engine log"
+)
+
+
+def _anchor_store_detail(action: str) -> str:
+    """The fixed answer for a start or restart whose trust-anchor check the store stopped."""
+    return _ANCHOR_STORE_RESTART_DETAIL if action == "restart" else _ANCHOR_STORE_DETAIL
+
+
+class _ConnectionTestRun(ConnectionTestResult):
+    """A :class:`ConnectionTestResult`, plus what the route's audit row needs and the reply does
+    not carry (vault BACKLOG #3746). ``_check_stopped`` is True when the test ended in
+    ``check_test_anchor``, before its connector was built. ``_reason`` is the row's ``reason``, set
+    only for a check the store stopped. Private attributes, so neither reaches the response."""
+
+    _check_stopped: bool = PrivateAttr(default=False)
+    _reason: str | None = PrivateAttr(default=None)
+
+
+async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) -> _ConnectionTestRun:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
     Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
     raising — only an unexpected bug would 500. Closes the test connector afterward.
@@ -3873,9 +3974,15 @@ async def _run_connection_test(
     that a connector's exceptions never interpolate a credential *value* — this is depth, not the seal."""
 
     def _result(
-        *, supported: bool, success: bool, ms: float, detail: str | None
-    ) -> ConnectionTestResult:
-        return ConnectionTestResult(
+        *,
+        supported: bool,
+        success: bool,
+        ms: float,
+        detail: str | None,
+        check_stopped: bool = False,
+        reason: str | None = None,
+    ) -> _ConnectionTestRun:
+        run = _ConnectionTestRun(
             name=name,
             direction=direction,
             supported=supported,
@@ -3883,6 +3990,8 @@ async def _run_connection_test(
             duration_ms=round(ms, 1),
             detail=detail,
         )
+        run._check_stopped, run._reason = check_stopped, reason
+        return run
 
     # A not-deployed connection (#233, ADR 0111) has no live endpoint to reach, and its env() must
     # NEVER be resolved — so short-circuit BEFORE build_test_connector, which would resolve env()
@@ -3899,22 +4008,42 @@ async def _run_connection_test(
             detail="connection is not deployed (deployed=false) — nothing to test",
         )
 
+    checked = False
     try:
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
+        checked = True
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if explicit_cause(exc, AnchorStoreUnavailable) is not None:
+            # Neither a refused CA nor a failed build (vault BACKLOG #3746). The check logged the
+            # store's own error; this line names the test it stopped.
+            _log.warning(
+                "connection test of %s stopped: the store refused its trust-anchor audit",
+                scrub_log_argument(name),
+            )
+            return _result(
+                supported=True,
+                success=False,
+                ms=0.0,
+                detail=_ANCHOR_STORE_DETAIL,
+                check_stopped=True,
+                reason="store_unavailable",
+            )
+        failure = safe_text(str(exc))
         if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
             _log.warning("connection test refused %r (trust anchor): %s", name, exc)
-            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
-        return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
+            failure = _ANCHOR_REFUSED_DETAIL
+        return _result(
+            supported=True, success=False, ms=0.0, detail=failure, check_stopped=not checked
+        )
     start = time.monotonic()
     supported, success, detail = True, False, None
     try:
@@ -5385,7 +5514,8 @@ def create_app(
         The name and its scope are resolved by :func:`_resolve_connection`."""
         rr, side = await _resolve_connection(engine, identity, name, client, role=role)
         if rr is not None and side == "in":
-            refused: str | None = None
+            refused: HTTPException | None = None
+            store_fault = False
             try:
                 # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
@@ -5399,11 +5529,17 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            except TrustAnchorError:
+            except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
-                refused = _ANCHOR_REFUSED_DETAIL
+                # Vault BACKLOG #3746: the lane's fixed line is a TrustAnchorError for a store fault
+                # too, raised from it. Nothing is known against the CA, so that is a 503.
+                store_fault = explicit_cause(exc, AnchorStoreUnavailable) is not None
+                if store_fault:
+                    refused = HTTPException(503, _anchor_store_detail(action))
+                else:
+                    refused = HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
@@ -5417,25 +5553,41 @@ def create_app(
                     name,
                     scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
                 )
-                refused = f"inbound connection {name!r}: {action} refused; see the server log"
-            if refused is not None:
-                await _record_control_audit(
-                    engine, identity, name, action, role="source", running=False, client=client
+                refused = HTTPException(
+                    409, f"inbound connection {name!r}: {action} refused; see the server log"
                 )
-                raise HTTPException(409, refused)
+            if refused is not None:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="source",
+                    running=rr.inbound_running(name),
+                    store_fault=store_fault,
+                    client=client,
+                )
+                raise refused
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
+            held = False
             try:
                 if action == "start":
-                    await rr.start_outbound(name)
+                    await rr.start_outbound(name, hold_on_store_fault=True)
                 elif action == "stop":
                     await rr.stop_outbound(name)
                 else:
-                    await rr.restart_outbound(name)
+                    await rr.restart_outbound(name, hold_on_store_fault=True)
+            except TrustAnchorError as exc:
+                # Vault BACKLOG #3746: the store stopped the lane's CA check, and the lane was not
+                # resumed. Answered below, outside this handler, as the inbound arm does.
+                if explicit_cause(exc, AnchorStoreUnavailable) is None:
+                    raise
+                held = True
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5449,6 +5601,18 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
+            if held:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="destination",
+                    running=rr.outbound_running(name),
+                    store_fault=True,
+                    client=client,
+                )
+                raise HTTPException(503, _anchor_store_detail(action))
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -5630,20 +5794,42 @@ def create_app(
         # Scope before existence, so a scoped caller cannot probe for names (BACKLOG #2551).
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         result = await _run_connection_test(rr, name, direction)
-        await engine.store.record_audit(
-            "connection_test",
-            actor=identity.username,
-            channel_id=name if direction == "in" else None,
-            detail=json.dumps(
-                {
-                    "connection": name,
-                    "direction": direction,
-                    "supported": result.supported,
-                    "success": result.success,
-                    "detail": result.detail,
-                }
+        actor, client = identity.username, client_ip(request)
+        row = json.dumps(
+            {
+                "connection": name,
+                "direction": direction,
+                "supported": result.supported,
+                "success": result.success,
+                "detail": result.detail,
+            }
+            | ({"reason": result._reason} if result._reason is not None else {})
+        )
+
+        def write_row() -> Coroutine[Any, Any, None]:
+            channel_id = name if direction == "in" else None
+            return engine.store.record_audit(
+                "connection_test", actor=actor, channel_id=channel_id, detail=row, client=client
+            )
+
+        if not result._check_stopped:
+            await write_row()
+            return result
+        # Vault BACKLOG #3746: a test that ended at its CA check dialled nothing, and a store that
+        # refused the check's rows is likely to refuse this one too. A raise would replace the
+        # answer with a 500, so () defects.
+        await write_audit_soft(
+            lambda: _write_through_cancel(
+                write_row(), lambda: _lost_row("connection_test", actor, row)
             ),
-            client=client_ip(request),
+            log=_log,
+            message="a connection test by %s at %s: its connection_test row failed. Lost row: %s",
+            args=lambda: (
+                scrub_log_argument(actor),
+                scrub_log_argument(client or "-"),
+                scrub_log_argument(row),
+            ),
+            defects=(),
         )
         return result
 

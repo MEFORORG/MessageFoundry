@@ -2895,6 +2895,35 @@ async def test_a_store_fault_in_the_lane_check_is_not_remembered_as_a_refusal(
     assert store.writes
 
 
+class _KeysetAuditStore(_FaultyAuditStore):
+    """One full page of other anchors' rows above the ``ad`` baseline, all carrying ``ts``. It
+    honours ``before_id`` and ignores ``until``, as a read keyed on the ``ts`` would then show."""
+
+    def __init__(self, ts: object) -> None:
+        super().__init__(None)
+        page = ta._FINGERPRINT_PAGE
+        other = json.dumps({"label": "oidc"})
+        self.rows: list[dict[str, Any]] = [
+            {"id": n, "detail": other, "ts": ts} for n in range(page + 1, 1, -1)
+        ]
+        baseline = json.dumps({"label": "ad", "fingerprint": "f1"})
+        self.rows.append({"id": 1, "detail": baseline, "ts": ts})
+
+    async def list_audit(self, **kw: Any) -> list[dict[str, Any]]:
+        below = kw.get("before_id")
+        return [r for r in self.rows if below is None or r["id"] < below][: kw["limit"]]
+
+
+@pytest.mark.parametrize("ts", ["not-a-time", None, "nan", "inf", 1.0])
+async def test_the_look_back_pages_past_any_ts(ts: object) -> None:
+    """Vault BACKLOG #3746 item 3: the look-back pages on ``id``, so it reads no ``ts``. A
+    malformed one on a page's last row raised ValueError through a reload, and a whole page at one
+    instant, the ``1.0`` case, gave up and read as a first observation. The baseline below that
+    page is found in each case. Red under: the page's cursor taken from ``ts``."""
+    store: Any = _KeysetAuditStore(ts)
+    assert (await ta._last_fingerprint(store, "ad")).found == (ta.ANCHOR_DIGEST, "f1")
+
+
 async def test_an_unreadable_settings_anchor_names_its_setting(
     store: MessageStore, tmp_path: Path
 ) -> None:
