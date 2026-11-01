@@ -4649,8 +4649,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
   in the instant the sweep runs can be missed by it. The same holds on that store for an
   unbind and for every other whole-account revoke, which run the same sweep: at least an
-  administrator's revoke of a user's sessions, a role change, a password reset, and the
-  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614). **A missed
+  administrator's revoke of a user's sessions, a role change and a password reset. The
+  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
+  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, after raising every
+  account's epoch in the same transaction, so treat it as having this limit too. That is a
+  reading by likeness to the per-account sweep, not one traced for the table-wide statement, and
+  the lock-order bullet below does not cover its every-account lock footprint. **A missed
   session is refused the next time it is presented** (BACKLOG #2592), with at least the
   exception below. Each of these raises the account's session epoch in the same transaction,
   and a rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
