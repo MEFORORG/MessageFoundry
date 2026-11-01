@@ -111,6 +111,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
@@ -230,6 +231,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
+from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
@@ -810,6 +812,8 @@ _CONN_EVENT_BURST_MAX = 256
 # never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
 # acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
 _CONN_EVENT_SALVAGE_GIVE_UP = 3
+# How much of an undeclared connection-event kind the refusal warning keys on and shows (BACKLOG #1624).
+_UNDECLARED_KIND_SHOWN = 64
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -1765,6 +1769,9 @@ class RegistryRunner:
         self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
+        # Throttles the undeclared-kind warning per (connection, kind), and counts every refusal so
+        # the next line written reports the volume behind a quiet log (BACKLOG #1624).
+        self._undeclared_kind_log = RefusalLog()
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
@@ -2217,9 +2224,24 @@ class RegistryRunner:
         reason: str | None,
     ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
-        connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
+        connection-event flood must never block a listener/delivery lane or grow memory unbounded.
+
+        **An undeclared kind is refused here, before it can join a burst** (BACKLOG #1624). The store
+        refuses one too, but there a single bad row fails the whole burst, and a run of them trips the
+        drainer's store-is-refusing cutoff and loses the declared rows behind them. Refused here it
+        is dropped, added to the overflow-drop tally, and warned about through a throttled line that
+        reports the running total; the store's check stays as the backstop for any other writer.
+
+        All of that holds only while the drain queue exists. With no queue the method returns first,
+        so any event, declared or not, is discarded with no row, no count and no warning. At least
+        one configuration reaches that: the ``[diagnostics].connection_events`` master switch off
+        with one inbound's ``capture_connection_errors`` on, which builds a sink but no queue."""
         q = self._conn_event_q
         if q is None:
+            return
+        if kind not in CONNECTION_EVENT_KINDS:
+            self._conn_events_dropped += 1
+            self._warn_undeclared_connection_event(connection, kind)
             return
         try:
             q.put_nowait(
@@ -2235,6 +2257,30 @@ class RegistryRunner:
             )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
+
+    def _warn_undeclared_connection_event(self, connection: str, kind: str) -> None:
+        """Log a refused undeclared kind, at most once per (connection, kind) per
+        :class:`RefusalLog` window and within its cross-key cap. Every refusal is noted, and each
+        line carries the running total, so refusals inside a quiet window show in the next line.
+
+        The kind is a code identifier, but it reached here through a variable, so it is treated as
+        free text. The throttle keys on its raw first ``_UNDECLARED_KIND_SHOWN`` characters, which
+        never reach the log. The line shows ``safe_text(kind, limit=_UNDECLARED_KIND_SHOWN)``:
+        redacted whole, then bounded. Cutting first would be the form ``messagefoundry.redaction``
+        documents as a leak, because a cut can leave a name fragment too short to match. A long
+        single-token kind therefore shows as an ellipsis with its length. The scrub runs only when a
+        line is written, so a refusal that is not logged pays no redaction pass."""
+        total = self._undeclared_kind_log.note(f"{connection}\x00{kind[:_UNDECLARED_KIND_SHOWN]}")
+        if total is None:
+            return
+        log.warning(
+            "connection %r emitted an undeclared connection_event kind %r; the event was dropped "
+            "(%d such event(s) dropped by this runner so far; repeats inside a minute are not "
+            "logged). Declare the kind in messagefoundry.connection_events",
+            connection,
+            safe_text(kind, limit=_UNDECLARED_KIND_SHOWN),
+            total,
+        )
 
     async def _connection_event_drainer(self) -> None:
         """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
@@ -2351,7 +2397,9 @@ class RegistryRunner:
             reason=reason,
         )
         try:
-            self._alert_sink.connection_error(name, kind="connection_lost", detail=reason)
+            self._alert_sink.connection_error(
+                name, kind="connection_lost", detail=reason, error_class=type(exc).__name__
+            )
         except Exception:
             log.warning("alert sink raised on connection_error for %r", name)
 

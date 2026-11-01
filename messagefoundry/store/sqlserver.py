@@ -75,6 +75,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
 from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
@@ -7301,6 +7302,7 @@ class SqlServerStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the id is IDENTITY, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
