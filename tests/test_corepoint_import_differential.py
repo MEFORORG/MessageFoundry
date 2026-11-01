@@ -381,22 +381,35 @@ def _opened(steps: list[Step]) -> list[Step]:
     return out
 
 
+@dataclass(frozen=True)
+class _Note(Control):
+    pass
+
+
 def _closed(steps: list[Step], produced: list[Step]) -> list[Step]:
-    # A bare marker main adopted onto a construct it flattened out of a disabled wrapper has no
-    # construct now. A note leaves it holding a step, so it opens no branch of the construct
-    # around it, and it renders as an orphan.
-    if len(produced) != 1 or not _bare(marker := produced[0]):
+    # A sibling branch main adopted onto a construct it flattened out of a disabled wrapper, or
+    # onto the chain such a branch closed before it, has no construct now. A note leads it, so
+    # it opens no branch of the construct around it, and it renders as an orphan.
+    if len(produced) != 1 or not isinstance(branch := produced[0], Control):
         return produced
-    at = _construct_at(steps, marker)
-    if at < 0 or not _wrapper(wrapper := steps[at]):
+    if branch.kind not in _BRANCH_PARENT:
         return produced
-    live = [s for s in _flat((wrapper,)) if not _label(s)]
-    if not (live and isinstance(live[-1], Control)):
+    at = len(steps) - 1
+    while at >= 0 and _hollow_step(steps[at]):
+        at -= 1
+    if at < 0:
         return produced
-    if live[-1].kind != _BRANCH_PARENT[marker.kind]:
+    before, want = steps[at], _BRANCH_PARENT[branch.kind]
+    if isinstance(before, Control) and _BRANCH_PARENT.get(before.kind) == want:
+        if before.body and type(before.body[0]) is _Note:
+            return [replace(branch, body=(before.body[0], *branch.body))]
+    if not _wrapper(before):
         return produced
-    why = f"its {live[-1].source_verb} is in a @Disabled {wrapper.source_verb}, so it never runs"
-    return [replace(marker, body=(Control("block", "Comment", why), *marker.body))]
+    live = [s for s in _flat((before,)) if not _label(s)]
+    if not (live and isinstance(live[-1], Control) and live[-1].kind == want):
+        return produced
+    why = f"its {live[-1].source_verb} is in a @Disabled {before.source_verb}, so it never runs"
+    return [replace(branch, body=(_Note("block", "Comment", why), *branch.body))]
 
 
 def _grouped(step: Step, kind: str) -> bool:

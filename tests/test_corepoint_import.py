@@ -3253,6 +3253,51 @@ def test_a_bare_marker_main_adopted_across_a_disabled_wrapper_leaves_no_stray(
     ast.parse(src)
 
 
+@pytest.mark.parametrize(
+    "chain",
+    [
+        pytest.param('<Line Data="Catch"/><Line Data="Catch"/>', id="two-bare"),
+        pytest.param(
+            '<Line Data="Catch"/><List Data="MsgLog %ADT"/><Line Data="Catch"/><Line Data="Catch"/>',
+            id="three-bare-a-label-between",
+        ),
+        pytest.param(
+            '<Line Data="Catch"><List><Line Data="ItemClear %ADT/PID-4"/></List></Line>'
+            '<List Disabled="1"/><Line Data="Catch"/>',
+            id="one-with-a-body-then-bare",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param(_LOOP, id="in-a-loop"),
+        pytest.param(
+            '<Line Data="If (a)"><List/></Line><Line Data="Else"><List>{x}</List></Line>',
+            id="in-an-adopted-else",
+        ),
+    ],
+)
+def test_every_sibling_main_adopted_onto_a_switched_off_construct_opens_nothing(
+    template: str, chain: str, tmp_path: Path
+) -> None:
+    """Main adopted every sibling of the chain onto the ``Try`` it flattened out of the wrapper,
+    so the steps after the last one stayed in the list around: dead in the loop, under the
+    ``Else``'s dead arm. Each sibling closes against the one before it, so none opens a branch:
+    not a stray after the loop, and not a branch of the ``Else`` whose send main's closing
+    ``return`` would make for every message. Code review of this change, round 8."""
+    before = '<List Disabled="1"><Try><List/></Try></List>'
+    body = template.replace("{x}", before + chain + _AFTER_THE_WRAPPER)
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert "return Send(" not in handler
+    assert not _send_lines(handler, 1)
+    assert "cannot continue" not in handler
+    assert handler.count(f"Corepoint Catch {_ORPHAN}") == chain.count('Data="Catch"')
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
+
+
 def test_a_marker_closed_by_a_switched_off_construct_keeps_its_counted_todos() -> None:
     """The orphan is a live element, so it and the statement on its label are counted unmapped,
     not folded into the wrapper's one disabled count. Code review of this change, round 7."""
