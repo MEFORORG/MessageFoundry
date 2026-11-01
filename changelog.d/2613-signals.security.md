@@ -1,8 +1,7 @@
 - **Refused peers, a switched-off signal layer and a restored posture now reach the alert sink.**
   A new `peer_refused_burst` security signal fires when one inbound listener (at least MLLP, raw
   TCP, X12, HTTP and the DICOM server) refuses `[alerts].security_peer_refusals` connections
-  (default `100`, at most `100000`) at its `source_ip_allowlist` or a connection cap (the DICOM
-  server's exceptions are in docs/CONFIGURATION.md) inside the
+  (default `100`, at most `100000`) at its `source_ip_allowlist` or a connection cap inside the
   window, whether or not connection-event capture is on, and then stays quiet for that listener
   for the window, at most 300 s. It is keyed `inbound:<name>`, never the peer's address.
   `[alerts].security_signals = false`, a detector count of `0` or above its default, and a

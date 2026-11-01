@@ -904,6 +904,7 @@ def test_a_dicom_refusal_reaches_the_refusal_observers() -> None:
 
 
 async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers() -> None:
+    pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
     seen: list[str] = []
     scp = DicomScpSource(
         Source(
@@ -929,6 +930,59 @@ async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers
     finally:
         await scp.stop()
     assert seen == ["IB_PACS"]
+
+
+def _verification_association(port: int) -> Any:
+    """An association request from a stand-in modality, held open if the SCP accepts it."""
+    from pynetdicom import AE
+    from pynetdicom.sop_class import Verification
+
+    ae = AE(ae_title="MODALITY1")
+    ae.add_requested_context(Verification)
+    return ae.associate("127.0.0.1", port, ae_title="MEFOR_SCP")
+
+
+async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers() -> None:
+    pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
+    seen: list[str] = []
+    scp = DicomScpSource(
+        Source(
+            type=ConnectorType.DIMSE,
+            name="IB_PACS",
+            settings={
+                "ae_title": "MEFOR_SCP",
+                "host": "127.0.0.1",
+                "port": 0,
+                "max_associations": 1,
+            },
+        )
+    )
+
+    async def handler(_data: bytes) -> str | None:
+        return None
+
+    await scp.start(handler)
+    add_refusal_observer(seen.append)
+    held: Any = None
+    try:
+        # The control: an association under the limit is admitted and notifies nothing.
+        held = await asyncio.to_thread(_verification_association, scp.sockport)
+        assert held.is_established
+        assert seen == []
+        rejected = await asyncio.to_thread(_verification_association, scp.sockport)
+        assert rejected.is_rejected
+        # EVT_REJECTED fires on the SCP's thread after the RJ is sent, so wait for it briefly.
+        for _ in range(100):
+            if seen:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.1)  # and give a second notify the chance to show
+        assert seen == ["IB_PACS"]
+    finally:
+        remove_refusal_observer(seen.append)
+        if held is not None and held.is_established:
+            await asyncio.to_thread(held.release)
+        await scp.stop()
 
 
 def test_a_failing_refusal_observer_never_reaches_the_listener(

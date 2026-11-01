@@ -201,6 +201,7 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in
 _RJ_RESULT_TRANSIENT = 0x02
 _RJ_SOURCE_PRESENTATION = 0x03
 _RJ_REASON_TEMPORARY_CONGESTION = 0x01
+_RJ_REASON_LOCAL_LIMIT = 0x02
 
 #: Loopback bind interfaces that need no peer controls (the common dev/single-box case). Copied (not
 #: imported) from :data:`messagefoundry.pipeline.wiring_runner._LOOPBACK_HOSTS` to keep the dependency
@@ -677,7 +678,7 @@ def _admitting_server_class() -> type[Any]:
             self._admit = admit
             self._refused = refused
             #: Called besides ``refused`` for a connection refused at a connection cap, which the
-            #: refusal observers count (vault BACKLOG #2613).
+            #: refusal observers count; ``refused`` alone never notifies them (vault BACKLOG #2613).
             self._refused_at_cap = refused_at_cap
             #: Called on the DUL thread with the peer address and the reason, when a read of an
             #: association that has started runs out its deadline. It is not a refusal: the SCP
@@ -1638,6 +1639,8 @@ class DicomScpSource(SourceConnector):
             # because the runner injects a gate into every source; the handler reads
             # `intake_gate` live and returns at once when there is none or it is open.
             (evt.EVT_REQUESTED, self._refuse_association_while_paused),
+            # vault BACKLOG #2613: a max_associations rejection reaches the refusal observers.
+            (evt.EVT_REJECTED, self._count_association_limit_rejection),
         ]
         if self._pacer is not None:
             # Registered ONLY when a rate is configured, so an unpaced SCP — the shipped default —
@@ -1912,6 +1915,29 @@ class DicomScpSource(SourceConnector):
             )
             assoc.abort()
         assoc.kill()
+
+    def _count_association_limit_rejection(self, event: Any) -> None:
+        """Tell the refusal observers about an association rejected because ``max_associations``
+        is full (vault BACKLOG #2613), the counterpart of a socket listener's connection cap.
+
+        ``EVT_REJECTED`` fires on the association's thread for every A-ASSOCIATE-RJ this SCP sends,
+        after the RJ is stored as the acceptor's primitive. pynetdicom sends local-limit-exceeded
+        only for ``max_associations``, so that reason alone is counted: the intake pause's
+        temporary-congestion rejection and the AE-title and user-identity rejections are not.
+        """
+        try:
+            assoc = event.assoc
+            rj = assoc.acceptor.primitive
+            at_limit = (
+                assoc.is_acceptor
+                and rj.result_source == _RJ_SOURCE_PRESENTATION
+                and rj.diagnostic == _RJ_REASON_LOCAL_LIMIT
+            )
+        except Exception as exc:  # noqa: BLE001 - on pynetdicom's thread: never raise into it
+            logger.debug("DICOM rejection not read for the refusal observers: %s", safe_exc(exc))
+            return
+        if at_limit:
+            notify_refusal(self._refusal_name)
 
     def _charge_association(self, event: Any) -> None:
         """Charge one token once an association is ACCEPTED — the debt is paid by the next arrival.
