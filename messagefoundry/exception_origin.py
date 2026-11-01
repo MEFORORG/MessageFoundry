@@ -13,8 +13,10 @@ The rule reads the innermost frame's compiled file name and its module name, and
 module can rebind ``__name__``, so the name alone is a claim. A config directory can sit inside the
 package, and its modules and helpers run as ``mefor_config_*``, so the file alone is not enough. The
 file name is fixed when code is compiled, so a module that compiles text under an engine path, and
-sets the name to match, still passes. This tells accident from engine wording: it does not stop code
-that sets out to forge a frame.
+sets the name to match, still passes. This tells most accidents from engine wording: it does not
+stop code that sets out to forge a frame, and it does not read a module that raises its own
+exception under a refusal's traceback, with ``with_traceback``, which keeps the engine's frame
+innermost and is an ordinary idiom rather than a forgery.
 
 A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
 ``__class__``, which leaves the engine's frame on it and prints through that class's ``__str__``, so

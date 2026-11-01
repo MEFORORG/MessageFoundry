@@ -1054,15 +1054,20 @@ def test_a_caught_refusal_given_a_subclass_comes_back_plain(
     assert err.__cause__ is None and err.__context__ is None
 
 
-def test_an_engine_subclass_of_wiring_error_keeps_its_text_as_a_plain_one(
-    tmp_path: Path, engine_probe: str
-) -> None:
+def test_an_engine_subclass_of_wiring_error_keeps_its_text_as_a_plain_one(tmp_path: Path) -> None:
     body = (
-        "from messagefoundry.config.wiring import PortConflictError\n"
-        f"import {engine_probe} as probe\n\nprobe.raises_this_type(PortConflictError)\n"
+        "from messagefoundry import Http\n"
+        "from messagefoundry.config.wiring import PortConflictError, WiringError\n\n"
+        "try:\n"
+        "    Http(port=8080, reply_from='OB_X', reply_on_timeout='500')\n"
+        "except WiringError as exc:\n"
+        "    exc.__class__ = PortConflictError\n"
+        "    raise\n"
     )
     _write(tmp_path, "feed.py", body)
-    assert type(_load_error(tmp_path)) is WiringError
+    err = _load_error(tmp_path)
+    assert type(err) is WiringError
+    assert "reply_on_timeout must be" in str(err)
 
 
 def test_a_context_with_its_own_repr_is_foreign(tmp_path: Path, engine_probe: str) -> None:
@@ -1077,11 +1082,14 @@ def test_a_context_with_its_own_repr_is_foreign(tmp_path: Path, engine_probe: st
 
 
 def _frames_holding(left: BaseException, held: type[BaseException]) -> list[str]:
-    """The frames on ``left``'s traceback with a local of type ``held``."""
+    """The frames on ``left``'s traceback with a local of type ``held`` other than ``left``."""
+    frames = [frame for frame, _line in traceback.walk_tb(left.__traceback__)]
+    # A floor: an empty walk would read as a clean one.
+    assert "_exec_module" in [frame.f_code.co_name for frame in frames]
     return [
         frame.f_code.co_name
-        for frame, _line in traceback.walk_tb(left.__traceback__)
-        if any(type(value) is held for value in frame.f_locals.values())
+        for frame in frames
+        if any(type(v) is held and v is not left for v in frame.f_locals.values())
     ]
 
 
@@ -1096,13 +1104,7 @@ def test_no_loader_frame_on_an_interrupt_holds_the_original(tmp_path: Path) -> N
     _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
     with pytest.raises(KeyboardInterrupt) as ei:
         load_config(tmp_path)
-    held = [
-        frame.f_code.co_name
-        for frame, _line in traceback.walk_tb(ei.value.__traceback__)
-        for value in frame.f_locals.values()
-        if type(value) is KeyboardInterrupt and value is not ei.value
-    ]
-    assert held == []
+    assert _frames_holding(ei.value, KeyboardInterrupt) == []
 
 
 def test_what_a_read_queues_is_not_drained_by_the_next_module(tmp_path: Path) -> None:

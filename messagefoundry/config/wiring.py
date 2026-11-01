@@ -9489,8 +9489,8 @@ def _is_a_signal(exc: BaseException) -> bool:
 def _read_fault(path: Path, fault: BaseException) -> None:
     """Act on ``fault``, which reading a failed module's exception raised.
 
-    Called after the ``except`` that caught it, so what this raises carries neither ``fault`` nor
-    the module's exception. A read runs the module's code, so a real Ctrl-C can land in it: that
+    Called after the ``except`` that caught it, so neither ``fault`` nor the module's exception is
+    chained to what this raises, though the frames on its traceback still hold them. A read runs the module's code, so a real Ctrl-C can land in it: that
     stops the load as a new, bare interrupt, by the rule :func:`_run_author_code` gives. An exact
     ``SystemExit`` leaves as a new one with its code, which the loader does not handle, except on a
     worker, where it would stop the event loop as an interrupt would. Exact, because a subclass can
@@ -9663,10 +9663,10 @@ def _textless_import_error(exc: ImportError) -> ImportError:
 
 
 def _is_engine_text(exc: BaseException) -> bool:
-    """Whether what ``exc`` prints is what a ``raise`` in this package wrote: an engine frame raised
-    it, and its class renders through a builtin's ``__str__`` and ``__repr__``. A class's own method
-    writes what prints, whoever raised the instance. Read from the class dicts, so no code of the
-    class runs."""
+    """Whether ``exc`` reads as engine text: its frame's ``raise`` is this package's, and its class
+    renders through a builtin's ``__str__`` and ``__repr__``, because a class's own method writes
+    what prints, whoever raised the instance. Read from the class dicts, so no code of the class
+    runs. This is evidence, not proof: :mod:`messagefoundry.exception_origin` says what passes."""
     return worded_by_the_engine(exc) and all(
         id(_class_attribute(type(exc), name)) in _BUILTIN_EXC_RENDERS
         for name in ("__str__", "__repr__")
