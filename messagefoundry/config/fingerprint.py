@@ -10,8 +10,10 @@ later innocent reload/restart detonates). :func:`config_fingerprint` returns a s
 **content** of every file the loader consumes, so the audit (and a startup row) can prove *which
 bytes* a given reload activated, diffable against a signed source-of-truth.
 
-This is **observational**: a fingerprint records, it does not gate — it never drops a message or
-changes a disposition. It complements (does not replace) ADR 0036's load-time write-access refusal,
+By default this is **observational**: a fingerprint records, it does not gate — it never drops a
+message or changes a disposition. At least the digest a dual-control release checks does gate
+(:func:`snapshot_fingerprint`): it refuses a reload, and still touches no message.
+It complements (does not replace) ADR 0036's load-time write-access refusal,
 which stops an *unauthorized* principal from writing the config dir; the fingerprint attributes an
 *authorized* change to a reviewed source.
 
@@ -69,7 +71,7 @@ _SCHEME = b"mefor-cfg-fp:v3\n"
 FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 
 #: The :func:`config_fingerprint_detail` key that marks a partial digest: the sorted relative paths of
-#: the covered files, and of the folders a glob reads, that could not be read and were left out
+#: the covered files, and of the folders a snapshot lists, that could not be read and were left out
 #: (vault BACKLOG #2944). Absent when the digest covers the whole bundle. Paths, not a count, so two
 #: partial digests can be compared like for like, and an operator can tell which file to fix. The
 #: entry ``.`` is the config directory itself, which could not be listed. Not ``degraded``: an audit
@@ -77,10 +79,12 @@ FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 UNREADABLE_FILES_KEY = "unreadable_files"
 
 # What is hashed is what :func:`~messagefoundry.config.snapshot.read_config_snapshot` reads: every
-# config module (``config.snapshot.config_py_files``, the one rule the loader and ADR 0036's guard
-# also use, ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble ``._X.py``
-# skipped), ``connections.toml``, each ``codesets/`` table, and each ``environments/*.toml`` under
-# the config directory. The last is never loaded as config. The value file a serve start reads sits
+# config module (by ``config.snapshot._covered_name``, which gives the list a load digests and runs;
+# of the reads a load makes, only ADR 0036's trust check lists by ``config_py_files``, a separate
+# copy of the rule; ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble
+# ``._X.py`` skipped), ``connections.toml``, each ``codesets/`` table, and each
+# ``environments/*.toml`` under the config directory. The last is never loaded as config. The value
+# file a serve start reads sits
 # under ``[environments].base_dir``; where that is this folder, a reload parses the very bytes
 # hashed here (``ConfigSnapshot.environment_file``), so dropping them from the fold would let a
 # released reload apply values its digest does not cover. ``__pycache__`` is never read:
@@ -126,9 +130,9 @@ def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     By default it is observational, as the module docstring says: a file it cannot read is left out,
     and a missing directory digests as an empty bundle. ``strict`` is for a digest that GATES, the
     one a dual-control approval binds (vault BACKLOG #2596). There a skipped file would leave bytes
-    the approval never covered, so ``strict`` raises instead: :class:`ConfigDirMissing` when
-    ``directory`` is not a directory, and the ``OSError`` when a folder it reads cannot be listed or
-    a file it covers cannot be stat'ed or read."""
+    the approval never covered, so ``strict`` raises instead.
+    :func:`~messagefoundry.config.snapshot.read_config_snapshot` says at which faults, and which
+    gone directory it does not refuse."""
     return snapshot_fingerprint(read_config_snapshot(directory, strict=strict))
 
 

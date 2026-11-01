@@ -57,6 +57,7 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -630,7 +631,7 @@ class X12Source(SourceConnector):
         # accident, since raw TCP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = str(s.get("host") or "127.0.0.1")
         self.port: int = port_setting(s["port"], transport="X12 source")
-        self.encoding: str = str(s.get("encoding", "utf-8"))
+        self.encoding: str = declared_encoding(s.get("encoding"))
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(

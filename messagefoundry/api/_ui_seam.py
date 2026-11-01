@@ -770,6 +770,11 @@ from typing import Any
 #: The digest reads field names only, so that part did not move it: a console from before it would
 #: take null for unflagged, hide every row under Flagged only and post ``flagged=true``.
 #:
+#: BACKLOG #3811: the console imports ``api.security.ConfigWriteNotRecorded``, the 503 the
+#: connection flag handler raises for a toggle its audit row did not record, and names that fix by
+#: the type rather than by any 503. A newer console on an older engine would raise ImportError at
+#: mount, so it forces a bump. Re-derived with ``--write`` (from b634db50214474e2).
+#:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
@@ -785,12 +790,18 @@ from typing import Any
 #: 0341bb4cd2670000). Neither parent's value covered both, so the value below was re-derived with
 #: ``--write`` on the merged tree.
 #:
+#: BACKLOG #2623 and #3765 merged with main, after BACKLOG #3811 landed there (digest
+#: 8774e324f0b1b7cf; this branch at 86ccf1e26578f65a). Neither parent's value covered both, so the
+#: value below was re-derived with ``--write`` on the merged tree. The flag handler now raises
+#: ``ConfigWriteNotRecorded`` for ``ConnectionFlagNotRecorded``, because the audit refusal that
+#: #3811 typed went with the config write.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "86ccf1e26578f65a"
+ENGINE_UI_SEAM: str = "1a399261c0bf7e2b"
 
 
 @dataclass(frozen=True, slots=True)

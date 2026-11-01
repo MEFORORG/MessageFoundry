@@ -231,6 +231,7 @@ from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
+    ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
     alert_sink_for,
@@ -5523,9 +5524,10 @@ def create_app(
                 client=client_ip(request),
             )
         except ConnectionFlagNotRecorded as exc:
-            # The store, not the request, is at fault, so 503 as for any refused audit write. The
-            # route's only 503, which the console relies on to name this fix.
-            raise HTTPException(503, str(exc)) from exc
+            # The store did not confirm the flag and its audit row (BACKLOG #2623). The store, not
+            # the request, is at fault, so 503 as for any refused audit write. Typed, because it is
+            # not the route's only 503 and the console names this fix (BACKLOG #3811).
+            raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
             # The one 409: the running graph has no such connection.
             raise HTTPException(409, str(exc)) from exc

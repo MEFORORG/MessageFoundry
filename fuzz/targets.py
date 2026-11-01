@@ -76,6 +76,7 @@ from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
     DocRefError,
+    EscapedDocumentError,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -658,8 +659,8 @@ def _binary_carriage(data: bytes) -> None:
       here would abort the whole pass, not just skip one row. Its docstring promises that a body it
       does not strip comes back unchanged;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
-      document-detach scan, which documents no refusal -- and ``extract_obx_document`` on every OBX,
-      whose refusal is ``BinaryCarriageError``.
+      document-detach scan, whose refusal is ``EscapedDocumentError`` -- and ``extract_obx_document``
+      on every OBX, whose refusal is ``BinaryCarriageError``.
 
     The HL7 half carries the only carve-outs in this file, one per registered known finding: see
     :data:`KNOWN_FINDINGS` and :func:`_is_known_binary_carriage_finding`.
@@ -686,7 +687,8 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    list(iter_obx_documents(message))
+    with contextlib.suppress(EscapedDocumentError):
+        list(iter_obx_documents(message))
     for occurrence in range(1, message.count_segments("OBX") + 1):
         with contextlib.suppress(BinaryCarriageError):
             extract_obx_document(message, occurrence=occurrence)

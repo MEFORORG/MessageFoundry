@@ -28,9 +28,11 @@ __all__ = ["IngressReceipt", "ReceiptHandler", "RefusalKind", "receipt_handler",
 class RefusalKind(StrEnum):
     """Why the runner refused a body it read, as the sender needs to know it."""
 
-    #: Engine-side and expected to clear: the same body may be accepted on a re-send. Only the
-    #: streaming detach's in-flight budget is classed here; ADR 0154's 2026-10-30 amendment says why
-    #: the strict-validation timeout is not.
+    #: Engine-side, not about the body: the same body may be accepted on a re-send once the cause
+    #: clears. At least two are classed here: the streaming detach's in-flight budget, which clears
+    #: on its own, and an inbound codec name that sets up no decode (BACKLOG #2431), which clears
+    #: only when the operator fixes it. ADR 0154's 2026-10-30 amendment says why the strict-validation
+    #: timeout is not.
     TEMPORARY = "temporary"
     #: About the body itself: a re-send of the same bytes is refused the same way.
     PERMANENT = "permanent"

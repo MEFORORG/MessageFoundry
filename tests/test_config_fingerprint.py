@@ -249,6 +249,21 @@ def test_strict_refuses_a_folder_it_cannot_list(
     assert config_fingerprint(d, strict=True) != readable  # the control: absent, not refused
 
 
+@pytest.mark.parametrize("name", ["codesets", "environments"])
+def test_a_file_named_like_a_folder_it_lists_is_a_missing_folder(tmp_path: Path, name: str) -> None:
+    """A sub-folder is judged as the directory itself is: a plain file in its place cannot be
+    listed, and it holds nothing a digest leaves out (vault BACKLOG #3535). So it refuses nothing,
+    is named as nothing left out, and does not move the digest."""
+    d = tmp_path / "cfg"
+    d.mkdir()
+    (d / "cfg.py").write_text("inbound = 1\n", encoding="utf-8")
+    without = config_fingerprint(d, strict=True)
+    (d / name).write_text("not a folder\n", encoding="utf-8")
+    assert config_fingerprint(d, strict=True) == without
+    detail = config_fingerprint_detail(d)
+    assert UNREADABLE_FILES_KEY not in detail and detail["fingerprint"] == without
+
+
 # --- vault BACKLOG #2944: the observational digest says when it left something out --------------
 
 
@@ -339,9 +354,27 @@ def test_a_file_removed_mid_digest_is_gone_not_unreadable(
 
     def _read(self: Path) -> bytes:
         if self.name == "cfg.py":
+            self.unlink()
             raise FileNotFoundError(2, "No such file", str(self))
         return real(self)
 
     monkeypatch.setattr(Path, "read_bytes", _read)
     detail = config_fingerprint_detail(d)
     assert UNREADABLE_FILES_KEY not in detail and detail["files"] == 4
+
+
+def test_a_file_a_read_called_missing_that_is_still_there_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its stat says it exists, so it is not gone, and the digest must not read as a whole one."""
+    d = tmp_path / "cfg"
+    _bundle(d)
+    real = Path.read_bytes
+
+    def _read(self: Path) -> bytes:
+        if self.name == "cfg.py":
+            raise FileNotFoundError(2, "No such file", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == ["cfg.py"]

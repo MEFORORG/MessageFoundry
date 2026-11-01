@@ -54,6 +54,7 @@ from messagefoundry.transports.framing import (
     FrameError,
     check_frame_bytes,
     codec_for,
+    declared_encoding,
     frame_for_delivery,
     frame_reply,
 )
@@ -481,7 +482,12 @@ class TcpSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = port_setting(s["port"], transport="TCP source")
         self.codec = _codec_from_settings(s)
-        self.encoding: str = s.get("encoding", "utf-8")
+        # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
+        # the runner decoded the body with. Config load refuses an env() inbound encoding, which the
+        # runner's decode would not resolve, and a non-str or unusable name (BACKLOG #2431); the str()
+        # rule is the backstop that hands one that got past it to frame_reply's fallback, rather than
+        # raising a TypeError that leaves the reply unsent.
+        self.encoding: str = declared_encoding(s.get("encoding"))
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(
@@ -687,7 +693,14 @@ class TcpSource(SourceConnector):
                             decoded += 1
                             reply = await self._handler(message)
                             if reply is not None:
-                                writer.write(frame_reply(self.codec, reply, self.encoding))
+                                writer.write(
+                                    frame_reply(
+                                        self.codec,
+                                        reply,
+                                        self.encoding,
+                                        connection=self._pacing_name,
+                                    )
+                                )
                                 await self._drain_reply(writer)
                         # Charge AFTER the messages in this chunk are fully handled.
                         if pacer is not None:

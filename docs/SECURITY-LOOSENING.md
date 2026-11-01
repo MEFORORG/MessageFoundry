@@ -1487,6 +1487,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
+  Both hold on a host the `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist admits; a host
+  off it is left to the per-send refusal.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
@@ -1510,10 +1512,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **How it is reported:** `security_loosenings()` names it as `alerts.email_tls_revocation_attested`
   or `alerts.webhook_tls_revocation_attested`, with the reason, so `security show`,
   `GET /security/posture` and the serve-time loosening WARNING list it. It is named whenever the
-  flag is set, whether or not the hop it covers is configured. A hop that crosses an enforcing
-  posture on it logs a WARNING carrying the reason. That line names the declaration as
-  `tls_revocation_attested`, the shared guard's spelling, with no connection; its cell names the
-  `[alerts]` hop. `messagefoundry check` has no line for these pairs.
+  flag is set, whether or not the hop it covers is configured. When a crossing on it logs a
+  WARNING carrying the reason is stated once, in the `email_tls_revocation_attested` and
+  `webhook_tls_revocation_attested` rows of [CONFIGURATION.md `[alerts]`](CONFIGURATION.md#alerts).
+  That line names the setting as
+  `[alerts].email_tls_revocation_attested` or `[alerts].webhook_tls_revocation_attested`, and no
+  connection; its cell names the `[alerts]` hop. `messagefoundry check` has no line for these pairs.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused.
 - **Reversible:** yes. Delete both lines and restart.

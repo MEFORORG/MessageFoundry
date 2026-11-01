@@ -420,6 +420,23 @@ class RepeatedCredentialError(HTTPException):
         self.credential = credential
 
 
+class ConfigWriteNotRecorded(HTTPException):
+    """A 503 for a connection flag toggle the store did not confirm with its audit row (BACKLOG
+    #2623). A commit whose answer was lost has landed, so it does not say the flag is unchanged.
+
+    The connection flag handler raises it in place of a plain 503, so the console's flag route can
+    name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). The JSON route
+    answers other 503s, at least ``_get_engine``'s "engine not started" and
+    ``RequestTimeoutMiddleware``'s deadline. Neither reaches the console, which calls the handler
+    in-process with its engine supplied, so keying on the status held only because nothing in the
+    handler itself raised another 503; a later change to the handler could. The HTTP answer is the
+    ordinary 503 with ``detail``. Defined here because this is the leaf module the console imports,
+    and the seam snapshot records what it imports from it."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+
+
 #: How much of the request path the repeated-credential line and row keep.
 _REPEATED_PATH_MAX = 256
 

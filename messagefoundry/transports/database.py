@@ -86,6 +86,7 @@ from messagefoundry.config.tls_policy import (
     current_hop_posture,
     hop_name_prefix,
 )
+from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
@@ -117,6 +118,7 @@ from messagefoundry.transports.db_endpoint import (
     odbc_keyword_name,
     odbc_param,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = [
@@ -2722,7 +2724,13 @@ class DatabaseSource(SourceConnector):
             knob="poll_max_rows",
             transport="DATABASE source",
         )
-        self._encoding: str = s.get("encoding", "utf-8")
+        self._encoding: str = declared_encoding(s.get("encoding"))
+        # Refused here, when the source is built, by the probe config load uses (BACKLOG #2431). Each
+        # polled row is encoded with this name, so an unusable one would otherwise surface per row.
+        # Config load refuses an env() inbound encoding and a literal naming no codec (BACKLOG #2431),
+        # so this is a backstop for a graph built past load.
+        if not _is_text_codec(self._encoding):
+            raise ValueError("DATABASE source 'encoding' names no usable text codec")
         self._login_timeout = _login_timeout(
             s,
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",

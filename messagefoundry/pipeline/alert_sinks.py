@@ -454,6 +454,7 @@ def _refuse_webhook_revocation(
         ways_across=_WEBHOOK_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink, not a connection
+        declaration="[alerts].webhook_tls_revocation_attested",
     ).enforce_construction()
 
 
@@ -537,6 +538,7 @@ def _refuse_alert_smtp_revocation(
         ways_across=_ALERT_SMTP_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink and the security notifier, not a connection
+        declaration="[alerts].email_tls_revocation_attested",
     ).enforce_construction()
 
 

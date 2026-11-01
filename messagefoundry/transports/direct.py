@@ -672,8 +672,9 @@ class DirectDestination(DestinationConnector):
         line break inside the subject) would quietly drain the whole queue into the dead-letter
         store. The body is synthetic, so the library's own text is safe to show.
 
-        An unknown ``encoding`` never gets this far on a config path: ``build_check_registry``
-        refuses it first (``resolved_encoding_problems``)."""
+        An unknown ``encoding`` never gets this far on a config path: config load refuses a literal
+        one (``Registry.encoding_problems``), and ``build_check_registry`` an ``env()`` one that
+        resolves to no codec (``resolved_encoding_problems``)."""
         try:
             self._build_smime(_PROBE_BODY)
         except _BUILD_ERRORS as exc:

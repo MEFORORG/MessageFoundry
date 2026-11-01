@@ -145,6 +145,7 @@ from messagefoundry.transports.file import (
     render_filename,
     scan_inbound_file,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["RemoteFileDestination", "RemoteFileSource"]
@@ -2519,10 +2520,10 @@ class RemoteFileSource(SourceConnector):
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
-        # The declared charset, resolved as ingress_guards.ingress_encoding resolves it (an absent or
-        # None setting is utf-8): the batch split decodes with it to find the MSH boundaries (ADR
-        # 0206 rule 5). A name the codec registry lacks makes the split hand the file over whole.
-        self._encoding: str = s.get("encoding") or "utf-8"
+        # The declared charset, by the rule ingress_guards.ingress_encoding reads (BACKLOG #2431):
+        # the batch split decodes with it to find the MSH boundaries (ADR 0206 rule 5). A name the
+        # codec registry lacks makes the split hand the file over whole.
+        self._encoding: str = declared_encoding(s.get("encoding"))
         self._poll_seconds: float = poll_interval(s, default=5.0, transport="REMOTEFILE source")
         self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self._after_read not in ("move", "delete", "leave"):

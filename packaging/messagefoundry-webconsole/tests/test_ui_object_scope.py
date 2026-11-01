@@ -14,6 +14,7 @@ import json
 
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
+from fastapi import HTTPException
 
 from messagefoundry.api.models import ConnectionRow
 from messagefoundry.auth import Role
@@ -136,3 +137,26 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     assert "clicking it again would undo that" in r.text
     assert "Flag not changed" not in r.text
     assert "try again" not in r.text.lower()
+
+
+async def test_ui_flag_gives_another_503_no_not_confirmed_page(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3811: a 503 that is not the store's refusal is not given that refusal's page."""
+
+    async def _other_503(*_args: object, **_kwargs: object) -> None:
+        raise HTTPException(503, "some other unavailable")
+
+    monkeypatch.setattr(engine, "set_connection_flag", _other_503)
+    service = await auth_service(engine)
+    await provision(service, "dep", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "inbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 503, r.text[:300]
+    assert "some other unavailable" in r.text
+    assert "The store did not confirm the change" not in r.text
