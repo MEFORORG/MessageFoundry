@@ -1036,6 +1036,14 @@ _SCHEMA: list[str] = [
         last_seen  DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (user_id, address)
     )""",
+    # The object-of-interest flag (BACKLOG #2623) -- mirrors the SQLite `connection_flag` table
+    # (store/store.py), whose comment gives the reasons: a row IS the flag. Adding this DDL moves
+    # _schema_hash() automatically -- the ADR 0064 bump.
+    """CREATE TABLE IF NOT EXISTS connection_flag (
+        connection TEXT NOT NULL,
+        direction  TEXT NOT NULL,
+        PRIMARY KEY (connection, direction)
+    )""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in _CIPHER_COLUMNS). Adding this DDL moves
     # _schema_hash() automatically — the ADR 0064 bump.
@@ -6218,6 +6226,42 @@ class PostgresStore:
             suspended_until=r["suspended_until"],
             escalation_tier=int(r["escalation_tier"]),
         )
+
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        now = time.time() if now is None else now
+        async with (
+            AuditedWrite(now) as written,
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(),
+        ):
+            if flagged:
+                await conn.execute(
+                    "INSERT INTO connection_flag (connection, direction) VALUES ($1, $2)"
+                    " ON CONFLICT (connection, direction) DO NOTHING",
+                    connection,
+                    direction,
+                )
+            else:
+                await conn.execute(
+                    "DELETE FROM connection_flag WHERE connection=$1 AND direction=$2",
+                    connection,
+                    direction,
+                )
+            await self._append_operator_audit(conn, written, if_applied(audit), True)
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
+        rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
+        return {(str(r["connection"]), str(r["direction"])) for r in rows}
 
     async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).

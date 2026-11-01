@@ -267,6 +267,35 @@ async def test_sqlite_adds_claim_owner_to_a_table_that_predates_it(tmp_path: Pat
         await store.close()
 
 
+def test_connection_flag_table_present_on_all_backends() -> None:
+    # BACKLOG #2623: a row IS the flag, keyed by name and direction, on all three backends. On the
+    # server backends the DDL lives in _SCHEMA, which is what moves _schema_hash. SQL Server's key is
+    # BIN2, so two names that differ by case are two connections, as on SQLite and Postgres.
+    from messagefoundry.store import store as sqlite_store
+
+    assert "CREATE TABLE IF NOT EXISTS connection_flag" in sqlite_store._SCHEMA
+    assert "PRIMARY KEY (connection, direction)" in sqlite_store._SCHEMA
+
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+    assert any(
+        "CREATE TABLE connection_flag" in s
+        and "PRIMARY KEY (connection, direction)" in s
+        and "connection NVARCHAR(256) COLLATE Latin1_General_100_BIN2" in s
+        for s in sqlserver._SCHEMA
+    )
+
+    postgres = pytest.importorskip(
+        "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS connection_flag" in s
+        and "PRIMARY KEY (connection, direction)" in s
+        for s in postgres._SCHEMA
+    )
+
+
 def test_known_login_addresses_table_present_on_all_backends() -> None:
     # vault BACKLOG #2145: the first-seen sign-in address record must exist in ALL THREE backend
     # schemas, keyed (user_id, address) so the signal's one read is a primary-key lookup. On the

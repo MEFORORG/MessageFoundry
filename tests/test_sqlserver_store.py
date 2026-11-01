@@ -127,6 +127,7 @@ async def store() -> AsyncIterator[object]:
                 "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
                 "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
+                "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it

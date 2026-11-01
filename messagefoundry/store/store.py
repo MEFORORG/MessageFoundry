@@ -8283,6 +8283,18 @@ CREATE TABLE IF NOT EXISTS known_login_addresses (
     PRIMARY KEY (user_id, address)
 );
 
+-- The operator's object-of-interest flag (BACKLOG #2623, ADR 0007 amendment of 2026-10-31). A row IS
+-- the flag: a flagged connection has one and an unflagged connection has none, so no stored value
+-- exists to be malformed. Display only. No start, reload or delivery path reads it, and no key seals
+-- it, so a database writer can move a marker on the console and nothing else. Keyed by name and
+-- direction because a name may be both an inbound and an outbound. Not cleaned when a connection
+-- leaves the graph: the row then matches nothing, and the name keeps its flag if it comes back.
+CREATE TABLE IF NOT EXISTS connection_flag (
+    connection TEXT NOT NULL,
+    direction  TEXT NOT NULL,                    -- 'inbound' or 'outbound'
+    PRIMARY KEY (connection, direction)
+);
+
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
     owner_user_id TEXT NOT NULL,                 -- the owning Identity.user_id (BACKLOG #1225: NOT the
@@ -14884,6 +14896,39 @@ class MessageStore:
         await self._append_operator_audit(written, if_applied(audit), applied)
         await self._commit()
         return applied
+
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        now = time.time() if now is None else now
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
+            if flagged:
+                await self._db.execute(
+                    "INSERT INTO connection_flag (connection, direction) VALUES (?, ?)"
+                    " ON CONFLICT(connection, direction) DO NOTHING",
+                    (connection, direction),
+                )
+            else:
+                await self._db.execute(
+                    "DELETE FROM connection_flag WHERE connection=? AND direction=?",
+                    (connection, direction),
+                )
+            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._commit()
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT connection, direction FROM connection_flag")
+            rows = await cur.fetchall()
+        return {(str(r["connection"]), str(r["direction"])) for r in rows}
 
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None

@@ -89,6 +89,7 @@ _TABLES = (
     "delivered_keys",
     "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
     "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+    "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
     "search_presets",  # ADR 0136 saved searches (no FK, so CASCADE never reaches it) — the ciphered
     #                    `criteria` is in the key-rotation reencrypt scan, and this suite asserts EXACT
     #                    rotate counts, so a preset left by one test miscounts an unrelated one
