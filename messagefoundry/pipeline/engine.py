@@ -2534,7 +2534,8 @@ class Engine:
     def fingerprint_bundle_blocking(
         self, path: Path, snapshot: ConfigSnapshot | None = None
     ) -> tuple[dict[str, object] | None, str | None]:
-        """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule."""
+        """:meth:`fingerprint_bundle`'s worker-thread body. A direct call to the fold, so the crypto
+        inventory scanner, which does not follow ``asyncio.to_thread``, keeps the hash on its record."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
         try:

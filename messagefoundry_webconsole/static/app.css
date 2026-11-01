@@ -229,8 +229,8 @@ table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
 }
 .rowcb { margin: 0; cursor: pointer; }
 
-/* Object-of-interest flag (#131): a per-row toggle button. Amber when flagged (the brand accent),
-   muted outline otherwise. */
+/* Object-of-interest flag (#131): a per-row toggle button, or the marker alone on a draining
+   row. Amber when flagged (the brand accent), muted outline otherwise. */
 .flagbtn {
   background: transparent; border: 0; cursor: pointer; padding: 0 0.2rem; line-height: 1;
   color: var(--muted); font-size: 1rem; border-radius: 4px;
@@ -239,6 +239,8 @@ table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
 .flagbtn.flagged { color: var(--foundry); }
 .flagbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .flagform { margin: 0; }
+.flag { color: var(--muted); }
+.flag.flagged { color: var(--foundry); }
 /* Flagged-only view toggle in the toolbar. */
 .flagfilter { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--muted);
   white-space: nowrap; cursor: pointer; }

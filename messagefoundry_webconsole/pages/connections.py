@@ -173,11 +173,18 @@ def _flag_name(r: ConnectionRow) -> tuple[str, str]:
 
 
 def _flag_cell(r: ConnectionRow) -> Markup:
-    """The Flag cell (#131, BACKLOG #2623): a same-origin POST toggle form on every row. The glyph
-    is filled (⚑) when flagged, outline (⚐) otherwise; the button posts the DESIRED new value so a
-    submit flips it (like the Alerts ack/resolve POST forms). Every value is placed through the
-    escaping builder."""
+    """The Flag cell (#131, BACKLOG #2623): a same-origin POST toggle form on a row in the running
+    graph, or the marker alone on a draining outbound, whose name the graph no longer holds, so the
+    toggle would only be refused. The glyph is filled (⚑) when flagged, outline (⚐) otherwise; the
+    button posts the DESIRED new value so a submit flips it (like the Alerts ack/resolve POST
+    forms). Every value is placed through the escaping builder."""
     glyph = "⚑" if r.flagged else "⚐"
+    if r.status == "draining":
+        return el(
+            "span",
+            glyph if r.flagged else "",
+            class_="flag" + (" flagged" if r.flagged else ""),
+        )
     name, direction = _flag_name(r)
     return el(
         "form",
@@ -503,8 +510,8 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
 
 
 def flag_rejected(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused (#131): the running graph has no such connection, as
-    for a removed outbound still draining (BACKLOG #2623). Both ``name`` and ``detail`` are
+    """Shown when a flag toggle is refused (#131): the running graph has no such connection, as for
+    a page drawn before a reload removed it (BACKLOG #2623). Both ``name`` and ``detail`` are
     escaped."""
     body = el(
         "div",

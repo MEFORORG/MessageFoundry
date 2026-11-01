@@ -15,10 +15,34 @@ import json
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
 
+from messagefoundry.api.models import ConnectionRow
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertRule, AlertsSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.pages import connections as connection_pages
+
+
+def _row(status: str, *, flagged: bool) -> ConnectionRow:
+    return ConnectionRow.model_construct(
+        role="destination",
+        channel_id="IB_A",
+        channel_name="IB_A",
+        destination="OB_A",
+        name="OB_A",
+        status=status,
+        flagged=flagged,
+    )
+
+
+def test_a_running_row_offers_the_toggle_and_a_draining_row_only_the_marker() -> None:
+    """BACKLOG #2623: any row in the running graph takes the flag, code-first included. A draining
+    outbound is no longer in it, so a toggle there could only be refused."""
+    assert 'action="/ui/connections/OB_A/flag"' in str(
+        connection_pages._flag_cell(_row("running", flagged=False))
+    )
+    draining = str(connection_pages._flag_cell(_row("draining", flagged=True)))
+    assert "<form" not in draining and "flagged" in draining
 
 
 async def _scoped(service: AuthService, username: str, role: Role, scope: list[str]) -> None:

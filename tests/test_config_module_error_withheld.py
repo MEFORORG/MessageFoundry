@@ -206,9 +206,11 @@ async def toml_engine(tmp_path: Path) -> AsyncIterator[Engine]:
         await eng.stop()
 
 
-async def test_the_flag_route_409_withholds_the_module_text(
+async def test_the_flag_route_never_reaches_a_module_that_would_raise(
     toml_engine: Engine, tmp_path: Path
 ) -> None:
+    """A toggle ran every config module, so this route could carry a module's text in a 409. It
+    runs none now (BACKLOG #2623): the tripped module raises on any load, and the toggle lands."""
     from messagefoundry.api import create_app
     from tests.test_connection_audit_writes import _deployer, _login
 
@@ -220,9 +222,8 @@ async def test_the_flag_route_409_withholds_the_module_text(
         r = await c.post(
             "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}, headers=h
         )
-    assert r.status_code == 409, r.text
+    assert r.status_code == 200, r.text
     assert NEEDLE not in r.text
-    assert "RuntimeError" in r.text
 
 
 def test_a_name_computed_at_run_time_is_withheld(tmp_path: Path) -> None:

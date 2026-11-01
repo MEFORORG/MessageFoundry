@@ -194,7 +194,7 @@ async def test_a_toggle_lands_in_a_config_directory_the_account_cannot_write(
     assert await engine.store.list_connection_flags() == {("OB_TOML", "outbound")}
 
 
-async def test_the_engine_makes_no_config_digest_move(engine: Engine) -> None:
+async def test_a_toggle_moves_no_config_digest(engine: Engine) -> None:
     """A flag is not config, so the digest the running graph vouches for stays what it was."""
     await engine.capture_start_provenance()
     loaded = engine.loaded_config_fingerprint

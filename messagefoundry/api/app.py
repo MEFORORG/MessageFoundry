@@ -663,20 +663,17 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
-async def _connection_flags(engine: Engine) -> frozenset[tuple[str, str]]:
-    """Every ``(direction, name)`` holding the object-of-interest flag, for the dashboard rows.
+async def _connection_flags(engine: Engine) -> set[tuple[str, str]]:
+    """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows.
 
     The flag's one reader (BACKLOG #2623), and ``tests/test_connection_flag_readers.py`` fails on a
     second. It decides nothing, so a read that fails costs the markers and never the page: a row a
     database writer planted that the driver cannot decode reads as no flags at all, at WARNING."""
     try:
-        return frozenset(
-            (direction, connection)
-            for connection, direction in await engine.store.list_connection_flags()
-        )
+        return await engine.store.list_connection_flags()
     except Exception as exc:  # noqa: BLE001 - display only; see the docstring
         _log.warning("the connection flags could not be read: %s", safe_exc(exc))
-        return frozenset()
+        return set()
 
 
 def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
@@ -5007,7 +5004,7 @@ def create_app(
                         # the status; ifail takes precedence. One connection can hold both: a passive DR
                         # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
-                        flagged=("inbound", iname) in flags,  # object-of-interest marker
+                        flagged=(iname, "inbound") in flags,  # object-of-interest marker
                     )
                 )
             emitted_dests: set[str] = set()
@@ -5082,7 +5079,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=("outbound", dname) in flags,  # object-of-interest marker
+                        flagged=(dname, "outbound") in flags,  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector, past its
                         # display delay). Duck-typed → False for non-ACK-waiting / draining outbounds.
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
@@ -5189,7 +5186,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=("outbound", dname) in flags,  # object-of-interest marker
+                        flagged=(dname, "outbound") in flags,  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector).
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )

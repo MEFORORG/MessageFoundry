@@ -31,7 +31,7 @@ this line.**
 
 ### Changed
 
-- **The flag toggle is on every row, and the store holds the flag.** A code-first connection takes
+- **The flag toggle is on every row but a draining one, and the store holds the flag.** A code-first connection takes
   the flag like any other, and a cluster node no longer refuses it. The refused-toggle page now
   has one hint, for a name the running graph does not have. Needs the engine seam without
   `ConnectionRow.toml_managed`. (`BACKLOG #2623`)

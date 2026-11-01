@@ -25,18 +25,12 @@ are not read. Neither reads the flag today, and neither shares this process.
 from __future__ import annotations
 
 import ast
-import functools
 import re
-from collections.abc import Iterator, Mapping
-from pathlib import Path
+from collections.abc import Mapping
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[1]
-PACKAGES = tuple(
-    REPO / name
-    for name in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
-)
+from tests._ast_sites import code_strings, outermost_def_sites, package_trees
 
 #: The store's read, by name.
 READ = "list_connection_flags"
@@ -77,38 +71,6 @@ FIELD_READERS: dict[tuple[str, str], str] = {
 }
 
 
-def _rel(path: Path) -> str:
-    return path.relative_to(REPO).as_posix()
-
-
-@functools.cache
-def _package_trees() -> dict[str, ast.Module]:
-    return {
-        _rel(path): ast.parse(path.read_text(encoding="utf-8"))
-        for package in PACKAGES
-        for path in package.rglob("*.py")
-    }
-
-
-def _sites(tree: ast.Module, test: functools.partial[bool] | object) -> Iterator[str]:
-    """The outermost def holding a node ``test`` accepts, class names included."""
-
-    def walk(node: ast.AST, owner: list[str], in_function: bool) -> Iterator[str]:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if in_function:
-                    yield from walk(child, owner, True)
-                else:
-                    is_def = not isinstance(child, ast.ClassDef)
-                    yield from walk(child, [*owner, child.name], is_def)
-                continue
-            if test(child):  # type: ignore[operator]
-                yield ".".join(owner) or "<module>"
-            yield from walk(child, owner, in_function)
-
-    yield from walk(tree, [], False)
-
-
 def _is_read_call(node: ast.AST) -> bool:
     """A reference to the store's read, called or handed on, outside its own definitions."""
     return isinstance(node, ast.Attribute) and node.attr == READ
@@ -135,39 +97,32 @@ def _loads_field(node: ast.AST) -> bool:
 
 
 def _read_callers(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
-    return {(path, site) for path, tree in trees.items() for site in _sites(tree, _is_read_call)}
+    return {
+        (path, site)
+        for path, tree in trees.items()
+        for site in outermost_def_sites(tree, _is_read_call)
+    }
 
 
 def _field_readers(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
-    return {(path, site) for path, tree in trees.items() for site in _sites(tree, _loads_field)}
+    return {
+        (path, site)
+        for path, tree in trees.items()
+        for site in outermost_def_sites(tree, _loads_field)
+    }
 
 
 def _table_modules(trees: Mapping[str, ast.Module]) -> set[str]:
-    """The modules with a string naming the table, docstrings and doc comments apart: a docstring is
-    an expression statement, and a string only counts where code can use it."""
-
-    def _names_table(tree: ast.Module) -> bool:
-        docstrings = {
-            id(node.body[0].value)
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-        }
-        return any(
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstrings
-            and TABLE.search(node.value) is not None
-            for node in ast.walk(tree)
-        )
-
-    return {path for path, tree in trees.items() if _names_table(tree)}
+    """The modules whose code holds a string naming the table. A docstring is no code."""
+    return {
+        path
+        for path, tree in trees.items()
+        if any(TABLE.search(text) for text in code_strings(tree))
+    }
 
 
 def test_the_store_read_has_one_caller() -> None:
-    found = _read_callers(_package_trees())
+    found = _read_callers(package_trees())
     assert found == READ_CALLERS, (
         "a new reader of the connection flag. It was moved to the store unsealed because it "
         f"decides nothing; if this one acts on it, seal it first: {sorted(found - READ_CALLERS)}"
@@ -175,12 +130,12 @@ def test_the_store_read_has_one_caller() -> None:
 
 
 def test_only_the_backends_name_the_table() -> None:
-    found = _table_modules(_package_trees())
+    found = _table_modules(package_trees())
     assert found == TABLE_MODULES, sorted(found ^ TABLE_MODULES)
 
 
 def test_every_load_of_the_field_is_display() -> None:
-    found = _field_readers(_package_trees())
+    found = _field_readers(package_trees())
     assert found == set(FIELD_READERS), (
         "unlisted: " + repr(sorted(found - set(FIELD_READERS))),
         "listed but gone: " + repr(sorted(set(FIELD_READERS) - found)),

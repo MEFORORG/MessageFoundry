@@ -7685,21 +7685,26 @@ class SqlServerStore:
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`. ``HOLDLOCK`` makes
         the MERGE's match-then-insert one decision, so two toggles cannot both take the insert
-        branch and collide on the key. The append takes the audit applock at the tail, as
+        branch and collide on the key. It is the transaction's first statement, so it is retried
+        as :meth:`_claim_keyed_surface` is. The append takes the audit applock at the tail, as
         :meth:`_alert_write`'s does."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
                     if flagged:
-                        await cur.execute(
-                            "MERGE connection_flag WITH (HOLDLOCK) AS t"
-                            " USING (SELECT ? AS connection, ? AS direction) AS s"
-                            " ON t.connection = s.connection AND t.direction = s.direction"
-                            " WHEN NOT MATCHED THEN INSERT (connection, direction)"
-                            " VALUES (s.connection, s.direction);",
-                            (connection, direction),
-                        )
+
+                        async def merge() -> None:
+                            await cur.execute(
+                                "MERGE connection_flag WITH (HOLDLOCK) AS t"
+                                " USING (SELECT ? AS connection, ? AS direction) AS s"
+                                " ON t.connection = s.connection AND t.direction = s.direction"
+                                " WHEN NOT MATCHED THEN INSERT (connection, direction)"
+                                " VALUES (s.connection, s.direction);",
+                                (connection, direction),
+                            )
+
+                        await _retry_idempotent_merge(merge, on_retry=conn.rollback)
                     else:
                         await cur.execute(
                             "DELETE FROM connection_flag WHERE connection=? AND direction=?",

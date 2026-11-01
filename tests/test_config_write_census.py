@@ -26,22 +26,12 @@ The IDE extension and the PySide6 harness are not engine code and are not read.
 from __future__ import annotations
 
 import ast
-import functools
 from collections.abc import Mapping
-from pathlib import Path
-from typing import Literal
 
 import pytest
 
 from messagefoundry.api import app as app_module
-
-REPO = Path(__file__).resolve().parents[1]
-#: The packages that run in the engine process or ship beside it: the engine, the web console
-#: mounted in it at /ui, and the toolkit split out of it.
-PACKAGES = tuple(
-    REPO / name
-    for name in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
-)
+from tests._ast_sites import outermost_def_sites, package_trees
 
 #: The functions that write a file in a config directory, matched by name at the call. The first
 #: group writes a file the config digest covers (``config/fingerprint.py``): config modules,
@@ -78,54 +68,38 @@ LIBRARY: frozenset[str] = frozenset(
     }
 )
 
-type Verdict = Literal["cli", "settings"]
-
-#: ``cli``: a CLI subcommand, which runs in its own process and records no row. Its edit does not
-#: move the baseline, by decision: no engine loaded it, and nothing in that process can say which
-#: engine would. A reload that loads it records a ``config_reload`` row with the new digest, which
-#: moves the baseline then. A start that loads it first raises ``config_changed``, and that alert is
-#: the record of an edit no engine made. ``settings``: writes the service settings file, which the
-#: config digest does not cover, so there is no baseline for it to move.
-CENSUS: dict[tuple[str, str], tuple[Verdict, str]] = {
+#: Each entry says why the site is outside the engine. A CLI subcommand runs in its own process and
+#: records no row. Its edit does not move the baseline, by decision: no engine loaded it, and nothing
+#: in that process can say which engine would. A reload that loads it records a ``config_reload`` row
+#: with the new digest, which moves the baseline then. A start that loads it first raises
+#: ``config_changed``, and that alert is the record of an edit no engine made. The service settings
+#: file is outside the config digest, so its two writers have no baseline to move.
+CENSUS: dict[tuple[str, str], str] = {
     ("messagefoundry/__main__.py", "_connection"): (
-        "cli",
-        "the `connection` CLI upserts or removes a connections.toml entry, in its own process",
+        "the `connection` CLI upserts or removes a connections.toml entry, in its own process"
     ),
     ("messagefoundry/__main__.py", "_codeset"): (
-        "cli",
         "the `codeset` CLI writes, renames or removes a codesets/ table, and a rename rewrites the "
-        "config modules that name it",
+        "config modules that name it"
     ),
     ("messagefoundry/__main__.py", "_impact"): (
-        "cli",
-        "the `impact` CLI's rename rewrites string literals in config modules",
+        "the `impact` CLI's rename rewrites string literals in config modules"
     ),
-    ("messagefoundry/__main__.py", "_init"): (
-        "cli",
-        "`init` scaffolds a new config directory",
-    ),
+    ("messagefoundry/__main__.py", "_init"): "`init` scaffolds a new config directory",
     ("messagefoundry/__main__.py", "_import"): (
-        "cli",
-        "`import` writes config modules generated from a Corepoint export",
+        "`import` writes config modules generated from a Corepoint export"
     ),
     ("messagefoundry/__main__.py", "_restore"): (
-        "cli",
         "`dr restore` writes an archived config bundle into an empty directory, beside a restored "
-        "store whose rows already baseline those bytes",
+        "store whose rows already baseline those bytes"
     ),
     ("messagefoundry/__main__.py", "_alert"): (
-        "settings",
-        "the `alert` CLI writes [[alerts]] rules into the service settings file",
+        "the `alert` CLI writes [[alerts]] rules into the service settings file"
     ),
     ("messagefoundry/__main__.py", "_security"): (
-        "settings",
-        "the `security` CLI writes the service settings file",
+        "the `security` CLI writes the service settings file"
     ),
 }
-
-
-def _rel(path: Path) -> str:
-    return path.relative_to(REPO).as_posix()
 
 
 def _names_writer(node: ast.expr) -> bool:
@@ -144,35 +118,13 @@ def _is_writer_ref(node: ast.AST) -> bool:
     )
 
 
-def _writer_sites(tree: ast.Module) -> set[str]:
-    """The defs in ``tree`` that reference a writer: class names down to the outermost function,
-    so a call in a nested ``_write`` closure is charged to the method that defines it."""
-    sites: set[str] = set()
-
-    def walk(node: ast.AST, owner: list[str], in_function: bool) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if in_function:
-                    walk(child, owner, True)
-                else:
-                    is_def = not isinstance(child, ast.ClassDef)
-                    walk(child, [*owner, child.name], is_def)
-                continue
-            if _is_writer_ref(child):
-                sites.add(".".join(owner) or "<module>")
-            walk(child, owner, in_function)
-
-    walk(tree, [], False)
-    return sites
-
-
 def _found_sites(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
     """Every ``(path, def)`` in ``trees`` (relative path to parsed module) that calls a writer."""
     return {
         (path, site)
         for path, tree in trees.items()
         if path not in LIBRARY
-        for site in _writer_sites(tree)
+        for site in outermost_def_sites(tree, _is_writer_ref)
     }
 
 
@@ -185,19 +137,8 @@ def _unlisted(trees: Mapping[str, ast.Module]) -> list[str]:
     ]
 
 
-@functools.cache
-def _package_trees() -> dict[str, ast.Module]:
-    """Every module in :data:`PACKAGES`, parsed once for the whole file: a full pass costs
-    seconds."""
-    return {
-        _rel(path): ast.parse(path.read_text(encoding="utf-8"))
-        for package in PACKAGES
-        for path in package.rglob("*.py")
-    }
-
-
 def test_every_config_write_call_site_is_in_the_census() -> None:
-    found = _found_sites(_package_trees())
+    found = _found_sites(package_trees())
     assert found == set(CENSUS), (
         "unlisted: " + repr(sorted(found - set(CENSUS))),
         "listed but gone: " + repr(sorted(set(CENSUS) - found)),
@@ -205,8 +146,8 @@ def test_every_config_write_call_site_is_in_the_census() -> None:
 
 
 def test_only_the_cli_writes_config() -> None:
-    """A ``cli`` or ``settings`` verdict says the write runs in its own process. Only the CLI
-    module's subcommands can earn one, so the engine writes no config file at all."""
+    """Only the CLI module's subcommands run in their own process, so the engine writes no config
+    file at all."""
     for path, site in CENSUS:
         assert path == "messagefoundry/__main__.py", (path, site)
 
@@ -300,7 +241,7 @@ def _direct_config_writes(trees: Mapping[str, ast.Module]) -> list[str]:
 
 
 def test_no_engine_code_writes_a_config_path_directly() -> None:
-    assert _direct_config_writes(_package_trees()) == []
+    assert _direct_config_writes(package_trees()) == []
 
 
 @pytest.mark.parametrize(
