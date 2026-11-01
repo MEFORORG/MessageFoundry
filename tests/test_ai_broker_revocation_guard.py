@@ -239,7 +239,7 @@ def test_an_attested_hop_whose_context_skips_time_validity_keeps_the_crossing_li
     ``RevocationHopGuard.enforce_construction``. No CRL reaches this hop today, so the context's two
     answers are stood in for; the test above is the control."""
     monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
-    monkeypatch.setattr(tls_policy, "_context_skips_time_validity", lambda ctx: True)
+    monkeypatch.setattr(tls_policy, "skips_validity_period", lambda ctx: True)
     caplog.set_level(logging.WARNING, logger=_LOGGER)
     _broker(posture=_ENFORCING, attested=True, reason=_REASON)
     assert len(_crossing_lines(caplog)) == 1

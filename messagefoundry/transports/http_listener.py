@@ -44,12 +44,16 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.credential import client_cert_principal, constant_time_match_any
+from messagefoundry.credential import (
+    VERIFIED_ISSUER_KEY,
+    client_cert_principal_under_issuer,
+    constant_time_match_any,
+)
 from messagefoundry.redaction import safe_exc
-from messagefoundry.tls_handshake_failures import HandshakeFailures
+from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
     InboundHandler,
@@ -62,14 +66,20 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.mllp import (
+    _TLS_HANDSHAKE_TIMEOUT,
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_RECEIVE_TIMEOUT,
+    _lost_its_transport,
     _MessagePacer,
     _mllp_ssl_context,
     _pacing_settings,
     _peer_host,
     _set_tcp_nodelay,
+    _upgrades_tls_itself,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.pki import IssuerIndex
 
 __all__ = [
     "DEFAULT_MAX_BODY_BYTES",
@@ -652,6 +662,59 @@ def reply_seconds(s: Mapping[str, Any], key: str) -> float:
     return positive_seconds(value, knob=key, transport="HTTP source")
 
 
+def _subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]]:
+    """``intake_client_subjects`` as the matcher reads it: issuer DN -> each name mapped to itself.
+
+    The ``Http`` factory has already validated the shape (vault BACKLOG #2287). This refuses a value
+    that is not a table at all, such as the retired flat list, so a ``Source`` built some other way
+    fails at construction rather than denying every peer with nothing in the log."""
+    if not subjects:
+        return {}
+    if not isinstance(subjects, Mapping) or any(
+        not isinstance(names, list | tuple) for names in subjects.values()
+    ):
+        raise ValueError(
+            "HTTP source intake_client_subjects must be a table keyed by the issuing CA's DN, each "
+            "naming a list of subjects, not a flat list (vault BACKLOG #2287)"
+        )
+    return {str(issuer): {str(n): str(n) for n in names} for issuer, names in subjects.items()}
+
+
+def _client_issuer_index(
+    name: str, cadata: str | None, subjects: Mapping[str, object]
+) -> IssuerIndex | None:
+    """Index the client CAs this listener loaded, and warn about an issuer key that cannot match.
+
+    ``cadata`` is the text the SSL context loaded, or ``None`` when it loaded none. A key
+    naming no loaded CA, or naming two loaded CAs with one subject and different keys, would deny
+    every certificate under it with nothing in the log, so each one is warned about here, as the API
+    does for ``[api].tls_client_cert_identities``."""
+    if cadata is None:
+        return None
+    # Lazy: pki pulls in cryptography, which a listener without mtls_subject never needs.
+    from messagefoundry.pki import IssuerIndex
+
+    index = IssuerIndex(cadata)
+    if index.unreadable:
+        logger.warning(
+            "HTTP source %s: %d certificate(s) in tls_ca_file could not be parsed for "
+            "intake_client_subjects; no client certificate is admitted under them",
+            name,
+            index.unreadable,
+        )
+    for issuer in index.unmatched_keys(subjects):
+        # pki's own reason names the API's file, so this line states both causes in this
+        # listener's terms rather than quote it.
+        logger.warning(
+            "HTTP source %s: intake_client_subjects issuer %r names no CA certificate loaded from "
+            "tls_ca_file, or names several with one subject and different keys; no client "
+            "certificate is admitted under it",
+            name,
+            issuer,
+        )
+    return index
+
+
 class HttpSource(SourceConnector):
     """Listen for inbound HTTP/1.1 requests, commit each POSTed body to the ingress stage via the
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
@@ -670,6 +733,8 @@ class HttpSource(SourceConnector):
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
+        #: How this source names itself in a log line.
+        self._log_name: str = config.name or f"{self.host}:{self.port}"
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled where allowed; a negative or NaN → refused at build
         # (BACKLOG #1872).
@@ -716,15 +781,24 @@ class HttpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
+        # The client trust store's exact text, handed back by the builder so the issuer index below
+        # reads the bytes the context loaded and never re-reads tls_ca_file (vault BACKLOG #2287).
+        loaded_client_ca: list[str] = []
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
-            s, server=True, name=config.name or "", listener_family="HTTP listener"
+            s,
+            server=True,
+            name=config.name or "",
+            listener_family="HTTP listener",
+            on_client_ca=loaded_client_ca.append,
         )
-        # The loop runs this listener's handshakes on every loop, so a failed one never reaches
-        # `_on_client`. The context reports it, as a throttled `tls_handshake_failed` event like the
-        # MLLP listener's (vault BACKLOG #3302). The peer is not known there.
+        # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
+        # #3302), counted as the MLLP listener counts them: `_start_tls` where this listener runs
+        # the handshake, and the context's hook (`HandshakeFailures.watch`, armed at start()) where
+        # the loop does. The peer is known only in the first case.
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
-        if self._ssl is not None:
-            self._tls_failures.watch(self._ssl)
+        # True while this listener runs TLS handshakes itself, after admission (BACKLOG #2479); set
+        # at start() from the running loop, see `_upgrades_tls_itself`.
+        self._upgrade_tls = False
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already
@@ -746,12 +820,12 @@ class HttpSource(SourceConnector):
         self._credential_header_folded: str | None = (
             self._credential_header.replace("_", "-") if self._credential_header else None
         )
-        subjects = s.get("intake_client_subjects")
-        #: Matched through ``client_cert_principal``, so the allow-list is a map to itself: it gives us
-        #: that helper's deny-by-default and its qualified CN/SAN namespacing for free, rather than a
-        #: second subject-matching implementation that could disagree with the API's.
-        self._intake_subjects: dict[str, str] = (
-            {str(x): str(x) for x in subjects} if subjects else {}
+        #: Issuer DN -> qualified subject names, each name mapped to itself (vault BACKLOG #2287).
+        #: Matched through ``client_cert_principal_under_issuer``, the API's own matcher, so a subject
+        #: counts only under the loaded CA that signed the leaf, with that helper's deny-by-default and
+        #: qualified CN/SAN namespacing, rather than a second matcher that could disagree with it.
+        self._intake_subjects: dict[str, dict[str, str]] = _subjects_by_issuer(
+            s.get("intake_client_subjects")
         )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
@@ -784,6 +858,19 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
+        #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
+        #: then no certificate names an issuer, so every one is denied. Built after every check
+        #: in this constructor that can refuse it, because it may warn (BACKLOG #2749's rule).
+        self._issuer_index: IssuerIndex | None = (
+            _client_issuer_index(
+                self._log_name,
+                loaded_client_ca[0] if loaded_client_ca else None,
+                self._intake_subjects,
+            )
+            if self.intake_auth == "mtls_subject"
+            else None
+        )
         if self.max_body_bytes is None:
             # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
             # #2749, as FileSource does for its caps). Logged after every check in this constructor,
@@ -791,7 +878,7 @@ class HttpSource(SourceConnector):
             logger.warning(
                 "HTTP source %s: max_body_bytes is off, so a request body of any declared size is "
                 "read whole; set a positive value to bound it",
-                config.name or f"{self.host}:{self.port}",
+                self._log_name,
             )
 
     async def start(
@@ -802,9 +889,99 @@ class HttpSource(SourceConnector):
         self._handler = handler
         self._admission.stopping = False  # a restart of this same instance serves again
         self._tls_failures.open()
-        self._server = await asyncio.start_server(
-            self._on_client, self.host, self.port, ssl=self._ssl
+        # BACKLOG #2479, the shape BACKLOG #1606 fixed on MLLP. On the stdlib loop a TLS listener
+        # accepts PLAIN TCP and upgrades each admitted socket itself, so the allowlist and both
+        # connection caps run before the handshake, and a socket in its handshake holds a slot.
+        # `_upgrades_tls_itself` says why other loops, uvloop among them, keep the loop's handshake.
+        self._upgrade_tls = self._ssl is not None and _upgrades_tls_itself(
+            asyncio.get_running_loop()
         )
+        if self._ssl is None:
+            self._server = await asyncio.start_server(self._on_client, self.host, self.port)
+            return
+        if self._upgrade_tls:
+            self._tls_failures.unwatch(self._ssl)  # `_start_tls` counts; a hook would count twice
+            self._server = await asyncio.start_server(self._on_tls_accept, self.host, self.port)
+            return
+        # The loop runs the handshake and `_on_client` sees the socket only after it, so the
+        # handshake is bounded here, as on MLLP. Before BACKLOG #2479 this path had asyncio's 60 s
+        # default, on every loop. Read at start() so a test can shorten it. The close exchange keeps
+        # asyncio's default on both paths, unlike MLLP's: a `reply_from` answer can be partner-sized,
+        # and its tail may still be queued when the close starts (see `_drain_budget`).
+        self._tls_failures.watch(self._ssl)
+        self._server = await asyncio.start_server(
+            self._on_client,
+            self.host,
+            self.port,
+            ssl=self._ssl,
+            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT,
+        )
+
+    def _on_tls_accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Take a new TLS-listener socket in plain TCP, then hand it to `_on_client` (BACKLOG #2479).
+
+        Deliberately NOT a coroutine, so reading is paused before the loop arms its first read and
+        the ClientHello stays in the kernel until ``start_tls``. ``MLLPSource._on_tls_accept``
+        states the reasoning once. The task and writer are registered here, so stop() closes a
+        socket still in its handshake."""
+        # A stream's transport reads as well as writes; typeshed types the attribute write-only.
+        cast(asyncio.Transport, writer.transport).pause_reading()
+        self._clients.add(writer)
+        task = asyncio.get_running_loop().create_task(self._on_client(reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(lambda done: self._client_task_done(done, writer))
+
+    def _client_task_done(self, task: asyncio.Task[None], writer: asyncio.StreamWriter) -> None:
+        """Drop a finished TLS client task, and close its socket if the task was cancelled or
+        failed: asyncio does that for a coroutine accept callback, and `_on_tls_accept` is not one.
+        A task cancelled before its first step never ran its own ``finally``, so its writer is
+        dropped from ``_clients`` here too."""
+        self._client_tasks.discard(task)
+        if task.cancelled():
+            self._clients.discard(writer)
+            writer.close()
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("HTTP client connection task failed: %s", safe_exc(exc))
+            self._clients.discard(writer)
+            writer.close()
+
+    async def _start_tls(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer_host: str | None
+    ) -> bool:
+        """Run the TLS handshake on an admitted socket; ``False`` when it did not complete.
+
+        The same upgrade as ``MLLPSource._start_tls``, whose docstring states each guard once: the
+        handshake bound, the DEBUG-only failure line, the writer a clean close leaves with no
+        transport, and the reader moved onto the TLS transport. The close-exchange bound is left
+        at asyncio's default; start() says why. A hang-up is not counted as a failure; a TLS error
+        and the handshake bound are."""
+        assert self._ssl is not None
+        raw = writer.transport
+        try:
+            await writer.start_tls(self._ssl, ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT)
+        except OSError as exc:
+            logger.debug(
+                "TLS handshake on HTTP from %s did not complete: %s",
+                writer.get_extra_info("peername"),
+                safe_exc(exc),
+            )
+            if not isinstance(exc, HUNG_UP):
+                await self._tls_failures.note(peer_host, handshake_cause(exc))
+            return False
+        except AttributeError:
+            if not _lost_its_transport(writer):
+                raise
+        if _lost_its_transport(writer):
+            writer._transport = raw  # type: ignore[attr-defined]  # see MLLPSource._start_tls
+            logger.debug(
+                "TLS connection on HTTP from %s closed during its handshake",
+                raw.get_extra_info("peername"),
+            )
+            return False
+        reader._transport = writer.transport  # type: ignore[attr-defined]  # see MLLPSource._start_tls
+        return True
 
     @property
     def sockport(self) -> int:
@@ -839,6 +1016,10 @@ class HttpSource(SourceConnector):
         # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
         # Then await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         try:
+            # Where this listener upgrades TLS itself, a socket still in its handshake is in
+            # `_clients` from its accept on (BACKLOG #2479; `_on_tls_accept`), so this closes it and
+            # its handshake fails rather than completing mid-stop. Where the loop runs it (uvloop),
+            # `_on_client` refuses such a socket unread if its handshake finishes after stop began.
             for writer in list(self._clients):
                 writer.close()
             pending = [task for task in self._client_tasks if not task.done()]
@@ -938,6 +1119,10 @@ class HttpSource(SourceConnector):
         is left is the subject binding the CA does not give us: ``tls_ca_file`` alone means "any
         certificate this CA ever signed".
 
+        The subject is looked up only under the loaded CA whose key signed the leaf (vault BACKLOG
+        #2287). With several CAs in ``tls_ca_file``, any of them can issue a listed subject, and
+        without the issuer every one of those certificates was admitted as that partner.
+
         Worth noting as an architectural asymmetry: ADR 0083's blocker on the admin API was that stock
         uvicorn does not surface the peer certificate to the ASGI scope. ``HttpSource`` owns its own
         socket, so mTLS-as-identity is strictly *easier* here than there.
@@ -956,9 +1141,10 @@ class HttpSource(SourceConnector):
                 peer,
                 HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
             )
-        if client_cert_principal(peercert, self._intake_subjects) is None:
-            # A chain this CA signed, carrying a subject nobody allow-listed — an AUTHORIZATION
-            # failure, and deliberately distinct from the 401 above (deny-by-default).
+        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        if client_cert_principal_under_issuer(verified, self._intake_subjects) is None:
+            # A chain a trusted CA signed, carrying a subject nobody allow-listed under THAT CA — an
+            # AUTHORIZATION failure, and deliberately distinct from the 401 above (deny-by-default).
             return self._charged(
                 peer,
                 HttpRequestError(
@@ -969,6 +1155,30 @@ class HttpSource(SourceConnector):
             )
         self._note_intake_success(peer)
         return None
+
+    def _verified_issuer(self, ssl_object: Any) -> str:
+        """The subject of the loaded CA that directly signed the peer's leaf, or ``""``.
+
+        Read from the leaf's DER and the index alone. Never from ``getpeercert()["issuer"]``, which
+        the issuing CA writes and OpenSSL matches to a CA loosely, folding case and whitespace; and
+        never from ``get_verified_chain()``, which is empty on a resumed session. ``""`` matches no
+        issuer, so anything that cannot be established is denied."""
+        index = self._issuer_index
+        if index is None:
+            return ""
+        try:
+            leaf_der = ssl_object.getpeercert(binary_form=True)
+            return index.issuer_of(leaf_der) if leaf_der else ""
+        except Exception:
+            # Deliberately broad, as the API shim's twin is: anything that stops the issuer being
+            # established must DENY (a charged, audited 403), never escape into the generic
+            # per-connection handler, which neither charges the attempt nor audits it.
+            logger.warning(
+                "HTTP source %s: could not establish a client certificate's issuer; denying",
+                self._log_name,
+                exc_info=True,
+            )
+            return ""
 
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""
@@ -1078,23 +1288,49 @@ class HttpSource(SourceConnector):
         # timer fires. Best-effort and framing-neutral; see _set_tcp_nodelay.
         _set_tcp_nodelay(writer)
         peer_host = _peer_host(writer)
+        epoch: int | None = None  # set by the admit; the finally releases exactly what it took
         established = False
         failed = False
+        # True from the start of a TLS handshake this listener runs until it succeeds; see
+        # `MLLPSource._on_client` for why `wait_closed()` is skipped then (BACKLOG #1606).
+        handshaking = False
+        # False while a socket this listener upgrades is still plain TCP. Nothing is written to it
+        # then: a TLS client cannot read a plaintext answer (BACKLOG #2479).
+        answerable = not self._upgrade_tls
         try:
             # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
-            # for every socket listener (transports/admission.py). Refused before a request byte.
+            # for every socket listener (transports/admission.py). Refused before a request byte,
+            # and, where this listener upgrades TLS itself, before any TLS byte (BACKLOG #2479).
             refusal = self._admission.check(writer, peer_host)
             if refusal is not None:
                 if refusal.kind is None:
                     return  # the listener is stopping: close unread, with no answer
                 await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
-                if refusal.kind == "peer_not_allowlisted":
-                    await self._write_safely(writer, build_response(403, '{"error":"forbidden"}'))
-                else:
-                    await self._write_safely(writer, build_response(503, '{"error":"at capacity"}'))
+                # A socket still awaiting its upgrade gets no answer (see `answerable`), and a
+                # handshake run only to refuse would be the work the pre-handshake refusal saves.
+                if answerable:
+                    status, body = (
+                        (403, '{"error":"forbidden"}')
+                        if refusal.kind == "peer_not_allowlisted"
+                        else (503, '{"error":"at capacity"}')
+                    )
+                    await self._write_safely(writer, build_response(status, body))
                 return  # refused (closed in the outer finally); no slot was taken
-            # mTLS intake auth needs no request bytes at all, so it refuses here, alongside the
-            # allowlist and capacity guards, without consuming a connection slot.
+            if self._upgrade_tls:
+                # The handshake runs inside an admitted slot (BACKLOG #2479), so a socket that never
+                # sends a ClientHello is counted against both caps until the handshake bound ends
+                # it, and the finally below gives the slot back however the handshake ends.
+                epoch = self._admission.admit(peer_host)
+                handshaking = True
+                if not await self._start_tls(reader, writer, peer_host):
+                    return  # never a session: no `established`, so no `closed` either
+                handshaking = False
+                answerable = True
+                if self._admission.stopping:
+                    return  # the handshake finished after stop() began: refuse it unread
+            # mTLS intake auth needs no request bytes at all, so it refuses here, before any read.
+            # It needs the verified certificate, so it follows the handshake. Where the loop ran
+            # the handshake, no slot is taken yet, and the refusal takes none.
             cert_refusal = self._authorize_peer_cert(writer, peer_host)
             if cert_refusal is not None:
                 await self._emit_event(
@@ -1110,8 +1346,9 @@ class HttpSource(SourceConnector):
                     ),
                 )
                 return  # pre-ingress refusal — nothing accepted, so nothing to count
-            epoch = self._admission.admit(peer_host)
-            established = True  # set with the admit, so the finally below always releases it
+            if epoch is None:
+                epoch = self._admission.admit(peer_host)
+            established = True
             await self._emit_event("established", peer_host=peer_host)
             failed = await self._serve_one(reader, writer, peer_host=peer_host)
         except OSError as exc:
@@ -1123,9 +1360,10 @@ class HttpSource(SourceConnector):
             failed = True
             logger.error("HTTP connection failed unexpectedly: %s", safe_exc(exc))
             await self._emit_event("framing_error", peer_host=peer_host, reason=safe_exc(exc))
-            await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
+            if answerable:
+                await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
-            if established:
+            if epoch is not None:
                 self._admission.release(peer_host, epoch)
             self._clients.discard(writer)
             if task is not None:
@@ -1134,7 +1372,9 @@ class HttpSource(SourceConnector):
             try:  # noqa: SIM105
                 # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would never
                 # let the per-client task finish, so stop()'s grace never sees it done (#55).
-                await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+                # Skipped for a socket whose TLS handshake never finished: see `handshaking`.
+                if not handshaking:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
             except (TimeoutError, OSError):
                 pass
             if established and not failed:

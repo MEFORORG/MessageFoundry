@@ -181,6 +181,11 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the builder runs _refuse_forward_revocation on the context it returns",
     ),
     "messagefoundry/store/postgres.py::_build_ssl": Guarded(note="the PostgreSQL store hop"),
+    "messagefoundry/__main__.py::_warn_on_an_unrevoked_store_hop": Guarded(
+        note="the store-opening CLI commands' warn-posture WARNING (BACKLOG #2532). It runs "
+        "_refuse_store_revocation on the context it builds and never handshakes on it; the "
+        "store's open builds and guards its own in _build_ssl"
+    ),
     "messagefoundry/store/postgres.py::_per_connection_ssl_connect.connect": Guarded(
         by="messagefoundry/store/postgres.py::_build_ssl",
         note="each pool connection rebuilds, from the same settings, the context _build_ssl "

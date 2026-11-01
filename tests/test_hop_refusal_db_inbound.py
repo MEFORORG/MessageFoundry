@@ -48,10 +48,10 @@ from messagefoundry.transports.database import (
     DatabaseSource,
     _assert_send_hop,
     _build_dsn,
-    _generic_hop_endpoint,
     _weakened_tls_permitted,
     generic_cleartext_hop_guard,
 )
+from messagefoundry.transports.db_endpoint import generic_hop_endpoint
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -723,7 +723,7 @@ def test_generic_guard_is_none_off_the_arm() -> None:
 def test_generic_hop_endpoint_splits(
     server: str, params: dict[str, str], expected: tuple[str, int]
 ) -> None:
-    assert _generic_hop_endpoint(server, params) == expected
+    assert generic_hop_endpoint(server, params) == expected
 
 
 # --- INBOUND: the --allow-insecure-bind clamp predicate -----------------------------------------
