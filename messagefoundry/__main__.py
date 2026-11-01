@@ -6991,8 +6991,8 @@ def _host_gated_store_settings(
 ) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
-    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin``
+    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp`` and
+    ``admin-revoke-sessions`` (BACKLOG #2614) so the gate is stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin``
     does not use it: it legitimately creates the store, so it cannot carry the M-31 guard below.
     ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
     passes ``false_finding``, the result a fresh empty store would wrongly report for it.
@@ -12446,8 +12446,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     refuses (BACKLOG #2532), into :class:`_StoreOpenRefused`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11) and
-    ``backup``, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the
+    code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11),
+    ``admin-revoke-sessions`` (BACKLOG #2614) and ``backup``, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
     before the backend reads a row, and a Vault hop refused there arrives as a
     ``KeyProviderError``. Under a ``vault_transit`` cipher the open also makes Transit calls after
