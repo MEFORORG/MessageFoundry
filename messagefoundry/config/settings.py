@@ -101,6 +101,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
+from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
@@ -304,6 +305,29 @@ def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
             "the SHA-256 of the CA file (64 hex characters)"
         )
     return value
+
+
+def refuse_a_non_canonical_issuer(issuer: str, setting: str) -> None:
+    """Refuse an issuing-CA DN key that could never equal a loaded CA's subject (#2237, #2287).
+
+    Shared by ``[api].tls_client_cert_identities`` and the ``Http`` factory's
+    ``intake_client_subjects``, so both surfaces hold an issuer key to one round trip and one wording.
+    Raises ``ValueError``; the factory re-raises it as its own error type."""
+    # Lazy: pki pulls in cryptography, which a config with no issuer-keyed map never needs.
+    from messagefoundry.pki import canonical_dn
+
+    canonical = canonical_dn(issuer)
+    if canonical is None:
+        raise ValueError(
+            f"{setting} issuer {issuer!r} is not an RFC 4514 distinguished name "
+            "(attr=value,...); name the issuing CA's DN"
+        )
+    if canonical != issuer:
+        # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
+        raise ValueError(
+            f"{setting} issuer {issuer!r} is not in the canonical form the engine compares, "
+            f"so it would never match; write it as the key '{canonical}'"
+        )
 
 
 def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
@@ -1352,9 +1376,6 @@ class StoreSettings(_Section):
 #: those is a separate question, recorded in ADR 0154.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-#: A cert-map name ``credential.cert_name_candidates`` can actually yield: ``CN:<value>`` or
-#: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
-_QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
 #: A users-row id as ``AuthService`` mints it (``uuid4().hex``). The cert map targets this, never a
 #: username, because a rename can hand a username to another row (#2238).
 _USER_ID = re.compile(r"[0-9a-f]{32}")
@@ -2010,27 +2031,13 @@ class ApiSettings(_Section):
     @classmethod
     def _cert_identities_can_match(cls, v: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
         """Refuse an entry that would silently match nothing (#2237)."""
-        # Lazy: pki pulls in cryptography, which a config with no cert map never needs.
-        from messagefoundry.pki import canonical_dn
-
         field = "[api].tls_client_cert_identities"
         for issuer, names in v.items():
-            canonical = canonical_dn(issuer)
-            if canonical is None:
-                raise ValueError(
-                    f"{field} issuer {issuer!r} is not an RFC 4514 distinguished name "
-                    "(attr=value,...); name the issuing CA's DN"
-                )
-            if canonical != issuer:
-                # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
-                raise ValueError(
-                    f"{field} issuer {issuer!r} is not in the canonical form the engine compares, "
-                    f"so it would never match; write it as the key '{canonical}'"
-                )
+            refuse_a_non_canonical_issuer(issuer, field)
             if not names:
                 raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")
             for name, target in names.items():
-                if not _QUALIFIED_CERT_NAME.fullmatch(name):
+                if not QUALIFIED_CERT_NAME.fullmatch(name):
                     raise ValueError(
                         f"{field} name {name!r} under {issuer!r} is not qualified: write "
                         '"CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal")'
@@ -5555,7 +5562,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
         # `approval:<id>`, which no connection can be named. A resolution's lost provenance row is
-        # keyed `approval:<id>:resolve` (vault BACKLOG #3438). Since vault BACKLOG #2254 also an
+        # keyed `approval:<id>:resolve` (vault BACKLOG #3438), and a queue listing's lost row
+        # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:

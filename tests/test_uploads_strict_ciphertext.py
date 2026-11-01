@@ -690,17 +690,24 @@ async def test_a_planted_lone_sidecar_is_never_sealed_and_ages_out(tmp_path: Pat
 
 
 async def test_a_body_unreadable_for_another_cause_still_waits_for_rotate_key(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only a body that is missing or is not text makes an upload unsealable. One that cannot be
-    opened for another cause can be sealed once that is fixed, so it is a skip, and it stays out of
-    retention like any refused upload. A directory in the body's place stands in for that cause."""
+    read for another cause can be sealed once that is fixed, so it is a skip, and it stays out of
+    retention like any refused upload. A refused read of the body stands in for that cause."""
     root = tmp_path / "uploads"
     fid = await _plaintext_upload(root)
-    (root / f"{fid}.blob").unlink()
-    (root / f"{fid}.blob").mkdir()
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    real = Path.read_text
+
+    def refuse_the_body(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == f"{fid}.blob":
+            raise PermissionError("refused for the test")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", refuse_the_body)
     assert await store.reseal_to_active() == ResealResult(skipped=1)
+    monkeypatch.undo()
     assert (await store.prune_expired(now=10**12)).pruned == []
     assert (root / f"{fid}.meta").exists()
     with pytest.raises(CipherError):

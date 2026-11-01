@@ -102,7 +102,7 @@ from messagefoundry.connection_names import (
     is_connection_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
-from messagefoundry.credential import CERT_NAME_PREFIXES
+from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
@@ -596,9 +596,11 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     included. Both spellings are refused: an :class:`EnvRef` from code-first, and the raw marker dict
     ``connections.toml`` leaves behind (see :func:`_is_nested_envref`).
 
-    Each factory calls this FIRST, ahead of its own validators, because at least one of them --
-    ``Http``'s ``intake_client_subjects`` prefix check -- quotes the offending items in its message and
-    would print the default this refusal withholds. Offenders are named by setting and index only.
+    Each factory calls this FIRST, ahead of its own validators, because a validator may quote the
+    offending items in its message and would print the default this refusal withholds. ``Http``'s
+    ``intake_client_subjects`` prefix check does, and since that setting became a table of lists
+    (BACKLOG #2287) ``_intake_subjects_by_issuer`` calls this once per issuer's list, before it.
+    Offenders are named by setting and index only.
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
@@ -2779,8 +2781,8 @@ def Http(
     intake_api_key_next: EnvRef
     | None = None,  # rotation: accepted alongside intake_api_key, so a partner key rotates without an outage
     intake_api_key_header: str = "x-api-key",  # header carrying the api_key credential (a header NAME, not a secret)
-    intake_client_subjects: Sequence[str]
-    | None = None,  # mtls_subject allow-list, QUALIFIED: "CN:<v>" / "SAN:DNS:<v>"
+    intake_client_subjects: Mapping[str, Sequence[str]]
+    | None = None,  # mtls_subject allow-list: issuing CA's DN -> QUALIFIED "CN:<v>" / "SAN:DNS:<v>"
     intake_auth_health: Literal[
         "require", "allow"
     ] = "require",  # whether GET/HEAD probes need the credential too
@@ -2852,6 +2854,14 @@ def Http(
     against ``intake_client_subjects``. Set ``intake_api_key_next`` to rotate a partner key without an
     outage: both are accepted while the partner cuts over.
 
+    ``intake_client_subjects`` is keyed by the DN of the CA that issues each partner's certificate,
+    as ``rfc4514_string()`` renders that CA's subject, and each key names that CA's subjects:
+    ``{"CN=Acme CA,O=Acme": ["CN:partner.example"]}``. A subject counts only when the loaded CA under
+    its key signed the leaf, so a listed subject from a CA it is not listed under is refused ``403``
+    (vault BACKLOG #2287). Only a CA loaded from ``tls_ca_file`` counts as an issuer: a leaf signed by
+    an intermediate the client sends is refused unless that intermediate is itself loaded there, so
+    load it beside its root and name it.
+
     **TLS is confidentiality; intake auth is authentication.** Enabling one is never an argument for
     relaxing the other. In particular a bare ``tls`` + ``tls_ca_file`` means "any certificate this CA ever
     signed", with no subject binding at all — which is why ``mtls_subject`` additionally requires
@@ -2887,7 +2897,7 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
-    _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
+    subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -2909,7 +2919,7 @@ def Http(
         "intake_api_key": intake_api_key,
         "intake_api_key_next": intake_api_key_next,
         "intake_api_key_header": intake_api_key_header,
-        "intake_client_subjects": list(intake_client_subjects) if intake_client_subjects else None,
+        "intake_client_subjects": subjects,
         "intake_auth_health": intake_auth_health,
         "intake_auth_rate_limit": intake_auth_rate_limit,
         "intake_auth_rate_limit_global": intake_auth_rate_limit_global,
@@ -3084,7 +3094,9 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
     * an unqualified subject entry — ``cert_name_candidates`` yields ``"CN:<v>"`` / ``"SAN:DNS:<v>"``, so
       a bare ``partner.example`` matches nothing and 403s every request from the very partner it names;
     * a credential configured while ``intake_auth="none"`` — nothing would ever check it, and an
-      operator reading that config would reasonably believe the listener was protected.
+      operator reading that config would reasonably believe the listener was protected;
+    * ``intake_client_subjects`` under ``api_key`` or ``bearer`` — the same reason: only
+      ``mtls_subject`` reads a client certificate (vault BACKLOG #2287).
 
     The secret itself must be an ``env()`` reference with no default and no cast, mirroring
     ``File(credential_password=...)`` (ADR 0132): a fallback credential is a silent credential.
@@ -3132,6 +3144,14 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         return
 
     if mode in _INTAKE_KEY_MODES:
+        if settings["intake_client_subjects"]:
+            # The same rule as under "none": the listener reads the table only under mtls_subject.
+            raise WiringError(
+                f"Http sets intake_client_subjects but intake_auth={mode!r}, which never reads a "
+                "client certificate — set intake_auth='mtls_subject', or remove the setting; a "
+                "control that is configured but never consulted reads as protection that does not "
+                "exist"
+            )
         if settings["intake_api_key"] is None:
             raise WiringError(
                 f"Http intake_auth={mode!r} needs intake_api_key — supply it via env() "
@@ -3156,14 +3176,91 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             "alone means 'any certificate this CA ever signed', which binds no subject and "
             "authenticates no one in particular"
         )
-    unqualified = [s for s in subjects if not str(s).startswith(CERT_NAME_PREFIXES)]
+    unqualified = [
+        s for names in subjects.values() for s in names if not QUALIFIED_CERT_NAME.fullmatch(str(s))
+    ]
     if unqualified:
         raise WiringError(
-            f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "
-            "'CN:' / 'SAN:<type>:' prefix. A certificate's names are matched as 'CN:<value>' and "
-            "'SAN:DNS:<value>' so a spoofed commonName cannot collide with a pinned SAN; a bare name "
-            "matches nothing and would 403 every request from the partner it names"
+            f"Http intake_client_subjects entries must be qualified — {unqualified} are not "
+            "'CN:<value>' / 'SAN:<type>:<value>', each part non-empty. A certificate's names are "
+            "matched as 'CN:<value>' and 'SAN:DNS:<value>' so a spoofed commonName cannot collide "
+            "with a pinned SAN; any other name matches nothing and would 403 every request from the "
+            "partner it names"
         )
+
+
+def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
+    """``Http``'s ``intake_client_subjects`` checked for shape, or ``None`` when unset (#2287).
+
+    The setting is a table: the DN of each issuing CA, as ``cryptography``'s ``rfc4514_string()``
+    renders that CA's subject, mapped to a list of qualified subject names. This mirrors
+    ``[api].tls_client_cert_identities``, and an issuer key is held to the same canonical-form
+    round trip, so a key that could never equal a loaded CA's subject is refused here.
+
+    Every check is made here because neither the ``connections.toml`` type check nor
+    :func:`_reject_envref_in_lists` reaches it. The type check stops one level in, at its depth cap,
+    so it never looks inside a subject list. The list refusal scans only list-valued settings, and
+    this one is a table. So this function refuses ``env()`` at each level itself: as the whole
+    table, as an issuer's list and as a list item. A whole-table ``env()`` would resolve to a string.
+    No refusal repeats a reference's ``default``. The flat list this setting used to be is refused
+    with the shape to write, and there is no compatibility shim, because nothing is deployed."""
+    if value is None:
+        return None
+    setting = "Http intake_client_subjects"
+    # An EnvRef only. In connections.toml, parse_env_setting has already turned any top-level table
+    # whose keys fit {env, default, cast} into an EnvRef (refused here) or refused it itself, so no
+    # raw marker arrives from a file. A code-first dict keyed "env" is not decoded; it reaches the
+    # issuer-key check below and is refused there as a key that is not a DN.
+    if isinstance(value, EnvRef):
+        raise WiringError(
+            f"{setting} may not be an env() reference - it is a table of issuer DN to subject "
+            "names, written in code or connections.toml, and an environment value is a string"
+        )
+    if not isinstance(value, Mapping):
+        raise WiringError(
+            f"{setting} must be a table keyed by the DN of the CA that issues each partner's "
+            "certificate, each naming that CA's subjects, e.g. "
+            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is no longer "
+            "read, because it let any CA in tls_ca_file issue a listed subject (BACKLOG #2287)"
+        )
+    if not value:
+        return None
+    from messagefoundry.config.settings import refuse_a_non_canonical_issuer
+
+    checked: dict[str, list[str]] = {}
+    for position, (issuer, names) in enumerate(value.items()):
+        if not isinstance(issuer, str):
+            label = _envref_label(issuer) if _is_nested_envref(issuer) else type(issuer).__name__
+            raise WiringError(
+                f"{setting} issuer key {position} must be the issuing CA's DN as a string, not "
+                f"{label}"
+            )
+        try:
+            refuse_a_non_canonical_issuer(issuer, setting)
+        except ValueError as exc:
+            raise WiringError(str(exc)) from exc
+        if _is_nested_envref(names):
+            raise WiringError(
+                f"{setting} issuer {issuer!r} may not name its subjects with an env() reference - "
+                "a nested setting is not env-resolved; write the subjects as a static list"
+            )
+        if not isinstance(names, list | tuple):
+            raise WiringError(
+                f"{setting} issuer {issuer!r} must name a list of subjects, e.g. "
+                "['CN:partner.example'], not a single value"
+            )
+        # The item scan first, so no message below can quote an item that is a reference.
+        _reject_envref_in_lists("Http", **{f"intake_client_subjects {issuer!r}": names})
+        if not names:
+            raise WiringError(f"{setting} issuer {issuer!r} names no subjects")
+        for index, name in enumerate(names):
+            if not isinstance(name, str) or not name:
+                raise WiringError(
+                    f"{setting} issuer {issuer!r} item {index} must be a non-empty subject name, "
+                    'such as "CN:partner.example"'
+                )
+        checked[issuer] = list(names)
+    return checked
 
 
 def File(
@@ -4192,8 +4289,22 @@ def DatabasePoll(
     ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
     in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
-    ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``)."""
+    ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
+
+    A ``poll_statement`` that could write is refused: a literal one here, when declared, and every
+    one, an ``env()`` value included, when the source is built (BACKLOG #2178;
+    ``transports.database._read_only_poll_refusal`` says what and why)."""
     _reject_envref_odbc_params(odbc_params)
+    # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
+    # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
+    # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
+    # this module at its top level.
+    if isinstance(poll_statement, str) and poll_statement:
+        from messagefoundry.transports.database import _read_only_poll_refusal
+
+        poll_refusal = _read_only_poll_refusal(poll_statement)
+        if poll_refusal is not None:
+            raise WiringError(poll_refusal)
     return ConnectionSpec(
         ConnectorType.DATABASE,
         {
@@ -4663,19 +4774,28 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        if not isinstance(self.namespace, str) or not self.namespace:
-            raise WiringError("SetState namespace must be a non-empty string")
-        if not isinstance(self.key, str) or not self.key:
-            raise WiringError("SetState key must be a non-empty string")
-        try:
-            import json
+        # Every message names the field only: namespace, key and value may be PHI.
+        for name, text in (("namespace", self.namespace), ("key", self.key)):
+            if not isinstance(text, str) or not text:
+                raise WiringError(f"SetState {name} must be a non-empty string")
+            # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
+            # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
+            # entries. Refused on every backend so a feed behaves the same wherever it runs.
+            if text.endswith(" "):
+                raise WiringError(f"SetState {name} must not end with a space")
+        import json
 
+        try:
             json.dumps(self.value)
         except (TypeError, ValueError) as exc:
-            raise WiringError(
-                f"SetState({self.namespace!r}, {self.key!r}, ...): value must be JSON-serializable "
-                f"(str/int/float/bool/None/list/dict) — {exc}"
-            ) from exc
+            reason = str(exc)
+        else:
+            return
+        # Raised outside the handler, so no __context__ is chained: on 3.14 json adds __notes__ such
+        # as "when serializing dict item '<key>'", and a traceback would print the value's own keys.
+        raise WiringError(
+            f"SetState value must be JSON-serializable (str/int/float/bool/None/list/dict) — {reason}"
+        )
 
 
 #: Per-message metadata cap (BACKLOG #150, ADR 0081): a handler's `SetMeta` contribution is bounded so
@@ -6243,7 +6363,8 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     A credential in the query rides the request line, so the partner's and every proxy's access log
     holds it. ``refuse_url_credentials`` refuses a credential in the userinfo, because that shape
     never authenticated anything; a query credential does authenticate, and some partner APIs take
-    it nowhere else, so it is reported rather than refused.
+    it nowhere else, so it is reported rather than refused, except where
+    ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
     It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
     construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.

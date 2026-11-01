@@ -276,16 +276,24 @@ async def test_a_lost_body_under_a_sealed_sidecar_is_not_a_skip(
     assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
 
 
-async def test_a_body_unreadable_for_another_cause_is_still_a_skip(tmp_path: Path) -> None:
-    """The control for the test above: a body that cannot be opened for a cause an operator can fix
-    may still be under the prior key, so it stays a skip. A directory in its place stands in."""
+async def test_a_body_unreadable_for_another_cause_is_still_a_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: a body that cannot be read for a cause an operator can fix
+    may still be under the prior key, so it stays a skip. A refused read stands in for that cause."""
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
-    (root / f"{fid}.blob").unlink()
-    (root / f"{fid}.blob").mkdir()
+    real = Path.read_text
 
+    def refuse_the_body(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == f"{fid}.blob":
+            raise PermissionError("refused for the test")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", refuse_the_body)
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
+    monkeypatch.undo()
     assert result == ResealResult(resealed=1, skipped=1)
     # The retired-key sidecar is still re-sealed, and reads under the new key alone (BACKLOG #2322).
     assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"

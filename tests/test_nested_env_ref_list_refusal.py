@@ -38,15 +38,6 @@ SENTINEL = "MFTEST-LIST-ITEM-ENV-DEFAULT-MUST-NOT-SHIP"
 #: ``(factory, setting)`` -> a call that builds that factory with ``value`` for that setting and
 #: otherwise valid arguments. The derived-domain test below asserts this covers the whole surface.
 LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
-    ("Http", "intake_client_subjects"): lambda v: messagefoundry.Http(
-        port=2575,
-        tls=True,
-        tls_cert_file="cert.pem",
-        tls_key_file="key.pem",
-        tls_ca_file="ca.pem",
-        intake_auth="mtls_subject",
-        intake_client_subjects=v,
-    ),
     ("Rest", "capture_response_headers"): lambda v: messagefoundry.Rest(
         url="https://example.invalid/x", capture_response_headers=v
     ),
@@ -98,6 +89,30 @@ LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
     ),
 }
 
+#: ``Http``'s ``intake_client_subjects`` is a TABLE of lists, keyed by the issuing CA's DN (vault
+#: BACKLOG #2287). The coverage walk still finds it, since its annotation names a sequence, so it is
+#: covered here, by the tests under "a table of lists" below, which are parametrized over
+#: ``TABLE_OF_LIST_SETTINGS`` as the list tests are over ``LIST_SETTINGS``.
+PARTNER_CA = "CN=Partner CA"
+
+
+def _http_subjects(value: Any) -> Any:
+    """``Http`` built with ``value`` as its whole ``intake_client_subjects``."""
+    return messagefoundry.Http(
+        port=2575,
+        tls=True,
+        tls_cert_file="cert.pem",
+        tls_key_file="key.pem",
+        tls_ca_file="ca.pem",
+        intake_auth="mtls_subject",
+        intake_client_subjects=value,
+    )
+
+
+TABLE_OF_LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
+    ("Http", "intake_client_subjects"): _http_subjects,
+}
+
 #: The two shapes a nested reference reaches a factory in. Code-first gives an ``EnvRef``;
 #: ``connections.toml`` gives the raw marker, because ``parse_env_setting`` decodes top-level only.
 NESTED_SHAPES: dict[str, Callable[[], Any]] = {
@@ -110,10 +125,9 @@ TOML_MARKER = f'{{ env = "partner_value", default = "{SENTINEL}" }}'
 
 
 def _static(setting: str) -> str:
-    """A static item the setting accepts; ``intake_client_subjects`` needs a qualified prefix, and
-    the FHIR Bundle entry lists take a verb and a resource type (vault BACKLOG #2804)."""
+    """A static item the setting accepts; the FHIR Bundle entry lists take a verb and a resource
+    type (vault BACKLOG #2804)."""
     return {
-        "intake_client_subjects": "CN:partner.example",
         "allowed_entry_methods": "POST",
         "allowed_entry_types": "Patient",
     }.get(setting, "static.example.invalid")
@@ -141,9 +155,9 @@ def test_the_leak_this_refusal_exists_to_stop_is_real(shape: str) -> None:
 def test_an_existing_validator_would_echo_the_default_so_the_refusal_must_run_first() -> None:
     """Ordering control. ``Http``'s subject-prefix check quotes unqualified items, so if it ran
     before the list refusal, its OWN message would carry the default."""
-    spec = LIST_SETTINGS["Http", "intake_client_subjects"](["CN:partner.example"])
+    spec = _http_subjects({PARTNER_CA: ["CN:partner.example"]})
     settings = dict(spec.settings)
-    settings["intake_client_subjects"] = [NESTED_SHAPES["connections.toml"]()]
+    settings["intake_client_subjects"] = {PARTNER_CA: [NESTED_SHAPES["connections.toml"]()]}
     with pytest.raises(WiringError) as excinfo:
         wiring._validate_intake_auth(settings)
     assert SENTINEL in str(excinfo.value)
@@ -315,7 +329,6 @@ _TOML_LIST_TARGETS = [
     (_OUTBOUND_HEAD.format(transport="rest"), "proxy_no_proxy"),
     (_SOAP_HEAD, "capture_response_headers"),
     (_SOAP_HEAD, "proxy_no_proxy"),
-    (_HTTP_INBOUND_HEAD, "intake_client_subjects"),
 ]
 
 
@@ -361,20 +374,7 @@ def test_a_static_list_still_builds(target: tuple[str, str]) -> None:
     assert spec.settings[setting] == [_static(setting)]
 
 
-#: ``Http`` copies ``intake_client_subjects`` with ``list(...)`` before anything resolves it, so a
-#: whole-setting env() there raises TypeError at build. That predates BACKLOG #1820 and is not what
-#: this file tests; the strict xfail pins it, and turns red the day someone fixes it.
-_WHOLE_SETTING_TARGETS = [
-    pytest.param(
-        target,
-        marks=pytest.mark.xfail(
-            strict=True, raises=TypeError, reason="Http list()s the setting before resolution"
-        ),
-    )
-    if target == ("Http", "intake_client_subjects")
-    else target
-    for target in sorted(LIST_SETTINGS)
-]
+_WHOLE_SETTING_TARGETS = sorted(LIST_SETTINGS)
 
 
 @pytest.mark.parametrize("target", _WHOLE_SETTING_TARGETS)
@@ -418,6 +418,94 @@ def test_a_whole_setting_env_ref_in_toml_is_still_decoded_and_resolves(
     assert isinstance(settings["capture_response_headers"], EnvRef)
     resolved = resolve_env_settings(settings, {"capture_list": ["content-type"]})
     assert resolved["capture_response_headers"] == ["content-type"]
+
+
+# --- a table of lists: Http's intake_client_subjects (vault BACKLOG #2287) ----
+
+
+@pytest.mark.parametrize("target", sorted(TABLE_OF_LIST_SETTINGS))
+@pytest.mark.parametrize("shape", sorted(NESTED_SHAPES))
+def test_an_env_ref_item_in_a_tables_list_is_refused_without_echoing_its_default(
+    shape: str, target: tuple[str, str]
+) -> None:
+    factory, setting = target
+    with pytest.raises(WiringError) as excinfo:
+        TABLE_OF_LIST_SETTINGS[target]({PARTNER_CA: ["CN:partner.example", NESTED_SHAPES[shape]()]})
+    message = str(excinfo.value)
+    assert f"{factory} {setting} '{PARTNER_CA}' item 1 may not be" in message, message
+    assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize("target", sorted(TABLE_OF_LIST_SETTINGS))
+@pytest.mark.parametrize("shape", sorted(NESTED_SHAPES))
+def test_an_env_ref_standing_for_one_of_a_tables_lists_is_refused(
+    shape: str, target: tuple[str, str]
+) -> None:
+    """One level down is never resolved, so it would reach the connector as the reference itself."""
+    factory, setting = target
+    with pytest.raises(WiringError) as excinfo:
+        TABLE_OF_LIST_SETTINGS[target]({PARTNER_CA: NESTED_SHAPES[shape]()})
+    message = str(excinfo.value)
+    assert f"{factory} {setting} issuer '{PARTNER_CA}' may not" in message, message
+    assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize(
+    "whole",
+    [
+        pytest.param(lambda: messagefoundry.env("whole_table"), id="no-default"),
+        pytest.param(
+            lambda: messagefoundry.env("whole_table", default={PARTNER_CA: [SENTINEL]}),
+            id="static-default",
+        ),
+        pytest.param(lambda: NESTED_DEFAULTS["EnvRef"]([SENTINEL]), id="nested-default"),
+    ],
+)
+@pytest.mark.parametrize("target", sorted(TABLE_OF_LIST_SETTINGS))
+def test_an_env_ref_standing_for_the_whole_table_is_refused(
+    whole: Callable[[], Any], target: tuple[str, str]
+) -> None:
+    """An environment value is a string, never a table, so the whole-setting spelling the list
+    settings take has no meaning here and is refused rather than resolved."""
+    factory, setting = target
+    with pytest.raises(WiringError) as excinfo:
+        TABLE_OF_LIST_SETTINGS[target](whole())
+    message = str(excinfo.value)
+    assert f"{factory} {setting} may not be an env() reference" in message, message
+    assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize("target", sorted(TABLE_OF_LIST_SETTINGS))
+def test_a_static_table_of_lists_still_builds(target: tuple[str, str]) -> None:
+    _factory, setting = target
+    spec = TABLE_OF_LIST_SETTINGS[target]({PARTNER_CA: ["CN:partner.example"]})
+    assert spec.settings[setting] == {PARTNER_CA: ["CN:partner.example"]}
+
+
+def test_the_toml_surface_refuses_an_env_ref_item_in_an_issuers_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = _write(
+        tmp_path,
+        f"{_HTTP_INBOUND_HEAD}[inbound.settings.intake_client_subjects]\n"
+        f"'{PARTNER_CA}' = [\"CN:partner.example\", {TOML_MARKER}]\n",
+    )
+    with pytest.raises(WiringError) as excinfo:
+        load_connections_file(path, Registry())
+    assert f"'{PARTNER_CA}' item 1 may not be" in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+def test_the_toml_surface_refuses_an_env_ref_for_an_issuers_list(tmp_path: pathlib.Path) -> None:
+    path = _write(
+        tmp_path,
+        f"{_HTTP_INBOUND_HEAD}[inbound.settings.intake_client_subjects]\n"
+        f"'{PARTNER_CA}' = {TOML_MARKER}\n",
+    )
+    with pytest.raises(WiringError) as excinfo:
+        load_connections_file(path, Registry())
+    assert "may not name its subjects with an env() reference" in str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
 
 
 def test_a_table_that_only_looks_like_an_env_ref_is_left_alone() -> None:
@@ -475,7 +563,8 @@ def _list_valued_factory_settings() -> set[tuple[str, str]]:
 def test_every_list_valued_factory_setting_is_covered() -> None:
     derived = _list_valued_factory_settings()
     assert derived, "the AST walk found nothing -- the instrument is broken, not the code"
-    assert derived == set(LIST_SETTINGS), (
-        f"list-valued settings not covered here: {sorted(derived - set(LIST_SETTINGS))}; "
-        f"covered but no longer found: {sorted(set(LIST_SETTINGS) - derived)}"
+    covered = set(LIST_SETTINGS) | set(TABLE_OF_LIST_SETTINGS)
+    assert derived == covered, (
+        f"list-valued settings not covered here: {sorted(derived - covered)}; "
+        f"covered but no longer found: {sorted(covered - derived)}"
     )
