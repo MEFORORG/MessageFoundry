@@ -1290,7 +1290,10 @@ as BACKLOG #1960.
 guards that do this live in `RegistryRunner._handle_inbound_http`; each records the message with status
 `ERROR` and commits no ingress row. D5 answered that `422` on the sync path only, and kept the `202`
 receipt path answering `202` with no `message_id`. Now both paths answer **`422`** with the fixed,
-non-PHI body `{"error":"message was not accepted"}`. One branch in `HttpSource._serve_one`
+non-PHI body `{"error":"message was not accepted"}`. *(Superseded 2026-10-30: the claim that every
+refused body gets this one fixed body and the status `422` no longer holds. The body now also names
+the `ERROR` row as `refused_message_id`, and the status is `503`, `413` or `422` by kind. See the
+[amendment of 2026-10-30](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)* One branch in `HttpSource._serve_one`
 ([`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py)) answers it before
 the mode is chosen, so the two paths cannot drift.
 
@@ -1338,6 +1341,8 @@ kind of its own. See the
 place. AC-8 now links a second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, which pins
 the `422`, the exact body, exactly one `ERROR` row, no ingress row, and the `closed` event.
+*(Superseded 2026-10-30: the exact body that test pins now carries `refused_message_id`, and it covers
+only permanent refusals. See the [amendment of 2026-10-30](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 ## Amendment 2026-09-29: a repeated credential header is answered 400
 
@@ -1433,7 +1438,7 @@ dead-letter messages that a re-send a few seconds later would have delivered.
 
 **The receipt contract.** A source that declares `wants_receipt` is started with a receipt handler that
 returns an `IngressReceipt` ([`transports/receipt.py`](../../messagefoundry/transports/receipt.py)). It
-holds the committed `message_id`, or a `RefusalKind` and the `ERROR` row's `message_id`. The generic
+holds the committed `message_id`, or a `RefusalKind` and the `ERROR` row's id. The generic
 `InboundHandler` that MLLP, TCP and the file sources use is unchanged. The `HttpReceiptHandler` alias
 the Context's code map names is gone; `ReceiptHandler` replaces it. A receipt is a refusal only when
 `enqueue_ingress` did not run, so an accepted body can never be reported refused.
@@ -1457,9 +1462,12 @@ that a temporary refusal, should a binary path ever produce one, is answered as 
 
 `Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
 [`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
-refused body is `{"error": "message was not accepted", "message_id": "<id>"}`, where the id is the
-`ERROR` row the runner wrote before it answered. An operator can match a refusal to its row by id
-rather than by time and peer. The `HL7MessageTooLarge` type the parse raises for an over-size body is
+refused body is `{"error": "message was not accepted", "refused_message_id": "<id>"}`, where the id is
+the `ERROR` row the runner wrote before it answered. The key is not `message_id`, which on every other
+answer names a committed message, so a refusal cannot be read as an acceptance (Lander decision
+d20261101T013132231-ef9540, under the owner's delegation). An operator can match a refusal to its row
+by id rather than by time and peer, and that row's error text opens with `[refusal kind: <kind>]`, so
+the kind is known before anyone resends the row. The `HL7MessageTooLarge` type the parse raises for an over-size body is
 named in that row's stored reason, where `HL7PeekError` was before.
 
 **The strict-validation timeout stays permanent.** The 2026-09-26 amendment named it as possibly
@@ -1468,8 +1476,11 @@ re-send, and each attempt leaves another `hl7apy` thread running that this path 
 retry would multiply the load the timeout exists to bound. **The cost is real:** the timeout also
 counts time spent waiting for a worker thread, so under load a valid body can time out, and it is then
 answered `422`, which a sender and the engine's REST outbound treat as final. Nothing here tells the
-two causes apart. It may be reclassified only if a discriminator is later measured that tells a body
-which would pass on a retry from one which would time out again.
+two causes apart. **A strict-validation timeout caused by load answers `422` and is final (PERMANENT).**
+That reclassifies a cause BACKLOG #2105 was filed with as temporary: its filing named the
+strict-validation timeout, beside the in-flight budget, as engine-side and possibly clearing on a retry.
+It may be reclassified only if a discriminator is later measured that tells a body which would pass on
+a retry from one which would time out again.
 
 **One code for over-size.** A body over the listener's `max_body_bytes` already answered `413`, before
 the body is read and with no row. A body the runner refuses for size now answers `413` too, naming its
