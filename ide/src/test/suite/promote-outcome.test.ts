@@ -105,9 +105,10 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.strictEqual(
       msg.text,
       "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers, running. Restart the engine at PROD to apply a changed trust anchor. This " +
-        "reload checked the new file but does not load it, so the engine still trusts the old CA " +
-        "for: [auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
+        "4 handlers, running. Restart the engine to apply a changed trust anchor. This reload " +
+        "checked the new file but does not load it, so the engine still trusts the old CA for: " +
+        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file. This covers only the engine that " +
+        "answered: another engine shard or cluster node reports its own anchors in its own log.",
     );
   });
 
@@ -126,11 +127,19 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
   for (const [name, restart] of [
     ["a bare string", "[auth].ad_tls_ca_cert_file"],
     ["a list holding a non-string", [1]],
+    ["a list holding an empty name", [""]],
+    ["a list holding a link", ["[Finish](command:workbench.action.reloadWindow)"]],
+    ["a good name beside a bad one", ["[auth].ad_tls_ca_cert_file", "[x](command:y)"]],
   ] as const) {
-    test(`a restart_required of ${name} is an ERROR, never a clean promote`, async () => {
+    test(`a restart_required of ${name} keeps the counts, warns, and prints none of it`, async () => {
       const msg = await promoteReplying(restart);
-      assert.strictEqual(msg.level, "error");
-      assert.ok(msg.text.includes("unknown whether the new config is live"), msg.text);
+      assert.strictEqual(msg.level, "warning");
+      assert.ok(msg.text.includes("promoted to PROD"), msg.text);
+      assert.ok(msg.text.includes("could not be read"), msg.text);
+      assert.ok(!msg.text.includes("command:"), msg.text);
+      assert.ok(!msg.text.includes("ad_tls_ca_cert_file"), msg.text);
+      // The pre-flight prints no restart list, so the same reply must not stop it.
+      assert.ok(preflightOutcome(await reloadConfig(url, "/cfg", true, "tok")).ok);
     });
   }
 

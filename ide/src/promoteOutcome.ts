@@ -47,18 +47,11 @@ export interface PromoteMessage {
 }
 
 /** Whether a finished reply really is a reload result, so its counts can be printed. A reply that is
- *  not (an empty body, a proxy's page) must not be announced as a promote with undefined counts. A
- *  malformed `restart_required` fails too, so it can be printed, and a clean promote is never
- *  announced for a list the extension could not read. */
+ *  not (an empty body, a proxy's page) must not be announced as a promote with undefined counts. */
 function isReloadResult(body: unknown): body is ReloadResult {
-  if (!isRecord(body)) {
-    return false;
-  }
-  const restart = body.restart_required ?? [];
   return (
-    ["inbound", "outbound", "routers", "handlers"].every((k) => typeof body[k] === "number") &&
-    Array.isArray(restart) &&
-    restart.every((name) => typeof name === "string")
+    isRecord(body) &&
+    ["inbound", "outbound", "routers", "handlers"].every((k) => typeof body[k] === "number")
   );
 }
 
@@ -95,20 +88,38 @@ export function preflightOutcome(
 }
 
 /**
- * The sentences for a swap that is live but not finished, or none for a clean one. A list, because
- * these facts are independent: one reload can report several, so none may hide another. The web
- * console's `_reload_shortfall` has the same shape. A degraded apply (BACKLOG #2259) is one more
- * sentence here.
+ * One `restart_required` entry: a setting name, such as `[auth].ad_tls_ca_cert_file`. This server
+ * text is headed for a notification, so a list holding anything else is reported as unreadable and
+ * never printed.
  */
-function reloadShortfall(targetName: string, r: ReloadResult): string[] {
-  const restart = r.restart_required ?? [];
-  return restart.length > 0
-    ? [
-        `Restart the engine at ${targetName} to apply a changed trust anchor. This reload checked ` +
-          "the new file but does not load it, so the engine still trusts the old CA for: " +
-          `${restart.join(", ")}.`,
-      ]
-    : [];
+const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
+
+/**
+ * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
+ * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, not reported here yet) can sit
+ * beside the restart sentence. A list this code cannot read keeps the counts and says so: the swap
+ * did happen, and it must not read as a clean promote.
+ */
+function reloadShortfall(r: ReloadResult): string[] {
+  const names: unknown = r.restart_required ?? [];
+  if (
+    !Array.isArray(names) ||
+    !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
+  ) {
+    return [
+      "The engine's list of trust anchors that take a restart could not be read, so check the " +
+        "engine's log for them.",
+    ];
+  }
+  if (names.length === 0) {
+    return [];
+  }
+  return [
+    "Restart the engine to apply a changed trust anchor. This reload checked the new file but " +
+      `does not load it, so the engine still trusts the old CA for: ${names.join(", ")}. This ` +
+      "covers only the engine that answered: another engine shard or cluster node reports its " +
+      "own anchors in its own log.",
+  ];
 }
 
 /**
@@ -146,7 +157,7 @@ export function promoteOutcomeMessage(
     `MessageFoundry: promoted to ${targetName} — live graph: ${r.inbound} inbound, ` +
     `${r.outbound} outbound, ${r.routers} routers, ${r.handlers} handlers` +
     `${r.running ? ", running" : ""}.`;
-  const shortfall = reloadShortfall(targetName, r);
+  const shortfall = reloadShortfall(r);
   return {
     level: shortfall.length > 0 ? "warning" : "info",
     text: [promoted, ...shortfall].join(" "),
