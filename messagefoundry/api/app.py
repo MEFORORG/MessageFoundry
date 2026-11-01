@@ -2948,8 +2948,9 @@ async def _compare_start_config(
     The caller passes the digest :meth:`Engine.capture_start_provenance` took: off its snapshot,
     or, when it has none, off :attr:`Engine.loaded_config_fingerprint` read before
     ``engine.start()`` (vault BACKLOG #3076). Never a read taken once a reload can run, so a reload
-    that lands before the row is written cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
-    since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
+    that lands before the row is written cannot change what this start is said to have loaded. Only
+    the ``fingerprint`` and what it left out are compared, since ``git_head``, ``dir`` and ``node``
+    differ between nodes running the same bytes.
 
     Any digest change pages, as it did before vault BACKLOG #2944 added the markers below; they
     name the outcome and never skip the comparison (vault BACKLOG #3765).

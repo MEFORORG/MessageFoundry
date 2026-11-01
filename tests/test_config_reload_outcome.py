@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine
@@ -432,6 +433,44 @@ async def test_clean_reload_reports_plain_success(tmp_path: Path) -> None:
         assert eng.loaded_config_fingerprint is not None
         assert eng.loaded_config_fingerprint["files"] == 1
         assert await _delivers(new_in, new_out, name="CLEAN")
+    finally:
+        await eng.stop()
+
+
+async def test_an_edit_after_a_reloads_read_is_not_recorded_as_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3765, item 22: the race the start had, an edit between the load and its
+    digest recorded as loaded, is closed here by the one read of vault BACKLOG #2596. The digest is
+    of the snapshot the load ran, so an edit landing right after the load changes nothing."""
+    old_in, old_out = tmp_path / "old-in", tmp_path / "old-out"
+    new_in, new_out = tmp_path / "new-in", tmp_path / "new-out"
+    old_cfg, new_cfg = tmp_path / "old", tmp_path / "new"
+    _write_config(
+        old_cfg, inbound_name="IB_OLD", outbound_name="OUT_OLD", inbox=old_in, outdir=old_out
+    )
+    _write_config(
+        new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
+    )
+    ran = config_fingerprint(new_cfg)
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        module = next(new_cfg.glob("*.py"))
+        module.write_text(module.read_text("utf-8") + "# edited after the load\n", "utf-8")
+        return registry
+
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    eng.add_registry(load_config(old_cfg))
+    await eng.start()
+    try:
+        monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", _load_then_edit)
+        outcome = await eng.reload_detail(new_cfg)
+        assert config_fingerprint(new_cfg) != ran, "control: the edit landed"
+        assert outcome.fingerprint is not None and outcome.fingerprint["fingerprint"] == ran
+        assert eng.loaded_config_fingerprint is outcome.fingerprint
     finally:
         await eng.stop()
 

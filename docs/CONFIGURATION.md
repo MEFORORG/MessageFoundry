@@ -1850,22 +1850,29 @@ started together, can each raise it; the alert list folds them into one instance
   row after all, after the 10 seconds or before it reported its failure.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
-- Any fingerprint change raises the alert. The markers below add detail to the page, as its
-  `comparison` field, and never stop one (vault BACKLOG #3765).
+- Any fingerprint change raises the alert. The markers below add detail to the page, in its
+  `comparison` field and at the head of its reason, and never stop one (vault BACKLOG #3765).
 - A fingerprint that could not read a file it covers leaves it out and lists it under
-  `unreadable_files` (vault BACKLOG #2944). It is still compared. A start whose own fingerprint
-  left a file out is `partial_start_digest`, logged at WARNING with the files; a start that read
-  everything and meets a partial baseline is `partial_baseline`. Two fingerprints that left out
+  `unreadable_files` (vault BACKLOG #2944). The entry `.` is the config directory itself. It is
+  still compared. A start where either fingerprint left a file out is `partial_start_digest`,
+  logged at WARNING with the files; a start that read everything and meets a partial baseline is
+  `partial_baseline`. Two fingerprints that left out
   different files always differ, so a file that an antivirus lock holds at one start and not at the
   next raises the alert on the same bytes, at the locked start and again at the next whole one. A
   file that stays unreadable compares like for like from the second start on, so an edit to any
-  file both fingerprints cover still alerts.
-- The start fingerprints the directory just before it loads it and again just after. When the two
-  differ, or the first cannot be taken, the comparison is `changed_during_load`, and the start is
-  still compared, on the fingerprint taken after the load. When both cover the same files and still
-  differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
-  reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
-  reads miss at least an edit that lands and is reverted between them.
+  file both fingerprints cover still alerts. `GET /config/provenance`, a DR activation's
+  `disk_config` verdict and a backup's `config_fingerprint` apply the same rule and name what was
+  left out, as `unreadable_files`, `disk_config_left_out` and `config_unreadable_files` (vault
+  BACKLOG #3765).
+- A start's fingerprint is of the bytes its load read and ran. Just after the load it fingerprints
+  the directory once more, and compares both with the baseline, so `config_changed` fires when
+  either differs. When the two cover the same files and differ, an edit landed after the load read
+  that file, and the comparison is `changed_during_load`. The alert then names the directory's
+  fingerprint, or the loaded one when only that differs from the baseline. The `config_loaded` row
+  names the bytes that ran, so the next start, on the edited bytes, raises the alert again, and
+  `GET /config/provenance` reports drift until a reload. A directory that cannot be read just after
+  the load costs that second comparison only. Together the two reads miss at least an edit that
+  lands and is reverted after the load read that file.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,

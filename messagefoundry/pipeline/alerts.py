@@ -839,11 +839,13 @@ class AlertSink(Protocol):
         ``control_action`` fires on it (BACKLOG #1898). Raised once per start at most, never on a
         fresh store, a baseline without a digest, or one taken under another fingerprint scheme.
 
-        ``comparison`` is the start's outcome: ``compared``, or a marker that the start's digest
-        left out a file it could not read (``partial_start_digest``), the baseline's did
-        (``partial_baseline``), or the directory changed while the start loaded it
-        (``changed_during_load``). A marker adds to the page; it never suppresses one (vault
-        BACKLOG #2944, #3765)."""
+        ``comparison`` is the start's outcome: ``compared``, or a marker that a digest the start
+        took left out a file it could not read (``partial_start_digest``), the baseline's did
+        (``partial_baseline``), the directory changed after the start's load read it
+        (``changed_during_load``), or the start has no digest of the bytes it loaded and judged
+        only the directory (``no_start_digest``). ``fingerprint`` is the digest that differs: the
+        directory's when it does, else that of the bytes the load read. A marker adds to the page;
+        it never suppresses one (vault BACKLOG #2944, #3765)."""
         ...
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:

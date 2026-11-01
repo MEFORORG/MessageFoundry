@@ -31,6 +31,20 @@ def test_config_page_badge_clean() -> None:
     assert "DRIFTED" not in html
 
 
+def test_config_page_badge_names_what_it_did_not_compare() -> None:
+    html = config_page(
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="a" * 64,
+            drift=False,
+            unreadable_files=["environments/dev.toml"],
+            reload_refused=None,
+        )
+    )
+    assert ">clean<" in html
+    assert "could not be read: environments/dev.toml" in html
+
+
 def test_config_page_badge_drifted() -> None:
     html = config_page(
         ConfigProvenance(

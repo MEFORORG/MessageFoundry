@@ -10861,6 +10861,8 @@ def _backup(args: argparse.Namespace) -> int:
     }
     if result.staging_leftover is not None:  # BACKLOG #1174: a good archive, plaintext left behind
         payload["staging_leftover"] = result.staging_leftover
+    if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
+        payload["config_unreadable_files"] = list(result.config_unreadable_files)
     if args.json:
         _print_json(payload, compact=True)
     else:
