@@ -11594,7 +11594,7 @@ def _dest_config(
         oc.spec.type, settings, f"outbound connection {oc.name!r}", batched=oc.batch is not None
     )
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This same choke
-    # point feeds start, check and a reload's dry run, so the same effective proxy is built at all three.
+    # point means every caller builds the same effective proxy.
     _apply_egress_proxy_default(settings, egress)
     # ADR 0153 / ADR 0173: the connectors read the typed Destination fields below, but the deep
     # settings-driven seams read a settings mapping, so the declarations and the name are mirrored.

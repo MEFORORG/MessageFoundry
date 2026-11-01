@@ -825,16 +825,14 @@ def refuse_capture_conflicts(
     and the ``connections.toml`` desugar, passes the spec's literals, and an :func:`env` flag is
     undecided there: a reference is truthy whatever it resolves to, so reading one as on would refuse
     a graph whose flag resolves False, and reading one as satisfying ``expect_reply`` would pass a
-    capture with no reply to capture (BACKLOG #3724). A ``statement`` behind ``env()`` is NOT
-    undecided on that first pass. The DATABASE arm reads ``str()`` of it, the reference's repr, so
-    with a literal capture flag on, that text is judged and never the value: ``capture_response=True``
-    is refused beside ``env("sql")`` however the value would read, and passes beside
-    ``env("output_sql")``. The connection's resolved settings then come through here once more when
-    its connector is built. ``serve`` does that, and so does
-    ``messagefoundry check``, unless its ``build-check`` leg skips a config dir with no declared
-    instance, which has no environment to resolve against. ``messagefoundry dryrun`` builds no
-    connector. Neither of those two reaches this second pass, so a conflict behind ``env()`` waits
-    for ``serve`` there."""
+    capture with no reply to capture (BACKLOG #3724). A ``statement`` behind ``env()`` is different:
+    this pass judges its repr, never its value, so ``capture_response=True`` is refused beside
+    ``env("sql")`` and passes beside ``env("output_sql")``.
+
+    The resolved settings come through here once more when the connector is built. ``serve`` always
+    reaches this second pass, ``messagefoundry check`` does unless its ``build-check`` leg skips a
+    config dir with no declared instance, and ``messagefoundry dryrun`` never does, since it builds
+    no connector. A conflict behind ``env()`` then waits for ``serve``."""
 
     def on(key: str) -> bool:
         value = settings.get(key)
@@ -869,8 +867,7 @@ def refuse_capture_conflicts(
                 "MSA-2 to match against the sent MSH-10 — verify_ack_control_id is incompatible with "
                 "no_ack (BACKLOG #117 + #82)."
             )
-    # ADR 0013: response capture must be wiring-valid with no store needed: a literal at load, an
-    # env() flag when its connector is built (the docstring says which commands reach that).
+    # ADR 0013: response capture must be wiring-valid with no store needed.
     if capturing:
         if type_ in (ConnectorType.FILE, ConnectorType.REMOTEFILE):
             raise WiringError(
