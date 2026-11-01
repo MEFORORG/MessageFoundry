@@ -897,15 +897,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
-    # BACKLOG #2614. DELETE /sessions ends every session through the API; this is the same act from
-    # the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
+    # BACKLOG #2614. DELETE /sessions ends sessions in bulk through the API; this is the same act
+    # from the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
     admin_revoke_sessions = sub.add_parser(
         "admin-revoke-sessions",
-        help="end every account's sessions from the host (offline; the API is not needed)",
-        description="Revoke every session of every account, directly against the store, on the "
-        "same host gate as admin-unlock. Every signed-in user, administrators included, must sign "
-        "in again, except for a session docs/SECURITY.md, Limits of the session sweep, says the "
-        "revoke could leave live. Audited. The engine may be running or stopped.",
+        help="end the sessions it finds, of any account, from the host (the API is not needed)",
+        description="End the sessions it finds, of any account, directly against the store, on "
+        "the same host gate as admin-unlock. docs/SECURITY.md, Limits of the session sweep, says "
+        "what it may miss. Audited. The engine may be running or stopped.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",
@@ -11222,7 +11221,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
 
 
 def _admin_revoke_sessions(args: argparse.Namespace) -> int:
-    """End every account's sessions from the host (BACKLOG #2614).
+    """End the sessions it finds, of any account, from the host (BACKLOG #2614).
 
     ``DELETE /sessions`` does the same through the API, and this exists for when the API is the
     thing not trusted, such as a suspected compromise of the engine's own host process. The gate

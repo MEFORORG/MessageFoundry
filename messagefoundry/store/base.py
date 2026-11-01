@@ -3108,18 +3108,13 @@ class AuthStore(Protocol):
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke the unrevoked sessions of every account, but for ``except_token_hash`` when it is
-        given (BACKLOG #2614). Returns the number revoked. docs/SECURITY.md, *Limits of the
-        session sweep*, says which sessions a backend can miss.
+        """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
+        return how many it revoked (BACKLOG #2614).
 
-        :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises the
-        session epoch of the accounts its one read of the account list returns, so an older copy
-        of any of their rows resolves to nothing, and re-seals the kept session under its
-        account's epoch. An account that read does not return keeps its epoch. A kept session
-        whose seal does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError` and
-        the whole transaction, revokes included, rolls back. An account whose record fails its
-        seal keeps its old epoch, and the sweep still revokes the sessions of it that it reaches,
-        because ending a session needs no key."""
+        Raises the session epoch of the accounts its read of the account list returns, then ends
+        the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for what it
+        may miss. A kept session whose seal does not verify raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
         ...
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:

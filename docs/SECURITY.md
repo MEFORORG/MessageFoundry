@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends every account's sessions and keeps the caller's own, so the reply reaches them, unless its seal fails, when it is ended too; their other sessions end with everyone's. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). It has limits, which the *Limits of the session sweep* bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states. `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's own, unless that session's seal fails, when it is ended too. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -4658,24 +4658,16 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   at least the two exceptions below. Each of these raises the account's session epoch in the same
   transaction, and a rotation keeps the epoch the session was sealed under. So the gate refuses
   and ends the session, and the user's own session list hides it and ends it the same way.
-  **The first exception is the every-account revoke's, and it holds on both server stores.** It
-  raises the epoch only of the accounts returned by its one read of the account list, which
-  takes no lock. An account that read did not return keeps its epoch, so no epoch check refuses
-  a session of it that the sweep does not end. The sweep can fail to end one committed after the
-  sweep's statement began and before the revoke commits, and that session would then stay live
-  after the revoke. That needs no rotation. On Postgres the statement does not see a row
-  committed after it began. On SQL Server it may or may not, depending on where its scan has
-  reached; that is the same untraced reading by likeness as the rotation miss. A sign-in to an
-  account the read did return does not open this gap: it either commits before the revoke raises
-  that account's epoch, and the sweep then ends it unless the rotation miss above applies, or it
-  waits for the revoke to commit and is sealed under the raised epoch, as any later sign-in is.
-  An account whose record fails its seal keeps its epoch too, but the engine refuses that
-  account's sign-ins and sessions while its record fails. The SQLite store takes its write lock
-  before it reads the account list, so another writer cannot commit an account or a session
-  between that read and its sweep. All of this was read from the code and has not been run.
-  **The second exception,** for every sweep this bullet names, the every-account revoke included:
-  a request from a missed session to end the user's other sessions, accepted just before the
-  sweep commits, waits for it and then stamps the session with the new epoch, so it stays usable.
+  **The first exception is the every-account revoke's, on the PostgreSQL and SQL Server
+  stores:** it raises the session epoch only for the accounts its one read of the account list
+  returns, so it may fail to end a session of an account that read does not return, for example
+  one created while the revoke runs, and such a session would stay live. This was read from the
+  code and has not been run or traced in detail, and closing it is a filed follow-up. The SQLite
+  store takes its write lock before that read.
+  **The second exception,** for every sweep this bullet names, and for the every-account revoke
+  only for a session of an account its read returned: a request from a missed session to end the
+  user's other sessions, accepted just before the sweep commits, waits for it and then stamps the
+  session with the new epoch, so it stays usable.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
@@ -4781,7 +4773,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
   for the action the operator started from, when that action takes one and the session is not
   refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action, or a save that ends the caller's own sessions (BACKLOG #3401),
-  or ending every session (BACKLOG #2614), as on the password leg). Every outcome
+  or the every-account session revoke (BACKLOG #2614), as on the password leg). Every outcome
   that `complete_oidc_step_up` or `abandon_oidc_step_up` decides writes an `auth.reauth` row with
   `mech=oidc`, and a refusal carries a closed-set `reason` (`step_up_not_fresh`,
   `step_up_idp_auth_time_not_later`, `step_up_idp_auth_time_missing`, `step_up_subject_mismatch`, `flow_purpose_mismatch`, a claims-ladder slug, and others).
@@ -5314,10 +5306,10 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way;
-- end every account's sessions at once with `DELETE /sessions`, which keeps only the caller's own,
-  or from the host with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614).
-  These revokes, and the per-account ones above, have limits that the *Limits of the session
-  sweep* bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states.
+- end sessions in bulk with `DELETE /sessions`, which keeps the caller's own, or from the host
+  with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What these and
+  the per-account revokes above may miss: *Limits of the session sweep* under
+  [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142).
 
 [CONFIGURATION.md](CONFIGURATION.md) documents each setting.
 

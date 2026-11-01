@@ -10633,15 +10633,12 @@ class PostgresStore:
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
+        """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        The epoch of each account its one unlocked read of the account list returns is raised
-        first, in id order, so those account row locks are taken before any session row's, the
-        order ``create_session`` takes them in, and two of these take them in one order.
-        docs/SECURITY.md, *Limits of the session sweep*, states what that read can miss. The
-        borrow is the ordinary bounded one: this is a standalone act, not the tail of a write its
-        caller already committed."""
+        Raises the session epoch of the accounts its read of the account list returns, then ends
+        the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for what it
+        may miss."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
