@@ -764,16 +764,17 @@ and the attestation, where the line was the only record of the attestation.
 time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
 line. A guard handed a context that skips time validity keeps it, because that context's CRL is no
 real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: at least
-MLLP and the DICOM SCU (since §13) and the REST, SOAP, FHIR and FTPS hops (§4.3 above) hand the
-guard no context there, so such a hop crosses on its attestation alone. **The guard's own
+MLLP and the DICOM SCU (since §13), the REST, SOAP and FHIR hops (§4.3 above) and the FTPS hops
+(§7.1's note of 2026-10-28 on the inbound FTPS poll, and §13) hand the guard no context there, so such a hop crosses on its attestation alone. **The guard's own
 disposition does not apply that reading:** it still admits a context that skips time validity on
 that context's CRL, with no attestation, so the rule rests on each caller passing no context. The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.
-`FhirLookupExecutor` (`fhir.py`) and `DicomWebDestination` (`dicomweb.py`) pass their opener
-unconditionally; neither builds an expiry-relaxed opener today. On a `tls_allow_expired` hop the
-line's over-statement stands only in part, since a certificate the CRL lists is still refused at the handshake. This correction
+At least `FhirLookupExecutor` (`fhir.py`) and `DicomWebDestination` (`dicomweb.py`) pass their
+opener unconditionally, and neither builds an expiry-relaxed opener today; other guarded hops pass
+their context unconditionally too. On a `tls_allow_expired` hop the line's over-statement stands
+only in part, since a certificate the CRL lists is still refused at the handshake. This correction
 changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
@@ -1515,7 +1516,8 @@ on first deployment, with no attestation.
   for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
   `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
   so the fix would not silence it. This amendment does not revisit that fix. *(Note 2026-10-31:
-  §4.3's CORRECTED 2026-10-30 paragraph records it applied since, as `crl_is_a_check`.)*
+  that fix is still not applied. §4.3's CORRECTED 2026-10-30 paragraph records a different
+  condition, `crl_is_a_check`, which keeps the line for a context that skips time validity.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
