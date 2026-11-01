@@ -44,6 +44,7 @@ import pytest
 from messagefoundry.config import wiring
 from messagefoundry.config.connections_file import _TRANSPORTS
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports.receipt import receipt_handler
 
 # --- doc drift: the security prose must agree with the signatures, in BOTH directions --------------
 
@@ -268,7 +269,7 @@ async def test_stop_releases_an_outstanding_pacing_wait() -> None:
     async def handler(raw: bytes) -> str | None:  # pragma: no cover - nothing is stored here
         return None
 
-    await src.start(handler)
+    await src.start(receipt_handler(handler))
     try:
         src._charge_association(object())
         src._charge_association(object())
@@ -467,7 +468,7 @@ async def _echo_run(
 
     with monkeypatch.context() as swap:
         swap.setattr(dicom_module, "time", clock)
-        await src.start(handler)
+        await src.start(receipt_handler(handler))
         port = src.sockport
         try:
 

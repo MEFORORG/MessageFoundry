@@ -195,10 +195,11 @@ def load_environment_values(
 ) -> dict[str, Any]:
     """Resolve this instance's environment values.
 
-    Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat key→scalar table) if present, then
-    overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
+    Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat table of scalars and arrays with no
+    table in them) if present, then overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
     directory (the directory wins; :mod:`messagefoundry.engine_secrets`). A missing file is **not** an error here —
     referenced-but-undefined keys fail loud when a connector is built, not at gather time.
+    :func:`environment_values_from_bytes` says what it refuses.
     """
     path = values_file_path(base_dir, dir_name, environment)
     return environment_values_from_bytes(
@@ -206,15 +207,56 @@ def load_environment_values(
     )
 
 
+def _tables_in_array(array: list[Any]) -> list[str]:
+    """The index path of each table inside ``array``: ``1`` for an item, ``0.1`` for an item of a
+    nested array. No depth cap, because a capped walk would stop at a depth a value file can reach,
+    and what it missed would load."""
+    found: list[str] = []
+    stack: list[tuple[str, list[Any]]] = [("", array)]
+    while stack:
+        prefix, items = stack.pop()
+        for index, item in enumerate(items):
+            if isinstance(item, dict):
+                found.append(f"{prefix}{index}")
+            elif isinstance(item, list):
+                stack.append((f"{prefix}{index}.", item))
+    return found
+
+
 def environment_values_from_bytes(
     file_bytes: bytes | None, *, path: Path, environ: Mapping[str, str]
 ) -> dict[str, Any]:
     """:func:`load_environment_values` over the value file's bytes already read, ``None`` when there
     is no file. ``path`` only names the file in a warning. A released reload parses the bytes its
-    approval digest covered this way, rather than reading the file again (vault BACKLOG #2596)."""
+    approval digest covered this way, rather than reading the file again (vault BACKLOG #2596).
+
+    Raises ``ValueError`` on a table anywhere inside an array value, in the inline or the
+    ``[[tables]]`` spelling, referenced or not (BACKLOG #1820). :func:`~messagefoundry.config.wiring.resolve_env_settings`
+    hands a value over whole, so an env marker in such a table is never resolved and a connector
+    that ``str()``s the item would carry its ``default=``. Today no setting takes a list of tables,
+    so any table is refused, not just a marker: a marker with one more key, or nested past the wiring
+    scan's depth, reaches ``str()`` the same way. The check sits here because at least the disk read
+    and the snapshot read both pass through this function. Only the file can hold an array here: the
+    overlay and the secrets directory supply strings. At least a mapping handed in directly, such as
+    ``Engine(env_values=...)``, never comes through this function, so it is not checked.
+
+    The message names the key and index only, because ``messagefoundry check`` prints it as it is."""
     values: dict[str, Any] = {}
     if file_bytes is not None:
         data = tomllib.loads(file_bytes.decode("utf-8"))
+        tables = [
+            f"{key!r} item {where}"
+            for key, value in data.items()
+            if isinstance(value, list)
+            for where in _tables_in_array(value)
+        ]
+        if tables:
+            # One offender and a count, and short, because safe_exc cuts at about 200 characters on
+            # the serve path. The walk's order is not file order, so it is not called the first.
+            raise ValueError(
+                f"a value file may not hold a table inside an array ({len(tables)} found, "
+                f"including {tables[0]}) - nothing resolves it. Use scalar items or remove the key."
+            )
         for key, value in data.items():
             if isinstance(value, dict):
                 # Nested tables are reserved (future grouping); a value must be a scalar/array today.

@@ -2613,6 +2613,10 @@ _CONNECTION_WAYS_ACROSS = (
 )
 
 
+#: The attestation setting a revocation record names for a hop that is a connection.
+_CONNECTION_ATTESTATION = "tls_revocation_attested"
+
+
 @dataclass(frozen=True, slots=True)
 class RevocationHopGuard:
     """A captured revocation-refusal decision for one VERIFYING outbound TLS hop (#201, ADR 0078 amend).
@@ -2641,6 +2645,10 @@ class RevocationHopGuard:
     #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
+    #: Whether that CRL is a real check: :attr:`crl_checked`, on a context that does not skip time
+    #: validity (:func:`skips_validity_period`). It decides whether the attested crossing is
+    #: logged, at :meth:`enforce_construction` and the AI broker's own arm; no disposition reads it.
+    crl_is_a_check: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
     #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
@@ -2664,6 +2672,10 @@ class RevocationHopGuard:
     #: The declaring connection's name, recorded in the same audit line so an auditor can trace the
     #: crossing to the declaration to fix. ``None`` for a hop that is not a connection.
     connection: str | None = None
+    #: The setting the same audit line names as the attestation. The default is a connection's flag;
+    #: a hop attested through another setting passes its name, or the record points an auditor at a
+    #: setting the operator never set.
+    declaration: str = _CONNECTION_ATTESTATION
 
     @classmethod
     def capture(
@@ -2678,6 +2690,7 @@ class RevocationHopGuard:
         ways_across: str | None = None,
         attested_reason: str | None = None,
         connection: str | None,
+        declaration: str = _CONNECTION_ATTESTATION,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -2700,7 +2713,11 @@ class RevocationHopGuard:
         in-gate cell is byte-identical. **This parameter exists so those callers do not have to
         re-stamp the contextvar themselves:** ``active_hop_posture(None)`` *clears* an ambient posture
         rather than inheriting it, so the obvious hand-rolled wrapper is a live footgun for any hop
-        that is sometimes in-gate and sometimes not."""
+        that is sometimes in-gate and sometimes not.
+
+        ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
+        connection's flag."""
+        crl_checked = context_checks_revocation(context)
         return cls(
             host=host,
             cell=cell,
@@ -2708,10 +2725,13 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=context_checks_revocation(context),
+            crl_checked=crl_checked,
+            crl_is_a_check=crl_checked
+            and not (context is not None and skips_validity_period(context)),
             ways_across=ways_across,
             attested_reason=attested_reason,
             connection=connection,
+            declaration=declaration,
         )
 
     def disposition(self) -> HopDisposition | None:
@@ -2754,18 +2774,24 @@ class RevocationHopGuard:
         if posture is None:
             return
         disposition = self._disposition(posture)
-        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the disposition is
-        # ALLOW only because tls_revocation_attested fired before the REFUSE arm, so an operator should
-        # see the unchecked-revocation hop was crossed on their attestation.
-        # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
-        # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
-        # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
-        # one `posture.enforcing` already excludes the line.
+        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the operator should
+        # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
+        # real check crossed on that check, so this line would be a false record there and it is
+        # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
+        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
+        # disposition is ALLOW on that CRL flag, which this line does not move. Nothing here refuses
+        # such a CRL: each caller makes the choice at its own call site, passing no context on a
+        # tls_allow_expired hop. At least the REST, SOAP and FHIR destinations, FTPS
+        # (_guard_ftps_revocation), MLLP and the DICOM SCU do (ADR 0173 §4.3 and §13), so those
+        # hops cross on the attestation and keep the line for that reason.
+        # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
+        # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
             and self.attested
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
+            and not self.crl_is_a_check
         ):
             log_attested_crossing(
                 logger,
@@ -2773,7 +2799,7 @@ class RevocationHopGuard:
                 connection=self.connection,
                 detail=f"{self.cell}: {self._detail()}",
                 reason=self.attested_reason,
-                declaration="tls_revocation_attested",
+                declaration=self.declaration,
             )
         enforce_insecure_hop(
             disposition, message=self._detail(), cell=self.cell, connection=self.connection

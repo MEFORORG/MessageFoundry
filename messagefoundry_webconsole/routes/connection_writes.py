@@ -16,7 +16,7 @@ from messagefoundry.api.models import (
     ConnectionFlagRequest,
     PendingApprovalResponse,
 )
-from messagefoundry.api.security import client_ip
+from messagefoundry.api.security import ConfigWriteNotRecorded, client_ip
 from messagefoundry.api.validation import ConnectionName
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import STEP_UP_ACTION_CONNECTION_PURGE
@@ -194,15 +194,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             await core.set_connection_flag(
                 name, req, engine=engine, identity=identity, request=request
             )
+        except ConfigWriteNotRecorded as exc:
+            # The audit log did not record the toggle (vault BACKLOG #2945), whose fix is neither
+            # of flag_rejected's. By type: any other 503 is re-raised below (BACKLOG #3811).
+            return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
         except HTTPException as exc:
             # At least: the scope fork (code-first), a validate-before-persist failure, or a
             # connections.toml the engine's account cannot write (vault BACKLOG #3106).
             if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
-            if exc.status_code == 503:
-                # The route's only 503: the audit log did not record the toggle (vault BACKLOG
-                # #2945), whose fix is neither of flag_rejected's.
-                return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)
 

@@ -9,15 +9,20 @@ driver. Synthetic values only.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import dataclasses
 import inspect
+from collections.abc import Sequence
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from harness.config.connscale._shape import ConnScaleShape, make_connscale_shape
 from harness.load.connscale import probe
+from harness.load.connscale import profile as profile_mod
 from harness.load.connscale import runner as runner_mod
 from harness.load.connscale.batchbox import iter_batch_cells
 from harness.load.connscale.intake_audit import VERDICT_INVARIANT_SUSPECT, not_run
@@ -37,6 +42,7 @@ from harness.load.connscale.runner import (
     sweep_step_count,
 )
 from harness.load.connscale.stepconfig import graph_module_text
+from harness.load.correlator import Correlator
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 
@@ -170,23 +176,43 @@ _NO_CORPUS: Any = object()
 
 
 class _Driver:
-    """Queues one send per connection and delivers ``deliver`` of them after a short delay."""
+    """Queues one send per connection, and after a short delay the correlator takes one arrival for
+    each seq in ``arrivals``."""
 
-    def __init__(self, metrics: LiveMetrics, *, count: int, deliver: int) -> None:
-        self._m = metrics
+    def __init__(self, correlator: Correlator, *, count: int, arrivals: Sequence[int]) -> None:
+        self._correlator = correlator
         self._count = count
-        self._deliver = deliver
+        self._arrivals = arrivals
         self.task: asyncio.Task[None] | None = None
 
-    def send_one_each(self, *, corpus: object, mix: object) -> int:
+    def send_one_each(self, *, corpus: object, mix: object) -> list[int]:
+        for seq in range(self._count):
+            self._correlator.on_send(seq, 0)
         self.task = asyncio.create_task(self._arrive())
-        return self._count
+        return list(range(self._count))
 
     async def _arrive(self) -> None:
         await asyncio.sleep(0.01)
-        for i in range(self._deliver):
-            self._m.e2e.record(float((i + 1) * 1_000_000))  # 1 ms, 2 ms, ...
-            self._m.counters.sink_received += 1
+        for i, seq in enumerate(self._arrivals):
+            self._correlator.on_recv(seq, (i + 1) * 1_000_000)  # 1 ms, 2 ms, ...
+
+
+async def _warm(
+    metrics: LiveMetrics, *, arrivals: Sequence[int], pid: int | None, timeout: float
+) -> SandboxReading:
+    """Run the warm-up over 10 connections, with a stand-in for ConnScaleDriver: only send_one_each
+    is called."""
+    correlator = Correlator(64, metrics)
+    driver: Any = _Driver(correlator, count=10, arrivals=arrivals)
+    return await _warm_up(
+        SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=30.0),
+        driver=driver,
+        corpus=_NO_CORPUS,
+        metrics=metrics,
+        correlator=correlator,
+        pid=pid,
+        timeout=timeout,
+    )
 
 
 async def test_the_warm_up_waits_for_every_first_delivery_and_keeps_it_out_of_the_hold(
@@ -196,13 +222,8 @@ async def test_the_warm_up_waits_for_every_first_delivery_and_keeps_it_out_of_th
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: next(walks))
     hold_ack, hold_e2e = Histogram(), Histogram()
     metrics = LiveMetrics(Counters(), hold_ack, hold_e2e)
-    # A stand-in for ConnScaleDriver: only send_one_each is called.
-    driver: Any = _Driver(metrics, count=10, deliver=10)
-    start = SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=30.0)
 
-    reading = await _warm_up(
-        start, driver=driver, corpus=_NO_CORPUS, metrics=metrics, pid=4242, timeout=5.0
-    )
+    reading = await _warm(metrics, arrivals=range(10), pid=4242, timeout=5.0)
 
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 10)
     assert reading.processes_started == 10
@@ -217,17 +238,85 @@ async def test_a_warm_up_that_runs_out_is_recorded_not_raised(
 ) -> None:
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: None)  # the walk did not read
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
-    # A stand-in for ConnScaleDriver: only send_one_each is called.
-    driver: Any = _Driver(metrics, count=10, deliver=4)
-    start = SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=30.0)
 
-    reading = await _warm_up(
-        start, driver=driver, corpus=_NO_CORPUS, metrics=metrics, pid=4242, timeout=0.3
-    )
+    reading = await _warm(metrics, arrivals=range(4), pid=4242, timeout=0.3)
 
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 4)
     assert reading.warmup_ran
     assert reading.processes_started is None
+
+
+async def test_a_redelivery_does_not_stand_in_for_a_connection_that_never_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection 0 delivers twice and connection 9 never does. The sink saw 10 arrivals for 10
+    sends, so a count of arrivals reads 10 of 10 and ends the wait at once; 9 of 10 is the truth."""
+    monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: None)
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+
+    reading = await _warm(metrics, arrivals=[0, 0, 1, 2, 3, 4, 5, 6, 7, 8], pid=None, timeout=0.3)
+
+    assert metrics.counters.sink_received == 10
+    assert (reading.warmup_sent, reading.warmup_delivered) == (10, 9)
+
+
+def _compare_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    out: Path,
+    *,
+    profile_text: str,
+) -> str:
+    """What ``--report-compare`` tells an operator when the run produced no comparison table."""
+    import harness.__main__ as hmain
+
+    async def no_engine(_profile: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            render_console=lambda: "report",
+            comparison=None,
+            fuse_comparison=None,
+            batch_comparison=None,
+            exit_code=0,
+        )
+
+    profile = load_connscale_profile_text(profile_text)
+    monkeypatch.setattr(profile_mod, "get_connscale_profile", lambda _name: profile)
+    monkeypatch.setattr(runner_mod, "run_connscale", no_engine)
+    args = argparse.Namespace(
+        connscale="stand-in",
+        connscale_api_port=None,
+        sink_port=None,
+        sink_ports=None,
+        report_json=None,
+        report_csv=None,
+        report_compare=str(out),
+    )
+    assert hmain._run_connscale(args) == 0
+    assert not out.exists()
+    return capsys.readouterr().err
+
+
+def test_report_compare_says_a_sandbox_ab_has_no_table_rather_than_no_ab(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A sandbox A/B has two arms and no comparison in report.py, so "no A/B" would be false, and
+    offering ``sandbox_modes`` beside the other axes would send an operator to a table that does
+    not exist. The single-arm message is the control."""
+    sandbox = _compare_stderr(monkeypatch, capsys, tmp_path / "out.txt", profile_text=_SANDBOX_AB)
+    assert "a sandbox A/B has no comparison table" in sandbox
+    assert "per-arm rows" in sandbox
+    assert "no A/B" not in sandbox
+
+    single = _compare_stderr(
+        monkeypatch,
+        capsys,
+        tmp_path / "out.txt",
+        profile_text=_SANDBOX_AB.replace('["off", "subprocess"]', '["off"]').replace(
+            "warmup_timeout_s = 30.0\n", ""
+        ),
+    )
+    assert "no A/B to write" in single
+    assert "sandbox" not in single
 
 
 # --- the sweep and its SLOs -----------------------------------------------------------------------

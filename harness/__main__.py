@@ -738,6 +738,12 @@ def _run_connscale(args: argparse.Namespace) -> int:
             tables.append(report.batch_comparison.render_table())
         if tables:
             Path(args.report_compare).write_text("\n\n".join(tables) + "\n", encoding="utf-8")
+        elif profile.sandbox_ab:
+            print(
+                "--report-compare: a sandbox A/B has no comparison table, so nothing was written; "
+                "read the per-arm rows of the report above (its sandbox column)",
+                file=sys.stderr,
+            )
         else:
             print(
                 "--report-compare: this profile has a single claim mode, a single fuse mode, AND a "

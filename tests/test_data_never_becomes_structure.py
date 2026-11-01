@@ -62,6 +62,7 @@ from messagefoundry.transports import remotefile as remotefile_mod
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.receipt import RefusalKind
 from tests.test_remotefile_transport import (
     _FakeClient,
     _FakeLedger,
@@ -579,7 +580,8 @@ async def test_P6_the_http_listener_records_error_and_commits_nothing(store: Mes
     )
     reg = _registry(ic)
     runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
-    assert await runner._handle_inbound_http(ic, P6_BODY.encode("utf-8")) is None
+    receipt = await runner._handle_inbound_http(ic, P6_BODY.encode("utf-8"))
+    assert receipt.refusal is RefusalKind.PERMANENT
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
 
 

@@ -2011,6 +2011,25 @@ def test_source_requires_core_settings(missing: str) -> None:
         )
 
 
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "base64", "undefined", 8, True])
+def test_source_refuses_an_unusable_encoding_when_built(encoding: object) -> None:
+    # BACKLOG #2431: each polled row is encoded with this name, so an unusable one is refused when
+    # the source is built rather than surfacing per row. The message never renders the name.
+    settings = {**DatabasePoll(server="s", database="d", poll_statement=POLL).settings}
+    settings["encoding"] = encoding
+    with pytest.raises(ValueError, match="names no usable text codec") as ei:
+        build_source(
+            Source(type=ConnectorType.DATABASE, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert str(encoding) not in str(ei.value)
+
+
+@pytest.mark.parametrize("encoding", [None, "", "latin-1", "UTF_8"])
+def test_source_builds_with_a_usable_or_undeclared_encoding(encoding: object) -> None:
+    _src(encoding=encoding)
+
+
 # --- source connect-allowlist ([egress].allowed_db) --------------------------
 
 

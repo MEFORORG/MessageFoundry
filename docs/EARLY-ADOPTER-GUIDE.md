@@ -683,6 +683,24 @@ decrypts it, and writes the store. It **refuses to overwrite** an existing store
 `--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
+**A restore brings back the archive's accounts as they were (BACKLOG #2614)**: users, password
+hashes, roles, second factors and sessions. So the restore ends every session in the store it
+places and writes a marker into it. The first `serve` on that store, wherever it has been moved,
+revokes every session again, writes one `store_restored` audit row naming the archive's SHA-256,
+its age and the time of its newest audit row, and raises a `store_restored` alert. Every user signs
+in again. Other commands that open the store, such as `provision-admin`, leave the marker for that
+start. The engine does not re-apply
+changes made after the archive was taken.
+
+**`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
+whose manifest does not say when it was taken, or that is dated more than an hour in the future,
+is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`
+restores it. The refusal, and every successful restore, print the time of the archive's newest
+audit row. Every disable, delete, role change and
+password or factor reset made after that time is undone by the restore and must be re-applied by
+hand; read the source's audit log, or its off-host copy, for the list. To restore an older archive on
+purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
+
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI
 key file**. Back the key up in a different location/system from the data, with its own access control.
