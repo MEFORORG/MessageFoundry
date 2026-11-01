@@ -161,6 +161,11 @@ class _SqlStore:
         assert "MERGE leader_lease" in sql
         return self._lease.claim(params[1])
 
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> dict[str, object] | None:
+        return await self._fetchone(sql, params)
+
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         owner = params[1] if _LEASE_SQL in sql else params[2]
         return await self.writes.run(sql, owner)

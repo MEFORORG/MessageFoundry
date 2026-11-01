@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from tests._queue_tag_contract import RawFetch, RawSql
+from tests._store_audit import no_operator_audit
 
 DAY = 86_400.0
 LOOP = "IB_LOOP"
@@ -118,14 +119,14 @@ async def assert_replay_refuses_an_erased_reply(store: Any, fetch: RawFetch, _ra
     assert (await token_row(fetch, kept))["payload"] != ""
 
     # The purged arm: nothing moves, the disposition stands, and no replayed event is written.
-    assert await store.replay(erased_mid, now=60 * DAY) == 0
+    assert await store.replay(erased_mid, now=60 * DAY, audit=no_operator_audit) == 0
     assert (await token_row(fetch, erased))["status"] == OutboxStatus.DEAD.value
     assert await status_of(store, erased_mid) == MessageStatus.ERROR.value
     events = await store.events_for(erased_mid)
     assert not [e for e in events if e["event"] == "replayed"]
 
     # The control: replay still re-queues and re-ingresses the retained reply.
-    assert await store.replay(kept_mid, now=60 * DAY) == 1
+    assert await store.replay(kept_mid, now=60 * DAY, audit=no_operator_audit) == 1
     assert await status_of(store, kept_mid) == MessageStatus.ROUTED.value
     assert await run_reingress(store, now=60 * DAY)
     assert await status_of(store, kept_mid) == MessageStatus.PROCESSED.value
@@ -152,9 +153,9 @@ async def assert_mixed_message_recovers_only_what_remains(
         assert (await token_row(fetch, token))["payload"] == ""
 
         requeued = (
-            await store.replay_dead(destination_name=sibling, now=60 * DAY)
+            await store.replay_dead(destination_name=sibling, now=60 * DAY, audit=no_operator_audit)
             if bulk
-            else await store.replay(mid, now=60 * DAY)
+            else await store.replay(mid, now=60 * DAY, audit=no_operator_audit)
         )
         assert requeued == 1, bulk
         assert (await token_row(fetch, token))["status"] == OutboxStatus.DEAD.value
@@ -175,8 +176,8 @@ async def assert_erased_after_replay_is_dead_lettered(
     artifact's erasure. This builds the result of that race directly."""
     gone_mid, gone = await dead_token(store, now=0.0, control="ER-RACE")
     kept_mid, _ = await dead_token(store, now=0.0, control="ER-RACE-KEPT")
-    assert await store.replay(gone_mid, now=1.0) == 1
-    assert await store.replay(kept_mid, now=1.0) == 1
+    assert await store.replay(gone_mid, now=1.0, audit=no_operator_audit) == 1
+    assert await store.replay(kept_mid, now=1.0, audit=no_operator_audit) == 1
     await raw("UPDATE response SET body=NULL WHERE message_id=?", (gone_mid,))
 
     assert await run_reingress(store, now=2.0)
@@ -189,7 +190,7 @@ async def assert_erased_after_replay_is_dead_lettered(
     events = await store.events_for(gone_mid)
     assert [e for e in events if e["event"] == "dead" and "erased" in str(e["detail"])]
     # The blank makes the dead-letter final: a second replay is refused, not re-run forever.
-    assert await store.replay(gone_mid, now=3.0) == 0
+    assert await store.replay(gone_mid, now=3.0, audit=no_operator_audit) == 0
 
     # The unpurged control: its child carries the true reply.
     assert await status_of(store, kept_mid) == MessageStatus.PROCESSED.value
@@ -224,7 +225,7 @@ async def assert_purge_concurrent_with_replay_keeps_the_invariant(
     What may never happen is a child with an empty body, or a PROCESSED origin whose reply was erased."""
     for first in ("replay", "purge"):
         mid, token = await dead_token(store, now=0.0, control=f"ER-CONC-{first}")
-        replay = store.replay(mid, now=60 * DAY)
+        replay = store.replay(mid, now=60 * DAY, audit=no_operator_audit)
         purge = store.purge_message_bodies(older_than=10 * DAY, now=60 * DAY)
         ordered = (replay, purge) if first == "replay" else (purge, replay)
         for outcome in await asyncio.gather(*ordered, return_exceptions=True):
@@ -252,7 +253,7 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     the evidence of which row went missing. A later replay re-queues it into the same dead end once,
     and the worker does not loop on it."""
     mid, token = await dead_token(store, now=0.0, control="ER-MISSING")
-    assert await store.replay(mid, now=1.0) == 1
+    assert await store.replay(mid, now=1.0, audit=no_operator_audit) == 1
     reference = (await token_row(fetch, token))["payload"]
     await raw("DELETE FROM response WHERE message_id=?", (mid,))
 
@@ -266,7 +267,7 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     assert await children(fetch) == []
 
     # One dead end per replay, not a loop.
-    assert await store.replay(mid, now=3.0) == 1
+    assert await store.replay(mid, now=3.0, audit=no_operator_audit) == 1
     assert await run_reingress(store, now=4.0)
     assert await run_reingress(store, now=5.0) is False
     row = await token_row(fetch, token)

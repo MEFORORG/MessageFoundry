@@ -28,6 +28,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from tests._store_audit import no_operator_audit
 
 _RETRY = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=1)
 
@@ -219,7 +220,7 @@ async def test_a_late_retry_lands_on_a_row_the_operator_replayed(store: MessageS
     takes ``backoff_seconds`` exactly: 102 + 5. Without the floor it would be 102 + 2.5."""
     mid, (oid,) = await _claimed(store, "OB1")
     await store.dead_letter_now(oid, "operator dead-letter", now=101.0)
-    assert await store.replay_dead(now=101.5) == 1
+    assert await store.replay_dead(now=101.5, audit=no_operator_audit) == 1
     policy = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=2)
 
     next_at = (await store.mark_failed(oid, "late failure", policy, now=102.0)).retry_at
@@ -242,7 +243,7 @@ async def test_a_zero_multiplier_on_a_reset_row_does_not_raise(store: MessageSto
     a policy that reaches it some other way, and this pins it."""
     mid, (oid,) = await _claimed(store, "OB1")
     await store.dead_letter_now(oid, "operator dead-letter", now=101.0)
-    await store.replay_dead(now=101.5)
+    await store.replay_dead(now=101.5, audit=no_operator_audit)
     policy = RetryPolicy.model_construct(
         max_attempts=None, backoff_seconds=5.0, backoff_multiplier=0.0, max_backoff_seconds=300.0
     )
