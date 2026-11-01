@@ -663,27 +663,31 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
-#: Whether the last flag read failed, so a run of failures logs once.
-_connection_flags_failing = False
-
-
-async def _connection_flags(engine: Engine) -> set[tuple[str, str]]:
-    """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows.
+async def _connection_flags(engine: Engine, state: Any) -> set[tuple[str, str]] | None:
+    """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows, or
+    ``None`` when the read failed.
 
     The flag's one reader (BACKLOG #2623), and ``tests/test_connection_flag_readers.py`` fails on a
-    second. It decides nothing, so a read that fails costs the markers and never the page: a row a
-    database writer planted that the driver cannot decode reads as no flags at all. Logged at
-    WARNING once per failure run, because the stats socket reads this every second per console."""
-    global _connection_flags_failing
+    second. No engine path reads the flag, so a read that fails costs the markers and never the
+    page: a row a database writer planted that the driver cannot decode reads as flags unknown. It
+    is ``None`` and not an empty set so that the console cannot take a failed read for an answer:
+    an empty set would hide every row under Flagged only, and every toggle would post a value
+    derived from it. Logged at WARNING once per failure run, because the stats socket reads this
+    every second per console. ``state`` is the app's, so a run belongs to one app."""
     try:
         flags = await engine.store.list_connection_flags()
-    except Exception as exc:  # noqa: BLE001 - display only; see the docstring
-        if not _connection_flags_failing:
+    except Exception as exc:  # noqa: BLE001 - the page outlives this read; see the docstring
+        if not state.connection_flags_failing:
             _log.warning("the connection flags could not be read: %s", safe_exc(exc))
-        _connection_flags_failing = True
-        return set()
-    _connection_flags_failing = False
+        state.connection_flags_failing = True
+        return None
+    state.connection_flags_failing = False
     return flags
+
+
+def _row_flag(flags: set[tuple[str, str]] | None, name: str, direction: str) -> bool | None:
+    """One dashboard row's ``flagged``, ``None`` when :func:`_connection_flags` read nothing."""
+    return None if flags is None else (name, direction) in flags
 
 
 def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
@@ -4164,6 +4168,7 @@ def create_app(
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
     app.state.configured_log_level = configured_log_level
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
+    app.state.connection_flags_failing = False  # see _connection_flags
     # BACKLOG #76 (ADR 0065 amendment): the in-memory metrics-history ring the console trend charts read
     # from GET /metrics/history. Fed by the ~1s /ws/stats sampler below (no new task, no extra store I/O);
     # bounded + process-local (a durable table would flip store_schema — out of scope for this first slice).
@@ -4963,8 +4968,8 @@ def create_app(
         # edge that has carried traffic (the outbox metrics are keyed that way).
         rr = engine.registry_runner
         if rr is not None:
-            # Display only. See _connection_flags for why its own failure stays out of the page.
-            flags = await _connection_flags(engine)
+            # See _connection_flags for why its own failure stays out of the page.
+            flags = await _connection_flags(engine, app.state)
             reg = rr.registry
             for iname, ic in reg.inbound.items():
                 if not identity.can_access_channel(iname):
@@ -5013,7 +5018,7 @@ def create_app(
                         # the status; ifail takes precedence. One connection can hold both: a passive DR
                         # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
-                        flagged=(iname, "inbound") in flags,  # object-of-interest marker
+                        flagged=_row_flag(flags, iname, "inbound"),  # object-of-interest marker
                     )
                 )
             emitted_dests: set[str] = set()
@@ -5088,7 +5093,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=(dname, "outbound") in flags,  # object-of-interest marker
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector, past its
                         # display delay). Duck-typed → False for non-ACK-waiting / draining outbounds.
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
@@ -5195,7 +5200,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=(dname, "outbound") in flags,  # object-of-interest marker
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector).
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )

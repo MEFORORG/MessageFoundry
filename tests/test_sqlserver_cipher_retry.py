@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -25,6 +26,7 @@ from messagefoundry.store.sqlserver import (
     SqlServerStore,
     _is_transient_write_conflict,
 )
+from messagefoundry.store.store import AuditAppend
 
 _HYT00 = Exception("('HYT00', '[HYT00] [Microsoft][ODBC Driver 18]Query timeout expired (0)')")
 _DEADLOCK = Exception("[42000] ... (1205) ... was deadlocked ... chosen as the deadlock victim")
@@ -188,3 +190,80 @@ async def test_a_raising_attempt_never_reaches_the_backoff() -> None:
         await _add(store)
     assert store.events == ["acquire", "release"]  # no sleep
     assert store.held == 0
+
+
+class _FlagStore:
+    """The surface ``set_connection_flag`` touches. It holds one cursor across its retries, unlike
+    ``add_cipher_invocations``, so each execute takes the next outcome."""
+
+    def __init__(self, outcomes: list[BaseException | None]) -> None:
+        self._outcomes = outcomes
+        self.statements: list[str] = []
+        self.rollbacks = 0
+        self.discards = 0
+        self.audits = 0
+        self.commits = 0
+
+    async def execute(self, sql: str, _params: Any) -> None:
+        self.statements.append(sql)
+        outcome = self._outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+    @contextlib.asynccontextmanager
+    async def _acquire(self) -> AsyncIterator[_FlagStore]:
+        yield self
+
+    @contextlib.asynccontextmanager
+    async def _cursor(self, _conn: Any) -> AsyncIterator[_FlagStore]:
+        yield self
+
+    async def _append_operator_audit(self, *_args: Any) -> None:
+        self.audits += 1
+
+    async def _commit(self, _conn: Any) -> None:
+        self.commits += 1
+
+    async def _rollback_or_discard(self, _conn: Any) -> None:
+        self.discards += 1
+
+
+async def _set_flag(store: _FlagStore, *, flagged: bool) -> None:
+    await SqlServerStore.set_connection_flag(
+        store,  # type: ignore[arg-type]
+        "OB_A",
+        "outbound",
+        flagged=flagged,
+        audit=AuditAppend("connection_flag_set"),
+    )
+
+
+@pytest.mark.parametrize(("flagged", "statement"), [(True, "MERGE"), (False, "DELETE")])
+async def test_a_flag_write_retries_past_a_conflict_and_appends_one_row(
+    flagged: bool, statement: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The set and the clear are each the transaction's first statement, so a conflict rolls back
+    and re-runs that statement alone, and the audit row lands once. The log names the statement that
+    ran. RED for the clear when the helper's line says MERGE for a DELETE."""
+    store = _FlagStore([_DEADLOCK, None])
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"):
+        await _set_flag(store, flagged=flagged)
+    assert [sql.split()[0] for sql in store.statements] == [statement, statement]
+    assert (store.rollbacks, store.audits, store.commits, store.discards) == (1, 1, 1, 0)
+    other = "DELETE" if flagged else "MERGE"
+    retried = [r.getMessage() for r in caplog.records if "retrying" in r.getMessage()]
+    assert len(retried) == 1
+    assert statement in retried[0] and other not in retried[0]
+
+
+async def test_a_flag_write_that_never_clears_commits_nothing() -> None:
+    """Bounded, as the other retries are, and no audit row is appended for a write that did not
+    land. The refusal reaches the caller, which is what the route answers 503 for."""
+    store = _FlagStore([_HYT00] * _CIPHER_MERGE_ATTEMPTS)
+    with pytest.raises(Exception, match="HYT00"):
+        await _set_flag(store, flagged=False)
+    assert len(store.statements) == _CIPHER_MERGE_ATTEMPTS
+    assert (store.audits, store.commits, store.discards) == (0, 0, 1)

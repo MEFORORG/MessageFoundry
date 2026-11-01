@@ -4,9 +4,9 @@
 
 ``Engine.set_connection_flag`` writes one table and one audit row in one transaction. It runs no
 config module, writes no file in the config directory and moves no config digest, so the service
-account needs no write access to the directory it executes code from. The flag decides nothing, so
-it is not on the :class:`Registry`, the loader never reads it, and no stored row can refuse a start
-or a reload. ``tests/test_connection_flag_readers.py`` is what keeps it that way.
+account needs no write access to the directory it executes code from. The flag drives no engine
+path, so it is not on the :class:`Registry`, the loader never reads it, and no stored row can refuse
+a start or a reload. ``tests/test_connection_flag_readers.py`` is what keeps it that way.
 
 The two probes the row reproduces are here too: a toggle re-ran every config module, which it no
 longer does, and a dry-run reload runs them, which it still does and ``docs/SECURITY.md`` records."""
@@ -152,9 +152,10 @@ async def test_a_dry_run_reload_runs_every_config_module_and_applies_nothing(
     engine: Engine, tmp_path: Path
 ) -> None:
     """The second probe (BACKLOG #2623), pinned rather than fixed: ``docs/SECURITY.md`` records that
-    a dry run executes config code until it can run in a throwaway worker. It is not held for an
-    approver, because the IDE promote pre-flight would stall on a second person. A change here means
-    that record is wrong."""
+    a dry run executes config code until it can run in a throwaway worker. A change here means that
+    record is wrong. This calls the engine, so it says nothing about a hold. That half of the record
+    is ``test_dry_run_reload_is_never_held`` in ``tests/test_dual_control_reload.py``, which goes
+    through the route with ``config_reload`` gated."""
     assert engine.registry_runner is not None
     live = engine.registry_runner.registry
     before = _runs(tmp_path)
@@ -229,8 +230,8 @@ async def test_a_dry_run_carries_the_engines_escape_and_a_toggle_meets_no_gate(
     """Vault BACKLOG #2622 item 1: a dry run includes the inbound exposure gates. An engine started
     with the escape accepted IB_TOML, so its dry-run reload (no live runner, so a throwaway checker)
     may not refuse it. Without the escape it refuses, which shows the pass is the escape reaching
-    the gate and not the gate never running. A toggle builds no graph, so it lands either way: a
-    display marker has no say in what an engine binds (BACKLOG #2623)."""
+    the gate and not the gate never running. A toggle builds no graph, so it lands either way: the
+    flag has no say in what an engine binds (BACKLOG #2623)."""
     _config_dir(tmp_path)
     eng = await _exposed_engine(tmp_path, allow=allow)
     try:
@@ -457,7 +458,7 @@ async def test_a_failed_row_changes_no_flag_and_names_the_store(
 @pytest.mark.parametrize("model", [InboundConnection, OutboundConnection])
 def test_the_registry_does_not_carry_the_flag(model: type) -> None:
     """Off the model, so nothing that loads a graph reads it. ``auto_start`` and ``deployed`` act,
-    and they stay: only the display marker moved."""
+    and they stay: only the flag moved."""
     fields = {f.name for f in dataclasses.fields(model)}
     assert "flagged" not in fields
     assert {"auto_start", "deployed"} <= fields
@@ -480,19 +481,22 @@ def test_a_flagged_key_in_connections_toml_is_refused(tmp_path: Path, direction:
 
 
 def test_a_flagged_argument_on_a_declaration_is_refused(tmp_path: Path) -> None:
+    """The loader withholds the TypeError's own text, so the match names the module and the line.
+    The control drops the argument and loads, so the refusal is that argument and nothing else."""
     cfg = _config_dir(tmp_path)
-    (cfg / "extra.py").write_text(
-        textwrap.dedent(
-            """
-            from messagefoundry import MLLP, outbound
+    extra = cfg / "extra.py"
+    source = textwrap.dedent(
+        """
+        from messagefoundry import MLLP, outbound
 
-            outbound("OB_MARKED", MLLP(host="127.0.0.1", port=2702), flagged=True)
-            """
-        ),
-        encoding="utf-8",
+        outbound("OB_MARKED", MLLP(host="127.0.0.1", port=2702), flagged=True)
+        """
     )
-    with pytest.raises(WiringError):
+    extra.write_text(source, encoding="utf-8")
+    with pytest.raises(WiringError, match=r"extra\.py: TypeError at line 4"):
         load_config(cfg)
+    extra.write_text(source.replace(", flagged=True", ""), encoding="utf-8")
+    assert "OB_MARKED" in load_config(cfg).outbound
 
 
 # --- A database writer with no key ---------------------------------------------------------------

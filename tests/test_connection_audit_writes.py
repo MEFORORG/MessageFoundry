@@ -193,6 +193,9 @@ async def test_flag_route_answers_503_when_the_audit_row_fails(toml_engine: Engi
             )
     assert r.status_code == 503, r.text
     assert r.json()["detail"].startswith("the store did not confirm this toggle")
+    # A commit whose answer was lost lands, so the refusal never tells a caller to just repeat it.
+    assert "may or may not have changed" in r.json()["detail"]
+    assert "try again" not in r.json()["detail"].lower()
     assert await toml_engine.store.list_connection_flags() == set()
 
 
@@ -222,21 +225,27 @@ async def test_the_dashboard_shows_the_flag_on_each_direction_and_a_code_first_r
     assert all("toml_managed" not in row for row in rows)
 
 
-async def test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page(
-    toml_engine: Engine, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A database writer with no key can plant bytes that are not text. The flag decides nothing, so
-    the page still answers, with no markers and a WARNING. RED without the read's guard: a 500 on
-    the dashboard, from a value that was never allowed to refuse anything."""
-    service = await _deployer(toml_engine)
-    await toml_engine.store.set_connection_flag(
-        "OB_TOML", "outbound", flagged=True, audit=AuditAppend("connection_flag_set")
-    )
-    db = toml_engine.store._db  # type: ignore[attr-defined]
+async def _plant_an_unreadable_row(engine: Engine) -> None:
+    db = engine.store._db  # type: ignore[attr-defined]
     await db.execute(
         "INSERT INTO connection_flag (connection, direction) VALUES (CAST(X'FF' AS TEXT), 'inbound')"
     )
     await db.commit()
+
+
+async def test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page(
+    toml_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A database writer with no key can plant bytes that are not text. No engine path reads the
+    flag, so the page still answers, with a WARNING, and every row's flag reads ``None``: unknown,
+    and not unflagged, so a console cannot act on a failed read as though it were an answer. RED
+    without the read's guard: a 500 on the dashboard, from a value that was never allowed to refuse
+    anything."""
+    service = await _deployer(toml_engine)
+    await toml_engine.store.set_connection_flag(
+        "OB_TOML", "outbound", flagged=True, audit=AuditAppend("connection_flag_set")
+    )
+    await _plant_an_unreadable_row(toml_engine)
     transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c)
@@ -245,9 +254,46 @@ async def test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page(
             again = await c.get("/connections", headers=h)
     assert r.status_code == again.status_code == 200, r.text
     assert r.json(), "control: the page has rows"
-    assert not any(row["flagged"] for row in r.json())
+    assert all(row["flagged"] is None for row in r.json())
     # Once, however many frames read it: the stats socket reads this every second per console.
     assert caplog.text.count("the connection flags could not be read") == 1
+
+
+async def test_each_app_keeps_its_own_run_of_failed_flag_reads(
+    toml_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The run lives on ``app.state``. RED on a module global: the first app leaves it set, so the
+    second app's first failure logs nothing, and a rerun in one process fails the test above."""
+    service = await _deployer(toml_engine)
+    await _plant_an_unreadable_row(toml_engine)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        for _ in range(2):
+            transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r = await c.get("/connections", headers=await _login(c))
+            assert r.status_code == 200, r.text
+    assert caplog.text.count("the connection flags could not be read") == 2
+
+
+async def test_flags_read_again_once_the_store_answers(
+    toml_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Recovery ends the run: the rows answer again, and the next failure is a new run that logs."""
+    service = await _deployer(toml_engine)
+    await _plant_an_unreadable_row(toml_engine)
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    db = toml_engine.store._db  # type: ignore[attr-defined]
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+            await c.get("/connections", headers=h)
+            await db.execute("DELETE FROM connection_flag")
+            await db.commit()
+            recovered = await c.get("/connections", headers=h)
+            await _plant_an_unreadable_row(toml_engine)
+            await c.get("/connections", headers=h)
+    assert all(row["flagged"] is False for row in recovered.json())
+    assert caplog.text.count("the connection flags could not be read") == 2
 
 
 async def test_credential_test_route_audits_under_the_acting_user(

@@ -767,10 +767,11 @@ class ConnectionRow(PhiGatedModel):
     # draining it (controls/purge for a non-owned lane 409 with the same owner).
     owner_shard: str | None = None
     # #131, BACKLOG #2623: the operator "object of interest" flag for the Flagged Objects filter.
-    # Display-only (no runtime effect), and read from the store. Console-settable via
-    # POST /connections/{name}/flag. Additive + defaulted so an older client deserializes /connections
-    # unchanged.
-    flagged: bool = False
+    # Read from the store, and no engine path reads it. The console's filter does, which is the
+    # reach ADR 0007's 2026-10-31 amendment records. None means the read failed, so the flag is
+    # unknown, not unset. Console-settable via POST /connections/{name}/flag. Additive + defaulted so
+    # an older client deserializes /connections unchanged.
+    flagged: bool | None = False
     # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
     # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY
     # ONLY (no delivery effect); False for source rows, non-ACK-waiting connectors, and no-ack mode.
@@ -780,7 +781,7 @@ class ConnectionRow(PhiGatedModel):
 
 class ConnectionFlagRequest(RequestModel):
     """Body for ``POST /connections/{name}/flag`` (#131, BACKLOG #2623). ``direction`` disambiguates
-    a name declared as both an inbound and an outbound. Display-only."""
+    a name declared as both an inbound and an outbound."""
 
     flagged: bool
     direction: Literal["inbound", "outbound"]

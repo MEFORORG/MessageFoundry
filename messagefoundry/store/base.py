@@ -1420,10 +1420,9 @@ class QueueStore(StoreLifecycle, Protocol):
     async def list_connection_flags(self) -> set[tuple[str, str]]:
         """Every ``(connection, direction)`` holding the flag (BACKLOG #2623).
 
-        Display only: the dashboard rows are the one reader, and
-        ``tests/test_connection_flag_readers.py`` fails on a second. Nothing here checks a row
-        against the graph, because nothing acts on one: a row that names no connection matches no
-        dashboard row."""
+        The dashboard rows are the one reader, and ``tests/test_connection_flag_readers.py`` fails on
+        a second. No engine path acts on a row, so nothing here checks one against the graph: a row
+        that names no connection matches no dashboard row."""
         ...
 
     # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The

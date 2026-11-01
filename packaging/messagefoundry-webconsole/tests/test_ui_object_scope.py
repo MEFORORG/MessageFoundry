@@ -131,3 +131,8 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     assert "The store did not confirm the change" in r.text
     assert "the store did not confirm this toggle" in r.text
     assert "running graph" not in r.text
+    # A lost commit answer lands, and the toggle posts the opposite of what the row then shows, so a
+    # bare retry would flip it back. The page sends the operator to read the flag first.
+    assert "clicking it again would undo that" in r.text
+    assert "Flag not changed" not in r.text
+    assert "try again" not in r.text.lower()

@@ -2469,10 +2469,13 @@ class Engine:
         config directory, moves no config digest and reaches every node of a cluster. The flag and
         its ``connection_flag_set`` audit row, under ``actor`` and ``client``, commit together.
 
-        The flag decides nothing: the dashboard rows are its one reader, and it is not on the
-        :class:`Registry`, so it cannot refuse a start or a reload.
-        ``tests/test_connection_flag_readers.py`` fails on a new reader, because a value that acts
-        would need the seal this one was decided without (ADR 0007, amendment of 2026-10-31).
+        The flag drives no engine path: the dashboard rows are its one reader, and it is not on the
+        :class:`Registry`, so it cannot refuse a start or a reload. It does feed the console's
+        Flagged-only filter, and select-all honours that filter, so a database writer could shape a
+        bulk action's target set. The rows stay on screen and an operator presses Go, and the owner
+        accepted that reach on 2026-11-01 (ADR 0007, amendment of 2026-10-31).
+        ``tests/test_connection_flag_readers.py`` fails on a new reader, because a value that drives
+        an engine path would need the seal this one was decided without.
 
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
@@ -2508,8 +2511,9 @@ class Engine:
         except Exception as exc:
             log.error("the store did not confirm a connection flag change: %s", safe_exc(exc))
             raise ConnectionFlagNotRecorded(
-                "the store did not confirm this toggle, so the flag has probably not changed. "
-                "Try again; if it keeps failing, the engine log names the cause"
+                "the store did not confirm this toggle, so the flag may or may not have changed. "
+                "Read it before you repeat the toggle. If this keeps failing, the engine log names "
+                "the cause"
             ) from exc
 
     @property

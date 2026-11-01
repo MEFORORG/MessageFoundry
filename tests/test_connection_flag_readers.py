@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The connection flag stays a display marker: every reader of it is named here (BACKLOG #2623).
+"""The connection flag drives no engine path: every reader of it is named here (BACKLOG #2623).
 
-The flag moved to the store with no seal, and that rests on one fact: it decides nothing. A database
-writer can move a marker on the console and no more. A reader that branched on it would change that
-without a word in any diff, and the seal question would be open again. So a new reader fails here
-until someone has looked at it. If the new reader acts on the value, seal it first.
+The flag moved to the store with no seal, and that rests on one fact: no engine path reads it. A
+database writer can move a marker on the console and, through the Flagged-only filter that select-all
+honours, shape a bulk action's target set. An operator still presses Go, and the owner accepted that
+reach on 2026-11-01 (ADR 0007, amendment of 2026-10-31). A reader that branched on it anywhere else
+would widen that reach without a word in any diff, and the seal question would be open again. So a
+new reader fails here until someone has looked at it. If the new reader acts on the value, seal it
+first.
 
 ``auto_start`` and ``deployed`` sit beside where this flag used to, and both act. They stayed in
 ``connections.toml`` and this file says nothing about them.
@@ -55,8 +58,8 @@ TABLE_MODULES: frozenset[str] = frozenset(
     }
 )
 
-#: Who loads ``.flagged``, ``["flagged"]`` or ``.get("flagged")``, and why that is only display.
-#: A site is charged to the NEAREST def, not the outermost as the write census charges one: every
+#: Who loads ``.flagged``, ``["flagged"]`` or ``.get("flagged")``, and why that drives no engine
+#: path. A site is charged to the NEAREST def, not the outermost as the write census charges one: every
 #: JSON route is a closure in ``create_app``, so charging that would let a new route read the field
 #: under a listed name.
 FIELD_READERS: dict[tuple[str, str], str] = {
@@ -64,9 +67,15 @@ FIELD_READERS: dict[tuple[str, str], str] = {
         "POST /connections/{name}/flag hands req.flagged to the engine and echoes it"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_selection_checkbox"): (
-        "the row's data-flagged attribute, which the client-side filter reads"
+        "the row's data-flagged attribute, which the client-side filter reads. That filter is the "
+        "flag's one reach past a marker: select-all honours it (the accepted residual)"
     ),
-    ("messagefoundry_webconsole/pages/connections.py", "_flag_cell"): "the flag cell's glyph",
+    ("messagefoundry_webconsole/pages/connections.py", "_flag_cell"): (
+        "the flag cell's glyph, and whether the toggle is offered"
+    ),
+    ("messagefoundry_webconsole/pages/connections.py", "connections_fragment"): (
+        "whether any row's flag is unknown, for the notice above the table"
+    ),
     ("messagefoundry_webconsole/routes/connection_writes.py", "ui_set_connection_flag"): (
         "POST /ui/connections/{name}/flag reads its form into the request the JSON handler takes"
     ),
@@ -148,8 +157,8 @@ def _table_modules(trees: Mapping[str, ast.Module]) -> set[str]:
 def test_the_store_read_has_one_caller() -> None:
     found = _read_callers(package_trees())
     assert found == READ_CALLERS, (
-        "a new reader of the connection flag. It was moved to the store unsealed because it "
-        f"decides nothing; if this one acts on it, seal it first: {sorted(found - READ_CALLERS)}"
+        "a new reader of the connection flag. It was moved to the store unsealed because no engine "
+        f"path reads it; if this one acts on it, seal it first: {sorted(found - READ_CALLERS)}"
     )
 
 
@@ -158,7 +167,7 @@ def test_only_the_backends_name_the_table() -> None:
     assert found == TABLE_MODULES, sorted(found ^ TABLE_MODULES)
 
 
-def test_every_load_of_the_field_is_display() -> None:
+def test_every_load_of_the_field_is_listed() -> None:
     found = _field_readers(package_trees())
     assert found == set(FIELD_READERS), (
         "unlisted: " + repr(sorted(found - set(FIELD_READERS))),
@@ -198,7 +207,7 @@ def test_a_route_closure_is_charged_to_itself() -> None:
     line = (
         "def create_app():\n"
         "    async def rogue(row, engine):\n"
-        "        await _connection_flags(engine)\n"
+        "        await _connection_flags(engine, app.state)\n"
         "        return row.flagged\n"
     )
     trees = {"messagefoundry/api/app.py": ast.parse(line)}

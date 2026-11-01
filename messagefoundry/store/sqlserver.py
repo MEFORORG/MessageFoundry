@@ -527,13 +527,18 @@ _CIPHER_MERGE_BACKOFF = 0.05
 
 
 async def _retry_idempotent_merge[T](
-    op: Callable[[], Awaitable[T]], *, on_retry: Callable[[], Awaitable[None]] | None = None
+    op: Callable[[], Awaitable[T]],
+    *,
+    on_retry: Callable[[], Awaitable[None]] | None = None,
+    statement: str = "insert-if-absent MERGE",
 ) -> T:
-    """Run an IDEMPOTENT insert-if-absent MERGE, retrying a transient write conflict with backoff.
+    """Run an IDEMPOTENT write, by default an insert-if-absent MERGE, retrying a transient write
+    conflict with backoff.
 
     Only for a statement a re-run cannot double-apply; an increment such as
     :meth:`SqlServerStore.add_cipher_invocations` needs its own no-double-count guard instead.
-    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back."""
+    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back.
+    ``statement`` is what the retry's log line calls it."""
     for attempt in range(1, _CIPHER_MERGE_ATTEMPTS + 1):
         try:
             return await op()
@@ -541,7 +546,8 @@ async def _retry_idempotent_merge[T](
             if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
                 raise
             log.debug(
-                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "%s hit a %s, attempt %d of %d; retrying",
+                statement,
                 "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
                 attempt,
                 _CIPHER_MERGE_ATTEMPTS,
@@ -7705,7 +7711,11 @@ class SqlServerStore:
                             (connection, direction),
                         )
 
-                    await _retry_idempotent_merge(write_flag, on_retry=conn.rollback)
+                    await _retry_idempotent_merge(
+                        write_flag,
+                        on_retry=conn.rollback,
+                        statement="connection flag MERGE" if flagged else "connection flag DELETE",
+                    )
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
                     await self._commit(conn)
             except Exception:
