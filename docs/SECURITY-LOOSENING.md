@@ -249,7 +249,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
-| | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
+| | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
@@ -1910,30 +1910,45 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
-> verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
+> TLS mode, or a mode pinned to no TLS. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
 > `dialect='generic'`. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 > (2026-07-12 amendment).
 - **What you lose:** on `dialect='generic'` MessageFoundry cannot introspect an arbitrary ODBC driver's
   TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
-  the driver's own keyword. With no such keyword — or with one pinned to a no-TLS value — the rows, and
+  the driver's own keyword. With no mode set — or with one pinned to a no-TLS value — the rows, and
   the credential in the DSN, may cross in plaintext.
-- **Why it is a delegation rather than a refusal:** the engine cannot enumerate an arbitrary driver's
-  keywords, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
-  was wrong, until #333, was that its only control was a log line.
-- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
+- **Why a set mode stays a delegation:** the engine cannot tell whether an arbitrary driver's value
+  verifies anything, and a guess-based refusal would break legitimate drivers. The delegation is
+  correct; what was wrong, until #333, was that its only control was a log line.
+- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying TLS mode —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
-- **How it is detected, precisely:** a TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) whose
-  **value** is not one of the known no-TLS spellings. The value check matters: matching the key alone
-  read `SSLmode=disable` as TLS ownership. A passphrase-shaped key such as `sslpassword` is not
+- **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
+  case, has a non-blank string value with no blank at either end, and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
+  no-TLS spellings. The value check matters: matching the key alone read `SSLmode=disable` as TLS
+  ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts
+  as a mode (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not
   TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
-  **Known residual:** an *encrypted-but-unverified* value
+  **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
-  for "verified" are not consistent enough to grade without guessing.
-- **It is never silent:** a WARN at each construction naming the connection and the offending keyword;
+  for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
+  clears the check however it is spelled. The build refuses an `sslmode` outside libpq's six
+  lower-case spellings on every driver but MySQL Connector/ODBC (BACKLOG #2705), so a typo still
+  clears an `encrypt` value, or an `sslmode` on MySQL Connector/ODBC, and on some drivers it would
+  select no TLS. `encrypt` is unproven, and absent from psqlODBC's keyword parser.
+  [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
+- **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
-  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
-- **What it cannot do:** it is advisory only, on every posture, in both directions. Nothing refuses it.
+  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A
+  `dialect` given as `env()`: `GET /security/posture` resolves it against the running engine's
+  values, as the build does, and lists the hop only when it resolves to `generic`, or marks the
+  name *possibly generic* when those values do not resolve it. `messagefoundry check` has no
+  values, so it lists such a hop as possibly generic and names the reference's key, never its
+  value.
+- **What it cannot do:** the WARN and these reports refuse nothing. The refusal is
+  `generic_cleartext_hop_guard` (BACKLOG #1178): an enforcing instance refuses this hop off-loopback,
+  in both directions, unless a per-connection declaration relaxes it
+  ([CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql)).
 
 ### `store_principal_over_granted` — the engine's database credential holds more than its runbook allows
 

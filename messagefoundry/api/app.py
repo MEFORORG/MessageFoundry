@@ -42,7 +42,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -389,6 +389,7 @@ from messagefoundry.config.tls_policy import (
     phi_read_hop_disposition,
 )
 from messagefoundry.config.wiring import (
+    POSSIBLY_GENERIC_DB_HOP,
     EnvRef,
     InboundConnection,
     Registry,
@@ -1920,6 +1921,7 @@ def _posture_loosenings(
     runner: RegistryRunner | None,
     *,
     graph: Registry | None = None,
+    graph_env_values: Mapping[str, Any] | None = None,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
     service_env: ServiceEnvPosture,
@@ -1941,8 +1943,10 @@ def _posture_loosenings(
     The per-connection entries are read off ``graph``, or off ``runner``'s live graph when no
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
-    #3076). The settings-scoped entries are the same for either graph: a reload changes no
-    settings."""
+    #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
+    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
+    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
@@ -1983,7 +1987,7 @@ def _posture_loosenings(
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
-    # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+    # being honoured, a generic DB hop has no TLS mode or one pinned to no TLS, a hop is attested secure, or a
     # revocation refusal is attested away, and a stale or absent list would understate the
     # posture. An engine with no
     # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
@@ -2002,7 +2006,28 @@ def _posture_loosenings(
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
     query_hops = hops(query_credential_hops)
-    db_hops = hops(unverified_generic_db_hops)
+    # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
+    # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
+    # the reader's marker beside its name, because this entry keeps names only and its text states
+    # that each named hop is generic. A passed graph comes with its own values, which the start's
+    # snapshot took beside it; the live graph's are the runner's.
+    db_env_values = (
+        graph_env_values
+        if graph is not None
+        else (runner.env_values if runner is not None else None)
+    )
+    db_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
+            if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
+            else name
+            for name, reason in unverified_generic_db_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     attested_hops = hops(attested_secure_hops)
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
@@ -2118,6 +2143,11 @@ class _LoadedConfig:
     #: that; a reload's row does not, since an in-flight reload may still roll back (vault BACKLOG
     #: #2257; see :func:`_record_reload_audit`).
     registry: Registry | None
+    #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
+    #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
+    #: ``None`` when the snapshot did not take them, as a reload's row does not. They include
+    #: secret values, so they are kept out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def _of(
@@ -2125,9 +2155,10 @@ class _LoadedConfig:
         directory: Path | None,
         registry: Registry | None,
         fingerprint: Mapping[str, object] | None,
+        env_values: Mapping[str, Any] | None = None,
     ) -> _LoadedConfig:
         # A reload rebinds the fingerprint rather than editing it; the copy keeps the snapshot safe
-        # even if that changes.
+        # even if that changes. The values are copied for the same reason.
         return cls(
             directory=str(directory) if directory else None,
             shard=registry.shard_id if registry else None,
@@ -2135,6 +2166,7 @@ class _LoadedConfig:
             outbound=len(registry.outbound) if registry else 0,
             fingerprint=dict(fingerprint) if fingerprint is not None else None,
             registry=registry,
+            env_values=dict(env_values) if env_values is not None else None,
         )
 
     @classmethod
@@ -2145,6 +2177,7 @@ class _LoadedConfig:
             engine.running_config_dir,
             rr.registry if rr else None,
             engine.loaded_config_fingerprint,
+            rr.env_values if rr else None,
         )
 
     @classmethod
@@ -3200,6 +3233,7 @@ async def _record_start_audit(
                 engine,
                 None,
                 graph=loaded.registry,
+                graph_env_values=loaded.env_values,
                 remote_debug=remote_debug_posture(),
                 startup=await asyncio.to_thread(startup_posture),
                 service_env=await asyncio.to_thread(service_env_posture),
@@ -4748,7 +4782,10 @@ def create_app(
         static_hops = [
             StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
             for hop in static_credential_hops(
-                registry=runner.registry if runner is not None else None, settings=cred_settings
+                registry=runner.registry if runner is not None else None,
+                settings=cred_settings,
+                # A database hop's env() dialect, resolved as the runner's build resolves it.
+                env_values=runner.env_values if runner is not None else None,
             )
             if visible is None or visible(hop.name)
         ]
