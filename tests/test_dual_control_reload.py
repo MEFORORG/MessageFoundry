@@ -228,9 +228,9 @@ async def test_a_released_reload_answers_the_whole_inline_shape(engine: Engine) 
     assert json.loads(rows[0]["detail"])["result"] == whole
 
 
-async def test_a_reload_answer_cannot_raise_after_the_swap(tmp_path: Path) -> None:
-    """The answer is built after the swap, where a raise would report a reload that ran as failed
-    (BACKLOG #1940). So a preflight outside the engine that breaks its type reports as it stands."""
+async def test_a_reload_answer_makes_the_preflights_names_text(tmp_path: Path) -> None:
+    """The answer is built after the swap, where a validation error would report a reload that ran
+    as failed (BACKLOG #1940), and the names come from a callback. Text suits every reader."""
     outcome = ReloadOutcome(
         registry=Registry(),
         applied=True,
@@ -238,8 +238,8 @@ async def test_a_reload_answer_cannot_raise_after_the_swap(tmp_path: Path) -> No
         restart_required=cast(tuple[str, ...], (7,)),
     )
     engine = cast(Engine, SimpleNamespace(registry_runner=None))
-    result = _reload_result(engine, outcome, [], dry_run=False).model_dump(warnings=False)
-    assert result["restart_required"] == [7]
+    answer = _reload_result(engine, outcome, [], dry_run=False)
+    assert answer.restart_required == ["7"]
 
 
 # --- AC-7: release re-executes + audits both identities + the fingerprint -------

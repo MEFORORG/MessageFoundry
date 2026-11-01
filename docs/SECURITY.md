@@ -2451,8 +2451,8 @@ reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline,
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
-for the config directory itself: at least one that is missing, and a share lost after the reload's
-target check. The row does not claim the old graph is still serving: at least a
+for the config directory itself: at least one that is missing, and a share lost between the
+reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -2586,11 +2586,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
 - on Windows, a network share the engine cannot reach can read as absent, not as a fault. At least
-  a share lost after the target check would answer `not_found`, `validate_config` would report a
-  base directory on such a share as absent, and a value file read from disk would read as absent
-  there;
-- a DR backup bundle takes its config digest by an ordinary read, which leaves out what it cannot
-  read and does not tell its caller, so that digest can be partial;
+  a share lost between the target check and the reload's read of the directory would answer
+  `not_found`, `validate_config`, which `messagefoundry check` runs, would report a config directory
+  on such a share as absent, and a value file read from disk would read as absent there;
+- a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
+  out what it cannot read and does not tell its caller, so it can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held

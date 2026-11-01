@@ -1812,9 +1812,7 @@ def _build_approval_gate(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
                 raise ApprovalError(422, answer) from exc
-            return _reload_result(engine, outcome, failures, dry_run=False).model_dump(
-                warnings=False
-            )
+            return _reload_result(engine, outcome, failures, dry_run=False).model_dump()
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
@@ -2191,12 +2189,13 @@ def _reload_result(
     engine: Engine, outcome: ReloadOutcome, failures: list[str], *, dry_run: bool
 ) -> ReloadResult:
     """A reload's answer, one shape for the inline route and a released hold, so dual control is
-    never the quieter of the two (BACKLOG #1111, #3015). Not validated: this runs after the swap,
-    where a raise would report a reload that ran as failed (BACKLOG #1940)."""
+    never the quieter of the two (BACKLOG #1111, #3015). The names come from a callback and are made
+    text, so validating them cannot raise after the swap, which would report a reload that ran as
+    failed (BACKLOG #1940)."""
     registry = outcome.registry
     runner = engine.registry_runner
-    restart_required = outcome.restart_required
-    return ReloadResult.model_construct(
+    names = outcome.restart_required
+    return ReloadResult(
         inbound=len(registry.inbound),
         outbound=len(registry.outbound),
         routers=len(registry.routers),
@@ -2205,7 +2204,7 @@ def _reload_result(
         dry_run=dry_run,
         degraded=outcome.applied and bool(failures),
         failures=failures,
-        restart_required=None if restart_required is None else list(restart_required),
+        restart_required=None if names is None else [str(name) for name in names],
     )
 
 

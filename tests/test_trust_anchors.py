@@ -1957,8 +1957,8 @@ async def test_a_convergence_reload_reports_a_changed_anchor_only_in_its_own_log
 ) -> None:
     """No route calls a follower's convergence reload, so no response carries the list, and the row
     names no node: the node's own log is the only place that says which node."""
-    engine, spec, _cfg = rotated
-    await engine._converge_reload(1)
+    engine, spec, cfg = rotated
+    await _convergence(engine, cfg)
     await _reported_once(caplog, engine, spec)
 
 
@@ -1970,8 +1970,26 @@ async def test_a_convergence_reload_refused_after_the_check_has_reported_too(
     engine, spec, cfg = rotated
     _refuse_after_the_check(cfg)
     with pytest.raises(WiringError):
-        await engine._converge_reload(1)
+        await _convergence(engine, cfg)
     await _reported_once(caplog, engine, spec)
+
+
+def test_the_section_the_restart_required_pointers_cite_is_there() -> None:
+    """A bold run-in title has no anchor, so nothing else fails when a rename strands a pointer."""
+    root = Path(__file__).resolve().parents[1]
+    title = "restart_required list covers"  # past the apostrophe, which _common.py escapes
+
+    def text(rel: str) -> str:
+        return " ".join((root / rel).read_text(encoding="utf-8").replace("`", "").split())
+
+    assert f"**What a reload's {title}" in text("docs/SECURITY.md")
+    for pointer in (
+        "docs/CONFIGURATION.md",
+        "messagefoundry/api/models.py",
+        "messagefoundry/pipeline/engine.py",
+        "messagefoundry_webconsole/pages/_common.py",
+    ):
+        assert title in text(pointer), pointer
 
 
 # --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------
