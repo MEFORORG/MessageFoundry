@@ -758,9 +758,9 @@ bucket — *mapped* (a vocabulary call or real control flow), *unmapped* (an in-
 *disabled* (a preserved comment). Counting a disabled element as mapped would claim it shipped;
 omitting it would claim it vanished.
 
-**(c.2) AMENDMENT 2026-10-31 — a switched-off wrapper is disabled, and a branch the import cannot
-place never runs (BACKLOG #2526, #2685).** Two places rendered live code from source that does not
-run:
+**(c.2) AMENDMENT 2026-10-31 — a switched-off wrapper is disabled, and a sibling branch with no
+construct never runs (BACKLOG #2526, #2685).** Two places rendered live code from source that does
+not run:
 
 - A `<List>`/`<Actions>` wrapper carrying `@Disabled` was flattened into its parent, so every
   statement in it rendered live, and the handle scan walked it to agree. It is now judged by the
@@ -769,20 +769,30 @@ run:
 - A sibling `Else`/`ElseIf`/`Catch`/`Matching` was adopted only when the step before it was its
   construct. A step between them orphaned it, and an orphan's body rendered at the handler's own
   level, so its send was made for every message. Now a step that runs nothing stands between no
-  construct and its branch: a label marker, a `@Disabled` element, a `<Line>` with no statement
-  (with or without a `@Comment`), a `MsgLog`, and a `<Block>` label over nothing but those. Such a
-  step renders after the whole chain, since an `if` chain has no line between its arms. A step
-  that runs, such as a field write, still orphans the branch. The orphan now fails closed: its
-  marker heads an `if False:` with its body beneath, and it still counts unmapped.
+  construct and a branch that carries its own body: a label marker, a `@Disabled` element that
+  holds no `If`, `Try` or `ChooseFrom`, a `<Line>` with no statement (with or without a
+  `@Comment`), a `MsgLog`, and a `<Block>` label over nothing but those. Such a step renders
+  after the whole chain, since an `if` chain has no line between its arms. A bare marker, one
+  holding no statement, is adopted across label markers alone, as before: in its construct's own
+  list the steps after it are its branch. A step that runs, such as a field write, still orphans
+  the branch. The orphan now fails closed: its marker heads an `if False:` with its body beneath,
+  and it still counts unmapped.
 
 This is quieter than main on purpose. A send or a refusal main made from a disabled wrapper, or
 from an orphan's body, no longer runs. A refusal there no longer sends the message to ERROR, so a
 message only an orphan's refused send would have stopped is FILTERED or delivered elsewhere, as in
 any branch whose condition is still a placeholder. "Never quieter than main" in §2(b.4) bounds that
 amendment. The differential guard now loads this amendment first, and bounds §2(b.4) against the
-tree it loads onto. A separate test bounds this amendment against the file as vendored: it adds no
-code line and moves none shallower, except in a list holding a disabled wrapper. There a
-switched-off overwrite of the input no longer makes a later send of the input a refusal.
+tree it loads onto. A separate test bounds this amendment. Its scan half changes a list only where
+the list holds a disabled wrapper, because a switched-off overwrite of the input no longer makes a
+later send of the input a refusal. Against the tree with that scan half alone, the rest adds no
+code line, moves none shallower, and adds no closing send, on the battery and the raw draw.
+
+At least these limits remain, each a lost scope that still renders live: a stray branch
+`_split_branches` gives a construct that cannot continue it, an element whose tag is not
+modelled, and the steps after a bare marker standing at the handler's own level. A branch marker
+inside a disabled wrapper no longer opens its branch in the construct around the wrapper, as a
+disabled marker line never did.
 
 ## 3. Acceptance criteria
 

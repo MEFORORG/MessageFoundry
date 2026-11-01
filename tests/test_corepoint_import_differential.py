@@ -277,10 +277,21 @@ _ADOPTED_FROM_LAST = (
     "            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))\n"
 )
 _LOOK_BACK = """\
+_OPENS = {"if", "try", "case", "choosefrom"}
+
+
+def _chained(step: Step) -> bool:
+    if not isinstance(step, Control):
+        return False
+    name = step.source_verb.lower() if step.kind == "disabled" else step.kind
+    return name in _OPENS or any(_chained(s) for s in (*step.body, *step.branches))
+
+
 def _off(step: Step) -> bool:
     if isinstance(step, Control):
         if step.kind == "disabled":
-            return True
+            # One that holds a construct may own the branch after it.
+            return not _chained(step)
         # A label over nothing that runs. The label amendment's demoted call keeps its kind.
         return (
             step.kind == "block"
@@ -297,10 +308,14 @@ def _off(step: Step) -> bool:
     )
 
 
-def _construct_at(steps: list[Step]) -> int:
+def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
-    while at >= 0 and _off(steps[at]):
-        at -= 1
+    # A marker holding nothing but label markers takes the steps after it in its own
+    # construct's list, so it looks back past nothing: the label amendment has already lifted
+    # its markers off the end.
+    if [s for s in marker.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)]:
+        while at >= 0 and _off(steps[at]):
+            at -= 1
     return at
 
 
@@ -309,8 +324,9 @@ _ORPHAN_INLINE = (
     '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
 )
+_SCAN_SKIP_PAIR = (_LIVE_SKIP, "        if _is_disabled(elem):\n")
 _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
-    (_LIVE_SKIP, "        if _is_disabled(elem):\n"),
+    _SCAN_SKIP_PAIR,
     # BACKLOG #2685: a branch with no construct renders its body under a dead placeholder.
     (
         _ORPHAN_INLINE,
@@ -336,7 +352,7 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
     (
         _ADOPTED_FROM_LAST,
-        "            and (at := _construct_at(steps)) >= 0\n"
+        "            and (at := _construct_at(steps, produced[0])) >= 0\n"
         "            and isinstance(steps[at], Control)\n"
         "            and steps[at].kind == _BRANCH_PARENT[produced[0].kind]\n"
         "        ):\n"
@@ -3423,16 +3439,25 @@ def _added_live_code(was: str, now: str) -> list[str]:
     """Every code line of ``now``'s handler that ``was`` does not hold at the same indent or
     shallower. A line one level deeper runs under a condition it did not have; a line that is not
     in ``was`` at all is new code. Neither may appear, past :data:`_DEAD_LINE`."""
-    shallowest: dict[str, int] = {}
-    for line in _code_lines(was):
-        text, indent = line.strip(), len(line) - len(line.lstrip())
-        shallowest[text] = min(indent, shallowest.get(text, indent))
-    return [
-        line
-        for line in _code_lines(now)
-        if not _DEAD_LINE.match(line.strip())
-        and shallowest.get(line.strip(), -1) not in range(len(line) - len(line.lstrip()) + 1)
-    ]
+
+    def indents(src: str) -> dict[str, list[int]]:
+        found: dict[str, list[int]] = {}
+        for line in _code_lines(src):
+            found.setdefault(line.strip(), []).append(len(line) - len(line.lstrip()))
+        return {text: sorted(at) for text, at in found.items()}
+
+    # Matched as multisets, one line of ``was`` to each line of ``now``, shallowest first: a
+    # line that surfaces beside an identical one already at that indent is still new there.
+    before = indents(was)
+    added: list[str] = []
+    for text, now_at in indents(now).items():
+        if _DEAD_LINE.match(text):
+            continue
+        was_at = before.get(text, [])
+        added.extend(
+            f"{' ' * at}{text}" for k, at in enumerate(now_at) if k >= len(was_at) or was_at[k] > at
+        )
+    return added
 
 
 def _code_lines(src: str) -> list[str]:
@@ -3454,47 +3479,64 @@ def _holds_a_disabled_wrapper(xml: str) -> bool:
     )
 
 
-#: Over one chunk of the battery and the raw draw: the fewest lists the fail-closed amendment
-#: changes, by whether the list holds a disabled wrapper, and the fewest the control reads the
-#: other way. About half the smallest chunk's count, measured 2026-10-31 (27, 62 and 15).
-_FAIL_CLOSED_FLOORS = {True: 13, False: 30}
-_FAIL_CLOSED_REVERSE_FLOOR = 7
+#: The vendored tree with the scan half of the fail-closed amendment alone: it skips a disabled
+#: wrapper, and the render still flattens one.
+step1_scan_skips: Any = _load_step1("_mefor_corepoint_import_step1_scan_skips", (_SCAN_SKIP_PAIR,))
+
+#: Over one chunk of the battery and the raw draw: the fewest lists whose render the amendment
+#: changes past its scan, and the fewest the control reads the other way. About half the
+#: smallest chunk's count, measured 2026-10-31 (101 and 30). Some chunks hold no list whose
+#: scan it changes, so the scan half is held to the seeds written for a disabled wrapper.
+_RENDER_FLOOR = 50
+_REVERSE_FLOOR = 15
+#: Of the battery's seeds that hold a disabled wrapper (307), the fewest whose scan it changes
+#: (64 measured 2026-10-31).
+_SCAN_FLOOR = 32
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
 def test_the_fail_closed_amendment_adds_no_live_code(chunk: int) -> None:
-    """The fail-closed amendment switches live code off, and nothing else, against the file
-    exactly as vendored: it adds no code line, moves none shallower, adds no closing send, and
-    refuses no list main renders. It is quieter than main on purpose: a send main made from
-    switched-off source is gone.
+    """The fail-closed amendment switches live code off, against the file exactly as vendored.
 
-    One partition is exempt from the code rule: a list holding a disabled wrapper. The scan now
-    skips the statements it holds, as it skips a disabled statement, so a switched-off overwrite
-    of the input no longer makes a later send of the input a refusal (BACKLOG #2526). The unit
-    tests pin that the wrapper's own statements emit no code. The control: read the other way,
-    main adds live code to the lists the amendment changes, so the check is not blind."""
-    changed = {True: 0, False: 0}
-    reverse = 0
+    Its scan half may change a list only where the list holds a disabled wrapper: the scan skips
+    the statements it holds, as it skips a disabled statement, so a switched-off overwrite of
+    the input no longer makes a later send of the input a refusal (BACKLOG #2526). Against that
+    tree, the rest of it adds no code line, moves none shallower, adds no closing send, and
+    refuses no list the other renders. It is quieter than main on purpose: a send main made
+    from switched-off source, or from a branch it cannot place, is gone. The control: read the
+    other way, the scan-only tree adds live code to the lists the render half changes, so the
+    check is not blind."""
+    renders = reverse = 0
     broken: list[str] = []
     for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]:
-        was, now = _generate(step1_as_vendored, xml), _generate(step1_unlabelled, xml)
-        if now == was:
+        was = _generate(step1_as_vendored, xml)
+        scan, now = _generate(step1_scan_skips, xml), _generate(step1_unlabelled, xml)
+        if scan != was and not _holds_a_disabled_wrapper(xml):
+            broken.append(f"{name}: the scan changes a list that holds no disabled wrapper")
+        if now == scan:
             continue
-        exempt = _holds_a_disabled_wrapper(xml)
-        changed[exempt] += 1
-        if bool(was[0]) != bool(now[0]):
+        renders += 1
+        if bool(scan[0]) != bool(now[0]):
             broken.append(f"{name}: one of the two refuses the list")
             continue
-        if exempt:
-            continue
-        added = _added_live_code(was[0], now[0])
-        if Counter(_trailing_sends(now[0])) - Counter(_trailing_sends(was[0])):
-            added.append("a closing return that delivers where main's does not")
+        added = _added_live_code(scan[0], now[0])
+        if Counter(_trailing_sends(now[0])) - Counter(_trailing_sends(scan[0])):
+            added.append("a closing return that delivers where the other's does not")
         broken.extend(f"{name}: {line}" for line in added)
-        reverse += bool(_added_live_code(now[0], was[0]))
+        reverse += bool(_added_live_code(now[0], scan[0]))
     assert not broken, "\n".join(broken[:20]) + f"\n... {len(broken)} in all"
-    assert all(changed[part] >= floor for part, floor in _FAIL_CLOSED_FLOORS.items()), changed
-    assert reverse >= _FAIL_CLOSED_REVERSE_FLOOR
+    assert renders >= _RENDER_FLOOR and reverse >= _REVERSE_FLOOR
+
+
+def test_the_scan_half_of_the_fail_closed_amendment_changes_its_seeds() -> None:
+    """The control for the scan rule above: it is not vacuous. Of the seeds that hold a disabled
+    wrapper, a share render otherwise once the scan skips the wrapper."""
+    seeds = [_render(s.nodes, s.inp) for s in _SHAPES if "disabled-list" in s.name]
+    changed = sum(
+        _generate(step1_as_vendored, xml) != _generate(step1_scan_skips, xml) for xml in seeds
+    )
+    assert all(map(_holds_a_disabled_wrapper, seeds))
+    assert changed >= _SCAN_FLOOR
 
 
 def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:

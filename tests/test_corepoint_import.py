@@ -1090,7 +1090,8 @@ def test_a_branch_marker_with_no_construct_is_counted_unmapped() -> None:
     ``else``/``elif``/``except``/``match`` are all in ``_MAPPED_CONTROL_KINDS`` -- they name real
     Python control flow when a construct adopts them. Standing alone there is no construct to
     continue, the render degrades to a marker, and the count has to follow the render. The
-    statement after the marker is its sibling, not its body, so it still runs."""
+    statement after a bare marker at the handler's own level renders where main renders it, a
+    limit ADR 0086 §2(c.2) records."""
     body = '<Line Data="Else"/><Line Data="ItemClear %ADT/PID-21"/>'
     src = _handler_source(body)
     assert "    if False:  # TODO: Corepoint Else with no enclosing construct" in src
@@ -3015,6 +3016,52 @@ def test_a_step_that_renders_as_a_comment_never_orphans_a_sibling_branch(
     unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
     assert branch.split()[0] not in unmapped
     ast.parse(src)
+
+
+@pytest.mark.parametrize(
+    ("outer", "inner", "bare"),
+    [
+        pytest.param(
+            '<Case Data="ChooseFrom (a)">',
+            '<Case Data="ChooseFrom (b)"><List/></Case>',
+            '<Line Data="Matching &quot;M&quot;"/>',
+            id="case",
+        ),
+        pytest.param(
+            '<Try Data="Try">', '<Try Data="Try"><List/></Try>', '<Line Data="Catch"/>', id="try"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "between",
+    ['<Line Data="MsgLog %ADT"/>', "<Line/>", '<Line Disabled="1" Data="ItemClear %ADT/PID-3"/>'],
+)
+def test_a_bare_branch_marker_keeps_the_steps_after_it(
+    outer: str, inner: str, bare: str, between: str
+) -> None:
+    """A branch marker holding no statement, in its construct's own list, takes the steps after
+    it as its branch. A step that runs nothing between a nested construct and that marker must
+    not hand the marker to the nested construct: the send after it would land in the outer
+    construct's own body, where it runs. Code review of this change, round 1."""
+    tag = outer.split()[0][1:]
+    body = f"{outer}<List>{inner}{between}{bare}{_SEND_INPUT}</List></{tag}>"
+    (construct,) = (s for s in _handler_steps(body) if isinstance(s, Control))
+    assert len(construct.branches) == 1
+    assert [s.kind for s in construct.branches[0].body if isinstance(s, Control)] == ["send"]
+    assert not any(isinstance(s, Control) and s.kind == "send" for s in construct.body)
+
+
+def test_a_disabled_construct_keeps_the_branch_written_after_it() -> None:
+    """A disabled ``If`` between an ``If`` and an ``Else`` may own that ``Else``, so the ``Else``
+    does not pass to the ``If`` before it. It stays an orphan and fails closed, counted unmapped.
+    The control: a disabled ``ElseIf`` in the same place continues the chain."""
+    first, arm = '<Line Data="If (a)"><List/></Line>', _sibling_arm("Else")
+    owned = first + '<Line Disabled="1" Data="If (b)"/>' + arm
+    handler = _handler_body(_handler_source(owned))
+    assert f"    if False:  # TODO: Corepoint Else {_ORPHAN}" in handler
+    assert "Else" in _count_steps(_handler_steps(owned), in_loop=False)[1]
+    continued = first + '<Line Disabled="1" Data="ElseIf (b)"/>' + arm
+    assert _ORPHAN not in _handler_body(_handler_source(continued))
 
 
 def test_the_filed_repro_keeps_its_send_conditional(tmp_path: Path) -> None:

@@ -97,7 +97,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 from xml.etree.ElementTree import (  # nosec B405 — exception type only; every parse goes through defusedxml
     ParseError,
 )
@@ -1459,14 +1459,7 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     marker: Control | None = None
     start = 0
     for i, step in enumerate(steps):
-        # A marker opens a branch when it holds no statement of its own. A label marker is none:
-        # a ``<List Data="MsgLog …"/>`` inside a ``Catch`` line leaves it a branch marker, and
-        # the label marker leads the branch.
-        if (
-            isinstance(step, Control)
-            and step.kind in _BRANCH_PARENT
-            and all(isinstance(inner, LabelMarker) for inner in step.body)
-        ):
+        if _opens_a_branch(step):
             if marker is None:
                 body = tuple(steps[:i])
             else:
@@ -1477,6 +1470,19 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
         return tuple(steps), ()
     branches.append(replace(marker, body=(*marker.body, *steps[start:])))
     return body, tuple(branches)
+
+
+def _opens_a_branch(step: Step) -> TypeGuard[Control]:
+    """Whether ``step`` is a branch marker in the in-body form: one holding no statement of its
+    own, so the steps after it in its construct's own list are its branch (:func:`_split_branches`).
+
+    A label marker is no statement: a ``<List Data="MsgLog …"/>`` inside a ``Catch`` line leaves
+    it a branch marker, and the label marker leads the branch."""
+    return (
+        isinstance(step, Control)
+        and step.kind in _BRANCH_PARENT
+        and all(isinstance(inner, LabelMarker) for inner in step.body)
+    )
 
 
 def _structural_kind(step: Step) -> str:
@@ -1572,7 +1578,7 @@ def _parse_list(
             # statements live and a <Switch> — or a <Lines> typo — vanished with its body. Untrusted
             # input is still never a crash.
             produced = _parse_statement(child, subject, held, in_control, depth + 1)
-            if _adopt_branch(steps, produced):
+            if _adopt_branch(steps, produced, waiting):
                 continue
         for step in produced:
             if _runs_nothing(step):
@@ -1584,13 +1590,18 @@ def _parse_list(
     return [*steps, *waiting]
 
 
-def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
+def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) -> bool:
     """Attach ``produced`` to the construct written before it, when ``produced`` is one branch
     marker that construct continues. Says whether it did. THE one adoption rule.
 
     It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every step that runs nothing out of
-    that position, a :class:`LabelMarker` among them, so such a step never changes which branch
-    is adopted: the answer is the one this list gives with every such step taken out of it."""
+    that position, a :class:`LabelMarker` among them, and passes them as ``between``. A marker
+    never changes which branch is adopted: the answer is the one this list gives with every
+    marker taken out of it. Any other such step is skipped only for a branch that carries its
+    own body. A bare marker (:func:`_opens_a_branch`) is adopted across label markers alone, as
+    it was before: in a construct's own list, the steps after it are its branch, and adopting
+    it onto a nested construct would leave them in the enclosing body, where they run
+    (BACKLOG #2685)."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1600,6 +1611,8 @@ def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
         and isinstance(previous, Control)
         and previous.kind == _BRANCH_PARENT[branch.kind]
     ):
+        return False
+    if _opens_a_branch(branch) and not all(isinstance(s, LabelMarker) for s in between):
         return False
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
@@ -1611,7 +1624,9 @@ def _runs_nothing(step: Step) -> bool:
 
     * a :class:`LabelMarker`, which is no statement position of the export (BACKLOG #2632);
     * a ``@Disabled`` element, which never runs. A disabled ``<List>`` wrapper was flattened
-      away, so it never stood there; it is a disabled step now (BACKLOG #2526);
+      away, so it never stood there; it is a disabled step now (BACKLOG #2526). Not one that
+      holds an ``If``, a ``Try`` or a ``ChooseFrom``: a branch written after it may continue
+      that construct, and must not pass to an earlier one;
     * a ``<Line>`` holding no statement (:class:`_NoStatement`), and the ``@Comment`` beside it;
     * a ``MsgLog``, which maps to no vocabulary helper, so it is always a TODO;
     * a ``<Block>`` label over nothing but such steps. Not "over nothing at all": a label
@@ -1628,9 +1643,25 @@ def _runs_nothing(step: Step) -> bool:
     if isinstance(step, UnmappedAction):
         return step.source_class.lower() == "msglog"
     if step.kind == "disabled":
-        return True
+        return not _holds_a_chain(step)
     # A label demoted from a call keeps the shape the call had (:func:`_structural_kind`).
     return step.kind == "block" and not step.demoted_from and all(map(_runs_nothing, step.body))
+
+
+# The constructs a sibling branch marker may continue (:func:`_adopt_branch`).
+_CHAIN_KINDS = frozenset(_BRANCH_PARENT.values())
+
+
+def _holds_a_chain(step: Step) -> bool:
+    """Whether ``step``, or any step under it, is a construct a sibling branch may continue. A
+    disabled step names the kind it would have had only through its source verb or tag."""
+    if not isinstance(step, Control):
+        return False
+    kind = step.kind
+    if kind == "disabled":
+        name = step.source_verb.lower()
+        kind = _KIND_BY_VERB.get(name) or _CONTAINER_KIND_BY_TAG.get(name) or ""
+    return kind in _CHAIN_KINDS or any(map(_holds_a_chain, (*step.body, *step.branches)))
 
 
 def _container_steps(
