@@ -956,6 +956,14 @@ async def test_a_dropped_outbound_namesake_owned_by_another_engine_shard_keeps_i
         await runner.stop()
 
 
+@pytest.fixture
+def one_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One attempt per resolve. These tests pin how a FAILED resolve settles, and since BACKLOG
+    #3756 a resolve fails only once its last attempt does; with one, a store call is a resolve."""
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", ())
+
+
+@pytest.mark.usefixtures("one_attempt")
 async def test_a_failed_resolve_leaves_the_count_cooldown_and_suspend_in_place() -> None:
     # connection_started clears the in-memory state at once, so a stop emitted before the write
     # lands pages. When the durable resolve then fails, the row is still open, so the cooldown,
@@ -993,7 +1001,8 @@ async def test_a_failed_resolve_leaves_the_count_cooldown_and_suspend_in_place()
 
 
 class _FlakyResolve:
-    """Fails the resolves named in ``fail`` (1-based call order) and lands the rest."""
+    """Fails the store calls named in ``fail`` (1-based call order) and lands the rest. Under the
+    ``one_attempt`` fixture each call is one resolve."""
 
     def __init__(self, *fail: int) -> None:
         self.fail = set(fail)
@@ -1017,6 +1026,7 @@ def _primed(store: object) -> NotifierAlertSink:
     return sink
 
 
+@pytest.mark.usefixtures("one_attempt")
 async def test_a_failed_resolve_hands_its_state_to_a_later_one_that_lands() -> None:
     # Two operator starts in quick succession: the first resolve fails, the second, queued behind
     # it, closes the row. Nothing comes back, so the next stop is a new incident that pages.
@@ -1038,6 +1048,7 @@ async def test_a_failed_resolve_hands_its_state_to_a_later_one_that_lands() -> N
     assert sink._pending_clears == {}
 
 
+@pytest.mark.usefixtures("one_attempt")
 async def test_an_operator_resolve_or_resume_before_a_failed_resolve_stays_in_force() -> None:
     key = "connection_stopped:IB"
     sink = _primed(_FlakyResolve(1))

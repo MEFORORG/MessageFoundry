@@ -67,7 +67,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     The identity is passed through unchanged, because the self-approval and self-resolution
     refusals live in the gate and key on ``identity.user_id`` (BACKLOG #1540). The id takes the JSON
     route's own ``ResourceId`` type, since calling the handler directly skips its path validation
-    too.
+    too. The list passes ``request`` for the caller's address on the ``approval.standing_shown``
+    row its handler writes (vault BACKLOG #3747).
 
     Approve, reject and resolve are not registered with ``register_ui_action``: that registry
     serves the step-up re-auth continuation, and a continuation that re-POSTed an approve or a
@@ -77,12 +78,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/approvals", response_class=HTMLResponse)
     async def ui_approvals(
+        request: Request,
         identity: Identity = Depends(require_ui(Permission.APPROVALS_APPROVE)),
         gate: Any = Depends(deps.get_gate),
         m: str = Query("", max_length=32),
     ) -> HTMLResponse:
         try:
-            listing: ApprovalList = await core.list_approvals(identity=identity, gate=gate)
+            listing: ApprovalList = await core.list_approvals(
+                request=request, identity=identity, gate=gate
+            )
         except HTTPException as exc:
             return _refused(exc)
         return HTMLResponse(pages.approvals_page(listing, notice=m))

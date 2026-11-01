@@ -141,8 +141,10 @@ described above. In TOML:
 - The key is a name, so two CAs loaded under one name with different keys name no issuer rather
   than two.
   Keying by certificate fingerprint would avoid that, at the cost of a key an operator cannot read.
-- The inbound HTTP listener's `intake_client_subjects` (ADR 0154) still matches a subject from any CA
-  its listener trusts. It is a separate surface and was not in this change.
+
+*Removed 2026-10-30:* a third bullet here said the inbound HTTP listener's `intake_client_subjects`
+(ADR 0154) still matched a subject from any CA its listener trusts. ADR 0154's amendment of that
+date binds it to the issuing CA the same way (vault BACKLOG #2287).
 
 ## Amendment 2 (2026-09-28): the map targets the account id (BACKLOG #2238)
 
