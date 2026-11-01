@@ -249,7 +249,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
-| | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode outside the no-TLS deny-list (*connection-scoped*; inbound **and** outbound) |
+| | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |

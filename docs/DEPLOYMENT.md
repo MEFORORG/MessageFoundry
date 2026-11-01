@@ -611,7 +611,7 @@ not): those four refuse on every one, while MLLP, raw TCP and X12 build on the n
 same run. So `enforcement = warn` is not a way to stand up a cleartext HTTP destination —
 `cleartext_accepted` is the only one, and it is audited at every construction.
 
-**Two outbound channels do not, or not always — and they are the two that reach furthest.** Confirming that MLLP and
+**Two channels do not, or not always — and they are the two that reach furthest.** Confirming that MLLP and
 REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
