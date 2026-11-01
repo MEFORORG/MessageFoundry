@@ -256,8 +256,9 @@ is the reply of `POST /connections/{name}/test` and `POST /connections/{name}/te
 live string with no table row. Its stored copy is `audit_log.detail`: both routes write it into
 their `connection_test` or `connection_credential_test` audit row. It says why a reachability
 probe failed or could not run. The probe sends no message, so no message content can reach it.
-`_run_connection_test` in `api/app.py` fills it with a fixed line (not deployed, timed out, or the
-trust-anchor refusal) or with a wiring or connector error passed through `safe_text()` or
+`_run_connection_test` in `api/app.py` fills it with a fixed line (at least not deployed, timed
+out, the trust-anchor refusal, or a store that stopped that check) or with a wiring or connector
+error passed through `safe_text()` or
 `safe_exc()`. The connector errors name the endpoint, an HTTP status, or a socket or driver error.
 No probe echoes a reply body. At least the REST, FHIR and DATABASE probes are a `HEAD`, a
 `GET /metadata` and a `SELECT 1`. A peer can still choose some of the text, such as a database
