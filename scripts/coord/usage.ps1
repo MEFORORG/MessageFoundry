@@ -12,6 +12,9 @@
     A percentage on its own does not answer that. 80% with two hours left and nothing running is fine;
     45% with 30 minutes left and six sessions compiling is not.
 
+    ONE WINDOW: `seven_day`, so the verdict below is the weekly window's. usage-collect.ps1's header
+    says why.
+
     WHICH ACCOUNT'S NUMBERS. This root's. The publish path is per config root -- see usage-collect.ps1
     for why, stated once there -- so a bare invocation answers for the account THIS session booted
     against, not for the box. Use -AllRoots to see every root side by side.
@@ -20,7 +23,6 @@
     it converts "I should check" into "I already know".
 
       1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
-         Windows are aged INDEPENDENTLY, because they are published independently.
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Below two fresh samples in the current window, or past
          -MaxAgeMinutes, the answer is UNKNOWN. Not an extrapolation, not a last-known value dressed up
          as current.
@@ -94,7 +96,7 @@ param(
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
     # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
-    # different 5h and 7d pools, so summing, averaging or taking a worst-of across them would rebuild
+    # different 7d pools, so summing, averaging or taking a worst-of across them would rebuild
     # the exact lie the per-root publish path removes.
     [switch]$AllRoots,
     # A parameter for the test-safety reason config-roots.ps1 states.
@@ -139,9 +141,9 @@ if (-not $StateDir) { $StateDir = Get-UsageStateDir $rootInfo.Path }
 $avail = Get-RootUnavailability -StateDir $StateDir
 if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
     $availRoot = Split-Path $StateDir -Parent
-    # NO five_hour / seven_day KEYS AT ALL, deliberately. Emitting them as nulls would let a consumer
-    # that reaches straight for a percentage read this as a window that merely has not published yet.
-    # Their absence is what forces the state to be looked at.
+    # NO seven_day KEY AT ALL, deliberately. Emitting it as null would let a consumer that reaches
+    # straight for a percentage read this as a window that merely has not published yet. Its absence
+    # is what forces the state to be looked at.
     if ($Json) {
         [ordered]@{
             state          = "UNAVAILABLE"
@@ -398,17 +400,17 @@ function Get-AgeMinutes($v) {
 # computed across that boundary is a large NEGATIVE number, which would read as "consumption has stopped"
 # at the exact moment a fresh window starts being spent. Rows are therefore grouped by their reset epoch
 # and only rows sharing the CURRENT epoch are used.
-function Get-Rate([string]$Key, [string]$ResetKey, $CurrentResetEpoch) {
+function Get-Rate($CurrentResetEpoch) {
     if (-not (Test-Path -LiteralPath $histPath)) { return $null }
     $rows = @()
     try {
         foreach ($line in (Get-Content -LiteralPath $histPath -Tail 400 -ErrorAction Stop)) {
             try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($null -eq $r.$Key) { continue }                       # carried-forward or absent: not an observation
-            if ($CurrentResetEpoch -and ($r.$ResetKey -ne $CurrentResetEpoch)) { continue }  # a previous window
+            if ($null -eq $r.seven_day) { continue }                  # carried-forward or absent: not an observation
+            if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
             $age = Get-AgeMinutes $r.at
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
-            $rows += [pscustomobject]@{ AgeMin = $age; Pct = [double]$r.$Key }
+            $rows += [pscustomobject]@{ AgeMin = $age; Pct = [double]$r.seven_day }
         }
     } catch { return $null }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
@@ -434,7 +436,8 @@ function Test-WindowFromRoot($w, [string]$ReadRoot) {
     return [bool](Test-SameRoot $e $ReadRoot)
 }
 
-function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [string]$ReadRoot) {
+function Get-WindowReport($w, [string]$ReadRoot) {
+    $Label = "weekly (7d)"
     if (-not $w) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "never published"; used_percentage = $null }
     }
@@ -490,7 +493,7 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
         return $o
     }
 
-    $rate = Get-Rate -Key $Key -ResetKey $ResetKey -CurrentResetEpoch $resetEpoch
+    $rate = Get-Rate -CurrentResetEpoch $resetEpoch
     if ($rate) {
         $o.rate_pct_per_hr = $rate.PctPerHour
         if ($null -ne $minsToReset -and $minsToReset -gt 0) {
@@ -517,28 +520,22 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
     return $o
 }
 
-$five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset" $readRoot
-$seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset" $readRoot
+$seven = Get-WindowReport $doc.seven_day $readRoot
 
 # NO "UNAVAILABLE" ENTRY, DELIBERATELY. It would be unreachable: Get-WindowReport only ever emits the
 # four states below, and the UNAVAILABLE path exits far above this line. Adding it would also make this
-# table disagree with the three sibling lists that have no UNAVAILABLE arm -- the verdict chain, the
-# $advice switch (which would fall through to "Normal working") and Show-Window's colours. The comment
+# table disagree with the two sibling lists that have no UNAVAILABLE arm -- the $advice switch (which
+# would fall through to "Normal working") and Show-Window's colours. The comment
 # below already warns that two lists naming different states is how the prose and the exit code come to
 # describe different situations; a fifth key here would be that defect, planted.
 $rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
-$states = @($five.state, $seven.state)
-# CRITICAL outranks UNKNOWN: a known emergency in one window is not softened by the other being unknown.
 # ONE LIST, READ TWICE. The warning printed below and the verdict computed here must name the same
 # states, or the prose and the exit code describe different situations -- the two-instruments-
 # disagreeing defect this whole change exists to remove, reproduced inside one script.
 $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
     "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
 
-$overall = if ($states -contains "CRITICAL") { "CRITICAL" }
-elseif ($states -contains "WARN") { "WARN" }
-elseif ($states -contains "UNKNOWN") { "UNKNOWN" }
-else { "OK" }
+$overall = $seven.state
 
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
 # diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0
@@ -566,7 +563,7 @@ $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan 
 function Get-RootSummary([string]$Root) {
     $sd = Get-UsageStateDir $Root
     $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
     # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
     # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
     # row against that row's own root, before its document is opened, for the same ordering reason the
@@ -595,26 +592,20 @@ function Get-RootSummary([string]$Root) {
     # THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where the cross-root refusal
     # matters most -- and it was the one place it did not run. Checking only the DOCUMENT stamp passes
     # a carry-forward: the document was written by this root and sits under this root, while the
-    # numbers inside came from another. Measured: the single-root reader refused both windows and the
-    # survey four lines later printed them as this root's own.
-    $fiveOurs = Test-WindowFromRoot $d.five_hour $Root
+    # numbers inside came from another. Measured: the single-root reader refused the window and the
+    # survey four lines later printed it as this root's own.
     $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
-    $s.five = if ($d.five_hour -and $fiveOurs) { [double]$d.five_hour.used_percentage } else { $null }
     $s.seven = if ($d.seven_day -and $sevenOurs) { [double]$d.seven_day.used_percentage } else { $null }
-    # AGED BY ITS WINDOWS, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
+    # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
     # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
-    # six-hour-old reading rendered as "[seen 0 min ago]". The OLDER of the two windows is the honest
-    # single number for a row printing both. The @() wrapper is load-bearing: without it a single
-    # surviving age arrives as a scalar and .Count is unreliable.
-    $fa = if ($d.five_hour) { Get-AgeMinutes $d.five_hour.captured_at } else { $null }
+    # six-hour-old reading rendered as "[seen 0 min ago]".
     $sa = if ($d.seven_day) { Get-AgeMinutes $d.seven_day.captured_at } else { $null }
-    $ages = @(@($fa, $sa) | Where-Object { $null -ne $_ })
-    # The document stamp is the fallback only when no window carries one, which keeps pre-change
+    # The document stamp is the fallback only when the window carries none, which keeps pre-change
     # documents and hand-written fixtures readable.
-    $s.age_min = if ($ages.Count) { ($ages | Measure-Object -Maximum).Maximum } else { Get-AgeMinutes $d.captured_at }
+    $s.age_min = if ($null -ne $sa) { $sa } else { Get-AgeMinutes $d.captured_at }
     $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes)
-    if (-not $fiveOurs -or -not $sevenOurs) {
-        $s.note = "REFUSED -- a window here was observed under a DIFFERENT config root"
+    if (-not $sevenOurs) {
+        $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
     }
     elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
     # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
@@ -639,16 +630,15 @@ if ($Json) {
     [ordered]@{
         state        = $overall
         exit_code    = $rank[$overall]
-        five_hour    = $five
         seven_day    = $seven
         advice       = $advice
         not_measured = $blindSpot
         provenance   = $provenance
         # ALWAYS PRESENT, null when there is no pending cancellation. An earlier comment here claimed
         # the key was emitted only when dated, which was simply false -- an [ordered] literal emits the
-        # key whatever the value, and the test asserts the null. The five_hour/seven_day keys really
-        # are absent on the UNAVAILABLE path and are pinned that way; this one is not, and a comment
-        # describing a shape the code does not have is worse than no comment.
+        # key whatever the value, and the test asserts the null. The seven_day key really is absent on
+        # the UNAVAILABLE path and is pinned that way; this one is not, and a comment describing a
+        # shape the code does not have is worse than no comment.
         cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
         statusline_line = $dx.line
@@ -701,8 +691,8 @@ if ($dx.state -in $dxUntrusted) {
 }
 # POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
 # reading on a box that does not use bash survives. Without this arm, a stale one fell through both
-# warnings and the operator saw no cause and no fix. Same -and rule as the WIRED_HERE arm below.
-elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+# warnings and the operator saw no cause and no fix.
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN") {
     Write-Host ""
     Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
@@ -717,13 +707,9 @@ elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -
 #
 # EVERY CLAUSE IS BACKED. "wired, and the collector it names exists" is what WIRED_HERE already tested
 # (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
-# fresh" is the window states. The two CAUSES are offered as alternatives, never asserted, because
+# fresh" is the window's state. The two CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
-# -and, NOT -or. With -or this fired on a document published 0.15 seconds earlier: a fresh five_hour
-# beside a seven_day that has simply never been published leaves one window UNKNOWN, and the warning
-# then claimed "nothing fresh has published here" over a reading taken moments ago. The claim is that
-# NOTHING is fresh, so the test has to be that nothing is.
-elseif ($dx.state -eq "WIRED_HERE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN") {
     # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
     # wired command carrying a -StateDir but no recognisable collector assignment yields a null
     # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting
@@ -738,7 +724,6 @@ elseif ($dx.state -eq "WIRED_HERE" -and $five.state -eq "UNKNOWN" -and $seven.st
     Write-Host "      'mefor-usage' there means it IS firing and the fault is elsewhere." -ForegroundColor DarkGray
 }
 Write-Host ""
-Show-Window $five
 Show-Window $seven
 Write-Host ""
 Write-Host "  $advice"
@@ -762,15 +747,14 @@ if ($survey) {
             Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor Magenta
         }
         elseif ($s.published) {
-            $f = if ($null -ne $s.five) { "5h {0,3:0}%" -f $s.five } else { "5h   -" }
             $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
             # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
             # throws ("Cannot convert null to type System.ConsoleColor"), measured.
             if ($s.stale) {
-                Write-Host ("    {0,-46} {1}  {2}   [STALE -- oldest window seen {3} min ago, max {4}]{5}" -f $s.root, $f, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
+                Write-Host ("    {0,-46} {1}   [STALE -- seen {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
             }
             else {
-                Write-Host ("    {0,-46} {1}  {2}   [seen {3} min ago]{4}" -f $s.root, $f, $v, $s.age_min, $mark)
+                Write-Host ("    {0,-46} {1}   [seen {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
             }
             if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
         }

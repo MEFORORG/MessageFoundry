@@ -97,20 +97,20 @@ def reversal(decision: dict[str, Any], at: datetime, by: str = "lander") -> dict
     return rec("outcome", at=at, seat=by, ref=decision["id"], outcome="reversed", note="PR 9")
 
 
-def usage(pct: float | None = 40.0, **five: Any) -> dict[str, Any]:
-    """usage.ps1 -Json's shape for a fresh 5-hour reading, with no burn rate unless given one."""
+def usage(pct: float | None = 40.0, **seven: Any) -> dict[str, Any]:
+    """usage.ps1 -Json's shape for a fresh weekly reading, with no burn rate unless given one."""
     window = {
-        "label": "session (5h)",
+        "label": "weekly (7d)",
         "used_percentage": pct,
         "reading_age_min": 1.0,
-        "minutes_to_reset": 120,
+        "minutes_to_reset": 3000,
         "rate_pct_per_hr": None,
         "minutes_to_empty": None,
         "state": "OK",
         "reason": "",
     }
-    window.update(five)
-    return {"state": window["state"], "exit_code": 0, "five_hour": window, "seven_day": {}}
+    window.update(seven)
+    return {"state": window["state"], "exit_code": 0, "seven_day": window}
 
 
 @pytest.fixture
@@ -222,9 +222,9 @@ def test_gate_needs_an_item_and_refuses_a_malformed_builds_on(sb: Sandbox) -> No
 
 
 def test_the_level_backstop_halts_before_anything_is_read(sb: Sandbox) -> None:
-    """With no burn rate, the 5-hour level at the start-nothing rung (80, STEWARD.md section 3)."""
+    """With no burn rate, the weekly level at the start-nothing rung (90, owner ruling 2026-10-31)."""
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(80.0))
+    write_fake_usage(_usage_path(sb), usage(90.0))
     sb.set_state(calls=[])
     code, doc = gate(sb)
     assert (code, doc["result"]) == (HALT, "HALT"), why(doc)
@@ -233,18 +233,40 @@ def test_the_level_backstop_halts_before_anything_is_read(sb: Sandbox) -> None:
 
 def test_below_the_level_with_no_rate_does_not_halt(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(79.9))
+    write_fake_usage(_usage_path(sb), usage(89.9))
     assert gate(sb)[0] == NO_REVIEW
 
 
-def test_a_projected_cutoff_inside_twenty_minutes_halts(sb: Sandbox) -> None:
+@pytest.mark.parametrize(
+    ("to_empty", "to_reset", "expected"),
+    [
+        pytest.param(60, 90, HALT, id="at-sixty-minutes"),
+        pytest.param(61, 90, NO_REVIEW, id="just-past-sixty-minutes"),
+        pytest.param(45, 45, NO_REVIEW, id="resets-as-it-runs-out"),
+    ],
+)
+def test_the_rate_limb_is_inside_sixty_minutes_and_before_the_reset(
+    sb: Sandbox, to_empty: int, to_reset: int, expected: int
+) -> None:
+    """The first limb of the owner's rung of 2026-10-31, on both its edges. Below the level
+    backstop and the ceiling, so only the projection can decide."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(50.0, rate_pct_per_hr=200.0, minutes_to_empty=15, minutes_to_reset=90),
+        usage(50.0, rate_pct_per_hr=50.0, minutes_to_empty=to_empty, minutes_to_reset=to_reset),
     )
     code, doc = gate(sb)
-    assert code == HALT and "run out in about 15 min" in why(doc)
+    assert code == expected, why(doc)
+    if expected == HALT:
+        assert f"run out in about {to_empty} min" in why(doc)
+
+
+def test_a_flat_rate_does_not_halt_at_the_level(sb: Sandbox) -> None:
+    """A rate of zero is a rate, and it governs: only with no rate at all is 90 the backstop."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(92.0, state="WARN", rate_pct_per_hr=0.0))
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
 
 
 def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
@@ -252,7 +274,7 @@ def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(90.0, state="WARN", rate_pct_per_hr=2.0, minutes_to_empty=300, minutes_to_reset=30),
+        usage(92.0, state="WARN", rate_pct_per_hr=2.0, minutes_to_empty=300, minutes_to_reset=30),
     )
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
@@ -270,10 +292,11 @@ def test_a_window_at_the_ceiling_halts_whatever_the_rate(sb: Sandbox) -> None:
 
 
 def test_a_critical_reading_below_the_rung_is_unknown(sb: Sandbox) -> None:
-    """usage.ps1 skips its statusLine trust check at CRITICAL overall, here from the weekly window."""
+    """usage.ps1 skips its statusLine trust check at CRITICAL overall, here for a burn that runs out
+    before the reset but outside the hour."""
     seed_vault(sb, calibrated("manager"))
-    doc = usage(40.0)
-    doc.update(state="CRITICAL", statusline_state="WIRED_ELSEWHERE")
+    doc = usage(40.0, state="CRITICAL", rate_pct_per_hr=10.0, minutes_to_empty=360)
+    doc.update(statusline_state="WIRED_ELSEWHERE")
     write_fake_usage(_usage_path(sb), doc, code=11)
     code, out = gate(sb)
     assert code == REVIEW and "may be another root's" in why(out)
@@ -297,10 +320,10 @@ def test_a_reading_usage_calls_unknown_overall_is_unknown_here(sb: Sandbox) -> N
 
 
 def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
-    """An OK 5-hour window past the level backstop, under usage.ps1's refusal of a statusLine
+    """An OK weekly window past the level backstop, under usage.ps1's refusal of a statusLine
     wired elsewhere: downgrading that hit to UNKNOWN would let a session at the rung act."""
     seed_vault(sb, calibrated("manager"))
-    doc = usage(82.0)
+    doc = usage(92.0)
     doc.update(state="UNKNOWN", statusline_state="WIRED_ELSEWHERE")
     write_fake_usage(_usage_path(sb), doc, code=20)
     code, out = gate(sb)
@@ -324,18 +347,35 @@ def test_the_thresholds_file_moves_the_rung(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), usage(75.0))
     _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [90, 94, 97]}}), encoding="utf-8")
-    assert gate(sb)[0] == NO_REVIEW, "a weekly-only file moved the 5-hour rung"
-    _thresholds(sb).write_text(json.dumps({"levels": {"5-hour": [70, 80, 90]}}), encoding="utf-8")
+    assert gate(sb)[0] == NO_REVIEW, "control: at the live file's level, 75 is below the rung"
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [70, 80, 90]}}), encoding="utf-8")
     code, doc = gate(sb)
     assert code == HALT and str(_thresholds(sb)) in why(doc)
+
+
+def test_the_thresholds_file_moves_the_minutes_clause(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(50.0, rate_pct_per_hr=50.0, minutes_to_empty=45, minutes_to_reset=90),
+    )
+    assert gate(sb)[0] == HALT, "control: 45 minutes is inside the default 60"
+    _thresholds(sb).write_text(json.dumps({"minutes": [20, 10, 5]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
 
 
 @pytest.mark.parametrize(
     "body",
     [
         pytest.param("{not json", id="unreadable"),
-        pytest.param(json.dumps({"levels": {"5-hour": [80, 86]}}), id="two-numbers"),
+        pytest.param(json.dumps({"levels": {"weekly": [80, 86]}}), id="two-numbers"),
         pytest.param(json.dumps({"levels": {"5h": [80, 86, 92]}}), id="unknown-window"),
+        pytest.param(json.dumps({"levels": {"5-hour": [80, 86, 92]}}), id="retired-window"),
+        pytest.param(
+            json.dumps({"levels": {"weekly": [90, 94, 97], "5-hour": [80, 86, 92]}}),
+            id="retired-window-beside-weekly",
+        ),
     ],
 )
 def test_a_malformed_thresholds_file_reviews(sb: Sandbox, body: str) -> None:
@@ -359,8 +399,7 @@ def test_the_real_usage_reader_feeds_the_rung(
     payload = {
         "session_id": "fixture",
         "rate_limits": {
-            "five_hour": {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 4800},
-            "seven_day": {"used_percentage": 10, "resets_at": int(ago().timestamp()) + 200000},
+            "seven_day": {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 200000},
         },
     }
     collect = sb.run(
