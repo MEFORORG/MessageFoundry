@@ -365,6 +365,11 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   assorted `Encrypt`  : no / 0 / false / off
 #   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
+# Since BACKLOG #2705 the build also holds `sslmode` to libpq's six lower-case spellings on every
+# driver but MySQL Connector/ODBC (_refuse_unread_sslmode), so for a built hop this list's open end
+# matters for `encrypt`, and for `sslmode` on MySQL's driver. The posture readers classify specs
+# that were never built, so they still apply the list alone.
+#
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
 # stays in the DEBUG branch. It is a real weakening, but a different one: the payload is not in
@@ -471,8 +476,9 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
     :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
     :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
-    this deliberately does not classify. An unrecognized mode value stays delegated for the same
-    reason.
+    this deliberately does not classify. An unrecognized mode value stays delegated here for the same
+    reason, though since BACKLOG #2705 the build refuses an ``sslmode`` spelling
+    :func:`_refuse_unread_sslmode` rejects before this verdict is used.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so

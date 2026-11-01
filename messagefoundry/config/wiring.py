@@ -6515,6 +6515,11 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
     ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
 
+    A ``dialect`` given as ``env()`` is read as possibly generic. The graph carries the reference and
+    this reader has no environment values, so comparing its text with ``generic`` would never match
+    and would leave off every surface a hop the build then gates or, on a non-enforcing instance,
+    builds with only a WARNING. The reason names the reference's key, never its value.
+
     ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
     than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
     ``odbc_params`` parameter, and the ADR 0010 read executor calls ``_build_dsn`` directly, so a live
@@ -6532,10 +6537,21 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     from messagefoundry.transports.database import generic_odbc_tls_unenforced
 
     def unenforced(settings: Mapping[str, Any]) -> str | None:
-        if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+        dialect = settings.get("dialect", "sqlserver")
+        # An env() dialect resolves only at build, where a generic value meets the gate. This reader
+        # has no environment values, so it reads the reference as possibly generic rather than as
+        # not generic, and names the key, never the value. A SQL Server value would make the entry a
+        # false alarm, which is the safe direction for an advisory list.
+        maybe = isinstance(dialect, EnvRef)
+        if not maybe and str(dialect).lower() != "generic":
             return None
         params = settings.get("odbc_params") or {}
-        return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
+        if not isinstance(params, Mapping):
+            return None
+        reason = generic_odbc_tls_unenforced(params)
+        if reason is None or not maybe:
+            return reason
+        return f"dialect is env({dialect.key}) and may resolve to generic, where {reason}"
 
     out: list[tuple[str, str]] = []
     for record_name, table in (

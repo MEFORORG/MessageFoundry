@@ -1926,12 +1926,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
   for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
-  is delegated however it is spelled, so a typo clears the check, and on some drivers it would select
-  no TLS. `encrypt` is unproven, and absent from psqlODBC's keyword parser.
+  clears the check however it is spelled. The build refuses an `sslmode` outside libpq's six
+  lower-case spellings on every driver but MySQL Connector/ODBC (BACKLOG #2705), so a typo still
+  clears an `encrypt` value, or an `sslmode` on MySQL Connector/ODBC, and on some drivers it would
+  select no TLS. `encrypt` is unproven, and absent from psqlODBC's keyword parser.
   [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
 - **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
-  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
+  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A
+  `dialect` given as `env()` is listed as possibly generic, naming the reference, because these
+  readers never resolve it.
 - **What it cannot do:** the WARN and these reports refuse nothing. The refusal is
   `generic_cleartext_hop_guard` (BACKLOG #1178): an enforcing instance refuses this hop off-loopback,
   in both directions, unless a per-connection declaration relaxes it

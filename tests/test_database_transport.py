@@ -596,8 +596,10 @@ def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, 
 
 @pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "yes\n"])
 def test_a_padded_mode_value_sets_no_mode(value: str) -> None:
-    # The DSN carries the value as written, and psqlODBC switches on its first character, so a
-    # leading blank would select the driver's default. The unpadded spelling is the control.
+    # psqlODBC switches on a value's first character, so a leading blank would select the driver's
+    # default. The build refuses a padded value outright since BACKLOG #2705; this pins the
+    # classifier the posture readers use on specs that were never built. The unpadded spelling is
+    # the control.
     for keyword in ("sslmode", "Encrypt"):
         assert generic_odbc_tls_unenforced({keyword: value}) == _NO_MODE_REASON
         assert generic_odbc_tls_unenforced({keyword: value.strip()}) is None
@@ -625,8 +627,9 @@ def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
 
 @pytest.mark.parametrize("value", ["bogus", "1", "VERIFY_IDENTITY"])
 def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) -> None:
-    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES): demanding a known good value
-    # would warn on every legitimate driver this path exists to support.
+    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES). This pins the classifier
+    # only: since BACKLOG #2705 the build refuses an sslmode outside libpq's spellings on every
+    # driver but MySQL Connector/ODBC.
     assert generic_odbc_tls_unenforced({"sslmode": value}) is None
 
 

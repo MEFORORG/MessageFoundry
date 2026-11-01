@@ -3297,6 +3297,80 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     assert "SSLmode=disable" in hops["inbound:IB_PG_ORDERS"]
 
 
+def test_unverified_generic_db_hops_reads_an_env_dialect_as_possibly_generic() -> None:
+    """An ``env()`` dialect is resolved only at build, where a generic value meets the gate. This
+    reader sees the unresolved graph, so it used to compare the reference's text with ``generic``,
+    never match, and leave the hop off ``check`` and the posture while the build refused it, or, on a
+    non-enforcing instance, built it with only a WARNING. It now reads such a dialect as possibly
+    generic and names the reference, never its value."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_BARE",
+            Database(
+                server="bare.example",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_OK",
+            Database(
+                server="ok.example",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"SSLmode": "verify-full"},
+            ),
+        )
+    )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_ENV_POLL",
+            DatabasePoll(
+                server="poll.example",
+                dialect=env("poll_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT 1",
+                odbc_params={"SSLmode": "disable"},
+            ),
+            router="R",
+        )
+    )
+    hops = dict(unverified_generic_db_hops(reg))
+    # A mode the classifier clears is cleared whatever the dialect resolves to.
+    assert set(hops) == {"OB_ENV_BARE", "inbound:IB_ENV_POLL"}
+    assert "env(db_dialect)" in hops["OB_ENV_BARE"]
+    assert "no TLS keyword" in hops["OB_ENV_BARE"]
+    assert "env(poll_dialect)" in hops["inbound:IB_ENV_POLL"]
+    assert "SSLmode=disable" in hops["inbound:IB_ENV_POLL"]
+
+    # The control: the build resolves the same reference, and a generic value meets the gate there.
+    from messagefoundry.config.models import ConnectorType, Destination
+    from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
+    from messagefoundry.config.wiring import resolve_env_settings
+    from messagefoundry.transports.database import DatabaseDestination
+
+    spec = reg.outbound["OB_ENV_BARE"].spec
+    resolved = resolve_env_settings(spec.settings, {"db_dialect": "generic"})
+    built = Destination(name="OB_ENV_BARE", type=ConnectorType.DATABASE, settings=resolved)
+    with active_hop_posture(HopPosture(enforcing=True)), pytest.raises(InsecureHopRefused):
+        DatabaseDestination(built)
+
+
 def test_accepted_cleartext_hops_reads_the_graph() -> None:
     """The single shared reader — `messagefoundry check` and the API posture route both use it, so the
     two can never report different accepted sets."""

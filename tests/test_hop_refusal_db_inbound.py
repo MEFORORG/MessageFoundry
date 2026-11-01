@@ -640,7 +640,7 @@ def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
 )
 @pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI])
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
-def test_generic_blank_padded_or_non_string_mode_refused_at_build(
+def test_generic_blank_padded_or_list_mode_refused_at_build(
     params: dict[str, object],
     connector: Callable[[Any], object],
     config: Callable[..., Any],
@@ -649,8 +649,10 @@ def test_generic_blank_padded_or_non_string_mode_refused_at_build(
     # Such a value is no evidence of a mode, and a padded one would reach a driver that does not trim
     # as another word. Since BACKLOG #2705 the DSN builder refuses every one of these values on any
     # posture, before the cleartext-hop guard is reached, so the build fails whether or not the
-    # instance enforces. The classifier still flags them (no usable mode) for the posture readers,
-    # which judge specs that were never built.
+    # instance enforces. The list is refused because its str() holds a quote character; a non-string
+    # scalar such as an int is not refused at build and reaches the cleartext-hop guard instead. The
+    # classifier still flags all of these (no usable mode) for the posture readers, which judge specs
+    # that were never built.
     with active_hop_posture(posture), pytest.raises(ValueError, match="odbc_params value for"):
         connector(config(odbc_params=params))
 
