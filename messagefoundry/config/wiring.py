@@ -251,6 +251,24 @@ class EnvRef:
     cast: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
+        # By type where it is not text: built directly, a table here can carry a default=.
+        name = repr(self.key) if isinstance(self.key, str) else f"<{type(self.key).__name__}>"
+        # vault BACKLOG #2519: resolve_env_settings resolves one link and hands a default over
+        # unchanged, so a reference inside a default is never resolved, even with its key set, and
+        # the connector would get it with its own default= inside. Refused here because at least
+        # env(), parse_env_setting and _ftp_protocol construct through this, and ahead of the bool
+        # read so a chain with a bool cast gets this message. The scan stops at
+        # _MAX_ENVREF_SCAN_DEPTH, so a reference nested deeper is not seen here; on a list setting
+        # _reject_envref_in_lists reads one level further.
+        if _contains_envref(self.default):
+            raise WiringError(
+                f"env reference {name} has an env() reference inside its default= (value "
+                "withheld) - only one link is resolved, so that inner reference would reach the "
+                "connector unresolved, with any default= of its own. Give the outer env() a static "
+                "default. A table with an env key and no other key but default or cast counts as a "
+                "reference here, even as a real header table, because connections.toml spells the "
+                "two alike."
+            )
         # vault BACKLOG #3138: the builtin ``bool`` is the wrong cast for an environment value. Every
         # ``MEFOR_VALUE_*`` variable is text, and ``bool("false")``/``bool("0")`` are True, so
         # ``env("x", cast=bool)`` used to turn "false" into True on a ``tls_allow_expired`` or a
@@ -267,7 +285,7 @@ class EnvRef:
             object.__setattr__(
                 self,
                 "default",
-                _strict_bool_default(self.default, f"env reference {self.key!r} with a bool cast"),
+                _strict_bool_default(self.default, f"env reference {name} with a bool cast"),
             )
 
     def __repr__(self) -> str:
@@ -322,7 +340,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
-    ``cast=lambda s: bool(s)`` still keeps the builtin's trap."""
+    ``cast=lambda s: bool(s)`` still keeps the builtin's trap.
+
+    A ``default=`` may not hold another reference, directly or inside a table or list: only one link
+    is resolved, so :class:`EnvRef` refuses it when the reference is made, down to its scan's depth
+    (vault BACKLOG #2519)."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -434,13 +456,14 @@ def _envref_label(value: Any) -> str:
     leak into the operator log, ``messagefoundry check`` output and the support bundle rather than
     closing it -- the shape BACKLOG #1183 is about. Only the env KEY is ever named."""
     key = value.key if isinstance(value, EnvRef) else value.get("env")
-    return f"env({key!r})"
+    # A raw marker can hold a table in this slot, and that table can carry a default=.
+    return f"env({key!r})" if isinstance(key, str) else f"env(<{type(key).__name__}>)"
 
 
-#: How far into one header's value :func:`_contains_envref` looks. A header value is ultimately a
-#: string, so anything structured under it is already unusual; the cap exists so a pathological or
-#: self-referential structure cannot spin the loader, not because a legitimate table is ever deep.
-_MAX_HEADER_SCAN_DEPTH = 6
+#: How far into a value :func:`_contains_envref` looks, for a header value or an ``env()`` default.
+#: The cap exists so a self-referential structure ends, not because a legitimate table is ever
+#: deep. The walk keeps no visited set, so its cost on such a structure still grows with fan-out.
+_MAX_ENVREF_SCAN_DEPTH = 6
 
 
 def _contains_envref(value: Any, depth: int = 0) -> bool:
@@ -456,7 +479,7 @@ def _contains_envref(value: Any, depth: int = 0) -> bool:
     ordinary list or table under a header value is still the author's business."""
     if _is_nested_envref(value):
         return True
-    if depth >= _MAX_HEADER_SCAN_DEPTH:
+    if depth >= _MAX_ENVREF_SCAN_DEPTH:
         return False
     if isinstance(value, Mapping):
         return any(
@@ -544,7 +567,8 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     :class:`EnvRef` because it IS a top-level settings value -- put the reference where
     :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
     runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
-    Only a reference INSIDE the table is unresolvable, so only that is refused.
+    Only a reference INSIDE the table is unresolvable, so only that is refused. Such a reference's
+    own ``default=`` is judged when it is made, in :class:`EnvRef`, so it is not walked here.
 
     A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
     input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
@@ -605,47 +629,34 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
     would otherwise arrive at the connector exactly as a list item written directly does.
+    :class:`EnvRef` refuses a reference inside a default when it is made (vault BACKLOG #2519). This
+    walk still runs: it starts one level further in, at each item, and it reads the default as it is
+    now, so it also sees a default changed after the reference was made.
 
-    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
-    :func:`resolve_env_settings` resolves one link only, so that inner reference is never resolved.
-    Wherever the outer key is unset, the connector gets the inner reference object instead of a list.
-    It gets it even when the environment sets the inner key. At least ``proxy_no_proxy`` then reads
-    as an empty list, and every host silently goes through the proxy. So the fallback link never
-    works, and there is no clean version of it to let through. Refusing at the first link also means
-    nothing walks a marker that is its own default. The ``connections.toml`` type check refuses this
-    shape first for at least the list settings it models, since it wants an array and finds a table.
-    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
-    items: list[str] = []
-    chains: list[str] = []
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here. At
+    least a value file answers for it when it is read; ``environment_values_from_bytes`` states
+    that check and its limit."""
+    offenders: list[str] = []
     for name, value in settings.items():
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
             if _is_nested_envref(value):
-                chains.append(name)
+                offenders.append(label)
                 continue
         if isinstance(value, list | tuple | set | frozenset):
-            items += [
+            offenders += [
                 f"{label} item {index}"
                 for index, item in enumerate(value)
                 if _contains_envref(item)
             ]
-    problems: list[str] = []
-    if items:
-        problems.append(
-            f"{', '.join(items)} may not be an env() reference - nested settings are not "
-            "env-resolved, so it would reach the connector unresolved, where a str() of it carries "
-            "any default= inside it. Write the items as static values, or let one env() reference "
-            "stand for the whole setting."
+    if offenders:
+        raise WiringError(
+            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
+            "not env-resolved, so it would reach the connector unresolved, where a str() of it "
+            "carries any default= inside it. Write the items as static values, or let one env() "
+            "reference with a static default stand for the whole setting."
         )
-    if chains:
-        problems.append(
-            f"{', '.join(chains)} env() default may not itself be an env() reference - only one "
-            "link is resolved, so wherever the outer key is unset the connector gets the inner "
-            "reference, not a list. Give the outer env() a static list default instead."
-        )
-    if problems:
-        raise WiringError(f"{factory} " + f" {factory} ".join(problems))
 
 
 def parse_env_setting(value: Any) -> Any:
@@ -655,19 +666,28 @@ def parse_env_setting(value: Any) -> Any:
     :class:`EnvRef` — the inverse of :func:`display_settings`'s ``{"env": key[, "default"]}`` encoding;
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
-    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, or
-    a ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138; :class:`EnvRef`
-    reads that default when it is made). The message names neither the connection nor the setting;
-    ``connections_file._build_spec`` adds both."""
+    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, a
+    ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138), or a default that
+    holds another reference (vault BACKLOG #2519); :class:`EnvRef` reads the default when it is made.
+    The message names neither the connection nor the setting; ``connections_file._build_spec`` adds
+    both."""
     if not _is_env_marker(value):
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
-        raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
+        # Named by type where it is not text: a table here can be a reference carrying a default=.
+        got = repr(key) if isinstance(key, str) else type(key).__name__
+        raise WiringError(f"env reference must name a non-empty string key, got {got}")
     cast_name = value.get("cast")
-    # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
-    # a raw TypeError that no caller turns into a message naming the connection.
-    if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
+    # Ahead of the lookup: a TOML array or table is unhashable, so the dict lookup would raise a raw
+    # TypeError that no caller turns into a message naming the connection. By type, as the key is.
+    if cast_name is not None and not isinstance(cast_name, str):
+        raise WiringError(
+            f"env reference {key!r}: unknown cast - it must be a string, got "
+            f"{type(cast_name).__name__} "
+            f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
+        )
+    if cast_name is not None and cast_name not in _NAMED_CASTS:
         raise WiringError(
             f"env reference {key!r}: unknown cast {cast_name!r} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
