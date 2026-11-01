@@ -1657,8 +1657,9 @@ def _adopt_branch(steps: list[Step], produced: list[Step], *, hollow: bool) -> b
     * A bare marker (:func:`_opens_a_branch`): in a construct's own list the steps after it are
       its branch, and adopting it onto a nested construct would leave them in the enclosing
       body, where they run.
-    * A branch holding branches of its own, from a bare marker in its own list: no chain renders
-      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead.
+    * A branch holding branches of its own, from a bare marker in its own list. It stays the
+      orphan main left: its branches render dead either way (:func:`_lift_branch_branches`), and
+      no rule here needs it adopted.
     * A ``Catch``. Adopted, it would give the ``Try`` an ``except`` that catches a raise and runs
       the steps after the ``try``, where main's orphaned ``Catch`` left the ``try`` re-raising.
       An orphan is dead, and the ``try`` still re-raises."""
@@ -1675,7 +1676,8 @@ def _adopt_branch(steps: list[Step], produced: list[Step], *, hollow: bool) -> b
     if not hollow:
         if _opens_a_branch(branch) or branch.branches or branch.kind == "except":
             return False
-        # Main orphaned it here. Dead either way, and still counted unmapped, as main counted it.
+        # Main orphaned it here and ran its body live. A dead arm here, still counted unmapped,
+        # as main counted it. A raise main's live body made is gone with it (ADR 0086 (c.2)).
         branch = replace(branch, adopted_across=True)
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
@@ -1996,11 +1998,9 @@ def _lift_branch_branches(steps: tuple[Step, ...]) -> tuple[Step, ...]:
     in, it is an orphan like any other: dead under its placeholder, counted unmapped, its send
     inline. So every walk of the tree reads the one tree the render emits. Run once placement and
     :func:`_switch_off` are done, so it moves no step into or out of a branch. A ``@Disabled``
-    subtree is left as it is: it renders commented out, whatever its shape."""
-    return tuple(
-        _lift_control(step) if isinstance(step, Control) and step.kind != "disabled" else step
-        for step in steps
-    )
+    subtree is lifted too: its commented-out preview renders a branch's body, never its branches,
+    so a branch of a branch there would vanish from the preview."""
+    return tuple(_lift_control(step) if isinstance(step, Control) else step for step in steps)
 
 
 def _lift_control(ctrl: Control) -> Control:
@@ -2926,12 +2926,10 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
         # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
         handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
-        first = next(filter(_raises_a_refusal, _live_controls(ctrl.body)), None)
-        if first is not None:
+        if _any_live_control(ctrl.body, _raises_a_refusal):
             # Every Catch renders as ``except Exception:``, which would swallow the refusal's raise
             # and run the Catch body instead: a delivery or a silent filter (BACKLOG #313).
-            sends = first.kind == "send" or _any_live_control(ctrl.body, _is_refused_send)
-            what = "MsgSend" if sends else "Catch"
+            what = "MsgSend" if _any_live_control(ctrl.body, _is_refused_send) else "Catch"
             out.append(f"{pad}except NotImplementedError:  # a refused {what} above — never caught")
             out.append(f"{pad}    raise")
         # Set only on a ``try`` left with no Catch (:func:`_switch_off_control`).

@@ -3721,16 +3721,29 @@ def test_a_switched_off_catch_never_hands_its_raise_to_a_catch_around_it(tmp_pat
     assert [send.to for send in sent] == ["OB_IN"]  # type: ignore[attr-defined]
 
 
-def test_a_live_catch_before_a_switched_off_one_still_catches() -> None:
+def test_a_live_catch_before_a_switched_off_one_still_catches(tmp_path: Path) -> None:
     """With a live Catch left ahead of the switched-off one, that Catch caught every raise on main
-    too: no refusal, and no guard on the outer ``try``."""
-    handler = _handler_body(
-        _handler_source(
-            _nested_try('<Line Data="Catch"/><List Disabled="1"><Line Data="Catch"/></List>')
-        )
-    )
+    too: no refusal, and no guard on the outer ``try``. Run, the live Catch takes the inner
+    body's raise, so the outer Catch never sends, as on main."""
+    body = _nested_try('<Line Data="Catch"/><List Disabled="1"><Line Data="Catch"/></List>')
+    handler = _handler_body(_handler_source(body))
     assert "a raise here is refused" not in handler
     assert "except NotImplementedError" not in handler
+    assert "        except Exception:  # TODO: Corepoint Catch" in handler
+    assert _run_handler(tmp_path, body) == []
+
+
+def test_a_branch_of_a_branch_in_a_disabled_subtree_stays_in_its_preview() -> None:
+    """A switched-off subtree renders as a commented-out preview of its branches' bodies. A
+    branch of a branch is lifted there too, so its send stays in the preview, and never runs."""
+    chain = '<Line Data="If (x)"><List/></Line>' + _BRANCH_OF_A_BRANCH
+    # In a wrapper, and in the list of a statement switched off on its own line.
+    for body in (
+        f'<List Disabled="1">{chain}</List>',
+        f'<Line Data="ForEach %ADT/OBX $o" Disabled="1"><List>{chain}</List></Line>',
+    ):
+        handler = _handler_body(_handler_source(body))
+        assert "MsgSend %ADT [OB_B]" in handler and 'Send("OB_B"' not in handler
 
 
 # A branch of a branch: an ``Else`` written bare in an ``Else`` branch's own list. Main rendered

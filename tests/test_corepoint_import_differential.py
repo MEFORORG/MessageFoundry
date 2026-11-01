@@ -364,7 +364,7 @@ def _off(step: Step) -> bool:
 def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
     # A marker holding nothing but label markers takes the steps after it in its own
-    # construct's list, a branch with branches of its own would lose them in a chain, and a
+    # construct's list, a branch with branches of its own stays the orphan main left, and a
     # Catch would give its Try a handler main's did not have. Each looks back past label markers
     # alone.
     plain = not marker.branches and not _bare(marker) and marker.kind != "except"
@@ -435,10 +435,11 @@ def _refused_try(steps: tuple[Step, ...]) -> bool:
 
 
 def _unbranch(steps: tuple[Step, ...]) -> tuple[Step, ...]:
-    # A branch's own branches go to the end of its body, where each is an orphan.
+    # A branch's own branches go to the end of its body, where each is an orphan. In a
+    # disabled subtree too, whose preview would drop them.
     out: list[Step] = []
     for step in steps:
-        if isinstance(step, Control) and step.kind != "disabled":
+        if isinstance(step, Control):
             arms = []
             for b in step.branches:
                 said = "a branch of the " + b.source_verb + " it is written in, "
@@ -3767,6 +3768,8 @@ def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
 
 # --- the baseline's fail-closed amendment (BACKLOG #2526) -----------------------------------------
 
+#: The refusal a ``try`` raises once its only ``Catch`` is switched off, after its opening quote.
+_TRY_REFUSAL = r"Corepoint import: \w+: its \w+ is in a @Disabled \w+\""
 #: Code lines the fail-closed amendment may write where main wrote none: the dead placeholder or
 #: the handler a branch it adopts is put under, the ``pass`` an emptied block needs, the guard that
 #: re-raises a refusal ahead of a Catch, and the ``return None`` of a handler left with no live
@@ -3774,8 +3777,6 @@ def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
 #: Also the ``sends`` list a handler takes once a send main never rendered renders dead, and
 #: returns in place of main's closing ``return Send(...)``; and the refusal a ``try`` raises once
 #: its only ``Catch`` is switched off, where main's ``Catch`` caught the raise.
-#: The refusal a ``try`` raises once its only ``Catch`` is switched off, after its opening quote.
-_TRY_REFUSAL = r"Corepoint import: \w+: its \w+ is in a @Disabled \w+\""
 _DEAD_LINE = re.compile(
     r"(?:(?:el)?if False:|except (?:Exception|NotImplementedError):|pass$|raise$|return None\b"
     r"|sends = \[\]$|return sends$"

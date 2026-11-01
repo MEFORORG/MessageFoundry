@@ -837,8 +837,9 @@ direction only: a send main made for every message through that `return` now nev
 wrapper, or from an orphan's body, no longer runs, and that holds for a step that raised. A
 refused send raised to ERROR on main: a `try` around it re-raised it past every `Catch`. A write
 that raised, such as a clear of a field the message lacks, went to the `Catch` of a `try` around
-it, or to ERROR. Switched off, or dead under a placeholder, neither raises, so the steps after it
-now run: a message main sent to ERROR or to a `Catch` there may be delivered by a later step, or
+it, or to ERROR. Switched off, or dead under a placeholder, neither raises, so the handler no
+longer stops there: the steps after it run, and every send the handler collected, before that step
+or after it, delivers. A message main sent to ERROR or to a `Catch` there may be delivered, or
 FILTERED. At least these reach it: a switched-off step in a `try` body or after it; a `Catch`
 whose body is wholly switched off, which now catches a raise where main's body raised again; and
 a branch adopted across a step that runs nothing, or left an orphan, whose body main ran live at
@@ -854,9 +855,10 @@ Two tests bound this amendment against a baseline, and the baseline is not origi
 vendored step 1 tree with only this amendment's scan half loaded, so it lacks the label amendment
 of §2(b.4) (BACKLOG #2632) that main carries. A send in a `<Block>` label, which main refuses and
 that tree delivers, is therefore left out of the second test's battery. One test reads code lines
-by depth: against that tree, the rest of the amendment adds no code line outside a dead
-placeholder, moves none shallower, and adds no closing send, on the battery and the raw draw. The
-other reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
+by depth, and it reads the guard's own re-implementation of this amendment, not the head: against
+that tree, the re-implementation adds no code line outside a dead placeholder, moves none
+shallower, and adds no closing send, on the battery and the raw draw. The head is held to that
+re-implementation byte for byte on the battery's shapes, not on the raw draw. The other reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
 live, by the nearest opener that is not dead, and holds the head to no line more live than the
 baseline over every list of a battery of disabled wrappers, refused sends and branches of branches
 among them, with the review rounds' repros. It holds the closing `return` to the destinations the
@@ -875,8 +877,10 @@ At least these limits remain:
   a bare marker standing at the handler's own level or in a `<Block>` body, and the steps after a
   bare marker adopted by a nested construct written directly before it.
 - A switched-off or dead step that raised on main, a refused send among them, no longer stops
-  the steps after it, and the scan change delivers some sends main refused, as the paragraph
-  above says. No test bounds either.
+  the handler, so its other sends, before that step and after it, deliver; and the scan change
+  delivers some sends main refused, as the paragraph above says. No test bounds either. This
+  reaches lists with no `@Disabled` anywhere, through an orphan or a branch adopted across a
+  step that runs nothing, whose body main ran live.
 
 ## 3. Acceptance criteria
 
