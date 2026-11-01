@@ -758,7 +758,9 @@ refusal.
 also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
 checking". The record says more than happened and loses nothing. A one-condition fix was built and
 reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
-and the attestation, where the line was the only record of the attestation.
+and the attestation, where the line was the only record of the attestation. *(Note 2026-10-31: no
+longer over-states on a hop whose CRL is a real check; the CORRECTED 2026-10-30 paragraph below
+says what changed.)*
 
 **CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
 time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
@@ -1516,8 +1518,10 @@ on first deployment, with no attestation.
   for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
   `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
   so the fix would not silence it. This amendment does not revisit that fix. *(Note 2026-10-31:
-  that fix is still not applied. §4.3's CORRECTED 2026-10-30 paragraph records a different
-  condition, `crl_is_a_check`, which keeps the line for a context that skips time validity.)*
+  §4.3's CORRECTED 2026-10-30 paragraph records a different condition, `crl_is_a_check`, which
+  keeps the line for a context that skips time validity. Its effect matches that fix for every
+  shipped caller, because each passes no context when its context skips time validity, so the line
+  is silenced where the CRL is a real check.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
