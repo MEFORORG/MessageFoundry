@@ -9496,7 +9496,6 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     from messagefoundry.auth.permissions import Role
     from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import keyless_opt_out_refusal
-    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.credential import constant_time_equal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import codec_safe_str
@@ -9567,18 +9566,19 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def opened() -> Store:
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
-        try:
-            return await open_store(
+        # Could not start, exit 2, for a hop refusal (#2532) or a short server schema (#1720) the
+        # OPEN raised, as `store withdraw-transit-bound` scopes it. A hop refusal raised after the
+        # open would not be reported as a store that did not open. None is known: the Transit
+        # cipher raises its failures as CipherError, which `open_refused` reports as a refusal,
+        # exit 1. A key the open cannot resolve arrives wrapped too, and `could_not_start` prints
+        # it with the same text it printed unwrapped.
+        return await _open_store_or_refuse(
+            open_store(
                 settings.store,
                 posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
-        except InsecureHopRefused as exc:
-            # Could not start, exit 2, only for a refusal the OPEN raised, as `store
-            # withdraw-transit-bound` scopes it. A hop refusal raised after the open would not be
-            # reported as a store that did not open. None is known: the Transit cipher raises its
-            # failures as CipherError, which `open_refused` reports as a refusal, exit 1.
-            raise _StoreOpenRefused(codec_safe_str(exc)) from exc
+        )
 
     async def refusal_for(store: Store, user: UserRecord) -> str | None:
         """Why this account's seed cannot be replaced here, or ``None``. Asked twice: before the
@@ -12214,9 +12214,11 @@ def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
 
 
 class _StoreOpenRefused(RuntimeError):
-    """The settings stopped the store opening, before it read a row: the key they name could not be
-    resolved (vault BACKLOG #2725), or the posture refused the store hop (BACKLOG #2532). Its text
-    is the refusal's, which names settings, variables, files, and the hop's host."""
+    """The store open refused, having changed nothing: the key the settings name could not be
+    resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532), or a server
+    store's live schema falls short of this build's (BACKLOG #1720). Its text is the refusal's,
+    which names settings, variables, files, the hop's host, or the tables, columns and indexes
+    that differ."""
 
 
 def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
@@ -12278,12 +12280,17 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
 
 
 async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
-    """Await a store open, turning a key that cannot be resolved, or a store hop the posture
-    refuses (BACKLOG #2532), into :class:`_StoreOpenRefused`.
+    """Await a store open, turning a key that cannot be resolved, a store hop the posture refuses
+    (BACKLOG #2532), or a server store whose live schema falls short of this build's DDL batch
+    (``ServerSchemaMismatchError``, BACKLOG #1720), into :class:`_StoreOpenRefused`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11) and
-    ``backup``, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the
+    code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11),
+    ``admin-reset-totp`` and ``backup``, and for ``rotate-key``, where it is an aborted rotation's
+    (BACKLOG #2109). The schema refusal rolls back the open's DDL transaction and marks nothing
+    current, so nothing was changed and the command could not start, exit 2, as SQLite's
+    ``SchemaMismatchError`` exits through its ``sqlite3.DatabaseError`` arm. Its text lists the
+    tables, columns and indexes that differ and the remedy, and names no row's content. Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
     before the backend reads a row, and a Vault hop refused there arrives as a
     ``KeyProviderError``. Under a ``vault_transit`` cipher the open also makes Transit calls after
@@ -12300,10 +12307,11 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     """
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.redaction import codec_safe_str
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     try:
         return await opening
-    except _key_unresolved() + (InsecureHopRefused,) as exc:
+    except _key_unresolved() + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         raise _StoreOpenRefused(codec_safe_str(exc)) from exc
 
 
