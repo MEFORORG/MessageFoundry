@@ -21,13 +21,12 @@ The candidate keeps the live file's NAME because the loaders read meaning from i
 its file stem and its format is its suffix, and ``connections.toml`` is found by name. ``companions``
 copies sibling files the loader reads beside the candidate, such as a code set's policy sidecar.
 
-:func:`edit_lock` is the cross-process half. The engine serialises its own writers with an
-``asyncio.Lock``, which the ``connection`` CLI in another process cannot see, so a CLI edit and a
-console edit could each read the same original and the second replace would drop the first. The lock
+:func:`edit_lock` is the cross-process half. Each ``connection`` CLI run is its own process, so two
+edits could each read the same original and the second replace would drop the first. The lock
 is an OS lock on one hidden file per DIRECTORY, ``.mefor-edit.lock`` beside the edited file, held from
 the read through the replace. One per directory rather than one per file, so a code-set rename or
-remove covers both of its names with one lock and a renamed table leaves no lock file behind. It never
-runs on an event loop: the engine's one caller already moves the whole write to a worker thread.
+remove covers both of its names with one lock and a renamed table leaves no lock file behind. It
+blocks, so it must not run on an event loop; the engine writes no config file and never takes it.
 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
 ``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.
@@ -134,7 +133,7 @@ _WINDOWS = sys.platform == "win32"
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
 # Lock files this THREAD already holds, so a caller that takes the lock around a wider read (the
-# engine's list-then-upsert) can call a writer that takes it again. A second ``flock`` on a new handle
+# list-then-upsert) can call a writer that takes it again. A second ``flock`` on a new handle
 # in the same process would wait on the first one forever.
 _held = threading.local()
 
@@ -373,8 +372,8 @@ def refused_as(
 def _refusal(path: Path, exc: OSError, step: str) -> str:
     """The message for an edit of ``path`` the file system refused, which left the file as it was.
 
-    It names the file, the step that was refused and the cause, not the directory: it reaches an
-    operator through the API, where an absolute host path adds nothing the file name does not. The
+    It names the file, the step that was refused and the cause, not the directory: an absolute host
+    path adds nothing the file name does not. The
     full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
     the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
     _log.warning(

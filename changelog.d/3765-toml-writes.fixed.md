@@ -1,7 +1,7 @@
 - **A config edit the file system denies (`EACCES`, `EPERM` or `EROFS`) is a refused edit at more
   steps.** At least the lock, the read, the candidate, its companion copy and the replace now raise
   the editor's own refusal, and each of them leaves the file as it was. For `connections.toml` that
-  is `WiringError`, which the API maps to 409; the alert, security and code-set editors use their
+  is `WiringError`; the alert, security and code-set editors use their
   own types instead of raising `OSError`. An error after the replace still propagates, because the
   edit has landed, and what a `validate` callback raises is its own. (`BACKLOG #3765`)
 - **A config file that may be there no longer reads as absent.** The four editors and their

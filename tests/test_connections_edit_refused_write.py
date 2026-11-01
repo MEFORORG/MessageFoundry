@@ -111,7 +111,7 @@ def _assert_refused(
     assert lead in message
     assert refusal.errno is not None
     assert errno.errorcode[refusal.errno] in message
-    # The message reaches the operator over the API; the host's directory stays in the log.
+    # The host's directory stays in the log.
     assert str(tmp_path) not in message
     assert exc.__cause__ is refusal
 
