@@ -311,6 +311,39 @@ def test_a_reference_valued_default_would_reach_the_connector_unresolved(spellin
     assert _normalize_no_proxy(resolved["proxy_no_proxy"]) == ()
 
 
+@pytest.mark.parametrize("target", sorted(LIST_SETTINGS))
+def test_a_default_turned_into_a_reference_after_it_was_made_is_refused_by_the_factory(
+    target: tuple[str, str],
+) -> None:
+    """``EnvRef`` reads the default once. A table it took as clean can become a marker afterwards,
+    and only the factory reads it again."""
+    factory, setting = target
+    default: dict[str, Any] = {}
+    whole = messagefoundry.env("whole_list", default=default)
+    default.update({"env": "inner", "default": [SENTINEL]})
+    with pytest.raises(WiringError) as excinfo:
+        LIST_SETTINGS[target](whole)
+    message = str(excinfo.value)
+    assert f"{factory} {setting} env() default may not be" in message, message
+    assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param({"env": {"env": "inner", "default": SENTINEL}}, id="key"),
+        pytest.param({"env": "outer", "cast": {"env": "inner", "default": SENTINEL}}, id="cast"),
+    ],
+)
+def test_a_reference_in_the_key_or_cast_slot_is_named_by_type(marker: dict[str, Any]) -> None:
+    """The same chain with its table one slot over. A refusal that printed the slot would carry the
+    default the refusal above withholds."""
+    with pytest.raises(WiringError) as excinfo:
+        wiring.parse_env_setting(marker)
+    assert "dict" in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
 def test_a_reference_inside_a_table_default_would_reach_the_partner() -> None:
     """Positive control for the table shape: nothing reads inside a resolved default, so the header
     value holds the marker, default included, wherever the whole-table key is unset."""

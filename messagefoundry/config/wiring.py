@@ -253,17 +253,17 @@ class EnvRef:
     def __post_init__(self) -> None:
         # vault BACKLOG #2519: resolve_env_settings resolves one link and hands a default over
         # unchanged, so a reference inside a default is never resolved, even with its key set, and
-        # the connector would get it with its own default= inside. No such default can work, so none
-        # is accepted. Here, because env(), parse_env_setting and _ftp_protocol all construct through
-        # this, and ahead of the bool read so a chain with a bool cast gets this message. The scan
-        # stops at _MAX_ENVREF_SCAN_DEPTH, so a reference nested deeper is not seen here; on a list
-        # setting _reject_envref_in_lists reads one level further.
+        # the connector would get it with its own default= inside. Refused here because at least
+        # env(), parse_env_setting and _ftp_protocol construct through this, and ahead of the bool
+        # read so a chain with a bool cast gets this message. The scan stops at
+        # _MAX_ENVREF_SCAN_DEPTH, so a reference nested deeper is not seen here; on a list setting
+        # _reject_envref_in_lists reads one level further.
         if _contains_envref(self.default):
             raise WiringError(
                 f"env reference {self.key!r} has an env() reference inside its default= (value "
                 "withheld) - only one link is resolved, so that inner reference would reach the "
                 "connector unresolved, with any default= of its own. Give the outer env() a static "
-                f"default. A table holding only {', '.join(sorted(_ENVREF_KEYS))} keys counts as a "
+                "default. A table with an env key and no other key but default or cast counts as a "
                 "reference here, even as a real header table, because connections.toml spells the "
                 "two alike."
             )
@@ -626,8 +626,8 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
     would otherwise arrive at the connector exactly as a list item written directly does.
     :class:`EnvRef` refuses a reference inside a default when it is made (vault BACKLOG #2519). This
-    walk still runs: it starts one level further in, at each item, and it reads the list as it is
-    now, so it also sees a list changed after the reference was made.
+    walk still runs: it starts one level further in, at each item, and it reads the default as it is
+    now, so it also sees a default changed after the reference was made.
 
     A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here. At
     least a value file answers for it when it is read; ``environment_values_from_bytes`` states
@@ -637,6 +637,9 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
+            if _is_nested_envref(value):
+                offenders.append(label)
+                continue
         if isinstance(value, list | tuple | set | frozenset):
             offenders += [
                 f"{label} item {index}"
@@ -668,13 +671,16 @@ def parse_env_setting(value: Any) -> Any:
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
-        raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
+        # Named by type where it is not text: a table here can be a reference carrying a default=.
+        got = repr(key) if isinstance(key, str) else type(key).__name__
+        raise WiringError(f"env reference must name a non-empty string key, got {got}")
     cast_name = value.get("cast")
     # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
     # a raw TypeError that no caller turns into a message naming the connection.
     if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
+        got = repr(cast_name) if isinstance(cast_name, str) else type(cast_name).__name__
         raise WiringError(
-            f"env reference {key!r}: unknown cast {cast_name!r} "
+            f"env reference {key!r}: unknown cast {got} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
         )
     cast = _NAMED_CASTS[cast_name] if cast_name is not None else None

@@ -230,15 +230,15 @@ def environment_values_from_bytes(
     is no file. ``path`` only names the file in a warning. A released reload parses the bytes its
     approval digest covered this way, rather than reading the file again (vault BACKLOG #2596).
 
-    Raises ``ValueError`` on a table anywhere inside an array, in the inline or the ``[[tables]]``
-    spelling, referenced or not (BACKLOG #1820). :func:`~messagefoundry.config.wiring.resolve_env_settings`
+    Raises ``ValueError`` on a table anywhere inside an array value, in the inline or the
+    ``[[tables]]`` spelling, referenced or not (BACKLOG #1820). :func:`~messagefoundry.config.wiring.resolve_env_settings`
     hands a value over whole, so an env marker in such a table is never resolved and a connector
-    that ``str()``s the item would carry its ``default=``. No setting takes a list of tables, so any
-    table is refused, not just a marker: a marker with one more key, or nested past the wiring scan's
-    depth, reaches ``str()`` the same way. The check sits here because every read of a value file
-    passes through this function, the snapshot read included. Only the file can hold an array here:
-    the overlay and the secrets directory supply strings. At least a mapping handed in directly,
-    such as ``Engine(env_values=...)``, never comes through this function, so it is not checked.
+    that ``str()``s the item would carry its ``default=``. Today no setting takes a list of tables,
+    so any table is refused, not just a marker: a marker with one more key, or nested past the wiring
+    scan's depth, reaches ``str()`` the same way. The check sits here because at least the disk read
+    and the snapshot read both pass through this function. Only the file can hold an array here: the
+    overlay and the secrets directory supply strings. At least a mapping handed in directly, such as
+    ``Engine(env_values=...)``, never comes through this function, so it is not checked.
 
     The message names the key and index only, because ``messagefoundry check`` prints it as it is."""
     values: dict[str, Any] = {}
@@ -251,11 +251,11 @@ def environment_values_from_bytes(
             for where in _tables_in_array(value)
         ]
         if tables:
-            # The first and a count, because safe_exc cuts a long message on the serve path.
+            # One offender and a count, and short, because safe_exc cuts at about 200 characters on
+            # the serve path. The walk's order is not file order, so it is not called the first.
             raise ValueError(
-                f"a value file may not hold a table inside an array ({len(tables)} found, first "
-                f"{tables[0]}) - a value is handed over whole, so nothing resolves or reads the "
-                "table. Write the array with scalar items, or remove the key."
+                f"a value file may not hold a table inside an array ({len(tables)} found, "
+                f"including {tables[0]}) - nothing resolves it. Use scalar items or remove the key."
             )
         for key, value in data.items():
             if isinstance(value, dict):

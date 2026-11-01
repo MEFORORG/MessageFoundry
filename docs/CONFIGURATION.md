@@ -469,7 +469,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
+| `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array value stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
 | `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. |
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running
@@ -519,10 +519,12 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   `env()` reference, directly or inside a table or list, would never resolve. Such a default stops
   the load, in a code-first module and in `connections.toml`, and the error names the key and
   withholds the default (vault BACKLOG #2519). The scan reads a few levels into the default, not
-  without limit. A table holding only `env`, `default` or `cast` keys counts as a reference inside a
-  default, because `connections.toml` spells the two alike, so a default header table with one
-  header named `env` is refused too. Write that header directly in `headers`, or use a different
-  default.
+  without limit. A table with an `env` key and no other key but `default` or `cast` counts as a
+  reference inside a default, because `connections.toml` spells the two alike, so a default header
+  table with one header named `env` is refused too. Write that header directly in a code-first
+  `headers` table, or give the default table another header. In `connections.toml`, a `headers`
+  table with only an `env` key is itself a reference, so a table of real headers there needs another
+  key.
 - **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
   **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
   Router/Handler on the deployment, read the active environment **name** with

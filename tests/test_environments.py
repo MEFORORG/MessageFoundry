@@ -361,11 +361,11 @@ def test_the_walk_has_no_depth_cap_a_value_file_could_reach() -> None:
         environment_values_from_bytes(body, path=Path("dev.toml"), environ={})
 
 
-def test_the_first_offender_and_a_count_are_named_even_for_an_unreferenced_key() -> None:
+def test_one_offender_and_a_count_are_named_even_for_an_unreferenced_key() -> None:
     body = f'kept = "x"\nfirst = [{_MARKER}]\nsecond = [["y", {_MARKER}]]\n'.encode()
     with pytest.raises(ValueError) as caught:
         environment_values_from_bytes(body, path=Path("dev.toml"), environ={})
-    assert "2 found, first 'first' item 0" in str(caught.value)
+    assert "2 found, including 'first' item 0" in str(caught.value)
     assert ARRAY_SENTINEL not in str(caught.value)
 
 
@@ -401,6 +401,7 @@ def test_serve_s_snapshot_read_reaches_the_refusal_as_a_wiring_error(
         reader.from_snapshot(snapshot)
     message = str(caught.value)
     assert "'recips' item 0" in message, message
+    assert "remove the key" in message, "safe_exc cut the remedy: " + message
     assert ARRAY_SENTINEL not in message, message
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
