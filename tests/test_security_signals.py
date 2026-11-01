@@ -14,6 +14,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -935,7 +936,7 @@ async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers
 def _verification_association(port: int, calling_ae: str = "MODALITY1") -> Any:
     """An association request from a stand-in modality, held open if the SCP accepts it."""
     from pynetdicom import AE
-    from pynetdicom.sop_class import Verification
+    from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
     ae = AE(ae_title=calling_ae)
     ae.add_requested_context(Verification)
@@ -976,6 +977,12 @@ async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers(
         # not counted, and a listed one is admitted and notifies nothing.
         stranger = await asyncio.to_thread(_verification_association, scp.sockport, "STRANGER")
         assert stranger.is_rejected and _rj(stranger) == (0x01, 0x01, 0x03)
+        # Its rejected association counts at pynetdicom's limit check until its thread ends, so
+        # wait for that, as the DICOM SCP tests' _until does, before holding the one slot.
+        deadline = time.monotonic() + 5.0
+        while cast(Any, scp._server).active_associations:
+            assert time.monotonic() < deadline, "the rejected association never ended"
+            await asyncio.sleep(0.01)
         held = await asyncio.to_thread(_verification_association, scp.sockport)
         assert held.is_established
         rejected = await asyncio.to_thread(_verification_association, scp.sockport)

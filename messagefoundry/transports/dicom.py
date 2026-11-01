@@ -1926,8 +1926,7 @@ class DicomScpSource(SourceConnector):
         pynetdicom sends local-limit-exceeded only from its ``max_associations`` check, so that
         reason alone is counted: the intake pause's temporary-congestion rejection is not. pynetdicom
         checks the limit last, so at the limit an AE-title or user-identity failure is sent, and
-        counted, as local-limit-exceeded; below it, it is not counted. Like the socket listeners, a
-        stopping server counts nothing.
+        counted, as local-limit-exceeded; below it, it is not counted.
         """
         try:
             assoc = event.assoc

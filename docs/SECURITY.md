@@ -6473,8 +6473,8 @@ lock state, and leaves out the withheld directory lock refusal, so its count doe
 under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
 withholds it from.
 
-A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and a
-`connection_event` row only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
+A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and at most a
+`connection_event` row, only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
 listeners and the DICOM server tell the layer directly, with the inbound's name and never the
 peer's address. Once a listener's burst raises, its refusals are not counted again for the window,
 or for five minutes when the window is longer. A refusal at a connection cap counts too, so a
