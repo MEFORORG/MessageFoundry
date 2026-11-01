@@ -2489,7 +2489,9 @@ the route writes to `audit_log.detail` would carry that line and the same `reaso
 `connection_control` row of a start or restart answered this way is fail-soft, as is that row for
 any refused inbound start or restart, and so is the `connection_test` row of a test stopped in its
 CA check step, before its connector is built. A store that also refuses the row would leave the answer
-standing, and the row's loss would be logged at ERROR. Any other test's row stays required.
+standing, and the row's loss would be logged at ERROR. Any other test's row stays required. A
+refused start's or restart's row carries `refused` true beside the lane's `running`, so it cannot
+read as a completed action.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,

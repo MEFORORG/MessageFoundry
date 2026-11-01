@@ -3693,6 +3693,7 @@ async def _record_control_audit(
     running: bool,
     client: str | None,
     reason: str | None = None,
+    refused: bool = False,
 ) -> None:
     """Audit a start/stop/restart of a connection (BACKLOG #1642).
 
@@ -3704,6 +3705,9 @@ async def _record_control_audit(
 
     ``reason``, where set, joins the row's detail. Only a store fault sets it (vault BACKLOG #3746),
     with the value a reload's row uses for one, so an audit reader can tell it from a refused CA.
+
+    ``refused`` marks the row of a refused start or restart with ``refused: true``, so it cannot
+    read as a completed action when ``running`` is true (vault BACKLOG #3746).
 
     ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
     for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
@@ -3723,6 +3727,7 @@ async def _record_control_audit(
         channel_id=name if role == "source" else None,
         detail=json.dumps(
             {"connection": name, "action": action, "role": role, "running": running}
+            | ({"refused": True} if refused else {})
             | ({"reason": reason} if reason is not None else {})
         ),
         client=client,
@@ -3762,6 +3767,7 @@ async def _record_refused_control_audit(
                 running=running,
                 client=client,
                 reason=reason,
+                refused=True,
             ),
             lambda: _lost_row(
                 "connection_control",
