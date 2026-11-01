@@ -149,12 +149,15 @@ def upsert_code_set(
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
     path = codesets_dir / f"{name}.csv"
-    with atomic_edit.refused_as(path, WiringError, "create its directory"):
-        codesets_dir.mkdir(parents=True, exist_ok=True)
+    if not atomic_edit.is_dir(codesets_dir, refused_error=WiringError):
+        with atomic_edit.refused_as(path, WiringError, "create its directory"):
+            codesets_dir.mkdir(parents=True, exist_ok=True)
     # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
     # cannot pass the check between them.
     with _directory_lock(codesets_dir):
-        if create and _existing_path_or_none(codesets_dir, name) is not None:
+        # On an edit too: the gate refuses a table it cannot stat, which is not one to overwrite.
+        existing = _existing_path_or_none(codesets_dir, name)
+        if create and existing is not None:
             # A create must not silently overwrite an existing code set — refuse loud (mirrors the
             # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
             raise WiringError(_create_collision_message(name, codesets_dir))
@@ -368,7 +371,8 @@ def _has_drive(name: str) -> bool:
 def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
     """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
     target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
-    if atomic_edit.is_file(codesets_dir / f"{name}.toml", refused_error=WiringError):
+    toml = codesets_dir / f"{name}.toml"
+    if atomic_edit.is_file(toml, refused_error=WiringError) or toml.exists():
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -414,6 +418,9 @@ def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
         # TRUE sidecar (companion code set present) is skipped; a standalone x.policy.toml still lists
         # as a code set, mirroring the loader (code_sets.is_policy_sidecar).
         if p.suffix.lower() in _SUPPORTED_EXTS
+        # An editor's lock link, as Emacs leaves for unsaved edits to a table: no load reads it, so
+        # the gate must not refuse the whole listing over it.
+        and not p.name.startswith(".#")
         and atomic_edit.is_file(p, refused_error=WiringError)
         and not is_policy_sidecar(p)
     ]

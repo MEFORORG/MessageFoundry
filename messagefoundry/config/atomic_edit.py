@@ -56,6 +56,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
+from messagefoundry.config.key_file_access import _UNREACHABLE_WINERRORS
 from messagefoundry.config.snapshot import is_missing_directory
 
 __all__ = [
@@ -180,9 +181,10 @@ def is_file(path: Path, *, refused_error: Callable[[str], Exception] | None) -> 
     ``False`` here means there is no file to lose: nothing at the path, or a name no file can have
     (:func:`~messagefoundry.config.snapshot.is_missing_directory`). So a bad path lists as empty, as
     ``Path.is_file`` answered. Every other failed stat is raised as ``refused_error(message)``, or as
-    itself with no ``refused_error``: a link at ``path`` that cannot be followed, and any fault that
-    does not say the file is gone. A link that ends at something other than a regular file answers
-    ``False``, and so does a broken link higher up the path, which leaves nothing an edit can write."""
+    itself with no ``refused_error``: a link on the path that cannot be followed, a share Windows
+    says it cannot reach, and any fault that does not say the file is gone. A link that ends at
+    something other than a regular file answers ``False``. A share that reads as a plain missing
+    path does too, because nothing tells the two apart (Windows answered error 3 for one)."""
     return _is_a(path, stat.S_ISREG, refused_error)
 
 
@@ -199,12 +201,25 @@ def _is_a(
     except ValueError:  # an embedded NUL, which no path can hold
         return False
     except OSError as exc:
-        if is_missing_directory(exc) and not path.is_symlink():
+        if _nothing_there(path, exc):
             return False
         if refused_error is None:
             raise
         step = _READ_STEP if exc.errno in _REFUSED else _STAT_STEP
         raise refused_error(_refusal(path, exc, step)) from exc
+
+
+def _nothing_there(path: Path, exc: OSError) -> bool:
+    """Whether ``exc``, from a stat of ``path``, means no file is there to lose. The walk stops at
+    the first entry that exists, so it costs a few calls, and only on a stat that failed."""
+    if not is_missing_directory(exc) or getattr(exc, "winerror", None) in _UNREACHABLE_WINERRORS:
+        return False
+    for entry in (path, *path.parents):
+        if os.path.exists(entry):
+            return True
+        if os.path.lexists(entry):  # a link or a Windows junction that cannot be followed
+            return False
+    return True
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -286,7 +301,8 @@ def replace_validated(
     """Replace ``path`` with ``data`` only if ``validate`` accepts a candidate holding ``data``.
 
     The candidate is ``<private dir>/<path.name>``, the private directory a unique one created beside
-    ``path``. Each existing file in ``companions`` is copied beside the candidate first. ``validate``
+    ``path``. Each file in ``companions`` is copied beside the candidate first, and one whose stat
+    fails stops the edit (:func:`is_file`), since a candidate without it would prove nothing. ``validate``
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
     ``path`` and re-restricted to its owner. The private directory is removed either way, and a
@@ -297,7 +313,7 @@ def replace_validated(
     replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
     did not pass) is raised as ``refused_error(message)``. Those steps leave the live file as it
     was, since a rename that fails has not happened. What follows the replace, any other
-    ``OSError``, and whatever ``validate`` raises are never converted."""
+    ``OSError`` past that companion stat, and whatever ``validate`` raises are never converted."""
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
@@ -363,9 +379,9 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
     )
     if step == _STAT_STEP:
         return (
-            f"{path.name} could not be read: {reason}. It may be a link whose target cannot be "
-            "reached, such as a file on an unmounted share, so it was not taken to be absent. "
-            "Restore the target or remove the link"
+            f"{path.name} could not be read: {reason}. It or a folder above it may be a link, or "
+            "on a share, that cannot be reached, so it was not taken to be absent. Restore the "
+            "share or the link's target, or remove the link"
         )
     if step == _READ_STEP:
         return (

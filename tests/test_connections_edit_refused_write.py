@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -597,14 +598,41 @@ CODE_SET_GATES = pytest.mark.parametrize(
     [
         ("diets.csv", _code_set_create),
         ("diets.toml", _code_set_create),
+        ("diets.csv", _codeset_upsert),
         ("diets.toml", _codeset_upsert),
         ("diets.csv", _code_set_list),
         ("diets.csv", _code_set_show),
         ("diets.csv", _code_set_remove),
         ("diets.toml", _code_set_rename_onto),
     ],
-    ids=["create-csv", "create-toml", "edit-toml", "list", "show", "remove", "rename-onto"],
+    ids=[
+        "create-csv",
+        "create-toml",
+        "edit-csv",
+        "edit-toml",
+        "list",
+        "show",
+        "remove",
+        "rename-onto",
+    ],
 )
+
+
+class _WinError(OSError):
+    """A Windows error by its code, on every platform: off Windows ``OSError`` drops a winerror."""
+
+    def __init__(self, winerror: int) -> None:
+        super().__init__(errno.EINVAL, "A Windows error")
+        self.winerror = winerror
+
+
+class _Unreachable(FileNotFoundError):
+    """A share Windows could not reach, which CPython raises as ``FileNotFoundError``."""
+
+    def __init__(self, winerror: int) -> None:
+        super().__init__(errno.ENOENT, "The network path was not found")
+        self.winerror = winerror
+
 
 # A name no file can have, or nothing under a parent that is no directory. Each reads as absent,
 # as Path.is_file answered, because no file is there to lose. The classifier is
@@ -614,22 +642,25 @@ NO_SUCH_FILE = pytest.mark.parametrize(
     [
         lambda: NotADirectoryError(errno.ENOTDIR, "Not a directory"),
         lambda: OSError(errno.ENAMETOOLONG, "File name too long"),
-        lambda: OSError(errno.EINVAL, "The filename is incorrect", None, 123),
-        lambda: OSError(errno.EINVAL, "The path is bad", None, 161),
-        lambda: OSError(errno.EINVAL, "The name is too long", None, 206),
+        lambda: _WinError(123),
+        lambda: _WinError(161),
+        lambda: _WinError(206),
     ],
     ids=["enotdir", "enametoolong", "winerror-123", "winerror-161", "winerror-206"],
 )
 
-# Nothing in these says the file is not there: a link cycle, the Windows cycle, and a disk fault.
+# Nothing in these says the file is not there: a link cycle, the Windows cycle, a disk fault, and
+# the two shares Windows says it could not reach.
 UNKNOWN = pytest.mark.parametrize(
     "make_failure",
     [
         lambda: OSError(errno.ELOOP, "Too many levels of symbolic links"),
-        lambda: OSError(errno.EINVAL, "The name cannot be resolved", None, 1921),
+        lambda: _WinError(1921),
         lambda: OSError(errno.EIO, "Input/output error"),
+        lambda: _Unreachable(53),
+        lambda: _Unreachable(67),
     ],
-    ids=["eloop", "winerror-1921", "eio"],
+    ids=["eloop", "winerror-1921", "eio", "winerror-53", "winerror-67"],
 )
 
 
@@ -661,6 +692,8 @@ def test_every_gate_lets_a_name_no_file_can_have_through(
         edit(path)
     except refused as exc:
         assert "could not be read" not in str(exc)
+    if edit in (_alerts_add, _security_set, _connection_upsert):
+        assert path.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -786,6 +819,75 @@ def test_a_link_it_cannot_follow_is_refused_rather_than_replaced(
     assert not (tmp_path / "unmounted").exists()
 
 
+@pytest.mark.parametrize(
+    ("edit", "refused"),
+    [
+        (connections_edit.list_connections, WiringError),
+        (lambda d: alerts_edit.list_rules(d / "messagefoundry.toml"), alerts_edit.AlertRuleError),
+        (
+            lambda d: security_edit.read_security(d / "messagefoundry.toml"),
+            security_edit.SecurityEditError,
+        ),
+    ],
+    ids=["connections", "alerts", "security"],
+)
+def test_a_config_folder_that_is_a_broken_link_is_refused_rather_than_listed_empty(
+    tmp_path: Path, edit: Callable[[Path], Any], refused: type[Exception]
+) -> None:
+    config = tmp_path / "config"
+    _link(config, tmp_path / "unmounted")
+
+    with pytest.raises(refused, match="could not be read"):
+        edit(config)
+
+
+def test_a_file_that_is_not_there_under_a_healthy_link_is_absent(tmp_path: Path) -> None:
+    # The positive control for the walk up the path: this link can be followed.
+    (tmp_path / "real").mkdir()
+    _link(tmp_path / "config", tmp_path / "real")
+
+    assert connections_edit.list_connections(tmp_path / "config") == []
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        _codeset_upsert,
+        _code_set_create,
+        _code_set_show,
+        _code_set_remove,
+        lambda p: codeset_edit.rename_code_set(p.parent.parent, "diets", "meals", validate=_noop),
+    ],
+    ids=["edit", "create", "show", "remove", "rename"],
+)
+def test_a_codesets_folder_that_is_a_broken_link_refuses_every_code_set_edit(
+    tmp_path: Path, edit: Callable[[Path], Any]
+) -> None:
+    # Its tables are on the far side of the link, so "no such code set" would be false.
+    folder = tmp_path / "codesets"
+    _link(folder, tmp_path / "unmounted")
+
+    with pytest.raises(WiringError, match="could not be read"):
+        edit(folder / "diets.csv")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows junction")
+def test_a_dangling_junction_is_refused_rather_than_listed_empty(tmp_path: Path) -> None:
+    # Path.is_symlink answers False for a junction, so this is the row a link test cannot stand for.
+    target = tmp_path / "unmounted"
+    target.mkdir()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(tmp_path / "codesets"), str(target)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    target.rmdir()
+
+    with pytest.raises(WiringError, match="could not be read"):
+        codeset_edit.list_code_sets(tmp_path)
+
+
 def test_a_link_to_a_real_file_reads_through_it(tmp_path: Path) -> None:
     # The positive control: the refusals above are for a link that cannot be followed.
     target = tmp_path / "elsewhere.toml"
@@ -885,6 +987,22 @@ def test_a_listing_is_not_refused_over_a_file_it_never_reads(tmp_path: Path) -> 
     _link(path.with_name("notes.txt"), path.with_name("gone.txt"))
 
     assert [entry["name"] for entry in codeset_edit.list_code_sets(tmp_path)] == ["diets"]
+
+
+def test_a_listing_is_not_refused_over_an_editors_lock_link(tmp_path: Path) -> None:
+    # The name Emacs gives one: it has a table's suffix, and it dangles for as long as it exists.
+    path = _code_set(tmp_path)
+    _link(path.with_name(".#diets.csv"), path.with_name("user@host.1234"))
+
+    assert [entry["name"] for entry in codeset_edit.list_code_sets(tmp_path)] == ["diets"]
+
+
+def test_a_folder_with_a_tables_name_still_collides(tmp_path: Path) -> None:
+    path = _code_set(tmp_path)
+    path.with_suffix(".toml").mkdir()
+
+    with pytest.raises(WiringError, match="duplicate code set name"):
+        _codeset_upsert(path)
 
 
 def test_a_policy_sidecar_it_cannot_stat_is_never_left_out_of_the_candidate(
