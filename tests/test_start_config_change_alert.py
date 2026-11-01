@@ -1394,7 +1394,7 @@ def test_the_logging_sink_carries_the_baseline_node_whole(caplog: pytest.LogCapt
             previous_fingerprint="b" * 64,
             node="this-node",
             shard=None,
-            baseline_action="connection_flag_set",
+            baseline_action="config_reload",
             baseline_actor="alice",
             baseline_at="2026-10-04T00:00:00+00:00",
             baseline_node=_LONG_NODE,

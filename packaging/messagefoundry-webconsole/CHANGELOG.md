@@ -50,6 +50,10 @@ this line.**
 - **Corrected: the two connection filters are not purely presentational.** Select-all skips a row
   either one hides, so both shape a bulk action's target set. For Flagged only, which reads the
   store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)
+- **Select-all's box reads the rows a click can take.** Under a filter it stays ticked once every
+  such row is taken, so the next click clears the selection, hidden rows included, rather than
+  selecting again. A selection that also holds a hidden row shows the part-selected mark. Typing a
+  filter judges the box again at once. (`BACKLOG #2623`)
 
 ### Security
 

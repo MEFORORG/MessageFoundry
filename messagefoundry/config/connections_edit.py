@@ -9,8 +9,8 @@ connection and leave every other table's comments + formatting byte-stable — h
 (load + the connector/egress build-check) BEFORE it persists: the dir is loaded with a candidate
 ``connections.toml`` in place of the live one, and only a candidate that loads replaces it (temp +
 replace, owner-only perms), so a bad edit never touches the live file. The read-modify-write holds a
-cross-process lock (:func:`locked`), so the ``connection`` CLI and the console cannot lose each other's
-edit (:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
+cross-process lock (:func:`locked`), so two ``connection`` CLI runs cannot lose each other's edit
+(:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 The validation is injected as a callback so this module stays free of service-settings/engine imports
 (and is trivially testable); the ``connection`` CLI builds the callback from ``load_config`` +

@@ -7,7 +7,8 @@ The recommended container layout makes ``/config`` root-owned, or mounts it read
 ``connection`` CLI edit run under an account that cannot write there meets an ``OSError`` (``EACCES``
 from the lock file, the read, the candidate or the replace, ``EROFS`` on a read-only mount). The
 editor raises ``WiringError`` instead, for every step that leaves the live file as it was and for
-none after the replace. The other three editors refuse the same way, each in its own type. The
+none after the replace. The code-set editor refuses in ``WiringError`` too, and the alert and
+security editors each in their own type. The
 running engine writes no config file, so no route meets this (BACKLOG #2623).
 
 The refusals are simulated with monkeypatched raises, so the tests run on Windows too, and as root,
@@ -280,7 +281,7 @@ def _refuse_stat(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -
     [
         lambda d: connections_edit.upsert_connection(d, ENTRY, validate=_noop),
         lambda d: connections_edit.remove_connection(d, "OB_TOML", validate=_noop),
-        # A read-modify-write lists before it writes, so this read comes first on that path.
+        # A read-modify-write lists before it writes, so this read comes first.
         connections_edit.list_connections,
     ],
     ids=["upsert", "remove", "list"],

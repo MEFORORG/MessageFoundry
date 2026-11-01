@@ -132,8 +132,8 @@ _WINDOWS = sys.platform == "win32"
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
-# Lock files this THREAD already holds, so a caller that takes the lock around a wider read (the
-# list-then-upsert) can call a writer that takes it again. A second ``flock`` on a new handle
+# Lock files this THREAD already holds, so a caller that takes the lock around a wider read
+# can call a writer that takes it again. A second ``flock`` on a new handle
 # in the same process would wait on the first one forever.
 _held = threading.local()
 

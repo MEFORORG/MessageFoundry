@@ -327,7 +327,9 @@
         }
       }
       box.checked = takeable > 0 && taken === takeable;
-      box.indeterminate = checked > 0 && !box.checked;
+      // A selection that holds a row select-all could not take keeps its mark, ticked or not: that
+      // row is hidden, it is still acted on, and the next click clears it too.
+      box.indeterminate = box.checked ? checked > taken : checked > 0;
     }
 
     // After every swap (poll tick AND ws push): re-apply cb.checked from the Set, recompute select-all,
@@ -373,7 +375,8 @@
     }
 
     // Delegated to the persistent [data-poll] node (only its children are swapped): a row checkbox
-    // toggles its .value in the Set; the select-all box checks/unchecks every rendered row + syncs.
+    // toggles its .value in the Set; the select-all box checks the rows selectAllTakes allows, or
+    // unchecks every rendered row, + syncs.
     poll.addEventListener("change", function (ev) {
       var t = ev.target;
       if (!t || !t.hasAttribute) return;

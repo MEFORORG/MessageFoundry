@@ -312,3 +312,13 @@ def test_typing_a_filter_judges_the_box_again(tmp_path: Path) -> None:
     run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
     assert run["selected"] == ["0"] and run["visible"] == ["1"]
     assert run["header"] is False and run["indeterminate"] is True
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_a_ticked_box_keeps_its_mark_for_a_selected_row_it_hides(tmp_path: Path) -> None:
+    """RED when the box reads plainly ticked: the operator then has no sign that a bulk action, and
+    the next click, also reach a row the filter hides."""
+    steps = ({"tick": "0"}, {"query": "row 1"}, "click")
+    run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
+    assert run["selected"] == ["1", "0"] and run["visible"] == ["1"]
+    assert run["header"] is True and run["indeterminate"] is True
