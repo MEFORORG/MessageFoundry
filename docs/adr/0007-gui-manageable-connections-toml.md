@@ -225,7 +225,8 @@ it could reach only its own copy.
    the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**. A
    cluster node toggles like any other: the store is the one thing the nodes share.
 6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
-   as the flag. If the row fails the flag does not change, and the route answers **503**. The row
+   as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
+   whose answer was lost answers 503 too, and then both may have landed. The row
    carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
    Left on that list, a row with no digest would read as a degraded baseline and the next start would
    compare nothing.
@@ -233,11 +234,14 @@ it could reach only its own copy.
    a gate is a decision of its own, not a side effect of this move.
 8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
    a config write and its baseline row together went with it. `tests/test_config_write_census.py` now
-   fails on any engine write of a config file.
+   fails on an engine write through at least the writers it names, and on a direct write whose target
+   names the config directory.
 
 **Accepted residual.** A database writer can flip the flag. That changes no fingerprint and writes no
 audit row. A stored value that disagrees with the newest `connection_flag_set` row is the only trace,
-and nothing compares them. An unusable row never refuses anything.
+and nothing compares them. An unusable row never refuses anything. A row also outlives its name: a
+connection removed or renamed leaves a row that matches nothing, which no route clears, and a later
+connection of that name takes the flag.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.

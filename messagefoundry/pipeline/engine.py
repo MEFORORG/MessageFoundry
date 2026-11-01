@@ -215,8 +215,10 @@ class ConfigRefusedBeforeApprovalCheck(WiringError):
 
 
 class ConnectionFlagNotRecorded(Exception):
-    """A flag toggle the store did not commit (BACKLOG #2623). The flag and its audit row are one
-    transaction, so neither landed. The API answers 503: the store, not the request, is at fault."""
+    """A flag toggle the store did not confirm (BACKLOG #2623). The flag and its audit row are one
+    transaction, so they land together or not at all, and a failed statement leaves neither. A
+    commit whose answer was lost may have landed both, so nothing here says which. The API answers
+    503: the store, not the request, is at fault."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2475,13 +2477,15 @@ class Engine:
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
-        Raises :class:`ConnectionFlagNotRecorded` when the store did not commit."""
+        Raises :class:`ConnectionFlagNotRecorded` when the store did not confirm the write."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
         graph = live.registry if live is not None else None
+        # inbound_names(), not .inbound: an engine shard's view holds only its own inbounds, and the
+        # store it writes is the one every engine shard shares.
         if graph is None or name not in (
-            graph.inbound if direction == "inbound" else graph.outbound
+            graph.inbound_names() if direction == "inbound" else graph.outbound
         ):
             raise WiringError(f"the running graph has no {direction} connection {name!r}")
         audit = AuditAppend(
@@ -2502,8 +2506,8 @@ class Engine:
         except Exception as exc:
             log.error("the connection flag was not changed: %s", safe_exc(exc))
             raise ConnectionFlagNotRecorded(
-                "the store did not record this toggle, so the flag did not change. Try again; if "
-                "it keeps failing, the store is not answering"
+                "the store did not confirm this toggle, so the flag has probably not changed. "
+                "Try again; if it keeps failing, the engine log names the cause"
             ) from exc
 
     @property

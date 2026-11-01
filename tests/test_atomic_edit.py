@@ -344,8 +344,8 @@ def test_a_held_lock_times_out_in_the_editors_own_error_type(tmp_path: Path) -> 
 
 
 def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
-    """The engine's flag toggle holds the lock across its list and its upsert, and the upsert takes it
-    again. A second ``flock`` on a new handle in one process would wait on the first forever."""
+    """A caller may hold the lock across a list and an upsert, and the upsert takes it again. A
+    second ``flock`` on a new handle in one process would wait on the first forever."""
     path = tmp_path / "connections.toml"
     path.write_text(CONNECTIONS_TOML, encoding="utf-8")
     finished = threading.Event()

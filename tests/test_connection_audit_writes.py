@@ -3,12 +3,10 @@
 """Audit writes on the two connection routes that had no success-arm test (BACKLOG #1643).
 
 ``connection_flag_set`` (``POST /connections/{name}/flag``) and ``connection_credential_test``
-(``POST /connections/{name}/test-credential``) each call ``record_audit`` only AFTER their write
-succeeds, and every pre-existing test of either route stopped short of that point -- the flag
-tests drove ``Engine.set_connection_flag`` directly (no API, so then no audit), and the credential-test
-arms in ``tests/test_channel_rbac.py`` all short-circuit at 403 / 400 / 404. So both writes could be
-deleted with the suite staying green. The flag row is now written by the engine itself (vault
-BACKLOG #2945), and this test still pins the actor the route hands it.
+(``POST /connections/{name}/test-credential``) each write their row only on the success path, and
+every pre-existing test of either route stopped short of that point: the credential-test arms in
+``tests/test_channel_rbac.py`` all short-circuit at 403 / 400 / 404. The flag's row now commits in
+the store with the flag (BACKLOG #2623), and this test still pins the actor the route hands it.
 
 These two tests reach the success arm and assert the row is there under the acting user.
 
@@ -194,7 +192,7 @@ async def test_flag_route_answers_503_when_the_audit_row_fails(toml_engine: Engi
                 headers=h,
             )
     assert r.status_code == 503, r.text
-    assert r.json()["detail"].startswith("the store did not record this toggle")
+    assert r.json()["detail"].startswith("the store did not confirm this toggle")
     assert await toml_engine.store.list_connection_flags() == set()
 
 

@@ -106,16 +106,16 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
     assert "data-poll" not in scoped_page and "data-mf-fragment" not in scoped_page
 
 
-async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_record(
+async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #2623: a toggle the store did not commit is refused 503. The console names that fix,
+    """BACKLOG #2623: a toggle the store did not confirm is refused 503. The console names that fix,
     not ``flag_rejected``'s hint, which does not apply. A 503 used to escape the route as an error
     page."""
     from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
 
     async def _not_recorded(*_args: object, **_kwargs: object) -> None:
-        raise ConnectionFlagNotRecorded("the store did not record this toggle")
+        raise ConnectionFlagNotRecorded("the store did not confirm this toggle")
 
     monkeypatch.setattr(engine, "set_connection_flag", _not_recorded)
     service = await auth_service(engine)
@@ -128,6 +128,6 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_record(
             headers=SAME_ORIGIN,
         )
     assert r.status_code == 200, r.text[:300]
-    assert "The store did not record the change, so the flag is as it was" in r.text
-    assert "the store did not record this toggle" in r.text
+    assert "The store did not confirm the change" in r.text
+    assert "the store did not confirm this toggle" in r.text
     assert "running graph" not in r.text

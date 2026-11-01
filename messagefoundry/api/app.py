@@ -2796,8 +2796,8 @@ async def _audit_reload_attempt(
 
 
 #: The audit actions that record which config bytes a process ran from: a start and an applied
-#: reload (vault BACKLOG #2597). The engine writes no file the config digest covers, which
-#: ``tests/test_config_write_census.py`` pins, so nothing else can move what a start compares with.
+#: reload (vault BACKLOG #2597). The engine has no write of a file the config digest covers, and
+#: ``tests/test_config_write_census.py`` fails on at least the writers it names.
 #: A dry run's ``config_reload_check`` is not one: it applied nothing. Nor is a flag toggle's
 #: ``connection_flag_set``: the store holds the flag, so the row carries no digest, and as a baseline
 #: it would read as degraded and leave the next start comparing nothing (BACKLOG #2623).

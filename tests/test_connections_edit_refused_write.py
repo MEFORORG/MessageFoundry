@@ -3,11 +3,11 @@
 """A ``connections.toml`` edit the file system refuses is a ``WiringError``, not an ``OSError``
 (vault BACKLOG #3106 item 2).
 
-The recommended container layout makes ``/config`` root-owned, or mounts it read-only, so the engine's
-own account cannot write there. The console's connection-flag toggle then reached
-``connections_edit`` and its ``OSError`` (``EACCES`` from the lock file or the candidate directory,
-``EROFS`` on a read-only mount) left the API as a 500. The API maps ``WiringError`` to 409, so the
-editor raises that instead, for every step before the replace and for none after it.
+The recommended container layout makes ``/config`` root-owned, or mounts it read-only, so a
+``connection`` CLI edit run under an account that cannot write there meets an ``OSError`` (``EACCES``
+from the lock file or the candidate directory, ``EROFS`` on a read-only mount). The editor raises
+``WiringError`` instead, for every step before the replace and for none after it. The running engine
+writes no config file, so no route meets this (BACKLOG #2623).
 
 The refusals are simulated with monkeypatched raises, so the tests run on Windows too, and as root,
 where a real root-owned directory would not refuse anything."""
@@ -120,11 +120,11 @@ def test_a_lock_file_it_cannot_create_is_a_wiring_error(
 
 
 @REFUSALS
-def test_the_engines_own_lock_refuses_the_same_way(
+def test_the_lock_itself_refuses_the_same_way(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refusal: Callable[[], OSError]
 ) -> None:
     refusal = make_refusal()
-    # The flag toggle takes `locked` around its read-modify-write before the upsert takes it again.
+    # A caller may take `locked` around a read-modify-write before the upsert takes it again.
     _live(tmp_path)
     _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
 

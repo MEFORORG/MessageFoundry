@@ -340,6 +340,9 @@ async def test_one_name_flags_each_direction_apart(tmp_path: Path) -> None:
     try:
         await _flag(eng, "BOTH", "inbound")
         assert await eng.store.list_connection_flags() == {("BOTH", "inbound")}
+        await _flag(eng, "BOTH", "outbound")
+        await _flag(eng, "BOTH", "inbound", False)
+        assert await eng.store.list_connection_flags() == {("BOTH", "outbound")}
     finally:
         await eng.stop()
 
@@ -379,6 +382,16 @@ async def test_concurrent_toggles_both_land(engine: Engine) -> None:
         ("IB_TOML", "inbound"),
     }
     assert len(await engine.store.list_audit(action="connection_flag_set")) == 2
+
+
+async def test_an_engine_shard_flags_an_inbound_a_sibling_owns(engine: Engine) -> None:
+    """An engine shard's graph holds only its own inbounds, and the store is the one every engine
+    shard shares. RED if the guard reads ``registry.inbound``, which this view does not fill."""
+    runner = engine.registry_runner
+    assert runner is not None
+    runner.registry.all_inbound = frozenset({"IB_TOML", "IB_SIBLING"})
+    await _flag(engine, "IB_SIBLING", "inbound")
+    assert await engine.store.list_connection_flags() == {("IB_SIBLING", "inbound")}
 
 
 async def test_a_cluster_node_toggles_for_every_node(
@@ -429,7 +442,7 @@ async def test_a_failed_row_changes_no_flag_and_names_the_store(
     with (
         caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.engine"),
         failing_append(engine.store, "connection_flag_set"),
-        pytest.raises(ConnectionFlagNotRecorded, match="the flag did not change") as refused,
+        pytest.raises(ConnectionFlagNotRecorded, match="did not confirm this toggle") as refused,
     ):
         await _flag(engine, "OB_TOML", "outbound")
     assert await engine.store.list_connection_flags() == {("IB_TOML", "inbound")}
@@ -497,9 +510,17 @@ async def _plant_rows(eng: Engine) -> None:
 
 async def test_a_stored_row_refuses_neither_a_start_nor_a_reload(tmp_path: Path) -> None:
     """The loader's ``_require_bool`` refuses a malformed ``flagged`` in TOML, and carrying that to
-    the store would let a writer with no key refuse a start. Neither path reads the table, and a
-    start here runs the graph and then a reload. A row IS the flag, so there is no value to parse."""
-    _config_dir(tmp_path)
+    the store would let a writer with no key refuse a start. Neither path reads the table. This runs
+    a real start of the runner and then a reload on it. A row IS the flag, so there is no value to
+    parse. ``auto_start = false`` keeps the start from binding a port, and the start still runs."""
+    cfg = _config_dir(tmp_path)
+    toml = cfg / "connections.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8").replace(
+            'router = "r"\n', 'router = "r"\nauto_start = false\n'
+        ),
+        encoding="utf-8",
+    )
     first = await _engine(tmp_path)
     await _plant_rows(first)
     await first.stop()
@@ -510,9 +531,8 @@ async def test_a_stored_row_refuses_neither_a_start_nor_a_reload(tmp_path: Path)
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        runner = second.add_registry(load_config(tmp_path / "config"))
-        assert second.registry_runner is runner
-        outcome = await second.reload_detail(str(tmp_path / "config"))
+        await second.add_registry(load_config(cfg)).start()
+        outcome = await second.reload_detail(str(cfg))
         assert outcome.applied is True
     finally:
         await second.stop()

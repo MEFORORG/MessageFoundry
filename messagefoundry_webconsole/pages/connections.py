@@ -531,10 +531,10 @@ def flag_rejected(name: str, detail: str) -> Markup:
 
 
 def flag_not_recorded(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused because the store did not commit it (BACKLOG #2623). The
-    flag and its audit row are one transaction, so neither landed. Its own page, because
-    :func:`flag_rejected`'s hint names a fix for another refusal. Both ``name`` and ``detail`` are
-    escaped."""
+    """Shown when the store did not confirm a flag toggle (BACKLOG #2623). The flag and its audit row
+    land together or not at all, and a lost commit answer may have landed both. Its own page,
+    because :func:`flag_rejected`'s hint names a fix for another refusal. Both ``name`` and
+    ``detail`` are escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -542,8 +542,9 @@ def flag_not_recorded(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The store did not record the change, so the flag is as it was. Try again; if it "
-            "keeps failing, the engine log names the cause.",
+            "The store did not confirm the change. The flag has probably not changed, but a "
+            "commit whose answer was lost can leave it changed, so check Connections before you "
+            "try again. If it keeps failing, the engine log names the cause.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),

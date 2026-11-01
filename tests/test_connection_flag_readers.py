@@ -15,7 +15,7 @@ The flag is off the :class:`Registry`, so there is one road to the value: the st
 field of the dashboard row. So the census has three arms: who calls the read, who names the table,
 and who loads a ``flagged`` attribute or key.
 
-Scope, stated rather than implied. It reads :data:`PACKAGES` by name. A read through an alias, or a
+Scope, stated rather than implied. It reads the packages ``package_trees`` parses, by name. A read through an alias, or a
 bare local such as ``if flagged:``, is not seen, and a local of that name means nothing by itself:
 at least the sign-in code keeps one of its own. The arms above catch the value at the road in, so a
 bare local is still downstream of a read this file lists. The IDE extension and the PySide6 harness
@@ -26,20 +26,24 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import pytest
 
-from tests._ast_sites import code_strings, outermost_def_sites, package_trees
+from tests._ast_sites import code_strings, package_trees
 
-#: The store's read, by name.
-READ = "list_connection_flags"
+#: The store's read, and the one wrapper over it, by name. The wrapper counts as the read, so a new
+#: caller of it is a new reader.
+READ = frozenset({"list_connection_flags", "_connection_flags"})
 #: The table, as whole words in a string, so ``connection_flag_set`` (the audit action) stays out.
 TABLE = re.compile(r"\bconnection_flag\b")
 
-#: The one caller of the read. Display, and it fails soft: see its docstring.
+#: Who reaches the read. The wrapper fails soft, and the dashboard rows are its one caller.
 READ_CALLERS: frozenset[tuple[str, str]] = frozenset(
-    {("messagefoundry/api/app.py", "_connection_flags")}
+    {
+        ("messagefoundry/api/app.py", "_connection_flags"),
+        ("messagefoundry/api/app.py", "_connection_rows"),
+    }
 )
 
 #: The modules whose SQL may name the table: the three backends, and nothing else.
@@ -52,28 +56,48 @@ TABLE_MODULES: frozenset[str] = frozenset(
 )
 
 #: Who loads ``.flagged``, ``["flagged"]`` or ``.get("flagged")``, and why that is only display.
-#: A site is charged to its outermost def, as ``tests/test_config_write_census.py`` charges a
-#: writer, so a route counts under the function that registers it.
+#: A site is charged to the NEAREST def, not the outermost as the write census charges one: every
+#: JSON route is a closure in ``create_app``, so charging that would let a new route read the field
+#: under a listed name.
 FIELD_READERS: dict[tuple[str, str], str] = {
-    ("messagefoundry/api/app.py", "create_app"): (
+    ("messagefoundry/api/app.py", "set_connection_flag"): (
         "POST /connections/{name}/flag hands req.flagged to the engine and echoes it"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_selection_checkbox"): (
         "the row's data-flagged attribute, which the client-side filter reads"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_flag_cell"): "the flag cell's glyph",
-    ("messagefoundry_webconsole/routes/connection_writes.py", "register"): (
+    ("messagefoundry_webconsole/routes/connection_writes.py", "ui_set_connection_flag"): (
         "POST /ui/connections/{name}/flag reads its form into the request the JSON handler takes"
     ),
     # Not this flag: an upload entry's own marker that an ERROR named it, listed so the scan stays
     # a scan by name with no exceptions in its code.
-    ("messagefoundry/uploads.py", "UploadStore._remove_and_report_sync"): "an unrelated field",
+    ("messagefoundry/uploads.py", "_remove_and_report_sync"): "an unrelated field",
 }
 
 
+def _nearest_def_sites(tree: ast.Module, test: Callable[[ast.AST], bool]) -> set[str]:
+    """The nearest enclosing def of each node ``test`` accepts, or ``<module>``."""
+    sites: set[str] = set()
+
+    def walk(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if test(child):
+                sites.add(owner)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, child.name)
+            else:
+                walk(child, owner)
+
+    walk(tree, "<module>")
+    return sites
+
+
 def _is_read_call(node: ast.AST) -> bool:
-    """A reference to the store's read, called or handed on, outside its own definitions."""
-    return isinstance(node, ast.Attribute) and node.attr == READ
+    """A reference to the read or its wrapper, called or handed on, outside their definitions."""
+    if isinstance(node, ast.Attribute):
+        return node.attr in READ
+    return isinstance(node, ast.Name) and node.id in READ
 
 
 def _loads_field(node: ast.AST) -> bool:
@@ -100,7 +124,7 @@ def _read_callers(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
     return {
         (path, site)
         for path, tree in trees.items()
-        for site in outermost_def_sites(tree, _is_read_call)
+        for site in _nearest_def_sites(tree, _is_read_call)
     }
 
 
@@ -108,7 +132,7 @@ def _field_readers(trees: Mapping[str, ast.Module]) -> set[tuple[str, str]]:
     return {
         (path, site)
         for path, tree in trees.items()
-        for site in outermost_def_sites(tree, _loads_field)
+        for site in _nearest_def_sites(tree, _loads_field)
     }
 
 
@@ -166,6 +190,20 @@ def test_the_read_scan_sees_a_rogue_caller(line: str) -> None:
 def test_the_field_scan_sees_each_shape(line: str) -> None:
     trees = {"messagefoundry/pipeline/rogue.py": ast.parse(line)}
     assert _field_readers(trees) == {("messagefoundry/pipeline/rogue.py", "route")}
+
+
+def test_a_route_closure_is_charged_to_itself() -> None:
+    """Every JSON route is a closure in ``create_app``, so a new one must not hide under a listed
+    name, whether it reads the row's field or calls the wrapper."""
+    line = (
+        "def create_app():\n"
+        "    async def rogue(row, engine):\n"
+        "        await _connection_flags(engine)\n"
+        "        return row.flagged\n"
+    )
+    trees = {"messagefoundry/api/app.py": ast.parse(line)}
+    assert _read_callers(trees) == {("messagefoundry/api/app.py", "rogue")}
+    assert _field_readers(trees) == {("messagefoundry/api/app.py", "rogue")}
 
 
 def test_the_field_scan_passes_over_a_write() -> None:

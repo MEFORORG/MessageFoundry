@@ -120,42 +120,6 @@ async def test_each_gate_kind_isolates_its_listener_at_start(
         await runner.stop()
 
 
-# --- item 6: the flag toggle passes the runner's predicate ------------------------------------------
-
-_LOGIC_PY = textwrap.dedent(
-    """
-    from messagefoundry import Send, handler, router
-
-    @router("r")
-    def route(msg):
-        return ["h"]
-
-    @handler("h")
-    def handle(msg):
-        return Send("OB_TOML", msg)
-    """
-)
-
-_CONNECTIONS_TOML = textwrap.dedent(
-    """
-    [[inbound]]
-    name = "IB_TOML"
-    transport = "mllp"
-    router = "r"
-    auto_start = false
-    [inbound.settings]
-    port = 2600
-
-    [[outbound]]
-    name = "OB_TOML"
-    transport = "mllp"
-    [outbound.settings]
-    host = "127.0.0.1"
-    port = 2700
-    """
-)
-
-
 # --- items 12 and 13: the predicate reads the skips the reload applies ------------------------------
 
 _MONDAY_8_TO_9 = Schedule(
