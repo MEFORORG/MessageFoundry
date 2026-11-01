@@ -18,6 +18,7 @@ wildcard forms (``"."`` was dropped silently), and ``allowed_recipient_domains``
 from __future__ import annotations
 
 import ipaddress
+import string
 
 import pytest
 from pydantic import ValidationError
@@ -318,8 +319,10 @@ def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
 
 
 def test_an_ascii_entry_still_loses_its_padding_and_capitals() -> None:
-    # The control for the test above.
-    assert not is_external("https://korp.example/", (" KORP.example\t",))
+    # The control for the test above, with all six characters the strip removes.
+    padded = f"{string.whitespace}KORP.example{string.whitespace}"
+    assert not is_external("https://korp.example/", (padded,))
+    assert is_allowlisted("https://korp.example/", (padded,))
 
 
 def test_localhost_loads_as_a_name_and_covers_its_subdomains() -> None:
@@ -330,6 +333,7 @@ def test_localhost_loads_as_a_name_and_covers_its_subdomains() -> None:
     assertion."""
     assert _load("organization_domains", "localhost") == ["localhost"]
     assert not is_external("https://foo.localhost/", ("localhost",))
+    assert is_allowlisted("https://foo.localhost/", ("localhost",))
     loopback = str(ipaddress.IPv4Address(0x7F00_0001))
     assert is_external(f"https://foo.{loopback}/", (loopback,))
 

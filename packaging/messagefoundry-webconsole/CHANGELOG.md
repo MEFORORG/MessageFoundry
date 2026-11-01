@@ -41,8 +41,9 @@ this line.**
 - **A non-ASCII entry that reaches the console other than through engine settings covers no host.**
   The console lower-cased an entry with `str.lower()`, which turns the Kelvin sign into an ASCII
   `k`, and removed non-ASCII white space, so such an entry covered an ASCII host. Hosts are compared
-  in ASCII, so it now shows the interstitial. An ASCII entry still loses its ASCII white space and
-  its capitals, and settings still strip a pasted entry at load. (BACKLOG #3765)
+  in ASCII, so it now shows the interstitial. An ASCII entry still loses its capitals and any
+  spaces, tabs or line breaks around it, and settings still strip a pasted entry at load.
+  (BACKLOG #3765)
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its
   Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
   for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
