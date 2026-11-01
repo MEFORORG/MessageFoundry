@@ -516,10 +516,14 @@ false premise.
 - **Compensating controls:** a bounded window (e.g. 30 days). Under `enforcement = enforce`, a startup
   **AUDIT** line records the override. Under `enforcement = warn` the gate writes no **AUDIT** line for it:
   with no opt-out it prints a plain `warning:` line to stderr, and with `allow_keeping_phi_indefinitely = true`
-  it prints nothing about the window. `security_loosenings()` names that switch and an explicit
-  `delete_message_bodies_after_days = 0`, so at least the start's posture warning, `GET /security/posture`
-  and the list the start's `config_loaded` audit row records carry them. It reads no other window, so none
-  of those shows that `dead_letter_days`, `reference_snapshot_days` or `processed_archive_days` is at `0`.
+  it prints nothing about the window. What is left is `security_loosenings()`, and what it names depends on
+  when it is read. The start's posture warning runs before the gate, on the settings as written: it names the
+  switch, and `delete_message_bodies_after_days` only on an explicit `0`. `serve` then folds the effective
+  window back into `[security]`, so at least `GET /security/posture` and the list the start's
+  [best-effort](#the-switches) `config_loaded` audit row records read the effective value: with the switch set
+  and that window unset, they name `delete_message_bodies_after_days` too, though nobody wrote `0`.
+  `security_loosenings()` does not read the other auto-bounded windows: at least `dead_letter_days`,
+  `reference_snapshot_days` and `processed_archive_days` can stay at `0` with no entry in any of these records.
 - **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
   **strict enforcement** (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true`
   (which downgrades the refusal to a loud audited warning). This bullet used to say the 30-day auto-bound of
@@ -683,8 +687,10 @@ is refused, so an opt-out does nothing and is not reported.
   encryption / egress / retention paths are exercised, not first met in production) but is deliberately run at
   warn severity during bring-up; or a custom PHI-loopback env. A stock production instance never needs it (it
   is `enforce`-equivalent already).
-- **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
-  **AUDIT** line + posture view keep the deviation visible.
+- **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings, the
+  posture view and the start's best-effort `config_loaded` audit row keep the deviation visible. A startup
+  **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
+  says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
   loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)

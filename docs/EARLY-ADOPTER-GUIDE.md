@@ -327,7 +327,7 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 > each of those. Which other rungs fire depends on which of them you have. A loopback bind can still
 > draw exposure warnings: with `[security].web_console_public_address` set and no proxy declared or
 > trusted, at least the undeclared-proxy warnings can fire, one of them only while `[security].require_mfa`
-> is off (vault BACKLOG #3474). Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
+> is off (vault BACKLOG #3474). Set `[security].enforcement = warn` to downgrade the PHI refusals to loud warnings during
 > local bring-up.
 
 ### 4.4 Run it as a Windows service (the supported production run-mode)
