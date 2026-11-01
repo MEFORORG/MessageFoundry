@@ -271,6 +271,65 @@ def test_an_idle_session_writes_no_row_on_a_timer(tmp_path: Path) -> None:
     assert d["seven_day"]["rate_pct_per_hr"] is None, d
 
 
+def test_a_lower_reading_in_one_reset_period_replaces_nothing(tmp_path: Path) -> None:
+    """An idle session keeps reporting its cached percentage, on a timer. Inside one reset period
+    the level only rises, so the highest reading binds, and the lower one must not move the number,
+    its age, or the history. Live 99 then idle 60 used to grade clear at the ceiling."""
+    live = window(91.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": live}})
+    first = latest(tmp_path)["seven_day"]
+
+    time.sleep(1.1)
+    idle = {**live, "used_percentage": 60.0}
+    line = collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(91.0), "the idle reading replaced the live one"
+    assert kept["captured_at"] == first["captured_at"], "a refused reading must not refresh the age"
+    assert "7d 91%" in line, line
+    assert len(history(tmp_path)) == 1, "a refused reading reached the rate's history"
+
+    # CONTROL. A guard that froze the window would pass everything above.
+    higher = {**live, "used_percentage": 93.0}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": higher}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(93.0)
+    assert len(history(tmp_path)) == 2
+
+
+def test_a_new_reset_period_replaces_the_old_value_in_either_direction(tmp_path: Path) -> None:
+    epoch = int(time.time()) + 3600
+    for resets_at, pct in ((epoch, 91.0), (epoch + 7 * 86400, 2.0), (epoch + 14 * 86400, 50.0)):
+        seven = {"used_percentage": pct, "resets_at": resets_at}
+        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+    assert [r["seven_day"] for r in history(tmp_path)] == [91.0, 2.0, 50.0]
+
+
+def test_a_reading_from_an_earlier_reset_period_replaces_nothing(tmp_path: Path) -> None:
+    """After a reset, an idle session still holds last week's number and last week's reset time.
+    Letting it in would swap a current reading for a gone one, every few seconds."""
+    epoch = int(time.time()) + 3600
+    current = {"used_percentage": 2.0, "resets_at": epoch}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": current}})
+    gone = {"used_percentage": 95.0, "resets_at": epoch - 7 * 86400}
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": gone}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
+    assert len(history(tmp_path)) == 1
+
+
+def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: Path) -> None:
+    """The highest reading binds inside one account's pool only. A foreign number kept as a floor
+    would block this root's own readings until the reset, and the reader would refuse it throughout."""
+    seven = window(88.0, 280000)
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    doc = latest(tmp_path)
+    doc["seven_day"]["config_root_env"] = str(tmp_path / "another-account")
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    mine = {**seven, "used_percentage": 12.0}
+    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": mine}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
+
+
 def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
     """90 minutes rounded to the even hour read as 2h30m."""
     line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
@@ -412,6 +471,39 @@ def test_a_burn_that_stopped_does_not_read_as_a_live_one(tmp_path: Path) -> None
     assert 0 < d["seven_day"]["rate_pct_per_hr"] < 1, d
 
 
+def test_one_tick_over_a_few_minutes_is_not_a_rate(tmp_path: Path) -> None:
+    """The weekly prints whole numbers. Over 4 minutes one point reads as 15 percent an hour, which
+    is 56 minutes to empty at 86 percent: inside the rung, on a single tick."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(4.0, 85.0), (0.1, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == WARN, d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert d["seven_day"]["minutes_to_empty"] is None, d
+
+
+def test_a_tick_over_more_than_the_minimum_span_is_a_rate(tmp_path: Path) -> None:
+    """The control: the same two percentages, far enough apart to mean something."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(31.0, 85.0), (0.1, 86.0)], epoch)
+    _, d = read(tmp_path)
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(1.94, abs=0.05), d
+
+
+def test_a_reading_whose_reset_has_passed_is_no_current_reading(tmp_path: Path) -> None:
+    """It describes a window that is gone: UNKNOWN, with no number to act on and no reset to print."""
+    publish(tmp_path, seven=95.0, seven_epoch=int(time.time()) - 300)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN, d
+    assert d["seven_day"]["state"] == "UNKNOWN", d
+    assert d["seven_day"]["used_percentage"] is None, d
+    assert "reset has passed" in d["seven_day"]["reason"], d
+    _, _, human = reader("-StateDir", str(tmp_path), pin=None)
+    assert "95.0%" not in human and "resets in" not in human, human
+
+
 def test_a_high_reading_with_no_rate_does_not_claim_a_projection(tmp_path: Path) -> None:
     publish(tmp_path, seven=91.0)
     code, d = read(tmp_path)
@@ -435,7 +527,7 @@ def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
         for m, p, e in [
             (50, 88.0, old_epoch),
             (40, 93.0, old_epoch),
-            (10, 2.0, new_epoch),
+            (35, 2.0, new_epoch),
             (1, 5.0, new_epoch),
         ]
     ]
@@ -2225,6 +2317,17 @@ def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Pat
     assert row["stale"] is True, row
     _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
     assert "STALE" in human, human
+
+
+def test_the_survey_prints_no_number_for_a_window_whose_reset_has_passed(fake_home: Path) -> None:
+    """The survey is the only place accounts are compared, so a gone week's number must not show
+    as this root's pool. The same rule the single-root read applies."""
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=95.0, seven_epoch=int(time.time()) - 300)
+    _, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    row = next(r for r in doc["roots"] if r["root"].lower() == str(pin).lower())
+    assert row["seven"] is None, row
+    assert "reset has passed" in row["note"], row
 
 
 def test_rewired_says_which_thing_changed_not_always_the_publish_path(tmp_path: Path) -> None:

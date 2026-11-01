@@ -844,13 +844,16 @@ function Get-DecisionCostRung {
       numbers). RATE GOVERNS (STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung
       is hit when the window is projected to run out within HoldMin minutes and before it resets,
       whatever the level. Only with no rate is the level the backstop. A rate of zero or below counts
-      as no rate, as it does in watch.py: usage inside one reset period does not fall, so such a rate
-      comes from cached readings, and it must not lift the backstop.
+      as no rate, because usage inside one reset period does not fall, and such a rate must not lift
+      the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
+      is positive, but its _burn is suppressed today, so the Steward has no rate at all and holds on
+      the level alone. This gate can therefore grade the same pool differently from the Steward.
 
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      UNKNOWN when the reading is missing, stale, refused, or usage.ps1 calls it UNKNOWN overall (its
+      UNKNOWN when the reading is missing, stale, refused, past its reset (it describes a window that
+      is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
       window's own state does not), unless the window grades HIT: a hit is never downgraded, since
       that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
@@ -903,6 +906,9 @@ function Get-DecisionCostRung {
     $rate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
     $toEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
     $toReset = Get-DecisionJsonValue $week 'minutes_to_reset'
+    if ($null -ne $toReset -and [double]$toReset -le 0) {
+        return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
+    }
     $at = "weekly at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
     $rung = if ($pct -ge 98) {
         New-DecisionRung 'HIT' "$at. At the ceiling (98 percent, usage.ps1's own CRITICAL band), whatever the rate"

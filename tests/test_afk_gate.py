@@ -311,6 +311,22 @@ def test_a_critical_reading_below_the_rung_is_unknown(sb: Sandbox) -> None:
     assert code == REVIEW and "may be another root's" in why(out)
 
 
+@pytest.mark.parametrize(
+    "pct",
+    [pytest.param(92.0, id="above-the-level"), pytest.param(99.0, id="at-the-ceiling")],
+)
+def test_a_reading_whose_reset_has_passed_neither_clears_nor_halts(sb: Sandbox, pct: float) -> None:
+    """The window it describes is gone, so its level says nothing about this one. The stand-in is
+    the shape usage.ps1 no longer emits: the rung must hold on its own."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(pct, rate_pct_per_hr=2.0, minutes_to_empty=240, minutes_to_reset=-5),
+    )
+    code, doc = gate(sb)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
+
+
 def test_an_unknown_cost_reading_reviews_rather_than_halts(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), {"state": "UNKNOWN", "reason": "no statusLine"}, code=20)
@@ -425,6 +441,28 @@ def test_the_real_usage_reader_feeds_the_rung(
     real = sb.repo / "scripts" / "coord" / "usage.ps1"
     code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
     assert code == expected, why(doc)
+
+
+def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """Last week's 99 percent, published with last week's reset. It used to HALT a refilled pool."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    seven = {"used_percentage": 99, "resets_at": int(ago().timestamp()) - 300}
+    collect = sb.run(
+        COORD / "usage-collect.ps1",
+        "-StateDir",
+        str(root / "mefor-usage"),
+        stdin=json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}}),
+        **env,
+    )
+    assert collect.returncode == 0, collect.stderr
+    seed_vault(sb, calibrated("manager"))
+    real = sb.repo / "scripts" / "coord" / "usage.ps1"
+    code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
 
 
 # --- the reversal budget (plan 4.5) and the item rule ----------------------------------------

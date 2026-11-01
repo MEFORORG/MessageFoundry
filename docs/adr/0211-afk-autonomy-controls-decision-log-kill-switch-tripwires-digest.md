@@ -387,10 +387,26 @@ roster alias of the Lander.
 > Steward's minutes default is (60, 10, 5), though the gate reads only the first.
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
-> `usage-collect.ps1` writes a history row only on a move, and `usage.ps1` needs two rows inside its
-> 90-minute rate window. So a slow or flat burn reads as no rate, and the 90 percent level decides.
-> A timed row was tried and refused: an idle session keeps reporting its cached percentage, so its rows
-> read as a measured rate of zero while other sessions burn the pool, which lifted the backstop.
+> `usage-collect.ps1` writes a history row only on a rise, and `usage.ps1` needs two rows inside its
+> 90-minute rate window, the oldest at least 30 minutes old, so that one tick is not read as a burn. So
+> a slow or flat burn reads as no rate, and the 90 percent level decides. A timed row was tried and
+> refused: its rows read as a measured rate of zero while other sessions burn the pool, which lifted
+> the backstop.
+>
+> **The highest reading in a reset period binds.** An idle session keeps reporting its cached
+> percentage, so no one session's reading is the truth; each is a valid floor. The collector therefore
+> refuses a lower reading in the same reset period, and any reading from an earlier one, so neither
+> reaches `latest.json` or the history. A later reset replaces the value in either direction. If usage
+> could ever fall inside a period, keeping the higher number errs toward a stop. **That does not close
+> the staleness gap:** an idle session reporting the same percentage as the published one still looks
+> freshly observed, and nothing here can tell it from a live one.
+>
+> **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
+> with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.
+>
+> **The Steward and this gate can disagree.** As read on 2026-11-01, the projection in the Steward's
+> `watch.py` is suppressed, so it has no rate and holds on the level alone, while this gate grades by
+> rate when it has one.
 
 ### Where it is enforced, and where it is not
 

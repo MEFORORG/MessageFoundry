@@ -1394,8 +1394,8 @@ whole shape:
 | [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the others share: what a config root is, which one am I in, where does its state live, is it still spendable |
 
 **One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
-draws down the same 7-day pool, so any one session's reading is the truth for all sessions
-*on that account*. Do not run a collector per session expecting to sum them; that double-counts a shared
+draws down the same 7-day pool, so any one session's reading is a valid floor for all sessions
+*on that account*, and inside one reset period the highest reading binds. Do not run a collector per session expecting to sum them; that double-counts a shared
 pool.
 
 **It is not machine-wide, and an earlier version of this section said it was.** A box can run several
@@ -1469,8 +1469,8 @@ obtained, and its advice is *treat headroom as unknown*; `UNAVAILABLE` means a m
 and it is zero-spendable-forever. Folding the second into the first understates a known fact and leaves a
 caller waiting for a reading that is never coming. It is not `CRITICAL` either — that says commit now
 because a live pool is running out, which is not an account that has none.
-`UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
-or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
+`UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable,
+future-dated or past its window's reset — a percentage is never extrapolated from a dead publisher, and every number is printed
 with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
 stamped with a config root other than the one it sits under is **refused** rather than reported as this
 session's headroom, and when there is no data at all the message diagnoses *which* state this root is in

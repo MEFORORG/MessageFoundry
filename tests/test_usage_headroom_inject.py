@@ -202,6 +202,14 @@ def test_it_reports_the_number_that_is_actually_in_the_published_file(tmp_path: 
     assert "41.2%" not in ctx_b, "the second reading carried the first fixture's number"
 
 
+def test_a_reading_whose_reset_has_passed_prints_no_number(tmp_path: Path) -> None:
+    state = tmp_path / "s"
+    collect(state, {"session_id": "f", "rate_limits": {"seven_day": window(95.0, -300)}})
+    ctx = context_of(state)
+    assert "7d  UNKNOWN" in ctx and "reset has passed" in ctx, ctx
+    assert "95.0%" not in ctx, ctx
+
+
 def test_a_document_still_carrying_five_hour_prints_no_line_for_it(tmp_path: Path) -> None:
     """Anthropic removed the five-hour limit. An older latest.json may still name it, and the block
     must carry only the weekly line, whose number is the positive control."""

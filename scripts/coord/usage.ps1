@@ -25,7 +25,8 @@
       1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the answer is UNKNOWN. Not an
          extrapolation, not a last-known value dressed up as current. Below two samples in the current
-         window there is no rate and no projection, and the percentage bands still grade the reading.
+         window, or under -MinRateSpanMinutes, there is no rate and no projection, and the percentage
+         bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -47,7 +48,8 @@
         0  OK
         10 WARN        -- high, or projected to exhaust before reset with slack
         11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN     -- no data, stale data, or a reading this root may not trust
+        20 UNKNOWN     -- no data, stale data, a window whose reset has passed, or a reading this root
+                          may not trust
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -95,6 +97,11 @@ param(
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
+    # And over at least this much. The weekly prints whole numbers, so over a few minutes one tick is
+    # quantisation, not a burn: over 4 minutes it reads as 15 percent an hour and would fire the rung
+    # on its own. watch.py's BURN_MIN_SPAN says the same, and its note says to retune its 4 minutes for
+    # the weekly before it is used. Under this, there is no rate and the level bands decide.
+    [int]$MinRateSpanMinutes = 30,
     # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
     # different 7d pools, so summing, averaging or taking a worst-of across them would rebuild
     # the exact lie the per-root publish path removes.
@@ -418,8 +425,8 @@ function Get-Rate($CurrentResetEpoch) {
     $newest = $rows | Sort-Object AgeMin | Select-Object -First 1
     # THE SPAN RUNS TO NOW, NOT TO THE NEWEST ROW. Rows land only on a move, so the flat time since the
     # last one is in no row, and ending the span there would keep a stopped burn reading as a live one.
+    if ($oldest.AgeMin -lt $MinRateSpanMinutes) { return $null }
     $spanH = $oldest.AgeMin / 60.0
-    if ($spanH -le 0) { return $null }
     $delta = $newest.Pct - $oldest.Pct
     return [pscustomobject]@{
         PctPerHour = [math]::Round($delta / $spanH, 2)
@@ -436,6 +443,15 @@ function Test-WindowFromRoot($w, [string]$ReadRoot) {
     $e = [string]$w.config_root_env
     if (-not $e -or $e -eq "unset" -or -not $ReadRoot) { return $true }
     return [bool](Test-SameRoot $e $ReadRoot)
+}
+
+# A READING WHOSE RESET HAS PASSED DESCRIBES A WINDOW THAT IS GONE. Its level says nothing about the
+# window now running, so it is no current reading, in either direction: a gone 99 must not stop work on
+# a refilled pool, and a gone 40 must not clear work on a spent one. One definition, for the same reason
+# as the test above.
+function Test-WindowResetPassed($w) {
+    $epoch = $w.resets_at_epoch -as [long]
+    return [bool]($epoch -and $epoch -le [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
 }
 
 function Get-WindowReport($w, [string]$ReadRoot) {
@@ -455,6 +471,9 @@ function Get-WindowReport($w, [string]$ReadRoot) {
             reason          = "this window was observed under a DIFFERENT config root ($wEnv) and carried into a document under $ReadRoot -- refusing to report another account's headroom"
             used_percentage = $null
         }
+    }
+    if (Test-WindowResetPassed $w) {
+        return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window's reset has passed"; used_percentage = $null }
     }
     $age = Get-AgeMinutes $w.captured_at
     $pct = [double]$w.used_percentage
@@ -600,7 +619,8 @@ function Get-RootSummary([string]$Root) {
     # numbers inside came from another. Measured: the single-root reader refused the window and the
     # survey four lines later printed it as this root's own.
     $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
-    $s.seven = if ($d.seven_day -and $sevenOurs) { [double]$d.seven_day.used_percentage } else { $null }
+    $sevenGone = Test-WindowResetPassed $d.seven_day
+    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone) { [double]$d.seven_day.used_percentage } else { $null }
     # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
     # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
     # six-hour-old reading rendered as "[seen 0 min ago]".
@@ -612,6 +632,7 @@ function Get-RootSummary([string]$Root) {
     if (-not $sevenOurs) {
         $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
     }
+    elseif ($sevenGone) { $s.note = "no current reading: this window's reset has passed" }
     elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
     # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
     # live until that date, so suppressing the percentage would throw away a reading that is true and

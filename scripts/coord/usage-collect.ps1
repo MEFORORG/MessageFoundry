@@ -13,10 +13,11 @@
     ONE PUBLISHER, N READERS, PER ACCOUNT -- AND THE "PER ACCOUNT" IS THE HALF THAT WAS MISSING. This
     is the single place that premise is stated; everything else links here.
 
-    The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same 7-day pool, so
-    any ONE session's reading is the truth for all sessions ON THAT ACCOUNT. Do not run a collector per
-    session expecting to add them up -- summing double-counts the same shared pool. The output path is
-    therefore not repo-level: the data is a property of the account, not of a checkout, and a
+    The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same 7-day pool, so any ONE
+    session's reading is a valid FLOOR for all sessions ON THAT ACCOUNT, and inside one reset period
+    the highest reading binds. It is not the truth: an idle session keeps reporting a cached number.
+    Do not run a collector per session expecting to add them up -- summing double-counts the same
+    shared pool. The output path is therefore not repo-level: the data is a property of the account, not of a checkout, and a
     repo-scoped copy would be a second truth that goes stale.
 
     IT IS NOT MACHINE-WIDE EITHER, and an earlier version of this file wrote as if it were. A box can
@@ -197,12 +198,6 @@ try {
 
     $seven = Get-Window $rl.seven_day
 
-    # Snapshotted BEFORE the carry-forward below, because HISTORY MUST RECORD ONLY WHAT WAS FRESHLY
-    # OBSERVED. A carried-forward percentage written against a new timestamp tells the burn-rate
-    # calculation that consumption had stopped -- the one lie that matters in a tool built to warn
-    # about consumption.
-    $freshSeven = if ($seven) { $seven.used_percentage } else { $null }
-
     # DO NOT CLOBBER A GOOD READING WITH AN EMPTY ONE.
     #
     # EVERY session runs this statusLine and they all publish to ONE shared file, so every session is a
@@ -227,11 +222,40 @@ try {
     # So a FRESHLY OBSERVED window is stamped here and a CARRIED one keeps whatever stamp it arrived
     # with. usage.ps1 applies the cross-root refusal per window as well as per document.
     $stampEnv = $(if ($ConfigRootEnv) { (Get-RootLabel $ConfigRootEnv) } else { "unset" })
-    if ($seven) { $seven.captured_at = $now; $seven.config_root_env = $stampEnv }
+    $prevDoc = $null
+    try { $prevDoc = Get-Content -LiteralPath (Join-Path $StateDir "latest.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
+    $published = if ($prevDoc) { $prevDoc.seven_day } else { $null }
+
+    # THE HIGHEST READING IN A RESET PERIOD BINDS. An idle session keeps reporting its cached number on
+    # a timer, and every session publishes here, so without this rule a stale 60 replaces a live 99 and
+    # reads as freshly observed. The level only rises inside a window; if it ever fell, keeping the
+    # higher number errs toward a stop. A later reset is a new window, and it replaces in either
+    # direction. An EARLIER reset is a window already gone, so it replaces nothing: after a reset, an
+    # idle session still holds last week's number. A refused reading leaves the published window whole,
+    # its own age included, so the staleness guard keeps counting from the last real observation.
+    #
+    # ONLY AGAINST THIS ROOT'S OWN WINDOW. A window stamped by another root is another pool, and as a
+    # floor it would shut this root's readings out until the reset. A reset time that cannot be read
+    # decides nothing, so the reading is taken.
+    $keepPublished = -not $seven
+    if ($seven -and $published -and [string]$published.config_root_env -ieq $stampEnv) {
+        $seenEpoch = $seven.resets_at_epoch -as [long]
+        $publishedEpoch = $published.resets_at_epoch -as [long]
+        if ($seenEpoch -and $publishedEpoch) {
+            $keepPublished = $seenEpoch -lt $publishedEpoch -or
+                ($seenEpoch -eq $publishedEpoch -and $seven.used_percentage -lt ($published.used_percentage -as [double]))
+        }
+    }
+
+    # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new
+    # timestamp tells the burn-rate calculation that consumption had stopped -- the one lie that matters
+    # in a tool built to warn about consumption. A refused lower one would also read as a falling rate.
+    $freshSeven = $null
+    if ($keepPublished) { $seven = $published }
     else {
-        $prevDoc = $null
-        try { $prevDoc = Get-Content -LiteralPath (Join-Path $StateDir "latest.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
-        if ($prevDoc -and $prevDoc.seven_day) { $seven = $prevDoc.seven_day }
+        $freshSeven = $seven.used_percentage
+        $seven.captured_at = $now
+        $seven.config_root_env = $stampEnv
     }
 
     # Nothing observed and nothing remembered: publish NOTHING rather than a document full of nulls.
