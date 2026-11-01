@@ -245,8 +245,9 @@ def test_inbound_invalid_content_type_string_fails_loud(tmp_path: Path) -> None:
         "def r(m): return []\n",
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match=r"invalid content_type 'yaml'"):
+    with pytest.raises(WiringError, match=r"invalid content_type, value withheld") as ei:
         load_config(tmp_path)
+    assert "yaml" not in str(ei.value)
 
 
 def test_build_inbound_connection_coerces_content_type() -> None:

@@ -464,10 +464,10 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
     if sep and len(head) != 2 and head[:1].isalpha() and not _is_hex(head):
         if head not in ANCHOR_DIGESTS:
             raise TrustAnchorError(
-                f"a trust-anchor pin names the digest {head!r}, which this release does not "
-                f"support, or it is not a hex digest. Supported prefixes: "
+                f"a trust-anchor pin names a digest this release does not support, or it is not a "
+                f"hex digest (value withheld). Supported prefixes: "
                 f"{', '.join(sorted(ANCHOR_DIGESTS))}. A pin with no prefix is read as "
-                f"{UNMARKED_DIGEST}. Got {pin!r}"
+                f"{UNMARKED_DIGEST}"
             )
         algorithm, cleaned = head, rest.strip()
     digest = cleaned.replace(":", "")
@@ -475,7 +475,7 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
     if len(digest) != want.hex_chars or not _is_hex(digest):
         raise TrustAnchorError(
             f"a trust-anchor pin must be a {want.title} hex digest ({want.hex_chars} hex chars, "
-            f"optional ':', optionally prefixed '{algorithm}:'); got {pin!r}"
+            f"optional ':', optionally prefixed '{algorithm}:') (value withheld)"
         )
     return Fingerprint(algorithm, digest)
 

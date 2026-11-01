@@ -40,6 +40,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from harness.config._refusal import prints_its_refusal
+
 # Transform cost modes (a subset of the load graph's — connscale only needs cheapest + a representative
 # whole-field rewrite, never the CPU-spin SLOW mode; the wall here is per-connection machinery, not CPU).
 CHEAP = "cheap"  # pass-through: deliver the receipt unchanged (the cheapest possible graph)
@@ -165,6 +167,7 @@ def _bounded(name: str, value: int, *, minimum: int, maximum: int) -> None:
         raise ValueError(f"{name} must be <= {maximum}, got {value}")
 
 
+@prints_its_refusal
 def load_connscale_shape() -> ConnScaleShape:
     """The shape the ``MEFOR_CONNSCALE_*`` environment names. The env route reaches the engine only:
     a ``[sandbox].mode = "subprocess"`` worker's environment is an allowlist that never carries a

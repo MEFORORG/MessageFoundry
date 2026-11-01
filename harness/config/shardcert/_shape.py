@@ -103,6 +103,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from harness.config._refusal import prints_its_refusal
 from harness.load.ids import SHARDCERT_IDS
 from messagefoundry.parsing.message import Message, RawMessage
 
@@ -411,6 +412,7 @@ def reported_shape(handlers: int, delivering: int, routing: str) -> tuple[int, i
     return handlers, delivering
 
 
+@prints_its_refusal
 def load_shape() -> ShardCertShape:
     transform = (os.environ.get("MEFOR_SHARDCERT_TRANSFORM", EDIT).strip().lower()) or EDIT
     if transform not in _TRANSFORMS:

@@ -35,6 +35,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from harness.config._refusal import prints_its_refusal
+
 # Transform cost modes (mirrors connscale): cheapest pass-through + an optional whole-field rewrite.
 CHEAP = "cheap"  # pass-through: deliver the receipt unchanged (the cheapest possible graph)
 EDIT = "edit"  # representative whole-field rewrites via the Message model (optional realism)
@@ -129,6 +131,7 @@ class EstateShape:
         return f"{role}_ES_{index:05d}_{sub:02d}"
 
 
+@prints_its_refusal
 def load_estate_shape() -> EstateShape:
     transform = os.environ.get("MEFOR_ESTATE_TRANSFORM", CHEAP).strip().lower() or CHEAP
     if transform not in _TRANSFORMS:

@@ -319,8 +319,8 @@ def refuse_a_non_canonical_issuer(issuer: str, setting: str) -> None:
     canonical = canonical_dn(issuer)
     if canonical is None:
         raise ValueError(
-            f"{setting} issuer {issuer!r} is not an RFC 4514 distinguished name "
-            "(attr=value,...); name the issuing CA's DN"
+            f"{setting} issuer is not an RFC 4514 distinguished name "
+            "(value withheld; attr=value,...); name the issuing CA's DN"
         )
     if canonical != issuer:
         # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.

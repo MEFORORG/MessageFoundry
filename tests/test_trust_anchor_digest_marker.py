@@ -98,7 +98,7 @@ def test_a_pin_naming_a_digest_not_compiled_in_is_refused(tmp_path: Path, marker
     p, _fp = _anchor(tmp_path)
     true = hashlib.new(marker, p.read_bytes(), usedforsecurity=False).hexdigest()
     pin = f"{marker}:{true}"
-    with pytest.raises(TrustAnchorError, match=f"names the digest '{marker}'"):
+    with pytest.raises(TrustAnchorError, match="names a digest this release does not support"):
         parse_anchor_pin(pin)
     spec = AnchorSpec("t", "[x].ca", str(p), pin, "[x].ca_pin")
     with pytest.raises(TrustAnchorError, match=r"^\[x\]\.ca_pin: .*does not support"):
@@ -119,7 +119,7 @@ def test_a_typo_in_a_bare_pin_reads_as_malformed_not_as_a_digest_name() -> None:
 
 def test_a_connection_pin_naming_an_unknown_digest_refuses_at_load() -> None:
     _check_tls_ca_pin("Rest", "sha256:" + "ab" * 32, "ca.pem")  # the control
-    with pytest.raises(ValueError, match="Rest tls_ca_pin: .*names the digest 'md5'"):
+    with pytest.raises(ValueError, match="Rest tls_ca_pin: .*names a digest this release does"):
         _check_tls_ca_pin("Rest", "md5:" + "ab" * 16, "ca.pem")
 
 

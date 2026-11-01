@@ -14,15 +14,20 @@ Every planted string is assembled at run time, so no committed literal looks lik
 
 from __future__ import annotations
 
+import inspect
+import sys
 import textwrap
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import ModuleType
 
 import httpx
 import pytest
 
+import messagefoundry
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
+from messagefoundry.exception_origin import raised_by_the_engine, worded_by_the_engine
 from messagefoundry.pipeline import Engine
 
 #: Assembled at run time: the text a config module raises, which must never be echoed.
@@ -387,3 +392,433 @@ def test_a_helper_symlinked_from_another_folder_is_named(tmp_path: Path) -> None
         pytest.skip("this account cannot create symlinks")
     (msg,) = _messages(cfg)
     assert "RuntimeError in _common.py at line 2" in msg
+
+
+# --- what is left of the withholding (vault BACKLOG #3765) ------------------------------------------
+
+
+def _load_error(d: Path) -> WiringError:
+    with pytest.raises(WiringError) as ei:
+        load_config(d)
+    return ei.value
+
+
+# Item 2: a factory typo names the bad keyword, and only a keyword the source spells.
+
+
+@pytest.mark.parametrize(
+    ("call", "line"),
+    [
+        ("MLLP(prot=2575)", 3),
+        ("MLLP(\n    host='h',\n    prot=2575,\n)", 3),
+    ],
+    ids=["one-line", "wrapped"],
+)
+def test_a_factory_keyword_typo_names_the_keyword(tmp_path: Path, call: str, line: int) -> None:
+    _write(tmp_path, "feed.py", f"from messagefoundry import MLLP\n\n{call}\n")
+    (msg,) = _messages(tmp_path)
+    assert f"TypeError at line {line} naming 'prot'" in msg
+
+
+def test_a_keyword_given_twice_is_named(tmp_path: Path) -> None:
+    _write(tmp_path, "feed.py", "def f(a):\n    pass\n\nf(1, a=2)\n")
+    (msg,) = _messages(tmp_path)
+    assert "TypeError at line 4 naming 'a'" in msg
+
+
+def test_a_run_time_keyword_is_withheld(tmp_path: Path) -> None:
+    # The call's text is the real one, and its keyword is a value the source never spells.
+    _write(
+        tmp_path,
+        "feed.py",
+        f"from messagefoundry import MLLP\n\nk = {_runtime_spelling(IDENT)}\nMLLP(**{{k: 1}})\n",
+    )
+    (msg,) = _messages(tmp_path)
+    assert "TypeError at line 4" in msg
+    assert IDENT not in msg and "naming" not in msg
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"raise TypeError(\"f() got an unexpected keyword argument '{IDENT}'\")",
+        f"class T(TypeError):\n    pass\n\n{IDENT} = 1\nraise T(\"argument '{IDENT}'\", {IDENT})",
+    ],
+    ids=["in-a-string", "subclass"],
+)
+def test_a_type_error_the_module_words_itself_names_nothing(tmp_path: Path, line: str) -> None:
+    _write(tmp_path, "feed.py", f"{line}\n")
+    (msg,) = _messages(tmp_path)
+    assert IDENT not in msg and "naming" not in msg
+
+
+# Item 1: a refusal keeps only what a `raise` in the engine wrote.
+
+_ENGINE_SOURCE = """
+from messagefoundry.config.wiring import WiringError
+
+def wraps_a_builtin(value):
+    try:
+        int(value)
+    except ValueError as exc:
+        raise WiringError(f"inbound 'IB_3765': {exc}") from exc
+
+def wraps_its_repr(value):
+    try:
+        int(value)
+    except ValueError as exc:
+        raise ValueError(f"knob: {exc!r}") from exc
+
+def calls_a_builtin(value):
+    return int(value)
+
+def hides_a_builtin(value):
+    try:
+        int(value)
+    except ValueError:
+        raise WiringError("knob is not a number (value withheld)") from None
+
+def wraps_author_code(fn):
+    try:
+        fn()
+    except Exception as exc:
+        raise WiringError(f"callback failed: {exc}") from exc
+
+def wraps_a_failed_import():
+    raise WiringError("an extra is missing") from ModuleNotFoundError("planted")
+
+def words_its_own():
+    raise ValueError("engine wording 3765")
+
+def wraps_its_own():
+    try:
+        words_its_own()
+    except ValueError as exc:
+        raise WiringError(f"wrapped: {exc}") from exc
+"""
+
+
+@pytest.fixture
+def engine_probe(monkeypatch: pytest.MonkeyPatch) -> str:
+    """A module whose frames count as the engine's, to call with a planted value. Its name is what
+    the rule reads, so it needs no file under ``messagefoundry``."""
+    name = "messagefoundry._probe_3765"
+    module = ModuleType(name)
+    exec(compile(_ENGINE_SOURCE, name, "exec"), module.__dict__)
+    monkeypatch.setitem(sys.modules, name, module)
+    return name
+
+
+def _calling(name: str, call: str) -> str:
+    return f"import {name} as probe\n\nprobe.{call}\n"
+
+
+@pytest.mark.parametrize(
+    ("call", "kept"),
+    [
+        (f"wraps_a_builtin({NEEDLE!r})", "inbound 'IB_3765': [ValueError text withheld]"),
+        (
+            f"wraps_its_repr({NEEDLE!r})",
+            "error loading config module feed.py: knob: [ValueError text withheld]",
+        ),
+    ],
+    ids=["wiring-error", "plain-error"],
+)
+def test_a_refusal_wrapping_a_builtin_loses_the_builtins_text(
+    tmp_path: Path, engine_probe: str, call: str, kept: str
+) -> None:
+    _write(tmp_path, "feed.py", _calling(engine_probe, call))
+    err = _load_error(tmp_path)
+    assert str(err) == kept
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_builtin_failing_in_engine_code_is_withheld(tmp_path: Path, engine_probe: str) -> None:
+    # int() ends in the engine's frame, and its text is the runtime's, quoting the value.
+    _write(tmp_path, "feed.py", _calling(engine_probe, f"calls_a_builtin({NEEDLE!r})"))
+    err = _load_error(tmp_path)
+    assert NEEDLE not in str(err)
+    assert "ValueError at line 3" in str(err) and "withheld" in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_refusal_hiding_a_builtin_with_from_none_drops_it_from_the_chain(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # `from None` hides the context from the printer. A reader of __context__ still gets the value.
+    _write(tmp_path, "feed.py", _calling(engine_probe, f"hides_a_builtin({NEEDLE!r})"))
+    err = _load_error(tmp_path)
+    assert str(err) == "knob is not a number (value withheld)"
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_refusal_wrapping_author_code_loses_the_authors_text(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    body = f"def boom():\n    raise KeyError({NEEDLE!r})\n\nprobe.wraps_author_code(boom)\n"
+    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
+    assert str(_load_error(tmp_path)) == "callback failed: [KeyError text withheld]"
+
+
+def test_an_author_str_that_raises_withholds_the_whole_refusal(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # The wrap itself runs __str__, so the failing str is what the loader finds, with a value on it.
+    body = (
+        "class Bad(Exception):\n"
+        "    def __str__(self):\n"
+        f"        raise RuntimeError({NEEDLE!r})\n\n"
+        "def boom():\n"
+        "    raise Bad()\n\n"
+        "probe.wraps_author_code(boom)\n"
+    )
+    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
+    assert NEEDLE not in str(_load_error(tmp_path))
+
+
+def test_a_rebuilt_refusal_keeps_a_textless_import_cause(tmp_path: Path, engine_probe: str) -> None:
+    # The engine-shard preflight reads the cause's type for its helper advice.
+    _write(tmp_path, "feed.py", _calling(engine_probe, "wraps_a_failed_import()"))
+    err = _load_error(tmp_path)
+    assert str(err) == "an extra is missing"
+    assert isinstance(err.__cause__, ModuleNotFoundError)
+    assert not err.__cause__.args
+
+
+@pytest.mark.parametrize(
+    ("call", "text"),
+    [
+        ("words_its_own()", "error loading config module feed.py: engine wording 3765"),
+        ("wraps_its_own()", "wrapped: engine wording 3765"),
+    ],
+    ids=["own-text", "own-wrap"],
+)
+def test_engine_wording_is_kept_with_its_chain(
+    tmp_path: Path, engine_probe: str, call: str, text: str
+) -> None:
+    _write(tmp_path, "feed.py", _calling(engine_probe, call))
+    err = _load_error(tmp_path)
+    assert str(err) == text
+    assert isinstance(err.__cause__, ValueError)
+
+
+#: Connection factories, read whole below: a parameter added later is read too.
+_FACTORIES = [
+    "MLLP",
+    "Tcp",
+    "X12",
+    "Http",
+    "File",
+    "Timer",
+    "Loopback",
+    "PassThrough",
+    "Rest",
+    "Direct",
+    "Email",
+    "SMTP",
+    "FHIR",
+    "DICOM",
+    "DICOMweb",
+    "Database",
+    "Soap",
+    "Sftp",
+    "Ftp",
+    "FileRef",
+    "DatabaseRef",
+    "FhirToken",
+]
+
+#: A dict KEY the refusal names. ``body_secrets`` keys are template tokens, and the refusal is about
+#: the value under one, which it does not quote.
+_QUOTES_A_NAME: frozenset[tuple[str, str, type]] = frozenset({("Soap", "body_secrets", dict)})
+
+
+def _required_arguments(factory: Callable[..., object]) -> dict[str, object]:
+    samples: dict[str, object] = {"port": 2575, "host": "127.0.0.1"}
+    return {
+        p.name: samples.get(p.name, "x")
+        for p in inspect.signature(factory).parameters.values()
+        if p.default is inspect.Parameter.empty and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+    }
+
+
+@pytest.mark.parametrize("factory_name", _FACTORIES)
+def test_no_factory_refusal_quotes_a_planted_value(factory_name: str) -> None:
+    factory = getattr(messagefoundry, factory_name)
+    required = _required_arguments(factory)
+    for parameter in inspect.signature(factory).parameters.values():
+        if parameter.kind in (parameter.VAR_KEYWORD, parameter.VAR_POSITIONAL):
+            continue
+        for value in (NEEDLE, NEEDLE.encode(), [NEEDLE], {NEEDLE: [NEEDLE]}):
+            if (factory_name, parameter.name, type(value)) in _QUOTES_A_NAME:
+                continue
+            try:
+                factory(**{**required, parameter.name: value})
+            except (ValueError, TypeError) as exc:
+                assert NEEDLE not in str(exc), (parameter.name, type(value))
+
+
+@pytest.mark.parametrize(
+    ("call", "wording"),
+    [
+        (f"Http(port=1, intake_auth={NEEDLE!r})", "Http intake_auth must be one of"),
+        (f"Http(port=1, intake_auth_health={NEEDLE!r})", "must be 'require' or 'allow'"),
+        (f"Rest(url='https://x.example/', tls_ca_pin={NEEDLE!r})", "must be a SHA-256 hex digest"),
+        (
+            f"Rest(url='https://x.example/', tls_ca_pin='md5{NEEDLE}:ab')",
+            "names a digest this release does not support",
+        ),
+        (
+            f"Http(port=1, intake_client_subjects={{{NEEDLE!r}: ['x']}})",
+            "is not an RFC 4514 distinguished name",
+        ),
+    ],
+    ids=["intake-auth", "intake-auth-health", "pin-shape", "pin-digest", "issuer"],
+)
+def test_a_measured_refusal_fires_without_its_value(
+    tmp_path: Path, call: str, wording: str
+) -> None:
+    _write(tmp_path, "feed.py", f"from messagefoundry import Http, Rest\n\n{call}\n")
+    (msg,) = _messages(tmp_path)
+    assert wording in msg and NEEDLE not in msg
+
+
+@pytest.mark.parametrize(
+    ("argument", "wording"),
+    [
+        (f"source_ip_allowlist=[{NEEDLE!r}]", "source_ip_allowlist entry 0 is not a valid"),
+        (f"content_type={NEEDLE!r}", "invalid content_type, value withheld"),
+    ],
+    ids=["allowlist", "content-type"],
+)
+def test_an_inbound_refusal_fires_without_its_value(
+    tmp_path: Path, argument: str, wording: str
+) -> None:
+    _write(
+        tmp_path,
+        "feed.py",
+        "from messagefoundry import MLLP, inbound\n\n"
+        f"inbound('IB', MLLP(port=1), router='r', {argument})\n",
+    )
+    (msg,) = _messages(tmp_path)
+    assert wording in msg and NEEDLE not in msg
+
+
+def test_a_soap_password_type_refusal_fires_without_its_value(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "feed.py",
+        "from messagefoundry import Soap, outbound\n\n"
+        f"outbound('OB', Soap(url='https://x.example/', ws_password_type={NEEDLE!r}))\n",
+    )
+    (msg,) = _messages(tmp_path)
+    assert "ws_password_type must be 'text'" in msg and NEEDLE not in msg
+
+
+# Item 4: whatever else a config module raises is a failed module, and carries no text.
+
+
+@pytest.mark.parametrize(
+    ("raised", "name"),
+    [
+        (f"BaseException({NEEDLE!r})", "BaseException"),
+        (f"GeneratorExit({NEEDLE!r})", "GeneratorExit"),
+        (f"asyncio.CancelledError({NEEDLE!r})", "CancelledError"),
+        (f"Mine({NEEDLE!r})", "Mine"),
+        (f"BaseExceptionGroup({NEEDLE!r}, [KeyboardInterrupt()])", "BaseExceptionGroup"),
+        (f"KeyboardInterrupt({NEEDLE!r})", "KeyboardInterrupt"),
+    ],
+    ids=["plain", "generator-exit", "cancelled", "subclass", "group", "interrupt-with-text"],
+)
+def test_a_base_exception_is_a_refused_module_with_no_text(
+    tmp_path: Path, raised: str, name: str
+) -> None:
+    _write(
+        tmp_path,
+        "feed.py",
+        f"import asyncio\n\nclass Mine(BaseException):\n    pass\n\nraise {raised}\n",
+    )
+    before = set(sys.modules)
+    err = _load_error(tmp_path)
+    assert NEEDLE not in str(err)
+    assert f"feed.py: {name} at line 6" in str(err) and "withheld" in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+    added = (sys.modules[m] for m in set(sys.modules) - before)
+    assert not [m for m in added if getattr(m, "__file__", None) == str(tmp_path / "feed.py")]
+
+
+def test_a_base_exception_from_a_helper_names_the_helper(tmp_path: Path) -> None:
+    _write(tmp_path, "_helper.py", f"raise BaseException({NEEDLE!r})\n")
+    _write(tmp_path, "feed.py", "import _helper\n")
+    (msg,) = _messages(tmp_path)
+    assert NEEDLE not in msg and "BaseException in _helper.py at line 1" in msg
+
+
+def test_a_base_exception_does_not_stop_validate_reading_the_next_module(tmp_path: Path) -> None:
+    _write(tmp_path, "a_feed.py", f"raise BaseException({NEEDLE!r})\n")
+    _write(tmp_path, "b_feed.py", "raise RuntimeError('second')\n")
+    assert [m.split(":")[0] for m in _messages(tmp_path)] == [
+        "error loading config module a_feed.py",
+        "error loading config module b_feed.py",
+    ]
+
+
+def test_a_real_interrupt_still_propagates(tmp_path: Path) -> None:
+    # What a signal raises: no arguments, so no text. Refusing it would make Ctrl-C a config error.
+    _write(tmp_path, "feed.py", "raise KeyboardInterrupt\n")
+    with pytest.raises(KeyboardInterrupt):
+        load_config(tmp_path)
+
+
+# Item 3: a harness graph's knob refusal reaches its reader, through the node's captured output.
+
+
+@pytest.mark.parametrize(
+    ("graph", "knob"),
+    [
+        ("load", "MEFOR_LOAD_TRANSFORM"),
+        ("estate", "MEFOR_ESTATE_TRANSFORM"),
+        ("connscale", "MEFOR_CONNSCALE_TRANSFORM"),
+        ("shardcert", "MEFOR_SHARDCERT_TRANSFORM"),
+    ],
+)
+def test_a_harness_knob_refusal_is_printed_while_the_loader_withholds_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], graph: str, knob: str
+) -> None:
+    monkeypatch.setenv(knob, "no-such-transform")
+    messages = _messages(Path(__file__).parent.parent / "harness" / "config" / graph)
+    assert any("ValueError" in m and "withheld" in m and knob not in m for m in messages), messages
+    assert knob in capsys.readouterr().err
+
+
+# Item 5: one rule, in one place.
+
+
+def _raised_in(module_name: str, source: str) -> BaseException:
+    namespace: dict[str, object] = {"__name__": module_name}
+    with pytest.raises(Exception) as ei:  # noqa: PT011 - each caller's source picks the type
+        exec(compile(source, module_name, "exec"), namespace)
+    return ei.value
+
+
+@pytest.mark.parametrize(
+    ("module", "source", "raised", "worded"),
+    [
+        ("messagefoundry.x", "raise ValueError('ours')", True, True),
+        ("messagefoundry", "raise ValueError('ours')", True, True),
+        ("messagefoundry.x", "int('x')", True, False),
+        ("messagefoundry.x", "{}['k']", True, False),
+        ("mefor_config_feed_abc", "raise ValueError('theirs')", False, False),
+        ("messagefoundry_lookalike", "raise ValueError('theirs')", False, False),
+    ],
+    ids=["raise", "package", "builtin", "lookup", "config-module", "lookalike-package"],
+)
+def test_who_raised_an_exception(module: str, source: str, raised: bool, worded: bool) -> None:
+    exc = _raised_in(module, source)
+    assert raised_by_the_engine(exc) is raised
+    assert worded_by_the_engine(exc) is worded
+
+
+def test_an_exception_never_raised_has_no_origin() -> None:
+    assert not raised_by_the_engine(ValueError("x"))
+    assert not worded_by_the_engine(ValueError("x"))

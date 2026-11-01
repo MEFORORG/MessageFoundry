@@ -103,6 +103,7 @@ from messagefoundry.connection_names import (
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
+from messagefoundry.exception_origin import worded_by_the_engine
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
@@ -3104,13 +3105,10 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
     mode = settings["intake_auth"]
     if mode not in ("none", *_INTAKE_KEY_MODES, "mtls_subject"):
         raise WiringError(
-            f"Http intake_auth must be one of none/api_key/bearer/mtls_subject — got {mode!r}"
+            "Http intake_auth must be one of none/api_key/bearer/mtls_subject (value withheld)"
         )
     if settings["intake_auth_health"] not in ("require", "allow"):
-        raise WiringError(
-            "Http intake_auth_health must be 'require' or 'allow' — got "
-            f"{settings['intake_auth_health']!r}"
-        )
+        raise WiringError("Http intake_auth_health must be 'require' or 'allow' (value withheld)")
 
     for name in ("intake_api_key", "intake_api_key_next"):
         value = settings[name]
@@ -6961,7 +6959,7 @@ def _check_source_ip_allowlist(
             f"inbound connection {name!r}: source_ip_allowlist is only valid for an "
             "MLLP/TCP/X12/DIMSE listen source"
         )
-    for entry in allowlist:
+    for position, entry in enumerate(allowlist):
         if not isinstance(entry, str) or not entry.strip():
             raise WiringError(
                 f"inbound connection {name!r}: source_ip_allowlist entries must be non-empty strings"
@@ -6973,8 +6971,8 @@ def _check_source_ip_allowlist(
                 ipaddress.ip_address(entry)
         except ValueError as exc:
             raise WiringError(
-                f"inbound connection {name!r}: source_ip_allowlist entry {entry!r} is not a valid "
-                f"IP address or CIDR network ({exc})"
+                f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
+                "IP address or CIDR network (value withheld)"
             ) from exc
     return tuple(allowlist)
 
@@ -6994,7 +6992,7 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
     except ValueError as exc:
         allowed = ", ".join(repr(member.value) for member in ContentType)
         raise WiringError(
-            f"inbound connection {name!r}: invalid content_type {content_type!r} (allowed: {allowed})"
+            f"inbound connection {name!r}: invalid content_type, value withheld (allowed: {allowed})"
         ) from exc
 
 
@@ -7616,8 +7614,8 @@ def build_outbound_connection(
             )
         if pw_type != "text":
             raise WiringError(
-                f"outbound connection {name!r}: SOAP ws_password_type must be 'text', "
-                f"got {pw_type!r} (ADR 0015, BACKLOG #1171)."
+                f"outbound connection {name!r}: SOAP ws_password_type must be 'text', value "
+                "withheld (ADR 0015, BACKLOG #1171)."
             )
         if (spec.settings.get("ws_security") or spec.settings.get("ws_addressing")) and str(
             spec.settings.get("soap_version", "1.1")
@@ -9411,24 +9409,19 @@ def untrusted_install_paths() -> list[str]:
     return reasons
 
 
-def _raised_by_the_engine(exc: BaseException) -> bool:
-    """Whether the innermost frame of ``exc``'s traceback is this package's own code, judged by the
-    frame's module name, as ``__main__._is_engine_refusal`` judges it. A config module and its
-    helpers run as ``mefor_config_*``, never under ``messagefoundry``."""
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    name = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(name, str) and name.split(".")[0] == "messagefoundry"
-
-
 #: Exceptions whose ``name`` attribute is usually an identifier from the SOURCE -- a module, a
 #: variable, an attribute. It is kept only where it also appears in the source line it was raised
 #: from: ``getattr(obj, value)`` or ``import_module(value)`` put a RUNTIME value in ``name``, which
 #: the line does not spell, so such a name is withheld with the rest.
 _NAMED_EXCEPTIONS: Final = (ImportError, NameError, AttributeError)
+
+#: The argument a call's ``TypeError`` objects to: an unexpected keyword or one given twice, which
+#: is how a factory typo reads. No attribute holds it. It goes through the same source-line check as
+#: a ``name``, because ``factory(**{value: 1})`` puts a RUN-TIME value here (vault BACKLOG #3765).
+_CALL_ARGUMENT_RE: Final = re.compile(r"\bargument '([^']+)'")
+
+#: The shortest cause text :func:`_engine_wording` replaces. Shorter, it matches the engine's prose.
+_SHORTEST_QUOTATION: Final = 3
 
 #: How the loader names a config file's module (:func:`_config_module_name`): the prefix, then the
 #: stem, then ``_`` and 12 hex digits. An ImportError naming a helper carries this mangled name.
@@ -9492,18 +9485,30 @@ def _failure_detail(
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
     detail += f" at line {line}"
-    if isinstance(exc, _NAMED_EXCEPTIONS):
-        # `from x import y` puts the module in `name` and the symbol in `name_from`.
+    claimed = _claimed_identifiers(exc)
+    if claimed:
         source = source_of(source_file) if source_of is not None else None
         names_on_line = _dotted_names_on_line(source_file, line, source)
         idents = [
             ident
-            for ident in map(_source_name, (exc.name, getattr(exc, "name_from", None)))
+            for ident in map(_source_name, claimed)
             if ident is not None and _spelled(ident, names_on_line)
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
     return detail
+
+
+def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
+    """What ``exc`` says the source named. Nothing here is trusted until the source line spells it.
+
+    Only an exact ``TypeError`` is read, by its ``args``: a subclass can define what its text is."""
+    if isinstance(exc, _NAMED_EXCEPTIONS):
+        # `from x import y` puts the module in `name` and the symbol in `name_from`.
+        return exc.name, getattr(exc, "name_from", None)
+    if type(exc) is TypeError and exc.args and isinstance(exc.args[0], str):
+        return tuple(_CALL_ARGUMENT_RE.findall(exc.args[0])[:1])
+    return ()
 
 
 def _dotted_names_on_line(source_file: str, line: int, source: bytes | None = None) -> list[str]:
@@ -9591,6 +9596,87 @@ def _textless_import_error(exc: ImportError) -> ImportError:
     return ModuleNotFoundError() if isinstance(exc, ModuleNotFoundError) else ImportError()
 
 
+def _withheld_failure(
+    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
+) -> str:
+    """:func:`_module_failure`, or the type alone when building that detail faults, so the fault
+    cannot escape with ``exc`` chained as its context."""
+    try:
+        return _module_failure(path, exc, source_of)
+    except Exception:  # noqa: BLE001 - the type alone is still a withheld diagnostic
+        return f"error loading config module {path.name}: {type(exc).__name__} ({_WITHHELD})"
+
+
+def _raised_from(exc: BaseException) -> Iterator[BaseException]:
+    """Each exception ``exc`` was raised from, through ``__cause__`` and ``__context__``, once.
+
+    ``from None`` hides a context from the default printer, and it is still there to be read."""
+    seen = {id(exc)}
+    todo = [exc.__cause__, exc.__context__]
+    while todo:
+        link = todo.pop()
+        if link is not None and id(link) not in seen:
+            seen.add(id(link))
+            yield link
+            todo += [link.__cause__, link.__context__]
+
+
+def _engine_wording(
+    path: Path,
+    exc: BaseException,
+    foreign: list[BaseException],
+    source_of: Callable[[str], bytes | None],
+) -> str:
+    """The text of ``exc``, an engine refusal, with each ``foreign`` exception's text it quotes
+    replaced by that exception's type name (vault BACKLOG #3765 item 1).
+
+    A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
+    ``int()`` or a library said, and either can quote the value it was given. A quotation in any
+    other shape, such as a slice of that text, is not caught. So the raise sites that wrap are still
+    the place to convert a failure."""
+    try:
+        quoted = {
+            text: type(link).__name__
+            for link in foreign
+            for text in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
+            if len(text) >= _SHORTEST_QUOTATION
+        }
+        text = str(exc)
+        if quoted:
+            # One pass, longest first, so a repr goes before the str inside it and no replacement
+            # is searched again.
+            pattern = "|".join(re.escape(q) for q in sorted(quoted, key=len, reverse=True))
+            text = re.sub(pattern, lambda m: f"[{quoted[m[0]]} text withheld]", text)
+    except Exception:  # noqa: BLE001 - a foreign __str__ runs here, and it can raise
+        return _withheld_failure(path, exc, source_of)
+    return (
+        text if isinstance(exc, WiringError) else f"error loading config module {path.name}: {text}"
+    )
+
+
+def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -> None:
+    """Run a config module, then load its helpers, and refuse a ``BaseException`` it raises that is
+    not an :class:`Exception`. ``_exec_module`` handles only that class, so anything else would
+    leave the loader with its text (vault BACKLOG #3765 item 4). ``SystemExit`` is not handled here.
+
+    A bare ``KeyboardInterrupt`` still propagates: it is what a real interrupt raises, and it has no
+    text. One that carries arguments was raised by code, so it is refused like the rest."""
+    refused: WiringError | None = None
+    try:
+        helpers.run(module, path)
+        # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
+        helpers.preload(path)
+    except (Exception, SystemExit):
+        raise
+    except BaseException as exc:
+        if type(exc) is KeyboardInterrupt and not exc.args:
+            raise
+        refused = WiringError(_withheld_failure(path, exc, helpers.source_of))
+    if refused is not None:
+        # Raised AFTER the handler, for the reason _exec_module gives.
+        raise refused
+
+
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     # Register the module in sys.modules under its path-derived name so intra-config imports and
     # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
@@ -9600,35 +9686,34 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     withheld: WiringError | None = None
     cause: ImportError | None = None
     try:
-        helpers.run(module, path)
-        # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
-        helpers.preload(path)
+        _run_author_code(path, module, helpers)
     except Exception as exc:
         helpers.unregister(mod_name, module)
         # An import or name error is judged by its identifier, not its frame: a failed import ends
         # in this package's own helper finder whoever wrote the import. A SyntaxError is the
         # author's source failing to compile; the loader compiles it, so its innermost frame is
-        # this package's, and it is judged as the author's failure it is.
+        # this package's, and it is judged as the author's failure it is. A builtin such as int()
+        # failing in engine code is not engine wording either, so it is withheld with the rest.
         if (
-            _raised_by_the_engine(exc)
+            worded_by_the_engine(exc)
             and not isinstance(exc, _NAMED_EXCEPTIONS)
             and not isinstance(exc, SyntaxError)
         ):
             # The engine's own wording -- a factory or registry refusal naming a connection or a
-            # setting -- which is the diagnostic an author needs, so it keeps its text, as before.
-            # That relies on engine raise sites not quoting a value. At least a few wrap another
-            # exception's text (`f"{where}: {exc}"`), and an engine call such as int() on an
-            # author value can quote it; nothing scrubs those here.
-            if isinstance(exc, WiringError):
-                raise
-            raise WiringError(f"error loading config module {path.name}: {exc}") from exc
-        try:
-            withheld = WiringError(_module_failure(path, exc, helpers.source_of))
-        except Exception:  # noqa: BLE001 - a fault building the detail must not escape with `exc`
-            # chained as its context; the type alone is still a withheld diagnostic.
-            withheld = WiringError(
-                f"error loading config module {path.name}: {type(exc).__name__} ({_WITHHELD})"
-            )
+            # setting -- which is the diagnostic an author needs, so it keeps its text. That relies
+            # on engine raise sites not quoting a value (tests/test_config_module_error_withheld.py
+            # reads every factory for one). Anything it was raised from that the engine did not word
+            # can hold a value: such text is taken out of the refusal, and off the chain.
+            foreign = [link for link in _raised_from(exc) if not worded_by_the_engine(link)]
+            if not foreign:
+                if isinstance(exc, WiringError):
+                    raise
+                raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+            withheld = WiringError(_engine_wording(path, exc, foreign, helpers.source_of))
+            if isinstance(exc.__cause__, ImportError):
+                cause = _textless_import_error(exc.__cause__)
+        else:
+            withheld = WiringError(_withheld_failure(path, exc, helpers.source_of))
         # An import failure keeps a textless stand-in of its type as the cause, because the
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
@@ -9693,10 +9778,9 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
                 _exec_module(path, helpers)
             except WiringError as exc:
                 # Not scrubbed, because the scrub would mangle the engine's own fix advice, which
-                # spells `credential_password=env(...)`. `_module_failure` withholds a module's own
-                # text (vault BACKLOG #3249), but an engine-raised WiringError passes through as
-                # worded, and at least a few engine raise sites wrap another exception's text, so
-                # this arm can still print an author value (vault BACKLOG #3765 item 1).
+                # spells `credential_password=env(...)`. `_exec_module` has already withheld a
+                # module's own text (vault BACKLOG #3249) and any text an engine refusal wraps
+                # (vault BACKLOG #3765 item 1); it cannot reach a value a raise site interpolates.
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
