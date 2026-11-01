@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import traceback
 from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1027,16 +1028,100 @@ def test_a_class_with_its_own_format_cannot_write_the_diagnostic(
     assert NEEDLE not in str(_load_error(tmp_path))
 
 
-def test_an_engine_subclass_of_wiring_error_stands_as_raised(
+@pytest.mark.parametrize(
+    ("member", "kept"), [("__format__", "reply_on_timeout"), ("__repr__", "Bad at line")]
+)
+def test_a_caught_refusal_given_a_subclass_comes_back_plain(
+    tmp_path: Path, member: str, kept: str
+) -> None:
+    # Only the exact class stands. What prints a subclass is more than __str__, and `check` formats
+    # a refusal with an f-string, so judging method by method would leave one out.
+    args = "self, spec" if member == "__format__" else "self"
+    body = (
+        "from messagefoundry import Http\n"
+        "from messagefoundry.config.wiring import WiringError\n\n"
+        f"class Bad(WiringError):\n    def {member}({args}):\n        return {NEEDLE!r}\n\n"
+        "try:\n"
+        "    Http(port=8080, reply_from='OB_X', reply_on_timeout='500')\n"
+        "except WiringError as exc:\n"
+        "    exc.__class__ = Bad\n"
+        "    raise\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert type(err) is WiringError
+    assert kept in str(err) and NEEDLE not in f"{err} {err!r}"
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_an_engine_subclass_of_wiring_error_keeps_its_text_as_a_plain_one(
     tmp_path: Path, engine_probe: str
 ) -> None:
-    # No __str__ of its own, so nothing prints but the builtin: an except clause can read the class.
     body = (
         "from messagefoundry.config.wiring import PortConflictError\n"
         f"import {engine_probe} as probe\n\nprobe.raises_this_type(PortConflictError)\n"
     )
     _write(tmp_path, "feed.py", body)
-    assert type(_load_error(tmp_path)) is wiring.PortConflictError
+    assert type(_load_error(tmp_path)) is WiringError
+
+
+def test_a_context_with_its_own_repr_is_foreign(tmp_path: Path, engine_probe: str) -> None:
+    bad_class = f"class Bad(Exception):\n    def __repr__(self):\n        return {NEEDLE!r}\n"
+    body = (
+        f"import {engine_probe} as probe\n\n{bad_class}\n"
+        "try:\n    probe.raises_this_type(Bad)\nexcept Bad:\n    probe.words_its_own()\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def _frames_holding(left: BaseException, held: type[BaseException]) -> list[str]:
+    """The frames on ``left``'s traceback with a local of type ``held``."""
+    return [
+        frame.f_code.co_name
+        for frame, _line in traceback.walk_tb(left.__traceback__)
+        if any(type(value) is held for value in frame.f_locals.values())
+    ]
+
+
+def test_no_loader_frame_on_a_refusal_holds_the_withheld_original(tmp_path: Path) -> None:
+    # What a locals-capturing crash reporter reads. The module's own frames are gone by then only
+    # because the original is, so nothing here may keep it.
+    _write(tmp_path, "feed.py", f"raise ValueError({NEEDLE!r})\n")
+    assert _frames_holding(_load_error(tmp_path), ValueError) == []
+
+
+def test_no_loader_frame_on_an_interrupt_holds_the_original(tmp_path: Path) -> None:
+    _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
+    with pytest.raises(KeyboardInterrupt) as ei:
+        load_config(tmp_path)
+    held = [
+        frame.f_code.co_name
+        for frame, _line in traceback.walk_tb(ei.value.__traceback__)
+        for value in frame.f_locals.values()
+        if type(value) is KeyboardInterrupt and value is not ei.value
+    ]
+    assert held == []
+
+
+def test_what_a_read_queues_is_not_drained_by_the_next_module(tmp_path: Path) -> None:
+    # A read can import a helper, which queues its own body imports. The next module must not run
+    # them, or a clean file is blamed for another's helper.
+    _write(tmp_path, "_broken.py", "raise ValueError('helper')\n")
+    _write(tmp_path, "_h.py", "def later():\n    import _broken\n")
+    body = (
+        "from messagefoundry.config.wiring import WiringError\n\n"
+        "class Bad(Exception):\n    def __str__(self):\n        import _h\n        return 'x'\n\n"
+        "try:\n"
+        "    raise Bad()\n"
+        "except Bad:\n"
+        "    from messagefoundry import Http\n"
+        "    Http(port=8080, reply_from='OB_X', reply_on_timeout='500')\n"
+    )
+    _write(tmp_path, "a_first.py", body)
+    _write(tmp_path, "b_second.py", "x = 1\n")
+    assert not any("b_second.py" in m for m in _messages(tmp_path))
 
 
 def test_a_helper_left_to_its_guard_is_logged_by_its_real_type_name(
@@ -1229,11 +1314,15 @@ def test_an_interrupt_off_the_main_thread_is_a_refused_module(tmp_path: Path, bo
     assert NEEDLE not in str(left) and "KeyboardInterrupt at line 1" in str(left)
 
 
-#: The two places the loader reads a failed module's exception: the withheld diagnostic, on a class
-#: the module raised itself, and the judgement of an engine refusal, on a context it was handling.
+#: Places the loader reads a failed module's exception under one guard: the withheld diagnostic, on
+#: an Exception or on any other BaseException the module raised, and the judgement of an engine
+#: refusal, on a context it was handling.
 _READ_WINDOWS = {
     "module-failure": (
         "class Bad(Exception):\n    def __getattr__(self, name):\n        {fault}\n\nraise Bad()\n"
+    ),
+    "base-exception": (
+        "class Bad(BaseException):\n    def __getattr__(self, name):\n        {fault}\n\nraise Bad()\n"
     ),
     "refusal": (
         "import {probe} as probe\n\n"
@@ -1285,14 +1374,34 @@ def test_an_exit_in_the_loaders_read_leaves_with_no_module_exception_on_it(
     assert ei.value.__context__ is None and ei.value.__cause__ is None
 
 
-def test_a_class_answering_as_an_exit_in_the_loaders_read_is_absorbed(
+def test_an_exit_raised_in_a_handler_in_the_read_leaves_with_nothing_on_it(
     tmp_path: Path, fails_in_the_read: Callable[[str], Path]
 ) -> None:
-    # Only the real class is an exit. Raised, this one would leave with its text.
     fails_in_the_read(
-        "class Liar(BaseException):\n            __class__ = SystemExit\n"
-        f"        raise Liar({NEEDLE!r})"
+        f"try:\n            raise ValueError({NEEDLE!r})\n"
+        "        except ValueError:\n            raise SystemExit(3)"
     )
+    with pytest.raises(SystemExit) as ei:
+        load_config(tmp_path)
+    assert ei.value.code == 3
+    assert ei.value.__context__ is None and ei.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "class Liar(BaseException):\n            __class__ = SystemExit\n"
+        f"        raise Liar({NEEDLE!r})",
+        f"class Liar(SystemExit, ValueError):\n            pass\n        raise Liar({NEEDLE!r})",
+        f"class Liar(SystemExit):\n            pass\n        raise Liar({NEEDLE!r})",
+    ],
+    ids=["answering-as-one", "also-an-exception", "subclass"],
+)
+def test_only_an_exact_exit_leaves_the_loaders_read(
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], fault: str
+) -> None:
+    # What a module raises directly is the same: an exit class that is an Exception is refused.
+    fails_in_the_read(fault)
     assert NEEDLE not in str(_load_error(tmp_path))
 
 

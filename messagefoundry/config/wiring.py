@@ -9461,8 +9461,9 @@ def _module_failure(
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
     withheld diagnostic: :func:`_read_fault` says what happens to one. The module is refused, which
-    ends a load, and a ``validate`` run goes on to its next module. Call this outside any handler of
-    ``exc``, so a stop leaving through here does not carry ``exc`` as its context."""
+    ends a load, and a ``validate`` run goes on to its next module, unless the fault is a stop,
+    which ends either. Call this outside any handler of ``exc``, so a stop leaving through here
+    does not carry ``exc`` as its context."""
     fault: BaseException | None = None
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
@@ -9490,15 +9491,16 @@ def _read_fault(path: Path, fault: BaseException) -> None:
 
     Called after the ``except`` that caught it, so what this raises carries neither ``fault`` nor
     the module's exception. A read runs the module's code, so a real Ctrl-C can land in it: that
-    stops the load as a new, bare interrupt, by the rule :func:`_run_author_code` gives. An exit
-    leaves as a module's own does, except on a worker, where it would stop the event loop as an
-    interrupt would. Anything else is absorbed, and logged: the file and the fault's type, never
-    its text, which is the module's, so ``exc_info`` stays off too."""
+    stops the load as a new, bare interrupt, by the rule :func:`_run_author_code` gives. An exact
+    ``SystemExit`` leaves as a new one with its code, which the loader does not handle, except on a
+    worker, where it would stop the event loop as an interrupt would. Exact, because a subclass can
+    also be an ``Exception``, which a module's own raise of it is refused as. Anything else is
+    absorbed, and logged: the file and the fault's type, never its text, which is the module's, so
+    ``exc_info`` stays off too."""
     if _is_a_signal(fault):
         raise KeyboardInterrupt
-    # The real type, as _refusal_for reads it: isinstance would run a ``__class__`` of the module's.
-    if issubclass(type(fault), SystemExit) and _on_the_main_thread():
-        raise fault
+    if type(fault) is SystemExit and _on_the_main_thread():
+        raise SystemExit(fault.code)
     _logger.warning(
         "config module %s: reading its failure raised %s, so the diagnostic is reduced",
         safe_name(path.name),
@@ -9662,16 +9664,17 @@ def _textless_import_error(exc: ImportError) -> ImportError:
 
 def _is_engine_text(exc: BaseException) -> bool:
     """Whether what ``exc`` prints is what a ``raise`` in this package wrote: an engine frame raised
-    it, and its class prints through a builtin's ``__str__``. A class's own method writes what
-    prints, whoever raised the instance. Read from the class dicts, so no code of the class runs."""
-    return (
-        worded_by_the_engine(exc)
-        and id(_class_attribute(type(exc), "__str__")) in _BUILTIN_EXC_RENDERS
+    it, and its class renders through a builtin's ``__str__`` and ``__repr__``. A class's own method
+    writes what prints, whoever raised the instance. Read from the class dicts, so no code of the
+    class runs."""
+    return worded_by_the_engine(exc) and all(
+        id(_class_attribute(type(exc), name)) in _BUILTIN_EXC_RENDERS
+        for name in ("__str__", "__repr__")
     )
 
 
 def _keeps_engine_wording(exc: BaseException) -> bool:
-    """Whether the loader may print ``exc``'s own text: a ``raise`` in this package wrote it.
+    """Whether the loader may print ``exc``'s own text: :func:`_is_engine_text`.
 
     An import or name error is judged by its identifier, not its frame: a failed import ends in
     this package's own helper finder whoever wrote the import. A builtin such as ``int()`` failing
@@ -9693,7 +9696,8 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
     ``WiringError`` from this text, so a subclass, every note and the whole chain go with it,
     engine links included.
 
-    A foreign link is one the engine did not word, ``from None`` or not: that hides a context from
+    A foreign link is one that is not :func:`_is_engine_text`, ``from None`` or not: that hides a
+    context from
     the default printer, and it is still there to be read. A note counts because a printed traceback
     shows it, and ``add_note`` works on a refusal a config module caught.
 
@@ -9728,12 +9732,14 @@ def _refusal_for(
     when ``exc`` stands as raised.
 
     The engine's own wording -- a factory or registry refusal naming a connection or a setting --
-    is the diagnostic an author needs, so it keeps its text. A class with its own ``__str__`` does
-    not, whoever raised it: :func:`_is_engine_text`. That relies on engine raise sites not quoting a value;
-    tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no refusal
-    that sits behind another. What it was raised from that the engine did not word can hold a value:
-    the whole text of such an exception is taken out of the refusal, and the chain goes. A slice of
-    that text, or a copy made before the raise, stays.
+    is the diagnostic an author needs, so it keeps its text. A class with its own render does not,
+    whoever raised it: :func:`_is_engine_text`. That relies on engine raise sites not quoting a
+    value; tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no
+    refusal that sits behind another. What it was raised from that the engine did not word can hold
+    a value: the whole text of such an exception is taken out of the refusal, and the chain goes. A
+    slice of that text, or a copy made before the raise, stays. Only an exact ``WiringError`` stands
+    as raised: a subclass can write what prints through more methods than one, and ``check``
+    formats a refusal with an f-string, so any other is rebuilt plain.
 
     An import failure keeps a textless stand-in of its type as the cause, because the engine-shard
     preflight (_config_preflight) reads the cause's type for its helper advice.
@@ -9748,12 +9754,14 @@ def _refusal_for(
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
             if text is None:
-                # The real type: ``__class__`` can answer WiringError, and a bare ``raise`` of that
-                # would leave ``validate_config``, which catches only the real one.
-                if issubclass(type(exc), WiringError):
+                # The real type: ``__class__`` can answer WiringError, and a ``raise`` of that would
+                # leave ``validate_config``, which catches only the real one.
+                if type(exc) is WiringError:
                     return None
-                # ``!s``, or the f-string would run a ``__format__`` of the class's own.
-                return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
+                if not issubclass(type(exc), WiringError):
+                    # ``!s``, or the f-string would run a ``__format__`` of the class's own.
+                    return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
+                text = str(exc)
             imported = exc.__cause__
         else:
             text = _module_failure(path, exc, source_of)
@@ -9786,10 +9794,13 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except BaseException as exc:
         failure = exc
     if failure is not None:
-        # Judged AFTER the handler, for the reason _exec_module gives.
-        if _is_a_signal(failure):
-            raise KeyboardInterrupt
-        raise WiringError(_module_failure(path, failure, helpers.source_of))
+        # Judged AFTER the handler, for the reason _exec_module gives, and the local goes before the
+        # raise, for the reason it gives there.
+        leaving: BaseException = KeyboardInterrupt()
+        if not _is_a_signal(failure):
+            leaving = WiringError(_module_failure(path, failure, helpers.source_of))
+        del failure
+        raise leaving
 
 
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:
@@ -9800,23 +9811,27 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     helpers.register(mod_name, module)
     failure: Exception | None = None
     try:
-        _run_author_code(path, module, helpers)
-    except Exception as exc:
+        try:
+            _run_author_code(path, module, helpers)
+        except Exception as exc:
+            failure = exc
+        if failure is None:
+            return
+        # Everything from here runs AFTER the handler, so a withheld original is not the __context__
+        # of a refusal or a stop: a rendered traceback, a structured log or a crash reporter would
+        # print it again from there.
         helpers.unregister(mod_name, module)
-        failure = exc
+        refusal = _refusal_for(path, failure, helpers.source_of)
     finally:
-        # Whatever this module queued -- a failure part-way included -- is never drained by the next
-        # module, whose diagnostic would then name the wrong file.
+        # Whatever this module queued -- a failure part-way included, or a read of it importing a
+        # helper -- is never drained by the next module, whose diagnostic would then name the wrong
+        # file.
         helpers.drop_pending()
-    if failure is None:
-        return
-    # Judged and raised AFTER the handler, so a withheld original is not the __context__ of a
-    # refusal or a stop: a rendered traceback, a structured log or a crash reporter would print it
-    # again from there.
-    refusal = _refusal_for(path, failure, helpers.source_of)
     if refusal is None:
         raise failure
     withheld, cause = refusal
+    # This frame is on the refusal's traceback, so a local would keep the original reachable.
+    del failure
     raise withheld from cause
 
 
