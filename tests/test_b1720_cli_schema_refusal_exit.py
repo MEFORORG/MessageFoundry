@@ -48,6 +48,7 @@ _COMMANDS: dict[str, list[str]] = {
         "ops@example.org",
     ],
     "admin-reset-totp": ["admin-reset-totp", "--username", "ops"],
+    "admin-revoke-sessions": ["admin-revoke-sessions"],
     "provision-admin": [
         "provision-admin",
         "--username",

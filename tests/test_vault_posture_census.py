@@ -274,6 +274,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_admin_reset_totp.opened", "open_store", "posture"),
         ("__main__.py", "_admin_set_notify_email.run", "open_store", "posture"),
         ("__main__.py", "_admin_unlock.run", "open_store", "posture"),
+        ("__main__.py", "_admin_revoke_sessions.run", "open_store", "posture"),  # BACKLOG #2614
         ("__main__.py", "_audit_anchor.run", "open_store", "posture"),
         ("__main__.py", "_audit_verify.run", "open_store", "posture"),
         ("__main__.py", "_backup.run", "_BackupRunner", "posture"),

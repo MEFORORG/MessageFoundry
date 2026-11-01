@@ -5575,6 +5575,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # edited on disk with no reload. Keyed by the inbound's name, once per refusal. Not in
         # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
         "sandbox_worker_refused",
+        # BACKLOG #2614: the first start on a store `restore` placed revoked every session. Keyed
+        # `store:restored`, which no connection can be named. An event, with no inverse.
+        "store_restored",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,

@@ -132,6 +132,16 @@ _REQUEST_ARCHIVE_REFUSED = (
 )
 
 
+#: Appended to the seed refusals' ``messagefoundry restore`` command (BACKLOG #2614). ``restore``
+#: refuses an archive past its age limit, 7 days unless ``--max-age-days`` says otherwise, or one
+#: of unknown age, unless ``--allow-old-archive`` is given. A cold seed is often older than that,
+#: and the plain command would then be refused. The 7 is the CLI's default, spelled here because
+#: the pipeline does not import the CLI.
+_OLD_SEED_FLAG = (
+    "; add --allow-old-archive for a seed taken more than 7 days ago or one that does not say when"
+)
+
+
 class DrActivationError(RuntimeError):
     """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
     ``profile``/``state``/``audit``/``error``, the last for an error no abort path caught) so the
@@ -1003,8 +1013,8 @@ class DrCoordinator:
                 "archive (a --config-only backup, or a server-DB store's DBA-delegated one) carries "
                 "no store.db, so nothing could have been restored from it into this box's store. "
                 "Seed this box from a full archive (messagefoundry restore <archive> --to <store "
-                "path>), then activate. Refusing to promote against a seed that carries no store "
-                "(ADR 0048 fail-closed)",
+                f"path>{_OLD_SEED_FLAG}), then activate. Refusing to promote against a seed that "
+                "carries no store (ADR 0048 fail-closed)",
                 actor,
                 now,
             )
@@ -1037,8 +1047,8 @@ class DrCoordinator:
                 "seed",
                 "the cold-seed archive VERIFIED but was never restored into this box's store: the DR "
                 f"store holds 0 messages while the seed carries {seeded}. Restore it first "
-                "(messagefoundry restore <archive> --to <store path>), then activate. Refusing to "
-                "promote onto an empty store (ADR 0048 fail-closed)",
+                f"(messagefoundry restore <archive> --to <store path>{_OLD_SEED_FLAG}), then "
+                "activate. Refusing to promote onto an empty store (ADR 0048 fail-closed)",
                 actor,
                 now,
             )

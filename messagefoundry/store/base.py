@@ -107,6 +107,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -145,6 +146,7 @@ __all__ = [
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
     "ResendSourceNotFound",
+    "RestoreRecord",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -3104,6 +3106,32 @@ class AuthStore(Protocol):
         writes the count beside its sweep with the same clause, and the session-seal contract
         checks the pair on every backend. Changes nothing, takes no lock and raises no epoch,
         so a concurrent sign-in can still move the number before the revoke runs."""
+        ...
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
+        return how many it revoked (BACKLOG #2614).
+
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss. A kept session whose seal does not verify raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        ...
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record, once, a restore the engine has not yet recorded (BACKLOG #2614).
+
+        ``messagefoundry restore`` writes a one-row marker into the store it places. The first
+        call after that reads the marker, revokes every session as :meth:`revoke_all_sessions`
+        does, appends one ``store_restored`` audit row and deletes the marker, all in one
+        transaction, and returns what it found. Every later call, and every call on a store no
+        restore placed, returns ``None`` and writes nothing.
+
+        Only the SQLite backend can hold a marker: a server database's backup and restore are the
+        DBA's (BACKLOG #52), so ``restore`` never places one there, and those backends return
+        ``None``."""
         ...
 
     async def enforce_session_cap(
