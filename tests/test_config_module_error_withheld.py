@@ -25,6 +25,7 @@ import httpx
 import pytest
 
 import messagefoundry
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
 from messagefoundry.exception_origin import raised_by_the_engine, worded_by_the_engine
@@ -585,6 +586,30 @@ def test_an_author_str_that_raises_withholds_the_whole_refusal(
     assert NEEDLE not in str(_load_error(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "member",
+    [
+        f"def __str__(self):\n        raise KeyboardInterrupt({NEEDLE!r})",
+        f"def __str__(self):\n        raise BaseException({NEEDLE!r})",
+        f"@property\n    def reason(self):\n        raise RuntimeError({NEEDLE!r})",
+        f"def __getattr__(self, name):\n        raise LookupError({NEEDLE!r})",
+    ],
+    ids=["str-interrupt", "str-base-exception", "reason-property", "getattr"],
+)
+def test_a_foreign_context_that_faults_when_read_withholds_the_refusal(
+    tmp_path: Path, engine_probe: str, member: str
+) -> None:
+    # Reading the chain runs the author's code, on an exception the module was merely handling.
+    body = (
+        f"class Bad(Exception):\n    {member}\n\n"
+        "try:\n    raise Bad()\nexcept Bad:\n    probe.words_its_own()\n"
+    )
+    _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
+    err = _load_error(tmp_path)
+    assert NEEDLE not in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+
+
 def test_a_rebuilt_refusal_keeps_a_textless_import_cause(tmp_path: Path, engine_probe: str) -> None:
     # The engine-shard preflight reads the cause's type for its helper advice.
     _write(tmp_path, "feed.py", _calling(engine_probe, "wraps_a_failed_import()"))
@@ -693,6 +718,23 @@ def test_no_factory_refusal_quotes_a_planted_value(factory_name: str) -> None:
             f"outbound('OB', Soap(url='https://x.example/', ws_password_type={NEEDLE!r}))",
             "ws_password_type must be 'text'",
         ),
+        (
+            f"Http(port=1, reply_from='OB', reply_on_timeout={NEEDLE!r})",
+            "reply_on_timeout must be '504' or '202'",
+        ),
+        (
+            f"Http(port=1, reply_from='OB', reply_on_empty={NEEDLE!r})",
+            "reply_on_empty must be '204' or '200'",
+        ),
+        (
+            f"Http(port=1, reply_from='OB', reply_content_type={NEEDLE!r})",
+            "reply_content_type must be 'passthrough' or a MIME type",
+        ),
+        (
+            "Http(port=1, tls=True, tls_ca_file='ca', intake_auth='mtls_subject', "
+            f"intake_client_subjects={{'CN=Acme CA': [{NEEDLE!r}]}})",
+            "entries must be qualified",
+        ),
     ],
     ids=[
         "intake-auth",
@@ -703,6 +745,10 @@ def test_no_factory_refusal_quotes_a_planted_value(factory_name: str) -> None:
         "allowlist",
         "content-type",
         "ws-password-type",
+        "reply-on-timeout",
+        "reply-on-empty",
+        "reply-content-type",
+        "unqualified-subject",
     ],
 )
 def test_a_measured_refusal_fires_without_its_value(
@@ -715,6 +761,21 @@ def test_a_measured_refusal_fires_without_its_value(
     )
     (msg,) = _messages(tmp_path)
     assert wording in msg and NEEDLE not in msg
+
+
+@pytest.mark.parametrize(
+    ("call", "wording"),
+    [
+        (f"_check_source_ip_allowlist('IB', True, [{NEEDLE!r}])", "entry 0 is not a valid"),
+        (f"_coerce_content_type('IB', {NEEDLE!r})", "invalid content_type"),
+    ],
+    ids=["allowlist", "content-type"],
+)
+def test_a_refusal_shared_with_toml_keeps_the_value_off_its_chain(call: str, wording: str) -> None:
+    # connections.toml reaches these without `_exec_module`, so nothing strips the chain for it.
+    with pytest.raises(WiringError, match=wording) as ei:
+        eval(call, vars(wiring))
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
 def test_a_missing_code_set_is_named_and_nothing_is_on_the_chain(tmp_path: Path) -> None:

@@ -3,9 +3,11 @@
 """Which code raised an exception, read from its traceback (vault BACKLOG #3765 item 5).
 
 The config loader, ``messagefoundry check-privileges`` and the CLI each read this to decide whether
-to print an exception's text, so all three share one rule. A leaf that imports only the standard
-library: ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``,
-and ``__main__`` without loading anything else.
+to print an exception's text. All three share :func:`raised_by_the_engine`'s frame rule, and only
+the loader also takes the narrower :func:`worded_by_the_engine`, so a builtin's text in engine code
+can still print from the other two. A leaf that imports only the standard library:
+``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``, and
+``__main__`` without loading anything else.
 
 The rule reads the innermost frame's module name. A config module and its helpers run as
 ``mefor_config_*``, never under ``messagefoundry``."""

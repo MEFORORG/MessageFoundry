@@ -3060,13 +3060,9 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
             )
 
     if settings["reply_on_timeout"] not in ("504", "202"):
-        raise WiringError(
-            f"Http reply_on_timeout must be '504' or '202' — got {settings['reply_on_timeout']!r}"
-        )
+        raise WiringError("Http reply_on_timeout must be '504' or '202' (value withheld)")
     if settings["reply_on_empty"] not in ("204", "200"):
-        raise WiringError(
-            f"Http reply_on_empty must be '204' or '200' — got {settings['reply_on_empty']!r}"
-        )
+        raise WiringError("Http reply_on_empty must be '204' or '200' (value withheld)")
 
     content_type = settings["reply_content_type"]
     if not content_type or not str(content_type).strip():
@@ -3075,8 +3071,8 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
         )
     if content_type != "passthrough" and "/" not in str(content_type):
         raise WiringError(
-            f"Http reply_content_type must be 'passthrough' or a MIME type — got {content_type!r}, "
-            "which is neither (a MIME type contains a '/', e.g. 'application/json')"
+            "Http reply_content_type must be 'passthrough' or a MIME type (value withheld; a MIME "
+            "type contains a '/', e.g. 'application/json')"
         )
 
 
@@ -3183,7 +3179,7 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
     ]
     if unqualified:
         raise WiringError(
-            f"Http intake_client_subjects entries must be qualified — {unqualified} are not "
+            f"Http intake_client_subjects entries must be qualified — {len(unqualified)} are not "
             "'CN:<value>' / 'SAN:<type>:<value>', each part non-empty. A certificate's names are "
             "matched as 'CN:<value>' and 'SAN:DNS:<value>' so a spoofed commonName cannot collide "
             "with a pinned SAN; any other name matches nothing and would 403 every request from the "
@@ -3238,7 +3234,7 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
                 f"{label}"
             )
         try:
-            refuse_a_non_canonical_issuer(issuer, setting)
+            refuse_a_non_canonical_issuer(issuer, f"{setting} key {position}")
         except ValueError as exc:
             raise WiringError(str(exc)) from exc
         if _is_nested_envref(names):
@@ -6973,11 +6969,14 @@ def _check_source_ip_allowlist(
                 ipaddress.ip_network(entry, strict=False)
             else:
                 ipaddress.ip_address(entry)
-        except ValueError as exc:
-            raise WiringError(
-                f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
-                "IP address or CIDR network (value withheld)"
-            ) from exc
+            continue
+        except ValueError:
+            pass
+        # Raised AFTER the handler: ipaddress's error quotes the entry, so it stays off the chain.
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
+            "IP address or CIDR network (value withheld)"
+        )
     return tuple(allowlist)
 
 
@@ -6993,11 +6992,13 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
         return content_type
     try:
         return ContentType(content_type)
-    except ValueError as exc:
-        allowed = ", ".join(repr(member.value) for member in ContentType)
-        raise WiringError(
-            f"inbound connection {name!r}: invalid content_type, value withheld (allowed: {allowed})"
-        ) from exc
+    except ValueError:
+        pass
+    # Raised AFTER the handler: the enum's error quotes the value, so it stays off the chain.
+    allowed = ", ".join(repr(member.value) for member in ContentType)
+    raise WiringError(
+        f"inbound connection {name!r}: invalid content_type, value withheld (allowed: {allowed})"
+    )
 
 
 def build_inbound_connection(
@@ -8315,9 +8316,9 @@ class _HelperImporter:
                 # Already failed under a guard elsewhere; this import site must be guarded too, or
                 # every message through it would fail.
                 if not _guard_covers(caught, failed):
-                    # Engine wording, so it passes _exec_module unchanged: the helper and the
-                    # importer are files the loader chose, and the detail was taken from the
-                    # failure's own traceback when it was recorded, under the same withholding.
+                    # Engine wording, so _exec_module keeps this text: the helper and the importer
+                    # are files the loader chose, and the detail was taken from the failure's own
+                    # traceback when it was recorded, under the same withholding.
                     raise WiringError(
                         f"config helper {name}.py failed to load "
                         f"({detail}; {_WITHHELD}), and "
@@ -9629,20 +9630,34 @@ def _foreign_links(exc: BaseException) -> list[BaseException]:
     ]
 
 
-def _engine_wording(
+def _is_an_interrupt(exc: BaseException) -> bool:
+    """Whether ``exc`` is what a real interrupt raises. It has no text, and code that raises one
+    with arguments is not an interrupt."""
+    return type(exc) is KeyboardInterrupt and not exc.args
+
+
+def _rewritten_refusal(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
-) -> str:
-    """The text of ``exc``, an engine refusal, with the text it quotes from each of its
-    :func:`_foreign_links` replaced by that exception's type name (vault BACKLOG #3765 item 1).
+) -> str | None:
+    """The diagnostic for ``exc``, an engine refusal, with the text it quotes from each of its
+    :func:`_foreign_links` replaced by that exception's type name, or ``None`` when it has none
+    and stands as raised (vault BACKLOG #3765 item 1).
 
     A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
     ``int()`` or a library said, and either can quote the value it was given. A quotation in any
     other shape, such as a slice of that text, is not caught. So the raise sites that wrap are still
-    the place to convert a failure."""
+    the place to convert a failure. A short quotation can also take a word of the engine's prose
+    with it, which is the cheaper failure.
+
+    Reading a foreign exception runs its own code (``__str__``, ``__repr__``, a ``reason``
+    property), and that can raise anything, so a fault here withholds the whole refusal."""
     try:
+        foreign = _foreign_links(exc)
+        if not foreign:
+            return None
         quoted = {
             quotation: type(link).__name__
-            for link in _foreign_links(exc)
+            for link in foreign
             for quotation in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
             if len(quotation) >= _SHORTEST_QUOTATION
         }
@@ -9650,7 +9665,9 @@ def _engine_wording(
         # Longest first, so a repr goes before the str inside it.
         for quotation in sorted(quoted, key=len, reverse=True):
             text = text.replace(quotation, f"[{quoted[quotation]} text withheld]")
-    except Exception:  # noqa: BLE001 - a foreign __str__ runs here, and it can raise
+    except BaseException as fault:  # noqa: BLE001 - see the docstring
+        if _is_an_interrupt(fault):
+            raise
         return _module_failure(path, exc, source_of)
     return (
         text if isinstance(exc, WiringError) else f"error loading config module {path.name}: {text}"
@@ -9672,7 +9689,7 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except (Exception, SystemExit):
         raise
     except BaseException as exc:
-        if type(exc) is KeyboardInterrupt and not exc.args:
+        if _is_an_interrupt(exc):
             raise
         refused = WiringError(_module_failure(path, exc, helpers.source_of))
     if refused is not None:
@@ -9695,15 +9712,16 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         if _keeps_engine_wording(exc):
             # The engine's own wording -- a factory or registry refusal naming a connection or a
             # setting -- which is the diagnostic an author needs, so it keeps its text. That relies
-            # on engine raise sites not quoting a value (tests/test_config_module_error_withheld.py
-            # reads every factory for one). Anything it was raised from that the engine did not word
-            # can hold a value: such text is taken out of the refusal, and off the chain. No local
-            # holds those links, because the frame stays on the raised error's traceback.
-            if not _foreign_links(exc):
+            # on engine raise sites not quoting a value; tests/test_config_module_error_withheld.py
+            # sweeps the factories for one, and reaches no refusal that sits behind another. What
+            # it was raised from that the engine did not word can hold a value: such text is taken
+            # out of the refusal, and off the chain.
+            rewritten = _rewritten_refusal(path, exc, helpers.source_of)
+            if rewritten is None:
                 if isinstance(exc, WiringError):
                     raise
                 raise WiringError(f"error loading config module {path.name}: {exc}") from exc
-            withheld = WiringError(_engine_wording(path, exc, helpers.source_of))
+            withheld = WiringError(rewritten)
             if isinstance(exc.__cause__, ImportError):
                 cause = _textless_import_error(exc.__cause__)
         else:

@@ -79,6 +79,7 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
     TOOLKIT_COMMAND,
 )
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.exception_origin import raised_by_the_engine  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
     PRODUCTION_DEBUG_REFUSED,
@@ -12363,8 +12364,6 @@ def _is_engine_refusal(exc: BaseException) -> bool:
     raised from engine code, as the store's refusal sites raise it. A plain one raised by a library,
     or a subclass from elsewhere such as ``NotImplementedError``, is not one. A refusal's text names
     its fix, so it is printed whole."""
-    from messagefoundry.exception_origin import raised_by_the_engine
-
     if not isinstance(exc, RuntimeError):
         return False
     if type(exc) is not RuntimeError:
