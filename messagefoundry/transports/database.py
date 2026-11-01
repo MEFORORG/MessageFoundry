@@ -285,7 +285,7 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # that check means something only while a keyword cannot hand the driver another host. Every ODBC
 # driver has its own keywords for a host, an address, a data source name, a socket or a whole option
 # string, and a new driver release can add another. A list of refused names would always trail the
-# drivers. This list instead names keywords the engine knows to carry no host, and
+# drivers. This list instead names keywords chosen to carry no host, and
 # :func:`_build_odbc_dsn` refuses everything else when the connection is built.
 #
 # WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
@@ -295,8 +295,9 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # a second copy here would leave the driver to choose between the two. A keyword whose only use is
 # to stop certificate verification is absent too.
 #
-# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords. Which driver ``odbc_driver`` names, and
-# what that driver does with the keywords it is sent, are outside it.
+# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords, and a braced password relies on the
+# driver reading the ``}}`` escape. Which driver ``odbc_driver`` names, and what that driver does
+# with the keywords it is sent, are outside it.
 #
 # ``port`` is here because the generic dialect has no other way to send one. It moves the port and
 # never the host.
@@ -944,7 +945,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     ``}}`` escape** (vault BACKLOG #2577, BACKLOG #2705). An ``odbc_params`` keyword must be on
     :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. A driver that takes its target under a keyword off those lists cannot be
+    twice is refused. A driver that takes its target under a keyword other than ``SERVER`` cannot be
     configured on this path. The egress check runs outside this builder, at least in
     ``build_source`` and ``build_destination`` (``transports.base``). This builder sends ``server``
     as written.
