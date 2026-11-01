@@ -362,7 +362,9 @@ def check_attested_and_accepted(attested: bool, accepted: bool) -> None:
     an accepted risk. (The proxy leg reads the acceptance alone, so there the pair adds nothing; it
     is refused as an incoherent declaration all the same.) The factories refuse the pair through
     ``config.wiring``; this is the one rule they share with :class:`Destination` and the
-    ``FhirLookup`` read executor, so neither can be built directly with the pair."""
+    ``FhirLookup`` read executor, so neither can be constructed directly with the pair. It runs at
+    construction only: :class:`Destination` does not validate on assignment, so a flag set on a
+    built model afterwards is not re-checked."""
     if attested and accepted:
         raise ValueError(
             "tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
@@ -808,10 +810,6 @@ class WindowsCredential(BaseModel):
 class Destination(BaseModel):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others."""
-
-    # A refusal from the validators below must not echo the resolved settings, which hold secrets
-    # such as ``proxy_password``, into a ValidationError's input.
-    model_config = ConfigDict(hide_input_in_errors=True)
 
     name: str
     type: ConnectorType

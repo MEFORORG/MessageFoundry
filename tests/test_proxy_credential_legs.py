@@ -271,16 +271,15 @@ def test_tls_hop_attested_does_not_admit_a_proxy_credential(
     assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
 
 
-@pytest.mark.parametrize("target", [_HTTP_TARGET, _HTTPS_TARGET], ids=["http", "https"])
-def test_a_directly_built_destination_refuses_attested_beside_accepted(target: str) -> None:
+def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None:
     """``outbound()`` refuses the pair, and so does the model itself, which is the one check a
     directly built ``Destination`` or ``OutboundConnection`` meets. Before, both built and the
-    acceptance admitted the proxy login. On an ``http`` target the body hop's disposition reads the
-    attestation first, so that hop crossed with no acceptance record (decision
+    acceptance admitted the proxy login. On a cleartext body hop the disposition reads the
+    attestation first, so that hop would cross with no acceptance record (decision
     d20261031T213402506-5d928c keeps ``cleartext_accepted`` as the proxy route and gives
-    ``tls_hop_attested`` none)."""
+    ``tls_hop_attested`` none). The refusal is the model's, so the target does not matter."""
     with pytest.raises(ValueError, match="opposite claims"):
-        _rest(target, accepted=True, attested=True, **_PROXY_LOGIN)
+        _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
 
 
 _ACCEPTED: dict[str, Any] = {
@@ -318,6 +317,15 @@ def test_a_directly_built_fhir_lookup_refuses_an_acceptance_with_no_reason(
     admitted on an acceptance whose record would carry no reason."""
     with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*cleartext_reason"):
         _lookup(cleartext_accepted=True, cleartext_reason=reason)
+
+
+@pytest.mark.parametrize("reason", [None, "   "], ids=["missing", "blank"])
+def test_a_directly_built_fhir_lookup_refuses_a_revocation_attestation_with_no_reason(
+    reason: str | None,
+) -> None:
+    """The sibling pair ``FhirLookupSpec`` refuses the same way."""
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*tls_revocation_attested_reason"):
+        _lookup(**_ACCEPTED, tls_revocation_attested_reason=reason)
 
 
 def test_control_a_directly_built_fhir_lookup_with_the_acceptance_alone_builds() -> None:

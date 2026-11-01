@@ -65,6 +65,7 @@ from messagefoundry.config.models import (
     ConnectorType,
     Destination,
     _check_cleartext_acceptance,
+    _check_revocation_attestation,
     bool_setting,
     check_attested_and_accepted,
     hop_attestation_from_settings,
@@ -1921,10 +1922,11 @@ class FhirLookupExecutor:
             try:
                 attested = hop_attestation_from_settings(s)
                 lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
-                # FhirLookup() and the runner's settings builder refuse an acceptance with no reason
-                # and the attested-plus-accepted pair; a directly built executor meets the same
-                # rules here, so it cannot hold a state the factories refuse.
+                # FhirLookupSpec refuses an acceptance or a revocation attestation with no reason,
+                # and FhirLookup() and the runner's settings builder refuse the attested-plus-
+                # accepted pair. A directly built executor meets those rules here too.
                 _check_cleartext_acceptance(lk_accepted, lk_reason)
+                _check_revocation_attestation(*revocation_attestation_from_settings(s)[:2])
                 check_attested_and_accepted(attested, lk_accepted)
             except ValueError as exc:
                 raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
