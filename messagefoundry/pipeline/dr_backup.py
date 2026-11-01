@@ -1284,7 +1284,7 @@ class BackupRunner:
         so a fault is not one the operator needs to hear about, and none is recorded."""
         if config_dir is None:
             return _ConfigBundle(path=None, bundled=False, fingerprint=None, error=None)
-        from messagefoundry.config.fingerprint import snapshot_fingerprint
+        from messagefoundry.config.fingerprint import describe_left_out, snapshot_fingerprint
         from messagefoundry.config.snapshot import read_config_snapshot
 
         include = self._settings.include_config
@@ -1317,7 +1317,7 @@ class BackupRunner:
             log.warning(
                 "DR backup: the config fingerprint of %s left out what it could not read: %s",
                 config_dir,
-                scrub_log_argument(", ".join(left_out)),
+                scrub_log_argument(describe_left_out(left_out)),
             )
         return _ConfigBundle(
             path=config_dir,

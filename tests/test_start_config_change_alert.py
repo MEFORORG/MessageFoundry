@@ -42,6 +42,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
+from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
@@ -1701,11 +1702,10 @@ async def test_a_start_reads_the_directory_for_a_digest_once(
     """Item 21, LF11: a start read the directory for a digest twice, around its load. The digest of
     what it runs comes from the load's own read, so only the one of the disk now takes a read."""
     reads: list[Any] = []
-    real = fp_mod.read_config_snapshot
 
     def _counted(directory: Any, *, strict: bool) -> Any:
         reads.append(directory)
-        return real(directory, strict=strict)
+        return read_config_snapshot(directory, strict=strict)
 
     with monkeypatch.context() as m:
         m.setattr(fp_mod, "read_config_snapshot", _counted)

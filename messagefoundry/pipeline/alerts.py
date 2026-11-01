@@ -77,7 +77,7 @@ _DETAIL_NODE_MAX = 56
 _DETAIL_NODE_TAIL = 24
 
 
-def _short_node(node: str, limit: int = _DETAIL_NODE_MAX) -> str:
+def _short_node(node: str, limit: int) -> str:
     """``node`` whole when it fits ``limit``, else its head and its ``pid:tag`` tail around
     ``...``, so both the host and the process it names stay readable. Not
     ``intake_bound.process_alert_subject``'s shortening: that one must give a stable alert key, so
@@ -95,7 +95,7 @@ def config_changed_detail(
     baseline_action: str,
     baseline_node: str | None,
     baseline_at: str,
-    comparison: str = "compared",
+    comparison: str,
 ) -> str:
     """The one-line description of a ``config_changed`` alert both sinks show (vault BACKLOG #2597).
 

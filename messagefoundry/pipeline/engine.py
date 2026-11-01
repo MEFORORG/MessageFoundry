@@ -1322,16 +1322,21 @@ class Engine:
         as ``disk_config_left_out``, because the verdict says nothing about those files (vault
         BACKLOG #3765). The log line carries digests and the directory path, never config
         content."""
-        from messagefoundry.config.fingerprint import digest_coverage, same_digest
+        from messagefoundry.config.fingerprint import (
+            DigestCoverage,
+            digest_coverage,
+            left_out_of,
+            same_digest,
+        )
 
         running = digest_coverage(self.loaded_config_fingerprint)
-        activated = await self._dr_config_fingerprint()
+        activated = running.fold if running is not None else None
         fields: dict[str, object] = {"config_fingerprint": activated}
         directory = self.running_config_dir
         if directory is None:
             return fields
         reason: str | None
-        disk: tuple[str, tuple[str, ...]] | None = None
+        disk: DigestCoverage | None = None
         try:
             async with asyncio.timeout(self._dr_settings.takeover_timeout_seconds):
                 if not await asyncio.to_thread(directory.is_dir):
@@ -1355,25 +1360,25 @@ class Engine:
                 fields["disk_config_error"],
             )
             return fields
-        left_out = sorted({*disk[1], *(running[1] if running is not None else ())})
+        left_out = left_out_of(running, disk)
         if left_out:
             fields["disk_config_left_out"] = left_out
-        if activated is None or running is None:
+        if running is None:
             fields["disk_config"] = "unknown"
-            fields["disk_config_fingerprint"] = disk[0]
+            fields["disk_config_fingerprint"] = disk.fold
             return fields
         if same_digest(running, disk):
             fields["disk_config"] = "matches"
             return fields
         fields["disk_config"] = "differs"
-        fields["disk_config_fingerprint"] = disk[0]
+        fields["disk_config_fingerprint"] = disk.fold
         log.warning(
             "DR activation applied the running graph (config fingerprint %s), and did not apply the "
             "config dir %s, which now differs on disk (fingerprint %s). POST /config/reload applies "
             "it, under that route's approval gate.",
             activated,
             directory,
-            disk[0],
+            disk.fold,
         )
         return fields
 

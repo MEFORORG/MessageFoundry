@@ -45,7 +45,10 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
         note = " — the config on disk differs from the running graph"
     if prov.unreadable_files:
         # A clean badge must not read as covering a file neither digest saw (vault BACKLOG #3765).
-        note += f". Not compared, because it could not be read: {', '.join(prov.unreadable_files)}"
+        left_out = ", ".join(
+            "the config directory" if r == "." else r for r in prov.unreadable_files
+        )
+        note += f". Not compared, because it could not be read: {left_out}"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 
 

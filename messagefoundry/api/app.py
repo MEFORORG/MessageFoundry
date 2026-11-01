@@ -327,7 +327,14 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import ConfigDirMissing, digest_coverage, same_digest
+from messagefoundry.config.fingerprint import (
+    ConfigDirMissing,
+    DigestCoverage,
+    describe_left_out,
+    digest_coverage,
+    left_out_of,
+    same_digest,
+)
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -2849,8 +2856,9 @@ type _StartOutcome = Literal[
 ]
 
 #: The outcomes that leave this start unchecked; see :data:`_BASELINE_UNCHECKED`. Only starts that
-#: made no comparison: one that compared, whatever marker it carries, paged on a change and is the
-#: next start's baseline, as every compared start is (vault BACKLOG #2944, #3765).
+#: made no comparison, or have no digest of the bytes they loaded to be a baseline: one that
+#: compared those bytes, whatever marker it carries, paged on a change and is the next start's
+#: baseline, as every compared start is (vault BACKLOG #2944, #3765).
 _UNCHECKED_OUTCOMES: frozenset[str] = frozenset({"read_failed", "no_start_digest"})
 
 
@@ -2875,7 +2883,8 @@ class _StartConfigComparison:
     @property
     def changed(self) -> bool:
         return not same_digest(
-            (self.fingerprint, self.left_out), (self.previous_fingerprint, self.previous_left_out)
+            DigestCoverage(self.fingerprint, self.left_out),
+            DigestCoverage(self.previous_fingerprint, self.previous_left_out),
         )
 
 
@@ -2988,19 +2997,17 @@ async def _compare_start_config(
     if not digests:
         _log.info("config change check skipped: this start has no config fingerprint")
         return "no_start_digest", None
-    left_out = sorted({rel for _fold, unread in digests for rel in unread})
+    left_out = left_out_of(*digests)
     if left_out:
         _log.warning(
             "config change check: this start's config fingerprint left out what it could not "
             "read: %s",
-            scrub_log_argument(
-                ", ".join("the config directory" if rel == "." else rel for rel in left_out)
-            ),
+            scrub_log_argument(describe_left_out(left_out)),
         )
     moved = (
         loaded is not None
         and disk is not None
-        and loaded[1] == disk[1]
+        and loaded.left_out == disk.left_out
         and not same_digest(loaded, disk)
     )
     if moved:
@@ -3044,7 +3051,6 @@ async def _compare_start_config(
                 row.get("action"),
             )
             return "degraded_baseline", None
-        previous, baseline_left_out = baseline
         if scheme is None or detail.get("scheme") != scheme:
             _log.info(
                 "config change check skipped: the store's newest usable %s row used fingerprint "
@@ -3062,21 +3068,21 @@ async def _compare_start_config(
             else "partial_start_digest"
             if left_out
             else "partial_baseline"
-            if baseline_left_out
+            if baseline.left_out
             else "compared"
         )
         judged = next((d for d in digests if not same_digest(d, baseline)), digests[0])
         node = detail.get("node")
         actor = row.get("actor")
         return outcome, _StartConfigComparison(
-            fingerprint=judged[0],
-            previous_fingerprint=previous,
+            fingerprint=judged.fold,
+            previous_fingerprint=baseline.fold,
             baseline_action=str(row.get("action")),
             baseline_actor=actor if isinstance(actor, str) else None,
             baseline_at=_iso_utc(row.get("ts")),
             baseline_node=node if isinstance(node, str) else None,
-            left_out=judged[1],
-            previous_left_out=baseline_left_out,
+            left_out=judged.left_out,
+            previous_left_out=baseline.left_out,
         )
     except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
         _log.warning(
@@ -9316,7 +9322,7 @@ def create_app(
             # No graph loaded yet, or fingerprint unavailable.
             return ConfigProvenance(loaded=False, reload_refused=reload_refused)
         drift = False
-        left_out = set(running[1])
+        on_disk = None
         target = engine.running_config_dir
         if target is not None:
             # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
@@ -9327,16 +9333,15 @@ def create_app(
                 # and so does a change in what a digest left out (vault BACKLOG #3765).
                 on_disk = digest_coverage(current)
                 drift = on_disk is None or not same_digest(on_disk, running)
-                left_out.update(on_disk[1] if on_disk is not None else ())
         git_head = loaded.get("git_head")
         files = loaded.get("files")
         return ConfigProvenance(
             loaded=True,
-            fingerprint=running[0],
+            fingerprint=running.fold,
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
-            unreadable_files=sorted(left_out),
+            unreadable_files=left_out_of(running, on_disk),
             reload_refused=reload_refused,
         )
 

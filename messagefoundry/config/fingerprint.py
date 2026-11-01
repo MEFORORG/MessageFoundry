@@ -24,8 +24,9 @@ exactly like ``load_config`` itself.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import NamedTuple
 
 from messagefoundry.config.snapshot import (
     ConfigDirMissing,
@@ -39,11 +40,14 @@ __all__ = [
     "FINGERPRINT_SCHEME",
     "UNREADABLE_FILES_KEY",
     "ConfigDirMissing",
+    "DigestCoverage",
     "config_fingerprint",
     "config_fingerprint_detail",
+    "describe_left_out",
     "fingerprint_matches",
     "digest_coverage",
     "is_missing_directory",
+    "left_out_of",
     "same_digest",
     "snapshot_fingerprint",
 ]
@@ -166,7 +170,14 @@ def config_fingerprint_detail(
     return detail
 
 
-def digest_coverage(detail: Mapping[str, object] | None) -> tuple[str, tuple[str, ...]] | None:
+class DigestCoverage(NamedTuple):
+    """A digest's fold, with the files and folders it left out (:data:`UNREADABLE_FILES_KEY`)."""
+
+    fold: str
+    left_out: tuple[str, ...]
+
+
+def digest_coverage(detail: Mapping[str, object] | None) -> DigestCoverage | None:
     """The ``fingerprint`` of a :func:`config_fingerprint_detail` with what it left out, or ``None``
     when it has no fingerprint (vault BACKLOG #2944).
 
@@ -181,18 +192,29 @@ def digest_coverage(detail: Mapping[str, object] | None) -> tuple[str, tuple[str
         return None
     left_out = detail.get(UNREADABLE_FILES_KEY)
     if left_out is None:
-        return fingerprint, ()
+        return DigestCoverage(fingerprint, ())
     if isinstance(left_out, list) and all(isinstance(rel, str) for rel in left_out):
-        return fingerprint, tuple(left_out)
-    return fingerprint, ("?",)
+        return DigestCoverage(fingerprint, tuple(left_out))
+    return DigestCoverage(fingerprint, ("?",))
 
 
-def same_digest(one: tuple[str, tuple[str, ...]], other: tuple[str, tuple[str, ...]]) -> bool:
+def same_digest(one: DigestCoverage, other: DigestCoverage) -> bool:
     """Whether two :func:`digest_coverage` results name the same bytes of the same files. The fold
     does not hash what a digest left out, so a partial digest can fold to a whole one's value over
-    other files: the lists are compared too (vault BACKLOG #3765). Every reader that asks whether
-    two digests differ asks here, so a left-out file reads as different everywhere."""
-    return one[1] == other[1] and fingerprint_matches(one[0], other[0])
+    other files: the lists are compared too (vault BACKLOG #3765)."""
+    return one.left_out == other.left_out and fingerprint_matches(one.fold, other.fold)
+
+
+def left_out_of(*digests: DigestCoverage | None) -> list[str]:
+    """Sorted, what any of ``digests`` left out: what a comparison of them says nothing about. A
+    digest that was not taken is skipped."""
+    return sorted({rel for digest in digests if digest is not None for rel in digest.left_out})
+
+
+def describe_left_out(left_out: Iterable[str]) -> str:
+    """``left_out`` for a log line, with ``.`` in words. Paths only, never content; a caller still
+    scrubs it, since a file name is whatever the directory holds."""
+    return ", ".join("the config directory" if rel == "." else rel for rel in left_out)
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:
