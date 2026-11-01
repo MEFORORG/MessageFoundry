@@ -204,6 +204,19 @@ async def test_provenance_does_not_read_clean_on_no_reading(
     assert body["loaded"] is True and body["drift"] is None
 
 
+async def test_provenance_does_not_read_clean_on_a_running_graph_with_no_baseline(
+    client: httpx.AsyncClient, engine: Engine, tmp_path: Path
+) -> None:
+    """A start whose digest failed runs a graph with no baseline. ``loaded`` is false there, and
+    the IDE reads ``drift`` alone, so ``false`` would be a green for a config nobody compared."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    engine.loaded_config_fingerprint = None
+    body = (await client.get("/config/provenance")).json()
+    assert body["loaded"] is False and body["drift"] is None
+
+
 async def test_provenance_requires_auth(engine: Engine) -> None:
     # Gated like every read (require(MONITORING_READ)): with no auth attached and allow_no_auth unset,
     # it is fail-closed 503 "authentication is not configured" (security.py) — never served publicly.

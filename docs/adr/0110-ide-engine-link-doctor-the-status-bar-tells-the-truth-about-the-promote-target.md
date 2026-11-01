@@ -266,8 +266,8 @@ prevent.
 
 ## Amendment — 2026-11-01 (vault BACKLOG #3765)
 
-`GET /config/provenance` can now answer `drift: null`: a graph is loaded and the engine took no on-disk
-fingerprint, so it compared nothing. The union gains **`notCompared`** for it, which Section 1's list
+`GET /config/provenance` can now answer `drift: null`: a graph is running and a fingerprint could not
+be taken, so the engine compared nothing. The union gains **`notCompared`** for it, which Section 1's list
 predates. The 200 proved the session, so this is not `unverified`, and like `drifted` it carries
 `verifiedAt`, survives the tokenless poll and shows the warning background. It offers no promote,
 because nothing says the config differs.

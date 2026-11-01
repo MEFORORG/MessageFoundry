@@ -12,6 +12,7 @@ import {
   POLL_PLAN,
   PROBE_ENDPOINTS,
   VERIFY_PLAN,
+  VERIFY_TTL_MS,
   classifyDeep,
   classifyForbidden,
   escapeMarkdown,
@@ -20,6 +21,7 @@ import {
   planActions,
   readVersion,
   resolveEngineStatusTarget,
+  withStaleness,
   type EngineLink,
 } from "../../engineStatusModel";
 
@@ -307,6 +309,18 @@ suite("engine doctor — the action menu is gated on the state", () => {
   test("drifted ⇒ the FIRST action is promote (the existing command — no second deploy path)", () => {
     const actions = planActions({ state: "drifted", target: T, checkedAt: NOW, verifiedAt: NOW }, NOW);
     assert.strictEqual(actions[0].command, CMD.promote);
+  });
+
+  test("notCompared offers no promote, since nothing says the config differs", () => {
+    const cmds = commandsFor({ state: "notCompared", target: T, checkedAt: NOW, verifiedAt: NOW });
+    assert.ok(!cmds.includes(CMD.promote));
+    assert.ok(cmds.includes(CMD.signOut), "the session is proven, so it can be ended");
+  });
+
+  test("notCompared warns, and decays like any earned verdict", () => {
+    const link: EngineLink = { state: "notCompared", target: T, checkedAt: NOW, verifiedAt: NOW };
+    assert.strictEqual(formatEngineStatus(link, NOW).background, "warning");
+    assert.strictEqual(withStaleness(link, NOW + VERIFY_TTL_MS + 1).state, "unverified");
   });
 
   test("blocked on a credential problem ⇒ deep-link to the console, which owns credentials", () => {

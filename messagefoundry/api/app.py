@@ -9337,9 +9337,9 @@ def create_app(
         fingerprint + best-effort git commit captured at load, and whether the on-disk config has since
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
-        compares it to the loaded baseline. It is ``False`` when there is no baseline, with
-        ``loaded`` false, and ``None`` when no on-disk digest was taken, so a read that compared
-        nothing does not read as clean (vault BACKLOG #3765).
+        compares it to the loaded baseline. It is ``None`` when a graph is running and either digest
+        could not be taken, so a read that compared nothing does not read as clean, and ``False``
+        when no graph is running (vault BACKLOG #3765).
 
         ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
         console's Reload form follows the engine (BACKLOG #3189)."""
@@ -9347,8 +9347,13 @@ def create_app(
         loaded = engine.loaded_config_fingerprint
         running = digest_coverage(loaded)
         if loaded is None or running is None:
-            # No graph loaded yet, or fingerprint unavailable.
-            return ConfigProvenance(loaded=False, reload_refused=reload_refused)
+            # No graph loaded yet, or fingerprint unavailable. A running graph with no baseline
+            # compared nothing, which must not read as clean (vault BACKLOG #3765).
+            return ConfigProvenance(
+                loaded=False,
+                drift=None if engine.registry_runner is not None else False,
+                reload_refused=reload_refused,
+            )
         drift: bool | None = None
         on_disk = None
         target = engine.running_config_dir

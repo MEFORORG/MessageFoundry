@@ -291,9 +291,7 @@ class BackupResult:
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
-    #: A file the archive walk then cannot open fails the run instead, so on a bundled pass this
-    #: names what the walk passed over, or a lock gone by the walk, whose file the archive does
-    #: hold; see :meth:`BackupRunner._inspect_config`.
+    #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
 
 

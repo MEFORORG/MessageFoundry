@@ -1865,14 +1865,11 @@ started together, can each raise it; the alert list folds them into one instance
   file both fingerprints cover still alerts. `GET /config/provenance` and a DR activation's
   `disk_config` verdict apply the same rule and name what was left out, as the count
   `left_out_files` and the list `disk_config_left_out`, so a lock alone can read as drift or
-  `differs` on unchanged bytes (vault BACKLOG #3765). With a graph loaded, `drift` is `null` when the
-  engine took no on-disk fingerprint, since then it compared nothing. With `loaded` false there is
-  no baseline to compare, and `drift` is `false`. A backup compares nothing: it records what
-  its `config_fingerprint` left out as `config_unreadable_files`.
-- A start's fingerprint is of the bytes its load read, when the running graph carries the load's
-  snapshot. One that carries none is fingerprinted from the directory after the load, so any
-  covered file can be left out of it, and a later edit can reach it. A start resolves `env()` values
-  earlier, when the engine is built, so for `environments/` files that means the bytes the load
+  `differs` on unchanged bytes (vault BACKLOG #3765). With a graph running, `drift` is `null` when
+  either fingerprint could not be taken, since then the engine compared nothing, and `loaded` is `false`
+  when it is the loaded one. With no graph running, `drift` is `false`. A backup compares nothing:
+  it records what its `config_fingerprint` left out as `config_unreadable_files`.
+- A start's fingerprint is of the bytes its load read. A start resolves `env()` values earlier, when the engine is built, so for `environments/` files that means the bytes the load
   read, not the bytes the values came from. Just after the load it fingerprints
   the directory once more, and compares both with the baseline, so `config_changed` fires when
   either differs. When the two cover the same files and differ, an edit landed after the load read

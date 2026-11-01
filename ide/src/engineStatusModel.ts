@@ -460,11 +460,16 @@ export function classifyDeep(outcome: ProbeOutcome, prior: EngineLink, now: numb
       ...base,
       state: "notCompared",
       blocked: undefined,
-      reason: "the engine could not fingerprint its config on disk, so it compared nothing",
+      reason: "the engine could not fingerprint its config, so it compared nothing; its log says why",
       verifiedAt: now,
     };
   }
   return { ...base, state: "ok", reason: undefined, blocked: undefined, verifiedAt: now };
+}
+
+/** The states only a deep probe can earn, which carry `verifiedAt`. */
+export function isEarnedState(state: LinkState): boolean {
+  return state === "ok" || state === "drifted" || state === "notCompared";
 }
 
 /**
@@ -472,7 +477,7 @@ export function classifyDeep(outcome: ProbeOutcome, prior: EngineLink, now: numb
  * item cannot sit on a stale "everything's fine" for hours after the session it verified has died.
  */
 export function withStaleness(link: EngineLink, now: number): EngineLink {
-  if (link.state !== "ok" && link.state !== "drifted" && link.state !== "notCompared") {
+  if (!isEarnedState(link.state)) {
     return link;
   }
   if (link.verifiedAt !== undefined && now - link.verifiedAt <= VERIFY_TTL_MS) {
@@ -838,12 +843,13 @@ export function planActions(
       break;
 
     case "notCompared":
-      // Nothing says the config differs, so no promote is offered; the log says why it failed.
+      // Nothing says the config differs, so no promote is offered.
       actions.push({
         label: "$(link-external) Open the web console",
         detail: `${l.target.url}/ui`,
         command: CMD.openConsole,
       });
+      actions.push({ label: "$(sign-out) Sign out", command: CMD.signOut });
       break;
 
     case "ok":

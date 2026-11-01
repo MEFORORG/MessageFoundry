@@ -54,6 +54,7 @@ import {
   classifyDeep,
   classifyHealth,
   formatEngineStatus,
+  isEarnedState,
   planActions,
   readVersion,
   resolveEngineStatusTarget,
@@ -294,10 +295,7 @@ export class EngineStatusBar implements vscode.Disposable {
     // "unverified" while we hold one. The earned verdict expires by re-checking (withStaleness), which is
     // the honest way for it to go — not by being forgotten on the next tick.
     if (next.state === "unverified" && this.link.verifiedAt !== undefined) {
-      next.state =
-        this.link.state === "drifted" || this.link.state === "notCompared"
-          ? this.link.state
-          : "ok";
+      next.state = isEarnedState(this.link.state) ? this.link.state : "ok";
       next.verifiedAt = this.link.verifiedAt;
       next.reason = this.link.reason;
     }
@@ -393,7 +391,7 @@ export class EngineStatusBar implements vscode.Disposable {
       let next = classifyDeep(deep.outcome, this.link, Date.now());
       logProbe(target.url, VERIFY_PLAN[0].route, deep.outcome, deep.ms, next.state);
 
-      if (next.state === "ok" || next.state === "drifted" || next.state === "notCompared") {
+      if (isEarnedState(next.state)) {
         const health = await this.runProbe(VERIFY_PLAN[1], target.url, PROBE_TIMEOUT_MS);
         if (gen !== this.targetGen) {
           return;
