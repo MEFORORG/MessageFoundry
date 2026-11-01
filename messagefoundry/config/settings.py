@@ -10709,7 +10709,9 @@ def security_loosenings(
                 "only) declares cleartext_accepted; a non-enforcing instance builds it with a "
                 "WARNING. A blank, padded or boolean mode value is refused at build on any "
                 "posture, and no declaration lifts that. A hop that is built may carry the rows, "
-                "and the DSN credential, in plaintext",
+                "and the DSN credential, in plaintext. A name marked possibly generic has an env() "
+                "dialect this reading could not resolve, and the above holds of it only if it "
+                "resolves to generic",
             )
         )
     # Owner ruling 2026-09-24: the one per-hop declaration that ALLOWs rather than WARNs, so it is the

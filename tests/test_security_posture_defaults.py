@@ -3371,6 +3371,48 @@ def test_unverified_generic_db_hops_reads_an_env_dialect_as_possibly_generic() -
         DatabaseDestination(built)
 
 
+def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
+    """Both DATABASE inventories read an ``env()`` dialect the way the build does once they are given
+    the values: generic is read as generic, sqlserver as sqlserver. With no value they say the dialect
+    is unresolved rather than guess one arm, and the static-credential reason stays a fixed sentence."""
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        static_credential_db_hops,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV",
+            Database(
+                server="db.example",
+                dialect=env("d"),  # type: ignore[arg-type]
+                auth="integrated",
+                odbc_driver="PostgreSQL Unicode",
+                username="svc",
+                password=env("pw"),
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    # Generic: auth is not read, so the username/password is a static credential, and no mode is set.
+    assert [n for n, _ in static_credential_db_hops(reg, env_values={"d": "generic"})] == ["OB_ENV"]
+    tls = dict(unverified_generic_db_hops(reg, env_values={"d": "generic"}))
+    assert tls["OB_ENV"].startswith("no TLS keyword")
+    # SQL Server: integrated auth is delegated, and the preset is not a generic hop.
+    assert static_credential_db_hops(reg, env_values={"d": "sqlserver"}) == []
+    assert unverified_generic_db_hops(reg, env_values={"d": "sqlserver"}) == []
+    # No value: neither arm is assumed. The generic arm would be static, so the hop is listed, and
+    # the reason is fixed text that names no operator-typed key.
+    unresolved = dict(static_credential_db_hops(reg))
+    assert "unresolved env()" in unresolved["OB_ENV"] and "env(d)" not in unresolved["OB_ENV"]
+    assert "possibly generic" in dict(unverified_generic_db_hops(reg))["OB_ENV"]
+
+
 def test_accepted_cleartext_hops_reads_the_graph() -> None:
     """The single shared reader — `messagefoundry check` and the API posture route both use it, so the
     two can never report different accepted sets."""

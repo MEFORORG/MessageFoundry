@@ -1934,8 +1934,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A
-  `dialect` given as `env()` is listed as possibly generic, naming the reference, because these
-  readers never resolve it.
+  `dialect` given as `env()`: `GET /security/posture` resolves it against the running engine's
+  values, as the build does, and lists the hop only when it resolves to `generic`, or marks the
+  name *possibly generic* when those values do not resolve it. `messagefoundry check` has no
+  values, so it lists such a hop as possibly generic and names the reference's key, never its
+  value.
 - **What it cannot do:** the WARN and these reports refuse nothing. The refusal is
   `generic_cleartext_hop_guard` (BACKLOG #1178): an enforcing instance refuses this hop off-loopback,
   in both directions, unless a per-connection declaration relaxes it

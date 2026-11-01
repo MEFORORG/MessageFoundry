@@ -388,6 +388,7 @@ from messagefoundry.config.tls_policy import (
     phi_read_hop_disposition,
 )
 from messagefoundry.config.wiring import (
+    POSSIBLY_GENERIC_DB_HOP,
     EnvRef,
     InboundConnection,
     Registry,
@@ -1998,7 +1999,24 @@ def _posture_loosenings(
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
     query_hops = hops(query_credential_hops)
-    db_hops = hops(unverified_generic_db_hops)
+    # A DATABASE dialect given as env() is resolved against the values the runner builds with, so a
+    # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
+    # the reader's marker beside its name, because this entry keeps names only and its text states
+    # that each named hop is generic.
+    db_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
+            if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
+            else name
+            for name, reason in unverified_generic_db_hops(
+                registry, env_values=runner.env_values if runner is not None else None
+            )
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     attested_hops = hops(attested_secure_hops)
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
@@ -4705,7 +4723,10 @@ def create_app(
         static_hops = [
             StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
             for hop in static_credential_hops(
-                registry=runner.registry if runner is not None else None, settings=cred_settings
+                registry=runner.registry if runner is not None else None,
+                settings=cred_settings,
+                # A database hop's env() dialect, resolved as the runner's build resolves it.
+                env_values=runner.env_values if runner is not None else None,
             )
             if visible is None or visible(hop.name)
         ]

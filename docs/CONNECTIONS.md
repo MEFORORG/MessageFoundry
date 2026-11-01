@@ -1975,8 +1975,11 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > reported (BACKLOG #1352). A hop that warns is also reported
 > by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
 > line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). A `dialect` given as
-> `env()` is resolved only at build, so those readers list such a hop as possibly generic and name
-> the reference, never its value. This exemption is
+> `env()` is resolved when the connection is built. `GET /security/posture` resolves it against the
+> running engine's values the same way and lists the hop only when it resolves to `generic`; when
+> those values do not resolve it, the posture lists the name marked *possibly generic*.
+> `messagefoundry check` reads the graph without the values, so its `generic-db-tls` line lists such a
+> hop as possibly generic and names the reference's key, never its value. This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
 > **A generic hop that says TLS is not required, or sets no TLS mode, is REFUSED, not merely warned about** (BACKLOG #1178).

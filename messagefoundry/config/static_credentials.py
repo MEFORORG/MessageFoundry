@@ -414,7 +414,10 @@ _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 
 def _graph_hops(
-    registry: Registry, site_proxy: str | None, site_no_proxy: Sequence[str] | None
+    registry: Registry,
+    site_proxy: str | None,
+    site_no_proxy: Sequence[str] | None,
+    env_values: Mapping[str, Any] | None = None,
 ) -> list[StaticCredentialHop]:
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
         inbound_record_name(ic.name) for ic in registry.inbound.values() if not ic.deployed
@@ -423,7 +426,7 @@ def _graph_hops(
     # compliant kind: auth='integrated'/'entra' on the SQL Server preset, a driver keyword on generic.
     out = [
         StaticCredentialHop(name, "static", reason, True)
-        for name, reason in static_credential_db_hops(registry)
+        for name, reason in static_credential_db_hops(registry, env_values=env_values)
         if name not in undeployed
     ]
     dialled = [(oc.name, oc.spec) for oc in registry.outbound.values() if oc.deployed] + [
@@ -545,7 +548,10 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
 
 
 def static_credential_hops(
-    *, registry: Registry | None, settings: ServiceSettings | None
+    *,
+    registry: Registry | None,
+    settings: ServiceSettings | None,
+    env_values: Mapping[str, Any] | None = None,
 ) -> list[StaticCredentialHop]:
     """Every backend hop that presents an unchanging credential or none, sorted by name.
 
@@ -553,12 +559,14 @@ def static_credential_hops(
     Pass ``None`` for a half the caller cannot see: ``registry=None`` reads the service settings only,
     and ``settings=None`` reads the connection graph only. A caller that passes ``None`` must say so in
     its own output. With both, the graph half also reads ``[egress].proxy_url`` and
-    ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent."""
+    ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent.
+    ``env_values``, when the caller has the running instance's, resolves a database hop's ``env()``
+    dialect as the build does (see ``static_credential_db_hops``)."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")
         site_no_proxy = None if settings is None else list(settings.egress.proxy_no_proxy)
-        out += _graph_hops(registry, site_proxy, site_no_proxy)
+        out += _graph_hops(registry, site_proxy, site_no_proxy, env_values)
     if settings is not None:
         out += _settings_hops(settings)
     return sorted(out, key=lambda hop: hop.name)

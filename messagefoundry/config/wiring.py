@@ -190,6 +190,7 @@ __all__ = [
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
+    "POSSIBLY_GENERIC_DB_HOP",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -6493,7 +6494,35 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
+#: Opens the reason :func:`unverified_generic_db_hops` gives for a hop whose ``env()`` dialect it
+#: could not resolve. ``GET /security/posture`` keeps only names, so it marks such a name with this
+#: text rather than state the hop is generic.
+POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
+
+
+def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
+    """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
+    this reader cannot resolve.
+
+    The build resolves the reference with :func:`resolve_env_settings` against the running instance's
+    values, so a reader handed those values resolves it the same way, default included. With no
+    values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
+    guess an arm, since each arm reads the same settings differently."""
+    dialect = settings.get("dialect", "sqlserver")
+    if not isinstance(dialect, EnvRef):
+        return str(dialect).lower()
+    if env_values is None:
+        return None
+    try:
+        resolved = resolve_env_settings({"dialect": dialect}, env_values)
+    except WiringError:
+        return None
+    return str(resolved["dialect"]).lower()
+
+
+def unverified_generic_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """The generic-ODBC ``DATABASE`` connections the TLS classifier flags, as
     ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
 
@@ -6516,10 +6545,13 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
     ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
 
-    A ``dialect`` given as ``env()`` is read as possibly generic. The graph carries the reference and
-    this reader has no environment values, so comparing its text with ``generic`` would never match
-    and would leave off every surface a hop the build then gates or, on a non-enforcing instance,
-    builds with only a WARNING. The reason names the reference's key, never its value.
+    A ``dialect`` given as ``env()`` is resolved against ``env_values`` when the caller has them, as
+    the build resolves it, so the live posture route lists such a hop only when it resolves to
+    generic. With no values (``messagefoundry check`` reads the graph alone) the hop is read as
+    possibly generic, and its reason opens with :data:`POSSIBLY_GENERIC_DB_HOP` and names the
+    reference's key, never its value. Comparing the reference's text with ``generic`` would never
+    match, and would leave off every surface a hop the build then gates or, on a non-enforcing
+    instance, builds with only a WARNING.
 
     ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
     than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
@@ -6538,21 +6570,20 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     from messagefoundry.transports.database import generic_odbc_tls_unenforced
 
     def unenforced(settings: Mapping[str, Any]) -> str | None:
-        dialect = settings.get("dialect", "sqlserver")
-        # An env() dialect resolves only at build, where a generic value meets the gate. This reader
-        # has no environment values, so it reads the reference as possibly generic rather than as
-        # not generic, and names the key, never the value. A SQL Server value would make the entry a
-        # false alarm, which is the safe direction for an advisory list.
-        maybe = isinstance(dialect, EnvRef)
-        if not maybe and str(dialect).lower() != "generic":
+        dialect = _db_dialect(settings, env_values)
+        if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
         if not isinstance(params, Mapping):
             return None
         reason = generic_odbc_tls_unenforced(params)
-        if reason is None or not maybe:
+        if reason is None or dialect is not None:
             return reason
-        return f"dialect is env({dialect.key}) and may resolve to generic, where {reason}"
+        # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
+        # make the entry a false alarm, the safe direction for an advisory list, and the reason opens
+        # with POSSIBLY_GENERIC_DB_HOP so a surface that keeps only names can still say so.
+        key = settings["dialect"].key
+        return f"{POSSIBLY_GENERIC_DB_HOP} (env({key})); if it is generic, {reason}"
 
     out: list[tuple[str, str]] = []
     for record_name, table in (
@@ -6578,7 +6609,9 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
 _DELEGATED_DB_AUTH = frozenset({"integrated", "entra"})
 
 
-def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
+def static_credential_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every declared DATABASE hop that authenticates with an UNCHANGING credential, as
     ``(name, reason)`` (BACKLOG #1182, ASVS 13.2.1).
 
@@ -6629,22 +6662,42 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
     the same limit :func:`unverified_generic_db_hops` records for TLS — so classifying that case would
     be guessing, and a reader that guessed would put a wrong name in a security report.
 
+    **A ``dialect`` given as ``env()``** is resolved against ``env_values`` when the caller has them,
+    as the build resolves it. With none, both arms are read and the hop is listed when either would
+    list it, with a fixed reason saying the dialect is unresolved: an inventory that guessed the
+    SQL Server arm would drop a generic hop's static username/password.
+
     Pure — it reads the loaded graph and touches nothing else."""
 
-    def kind(settings: Mapping[str, Any]) -> str | None:
-        """The reason this hop's credential is unchanging, or ``None`` when it is delegated."""
-        if str(settings.get("dialect", "sqlserver")).lower() == "generic":
-            if not (settings.get("username") or settings.get("password")):
-                return None
-            return (
-                "generic-ODBC hop emits a static username/password (auth= is not read on this arm)"
-            )
+    def generic_kind(settings: Mapping[str, Any]) -> str | None:
+        if not (settings.get("username") or settings.get("password")):
+            return None
+        return "generic-ODBC hop emits a static username/password (auth= is not read on this arm)"
+
+    def preset_kind(settings: Mapping[str, Any]) -> str | None:
         auth = str(settings.get("auth", "sql")).lower()
         if auth in _DELEGATED_DB_AUTH:
             return None
         # Named from a closed set rather than echoed: this reason reaches the static-credential detail,
         # which must not be able to carry an operator-typed string.
         return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
+
+    def kind(settings: Mapping[str, Any]) -> str | None:
+        """The reason this hop's credential is unchanging, or ``None`` when it is delegated."""
+        dialect = _db_dialect(settings, env_values)
+        if dialect == "generic":
+            return generic_kind(settings)
+        if dialect is not None:
+            return preset_kind(settings)
+        # Fixed text, never the reference's key: see the closed-set note above.
+        generic, preset = generic_kind(settings), preset_kind(settings)
+        if generic and preset:
+            return "dialect is an unresolved env() reference, and either dialect sends a static credential"
+        if generic:
+            return "dialect is an unresolved env() reference; if generic, it sends a static username/password"
+        if preset:
+            return "dialect is an unresolved env() reference; if sqlserver, a static SQL login"
+        return None
 
     out: list[tuple[str, str]] = []
     for record_name, table in (

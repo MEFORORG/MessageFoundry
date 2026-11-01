@@ -431,6 +431,75 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
     assert "OB_ATTESTED" not in switches["tls_hop_attested"]
 
 
+async def test_posture_route_resolves_an_env_dialect_from_the_runner(engine: Engine) -> None:
+    """A DATABASE ``dialect`` given as ``env()`` is resolved at build against the runner's values, so
+    the route resolves it against the same values. One that resolves to sqlserver is not a generic
+    hop and must not be listed as one; one that resolves to generic is listed in the TLS entry and in
+    the static-credential inventory; one with no value here is marked possibly generic, never stated
+    as generic."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        env,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_SS",
+            Database(
+                server="ss.example.invalid",
+                database="MFDB",
+                dialect=env("ss_dialect"),  # type: ignore[arg-type]
+                auth="integrated",
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_ENV_PG",
+            DatabasePoll(
+                server="pg.example.invalid",
+                dialect=env("pg_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT id, body FROM queue",
+                username="svc",
+                password=env("pg_password"),
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_UNSET",
+            Database(
+                server="unset.example.invalid",
+                dialect=env("unset_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    runner = engine.add_registry(reg)
+    runner.set_env_values({"ss_dialect": "sqlserver", "pg_dialect": "generic"})
+    body = await _posture(engine)
+    switches = {e["switch"]: e["risk"] for e in _loosenings(body)}
+    entry = switches["generic_odbc_tls_unenforced"]
+    assert "OB_ENV_SS" not in entry
+    assert "inbound:IB_ENV_PG" in entry
+    assert "inbound:IB_ENV_PG (possibly generic" not in entry
+    assert "OB_ENV_UNSET (possibly generic: dialect is an unresolved env() reference)" in entry
+    static = body["static_credential_hops"]
+    assert isinstance(static, list)
+    static_names = {hop["name"] for hop in static}
+    assert "inbound:IB_ENV_PG" in static_names
+    assert "OB_ENV_SS" not in static_names
+
+
 async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
     """With no graph the route cannot see ANY per-connection declaration, and the marker must name
     each of them. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same
