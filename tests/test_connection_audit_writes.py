@@ -266,11 +266,16 @@ async def test_each_app_keeps_its_own_run_of_failed_flag_reads(
     second app's first failure logs nothing, and a rerun in one process fails the test above."""
     service = await _deployer(toml_engine)
     await _plant_an_unreadable_row(toml_engine)
+    apps = [create_app(toml_engine, auth=service) for _ in range(2)]
+    # One sign-in: both apps share the auth service, so the first app's token opens the second.
+    first = httpx.ASGITransport(app=apps[0])
+    async with httpx.AsyncClient(transport=first, base_url="http://t") as c:
+        h = await _login(c)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        for _ in range(2):
-            transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+        for app in apps:
+            transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-                r = await c.get("/connections", headers=await _login(c))
+                r = await c.get("/connections", headers=h)
             assert r.status_code == 200, r.text
     assert caplog.text.count("the connection flags could not be read") == 2
 

@@ -766,7 +766,9 @@ from typing import Any
 #:
 #: BACKLOG #2623: the connection flag moved to the store, so ``ConnectionRow.toml_managed`` is gone
 #: and the console offers the toggle on every row. Re-derived with ``--write`` (from
-#: b634db50214474e2).
+#: b634db50214474e2). ``ConnectionRow.flagged`` also became ``bool | None``, null on a failed read.
+#: The digest reads field names only, so that part did not move it: a console from before it would
+#: take null for unflagged, hide every row under Flagged only and post ``flagged=true``.
 #:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot

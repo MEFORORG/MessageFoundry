@@ -220,7 +220,7 @@ it could reach only its own copy.
    dashboard read fails soft: a row the driver cannot decode costs every marker, logged once per run
    of failures at WARNING, and never the page. Until the read recovers, each row's flag is unknown
    rather than unset: `ConnectionRow.flagged` is `null`, the row offers no toggle, Flagged only hides
-   no row, and a notice above the table says why.
+   no row, select-all under it takes no such row, and a notice above the table says why.
 4. **The store is the only source.** The `flagged` TOML key and the `flagged=` declaration argument
    are removed, and the loader refuses both. Ignoring the key would leave a hand edit that reads as
    flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate
@@ -245,7 +245,9 @@ it could reach only its own copy.
 audit row. A stored value that disagrees with the newest `connection_flag_set` row is the only trace,
 and nothing compares them. An unusable row never refuses anything. A row also outlives its name: a
 connection removed or renamed leaves a row that matches nothing, which no route clears, and a later
-connection of that name takes the flag.
+connection of that name takes the flag. A row the driver cannot decode fails every read until
+someone deletes it by SQL, because no route can name it, so one such row costs every marker and
+toggle and turns Flagged only off for the whole estate.
 
 **Accepted residual: the flag reaches a bulk action (owner ruling 2026-11-01).** Flagged only hides
 rows, select-all takes only the rows left on screen, and that selection then goes into a bulk action
@@ -272,7 +274,8 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
   SHALL fail.
   → `tests/test_connection_flag_readers.py`
 - **AC-5** — WHEN the flag read fails, THE SYSTEM SHALL answer the dashboard with each row's flag
-  unknown, offer no toggle, hide no row under Flagged only, and say why on the page.
+  unknown, offer no toggle, hide no row under Flagged only, leave such a row out of select-all under
+  that filter, and say why on the page.
   → `tests/test_connection_audit_writes.py::test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page`,
   `packaging/messagefoundry-webconsole/tests/test_ui_flag_read_failed.py`
 
@@ -280,8 +283,9 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
 
 ## Amendment (2026-07-19) — Console-settable object flag + the FIRST console→connections.toml write seam (BACKLOG #131)
 
-- **Status:** **Reversed by the 2026-10-31 amendment above.** Kept as the record of what was built.
-  **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
+- **Status:** **Reversed by the 2026-10-31 amendment above.** Kept as the record of what was built,
+  except that the test citations under its criteria were corrected on 2026-11-01, once the tests
+  they named were gone. **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
   a Flagged Objects filter" (lane `dg-s8a`, Wave 6). Additive to the accepted read/CLI-write design.
 
 **What it adds.**

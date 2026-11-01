@@ -769,8 +769,8 @@ class ConnectionRow(PhiGatedModel):
     # #131, BACKLOG #2623: the operator "object of interest" flag for the Flagged Objects filter.
     # Read from the store, and no engine path reads it. The console's filter does, which is the
     # reach ADR 0007's 2026-10-31 amendment records. None means the read failed, so the flag is
-    # unknown, not unset. Console-settable via POST /connections/{name}/flag. Additive + defaulted so
-    # an older client deserializes /connections unchanged.
+    # unknown, not unset, and a client must take it that way. Console-settable via
+    # POST /connections/{name}/flag.
     flagged: bool | None = False
     # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
     # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY

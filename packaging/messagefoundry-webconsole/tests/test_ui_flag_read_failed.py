@@ -26,27 +26,45 @@ from messagefoundry_webconsole.pages import connections as connection_pages
 _APP_JS = Path(messagefoundry_webconsole.__file__).parent / "static" / "app.js"
 _NODE = shutil.which("node")
 
-#: Loads app.js against just enough of a browser for the connections filter, with Flagged only
-#: ticked, and prints which of the given ``data-flagged`` values stayed visible.
+#: Loads app.js against just enough of a browser for the connections filter and the toolbar, one row
+#: per given ``data-flagged`` value, then ticks select-all. Prints which values stayed visible and
+#: which select-all took.
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
-const [appPath, valuesJson] = process.argv.slice(2);
-const rows = JSON.parse(valuesJson).map((value) => ({
-  value,
-  style: {},
-  textContent: "",
-  querySelector() {
-    return { getAttribute() { return value; } };
+const [appPath, valuesJson, flaggedOnlyJson] = process.argv.slice(2);
+const rows = JSON.parse(valuesJson).map((value) => {
+  const row = { value, style: {}, textContent: "" };
+  row.cb = {
+    value,
+    checked: false,
+    getAttribute(name) { return name === "data-flagged" ? value : null; },
+    hasAttribute(name) { return name === "data-mf-conns-cb"; },
+    get offsetParent() { return row.style.display === "none" ? null : row; },
+  };
+  row.querySelector = () => row.cb;
+  return row;
+});
+const all = {
+  checked: false,
+  hasAttribute(name) { return name === "data-mf-conns-all"; },
+};
+let onChange = null;
+const poll = {
+  querySelectorAll(sel) {
+    return sel === "tbody tr" ? rows : rows.map((r) => r.cb);
   },
-}));
-const poll = { querySelectorAll() { return rows; } };
+  querySelector() { return all; },
+  addEventListener(_type, fn) { onChange = fn; },
+};
 const input = { value: "", addEventListener() {} };
-const flaggedOnly = { checked: true, addEventListener() {} };
+const flaggedOnly = { checked: JSON.parse(flaggedOnlyJson), addEventListener() {} };
+const toolbar = { querySelector() { return null; } };
 const hooks = {
   "[data-poll]": poll,
   "[data-mf-conns-filter]": input,
   "[data-mf-conns-flagged]": flaggedOnly,
+  "[data-mf-conns-toolbar]": toolbar,
 };
 const document = {
   querySelector(sel) { return hooks[sel] ?? null; },
@@ -61,6 +79,7 @@ const sandbox = {
   window: { addEventListener() {}, location: {} },
   location: { protocol: "https:", host: "ops.example" },
   MutationObserver: FakeObserver,
+  Set,
   Date,
   Math,
   JSON,
@@ -74,8 +93,30 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(appPath, "utf8"), sandbox);
-console.log(JSON.stringify(rows.filter((r) => r.style.display !== "none").map((r) => r.value)));
+all.checked = true;
+onChange({ target: all });
+console.log(JSON.stringify({
+  visible: rows.filter((r) => r.style.display !== "none").map((r) => r.value),
+  selected: rows.filter((r) => r.cb.checked).map((r) => r.value),
+}));
 """
+
+
+def _run_app_js(tmp_path: Path, *, flagged_only: bool) -> dict[str, list[str]]:
+    harness = tmp_path / "harness.js"
+    harness.write_text(_HARNESS, encoding="utf-8")
+    assert _NODE is not None
+    values = json.dumps(["1", "0", "unknown"])
+    proc = subprocess.run(
+        [_NODE, str(harness), str(_APP_JS), values, json.dumps(flagged_only)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result: dict[str, list[str]] = json.loads(proc.stdout.strip().splitlines()[-1])
+    return result
 
 
 def _row(*, flagged: bool | None, status: str = "running") -> ConnectionRow:
@@ -140,15 +181,21 @@ def test_the_page_says_why_the_flags_are_missing() -> None:
 def test_flagged_only_hides_only_a_row_known_to_be_unflagged(tmp_path: Path) -> None:
     """RED when an unknown row is hidden: a failed read then empties the page under Flagged only.
     The ``"0"`` row is the control, so a pass is not a filter that stopped filtering."""
-    harness = tmp_path / "harness.js"
-    harness.write_text(_HARNESS, encoding="utf-8")
-    assert _NODE is not None
-    proc = subprocess.run(
-        [_NODE, str(harness), str(_APP_JS), json.dumps(["1", "0", "unknown"])],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout.strip().splitlines()[-1]) == ["1", "unknown"]
+    assert _run_app_js(tmp_path, flagged_only=True)["visible"] == ["1", "unknown"]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_select_all_under_flagged_only_takes_no_row_of_unknown_flag(tmp_path: Path) -> None:
+    """A failed read keeps an unknown row on screen, so visibility alone would let one transient
+    error sweep every connection into a bulk action the operator scoped to flagged rows. RED when
+    select-all takes the ``"unknown"`` row."""
+    assert _run_app_js(tmp_path, flagged_only=True)["selected"] == ["1"]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_select_all_with_flagged_only_off_takes_every_row(tmp_path: Path) -> None:
+    """The control: the skip belongs to the filter. With it off, the flag has no say."""
+    assert _run_app_js(tmp_path, flagged_only=False) == {
+        "visible": ["1", "0", "unknown"],
+        "selected": ["1", "0", "unknown"],
+    }

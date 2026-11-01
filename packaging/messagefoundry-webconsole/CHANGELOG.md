@@ -36,14 +36,15 @@ this line.**
   has one hint, for a name the running graph does not have. Needs the engine seam without
   `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
 - **A failed flag read reads as unknown, not as unflagged.** Until the read recovers, a row offers
-  no toggle, Flagged only hides no row, and a notice above the table says why. Before, Flagged only
-  emptied the page and every toggle posted `flagged=true`. (`BACKLOG #2623`)
+  no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
+  the table says why. Before, Flagged only emptied the page and every toggle posted `flagged=true`.
+  (`BACKLOG #2623`)
 - **The page for a toggle the store did not confirm no longer says the flag did not change.** A
   commit whose answer was lost still lands, so it sends the operator to read the flag first, and it
   no longer says to try again. Its heading is now "Flag change not confirmed". (`BACKLOG #2623`)
-- **Corrected: Flagged only is not purely presentational.** Select-all skips a row it hides, so it
-  shapes a bulk action's target set. Accepted by the owner's ruling of 2026-11-01 (ADR 0007).
-  (`BACKLOG #2623`)
+- **Corrected: the two connection filters are not purely presentational.** Select-all skips a row
+  either one hides, so both shape a bulk action's target set. For Flagged only, which reads the
+  store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)
 
 ### Security
 

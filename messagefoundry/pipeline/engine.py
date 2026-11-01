@@ -2472,8 +2472,8 @@ class Engine:
         The flag drives no engine path: the dashboard rows are its one reader, and it is not on the
         :class:`Registry`, so it cannot refuse a start or a reload. It does feed the console's
         Flagged-only filter, and select-all honours that filter, so a database writer could shape a
-        bulk action's target set. The rows stay on screen and an operator presses Go, and the owner
-        accepted that reach on 2026-11-01 (ADR 0007, amendment of 2026-10-31).
+        bulk action's target set. An operator still presses Go, and the owner accepted that reach on
+        2026-11-01; ADR 0007's amendment of 2026-10-31 records what bounds it.
         ``tests/test_connection_flag_readers.py`` fails on a new reader, because a value that drives
         an engine path would need the seal this one was decided without.
 

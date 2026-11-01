@@ -211,9 +211,9 @@ def _flag_cell(r: ConnectionRow) -> Markup:
 #: Above the table while the store's flag read fails (BACKLOG #2623). Without it an operator would see
 #: every marker and toggle gone and Flagged only showing rows that may not be flagged, with no reason.
 FLAGS_UNREAD_NOTICE = (
-    "The connection flags could not be read, so no row shows a flag or offers the toggle, and "
-    "Flagged only shows every connection. This clears when the read recovers. The engine log "
-    "names the cause."
+    "The connection flags could not be read, so no row shows a flag or offers the toggle. Flagged "
+    "only shows every connection, and select-all takes none of them while it is ticked. This "
+    "clears when the read recovers. The engine log names the cause."
 )
 
 
@@ -307,8 +307,9 @@ def _controls_toolbar() -> Markup:
 def _filter_box() -> Markup:
     """A filter-as-you-type box over the connections table (client-side, ``app.js``). It lives OUTSIDE the
     ``[data-poll]`` container so its typed value survives the live swap; ``app.js`` hides rows whose text
-    doesn't match and re-applies the filter after each poll/ws swap. Purely presentational — the server
-    still sends every row, and a hidden row's checkbox value stays in the selection (filter is view-only)."""
+    doesn't match and re-applies the filter after each poll/ws swap. The server still sends every row,
+    and a hidden row's checkbox value stays in the selection. Select-all skips a hidden row, so what is
+    typed here shapes a bulk action's target set."""
     return el(
         "input",
         type="search",
