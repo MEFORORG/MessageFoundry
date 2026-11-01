@@ -2996,7 +2996,9 @@ def test_a_marker_switched_off_in_a_wrapper_leaves_the_steps_after_it_dead(
 ) -> None:
     """The steps main put in the switched-off marker's branch never run: they render under the
     orphan's dead placeholder, and the marker counts unmapped. The control is the same wrapper
-    live, whose marker opens the branch the send runs in, as on main."""
+    live, whose marker opens the branch the send runs in, as on main. In ``if-else`` the run
+    check cannot fail, since the whole ``If`` body is under a placeholder; the placement checks
+    are the ones that bind there."""
     template, marker = _MARKER_CONSTRUCTS[construct]
     verb = marker.split('"')[1].split()[0]
     wrapped = _MARKER_WRAPPINGS[wrapping].replace("{m}", marker)
@@ -3031,13 +3033,11 @@ def test_a_switched_off_marker_seals_only_up_to_the_next_marker() -> None:
         quiet = _handler_body(_handler_source(f"<Try><List>{off}{after}</List></Try>"))
         assert _ORPHAN not in quiet, after
     # Two such wrappers: each seals its own run, under its own marker.
-    two = (
-        f'<Try><List>{off}{_CLEAR}<List Disabled="1"><Line Data="Else"/></List>{second}'
-        "</List></Try>"
-    )
+    two = f"<Try><List>{off}{_CLEAR}{off}{second}</List></Try>"
     handler = _handler_body(_handler_source(two))
-    assert f"# TODO: Corepoint Catch {_ORPHAN}" in _enclosing(handler, "PID-19")
-    assert f"# TODO: Corepoint Else {_ORPHAN}" in _enclosing(handler, "OB_TWO")
+    first, last = _enclosing(handler, "PID-19"), _enclosing(handler, "OB_TWO")
+    assert f"# TODO: Corepoint Catch {_ORPHAN}" in first and first == last
+    assert handler.count(first) == 2
 
 
 def test_no_branch_is_adopted_across_a_switched_off_marker(tmp_path: Path) -> None:
@@ -3070,6 +3070,44 @@ def test_a_disabled_statement_named_like_a_wrapper_seals_nothing() -> None:
     handler = _handler_body(_handler_source(body))
     assert _ORPHAN not in handler
     assert _enclosing(handler, "OB_Y") == "    try:"
+
+
+@pytest.mark.parametrize(
+    ("template", "opener"),
+    [
+        pytest.param("<Try><List>{x}</List></Try>", "    try:", id="else-in-a-try"),
+        pytest.param(
+            '<Line Data="ForEach %ADT/OBX $o"><List>{x}</List></Line>',
+            "    for _item in []:",
+            id="else-in-a-loop",
+        ),
+    ],
+)
+def test_a_stray_switched_off_marker_seals_nothing(template: str, opener: str) -> None:
+    """A construct that cannot continue the marker made its branch a stray on main, inlined live
+    after the construct. Corepoint, its marker switched off, runs those steps in the construct's
+    body, so they stay there, live as far as the construct is. Code review of this change, round
+    5."""
+    off = '<List Disabled="1"><Line Data="Else"/></List>'
+    handler = _handler_body(_handler_source(template.replace("{x}", off + _AFTER_THE_WRAPPER)))
+    assert _ORPHAN not in handler
+    assert _enclosing(handler, "OB_FLAT").startswith(opener)
+
+
+def test_a_switched_off_markers_own_branches_stay_commented_out() -> None:
+    """A marker in the wrapper may hold branches of its own, split from its own list. They are
+    switched-off content: no destination is declared for them, and no line of them is code. Code
+    review of this change, round 5."""
+    body = (
+        '<Try><List><List Disabled="1"><Line Data="Catch"><List><Line Data="Else"/>'
+        '<Line Data="MsgSend %ADT [OB_OFF]"/></List></Line></List>'
+        f"{_AFTER_THE_WRAPPER}</List></Try>"
+    )
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert 'outbound("OB_OFF"' not in src
+    assert not [line for line in _code(handler) if "OB_OFF" in line]
+    assert f"Corepoint Catch {_ORPHAN}" in _enclosing(handler, "OB_FLAT")
 
 
 def test_a_switched_off_marker_at_the_handlers_own_level_changes_nothing() -> None:

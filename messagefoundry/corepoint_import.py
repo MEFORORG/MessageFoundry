@@ -1452,13 +1452,13 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
     )
 
 
-def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
-    """Split a container body at its branch markers into ``(body, branches)``.
+def _split_branches(steps: list[Step], kind: str) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
+    """Split the body of a ``kind`` container at its branch markers into ``(body, branches)``.
 
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
     construct's own ``<List>``, so everything after such a marker belongs to that branch. Walk once
     to keep successive branches siblings without consuming stack space for a wide list."""
-    steps = _seal_switched_off_branches(steps)
+    steps = _seal_switched_off_branches(steps, kind)
     body: tuple[Step, ...] = ()
     branches: list[Control] = []
     marker: Control | None = None
@@ -1477,15 +1477,21 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     return body, tuple(branches)
 
 
-def _seal_switched_off_branches(steps: list[Step]) -> list[Step]:
+def _seal_switched_off_branches(steps: list[Step], kind: str) -> list[Step]:
     """``steps`` with each run main placed in a switched-off marker's branch made an orphan.
 
     A bare marker inside a ``@Disabled`` ``<List>``/``<Actions>`` wrapper opened its branch while
     the wrapper was flattened, so the steps after the wrapper, up to the next marker, ran in it:
-    in an ``except``, or under a placeholder arm, or in a stray branch. With the wrapper commented
-    out whole (BACKLOG #2526) they would run in the construct's own body, for every message. They
-    fail closed instead: the marker's orphan holds them, which renders them under a dead
-    placeholder and counts the marker unmapped.
+    in an ``except``, or under a placeholder arm. With the wrapper commented out whole (BACKLOG
+    #2526) they would run in the construct's own body, for every message. They fail closed
+    instead: the marker's orphan holds them, which renders them under a dead placeholder and
+    counts the marker unmapped. The marker's own branches are switched-off content, and stay in
+    the wrapper's comment alone.
+
+    Only where a ``kind`` construct renders that marker as a branch (:func:`_renders_as_branch`).
+    A stray one, such as an ``Else`` in a ``Try`` or any marker in a loop, main inlined live after
+    the construct, and Corepoint, its marker switched off, runs those steps in the construct's
+    body. So they stay live there.
 
     A run ends at the next bare marker, or at the next such wrapper, whose own marker opened the
     next branch on main. So the runs are disjoint, and the walk stays linear in the list. A run
@@ -1496,7 +1502,9 @@ def _seal_switched_off_branches(steps: list[Step]) -> list[Step]:
         step = steps[i]
         out.append(step)
         i += 1
-        if not isinstance(step, Control) or (marker := _switched_off_marker(step)) is None:
+        marker = _switched_off_marker(step)
+        # ``isinstance`` holds wherever a marker does; it tells the type checker so.
+        if not (marker and isinstance(step, Control) and _renders_as_branch(kind, marker.kind)):
             continue
         end = next(
             (
@@ -1512,7 +1520,7 @@ def _seal_switched_off_branches(steps: list[Step]) -> list[Step]:
         # The reason first: the render cuts a long label, and a condition is untrusted text.
         why = f"its marker is in a @Disabled {step.source_verb}"
         detail = f"{why}; {marker.detail}" if marker.detail else why
-        out.append(replace(marker, detail=detail, body=tuple(run)))
+        out.append(replace(marker, detail=detail, body=tuple(run), branches=()))
         i = end
     return out
 
@@ -1874,7 +1882,7 @@ def _parse_statement(
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
         return [Control(kind, source, statement or note or tag, body=(*marker, *body))]
 
-    inner, branches = _split_branches(body)
+    inner, branches = _split_branches(body, kind)
     detail = _strip_leading_verb(statement, verb)
     return [*marker, Control(kind, source, detail, body=inner, branches=branches)]
 

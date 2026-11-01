@@ -266,8 +266,9 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
 # here the adoption looks back past such steps, where the head holds them out of the list until
 # a step that runs follows them. A bare branch marker inside a disabled wrapper opened its branch
 # while the wrapper was flattened, so the steps after the wrapper in its construct's own list,
-# up to the next marker, become that marker's orphan, and never run. Written apart from the head
-# too: here the run is gathered as the list is walked, and the marker found from the back.
+# up to the next marker, become that marker's orphan, and never run, where the construct renders
+# that marker as a branch. Written apart from the head too: here the run is gathered as the list
+# is walked, at the call that splits it, and the marker found from the back.
 _LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
 _WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
 _PARSE_LIST_DEF = "def _parse_list(\n"
@@ -348,14 +349,18 @@ def _left_open(step: Step) -> Control | None:
     return None
 
 
-def _settle(marker: Control, tag: str, run: list[Step]) -> list[Step]:
-    if not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
+def _settle(marker: Control, tag: str, run: list[Step], kind: str) -> list[Step]:
+    # A stray marker's run stays live, as main inlined it after the construct. So does a run
+    # that renders no code.
+    stray = kind not in ("if", "case") and (kind, marker.kind) != ("try", "except")
+    if stray or not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
         return run
     why = "its marker is in a @Disabled " + tag
-    return [replace(marker, detail="; ".join(filter(None, (why, marker.detail))), body=tuple(run))]
+    detail = "; ".join(filter(None, (why, marker.detail)))
+    return [replace(marker, detail=detail, body=tuple(run), branches=())]
 
 
-def _sealed(steps: list[Step]) -> list[Step]:
+def _sealed(steps: list[Step], kind: str) -> list[Step]:
     out: list[Step] = []
     held: tuple[Control, str, list[Step]] | None = None
     for step in steps:
@@ -364,18 +369,18 @@ def _sealed(steps: list[Step]) -> list[Step]:
             held[2].append(step)
             continue
         if held is not None:
-            out.extend(_settle(*held))
+            out.extend(_settle(*held, kind))
             held = None
         out.append(step)
         if (marker := _left_open(step)) is not None:
             held = (marker, step.source_verb, [])
     if held is not None:
-        out.extend(_settle(*held))
+        out.extend(_settle(*held, kind))
     return out
 
 
 """
-_SPLIT_START = "    body: tuple[Step, ...] = ()\n"
+_SPLIT_CALL = "    inner, branches = _split_branches(body)\n"
 _ORPHAN_INLINE = (
     '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
@@ -421,7 +426,7 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     ),
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
     # A bare marker switched off in a wrapper leaves the steps after it dead, not live.
-    (_SPLIT_START, "    steps = _sealed(steps)\n" + _SPLIT_START),
+    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_sealed(body, kind))")),
     (
         _ADOPTED_FROM_LAST,
         "            and (at := _construct_at(steps, produced[0])) >= 0\n"
