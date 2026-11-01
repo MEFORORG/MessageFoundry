@@ -29,6 +29,15 @@ this line.**
   sign-in lock that someone else's wrong passwords set. Needs the engine seam that carries
   `AuthService.begin_passkey_sign_in`. (BACKLOG #3373, ADR 0197 Amendment A wave 2)
 
+### Changed
+
+- **The event log's kind filter reads the engine's one connection-event vocabulary.** The console
+  no longer keeps its own list; it imports `CONNECTION_EVENT_KIND_ORDER` from the engine module
+  `messagefoundry.connection_events`, and the choices and their order are unchanged. Needs an engine
+  that ships that module, which no published engine does yet, so the release that carries this
+  raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
+  cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
+
 ### Security
 
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its

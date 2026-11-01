@@ -155,7 +155,9 @@ transport = "mllp"
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
   spelling. The one cap with no "off", the HTTP listener's `max_header_bytes`, refuses `0` in either
   spelling. Not every numeric setting has the negative refusal yet: at least DICOM `max_pdu_size`,
-  `max_associations` and `timeout_seconds` do not.
+  `max_associations`, and `timeout_seconds` on the outbound SCU, do not. The inbound SCP refuses a
+  `timeout_seconds` under 1 second, and a `max_pdu_size` outside 4096 to 1 MiB, when the
+  connection is built.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so
@@ -627,7 +629,9 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). **A TA1 is acted on only when its
+  accepted-with-warning (delivered, **not** retried, logged). An empty TA1-04, or one outside that
+  code set, is accepted too, and its captured `detail` is a fixed phrase, never the partner's text;
+  only a TA1-04 of `A` records `TA1*A` (BACKLOG #2984). **A TA1 is acted on only when its
   TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
   all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
   a blank one matches nothing. If the sent payload has no readable ISA there is nothing to
@@ -720,11 +724,31 @@ and answered **`202 Accepted`** carrying the engine `message_id` the instant it 
 HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
 `202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A body the engine **refuses at
-ingress**, after reading it, answers **`422`** with `{"error":"message was not accepted"}` and no
-`message_id`. Examples are a body the engine cannot decode or one over its ingress ceiling. Others include
-a body that does not match the declared `content_type`, or an HL7 parse or strict-validation failure. The
-message is still recorded, with status `ERROR`, so it is counted and never silently dropped
-(owner ruling 2026-09-26, [ADR 0154 amendment](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths)).
+ingress**, after reading it, is never answered `202`. The message is still recorded, with status
+`ERROR`, so it is counted and never silently dropped, and the answer's body names that row:
+`{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
+
+- **`503`** with `Retry-After` when the refusal is temporary, the engine's own and expected to clear.
+  At least two refusals are classed so: the streaming detach's in-flight budget, while other
+  detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
+  the name is fixed (BACKLOG #2431). Re-send the same body later. A body larger than that whole
+  budget is over-size instead.
+- **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
+  covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
+  with `max_message_bytes`.
+- **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
+  body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
+  or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
+  by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
+  reclassified as permanent.
+
+The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
+`422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
+the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
+The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
+temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
+temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
+`ERROR` row's error text opens with `[refusal kind: <kind>]`, ahead of any refused-body allowance note.
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
@@ -742,8 +766,8 @@ the sole authority** for the returned bytes: every in-process signal is only a l
 re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
 and any race between the capturing worker and the reader. A reply is therefore returned only once it is
 durable and replayable. An inbound **without** `reply_from` keeps the receipt path above: `202` for a
-committed body, `422` for a body refused at ingress. A `reply_from` inbound answers that same `422` for a
-refused body, before it would wait for any reply.
+committed body, and `503`, `413` or `422` for a body refused at ingress. A `reply_from` inbound answers
+that same refusal for a refused body, before it would wait for any reply.
 
 Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
@@ -1668,7 +1692,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
 | `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
-| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on the **SQL Server preset only**, where it reaches ODBC Driver 18 as pyodbc's `timeout=` (the driver ignores a DSN keyword for it). `generic` gets no login timeout from the engine and uses its driver's default |
+| `connect_timeout` | `15` | login timeout (s): how long connecting to the server may take. A whole number, at least 1, or the connection is **refused at construction**. Applied on both dialects as pyodbc's `timeout=`, never as a DSN keyword (ODBC Driver 18 ignores one). On `generic` since BACKLOG #2705: measured on 2026-10-30, `timeout=5` bounded a psqlODBC and a MySQL connect to an unreachable host at about 5 s, against about 21 s without it. Other drivers are unmeasured: one that ignores the attribute keeps its own default, and one that refuses it would fail the connect |
 | `app_name` | `messagefoundry` | ODBC `APP` name |
 | `pool_max` | `5` | max pooled connections |
 
@@ -1678,7 +1702,7 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 `NegativeAckError` → **dead-letter** (a retry can't fix it).
 
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
-string brace-quotes every value (no connection-string injection); TLS is **on by default** and a
+string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect braces the driver name, and the password for the drivers it lists, and sends the rest plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a
 weakened posture (`encrypt=false` / `trust_server_certificate=true`, `dialect="sqlserver"` only) is
 **refused at construction** — `MEFOR_ALLOW_INSECURE_TLS` is **clamped** and cannot relax it while
 `[security].enforcement = enforce`, which is the shipped default, so on a stock instance there is **no
@@ -1723,11 +1747,11 @@ differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_d
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are sent **without braces** (see [*Values*](#values-on-the-generic-dialect)). Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
-The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+The DSN is built as `DRIVER={<odbc_driver>};SERVER=<server>;[DATABASE=<database>;][<user>=<username>;<pwd>=<password>;]<odbc_params…>`, where only the driver name is braced, and the password for the drivers [*Values*](#values-on-the-generic-dialect) lists. `server` is emitted as the near-universal `SERVER` keyword.
 
 ##### The port an `allowed_db` entry binds
 
@@ -1828,10 +1852,10 @@ An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-w
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
 with a weak wrap is refused, and so is an encrypted key with no `sslpassword`. A legacy
 `Proc-Type: 4,ENCRYPTED` key is refused even with one. A certificate with no key passes, PEM or
-DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read; a blank `SSLKEY`
-counts as unset, since a driver may trim it. Each file is read
-the way an `SSLCA` file is: a missing file is left to the driver, a padded value is checked as a
-driver may trim it, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
+DER. With `SSLKEY` set, the key comes from that file, so `SSLCERT` is not read. A blank or padded
+value is refused when the connection is built, before any file is read (see
+[*Values*](#values-on-the-generic-dialect)). Each file is read the way an `SSLCA` file is: a
+missing file is left to the driver, and a file over 1 MiB is refused. A directory, a device or a pipe is left to
 the driver as `SSLCERT`, and refused unread as `SSLKEY`. At least these gaps remain:
 
 - **MySQL's ODBC driver has no passphrase keyword.** An `sslpassword` set beside its `SSLCERT`
@@ -1865,14 +1889,71 @@ Two limits follow from this:
 
 ##### Values on the generic dialect
 
-Every value is sent inside braces and must be printable ASCII. A value that breaks its rule is
-refused when the connection is built, and the error names the setting and never the value:
+**On the generic dialect, values are sent WITHOUT braces** (BACKLOG #2705). Only the
+`odbc_driver` name is braced, and a password is braced for the drivers the password rule
+below lists. Every value must be printable ASCII. A value that breaks its rule is refused when the connection is
+built, and the error names the setting and never the value:
 
-| Setting | Rule |
-|---|---|
-| `odbc_driver`, `database`, `username`, every `odbc_params` value | printable ASCII, and none of `;`, `{`, `}` |
-| `server` | printable ASCII, and none of `;`, `{`, `}`, `=` |
-| `password` | printable ASCII. A `}` is sent with the ODBC `}}` escape, which the driver must read |
+| Setting | Sent as | Rule |
+|---|---|---|
+| `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
+| `SSLmode`, in any case of the keyword | plain | for every driver but MySQL Connector/ODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
+| `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
+| `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
+| `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
+
+Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
+psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each connected with no TLS
+at all, with no CA file, with an untrusted CA, with a hostname mismatch, and against a server with
+TLS off. psqlODBC also kept the braces as part of `UID` and `DATABASE`, and both psqlODBC and MySQL
+Connector/ODBC refused a braced port. The same values sent plain behaved correctly. A plain value
+cannot be quoted, so at least the characters the table above lists are refused instead: the ones
+that would end the value or start another keyword, and the two quote characters, which sat inside
+braces before and whose plain reading by a driver has not been measured. An empty value is refused
+because the driver would read it as its default, and libpq's default `prefer` falls back to
+plaintext. A padded value is refused because one driver may trim it and another may not.
+
+###### The `SSLmode` spelling
+
+psqlODBC's source reads an `SSLmode` value by its first character, and only a lower-case one
+names a mode, so `Require`, `VERIFY-FULL`, `REQUIRED`, `on`, `1` and `True` mean `disable` to it.
+This was read in the source, not measured against a server. The engine's no-TLS check would count
+each of those as TLS addressed. So on the generic dialect an `SSLmode` value must be
+exactly one of libpq's six modes, in lower case, or the connection is refused when it is built,
+with an error that lists the six.
+
+The rule depends on the driver, read from the `odbc_driver` name. MySQL Connector/ODBC takes the
+same keyword with its own upper-case values (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`,
+`VERIFY_IDENTITY`). So when `odbc_driver` is a whole MySQL Connector/ODBC registered name, `MySQL
+ODBC <version> Unicode Driver` or `... ANSI Driver` in any case, its value is left to MySQL as
+before. Every other driver name takes the libpq spellings, including psqlODBC under any name and
+MySQL's driver under a library path or an alias.
+
+**The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
+registered name of one of these drivers, the password is **always** sent braced, with the ODBC
+`}}` escape, whatever it holds:
+
+- psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
+  `(x64)`, or the bare `PostgreSQL`, the section name RHEL registers it under;
+- MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
+  `... ANSI Driver`;
+- Microsoft's `ODBC Driver <n> for SQL Server`, not probed for this item but relied on for the
+  same escape by the SQL Server preset and the store.
+
+Braces matter even for a password with no delimiter in it. psqlODBC URL-decodes an unbraced `PWD`,
+so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (its
+`dlg_specific.c`, where `copyConnAttributes` calls `decode_or_remove_braces`). The braced form is
+the only one that sends such a password as written.
+
+For any other driver name, the password is sent plain when it holds none of `;`, `{`, `}`, `"`
+or `'` and has no leading or trailing space. Any other password is refused when the connection is built,
+with an error that says only that this driver cannot carry it, so change the password. This
+covers a library path, another vendor's driver for the same database, and the legacy name
+`SQL Server`, which is not on the list: on Linux it is commonly a FreeTDS alias, which has not been
+measured. The engine reads the driver name as written, never the library it loads, so a driver
+manager alias that reuses a listed name is taken at its word. The Microsoft Access driver (ACE)
+is one that does not read the escape: it refused even a braced password with no brace in it, and
+a `}` let password text set another keyword.
 
 ASCII only, because a driver manager may convert the string for the driver, and some
 conversions turn a non-ASCII character into a delimiter.
@@ -2171,7 +2252,7 @@ kills the poller; it retries next interval.
 is **refused at construction** through the same cell as the `Database(...)` destination, and the
 `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the
 shipped default). The connection
-string brace-quotes every value; secrets go through `env()`. The polled `server` is gated by the same
+string checks every value, as for the destination; secrets go through `env()`. The polled `server` is gated by the same
 fail-closed `[egress].allowed_db` allowlist as the destination — although the source pulls data *in*, it
 still dials out to a host, so the allowlist guards against polling an arbitrary server.
 
@@ -2886,7 +2967,7 @@ Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
-`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
+`pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
 extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
@@ -2897,12 +2978,12 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
 | `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
 | `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
-| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. When the SCP clamps a value you set, for example 64 MiB or `0`, it logs a `WARNING` at build naming the value, the ceiling and the inflate bound (BACKLOG #1962). It stays silent on 128 MiB, since the shipped default cannot be told from an explicit setting. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It **also** bounds the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. The inflate bound is never above 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling, and a negative value is refused at build. An over-cap object is refused before any commit, so nothing is recorded for it. The SCP does not answer Success for an object that the engine's ingress, or the codec's inflate ceiling, would then refuse. The C-STORE status each refusal answers, and whether a sender should re-send, is stated once in [`DICOM.md`](DICOM.md) section 3 |
-| `max_associations` | `10` | cap on concurrent inbound associations (connection-flood guard) |
-| `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **nothing is dropped, refused or answered differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Pair it with `max_associations`,** which must be large enough to hold the peers waiting behind a pace — and keep the resulting wait inside your senders' ACSE timeouts, or a paced modality aborts. |
+| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. When the SCP clamps a value you set, for example 64 MiB or `0`, it logs a `WARNING` at build naming the value, the ceiling and the inflate bound (BACKLOG #1962). It stays silent on 128 MiB, since the shipped default cannot be told from an explicit setting. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It **also** bounds the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. The inflate bound is never above 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling, and a negative value is refused at build. An over-cap object is refused before any commit, so nothing is recorded for it. The SCP does not answer Success for an object that the engine's ingress, or the codec's inflate ceiling, would then refuse. An object past **twice** the effective cap gets no status: the SCP aborts the association as the object arrives, so it never holds more than that of one object (owner ruling B462-R3). The C-STORE status each refusal answers, and whether a sender should re-send, is stated once in [`DICOM.md`](DICOM.md) section 3 |
+| `max_associations` | `10` | cap on concurrent inbound associations. Connections with no association yet have their own fixed caps ([DICOM.md](DICOM.md) section 3) |
+| `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **the wait itself drops, refuses and answers nothing differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Choose a rate that keeps few peers waiting.** A waiting peer has no association yet, so it holds one of the fixed slots [DICOM.md](DICOM.md) section 3 states, and raising `max_associations` does not change that: a connection over those slots is closed. Keep the wait inside your senders' ACSE timeouts too, or a paced modality aborts. |
 | `association_burst` | = the rate | tokens the bucket holds, i.e. how large a burst of associations passes unpaced before the sustained rate applies. Only meaningful with `max_associations_per_second` set. Floor of 1 so an SCP can always make progress. |
-| `max_pdu_size` | `16384` | cap one PDU's bytes (`0` = unbounded); DoS guard |
-| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
+| `max_pdu_size` | `16384` | the largest P-DATA-TF this SCP offers to take, **and takes**: a PDU that declares a longer one gets an A-ABORT before its body is read ([DICOM.md](DICOM.md) section 3). Must be from 4096 to 1 MiB: `0` would offer a peer no limit, six bytes or less breaks a pynetdicom sender, and a larger PDU is read whole before the SCP counts any of it |
+| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout, and a **fixed deadline on each PDU header and body read, and on each whole send**, not an idle timer, so a low value cuts a slow sender off. Must be at least 1 second |
 | `tls` | `false` | wrap the association in **DICOM-over-TLS** (required for a non-loopback bind — see below) |
 | `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). The key must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
@@ -3827,7 +3908,8 @@ Facts that are easy to get wrong, stated plainly first:
   listeners took the same key and default from vault BACKLOG #2606. **The HTTP listener has the key
   but it ships OFF**: it answers one request per connection, so behind a reverse proxy any per-host
   cap would be its whole capacity. Set it there only where the listener sees real client addresses.
-  The DICOM SCP has no per-host connection term.
+  The DICOM SCP has no such key. Its own per-host cap is a constant, and it counts only connections
+  with no association yet; see its paragraph below.
 - **An allowlist refusal is logged at most once per address per minute.** On the MLLP, raw-TCP, X12
   and HTTP listeners, a peer outside `source_ip_allowlist` earns one WARNING per 60 s however often
   it reconnects, and the listener writes at most 20 such lines per 60 s across every address. Each
@@ -3835,23 +3917,25 @@ Facts that are easy to get wrong, stated plainly first:
   connection event still records every refusal. The DICOM SCP uses the same throttle (vault BACKLOG
   #2606).
 - **The DICOM C-STORE SCP is a different shape** and none of the paragraph above describes it. It has
-  no `max_connections` and no engine-side active-client counter: its bound is `max_associations`
-  (**default 10**, `transports/dicom.py:165`), enforced inside pynetdicom, which **rejects the
-  association** rather than accepting it and closing at the application layer. Its idle/response bound
-  is `timeout_seconds` (**30 s**) applied to the ACSE/DIMSE/network timers, not `receive_timeout`. A
-  peer failing the per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a
-  `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP peer-control
-  note](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025))
-  is refused with a DIMSE **not-authorized status on an
-  already-established association** (`dicom.py:254-262`) and logged. `transports/dicom.py` has zero
-  `_emit_event` call sites, so no ADR 0021 `connection_event` is written for either refusal.
+  no `max_connections` key: its bound on established work is `max_associations`
+  (**default 10**), enforced inside pynetdicom, which **rejects the
+  association** rather than accepting it and closing at the application layer. Before that, fixed
+  caps hold the connections with no association yet, and a deadline bounds each one.
+  [DICOM.md](DICOM.md) section 3 states the numbers and what they leave open, and what a peer
+  failing the per-connection `source_ip_allowlist` gets. That allowlist is an `inbound(...)`
+  keyword, **not** a `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP
+  peer-control
+  note](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025).
+  The SCP's bound is `timeout_seconds` (**30 s**), not `receive_timeout`; the same section says
+  where it applies. `transports/dicom.py` has zero `_emit_event` call sites, so no ADR 0021
+  `connection_event` is written for any of its refusals.
 - **The DATABASE connector's pool acquire is bounded.** `acquire_timeout` (default 30 s, per
   connection on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`) wraps the driver's
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the
   `RetryPolicy` path. It never waits indefinitely.
 - **The DATABASE connector has no per-statement timeout.** It exposes `connect_timeout` (default
-  15 s, a **login** timeout only, passed to the driver as pyodbc's `timeout=`, SQL Server preset
-  only), `pool_max` and
+  15 s, a **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects),
+  `pool_max` and
   `acquire_timeout`, and there is **no** `timeout_seconds` on this connector. A long-running
   statement is therefore unbounded; keep lookup/write statements indexed and narrow. (The *store's*
   own SQL Server / Postgres connections do apply `[store].command_timeout`, default 30 s.)
@@ -4132,7 +4216,7 @@ reading this page already applies to a file the scan never opened.
 | SOAP destination | as REST — indirect via the lane budget | as REST | as REST |
 | FHIR destination + `fhir_lookup` | as REST; `fhir_lookup` additionally runs off the event loop on the thread executor | as REST; a lookup that cannot run raises into the Handler | transient → retry; a `fhir_lookup` failure fails the message, never silently degrades |
 | DICOMweb STOW-RS destination | as REST — indirect via the lane budget | as REST | as REST |
-| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
+| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit. A PDU longer than `max_pdu_size`, or an object past twice the effective `max_object_bytes`, aborts the association | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
@@ -4183,11 +4267,11 @@ reading this page already applies to a file the scan never opened.
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
 | DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest) | `RetryPolicy` |
-| DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future | the association is released by pynetdicom; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
+| DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent | `RetryPolicy` |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL | `RetryPolicy` |
-| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, SQL Server preset) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
+| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
 | Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
@@ -4347,7 +4431,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
 **Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
-optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure‑Python, no numpy), `[fhir]`
+optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure‑Python, no numpy), `[fhir]`
 (`fhir.resources` + `fhir-core` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
 lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
 chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the

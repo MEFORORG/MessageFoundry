@@ -44,6 +44,7 @@ from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.soap import SoapDestination
+from tests._store_audit import no_operator_audit
 
 URL = "https://api.example.com/svc"
 TOKEN = "MF_IIS_PW_9f2c41ab3d7e"
@@ -459,7 +460,7 @@ async def test_replay_re_substitutes(store: MessageStore) -> None:
     await runner._process_delivery_item(DEST, item)
 
     # replay re-pends the SAME stored (token-only) payload (explicit now: the claim below must be later)
-    assert await store.replay(mid, now=2.0) == 1
+    assert await store.replay(mid, now=2.0, audit=no_operator_audit) == 1
     d2, op2 = _dest()  # a fresh, healthy connector
     runner._destinations[DEST] = d2
     item2 = await store.claim_next_fifo(DEST, now=3.0)

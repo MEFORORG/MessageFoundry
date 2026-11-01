@@ -48,8 +48,8 @@ connector hands the raw bytes to one of two shared handlers in
 
 - `RegistryRunner._handle_inbound` serves most connectors. Its return value is the reply to send.
 - `RegistryRunner._handle_inbound_http` serves every connector that declares `wants_receipt`. Today
-  that is at least the HTTP listener and the DICOM C-STORE receiver. It returns the engine
-  `message_id`, or `None` when the body was refused.
+  that is at least the HTTP listener and the DICOM C-STORE receiver. It returns an `IngressReceipt`:
+  the engine `message_id`, or, when the body was refused, the refusal's kind and the `ERROR` row's id.
 
 Both handlers run the same checks, in the same order. The checks themselves live in
 [`pipeline/ingress_guards.py`](../messagefoundry/pipeline/ingress_guards.py). The inbound's
@@ -116,7 +116,7 @@ What the sender is told depends on the connector and the content type:
 |---|---|
 | An `hl7v2` inbound with an acknowledgment mode other than `none`, on a connector that writes the handler's reply back. MLLP does, and so does raw TCP. | A negative HL7 acknowledgment. `_handle_inbound` picks the reject or the error code for each check. `build_ack` in [`mllpcodec.py`](../messagefoundry/mllpcodec.py) builds it, and the inbound's `AckMode` picks the code family. |
 | A non-HL7 inbound on MLLP, raw TCP or X12 | No reply. These connectors send nothing for a non-HL7 body, accepted or refused. |
-| The HTTP listener, for any content type | `422` with a fixed JSON body and no `message_id`. It never sends an HL7 acknowledgment. |
+| The HTTP listener, for any content type | `503` with `Retry-After`, `413` or `422` by the refusal's kind. The JSON body names that refusal's own `ERROR` row as `refused_message_id`, so it differs per refusal; only an accepted body's answer carries `message_id`. [CONNECTIONS.md](CONNECTIONS.md) says which refusal gets which code. It never sends an HL7 acknowledgment. |
 | The DICOM C-STORE receiver | A DIMSE failure status. [DICOM.md](DICOM.md) section 3 states which status answers which refusal. |
 | A polling source (file, remote file, database), for any content type | Nothing. There is no sender on the line. The `ERROR` row is the record. |
 

@@ -14,9 +14,9 @@ listener carries its own copy of the sequence.
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import io
+import re
 import textwrap
 import tokenize
 from collections.abc import AsyncIterator
@@ -39,7 +39,6 @@ from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
-from messagefoundry.transports.base import ReceiptRefusedRetryable
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -333,12 +332,18 @@ async def _live_rows(
         wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)),
         listener,
     )
-    # The HTTP receipt handler raises, after recording the row, for a codec name that sets up no
-    # decode; the row is what this compares, so the raise is the listener's answer and not a fault.
-    with contextlib.suppress(ReceiptRefusedRetryable):
-        await handler(reg.inbound[ic.name], body)
+    await handler(reg.inbound[ic.name], body)
     cur = await store._db.execute("SELECT status, error FROM messages")
     return [dict(r) for r in await cur.fetchall()]
+
+
+def _as_stored(listener: str, error: str, *, kind: str = "temporary") -> str:
+    """The stored reason for a refusal the dry run words as ``error``.
+
+    The receipt path leads its stored reason with the refusal's kind (BACKLOG #2105); the MLLP path
+    stores the reason alone. The default is the unusable codec name's kind, temporary on the receipt
+    path (BACKLOG #2431): the configuration is at fault, not the body."""
+    return f"[refusal kind: {kind}] {error}" if listener == "_handle_inbound_http" else error
 
 
 #: One body per guard, each with the inbound that makes that guard fire.
@@ -399,7 +404,14 @@ async def test_the_listener_and_the_dry_run_refuse_with_the_same_reason(
 
     assert preview.disposition is MessageStatus.ERROR, preview.error
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
-    assert rows[0]["error"] == preview.error
+    stored = rows[0]["error"]
+    if listener == "_handle_inbound_http":
+        # The receipt path leads its stored reason with the refusal's kind (BACKLOG #2105). The
+        # reason after that tag must still agree with the dry run word for word.
+        tag = re.match(r"\[refusal kind: (permanent|oversize)\] ", stored)
+        assert tag is not None, stored
+        stored = stored[tag.end() :]
+    assert stored == preview.error
 
 
 def _spy(monkeypatch: pytest.MonkeyPatch, module: Any, names: tuple[str, ...]) -> list[str]:
@@ -560,7 +572,9 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
 
     assert preview.disposition is MessageStatus.ERROR
     assert preview.error is not None and preview.error.startswith("decode error (")
-    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+    assert rows == [
+        {"status": MessageStatus.ERROR.value, "error": _as_stored(listener, preview.error)}
+    ]
 
 
 @pytest.mark.parametrize("listener", _LISTENERS)
@@ -576,16 +590,15 @@ async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
     runner = wiring_runner.RegistryRunner(
         reg, store, egress=EgressSettings(deny_by_default=False), env_values={"charset": "utf-8"}
     )
-    with contextlib.suppress(
-        ReceiptRefusedRetryable
-    ):  # the HTTP receipt's answer, as in _live_rows
-        await getattr(runner, listener)(reg.inbound["in"], ADT_UTF8)
+    await getattr(runner, listener)(reg.inbound["in"], ADT_UTF8)
 
     cur = await store._db.execute("SELECT status, error FROM messages")
     rows = [dict(r) for r in await cur.fetchall()]
     assert preview.disposition is MessageStatus.ERROR
     assert preview.error is not None and preview.error.startswith("decode error (")
-    assert rows == [{"status": MessageStatus.ERROR.value, "error": preview.error}]
+    assert rows == [
+        {"status": MessageStatus.ERROR.value, "error": _as_stored(listener, preview.error)}
+    ]
 
 
 async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: MessageStore) -> None:
@@ -680,7 +693,8 @@ async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_side
     assert preview.disposition is MessageStatus.ERROR, preview.error
     assert preview.error == "strict-validation timed out after 0.05s"
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
-    assert rows[0]["error"] == preview.error
+    # Permanent on the receipt path: ADR 0154's 2026-10-30 amendment keeps the timeout final.
+    assert rows[0]["error"] == _as_stored(listener, preview.error, kind="permanent")
 
 
 def _clock(monkeypatch: pytest.MonkeyPatch, step: float) -> None:

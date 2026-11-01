@@ -36,6 +36,7 @@ from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports import http_listener, tcp, x12
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import _MessagePacer
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
 
@@ -284,11 +285,13 @@ async def _run_http(
     ``decline`` makes the handler refuse every body, as the runner does after recording ERROR."""
     seen: list[bytes] = []
 
-    async def handler(raw: bytes) -> str | None:
+    async def handler(raw: bytes) -> IngressReceipt:
         seen.append(raw)
-        return None if decline else f"msg-{len(seen)}"
+        if decline:
+            return IngressReceipt.refused(RefusalKind.PERMANENT, f"err-{len(seen)}")
+        return IngressReceipt.accepted(f"msg-{len(seen)}")
 
-    await src.start(handler)
+    await src.start(receipt_handler(handler))
     status = 0
     try:
         for i in range(count):

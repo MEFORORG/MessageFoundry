@@ -203,6 +203,13 @@ def test_message_id_of_reads_only_a_receipt() -> None:
     assert message_id_of(b"[" * 65536) is None  # nesting deep enough to raise RecursionError
 
 
+def test_a_refusal_reply_never_reads_as_a_receipt() -> None:
+    # BACKLOG #2105: a refused body's answer names its ERROR row as refused_message_id, so the
+    # harness can never take a refusal for an accepted message.
+    refusal = b'{"error": "message was not accepted", "refused_message_id": "err-1"}'
+    assert message_id_of(refusal) is None
+
+
 def test_discovery_registers_the_http_driver_and_one_sink_per_http_kind() -> None:
     assert isinstance(drivers.build("http", Endpoints(), "http_in"), HttpDriver)
     built = {kind: sinks.build(kind, Endpoints(), f"http_{kind}") for kind in _HTTP_KINDS}

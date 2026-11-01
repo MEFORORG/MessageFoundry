@@ -26,6 +26,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from tests import _erased_reply_contract as contract
 from tests._ast_sites import call_sites, code_names, code_strings, named_func, parse_source
 from tests._queue_tag_contract import RawFetch, RawSql
+from tests._store_audit import no_operator_audit
 
 _STORE_DIR = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store"
 _DAY = contract.DAY
@@ -80,8 +81,8 @@ async def test_the_real_worker_step_never_ingresses_an_erased_reply(store: Messa
     fetch, raw = _fetch(store), _raw(store)
     gone_mid, gone = await contract.dead_token(store, now=0.0, control="ER-W")
     kept_mid, _ = await contract.dead_token(store, now=0.0, control="ER-W-KEPT")
-    assert await store.replay(gone_mid, now=1.0) == 1
-    assert await store.replay(kept_mid, now=1.0) == 1
+    assert await store.replay(gone_mid, now=1.0, audit=no_operator_audit) == 1
+    assert await store.replay(kept_mid, now=1.0, audit=no_operator_audit) == 1
     await raw("UPDATE response SET body=NULL WHERE message_id=?", (gone_mid,))
 
     runner = _runner(store)
@@ -104,7 +105,7 @@ async def test_a_reference_with_a_malformed_sequence_dead_letters(tmp_path: path
     try:
         fetch, raw = _fetch(store), _raw(store)
         mid, token = await contract.dead_token(store, now=0.0, control="ER-SEQ")
-        assert await store.replay(mid, now=1.0) == 1
+        assert await store.replay(mid, now=1.0, audit=no_operator_audit) == 1
         await raw(
             "UPDATE queue SET payload=? WHERE id=?", (f"{mid}\x1fOB_X\x1fnot-a-number", token)
         )
@@ -135,7 +136,7 @@ async def test_a_later_capture_does_not_revive_an_erased_token(store: MessageSto
     await store.dead_letter_now(row.id, "permanent reject", now=0.0)
     await store.purge_message_bodies(older_than=10 * _DAY, now=50 * _DAY)
 
-    assert await store.replay(mid, now=60 * _DAY) == 1
+    assert await store.replay(mid, now=60 * _DAY, audit=no_operator_audit) == 1
     [item] = await store.claim_ready(destination_name=sibling, now=60 * _DAY)
     await store.complete_with_response(
         item.id, body=contract.REPLY, outcome="accepted", now=60 * _DAY
@@ -143,7 +144,7 @@ async def test_a_later_capture_does_not_revive_an_erased_token(store: MessageSto
     bodies = await fetch("SELECT body FROM response WHERE message_id=?", (mid,))
     assert [b["body"] for b in bodies].count(None) == 1 and len(bodies) == 2  # the later capture
 
-    assert await store.replay(mid, now=61 * _DAY) == 0
+    assert await store.replay(mid, now=61 * _DAY, audit=no_operator_audit) == 0
     assert (await contract.token_row(fetch, token))["status"] == OutboxStatus.DEAD.value
     assert await contract.children(fetch) == []
 
@@ -185,7 +186,7 @@ async def test_a_shared_body_survives_for_the_delivery_that_still_needs_it(
     await store.purge_message_bodies(older_than=10 * _DAY, now=50 * _DAY)
 
     assert (await contract.token_row(fetch, token))["payload"] == ""
-    assert await store.replay(mid, now=60 * _DAY) == 1
+    assert await store.replay(mid, now=60 * _DAY, audit=no_operator_audit) == 1
     [item] = await store.claim_ready(destination_name="OB_SHARED", now=60 * _DAY)
     assert item.payload == contract.BODY
     await store.mark_done(item.id, now=60 * _DAY)

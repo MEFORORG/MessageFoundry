@@ -51,6 +51,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.receipt import RefusalKind
 
 
 @pytest.fixture
@@ -650,10 +651,14 @@ async def test_the_http_listener_refuses_an_escape_in_obx_5_5_too(store: Message
     ic = _streaming_ic(threshold=500)
     runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
 
-    assert await runner._handle_inbound_http(ic, raw.encode("utf-8")) is None
+    receipt = await runner._handle_inbound_http(ic, raw.encode("utf-8"))
 
+    # Permanent, as the MLLP path's AR: the same bytes fail the same way on every re-send.
+    assert receipt.refusal is RefusalKind.PERMANENT
     msgs = await _messages(store)
     assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    cur = await store._db.execute("SELECT id FROM messages")
+    assert [r["id"] for r in await cur.fetchall()] == [receipt.message_id]
     assert "escape sequence" in msgs[0]["error"]
     assert await _attachments(store) == []
 

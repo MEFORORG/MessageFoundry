@@ -76,7 +76,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
@@ -297,6 +297,34 @@ class _RemoteError(Exception):
         """True for a credential or a configuration fault: a fault of the connection, which every
         row meets alike, rather than of one message or one path."""
         return self.credential_fault or self.config_fault
+
+    def without_names(self, names: Iterable[str]) -> _RemoteError:
+        """A copy of this error, same markers, with every basename in ``names`` replaced by its
+        ``safe_name`` label, in any letter case (BACKLOG #2814). A server reply can quote the path
+        it refused, and on an upload that path ends in a name rendered from message fields, in its
+        temp form or as a bumped candidate; a case-insensitive server may echo it in its stored
+        case. A temp name holds the name it is for, so replacing the name covers it. One pass,
+        longest name first, so a label already put in is never matched again. Each echo takes the
+        label of the name as rendered, whatever its case, so it matches the label the upload's own
+        log lines carry.
+
+        It is a denylist over the server's free text: a reply that cuts a name short or encodes it
+        some other way keeps that form. A very short name is also replaced where it appears as
+        other text, such as a reply code."""
+        text = str(self)
+        bases = sorted({posixpath.basename(n) for n in names} - {""}, key=len, reverse=True)
+        if bases:
+            labels = {base.casefold(): safe_name(base) for base in bases}
+            pattern = re.compile("|".join(map(re.escape, bases)), re.IGNORECASE)
+            text = pattern.sub(
+                lambda m: labels.get(m.group(0).casefold()) or safe_name(m.group(0)), text
+            )
+        return _RemoteError(
+            text,
+            permanent=self.permanent,
+            credential_fault=self.credential_fault,
+            config_fault=self.config_fault,
+        )
 
     def as_delivery_error(self) -> DeliveryError:
         """The pipeline error for this failure: a transient one retries, a permanent one is a
@@ -2350,6 +2378,7 @@ class RemoteFileDestination(DestinationConnector):
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
+        failed: _RemoteError | None = None
         try:
             self._client.store(tmp, data)
         except _RemoteError as exc:
@@ -2362,19 +2391,25 @@ class RemoteFileDestination(DestinationConnector):
             # _prepare_remote_dir connected just before, so that case is rare.
             if not exc.connection_fault:
                 self._remove_temp(tmp, name, "store")
-            raise
-        try:
-            if self._overwrite:  # replacing is what it asks for
-                self._client.rename(tmp, posixpath.join(self._remote_dir, name))
-            else:
-                self._publish_new(tmp, name, candidates)
-        except _RemoteError:
-            # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
-            # delivery is classified (retry/dead-letter) by send(). Unlike the store branch, this
-            # tries even after a connection fault: the store succeeded, so a whole message sits in
-            # the temp, and the lane stops right after, so it costs one more login at most.
-            self._remove_temp(tmp, name, "rename")
-            raise
+            failed = exc
+        if failed is None:
+            try:
+                if self._overwrite:  # replacing is what it asks for
+                    self._client.rename(tmp, posixpath.join(self._remote_dir, name))
+                else:
+                    self._publish_new(tmp, name, candidates)
+            except _RemoteError as exc:
+                # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise
+                # so the delivery is classified (retry/dead-letter) by send(). Unlike the store
+                # branch, this tries even after a connection fault: the store succeeded, so a whole
+                # message sits in the temp, and the lane stops right after, so it costs one more
+                # login at most.
+                self._remove_temp(tmp, name, "rename")
+                failed = exc
+        if failed is not None:
+            # A reply can quote the paths this upload chose (BACKLOG #2814). Raised outside the
+            # handlers, so the unscrubbed reply is on neither __cause__ nor __context__.
+            raise failed.without_names([name, *candidates])
 
     def _publish_new(self, tmp: str, name: str, candidates: list[str]) -> None:
         """Publish ``tmp`` under the first of ``candidates`` still free when the client tries it,

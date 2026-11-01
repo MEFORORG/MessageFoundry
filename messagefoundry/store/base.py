@@ -782,7 +782,12 @@ class QueueStore(StoreLifecycle, Protocol):
         headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
-        ``response_get(dest).headers``)."""
+        ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
+
+        ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
+        every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -1069,14 +1074,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
-    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
+    # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
+    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
+    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
+    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
     async def replay(
         self,
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None: ...
@@ -1090,7 +1098,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome: ...
 
@@ -1101,7 +1109,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome: ...
 
@@ -1111,7 +1119,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def cancel_queued(
@@ -1271,14 +1279,12 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
-        inbound lifecycle (``established``/``closed``) + the pre-ingress failures
-        (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
-        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
-        cleanly, such as a store outage at the ingress commit)
-        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
-        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
-        + the outbound lane transitions (``connection_lost``/``connection_restored``).
+        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): a
+        listener's lifecycle and pre-ingress refusals, a poll source's rejects, and the outbound lane
+        transitions. ``kind`` must be one of
+        :data:`messagefoundry.connection_events.CONNECTION_EVENT_KINDS`, the one vocabulary the
+        connectors, this store and the web console's filter share; an undeclared kind raises
+        :class:`ValueError` on every backend (BACKLOG #1624).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
         row and calling no finalizer, so it can never pin a message's disposition or inflate received

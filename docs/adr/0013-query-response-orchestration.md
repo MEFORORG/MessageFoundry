@@ -551,6 +551,14 @@ into the *existing* DeliveryResponse carriage.
 reader. The nullable encrypted column reuses the store's existing column-migration + PHI-at-rest machinery
 and reaches the designed `response_get` reader with zero new surface.
 
+**Note (2026-10-30, BACKLOG #2984) -- "the PHI gate" overstated the allow-list.** The allow-list bounds
+which header NAMES are captured. It does not bound their values: an allow-listed value, such as a
+`Location` naming a patient resource, is stored whole, and the store does not scrub `resp_headers`, by
+decision, because a Handler reads the values back. The allow-list is therefore not a PHI gate on what
+a captured header holds. What covers a captured value is stated once, in
+[`docs/PHI.md`](../PHI.md) section 3, under `response.resp_headers`. The bullet above is left as written
+on 2026-07-12.
+
 ## Amendment (2026-07-17) — DATABASE capture of stored-proc OUT params + scalar return value (BACKLOG #67)
 
 The "DATABASE capture must be `RETURNING`/`OUTPUT`" subsection (above) captures a write's `RETURNING`/`OUTPUT`
