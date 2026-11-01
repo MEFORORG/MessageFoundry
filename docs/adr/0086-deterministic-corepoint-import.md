@@ -774,8 +774,10 @@ from source that does not run:
   `<Line>` with no statement (with or without a `@Comment`), a `MsgLog`, and a `<Block>` label over
   nothing but those. Such a step renders after the whole chain, since an `if` chain has no line
   between its arms. A bare marker, one holding no statement, is adopted across label markers
-  alone, as before: in its construct's own list the steps after it are its branch. A step that
-  runs, such as a field write, still orphans the branch. The orphan now fails closed: its marker
+  alone, as before: in its construct's own list the steps after it are its branch. So is a
+  `Catch`: adopted across a step, it would give its `Try` an `except` main's did not have, which
+  catches a raise and runs the steps after the `try`. A step that runs, such as a field write,
+  still orphans the branch. The orphan now fails closed: its marker
   heads an `if False:` with its body beneath, and it still counts unmapped.
 
 **How a disabled wrapper is switched off: placement is main's, by construction.** The wrapper is
@@ -786,23 +788,26 @@ special-cases the wrapper. Each step it held, at any depth and through nested di
 carries a mark naming the wrapper. Once the whole list is placed, one pass switches off what the
 operator switched off, and decides no placement:
 
-- Each run of marked steps that stays together after placement renders as one disabled step,
-  commented out under the wrapper's name, counted `disabled`, and naming no destination. A
-  statement in the wrapper's own `@Data` rides in that run, not as a label marker.
+- Each run of one wrapper's marked steps that stays together after placement renders as one
+  disabled step, commented out under the wrapper's name, counted `disabled`, and naming no
+  destination. Two wrappers are two steps, however alike they read. A statement in the wrapper's
+  own `@Data` rides in that run, not as a label marker.
 - A branch whose marker the wrapper held fails closed. The marker no longer opens its branch: the
   steps main placed in that branch render after the construct as the marker's orphan, under an
   `if False:` whose comment says the marker is in a `@Disabled` wrapper, and the marker counts
-  unmapped. Main ran them only on that branch, so they never run here. A branch whose steps are all
-  switched off too is just a disabled step.
+  unmapped. Main ran them only on that branch, so they never run here. A branch with nothing
+  live anywhere under it is just a disabled step. A branch lifted out of a loop this way names no
+  loop: a `LoopExit` in it is a TODO, as main marks a stray's, not a `break` of a loop around it.
 - A live branch main adopted onto a construct the wrapper held has no construct left to continue,
   and fails closed the same way, its comment naming the switched-off construct.
 - A `Try` whose `Catch` is switched off closes every `Catch` after it too. Main rendered each
   `Catch` as `except Exception:`, so a later one never ran; left in place, it would catch what the
   first caught. With no `Catch` left, the `try` re-raises.
 
-A step main placed outside a switched-off branch stays exactly where main placed it. So no step
-the import renders runs on a path more live than main gave it: a switched-off step does not run,
-and every live step the pass moves goes under a dead placeholder.
+A step main placed outside a switched-off branch stays exactly where main placed it. A
+switched-off step does not run, and every live step the pass moves goes under a dead placeholder.
+That is the aim: no step on a path more live than main gave it. The limits below are where it does
+not hold, at least.
 
 This is quieter than main on purpose. A send or a refusal main made from a disabled wrapper, or
 from an orphan's body, no longer runs. A refusal there no longer sends the message to ERROR, so a
@@ -818,7 +823,8 @@ reads each line that writes a field or sends as dead, in an `except`, or live, b
 opener that is not dead, and holds the head to no line more live than main over every list of a
 battery of disabled wrappers, the review rounds' repros among them. Against the first cut of this
 amendment, which commented a wrapper out as one node, it finds lists more live than main; against
-this one it finds none.
+this one it finds none. That is a reading of that battery, not a proof: it holds the closing
+`return` only to destinations main names, for the reason the last limit below gives.
 
 At least these limits remain:
 
@@ -826,12 +832,12 @@ At least these limits remain:
   gives a construct that cannot continue it, an element whose tag is not modelled, the steps after
   a bare marker standing at the handler's own level or in a `<Block>` body, and the steps after a
   bare marker adopted by a nested construct written directly before it.
-- A sibling branch adopted across a step that runs nothing can give a `Try` a `Catch` it had none
-  for on main, so a raise in its body runs that `Catch` and then the steps after the `try`, where
-  main's orphaned `Catch` left the raise to end the handler.
 - Main's own defect stands: a branch of a branch is never rendered, while a send in it still
-  selects the handler's closing `return Send(...)`, which delivers for every message. Switching
-  off an inline send can leave a handler on that `return` where main had another inline send.
+  selects the handler's closing `return Send(...)`, which delivers for every message. It is reached
+  wherever a handler has no inline send left. Switching off an inline send, from a wrapper or a
+  `@Disabled` statement alike, can leave a handler on that `return` where main had the inline
+  send, so a destination main never sent to then gets every message. This is a live delivery on a
+  path more live than main's, and it is not fixed here.
 
 ## 3. Acceptance criteria
 

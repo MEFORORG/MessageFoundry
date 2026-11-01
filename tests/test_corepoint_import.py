@@ -2942,11 +2942,14 @@ def test_a_wrapper_and_a_statement_are_judged_disabled_by_one_rule(value: str) -
 def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(pair: str) -> None:
     """A disabled wrapper holding a step that runs nothing leaves nothing between a construct and
     a sibling branch, so it must not orphan the branch, and the branch's send stays under its dead
-    condition. The control is the same wrapper live, holding nothing."""
+    condition. A ``Catch`` is the exception: adopted across a step, it would catch a raise main
+    let through, so it stays an orphan, dead. The control is the same wrapper live, holding
+    nothing, which main adopts across."""
     construct, branch = _SIBLING_BRANCHES[pair]
     for wrapper in ('<List Disabled="1"><Line Data="MsgLog %ADT"/></List>', "<List/>"):
         src = _handler_body(_handler_source(construct + wrapper + _sibling_arm(branch)))
-        assert _ORPHAN not in src, wrapper
+        closed = pair == "try-catch" and "Disabled" in wrapper
+        assert (_ORPHAN in src) is closed, wrapper
         assert '        sends.append(Send("OB_FLAT", msg))' in src, wrapper
         assert not _send_lines(src, 1)
 
@@ -3443,7 +3446,9 @@ def test_a_step_that_renders_as_a_comment_never_orphans_a_sibling_branch(
 ) -> None:
     """Each kind the row names, between each construct and its branch. The branch is adopted,
     so its send stays under a dead condition, and the step is still rendered. ``nothing`` is the
-    plain construct-then-branch control."""
+    plain construct-then-branch control. A ``Catch`` across a step is not adopted: it would give
+    the ``Try`` a handler main's did not have (code review of the re-cut, round 1). It stays an
+    orphan, its send dead under the placeholder and its marker counted unmapped."""
     construct, branch = _SIBLING_BRANCHES[pair]
     between, rendered = _INTERVENING.get(kind, ("", ""))
     body = (
@@ -3454,13 +3459,37 @@ def test_a_step_that_renders_as_a_comment_never_orphans_a_sibling_branch(
     )
     src = _handler_source(body)
     handler = _handler_body(src)
-    assert _ORPHAN not in handler
+    closed = pair == "try-catch" and kind != "nothing"
+    assert (_ORPHAN in handler) is closed
     assert len(_send_lines(handler, 2)) == 1 and not _send_lines(handler, 1)
     assert not [line for line in handler.splitlines() if line.startswith("    set_field")]
     assert rendered in handler
     unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
-    assert branch.split()[0] not in unmapped
+    assert (branch.split()[0] in unmapped) is closed
     ast.parse(src)
+
+
+@pytest.mark.parametrize(
+    "between",
+    ['<Line Data="MsgLog %ADT"/>', '<Line Disabled="1" Data="ItemClear %ADT/PID-3"/>', "<Line/>"],
+)
+def test_a_catch_across_a_step_leaves_the_try_re_raising(between: str, tmp_path: Path) -> None:
+    """Main orphaned a ``Catch`` written after a step, so its ``Try`` re-raised and the message
+    went to ERROR. Adopted, the ``Catch`` would catch the raise and the send after the ``try``
+    would run. The ``Try`` still re-raises, and the ``Catch`` is a dead orphan. The write in the
+    ``try`` raises on the test message, which holds no OBX segment. Code review of the re-cut,
+    round 1."""
+    body = (
+        '<Try><List><Line Data="ItemClear %ADT/OBX-5"/></List></Try>'
+        + between
+        + '<Line Data="Catch"><List><Line Data="ItemClear %ADT/PID-4"/></List></Line>'
+        + '<Line Data="MsgSend %ADT [OB_AFTER]"/>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert "    except Exception:  # TODO: Corepoint Try with no Catch" in handler
+    assert f"Corepoint Catch {_ORPHAN}" in _enclosing(handler, "PID-4")
+    with pytest.raises(Exception):  # noqa: B017 -- the write's own error, whatever its type
+        _run_handler(tmp_path, body)
 
 
 @pytest.mark.parametrize(
@@ -3601,3 +3630,50 @@ def test_an_orphan_branch_with_no_construct_at_all_sends_nothing(tmp_path: Path)
     assert _run_handler(tmp_path / "orphan", orphan) == []
     sent = _run_handler(tmp_path / "control", _SEND_INPUT)
     assert isinstance(sent, list) and len(sent) == 1
+
+
+# --- code review of the re-cut, round 1 (BACKLOG #2526) -------------------------------------------
+
+
+def test_a_live_branch_under_a_switched_off_branch_is_not_commented_out() -> None:
+    """A switched-off bare ``Else`` takes the steps after it as its branch: here a switched-off
+    ``If`` that adopted a live ``Else``. That live ``Else`` is not the operator's to switch off.
+    It fails closed as an orphan, its write and send dead and counted, not folded into the
+    wrapper's disabled count."""
+    body = (
+        '<Line Data="If (a)"><List><List Disabled="1"><Line Data="Else"/><Line Data="If (b)"/>'
+        '</List><Line Data="Else"><List><Line Data="ItemClear %ADT/PID-7"/>'
+        '<Line Data="MsgSend %ADT [OB_LIVE]"/></List></Line></List></Line>'
+    )
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert "its If is in a @Disabled List" in _enclosing(handler, "OB_LIVE")
+    assert _enclosing(handler, "OB_LIVE").lstrip().startswith("if False:")
+    assert 'outbound("OB_LIVE"' in src
+    mapped, unmapped, _ = _count_steps(_handler_steps(body), in_loop=False)
+    assert "Else" in unmapped and mapped >= 2
+    ast.parse(src)
+
+
+def test_a_loop_exit_lifted_out_of_its_loop_names_no_loop_around_it() -> None:
+    """A branch of an inner loop closed by a switched-off marker renders after that loop, inside
+    the outer one. A ``LoopExit`` in it named the inner loop, so it is a marked TODO, counted
+    unmapped, as main marks a stray's, never a ``break`` of the outer loop."""
+    inner = (
+        '<Line Data="ForEach %ADT/OBX $i"><List><Line Data="ItemClear %ADT/PID-3"/>'
+        '<List Disabled="1"><Line Data="Else"/></List><Line Data="LoopExit"/></List></Line>'
+    )
+    body = f'<Line Data="ForEach %ADT/OBX $o"><List>{inner}</List></Line>'
+    handler = _handler_body(_handler_source(body))
+    assert "break" not in [line.split("#")[0].strip() for line in handler.splitlines()]
+    assert "TODO: Corepoint LoopExit outside a loop" in handler
+    assert "LoopExit" in _count_steps(_handler_steps(body), in_loop=False)[1]
+
+
+def test_two_disabled_wrappers_that_read_alike_are_two_disabled_steps() -> None:
+    """Each wrapper is its own disabled element in the count-and-log summary, however alike their
+    tags and labels read."""
+    one = '<List Disabled="1"><Line Data="ItemClear %ADT/PID-3"/></List>'
+    two = one + one.replace("PID-3", "PID-4")
+    assert _count_steps(_handler_steps(one), in_loop=False)[2] == 1
+    assert _count_steps(_handler_steps(two), in_loop=False)[2] == 2

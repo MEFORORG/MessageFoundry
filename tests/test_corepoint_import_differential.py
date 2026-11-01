@@ -282,11 +282,17 @@ _ADOPTED_FROM_LAST = (
     "            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))\n"
 )
 _HANDLER_STEPS = "        steps = tuple(_container_steps(action_list, subject, held, False))\n"
-# The mark, a field on each of the three step types: ``(wrapper tag, wrapper label)``, or empty.
+# The mark, a field on each of the three step types: ``(wrapper tag, wrapper label, the
+# wrapper's identity)``, or empty. And a field on a construct lifted out of its loop.
 _ACTION_LAST = "    keywords: tuple[tuple[str, str], ...] = ()\n"
 _UNMAPPED_LAST = "    source_class: str\n    detail: str\n"
 _CONTROL_LAST = '    refusal: str = ""\n'
-_MARK_FIELD = "    wrapped_off: tuple[str, ...] = ()\n"
+_MARK_FIELD = "    wrapped_off: tuple[object, ...] = ()\n"
+_LIFTED_FIELD = "    lifted: bool = False\n"
+_GENERATE_EACH = "            out.extend(_generate_control(step, indent, in_loop=in_loop))\n"
+_COUNT_BREAK = '                and (step.kind != "break" or in_loop)\n'
+_COUNT_BODY = "                (step.body, in_loop or is_loop),\n"
+_COUNT_BRANCHES = "                *((b.body, in_loop and not is_loop) for b in step.branches),\n"
 _LOOK_BACK = """\
 _OPENS = {"if", "try", "case", "choosefrom"}
 
@@ -339,15 +345,17 @@ def _off(step: Step) -> bool:
 def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
     # A marker holding nothing but label markers takes the steps after it in its own
-    # construct's list, and a branch with branches of its own would lose them in a chain. Either
-    # looks back past label markers alone.
-    skip = _off if not marker.branches and not _bare(marker) else _label
+    # construct's list, a branch with branches of its own would lose them in a chain, and a
+    # Catch would give its Try a handler main's did not have. Each looks back past label markers
+    # alone.
+    plain = not marker.branches and not _bare(marker) and marker.kind != "except"
+    skip = _off if plain else _label
     while at >= 0 and skip(steps[at]):
         at -= 1
     return at
 
 
-def _wrapped(step: Step, mark: tuple[str, ...]) -> Step:
+def _wrapped(step: Step, mark: tuple[object, ...]) -> Step:
     if isinstance(step, Control):
         return replace(
             step,
@@ -388,11 +396,22 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
         b, below = _turned_off(b)
         kept.append(b)
         after.extend(below)
+    if step.kind in _LOOP_KINDS:
+        # Lifted out of its loop: a LoopExit in it named that loop, not one around it.
+        after = [replace(s, lifted=True) if isinstance(s, Control) else s for s in after]
     return replace(step, body=_off_list(step.body), branches=tuple(kept)), after
 
 
+def _all_wrapped(step: Step) -> bool:
+    if not step.wrapped_off:
+        return False
+    if not isinstance(step, Control):
+        return True
+    return all(_all_wrapped(s) for s in step.body) and all(map(_all_wrapped, step.branches))
+
+
 def _orphaned(branch: Control, why: str) -> list[Step]:
-    if branch.wrapped_off and not [s for s in branch.body if not s.wrapped_off]:
+    if _all_wrapped(branch):
         return [branch]
     note = why + "; " + branch.detail if branch.detail else why
     head, after = _turned_off(replace(branch, wrapped_off=(), detail=note))
@@ -433,7 +452,20 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     _SCAN_SKIP_PAIR,
     (_ACTION_LAST, _ACTION_LAST + _MARK_FIELD),
     (_UNMAPPED_LAST, _UNMAPPED_LAST + _MARK_FIELD),
-    (_CONTROL_LAST, _CONTROL_LAST + _MARK_FIELD),
+    (_CONTROL_LAST, _CONTROL_LAST + _MARK_FIELD + _LIFTED_FIELD),
+    # A construct lifted out of its loop renders and counts outside every loop.
+    (
+        _GENERATE_EACH,
+        _GENERATE_EACH.replace("in_loop=in_loop)", "in_loop=in_loop and not step.lifted)"),
+    ),
+    (_COUNT_BREAK, _COUNT_BREAK.replace("or in_loop)", "or in_loop and not step.lifted)")),
+    (_COUNT_BODY, _COUNT_BODY.replace("(in_loop or", "(in_loop and not step.lifted or")),
+    (
+        _COUNT_BRANCHES,
+        _COUNT_BRANCHES.replace(
+            "in_loop and not is_loop", "in_loop and not step.lifted and not is_loop"
+        ),
+    ),
     # A disabled statement keeps the kind it would have had, for the look-back below.
     (
         _DISABLED_RETURN_STEP,
@@ -466,7 +498,7 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         '                said = strip_markup(_attr(child, "Data")) or strip_markup(\n'
         '                    _attr(child, "Comment")\n'
         "                )\n"
-        "                mark = (_local(child.tag), said or _local(child.tag))\n"
+        "                mark = (_local(child.tag), said or _local(child.tag), id(child))\n"
         "                steps[first:] = [_wrapped(s, mark) for s in steps[first:]]\n"
         + _WRAPPER_DONE,
     ),
@@ -3364,7 +3396,7 @@ def _skeleton(module: Any, xml: str) -> tuple[Any, ...] | None:
         # The disabled wrapper a step is marked from, by the head's field or the baseline's.
         if (off := getattr(step, "off", None)) is not None:
             return off.source, off.label
-        return tuple(getattr(step, "wrapped_off", ())) or None
+        return tuple(getattr(step, "wrapped_off", ()))[:2] or None
 
     def left_out(step: Any) -> bool:
         # A label marker, or the run a disabled wrapper's label markers make with nothing beside

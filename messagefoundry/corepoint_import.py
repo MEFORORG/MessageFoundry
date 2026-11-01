@@ -158,14 +158,16 @@ class CorepointImportError(ValueError):
 # --- intermediate action model ----------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _SwitchedOff:
     """The ``@Disabled`` ``<List>``/``<Actions>`` wrapper a step was written in (BACKLOG #2526).
 
     The parse flattens such a wrapper exactly as it flattens a live one, so every test of where a
     step lands sees what it would see with the wrapper live. Each step it held carries this mark,
     at any depth, and :func:`_switch_off` then renders it commented out. ``source`` is the
-    wrapper's tag and ``label`` its ``@Data`` or ``@Comment``, for the comment's header."""
+    wrapper's tag and ``label`` its ``@Data`` or ``@Comment``, for the comment's header. Each
+    wrapper is its own mark, compared by identity, so two wrappers that read alike are still two
+    disabled steps."""
 
     source: str
     label: str
@@ -282,6 +284,10 @@ class Control:
     disabled_kind: str = ""
     # The ``@Disabled`` wrapper this step was written in, if any (:class:`_SwitchedOff`).
     off: _SwitchedOff | None = None
+    # A branch lifted out of the loop it was written in (:func:`_switch_off_control`). A
+    # ``LoopExit`` in it named that loop, so it is no ``break`` of a loop around it, as
+    # :func:`_stray_branches` drops the loop for a stray. The render and the count both read it.
+    out_of_loop: bool = False
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -1571,8 +1577,9 @@ def _parse_list(
         )
     steps: list[Step] = []
     # Steps that run nothing (:func:`_runs_nothing`), written after the last step that does. They
-    # wait here, outside ``steps``, until the next step that runs arrives. So ``steps[-1]`` always
-    # runs, and none of these comes between a construct and a branch written after it: not from a
+    # wait here, outside ``steps``, until the next step that runs arrives. So ``steps[-1]`` is never
+    # one of them (a switched-off construct that may own a branch, or a bare marker, is not), and
+    # none of these comes between a construct and a branch written after it: not from a
     # wrapper beside the construct, not from one nested in another, not at the end of a body
     # flattened to this level. Seen as a step, it would orphan the branch (BACKLOG #2632, #2526,
     # #2685). It keeps its place in source order among the steps that are not adopted. So one
@@ -1632,7 +1639,10 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
       its branch, and adopting it onto a nested construct would leave them in the enclosing
       body, where they run.
     * A branch holding branches of its own, from a bare marker in its own list: no chain renders
-      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead."""
+      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead.
+    * A ``Catch``. Adopted, it would give the ``Try`` an ``except`` that catches a raise and runs
+      the steps after the ``try``, where main's orphaned ``Catch`` left the ``try`` re-raising.
+      An orphan is dead, and the ``try`` still re-raises."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1644,7 +1654,7 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
     ):
         return False
     hollow = all(isinstance(step, LabelMarker) for step in between)
-    if (_opens_a_branch(branch) or branch.branches) and not hollow:
+    if (_opens_a_branch(branch) or branch.branches or branch.kind == "except") and not hollow:
         return False
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
@@ -1882,29 +1892,18 @@ def _switch_off(steps: Iterable[Step]) -> tuple[Step, ...]:
       branch, and the steps it took render under an orphan's dead placeholder, after the
       construct, counted unmapped (:func:`_closed`). A ``Try`` whose ``Catch`` is switched off
       closes every ``Catch`` after it too: left in place, a later one would catch what the first
-      caught, where it never ran. A branch whose own steps are all switched off is just a
-      disabled step.
+      caught, where it never ran. A branch with nothing live under it is just a disabled step.
     * A live branch adopted by a construct switched off fails closed the same way.
 
-    A step placed outside a switched-off branch stays where the parse placed it. Nothing here
-    moves a live step onto a path that runs more often: a switched-off step never runs, and every
-    step it moves goes under a dead placeholder."""
+    A step placed outside a switched-off branch stays where the parse placed it, and every live
+    step this moves goes under a dead placeholder. ADR 0086 §2(c.2) lists the limits that remain."""
     placed: list[Step] = []
     for step in steps:
-        if not isinstance(step, Control) or step.kind == "disabled":
-            placed.append(step)
-        elif step.off is not None:
-            # Its own content is switched off with it. A branch adopted from outside the wrapper
-            # is not, and has no construct left to continue.
-            why = f"its {step.source_verb} is in a @Disabled {step.off.source}"
-            off = tuple(branch for branch in step.branches if branch.off is not None)
-            placed.append(replace(step, branches=off))
-            for branch in step.branches:
-                if branch.off is None:
-                    placed.extend(_closed(branch, why))
+        if isinstance(step, Control) and step.kind != "disabled":
+            ctrl, after = _switch_off_control(step)
+            placed.extend((ctrl, *after))
         else:
-            live, after = _switch_off_control(step)
-            placed.extend((live, *after))
+            placed.append(step)
     out: list[Step] = []
     for wrapper, run in groupby(placed, key=lambda step: step.off):
         if wrapper is None:
@@ -1915,13 +1914,23 @@ def _switch_off(steps: Iterable[Step]) -> tuple[Step, ...]:
 
 
 def _switch_off_control(ctrl: Control) -> tuple[Control, list[Step]]:
-    """A live ``ctrl`` with its contents switched off, and the steps to place after it: each
-    branch that fails closed (:func:`_switch_off`)."""
+    """``ctrl`` with what was switched off taken out of the code, and the steps to place after
+    it: each branch that fails closed (:func:`_switch_off`). The one closing rule.
+
+    A switched-off ``ctrl`` keeps its own content, which renders commented out with it; a branch
+    adopted from outside its wrapper has no construct left to continue. A branch lifted out of a
+    loop is marked so: a ``LoopExit`` in it no longer names a loop around it."""
     kept: list[Control] = []
     after: list[Step] = []
     closing = ""
     for branch in ctrl.branches:
-        if branch.off is not None:
+        if ctrl.off is not None:
+            if branch.off is not None:
+                kept.append(branch)
+            else:
+                why = f"its {ctrl.source_verb} is in a @Disabled {ctrl.off.source}"
+                after.extend(_closed(branch, why))
+        elif branch.off is not None:
             after.extend(_closed(branch, f"its marker is in a @Disabled {branch.off.source}"))
             if ctrl.kind == "try" and _renders_as_branch(ctrl.kind, branch.kind) and not closing:
                 closing = (
@@ -1934,18 +1943,29 @@ def _switch_off_control(ctrl: Control) -> tuple[Control, list[Step]]:
             live, nested = _switch_off_control(branch)
             kept.append(live)
             after.extend(nested)
-    return replace(ctrl, body=_switch_off(ctrl.body), branches=tuple(kept)), after
+    if ctrl.kind in _LOOP_KINDS:
+        after = [replace(s, out_of_loop=True) if isinstance(s, Control) else s for s in after]
+    body = ctrl.body if ctrl.off is not None else _switch_off(ctrl.body)
+    return replace(ctrl, body=body, branches=tuple(kept)), after
 
 
 def _closed(branch: Control, why: str) -> list[Step]:
     """``branch`` taken off its construct: an orphan that never runs, its marker counted unmapped
     and ``why`` leading its label, then whatever fails closed under it. A switched-off branch
-    whose steps are all switched off too is just a disabled step."""
-    if branch.off is not None and all(step.off is not None for step in branch.body):
+    with nothing live anywhere under it is just a disabled step."""
+    if _wholly_off(branch):
         return [branch]
     detail = f"{why}; {branch.detail}" if branch.detail else why
     orphan, after = _switch_off_control(replace(branch, off=None, detail=detail))
     return [orphan, *after]
+
+
+def _wholly_off(step: Step) -> bool:
+    """Whether ``step`` and every step under it were written in a ``@Disabled`` wrapper. A live
+    branch adopted by a switched-off construct deep in its body is not."""
+    if step.off is None:
+        return False
+    return not isinstance(step, Control) or all(map(_wholly_off, (*step.body, *step.branches)))
 
 
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
@@ -2761,7 +2781,7 @@ def _generate_steps(steps: tuple[Step, ...], indent: int, *, in_loop: bool) -> l
                 f"({_comment_text(step.detail)})"
             )
         else:
-            out.extend(_generate_control(step, indent, in_loop=in_loop))
+            out.extend(_generate_control(step, indent, in_loop=in_loop and not step.out_of_loop))
     return out
 
 
@@ -3331,13 +3351,14 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
+            here = in_loop and not step.out_of_loop
             if step.kind == "send" and (step.refusal or not step.args):
                 # Rendered as a raise or a bare TODO, never as the send, so not reported as shipped.
                 unmapped.append(step.source_verb)
             elif (
                 step.kind in _MAPPED_CONTROL_KINDS
                 and step.kind not in _BRANCH_PARENT
-                and (step.kind != "break" or in_loop)
+                and (step.kind != "break" or here)
             ):
                 mapped += 1
             elif step.kind in ("exit", "unknown", "break") or step.kind in _BRANCH_PARENT:
@@ -3354,8 +3375,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # branch of a loop is a stray the render lifts OUT of it (see :func:`_stray_branches`).
             is_loop = step.kind in _LOOP_KINDS
             nested_trees = (
-                (step.body, in_loop or is_loop),
-                *((b.body, in_loop and not is_loop) for b in step.branches),
+                (step.body, here or is_loop),
+                *((b.body, here and not is_loop) for b in step.branches),
             )
             for nested, nested_in_loop in nested_trees:
                 n_mapped, n_unmapped, n_disabled = _count_steps(nested, in_loop=nested_in_loop)
