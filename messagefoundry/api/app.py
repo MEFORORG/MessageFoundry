@@ -3696,10 +3696,10 @@ async def _record_control_audit(
 ) -> None:
     """Audit a start/stop/restart of a connection (BACKLOG #1642).
 
-    Written when the action completed, and for an inbound whose start or restart was attempted and
-    refused (:func:`_record_refused_control_audit`), where ``running`` is false. A refused restart
-    has already stopped the listener, so that row records something that happened. The denial paths
-    write ``auth.channel_denied`` instead. At least a 404 and the 409 for a connection not deployed
+    Written when the action completed, and for at least an inbound's refused start or restart and
+    an outbound's the store stopped (:func:`_record_refused_control_audit`), where ``running`` is
+    the lane's state after the refusal. A refused restart has already stopped the lane, so that row
+    records something that happened. The denial paths write ``auth.channel_denied`` instead. At least a 404 and the 409 for a connection not deployed
     write no row here: nothing was attempted, so a row would assert an action that did not happen.
 
     ``reason``, where set, joins the row's detail. Only a store fault sets it (vault BACKLOG #3746),
@@ -3736,11 +3736,14 @@ async def _record_refused_control_audit(
     action: str,
     *,
     role: str,
+    running: bool,
     store_fault: bool,
     client: str | None,
 ) -> None:
     """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
-    outbound's the store stopped. ``role`` is the resolved role.
+    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    after the refusal, which is not always stopped: at least a lane that failed at boot on a store
+    fault stays unpaused through a start the store stopped.
 
     Written fail-soft, as :func:`_audit_refused_reload`'s row is. The refusal's answer stands
     whether or not the row lands, and a store that stopped the trust-anchor check is likely to
@@ -3756,7 +3759,7 @@ async def _record_refused_control_audit(
                 name,
                 action,
                 role=role,
-                running=False,
+                running=running,
                 client=client,
                 reason=reason,
             ),
@@ -3845,17 +3848,19 @@ async def _audit_alert_rules_withheld(
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 #: What a route answers for a trust-anchor check the store stopped, which says nothing against the
-#: anchor (BACKLOG #3091): a reload, an inbound's operator start and a connection test. Fixed text,
-#: because a connection test's detail is written to ``audit_log.detail`` (vault BACKLOG #3746).
+#: anchor (BACKLOG #3091): at least a reload, an operator start of an inbound or an outbound, and a
+#: connection test. Fixed text, because a connection test's detail is written to
+#: ``audit_log.detail`` (vault BACKLOG #3746).
 _ANCHOR_STORE_DETAIL = (
     "the engine could not reach its store to check a trust anchor; see the engine log"
 )
 
-#: :data:`_ANCHOR_STORE_DETAIL` for a restart, whose stop half already ran, so the listener stays
-#: down until a start gets past the check (vault BACKLOG #3746).
+#: :data:`_ANCHOR_STORE_DETAIL` for a restart, whose stop half already ran. The connection stays
+#: stopped only until the next start, which need not be an operator's (vault BACKLOG #3746).
 _ANCHOR_STORE_RESTART_DETAIL = (
     "the engine could not reach its store to check a trust anchor, so this restart left the "
-    "connection stopped; start it once the store is back, and see the engine log"
+    "connection stopped until the next start, which a schedule or an alert rule can also make; "
+    "see the engine log"
 )
 
 
@@ -5472,6 +5477,7 @@ def create_app(
                     name,
                     action,
                     role="source",
+                    running=rr.inbound_running(name),
                     store_fault=store_fault,
                     client=client,
                 )
@@ -5482,15 +5488,18 @@ def create_app(
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
-            # Vault BACKLOG #3746: the store stopped the lane's CA check, and it was not resumed.
             held = False
             try:
                 if action == "start":
-                    held = await rr.start_outbound(name)
+                    await rr.start_outbound(name, hold_on_store_fault=True)
                 elif action == "stop":
                     await rr.stop_outbound(name)
                 else:
-                    held = await rr.restart_outbound(name)
+                    await rr.restart_outbound(name, hold_on_store_fault=True)
+            except TrustAnchorError:
+                # Vault BACKLOG #3746: only a store fault raises this here, and the lane was not
+                # resumed. Answered below, outside this handler, as the inbound arm does.
+                held = True
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5511,6 +5520,7 @@ def create_app(
                     name,
                     action,
                     role="destination",
+                    running=rr.outbound_running(name),
                     store_fault=True,
                     client=client,
                 )

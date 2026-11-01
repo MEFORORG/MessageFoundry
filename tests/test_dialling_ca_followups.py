@@ -30,7 +30,11 @@ import pytest
 
 import messagefoundry.auth.trust_anchors as ta
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _ANCHOR_REFUSED_DETAIL, _run_connection_test
+from messagefoundry.api.app import (
+    _ANCHOR_REFUSED_DETAIL,
+    _alert_control_action,
+    _run_connection_test,
+)
 from messagefoundry.auth.trust_anchors import (
     AnchorSettingRefused,
     AnchorStoreUnavailable,
@@ -53,8 +57,10 @@ from messagefoundry.store import MessageStore
 from tests.test_dr_outlive_deadline import _admin_client, _coordinator, _rows, _seed
 from tests.test_dr_passive_followups import _PASSIVE_UNCHECKED, _runner
 from tests.test_outbound_ca_anchors import (
+    _at,
     _ca,
     _CountingSink,
+    _day_schedule,
     _outbound_registry,
     _real_ca,
     _sha,
@@ -724,10 +730,12 @@ async def test_an_outbound_start_the_store_stopped_answers_503_and_holds_its_row
             channel_id="IB_X", raw=_ADT, deliveries=[("OUT", _ADT)]
         )
         faulty.fail = "list_audit"
-        if not row_lands:
-            monkeypatch.setattr(store, "record_audit", refuse_control)
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
-            r = await _control(engine, action, "OUT")
+        # A context, not monkeypatch.undo(), which would also lift the judged fixture.
+        with monkeypatch.context() as patched:
+            if not row_lands:
+                patched.setattr(store, "record_audit", refuse_control)
+            with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+                r = await _control(engine, action, "OUT")
         assert r.status_code == 503, r.text
         assert expected in r.json()["detail"]
         await asyncio.sleep(0.3)
@@ -737,7 +745,6 @@ async def test_an_outbound_start_the_store_stopped_answers_503_and_holds_its_row
         assert "could not be checked" in (rr.outbound_failed("OUT") or "")
         lost = [rec for rec in caplog.records if "connection_control row" in rec.getMessage()]
         assert [rec.levelno for rec in lost] == ([] if row_lands else [logging.ERROR])
-        monkeypatch.undo()
         if row_lands:
             assert await _rows(store, "connection_control") == [
                 {
@@ -756,29 +763,127 @@ async def test_an_outbound_start_the_store_stopped_answers_503_and_holds_its_row
         await engine.stop()
 
 
-async def test_an_engine_door_holds_a_lane_the_store_stopped_without_raising(
-    store: MessageStore, tmp_path: Path, judged: None
-) -> None:
-    """A window open and an alert rule reach the same start with nobody to answer. It says the
-    lane is held rather than raising, so a scheduler tick logs no traceback and a reload that
-    resumes a calendar-parked lane after its swap cannot fail on it. Red under: the start raising
-    the fault."""
+def _store_stopped_runner(store: MessageStore, tmp_path: Path, **kw: Any) -> RegistryRunner:
+    """A runner whose ``OUT`` CA check the store stops from the first start, so it has no connector."""
     ca = _ca(tmp_path)
     faulty: Any = _FaultyAuditStore("list_audit")
     check = ta.make_lane_anchor_check(faulty, enforcing=True)
-    runner = _runner(
-        store, _outbound_registry(ca, _sha(ca), auto_start=False), lane_anchor_check=check
-    )
+    reg = _outbound_registry(ca, _sha(ca), **kw.pop("connection", {}))
+    return _runner(store, reg, lane_anchor_check=check, **kw)
+
+
+async def test_only_the_operator_door_holds_a_lane_the_store_stopped(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Vault BACKLOG #3746: the hold is not durable. Held by the operator's door, the lane reads
+    not running, and a start from any other door resumes it with no connector, as main does. That
+    is the open gap the docs state, pinned so a change to it is a decision. Red under: the hold
+    applied by default."""
+    runner = _store_stopped_runner(store, tmp_path, connection={"auto_start": False})
     await runner.start()
     try:
-        assert await runner.start_outbound("OUT") is True
-        assert await runner.restart_outbound("OUT") is True
+        with pytest.raises(TrustAnchorError, match="could not be checked") as held:
+            await runner.start_outbound("OUT", hold_on_store_fault=True)
+        assert isinstance(held.value.__cause__, AnchorStoreUnavailable)
         assert not runner.outbound_running("OUT")
-        faulty.fail = None
-        assert await runner.start_outbound("OUT") is False
+        assert "OUT" in runner._outbound_paused  # which suppresses its buildup and stall pages
+        await runner.start_outbound("OUT")
+        assert runner.outbound_running("OUT") and "OUT" not in runner._destinations
+        with pytest.raises(TrustAnchorError, match="could not be checked"):
+            await runner.restart_outbound("OUT", hold_on_store_fault=True)
+        assert not runner.outbound_running("OUT")
+        await runner.restart_outbound("OUT")
         assert runner.outbound_running("OUT")
     finally:
         await runner.stop()
+
+
+async def test_a_scheduler_tick_resumes_a_lane_the_store_stopped_as_main_does(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Vault BACKLOG #3746: a window open has nobody to answer, so it keeps its old behaviour. Red
+    under: the start holding the lane for every caller."""
+    schedule = _day_schedule()
+    runner = _store_stopped_runner(
+        store,
+        tmp_path,
+        connection={"schedule": schedule},
+        schedule_clock=lambda: _at(9),
+    )
+    await runner.start()
+    try:
+        await runner.stop_outbound("OUT")
+        assert not runner.outbound_running("OUT")
+        await runner._reconcile_schedule("OUT", "outbound", schedule)
+        assert runner.outbound_running("OUT") and "OUT" not in runner._destinations
+    finally:
+        await runner.stop()
+
+
+async def test_a_calendar_resume_of_a_lane_the_store_stopped_is_as_main_does(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The reload's resume of a lane whose schedule went has nobody to answer either. Red under:
+    the start holding the lane for every caller."""
+    runner = _store_stopped_runner(store, tmp_path)
+    await runner.start()
+    try:
+        await runner.stop_outbound("OUT")
+        runner._schedule_parked.add("OUT")
+        await runner._resume_unscheduled_outbound("OUT")
+        assert runner.outbound_running("OUT")
+    finally:
+        await runner.stop()
+
+
+async def test_a_rule_fired_restart_resumes_a_lane_the_store_stopped_as_main_does(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """An alert rule's restart keeps its old behaviour. Red under: the start holding the lane for
+    every caller, which left it stopped as an operator pause that nothing automatic lifts."""
+    ca = _ca(tmp_path)
+    faulty: Any = _FaultyAuditStore("list_audit")
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_outbound_registry(ca, _sha(ca)))
+    await engine.start()
+    try:
+        rr = engine.registry_runner
+        assert rr is not None
+        await _alert_control_action(engine, "restart_outbound", "OUT", default_target=False)
+        assert rr.outbound_running("OUT")
+    finally:
+        await engine.stop()
+
+
+async def test_a_refused_row_records_the_lane_s_true_running_state(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Vault BACKLOG #3746: a lane that failed at boot on the store fault was never paused, so the
+    503 leaves it running, and its row must say so. It keeps claiming with no connector, which is
+    the open gap the docs state. Red under: the row hard-coding ``running`` false."""
+    ca = _ca(tmp_path)
+    faulty: Any = _FaultyAuditStore("list_audit")
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_outbound_registry(ca, _sha(ca)))
+    await engine.start()
+    try:
+        rr = engine.registry_runner
+        assert rr is not None and rr.outbound_running("OUT")
+        r = await _control(engine, "start", "OUT")
+        assert r.status_code == 503, r.text
+        assert rr.outbound_running("OUT")
+        rows = await _rows(store, "connection_control")
+        assert [row["running"] for row in rows] == [True]
+    finally:
+        await engine.stop()
 
 
 def _store_fault_line() -> TrustAnchorError:

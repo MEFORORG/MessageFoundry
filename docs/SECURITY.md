@@ -2471,12 +2471,22 @@ every refused release does. The engine log carries the store's error.
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
 **503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
 carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
-its 503 would say the connection is left stopped. The lane would read `failed`, and a lane with no
-earlier failure on record would show a line saying the CA could not be checked. An outbound checks
-its CA at a start only when it has no connector. Such a lane would stay paused with its rows
-pending, because a resumed lane with no connector charges each row it claims an attempt, and a
-finite `max_attempts` would dead-letter it with nothing known against the CA. The next start checks
-the CA again. A lane that was not paused, such as one that failed at boot, would stay as it was.
+its 503 would say the connection is left stopped until the next start. The lane would read
+`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
+checked. An outbound checks its CA at a start only when it has no connector. An operator start of
+such a lane that was paused would leave it paused with its rows pending, because a resumed lane
+with no connector charges each row it claims an attempt, and a finite `max_attempts` would
+dead-letter it with nothing known against the CA.
+
+**That hold is not durable, and it covers the operator control route only.** The lane would stay
+paused only until the next start, and a start need not be an operator's. An in-window schedule tick
+reads a held lane as not running and starts it, and the `connection_stopped` alert can fire a
+rule's restart. Either would resume it with no connector and charge its rows, as would a calendar
+resume after a reload. While a lane is held it sits in the paused set, which suppresses its buildup
+and stall pages. A lane that was not paused, such as one that failed at boot on the same fault,
+would keep claiming with no connector and charging its rows through the 503, unless a restart
+paused it first. Its `connection_control` row would then record `running` true. These gaps are
+known and open.
 
 A connection test the store stopped would report `success: false` with one fixed line, and the row
 the route writes to `audit_log.detail` would carry that line and the same `reason`. The
