@@ -76,7 +76,7 @@ def list_rules(service_config: str | Path) -> list[dict[str, Any]]:
     path = Path(service_config)
     if not path.is_file():
         return []
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=AlertRuleError))
     rules = _existing_rules(doc)
     if rules is None:
         return []

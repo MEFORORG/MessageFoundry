@@ -283,8 +283,8 @@ def ride_out_a_held_file(action: Callable[[], None], held: frozenset[int]) -> No
 
 
 def unlink_generated(path: Path) -> None:
-    """Delete one file the engine wrote, riding out a brief Windows sharing violation. Shared by
-    the API's minted pair and the `cert` commands' cleanup, so neither imports the other."""
+    """Delete one file, riding out a brief Windows sharing violation. Shared by the API's minted
+    pair and the `cert` commands' cleanup, so neither imports the other, and the code-set editor."""
     ride_out_a_held_file(path.unlink, frozenset({WINERROR_SHARING_VIOLATION}))
 
 

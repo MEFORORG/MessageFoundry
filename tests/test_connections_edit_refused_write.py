@@ -22,7 +22,6 @@ import shutil
 import sys
 import tempfile
 import textwrap
-import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -403,6 +402,88 @@ def test_the_settings_editors_refuse_a_read_in_their_own_type(
     assert caught.value.__cause__ is refusal
 
 
+@pytest.mark.parametrize(
+    ("list_it", "refused"),
+    [
+        (alerts_edit.list_rules, alerts_edit.AlertRuleError),
+        (security_edit.read_security, security_edit.SecurityEditError),
+    ],
+    ids=["alerts", "security"],
+)
+def test_the_settings_listings_refuse_a_read_in_their_own_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    list_it: Callable[[Path], Any],
+    refused: type[Exception],
+) -> None:
+    # The security CLI reads through here before it sets, so this read comes first on that path.
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(RULES_TOML, encoding="utf-8")
+    refusal = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_reads(monkeypatch, refusal, path.name)
+
+    with pytest.raises(refused, match="read it") as caught:
+        list_it(path)
+
+    assert caught.value.__cause__ is refusal
+
+
+def test_a_read_refusal_gives_read_advice_not_write_advice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A read-only directory refuses no read, so naming one would send an operator the wrong way.
+    _live(tmp_path)
+    _refuse_reads(
+        monkeypatch, PermissionError(errno.EACCES, "Permission denied"), "connections.toml"
+    )
+
+    with pytest.raises(WiringError) as caught:
+        connections_edit.list_connections(tmp_path)
+
+    assert "read-only" not in str(caught.value)
+    assert "give this account access" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("edit", "refused"),
+    [
+        (_alerts_add, alerts_edit.AlertRuleError),
+        (_security_set, security_edit.SecurityEditError),
+    ],
+    ids=["alerts", "security"],
+)
+def test_a_file_it_cannot_stat_is_refused_rather_than_read_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
+) -> None:
+    # is_file() answers False for a path it could not stat. Reading that as "no file" would start
+    # from an empty document and replace the file with it.
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(RULES_TOML, encoding="utf-8")
+    before = path.read_bytes()
+    validated: list[Path] = []
+    monkeypatch.setattr(Path, "is_file", lambda _self: False)
+    _refuse_reads(monkeypatch, PermissionError(errno.EACCES, "Permission denied"), path.name)
+    monkeypatch.setattr(os, "replace", lambda src, _dst: validated.append(Path(src)))
+
+    with pytest.raises(refused, match="read it"):
+        edit(path)
+
+    monkeypatch.undo()
+    assert validated == []
+    assert path.read_bytes() == before
+
+
+def test_an_edit_of_a_file_that_is_not_there_creates_it(tmp_path: Path) -> None:
+    path = tmp_path / "messagefoundry.toml"
+
+    _security_set(path)
+
+    assert "require_mfa" in path.read_text(encoding="utf-8")
+
+
 def _code_set(tmp_path: Path) -> Path:
     path = tmp_path / "codesets" / "diets.csv"
     path.parent.mkdir()
@@ -611,16 +692,30 @@ def test_a_real_hold_on_the_live_file_is_refused_with_the_file_intact(
 
 
 @windows_only
-def test_a_real_hold_that_lets_go_inside_the_retry_lets_the_edit_land(tmp_path: Path) -> None:
+def test_a_real_hold_that_lets_go_inside_the_retry_lets_the_edit_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = _live(tmp_path)
     holder = path.open("rb")
-    timer = threading.Timer(0.2, holder.close)
-    timer.start()
+    real_replace = os.replace
+    refused: list[OSError] = []
+
+    def lets_go_once_refused(src: Any, dst: Any) -> None:
+        try:
+            real_replace(src, dst)
+        except PermissionError as exc:
+            # Inside the first refusal, so the test proves the replace met the hold.
+            refused.append(exc)
+            holder.close()
+            raise
+
+    monkeypatch.setattr(os, "replace", lets_go_once_refused)
     try:
         connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
     finally:
-        timer.join()
+        holder.close()
 
+    assert len(refused) == 1
     assert "flagged" in path.read_text(encoding="utf-8")
 
 

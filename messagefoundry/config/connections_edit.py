@@ -167,9 +167,7 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     path = _path(config_dir)
     if not path.is_file():
         return []
-    with atomic_edit.refused_as(path, WiringError, "read it"):
-        text = path.read_text(encoding="utf-8")
-    doc = tomlkit.parse(text)
+    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=WiringError))
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):

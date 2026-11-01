@@ -525,11 +525,34 @@ def test_an_edit_locks_on_nfs_where_an_exclusive_lock_needs_a_writable_handle(
 
     monkeypatch.setattr(os, "open", spying_open)
     monkeypatch.setattr(atomic_edit, "_try_lock", nfs_lock)
+    monkeypatch.setattr(atomic_edit, "_WINDOWS", False)
 
     with atomic_edit.edit_lock(path):
         pass
 
     assert locked
+
+
+def test_the_lock_handle_stays_read_only_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder with read sharing only, such as a backup agent, would refuse a request for write."""
+    real_open = os.open
+    seen: list[int] = []
+
+    def spying_open(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        seen.append(flags)
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spying_open)
+    monkeypatch.setattr(atomic_edit, "_try_lock", lambda _fd: True)
+    monkeypatch.setattr(atomic_edit, "_WINDOWS", True)
+
+    with atomic_edit.edit_lock(tmp_path / "messagefoundry.toml"):
+        pass
+
+    assert seen
+    assert not seen[0] & (os.O_WRONLY | os.O_RDWR)
 
 
 def test_the_candidate_pattern_ends_in_the_candidate_suffix() -> None:

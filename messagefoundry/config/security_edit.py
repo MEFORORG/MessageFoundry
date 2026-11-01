@@ -44,7 +44,7 @@ def read_security(service_config: str | Path) -> dict[str, Any]:
     path = Path(service_config)
     if not path.is_file():
         return {}
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=SecurityEditError))
     sec = doc.get("security")
     return dict(sec.unwrap()) if sec is not None else {}
 

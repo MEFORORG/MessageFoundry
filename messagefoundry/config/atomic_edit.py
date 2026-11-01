@@ -62,6 +62,7 @@ __all__ = [
     "encode_text",
     "is_candidate_dir_name",
     "lock_path_for",
+    "read_for_listing",
     "read_text",
     "read_text_if_present",
     "refused_as",
@@ -100,10 +101,15 @@ _LOCK_POLL_S = 0.05
 #: FUSE and SMB mounts), as opposed to a lock someone else holds. The same set ``dr_backup`` reads.
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
-#: ``errno`` values meaning the file system will not let this account write the directory: a
-#: root-owned one, or a read-only mount. Only these become an editor's ``refused_error``; a full
-#: disk or a missing directory keeps its own ``OSError``, so it is not reported as a permission.
+#: ``errno`` values meaning the file system will not let this account read the file or write its
+#: directory: a root-owned one, or a read-only mount. Only these become an editor's
+#: ``refused_error``; a full disk or a missing directory keeps its own ``OSError``, so it is not
+#: reported as a permission.
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
+#: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
+#: directory refuses no read, so the write advice would send an operator to the wrong fix.
+_READ_STEP = "read it"
 
 #: Windows also answers ``EACCES`` when another program holds the file open, and for most of these
 #: steps nothing tells the two apart: ``open`` reports a sharing violation through the C runtime as
@@ -139,7 +145,7 @@ def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple
     A file with mixed endings reads as ``\n``, the editors' own form, rather than being
     reflowed to ``\r\n`` on the strength of one line. A refused read is raised as
     ``refused_error(message)``, as :func:`refused_as` says."""
-    with refused_as(path, refused_error, "read it"):
+    with refused_as(path, refused_error, _READ_STEP):
         raw = path.read_bytes()
     crlf = raw.count(b"\r\n")
     return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
@@ -148,8 +154,24 @@ def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple
 def read_text_if_present(
     path: Path, *, refused_error: Callable[[str], Exception]
 ) -> tuple[str | None, bool]:
-    """:func:`read_text`, or ``(None, False)`` for a file an edit is about to create."""
-    return read_text(path, refused_error=refused_error) if path.is_file() else (None, False)
+    """:func:`read_text`, or ``(None, False)`` for a file an edit is about to create.
+
+    The read decides, not ``is_file``: that answers ``False`` for a path it could not stat, so a
+    file in a directory this account cannot search would read as absent, and the edit would write
+    a new file over it with every other setting gone."""
+    try:
+        return read_text(path, refused_error=refused_error)
+    except FileNotFoundError:
+        return None, False
+
+
+def read_for_listing(path: Path, *, refused_error: Callable[[str], Exception]) -> str:
+    """``path``'s text for a list or show, with a refused read raised as ``refused_error(message)``.
+
+    Not :func:`read_text`, which keeps the bytes an edit will write back: a listing has always read
+    in Python's text mode, whose newline translation also takes a lone ``\r``."""
+    with refused_as(path, refused_error, _READ_STEP):
+        return path.read_text(encoding="utf-8")
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -180,14 +202,16 @@ def edit_lock(
     if key in held:
         yield
         return
-    # Read-write, although nothing is written to it: an NFS client emulates flock with a byte-range
-    # lock, and an exclusive one needs a writable handle or it fails EBADF (flock(2)), so a read-only
-    # handle would fail every edit on NFS. Owner-only, like the files it guards: every edit leaves
+    # Read-write off Windows, although nothing is written to it: an NFS client emulates flock with a
+    # byte-range lock, and an exclusive one needs a writable handle or it fails EBADF (flock(2)), so
+    # a read-only handle would fail every edit on NFS. Read-only on Windows, where msvcrt.locking
+    # needs no more, and asking for write would be refused by a backup agent or scanner holding the
+    # file with read sharing only. Owner-only, like the files it guards: every edit leaves
     # the edited file 0600, so an account that could not open this lock could not edit that file
     # either, and root opens a 0600 file regardless. Wider access gains nothing.
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
-    flags = os.O_RDWR | os.O_CREAT | _O_BINARY
+    flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         with refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
@@ -291,7 +315,7 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
     operator through the API, where an absolute host path adds nothing the file name does not. The
     full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
     the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
-    _log.warning("the file system refused an edit of %s: %s", path, exc)
+    _log.warning("the file system would not let this account %s, for %s: %s", step, path, exc)
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
     held = (
@@ -300,11 +324,17 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
         if _WINDOWS and exc.errno == errno.EACCES
         else ""
     )
+    advice = (
+        "Another account owns the file or its directory; read it as that account, or give this "
+        "account access to it"
+        if step == _READ_STEP
+        else "Its directory is read-only or another account owns it, as a root-owned or read-only "
+        "config directory is, or another account owns the file named; change the file where this "
+        "account can write it, or as the account that owns it"
+    )
     return (
         f"{path.name} was not changed: the file system would not let this account {step}: "
-        f"{reason}. {held}Its directory is read-only or another account owns it, as a root-owned or "
-        "read-only config directory is, or another account owns the file named; change the file "
-        "where this account can write it, or as the account that owns it"
+        f"{reason}. {held}{advice}"
     )
 
 
