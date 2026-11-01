@@ -1059,13 +1059,23 @@ class DeliveryResponse:
       frame **was received** but its content could not be parsed — **never** "no reply was received",
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
-    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest.
+    * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest
+      only when a store key is configured. The store passes it through ``safe_text(detail,
+      limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
+      knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
+      every identifier: at least a lone surname such as ``Smith``, an identifier such as
+      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
+      ``response_get(dest).detail``, so a connector author keeps partner free text out of
+      ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
-      ever captured (PHI gate: a partner reply header could carry sensitive data, so it is opt-in by
-      name — never all headers). This is a **captured external value** (like the ``fhir_lookup``
-      read-only carve-out): it is read off the wire at delivery and, unlike a pure transform output,
+      ever captured: a partner reply header could carry sensitive data, so it is opt-in by name,
+      never all headers. The allow-list bounds which names are captured, not their values;
+      ``docs/PHI.md`` section 3 says what covers a captured value (BACKLOG #2984). This is a
+      **captured external value** (like the ``fhir_lookup`` read-only carve-out): it is read off
+      the wire at delivery and, unlike a pure transform output,
       reflects the partner's reply at that pass — the capture itself is deterministic per reply
       (the same names off the same reply → the same dict), so it re-ingresses re-run-stably from the
       immutable stored copy. Surfaced to a re-ingressed answer's Handler via
