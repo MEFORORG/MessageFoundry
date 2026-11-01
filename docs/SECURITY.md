@@ -2450,8 +2450,9 @@ written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mi
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
-raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
-missing config directory writes. The row does not claim the old graph is still serving: at least a
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
+for the config directory itself: at least one that is missing, and a share lost after the reload's
+target check. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -2584,6 +2585,12 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
+- on Windows, a network share the engine cannot reach can read as absent, not as a fault. At least
+  a share lost after the target check would answer `not_found`, `validate_config` would report a
+  base directory on such a share as absent, and a value file read from disk would read as absent
+  there;
+- a DR backup bundle takes its config digest by an ordinary read, which leaves out what it cannot
+  read and does not tell its caller, so that digest can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
@@ -6950,9 +6957,21 @@ reads the file again by path, on its own schedule. The SMTP hop reads it at ever
 swapped between reloads would be trusted by the next send. A connection that falls back to the
 internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
-`restart_required` row for them. A changed syslog CA takes effect only at a restart. The reload
-response's `restart_required` field lists none of these dialling CAs, so an empty list there does
-not mean a changed one is applied (BACKLOG #3015).
+`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+
+**What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
+response says that no settings anchor with a recorded load changed in the engine process that
+answered, including when none is configured. It does not say that no restart is needed. At least
+these sit outside the list:
+
+- the dialling CAs `[tls].internal_ca_file`, `[alerts].email_tls_ca_file` and
+  `[logging].forward_tls_ca_file`. Their hops load the file by path and record no fingerprint to
+  compare with, so a changed one is never listed, and it can still need a restart or a rebuild of
+  the connections that use it, as above;
+- another engine shard. A reload is per process with no fleet coordination (ADR 0073), so a shard
+  reports only once a reload reaches its own API;
+- a cluster node. It has no response to carry a list, and the `auth.trust_anchor` row names no
+  node, so it says so only in its own log, and only once its convergence reload reaches this check.
 
 **The hops built before that check take the same checks first (BACKLOG #3470).** At least four
 are covered:
