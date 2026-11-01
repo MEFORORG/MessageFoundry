@@ -119,10 +119,11 @@ function reloadShortfall(r: ReloadResult): string[] {
   }
   return [
     "Restart the engine to apply a changed trust anchor: this reload checked the new file but " +
-      "does not load it. The names that follow may leave some out. At least these are not " +
-      "listed: anchors on another engine shard or cluster node, which report in their own logs, " +
-      "and the dialling CAs in the settings. The engine still trusts the old CA for: " +
-      `${names.join(", ")}.`,
+      `does not load it, so the engine still trusts the old CA for: ${names.join(", ")}. This ` +
+      "list is not complete, for at least these reasons: it covers only the engine that " +
+      "answered; another engine shard reports only once a reload reaches its own API; a cluster " +
+      "node reports only if it converges on the reload; and the dialling CAs are never listed, " +
+      "so see docs/SECURITY.md for which need a restart.",
   ];
 }
 

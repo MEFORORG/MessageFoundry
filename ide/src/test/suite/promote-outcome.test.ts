@@ -39,6 +39,10 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     dry_run: false,
     restart_required: [],
   };
+  // The success sentence for `live`, which every outcome of a live swap starts with.
+  const promoted =
+    "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
+    "4 handlers, running.";
 
   setup(async () => {
     replyStatus = 200;
@@ -88,11 +92,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     const msg = promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
     assert.deepStrictEqual(sent, { config_dir: null, dry_run: false });
     assert.strictEqual(msg.level, "info");
-    assert.strictEqual(
-      msg.text,
-      "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers, running.",
-    );
+    assert.strictEqual(msg.text, promoted);
   });
 
   const promoteReplying = async (restart: unknown): Promise<PromoteMessage> => {
@@ -105,18 +105,42 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.strictEqual(msg.level, "warning");
     assert.strictEqual(
       msg.text,
-      "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers, running. Restart the engine to apply a changed trust anchor: this reload " +
-        "checked the new file but does not load it. The names that follow may leave some out. " +
-        "At least these are not listed: anchors on another engine shard or cluster node, which " +
-        "report in their own logs, and the dialling CAs in the settings. The engine still trusts " +
-        "the old CA for: [auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
+      `${promoted} Restart the engine to apply a changed trust anchor: this reload checked the ` +
+        "new file but does not load it, so the engine still trusts the old CA for: " +
+        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file. This list is not complete, for at " +
+        "least these reasons: it covers only the engine that answered; another engine shard " +
+        "reports only once a reload reaches its own API; a cluster node reports only if it " +
+        "converges on the reload; and the dialling CAs are never listed, so see " +
+        "docs/SECURITY.md for which need a restart.",
     );
   });
 
+  for (const [name, names] of [
+    [
+      "the seven settings anchor names, as a check of the name shape",
+      [
+        "[auth].oidc_tls_ca_cert_file",
+        "[auth].ad_tls_ca_cert_file",
+        "[api].tls_client_ca_file",
+        "[tls].internal_ca_file",
+        "[alerts].email_tls_ca_file",
+        "[logging].forward_tls_ca_file",
+        "[store].ssl_root_cert",
+      ],
+    ],
+    ["a 64-character key", [`[auth].${"k".repeat(64)}`]],
+    ["a 64-character section", [`[${"s".repeat(64)}].x`]],
+  ] as const) {
+    test(`a restart_required of ${name} is printed`, async () => {
+      const msg = await promoteReplying(names);
+      assert.strictEqual(msg.level, "warning");
+      assert.ok(msg.text.includes(`old CA for: ${names.join(", ")}. This list`), msg.text);
+    });
+  }
+
   for (const [name, restart] of [
-    // An applied reload always sends a list; null is a dry run's value, and undefined drops the key
-    // from the reply. On an apply, either says the anchors went unchecked, not that none changed.
+    // The engine sends a list on every apply; null is a dry run's value, and undefined drops the
+    // key from the reply. On an apply, either says the anchors went unchecked, not that none did.
     ["null", null],
     ["no value at all", undefined],
     ["a bare string", "[auth].ad_tls_ca_cert_file"],
@@ -130,6 +154,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     ["a good name with a trailing newline", ["[auth].x\n"]],
     ["a name in the wrong case", ["[AUTH].X"]],
     ["a key past the length bound", [`[auth].${"x".repeat(65)}`]],
+    ["a section past the length bound", [`[${"s".repeat(65)}].x`]],
     // Falsy values, which a truthiness test would read as clean.
     ["an empty string", ""],
     ["zero", 0],
@@ -139,10 +164,11 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     test(`a restart_required of ${name} keeps the counts, warns, and prints none of it`, async () => {
       const msg = await promoteReplying(restart);
       assert.strictEqual(msg.level, "warning");
-      assert.ok(msg.text.includes("promoted to PROD"), msg.text);
-      assert.ok(msg.text.endsWith("not be read, so check the engine's log for them."), msg.text);
-      assert.ok(!msg.text.includes("command:"), msg.text);
-      assert.ok(!msg.text.includes("ad_tls_ca_cert_file"), msg.text);
+      assert.strictEqual(
+        msg.text,
+        `${promoted} The engine's list of trust anchors that take a restart could not be read, ` +
+          "so check the engine's log for them.",
+      );
       // The pre-flight prints no restart list, so the same reply must not stop it.
       assert.ok(preflightOutcome(await reloadConfig(url, "/cfg", true, "tok")).ok);
     });
