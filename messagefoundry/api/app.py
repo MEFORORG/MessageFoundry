@@ -16,7 +16,7 @@ Authentication + RBAC are enforced whenever an :class:`AuthService` is attached,
 turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
 bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
 protected route is refused. Only ``allow_no_auth=True`` opens the bearer-token gates, which then
-admit a tokenless caller as the full-access system identity (SYS-1). Both factories refuse that
+admit every caller as the full-access system identity (SYS-1). Both factories refuse that
 opt-in beside an auth service or auth settings. Only embedders and tests pass it; ``serve`` never
 does.
 
@@ -12555,15 +12555,15 @@ def create_managed_app(
         if open_mode(app.state):
             _log.warning(
                 "create_managed_app: built with allow_no_auth=True and no auth_settings, so no "
-                "service attaches and the API's bearer-token gates admit a tokenless caller as "
-                "the full-access system identity, with no sign-in"
+                "service attaches and the API's bearer-token gates admit every caller as the "
+                "full-access system identity, with no sign-in"
             )
         else:
             _log.warning(
                 "create_managed_app: built with no auth_settings and without allow_no_auth, so %s: "
                 "no service attaches and the API's bearer-token gates refuse every caller. "
-                "auth_settings attaches sign-in; allow_no_auth=True instead admits a tokenless "
-                "caller as the full-access system identity",
+                "auth_settings attaches sign-in; allow_no_auth=True instead has those gates admit "
+                "every caller as the full-access system identity",
                 AUTH_NOT_CONFIGURED,
             )
     return app
