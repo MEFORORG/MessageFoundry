@@ -394,25 +394,35 @@ roster alias of the Lander.
 > nothing, because they say only that a cached number has not changed.
 >
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
-> percentage, so no one session's reading is the truth; each is a valid floor. The collector therefore
-> refuses a reading for the same reset that is not higher, and a reading whose reset has already passed,
-> so neither reaches `latest.json` or the history. Any other reset is a new window and replaces the
-> value in either direction. A reading that is not higher and has no readable reset is refused while the
-> published reset is ahead.
+> percentage, so no one session's reading is the truth; each is a valid floor. Against a published
+> window of this root's, the collector therefore refuses a reading with the same reset that is not
+> higher, and a reading whose reset is earlier than the published one and has already passed. A refused
+> reading reaches neither `latest.json` nor the history. Any other reset is a new window and replaces
+> the value in either direction. A reading with no readable reset is refused if it is not higher while
+> the published reset is ahead, and a higher one keeps that reset.
 >
-> **The age therefore counts from the last change.** The payload carries no time of its own, so an idle
-> session's cached number looks like a live flat one. Restamping an equal reading let one idle terminal
-> keep a frozen number fresh, and the rung read OK on it. The cost is deliberate: a flat account, live or
-> not, goes stale after 20 minutes and reads UNKNOWN, so the gate answers REVIEW, even above the level.
+> **The age therefore counts from the last change, and age never blocks a hit.** The payload carries no
+> time of its own, so an idle session's cached number looks like a live flat one. Restamping an equal
+> reading let one idle terminal keep a frozen number fresh, and the rung read OK on it. So a flat
+> account, live or not, goes stale after 20 minutes and reads UNKNOWN. That reading still proves at
+> least its level while its reset is ahead, so `usage.ps1` publishes it as `level_floor`, and the rung
+> is hit at the 90 percent level or the 98 percent ceiling as before. Below them the gate answers REVIEW,
+> because a stale number cannot clear work. A future-dated or undateable reading sets no floor, and
+> neither does one with no reset. Until the reset, a pool that stays flat at the level stays halted.
 >
-> The limits of that rule, all of them open:
+> The rule has at least these limits, all of them open:
 >
+> - It needs a published window to compare with. A gone reading on an empty directory, over a window
+>   stamped with another root, or over one with no reset, is published and reaches the history. A higher
+>   reading for the same gone reset replaces too. `usage.ps1` is what stops the number being used, by
+>   reporting any window past its reset as UNKNOWN.
+> - With no published reset ahead, there is no floor at all: a reading with no reset is taken whatever
+>   its value, and an equal one refreshes the age, until a reading brings a reset.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.
-> - If usage ever does fall inside a period, the kept reading stops being refreshed, goes stale in 20
->   minutes, and the gate answers REVIEW until the reset. That errs away from clearing work, not toward
->   a stop.
+> - If usage ever does fall inside a period, the kept reading stops being refreshed and goes stale in
+>   20 minutes. The gate then answers REVIEW below the rung and HALT at it, until the reset.
 >
 > **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
 > with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.

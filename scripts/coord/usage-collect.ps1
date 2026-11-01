@@ -228,21 +228,30 @@ try {
 
     # THE HIGHEST READING IN A RESET PERIOD BINDS. An idle session keeps reporting its cached number on
     # a timer, and every session publishes here, so without this rule a stale 60 replaces a live 99 and
-    # reads as freshly observed. The level only rises inside a window. Any other reset is a new window
-    # and replaces in either direction, unless that reset has already passed: then it is a window that
-    # is gone, the number an idle session still holds after a reset, and it replaces nothing. A refused
-    # reading leaves the published window whole, its own age included, so the staleness guard keeps
-    # counting from the last real observation.
+    # reads as freshly observed. The level only rises inside a window. So against a published window
+    # of this root's, a reading is refused when it has the same reset and is not higher, or when its
+    # reset is earlier than the published one and has already passed: that is the number an idle
+    # session still holds after a reset. Any other reset is a new window and replaces in either
+    # direction. A refused reading leaves the published window whole, its own age included, so the
+    # staleness guard keeps counting from the last real observation.
+    #
+    # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. A gone reading on an empty directory, over a
+    # window stamped with another root, or over one with no reset, is published and reaches the history.
+    # Nothing here reads the clock against a lone reading. The reader is what stops its number being
+    # used: it reports any window past its reset as UNKNOWN.
     #
     # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
     # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
     # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
-    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale, and reads
-    # UNKNOWN, which sends the gate to REVIEW rather than clearing work.
+    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. The
+    # number still stands as a floor while its reset is ahead, so usage.ps1 and the gate's rung keep a
+    # stale reading at the rung as a HIT, and only below the rung does the gate fall to REVIEW.
     #
     # A READING WITH NO READABLE RESET CANNOT PROVE IT IS A NEW WINDOW. While the published reset is
-    # still ahead, one that is not higher is refused like any other. If it were taken, it would wipe
-    # the reset time this rule and the reader's gone-window check both need.
+    # still ahead, one that is not higher is refused like any other, and a higher one keeps that reset,
+    # because this rule and the reader's gone-window check both need it. With no published reset ahead
+    # there is nothing to hold on to: the reading is taken, and the rule does not apply until a reading
+    # brings a reset.
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
@@ -262,6 +271,10 @@ try {
             ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $notHigher -and $publishedEpoch -gt $nowEpoch }
+        if (-not $keepPublished -and -not $seenEpoch -and $publishedEpoch -gt $nowEpoch) {
+            $seven.resets_at_epoch = $published.resets_at_epoch
+            $seven.resets_at = $published.resets_at
+        }
     }
 
     # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new
@@ -331,11 +344,11 @@ try {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $rl.seven_day.resets_at) {
+        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch) {
             $row = [ordered]@{
                 at          = $now
                 seven_day   = $freshSeven
-                seven_reset = $rl.seven_day.resets_at
+                seven_reset = $seven.resets_at_epoch
             } | ConvertTo-Json -Compress
             Add-Content -LiteralPath $histPath -Value $row -Encoding UTF8
         }

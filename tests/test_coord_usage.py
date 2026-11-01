@@ -332,6 +332,44 @@ def test_a_later_reading_with_an_earlier_reset_ahead_of_now_is_a_new_window(tmp_
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(3.0)
 
 
+def test_a_higher_reading_with_no_reset_keeps_the_published_reset(tmp_path: Path) -> None:
+    """Taken bare, it would wipe the reset, and the next idle reading would pass the floor."""
+    seven = window(99.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    bare = {"used_percentage": 100.0}
+    collect(tmp_path, {"session_id": "odd", "rate_limits": {"seven_day": bare}})
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(100.0), kept
+    assert kept["resets_at_epoch"] == seven["resets_at"], kept
+    assert history(tmp_path)[-1]["seven_reset"] == seven["resets_at"]
+
+    idle = {**seven, "used_percentage": 60.0}
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+
+
+def test_with_no_published_reset_there_is_no_floor(tmp_path: Path) -> None:
+    """The stated limit, pinned so a change to it is a decision: with no reset to compare, the rule
+    has nothing to hold on to, and a later reading replaces the number either way."""
+    for pct in (70.0, 40.0):
+        seven = {"used_percentage": pct}
+        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+
+
+def test_a_gone_reading_on_an_empty_directory_is_published_and_read_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """The floor refuses a gone reading only against a later published reset. With nothing published
+    it lands in both files, and the reader is what keeps its number from being used."""
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(95.0, -300)}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+    assert len(history(tmp_path)) == 1
+    code, d = read(tmp_path)
+    assert code == UNKNOWN, d
+    assert d["seven_day"]["used_percentage"] is None, d
+
+
 def test_a_lower_reading_with_no_reset_cannot_disarm_the_floor(tmp_path: Path) -> None:
     """Taken, it would wipe the published reset, and every lower reading after it would pass too."""
     seven = window(99.0, 280000)
@@ -518,6 +556,27 @@ def test_a_future_dated_reading_is_refused_rather_than_treated_as_fresh(tmp_path
     code, d = read(tmp_path)
     assert code == UNKNOWN
     assert "FUTURE" in d["seven_day"]["reason"].upper()
+
+
+def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
+    tmp_path: Path,
+) -> None:
+    """The gate may HALT on level_floor, so only a reading that was once true and whose window is
+    still running may carry it. A future date, or no reset to prove the window, proves nothing."""
+    publish(tmp_path, seven=95.0, age_min=75)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] == pytest.approx(95.0)
+
+    publish(tmp_path, seven=95.0)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "a fresh reading is no floor"
+
+    publish(tmp_path, seven=95.0, age_min=-120)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "a future date proves nothing"
+
+    publish(tmp_path, seven=95.0, age_min=75)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "no reset proves no window"
 
 
 def test_a_never_published_window_is_unknown_not_zero(tmp_path: Path) -> None:

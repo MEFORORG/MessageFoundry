@@ -852,8 +852,13 @@ function Get-DecisionCostRung {
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      UNKNOWN when the reading is missing, stale, refused, past its reset (it describes a window that
-      is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
+      AGE BLOCKS CLEARING AND NEVER BLOCKS A HIT. An equal reading does not refresh its age, so a flat
+      pool goes stale, and a spent one cannot rise. A stale reading whose reset is ahead still proves
+      at least its level, which usage.ps1 publishes as level_floor, so at the level or the ceiling it
+      is HIT. Below them it is UNKNOWN, because a stale number cannot clear work.
+
+      UNKNOWN when the reading is missing, stale below the rung, refused, past its reset (it describes
+      a window that is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
       window's own state does not), unless the window grades HIT: a hit is never downgraded, since
       that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
@@ -897,6 +902,10 @@ function Get-DecisionCostRung {
     $week = Get-DecisionJsonValue $j 'seven_day'
     $pct = Get-DecisionJsonValue $week 'used_percentage'
     $weekState = [string](Get-DecisionJsonValue $week 'state')
+    $floor = Get-DecisionJsonValue $week 'level_floor'
+    if ($null -ne $floor -and ([double]$floor -ge 98 -or [double]$floor -ge $lv.HoldAt)) {
+        return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
+    }
     if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
         $why = [string](Get-DecisionJsonValue $week 'reason')
         if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }

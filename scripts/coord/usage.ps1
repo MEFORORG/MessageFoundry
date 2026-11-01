@@ -495,6 +495,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         rate_pct_per_hr  = $null
         projected_at_reset = $null
         minutes_to_empty = $null
+        # Set only on a reading past -MaxAgeMinutes whose reset is known and still ahead. It says the
+        # window now running has reached at least this level: usage does not fall inside a reset
+        # period, so age takes away what the number says about now, not what it proves. Get-DecisionCostRung
+        # halts on it. A future date or an undateable reading sets nothing, because it proves nothing.
+        level_floor      = $null
         state            = "OK"
         reason           = ""
     }
@@ -514,6 +519,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # root. The mis-wire warning printed above the numbers names that case; this line states the
         # age and stops.
         else { "reading is $age min old (max $MaxAgeMinutes)" }
+        if ($age -gt $MaxAgeMinutes -and $null -ne $minsToReset) { $o.level_floor = $pct }
         return $o
     }
 

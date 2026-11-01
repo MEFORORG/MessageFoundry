@@ -443,6 +443,69 @@ def test_the_real_usage_reader_feeds_the_rung(
     assert code == expected, why(doc)
 
 
+def _stale(pct: float, **over: Any) -> dict[str, Any]:
+    """usage.ps1 -Json's shape for a reading past the age limit, with its reset still ahead."""
+    fields: dict[str, Any] = {
+        "state": "UNKNOWN",
+        "reading_age_min": 25.0,
+        "reason": "reading is 25 min old (max 20)",
+        "level_floor": pct,
+    }
+    return usage(pct, **{**fields, **over})
+
+
+@pytest.mark.parametrize("pct", [90.0, 98.0, 100.0], ids=["at-the-level", "ceiling", "spent"])
+def test_a_stale_reading_at_the_rung_still_halts(sb: Sandbox, pct: float) -> None:
+    """A stale reading whose reset is ahead proves at least that level: usage does not fall inside
+    a reset period. So age blocks clearing, and it never blocks a hit."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(pct), code=20)
+    code, doc = gate(sb)
+    assert code == HALT and "at least" in why(doc), why(doc)
+
+
+def test_a_stale_reading_below_the_rung_does_not_clear(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(89.9), code=20)
+    code, doc = gate(sb)
+    assert code == REVIEW and "25 min old" in why(doc), why(doc)
+
+
+def test_a_percentage_with_no_floor_proves_nothing(sb: Sandbox) -> None:
+    """A future-dated or undateable reading also carries a number, and the reader marks no floor."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(99.0, level_floor=None, reason="dated in the FUTURE"))
+    code, doc = gate(sb)
+    assert code == REVIEW and "FUTURE" in why(doc), why(doc)
+
+
+def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """A spent pool cannot rise, so an equal reading never refreshes its age, and this state is
+    certain. It used to fall to REVIEW until the reset."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    seven = {"used_percentage": 100, "resets_at": int(ago().timestamp()) + 200000}
+    payload = json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+
+    def fire() -> subprocess.CompletedProcess[str]:
+        return sb.run(COORD / "usage-collect.ps1", "-StateDir", str(state), stdin=payload, **env)
+
+    assert fire().returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    assert fire().returncode == 0, "the idle fire"
+
+    seed_vault(sb, calibrated("manager"))
+    real = sb.repo / "scripts" / "coord" / "usage.ps1"
+    code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
+    assert code == HALT, why(doc)
+
+
 def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(
     sb: Sandbox, tmp_path: Path
 ) -> None:
