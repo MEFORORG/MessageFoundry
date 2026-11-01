@@ -250,10 +250,12 @@ someone deletes it by SQL, because no route can name it, so one such row costs e
 toggle and turns Flagged only off for the whole estate.
 
 **Accepted residual: the flag reaches a bulk action (owner ruling 2026-11-01).** Flagged only hides
-rows, select-all takes only the rows left on screen, and that selection then goes into a bulk action
+rows, select-all takes only rows no filter hides, and that selection then goes into a bulk action
 such as Stop, Restart, Reset or Purge. So a database writer who sets or clears rows could add a
 connection to that target set or keep one out of it. Asked whether to accept this, the owner chose
-*"Accept, record the reach"*, so the filter and select-all stay as they are. What bounds it: no
+*"Accept, record the reach"*. The failed-read repair then changed both controls: the filter now
+shows a row of unknown flag, and under it select-all skips any row not known to be flagged. That
+narrowed the reach, and it accepts nothing further. What bounds it: no
 filter has hidden a row select-all takes as it is taken, the toolbar counts the selection beside Go,
 and an operator must press Go. Purge then adds a confirm page naming each outbound. Every other bulk
 action has no such page, a row below the fold is still taken, and a selected row a later refresh

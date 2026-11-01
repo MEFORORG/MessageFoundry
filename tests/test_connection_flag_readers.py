@@ -173,8 +173,9 @@ def test_only_the_backends_name_the_table() -> None:
 
 
 def test_the_browser_reads_the_flag_in_the_filter_and_in_select_all_only() -> None:
-    """Those two are the reach the owner accepted. A third branch on the value in ``app.js``, such as
-    preselecting flagged rows, would widen it, so it fails here until someone has looked at it."""
+    """The filter's read is the reach the owner accepted. Select-all's read did not exist then: it
+    narrows that reach and accepts nothing further. A third branch on the value in ``app.js``, such
+    as preselecting flagged rows, would widen it, so it fails here until someone has looked at it."""
     source = (REPO / "messagefoundry_webconsole/static/app.js").read_text(encoding="utf-8")
     assert source.count('getAttribute("data-flagged")') == 2
 
