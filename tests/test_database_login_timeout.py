@@ -153,21 +153,47 @@ async def test_reference_sync_pool_passes_the_login_timeout(
     assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
 
 
-async def test_generic_dialect_passes_no_login_timeout(
+_GENERIC: dict[str, Any] = {
+    "server": "db.example",
+    "dialect": "generic",
+    "odbc_driver": "PostgreSQL Unicode",
+    "odbc_params": {"SSLmode": "verify-full"},
+    "connect_timeout": _LOGIN_TIMEOUT,
+}
+
+
+async def test_generic_dialect_passes_the_login_timeout(
     pool_calls: list[dict[str, Any]],
 ) -> None:
-    """Scope pin: the generic dialect never carried a login timeout, and #2089 does not turn one on.
-    Whether an arbitrary operator-named driver accepts ``SQL_ATTR_LOGIN_TIMEOUT`` is unmeasured."""
-    settings = {
-        "server": "db.example",
-        "dialect": "generic",
-        "odbc_driver": "PostgreSQL Unicode",
-        "odbc_params": {"SSLmode": "verify-full"},
-        "connect_timeout": _LOGIN_TIMEOUT,
-    }
+    """BACKLOG #2705: the generic dialect is bounded too. Measured 2026-10-30, pyodbc ``timeout=5``
+    bounded a psqlODBC and a MySQL connect to an unreachable host at about 5 s, against about 21 s
+    without it. Red on the code before #2705, where the generic dialect passed no ``timeout=``."""
+    with pytest.raises(_StopPool):
+        await _dest(dict(_GENERIC))._get_pool()
+    assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
+
+
+async def test_generic_poll_source_passes_the_login_timeout(
+    pool_calls: list[dict[str, Any]],
+) -> None:
+    source = DatabaseSource(
+        Source(
+            name="IB_DB",
+            type=ConnectorType.DATABASE,
+            settings={**_GENERIC, "poll_statement": "SELECT 1"},
+        )
+    )
+    with pytest.raises(_StopPool):
+        await source._get_pool()
+    assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
+
+
+async def test_generic_dialect_default_login_timeout(pool_calls: list[dict[str, Any]]) -> None:
+    """With no ``connect_timeout`` set, the generic dialect takes the SQL Server preset's default."""
+    settings = {k: v for k, v in _GENERIC.items() if k != "connect_timeout"}
     with pytest.raises(_StopPool):
         await _dest(settings)._get_pool()
-    assert "timeout" not in pool_calls[0]
+    assert pool_calls[0].get("timeout") == DEFAULT_DB_CONNECT_TIMEOUT
 
 
 async def test_make_pool_requires_the_login_timeout() -> None:
@@ -199,7 +225,7 @@ async def test_an_env_resolved_string_connect_timeout_is_accepted(
 
 
 def test_a_bad_connect_timeout_is_refused_on_the_generic_dialect_too() -> None:
-    """The generic dialect ignores the value, but a malformed one is still a config error."""
+    """The generic dialect is bounded too (BACKLOG #2705), so a malformed value is refused there."""
     settings = {
         "server": "db.example",
         "dialect": "generic",
