@@ -11,6 +11,7 @@ replacement in :mod:`messagefoundry.config.atomic_edit` through each editor's pu
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -18,6 +19,7 @@ import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -497,6 +499,60 @@ def test_the_lock_file_is_owner_only(tmp_path: Path) -> None:
     with atomic_edit.edit_lock(path):
         pass
     assert stat.S_IMODE(atomic_edit.lock_path_for(path).stat().st_mode) == 0o600
+
+
+def test_an_edit_locks_on_nfs_where_an_exclusive_lock_needs_a_writable_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """flock(2): an NFS client emulates flock with a byte-range lock, so an exclusive lock on a
+    read-only handle fails EBADF. No NFS mount here, so the rule is modelled, on every platform."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(SETTINGS_TOML, encoding="utf-8")
+    real_open = os.open
+    opened: dict[int, int] = {}
+    locked: list[int] = []
+
+    def spying_open(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(target, flags, *args, **kwargs)
+        opened[fd] = flags
+        return fd
+
+    def nfs_lock(fd: int) -> bool:
+        if not opened[fd] & (os.O_WRONLY | os.O_RDWR):
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        locked.append(fd)
+        return True
+
+    monkeypatch.setattr(os, "open", spying_open)
+    monkeypatch.setattr(atomic_edit, "_try_lock", nfs_lock)
+    monkeypatch.setattr(atomic_edit, "_WINDOWS", False)
+
+    with atomic_edit.edit_lock(path):
+        pass
+
+    assert locked
+
+
+def test_the_lock_handle_stays_read_only_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder with read sharing only, such as a backup agent, would refuse a request for write."""
+    real_open = os.open
+    seen: list[int] = []
+
+    def spying_open(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        seen.append(flags)
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spying_open)
+    monkeypatch.setattr(atomic_edit, "_try_lock", lambda _fd: True)
+    monkeypatch.setattr(atomic_edit, "_WINDOWS", True)
+
+    with atomic_edit.edit_lock(tmp_path / "messagefoundry.toml"):
+        pass
+
+    assert seen
+    assert not seen[0] & (os.O_WRONLY | os.O_RDWR)
 
 
 def test_the_candidate_pattern_ends_in_the_candidate_suffix() -> None:

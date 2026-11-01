@@ -31,6 +31,12 @@ runs on an event loop: the engine's one caller already moves the whole write to 
 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
 ``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.
+
+:func:`refused_as` turns a refusal from the file system into the editor's own refusal type, for at
+least the lock, the read, the candidate, its companions and the replace, each of which leaves the
+edited file as it was. Each editor names that type, so a root-owned or read-only config directory
+reaches an operator as a refused edit and not as an unhandled ``OSError``. ``validate`` is not one of
+those steps: what it raises is its own.
 """
 
 from __future__ import annotations
@@ -50,15 +56,24 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
+from messagefoundry.config.key_file_access import _UNREACHABLE_WINERRORS
+from messagefoundry.config.snapshot import is_missing_directory
+from messagefoundry.controlchars import scrub_log_argument
+
 __all__ = [
     "CANDIDATE_DIR_SUFFIX",
     "DEFAULT_LOCK_TIMEOUT_S",
     "LOCK_FILE_NAME",
+    "READ_STEP",
     "edit_lock",
     "encode_text",
     "is_candidate_dir_name",
     "lock_path_for",
+    "is_dir",
+    "is_file",
     "read_text",
+    "read_text_if_present",
+    "refused_as",
     "replace_validated",
 ]
 
@@ -94,10 +109,26 @@ _LOCK_POLL_S = 0.05
 #: FUSE and SMB mounts), as opposed to a lock someone else holds. The same set ``dr_backup`` reads.
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
-#: ``errno`` values meaning the file system will not let this account write the directory: a
-#: root-owned one, or a read-only mount. Only these become an editor's ``refused_error``; a full
-#: disk or a missing directory keeps its own ``OSError``, so it is not reported as a permission.
+#: ``errno`` values meaning the file system will not let this account read the file or write its
+#: directory: a root-owned one, or a read-only mount. Only these become an editor's
+#: ``refused_error`` at a read or a write; a full disk or a missing directory keeps its own
+#: ``OSError``, so it is not reported as a permission. The stat gate has its own rule (:func:`is_file`).
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
+#: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
+#: directory refuses no read, so the write advice would send an operator to the wrong fix.
+READ_STEP = "read it"
+
+#: The ``step`` of a stat that failed with no refusal in it: a broken link or a fault, which no
+#: change of account cures.
+_STAT_STEP = "stat it"
+
+#: Windows also answers ``EACCES`` when another program holds the file open, and for most of these
+#: steps nothing tells the two apart: ``open`` reports a sharing violation through the C runtime as
+#: bare ``EACCES`` with no ``winerror``, and a replace over a held file reports the same
+#: ``ERROR_ACCESS_DENIED`` as a true denial (both measured on Windows 11). So the wording on Windows
+#: names both causes.
+_WINDOWS = sys.platform == "win32"
 
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -120,14 +151,81 @@ def is_candidate_dir_name(name: str, *, of: str | None = None) -> bool:
     return match is not None and (of is None or match.group("name") == of)
 
 
-def read_text(path: Path) -> tuple[str, bool]:
+def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple[str, bool]:
     """``path`` as UTF-8 text with ``\n`` line endings, and whether EVERY line ended ``\r\n``.
 
     A file with mixed endings reads as ``\n``, the editors' own form, rather than being
-    reflowed to ``\r\n`` on the strength of one line."""
-    raw = path.read_bytes()
+    reflowed to ``\r\n`` on the strength of one line. A refused read is raised as
+    ``refused_error(message)``, as :func:`refused_as` says."""
+    with refused_as(path, refused_error, READ_STEP):
+        raw = path.read_bytes()
     crlf = raw.count(b"\r\n")
     return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
+
+
+def read_text_if_present(
+    path: Path, *, refused_error: Callable[[str], Exception]
+) -> tuple[str | None, bool]:
+    """:func:`read_text`, or ``(None, False)`` for a path that is no regular file, as for a file an
+    edit is about to create."""
+    if not is_file(path, refused_error=refused_error):
+        return None, False
+    return read_text(path, refused_error=refused_error)
+
+
+def is_file(path: Path, *, refused_error: Callable[[str], Exception] | None) -> bool:
+    """Whether ``path`` is a regular file, by the stat the four editors share.
+
+    Not ``Path.is_file``, which answers ``False`` for every stat that fails: a config file that is a
+    link to an unmounted share, or into a directory this account cannot search, would read as absent,
+    and an edit would start from an empty document and replace the link with it.
+
+    ``False`` here means there is no file to lose: nothing at the path, or a name no file can have
+    (:func:`~messagefoundry.config.snapshot.is_missing_directory`). So a bad path lists as empty, as
+    ``Path.is_file`` answered. Every other failed stat is raised as ``refused_error(message)``, or as
+    itself with no ``refused_error``: a link on the path that cannot be followed, a share Windows
+    says it cannot reach, and any fault that does not say the file is gone. A link that ends at
+    something other than a regular file answers ``False``. A share that reads as a plain missing
+    path does too, because nothing tells the two apart (Windows answered error 3 for one)."""
+    return _is_a(path, stat.S_ISREG, refused_error)
+
+
+def is_dir(path: Path, *, refused_error: Callable[[str], Exception]) -> bool:
+    """:func:`is_file`, for whether ``path`` is a directory."""
+    return _is_a(path, stat.S_ISDIR, refused_error)
+
+
+def _is_a(
+    path: Path, kind: Callable[[int], bool], refused_error: Callable[[str], Exception] | None
+) -> bool:
+    try:
+        return kind(path.stat().st_mode)
+    except ValueError:  # an embedded NUL, which no path can hold
+        return False
+    except OSError as exc:
+        if _nothing_there(path, exc):
+            return False
+        if refused_error is None:
+            raise
+        step = READ_STEP if exc.errno in _REFUSED else _STAT_STEP
+        raise refused_error(_refusal(path, exc, step)) from exc
+
+
+def _nothing_there(path: Path, exc: OSError) -> bool:
+    """Whether ``exc``, from a stat of ``path``, means no file is there to lose. The walk stops at
+    the first entry that exists, so it costs a few calls, and only on a stat that failed."""
+    if not is_missing_directory(exc) or getattr(exc, "winerror", None) in _UNREACHABLE_WINERRORS:
+        return False
+    # Anything at the path itself is a file the stat could not answer for, however it got there: a
+    # link or a Windows junction that cannot be followed, or a share that came back a moment later.
+    if os.path.lexists(path):
+        return False
+    for folder in path.parents:
+        if os.path.exists(folder):
+            return True
+        if os.path.lexists(folder):
+            return False
+    return True
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -158,15 +256,25 @@ def edit_lock(
     if key in held:
         yield
         return
-    # Read-only, because a lock needs only an open handle. Owner-only, like the files it guards:
-    # every edit leaves the edited file 0600, so an account that could not open this lock could
-    # not edit that file either, and root opens a 0600 file regardless. Wider access gains nothing.
+    # Read-write off Windows, although nothing is written to it: an NFS client emulates flock with a
+    # byte-range lock, and an exclusive one needs a writable handle or it fails EBADF (flock(2)), so
+    # a read-only handle would fail every edit on NFS. Read-only on Windows, where msvcrt.locking
+    # needs no more, and asking for write would be refused by a backup agent or scanner holding the
+    # file with read sharing only. The cost, off Windows: a lock file this account cannot write, at
+    # 0444 or at 0644 under another account, refuses the edit where a read-only open would have
+    # locked it. The refusal names the lock file, though its advice speaks of owners, not modes.
+    # Owner-only, like the files it guards: every edit leaves the edited file 0600, so an account
+    # that could not open a lock an editor created could not edit that file either, and root opens
+    # a 0600 file regardless. Wider access gains nothing.
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
-    flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
+    flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if refused_error is not None:
+        # For its refusal alone: a folder that is a broken link would fail the open as plain ENOENT.
+        is_dir(path.parent, refused_error=refused_error)
     try:
-        with _refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
+        with refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
             fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno != errno.ELOOP:
@@ -202,24 +310,30 @@ def replace_validated(
     """Replace ``path`` with ``data`` only if ``validate`` accepts a candidate holding ``data``.
 
     The candidate is ``<private dir>/<path.name>``, the private directory a unique one created beside
-    ``path``. Each existing file in ``companions`` is copied beside the candidate first. ``validate``
+    ``path``. Each file in ``companions`` is copied beside the candidate first, and one whose stat
+    fails stops the edit (:func:`is_file`), since a candidate without it would prove nothing. ``validate``
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
     ``path`` and re-restricted to its owner. The private directory is removed either way, and a
     stale one a killed editor of ``path`` left behind is removed first.
 
-    With ``refused_error`` set, a refusal creating or writing the candidate (``EACCES``, ``EPERM`` or
-    ``EROFS``: a root-owned or read-only directory) is raised as ``refused_error(message)``. Only
-    those steps: they run before the replace, so the live file is untouched. An error from the
-    replace onward, and any other ``OSError``, is never converted."""
+    On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
+    the new candidate. With ``refused_error`` set, a refusal building the candidate or making the
+    replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
+    did not pass) is raised as ``refused_error(message)``. Those steps leave the live file as it
+    was, since a rename that fails has not happened. What follows the replace, any other
+    ``OSError`` past that companion stat, and whatever ``validate`` raises are never converted."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import replace_generated
+
     _remove_stale_candidates(path)
-    with _refused_as(path, refused_error, "create its edit candidate"):
+    with refused_as(path, refused_error, "create its edit candidate"):
         private = Path(
             tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
         )
     try:
         candidate = private / path.name
-        with _refused_as(path, refused_error, "write its edit candidate"):
+        with refused_as(path, refused_error, "write its edit candidate"):
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
@@ -227,10 +341,13 @@ def replace_validated(
                 handle.flush()
                 os.fsync(handle.fileno())
         for companion in companions:
-            if companion.is_file():
-                shutil.copyfile(companion, private / companion.name)
+            # The stat gate: a companion read as absent would validate the candidate without it.
+            if is_file(companion, refused_error=refused_error):
+                with refused_as(path, refused_error, f"copy {companion.name} to validate it"):
+                    shutil.copyfile(companion, private / companion.name)
         validate(candidate)
-        os.replace(candidate, path)
+        with refused_as(path, refused_error, "replace it with the validated edit"):
+            replace_generated(candidate, path)
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
@@ -238,13 +355,13 @@ def replace_validated(
 
 
 @contextlib.contextmanager
-def _refused_as(
+def refused_as(
     path: Path, refused_error: Callable[[str], Exception] | None, step: str
 ) -> Iterator[None]:
-    """Raise a refusal (``_REFUSED``) from the body, which does ``step``, as
+    """Raise a refusal (``_REFUSED``) from the body, which does ``step`` to ``path``, as
     ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
-    ``None``, propagates unchanged. Only for steps before the replace, when the live file is known
-    to be untouched."""
+    ``None``, propagates unchanged. Only for a step that leaves ``path`` as it was when it fails,
+    because the message says so."""
     try:
         yield
     except OSError as exc:
@@ -254,17 +371,40 @@ def _refused_as(
 
 
 def _refusal(path: Path, exc: OSError, step: str) -> str:
-    """The message for an edit of ``path`` the file system refused before anything was written.
+    """The message for an edit of ``path`` the file system refused, which left the file as it was.
 
     It names the file, the step that was refused and the cause, not the directory: it reaches an
     operator through the API, where an absolute host path adds nothing the file name does not. The
-    full error, with the path, is logged."""
-    _log.warning("the file system refused an edit of %s: %s", path, exc)
+    full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
+    the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
+    _log.warning(
+        "this account could not %s, for %s: %s",
+        step,
+        scrub_log_argument(str(path)),  # a name from a directory listing, which nothing has checked
+        scrub_log_argument(str(exc)),
+    )
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
+    held = (
+        "Another program may have the file open, such as an editor or a virus scanner, so try "
+        "again once it closes it. If that is not it: "
+        if _WINDOWS and exc.errno == errno.EACCES
+        else ""
+    )
+    if step == _STAT_STEP:
+        return (
+            f"{path.name} could not be read: {reason}. It or a folder above it may be a link, or "
+            "on a share, that cannot be reached, so it was not taken to be absent. Restore the "
+            "share or the link's target, or remove the link"
+        )
+    if step == READ_STEP:
+        return (
+            f"{path.name} could not be read: {reason}. {held}Another account owns the file or its "
+            "directory; read it as that account, or give this account access to it"
+        )
     return (
         f"{path.name} was not changed: the file system would not let this account {step}: "
-        f"{reason}. Its directory is read-only or another account owns it, as a root-owned or "
+        f"{reason}. {held}Its directory is read-only or another account owns it, as a root-owned or "
         "read-only config directory is, or another account owns the file named; change the file "
         "where this account can write it, or as the account that owns it"
     )

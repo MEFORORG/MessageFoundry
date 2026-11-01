@@ -64,18 +64,21 @@ Validate = Callable[[Path], None]
 
 
 class AlertRuleError(ValueError):
-    """An alert-rule edit was rejected: a malformed rule/file, a missing file, or an out-of-range
-    index. Raised with an operator-facing message (the CLI surfaces it as ``{"error": ...}``)."""
+    """An alert-rule edit was rejected: a malformed rule/file, a missing file, an out-of-range index,
+    or a file system that refused the edit. Raised with an operator-facing message (the CLI surfaces
+    it as ``{"error": ...}``)."""
 
 
 def list_rules(service_config: str | Path) -> list[dict[str, Any]]:
     """The operator-authored ``[[alerts.rules]]`` in ``service_config`` (``[]`` if the file or the
     ``[alerts].rules`` table is absent). Each entry is the rule as a plain dict with its ordinal
     ``index`` added — the positional handle the GUI uses for ``remove``."""
-    path = Path(service_config)
-    if not path.is_file():
+    text, _crlf = atomic_edit.read_text_if_present(
+        Path(service_config), refused_error=AlertRuleError
+    )
+    if text is None:
         return []
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc = tomlkit.parse(text)
     rules = _existing_rules(doc)
     if rules is None:
         return []
@@ -98,8 +101,8 @@ def add_rule(
     so a new rule goes last; reordering/editing is remove + re-add (mirrors a connection rename)."""
     _validate_input(obj)
     path = Path(service_config)
-    with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
-        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+    with atomic_edit.edit_lock(path, busy_error=AlertRuleError, refused_error=AlertRuleError):
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=AlertRuleError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         alerts = doc.get("alerts")
@@ -120,10 +123,10 @@ def remove_rule(service_config: str | Path, index: int, *, validate: Validate) -
     """Remove the rule at ordinal ``index`` from ``[[alerts.rules]]``. Raises :class:`AlertRuleError`
     if the file/table is absent or the index is out of range (every other table's trivia survives)."""
     path = Path(service_config)
-    if not path.is_file():
+    if not atomic_edit.is_file(path, refused_error=AlertRuleError):
         raise AlertRuleError(f"no settings file at {path}")
-    with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
-        text, crlf = atomic_edit.read_text(path)
+    with atomic_edit.edit_lock(path, busy_error=AlertRuleError, refused_error=AlertRuleError):
+        text, crlf = atomic_edit.read_text(path, refused_error=AlertRuleError)
         doc = tomlkit.parse(text)
         rules = _existing_rules(doc)
         if rules is None or not 0 <= index < len(rules):
@@ -182,4 +185,4 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
     whole-file ``load_settings`` failure must leave the callback already rendered, as the ``alert``
     CLI's callback renders it with ``settings_error_detail`` (vault BACKLOG #2760): its caller prints
     the message, and this module stays outside the settings import graph."""
-    atomic_edit.replace_validated(path, data, validate)
+    atomic_edit.replace_validated(path, data, validate, refused_error=AlertRuleError)

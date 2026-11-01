@@ -72,7 +72,7 @@ def list_code_sets(config_dir: str | Path) -> list[dict[str, Any]]:
     Raises :class:`WiringError` on a malformed file, a duplicate-key file, a stem collision, or an
     OSError reading the dir — the same fail-loud surface the loader gives."""
     codesets_dir = _codesets_dir(config_dir)
-    if not codesets_dir.is_dir():
+    if not atomic_edit.is_dir(codesets_dir, refused_error=WiringError):
         return []
     # load_code_sets is the authority for duplicate-stem / malformed-file errors; reuse it so `list`
     # fails loud exactly like a reload would, rather than papering over a broken table.
@@ -149,11 +149,15 @@ def upsert_code_set(
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
     path = codesets_dir / f"{name}.csv"
-    codesets_dir.mkdir(parents=True, exist_ok=True)
+    if not atomic_edit.is_dir(codesets_dir, refused_error=WiringError):
+        with atomic_edit.refused_as(path, WiringError, "create its directory"):
+            codesets_dir.mkdir(parents=True, exist_ok=True)
     # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
     # cannot pass the check between them.
     with _directory_lock(codesets_dir):
-        if create and _existing_path_or_none(codesets_dir, name) is not None:
+        # On an edit too: the gate refuses a table it cannot stat, which is not one to overwrite.
+        existing = _existing_path_or_none(codesets_dir, name)
+        if create and existing is not None:
             # A create must not silently overwrite an existing code set — refuse loud (mirrors the
             # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
             raise WiringError(_create_collision_message(name, codesets_dir))
@@ -176,6 +180,9 @@ def rename_code_set(
     is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
     :class:`WiringError` if ``old``/``new`` is missing or unsafe, the source is absent, or the stem
     collides."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import replace_generated
+
     if not old:
         raise WiringError("--name is required for `codeset rename`")
     if not new:
@@ -208,7 +215,8 @@ def rename_code_set(
         # rename is the core operation, so a config that doesn't load leaves the result
         # byte-identical to the pre-#152 shape.
         plan = _plan_code_set_referents(config_dir, old, new)
-        os.replace(src, dest)
+        with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
+            replace_generated(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
@@ -228,6 +236,9 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
     ``validate`` is accepted for signature symmetry with the other mutators (a delete has nothing to
     re-load) and is intentionally unused."""
     del validate  # a delete leaves nothing to re-validate; kept for a uniform mutator signature
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import unlink_generated
+
     if not name:
         raise WiringError("--name is required for `codeset remove`")
     codesets_dir = _codesets_dir(config_dir)
@@ -246,7 +257,8 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
         # (plan-before-move). Best-effort + additive: the delete is the core op, so an unloadable
         # graph yields no referrers.
         dangling = _code_set_referrers(config_dir, name)
-        path.unlink()
+        with atomic_edit.refused_as(path, WiringError, "remove it"):
+            unlink_generated(path)
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -359,7 +371,9 @@ def _has_drive(name: str) -> bool:
 def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
     """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
     target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
-    if (codesets_dir / f"{name}.toml").exists():
+    toml = codesets_dir / f"{name}.toml"
+    # The gate for its refusal, then exists() too, because a folder of that name has always collided.
+    if atomic_edit.is_file(toml, refused_error=WiringError) or toml.exists():
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -393,7 +407,7 @@ def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
     It is the CONFIG directory's lock, the one ``connections_edit`` takes, because the engine's
     flag toggle holds it across two digests of the whole bundle, code sets included. Keyed on
     the directory, never on an operator-supplied name, so no name can steer the lock file."""
-    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError)
+    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError, refused_error=WiringError)
 
 
 def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
@@ -404,8 +418,17 @@ def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
         # Skip the #162 <name>.policy.toml sidecars — they are policy metadata, not code sets. Only a
         # TRUE sidecar (companion code set present) is skipped; a standalone x.policy.toml still lists
         # as a code set, mirroring the loader (code_sets.is_policy_sidecar).
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTS and not is_policy_sidecar(p)
+        if p.suffix.lower() in _SUPPORTED_EXTS
+        and not _is_editor_lock_link(p)
+        and atomic_edit.is_file(p, refused_error=WiringError)
+        and not is_policy_sidecar(p)
     ]
+
+
+def _is_editor_lock_link(path: Path) -> bool:
+    """A dangling ``.#<name>`` link, as Emacs leaves for unsaved edits to a table. The loader skips
+    a dangling link, so the listing's gate must not refuse every table over this one."""
+    return path.name.startswith(".#") and path.is_symlink() and not path.exists()
 
 
 def _existing_path(codesets_dir: Path, name: str) -> Path:
@@ -423,7 +446,7 @@ def _existing_path(codesets_dir: Path, name: str) -> Path:
 def _existing_path_or_none(codesets_dir: Path, name: str) -> Path | None:
     for ext in _SUPPORTED_EXTS:
         candidate = codesets_dir / f"{name}{ext}"
-        if candidate.is_file():
+        if atomic_edit.is_file(candidate, refused_error=WiringError):
             return candidate
     return None
 
@@ -434,7 +457,8 @@ def _load_all(codesets_dir: Path) -> dict[str, CodeSet]:
     Translate the loader's :class:`CodeSetError` to :class:`WiringError` so a read path raises the
     one exception type the CLI catches (the message is preserved verbatim — the loader's wording)."""
     try:
-        return load_code_sets(codesets_dir)
+        with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
+            return load_code_sets(codesets_dir)
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
 
@@ -601,6 +625,7 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
         new_text.encode("utf-8"),
         validate,
         companions=(_policy_sidecar_path(path),),
+        refused_error=WiringError,
     )
 
 
