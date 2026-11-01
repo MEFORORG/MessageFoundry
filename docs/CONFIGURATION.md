@@ -1225,13 +1225,13 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >   graph and names each connection. At startup the engine does not start. On a reload the running
 >   graph stays.
 > - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
->   each connection, with the remedy (owner ruling 2026-11-01). Nothing is relaxed: those bodies are
->   still kept forever.
+>   each connection, with the remedy (owner ruling 2026-11-01). The graph loads with no
+>   acknowledgement, and those bodies are kept forever.
 > - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
 >
 > The gate writes its `AUDIT:` line each time it passes such a graph. A dry-run reload counts, and
-> each engine shard writes its own. The startup gate for the global windows differs: it writes its
-> `AUDIT:` line only under `enforce`.
+> each engine shard writes its own. The startup gate for the global body windows differs: it writes
+> its `AUDIT:` line only under `enforce`.
 >
 > **That switch is not scoped to one connection.** It also turns off the 30-day default for each
 > unset window that carries one (those named in the posture paragraph above), and it acknowledges

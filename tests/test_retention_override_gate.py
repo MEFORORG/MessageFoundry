@@ -156,8 +156,8 @@ def test_an_acknowledged_override_loads_and_is_audited_by_name(
 def test_the_audit_line_is_written_each_time_the_guard_passes_a_graph(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool, enforcing: bool
 ) -> None:
-    # The cadence is the same in every arm that passes the graph: one line per pass, so a reload and
-    # a dry-run reload each write one, and so does each engine shard.
+    # The cadence is the same in every arm that passes the graph: one line per pass, with no memory
+    # of an earlier one. The engine's dry-run path is driven below.
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
     guard = _guard(acknowledged=acknowledged, enforcing=enforcing)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
@@ -204,7 +204,7 @@ def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
         _guard(acknowledged=False, enforcing=True)(registry)
 
     assert warn.startswith("- Without it, under `warn`, the gate passes the graph")
-    assert "still kept forever" in warn
+    assert "those bodies are kept forever" in warn
     assert acknowledged.startswith("- With it, the gate passes the graph")
     for bullet, ack in ((warn, False), (acknowledged, True)):
         assert "logs a WARNING-level `AUDIT:` line naming each connection" in bullet
@@ -219,15 +219,12 @@ def test_the_configuration_doc_keeps_the_guard_apart_from_the_global_gate() -> N
     note = " ".join(_override_note())
     assert "each time it passes such a graph" in note and "A dry-run reload counts" in note
     assert "each engine shard writes its own" in note
-    # The dead_letter_days row hands the reader to this note, so the row and the note stay joined.
-    (row,) = [
-        line
-        for line in _configuration_doc().splitlines()
-        if line.startswith("| `dead_letter_days`")
-    ]
-    assert "An override of `0` meets its own gate, described there." in row
-    # The global gate's line is the older rule, left alone by the 2026-11-01 ruling.
-    assert "it writes its `AUDIT:` line only under `enforce`" in note
+    # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
+    # global tiers are not in this claim: an acknowledged one writes its line on either dial.
+    assert (
+        "The startup gate for the global body windows differs: it writes its `AUDIT:` line only "
+        "under `enforce`." in note
+    )
     settings = ServiceSettings()
     settings.retention.allow_unbounded_phi = True
     settings.retention.messages_days = 0
@@ -289,6 +286,29 @@ async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
             await eng.reload_detail(cfg, dry_run=True)
     finally:
         await eng.stop()
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+async def test_a_dry_run_reload_writes_the_audit_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool
+) -> None:
+    # The docs say a dry-run reload counts. Nothing goes live, which is why the line says the gate
+    # passed the graph and never that the graph is running.
+    cfg = tmp_path / "cfg"
+    _graph(cfg, inbound_days=0, outbound_days=None)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(acknowledged=acknowledged, enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger=_LOG.name):
+            await eng.reload_detail(cfg, dry_run=True)
+    finally:
+        await eng.stop()
+    (record,) = _guard_records(caplog)
+    assert record.getMessage().startswith("AUDIT:") and "IB_FEED" in record.getMessage()
 
 
 def _served_guard(

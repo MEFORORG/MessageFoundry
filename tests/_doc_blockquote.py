@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Read and plant into one blockquote of ``docs/SECURITY.md``, located by its bold open.
+"""Read and plant into one blockquote of a document, located by its bold open.
 
-Shared by the doc-drift tests that bind a blockquote to an executed measurement
-(``tests/test_monitoring_scope_doc_drift.py``, ``tests/test_single_route_data_rules_doc_drift.py``),
-so a lesson learned about locating or planting fixes both at once.
+Shared by the doc-drift tests that bind a blockquote to an executed measurement, at least
+``tests/test_monitoring_scope_doc_drift.py``, ``tests/test_single_route_data_rules_doc_drift.py``
+and ``tests/test_retention_override_gate.py``, so a lesson learned about locating or planting fixes
+all of them at once.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ def blockquote_lines(text: str, marker: str) -> list[str]:
     silently took every check built on it along."""
     lines = text.splitlines()
     start = next((i for i, line in enumerate(lines) if marker in line), None)
-    assert start is not None, f"docs/SECURITY.md no longer contains {marker!r}"
+    assert start is not None, f"the document no longer contains {marker!r}"
     return list(takewhile(lambda line: line.startswith(">"), lines[start:]))
 
 

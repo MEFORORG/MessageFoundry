@@ -597,9 +597,11 @@ def _override_audit_line(
     """The ``AUDIT:`` line for a graph the gate passes with ``kept`` keeping bodies forever.
 
     ``basis`` says why the gate passed it and ``status`` what that means. One sentence for every
-    arm, so a search of the logs for a keep-forever override finds each of them."""
+    arm, so a search of the logs for a keep-forever override finds each of them. ``env_name`` is
+    ``None`` where no environment is active, and the line then names none."""
+    where = f" (environment {env_name!r})" if env_name is not None else ""
     return (
-        f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a graph "
+        f"AUDIT: the retention gate on a PHI instance{where} passed a graph "
         f"with per-connection unbounded data retention ({basis}; {'; '.join(kept)}) -- once that "
         "graph is live, these connections' PHI message bodies are retained INDEFINITELY "
         f"({status})."
@@ -627,12 +629,8 @@ def judge_keep_forever_overrides(
     each reaches the same verdict in the same words for the same registry and switches. It prints
     and logs nothing.
 
-    ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. With it the
-    graph passes and :attr:`OverrideVerdict.report` is an ``AUDIT:`` line, on either dial. Without
-    it an enforcing instance refuses. Under ``enforcement = warn`` the graph passes and the report
-    is an ``AUDIT:`` line that says nobody acknowledged it and gives the remedy (owner ruling
-    2026-11-01). That arm relaxes nothing: the bodies are kept forever either way, so a site on
-    that dial gets the audited record it would otherwise lack."""
+    ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. What each arm
+    does is stated once, on :func:`make_retention_override_guard`."""
     kept = keep_forever_overrides(registry)
     if not kept:
         return OverrideVerdict(refusal=None, report=None)
@@ -662,13 +660,15 @@ def make_retention_override_guard(
 ) -> Callable[[Registry], None]:
     """The engine registry guard for a connection's own keep-forever retention override.
 
-    The graph half of the body-window gate in ``serve``, with the same refuse-or-warn split.
+    The graph half of the body-window gate in ``serve``.
     Without the acknowledgement (``acknowledged``, the loaded
     ``[security].allow_keeping_phi_indefinitely``) an enforcing instance refuses the graph by
     raising ``WiringError``: a first load fails the start, and a ``/config/reload`` is refused with
     the running graph kept. In every other case the guard passes the graph and a WARNING-level
     ``AUDIT:`` line names each connection: with the acknowledgement on either dial, and without it
-    under ``enforcement = warn``, where the line also gives the remedy.
+    under ``enforcement = warn``, where the line says nobody acknowledged it and gives the remedy
+    (owner ruling 2026-11-01). That second arm keeps the bodies forever with no acknowledgement, so
+    the line is the only audited record that a site on that dial has of the choice.
 
     It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
     line only under ``enforce``, and this guard writes one whenever it passes such a graph.
