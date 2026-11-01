@@ -105,6 +105,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    refuse_capture_conflicts,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -11585,6 +11586,11 @@ def _dest_config(
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
+    # BACKLOG #3724: the build read an env() flag as undecided, so its capture and no_ack checks run
+    # again here on the value the connector will read.
+    refuse_capture_conflicts(
+        oc.spec.type, settings, f"outbound connection {oc.name!r}", batched=oc.batch is not None
+    )
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
