@@ -3072,15 +3072,15 @@ def test_a_disabled_statement_named_like_a_wrapper_seals_nothing() -> None:
     assert _enclosing(handler, "OB_Y") == "    try:"
 
 
+_LOOP = '<Line Data="ForEach %ADT/OBX $o"><List>{x}</List></Line>'
+_FOR = "    for _item in []:"
+
+
 @pytest.mark.parametrize(
     ("template", "opener"),
     [
         pytest.param("<Try><List>{x}</List></Try>", "    try:", id="else-in-a-try"),
-        pytest.param(
-            '<Line Data="ForEach %ADT/OBX $o"><List>{x}</List></Line>',
-            "    for _item in []:",
-            id="else-in-a-loop",
-        ),
+        pytest.param(_LOOP, _FOR, id="else-in-a-loop"),
     ],
 )
 def test_a_stray_switched_off_marker_seals_nothing(template: str, opener: str) -> None:
@@ -3119,6 +3119,156 @@ def test_a_switched_off_marker_at_the_handlers_own_level_changes_nothing() -> No
     )
     assert _ORPHAN not in handler
     assert len(_send_lines(handler, 1)) == 1
+
+
+# A disabled wrapper never moves a live step. Main flattened it, so every test of where a step
+# lands saw the statements it held, or nothing where it held none. Commented out whole, it is one
+# step, and each such test now reads it as main did. Code review of this change, round 6.
+_HOLLOW_BODIES = {
+    "empty": '<List Disabled="1"/>',
+    "label-marker": '<List Disabled="1"><List Data="MsgLog %ADT"/></List>',
+    "own-label-marker": '<List Disabled="1" Data="MsgLog %ADT"/>',
+    "bare-marker": '<List Disabled="1"><Line Data="Else"/></List>',
+    "nested-empty": '<List Disabled="1"><List Disabled="1"/></List>',
+}
+# Each construct, its own list, and the line that opens the branch the marker opened on main.
+_HOLLOW_CONSTRUCTS = {
+    "try-catch": (
+        '<Try><List><Line Data="ItemClear %ADT/PID-3"/>{x}</List></Try>',
+        "Catch",
+        "    except Exception:  # TODO: Corepoint Catch",
+    ),
+    "case-matching": (
+        '<Case Data="ChooseFrom (a)"><List>{x}</List></Case>',
+        "Matching &quot;M&quot;",
+        "    if False:  # TODO: Corepoint Matching",
+    ),
+    "if-else": (
+        '<Line Data="If (a)"><List>{x}</List></Line>',
+        "Else",
+        "    elif False:  # TODO: Corepoint Else",
+    ),
+}
+
+
+def _marker_over(construct: str, inner: str) -> str:
+    """``construct``'s own list holding its branch marker over ``inner``, then a write and a send."""
+    template, marker, _ = _HOLLOW_CONSTRUCTS[construct]
+    return template.replace("{x}", f'<Line Data="{marker}">{inner}</Line>' + _AFTER_THE_WRAPPER)
+
+
+@pytest.mark.parametrize("hollow", _HOLLOW_BODIES)
+@pytest.mark.parametrize("construct", _HOLLOW_CONSTRUCTS)
+def test_a_marker_whose_body_main_flattened_bare_still_opens_its_branch(
+    construct: str, hollow: str, tmp_path: Path
+) -> None:
+    """A branch marker whose own body is a disabled wrapper main flattened to label markers, to
+    nothing, or to bare markers it split off, held no statement on main, so it opened its branch
+    and the steps after it ran there. They run there still, under the dead condition or in the
+    ``except``, with the wrapper commented out at the head of the branch."""
+    opener = _HOLLOW_CONSTRUCTS[construct][2]
+    body = _marker_over(construct, _HOLLOW_BODIES[hollow])
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert "# DISABLED in Corepoint (@Disabled)" in handler
+    assert _enclosing(handler, "OB_FLAT").startswith(opener)
+    assert _enclosing(handler, "PID-19").startswith(opener)
+    assert _ORPHAN not in handler
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
+
+
+@pytest.mark.parametrize("construct", _HOLLOW_CONSTRUCTS)
+def test_a_marker_over_a_wrapper_holding_a_disabled_statement_opens_nothing(
+    construct: str,
+) -> None:
+    """The control for the test above: a wrapper holding a disabled statement left the marker
+    holding a step on main too, so it opened nothing. Its orphan fails closed (BACKLOG #2685),
+    and the steps after it stay in the construct's own list, where main ran them."""
+    _, marker, opener = _HOLLOW_CONSTRUCTS[construct]
+    inner = '<List Disabled="1"><Line Disabled="1" Data="ItemClear %ADT/PID-4"/></List>'
+    handler = _handler_body(_handler_source(_marker_over(construct, inner)))
+    assert f"Corepoint {marker.split()[0]} {_ORPHAN}" in handler
+    assert not _enclosing(handler, "OB_FLAT").startswith(opener)
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        # A bare marker main adopted onto a construct it flattened out of a disabled wrapper.
+        pytest.param('<List Disabled="1"><Try><List/></Try></List>', id="construct-in-a-wrapper"),
+        pytest.param(
+            '<List Disabled="1"><Try><List/></Try><List Disabled="1"/></List>',
+            id="construct-then-an-empty-wrapper",
+        ),
+        pytest.param(
+            '<List Disabled="1"><List Disabled="1"><Try><List/></Try></List></List>',
+            id="construct-two-wrappers-deep",
+        ),
+        # A bare marker main adopted across a wrapper it flattened to nothing.
+        pytest.param('<Try><List/></Try><List Disabled="1"/>', id="an-empty-wrapper-between"),
+        pytest.param(
+            '<Try><List/></Try><List Disabled="1"><List Data="MsgLog %ADT"/></List>',
+            id="a-label-wrapper-between",
+        ),
+    ],
+)
+def test_a_bare_marker_main_adopted_across_a_disabled_wrapper_leaves_no_stray(
+    before: str, tmp_path: Path
+) -> None:
+    """Main adopted the bare ``Catch`` onto the ``Try`` before it, so the steps after it stayed in
+    the loop's body, dead. Left an orphan, the marker opened a branch of the loop instead, a stray
+    the render inlines live after the loop, for every message. It is adopted still: by the live
+    ``Try``, or by the switched-off one inside the wrapper's comment."""
+    body = _LOOP.replace("{x}", before + '<Line Data="Catch"/>' + _AFTER_THE_WRAPPER)
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert _enclosing(handler, "OB_FLAT").startswith(_FOR)
+    assert _enclosing(handler, "PID-19").startswith(_FOR)
+    assert "cannot continue a Corepoint ForEach" not in handler
+    assert not _send_lines(handler, 1)
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        pytest.param(
+            '<Try><List/></Try><List Disabled="1"><Line Data="ItemClear %ADT/PID-4"/></List>',
+            id="a-statement-wrapper-between",
+        ),
+        pytest.param(
+            '<List Disabled="1"><Try><List/></Try><Line Data="ItemClear %ADT/PID-4"/></List>',
+            id="a-statement-after-the-construct",
+        ),
+    ],
+)
+def test_a_bare_marker_main_left_an_orphan_stays_one(before: str) -> None:
+    """The control for the test above: a wrapper holding a statement, or a construct followed by
+    one, left a step between the ``Try`` and the ``Catch`` on main, so the ``Catch`` was an orphan
+    there too, and its branch a stray of the loop. Neither changes that."""
+    body = _LOOP.replace("{x}", before + '<Line Data="Catch"/>' + _AFTER_THE_WRAPPER)
+    handler = _handler_body(_handler_source(body))
+    assert "Catch cannot continue a Corepoint ForEach" in handler
+
+
+def test_a_disabled_wrapper_makes_a_branch_group_as_main_did(tmp_path: Path) -> None:
+    """A ``<Try>`` with no ``@Data`` holding a ``Try`` line is a branch-group wrapper, and main
+    flattened that line out of a disabled wrapper too. So the ``Catch`` beside it fell to the
+    ``ChooseFrom`` around, an arm under a dead condition. Built as a ``try`` here, its send would
+    run whenever the write before it raised."""
+    body = (
+        '<Case Data="ChooseFrom (a)"><List><Try><List Disabled="1"><Line Data="Try"><List/>'
+        '</Line></List><Line Data="ItemClear %ADT/PID-3"/><Line Data="Catch"/>'
+        f"{_AFTER_THE_WRAPPER}</Try></List></Case>"
+    )
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert _enclosing(handler, "OB_FLAT").startswith("    if False:  # TODO: Corepoint Catch")
+    assert "    try:" not in handler
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
 
 
 # --- a step between a construct and the branch written after it (BACKLOG #2685) ------------------

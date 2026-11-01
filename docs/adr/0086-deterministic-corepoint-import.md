@@ -806,17 +806,39 @@ well as disabled. The marker's own branches stay in the wrapper's comment. A run
 code stays where it is. Such a wrapper is also no step that runs nothing, because the marker
 stood in its place, so no sibling branch is adopted across it. Where the construct cannot
 continue the marker, as with an `Else` in a `Try` or any marker in a loop, main inlined the
-branch live after the construct as a stray, and the steps stay live in the construct's body. In a
-list that is not split into branches, at least the handler's own level and a `<Block>` body, main
-opened no branch, so there too the steps after the wrapper stay live, as after a bare marker
-written live there. The differential guard's baseline carries the same rule; its depth-only
-reading cannot tell an `except` body from a `try:` body, so the unit tests are what pin this case.
+branch as a stray after the construct, and the steps stay in the construct's own body, nowhere
+deeper than the construct puts them. In a `Try` that is the `try:` body, which runs as the stray
+did. In a loop it is the loop's body, rendered under `for _item in []:` or `while False:`, so
+there they are dead, where main ran them for every message, and a `LoopExit` among them renders
+as a `break` counted mapped, where main marked it. In a list that is not split into branches, at
+least the handler's own level and a `<Block>` body, main opened no branch, so there the steps
+after the wrapper stay live, as after a bare marker written live there. The differential guard's
+baseline carries the same rule; its depth-only reading cannot tell an `except` body from a `try:`
+body, so the unit tests are what pin this case.
 
-At least one shape of the same class is open. A branch marker whose own body is a disabled
-wrapper that holds no statement, such as `<Line Data="Catch"><List Disabled="1"/></Line>` in a
-`Try`'s own list, held nothing once main flattened the wrapper, so it opened its branch. Here the
-wrapper is a step of its body, so the marker opens nothing, and the steps after it run in the
-construct's own body, for every message.
+A disabled wrapper never moves a live step. Main flattened it, so every test of where a step
+lands saw the statements it held, or nothing where it held none, and each such test still reads
+it that way; the wrapper's contents stay commented out. At least these are:
+
+- Whether a branch marker opens its branch. A marker whose own body is a disabled wrapper main
+  flattened to label markers, to nothing, or to bare markers its own list split off, such as
+  `<Line Data="Catch"><List Disabled="1"/></Line>` in a `Try`'s own list, held no statement on
+  main, so it opens its branch, and the steps after it run there, with the wrapper commented out
+  at the head of the branch.
+- What a sibling branch is adopted across. A bare marker, or a branch with branches of its own,
+  is adopted across a disabled wrapper main flattened to label markers or to nothing.
+- Which construct adopts a bare marker. Main adopted one written after a disabled wrapper onto
+  the construct it flattened out of the wrapper last. It is adopted onto that construct still,
+  inside the wrapper's comment: the construct is switched off, so its branch is too, and the
+  steps after the marker stay where main put them. Left an orphan, the marker opened a branch of
+  the construct around it, and in a loop that branch is a stray inlined live after the loop. A
+  branch that carries its own body is not adopted so; it stays an orphan and fails closed.
+- Whether a `<Try>` or `<If>` with no `@Data` is a branch-group wrapper. A disabled wrapper
+  holding the construct it repeats made it one on main, so the branches beside it fall to the
+  list around, as there.
+
+The differential guard's baseline reads a disabled wrapper the same way, written apart from the
+head.
 
 ## 3. Acceptance criteria
 

@@ -268,7 +268,11 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
 # while the wrapper was flattened, so the steps after the wrapper in its construct's own list,
 # up to the next marker, become that marker's orphan, and never run, where the construct renders
 # that marker as a branch. Written apart from the head too: here the run is gathered as the list
-# is walked, at the call that splits it, and the marker found from the back.
+# is walked, at the call that splits it, and the marker found from the back. Every test of where
+# a live step lands reads a disabled wrapper as main flattened it: whether a marker opens its
+# branch, what the adoption looks back past, which construct adopts a bare marker, and whether a
+# body makes a branch group. Written apart from the head, which reads one generator: here the
+# wrapper is flattened into a list from a stack, and each test widens main's own by a disjunct.
 _LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
 _WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
 _PARSE_LIST_DEF = "def _parse_list(\n"
@@ -307,8 +311,7 @@ def _off(step: Step) -> bool:
     if not isinstance(step, UnmappedAction):
         return False
     return (
-        # The label amendment's marker, a subclass, when that amendment is loaded too.
-        type(step) is not UnmappedAction
+        _label(step)
         or step.source_class.lower() == "msglog"
         or step.detail == f"<{step.source_class}> carries no statement to translate"
     )
@@ -318,28 +321,94 @@ def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
     # A marker holding nothing but label markers takes the steps after it in its own
     # construct's list, and a branch with branches of its own would lose them in a chain. Either
-    # looks back past nothing: the label amendment has already lifted its markers off the end.
-    if not marker.branches and not _bare(marker):
-        while at >= 0 and _off(steps[at]):
-            at -= 1
+    # looks back past label markers alone, and past a disabled wrapper main flattened to them.
+    skip = _off if not marker.branches and not _bare(marker) else _hollow_step
+    while at >= 0 and skip(steps[at]):
+        at -= 1
     return at
 
 
+def _wrapper(step: Step) -> bool:
+    # A disabled wrapper carries no ``args``, where a disabled statement carries its kind.
+    return isinstance(step, Control) and step.kind == "disabled" and not step.args
+
+
+def _flat(steps: tuple[Step, ...]) -> list[Step]:
+    # The steps as main had them, every disabled wrapper flattened, at any depth.
+    out: list[Step] = []
+    pending = list(reversed(steps))
+    while pending:
+        step = pending.pop()
+        if _wrapper(step):
+            pending.extend(reversed(step.body))
+        else:
+            out.append(step)
+    return out
+
+
+def _label(step: Step) -> bool:
+    # The label amendment's marker, a subclass, when that amendment is loaded too.
+    return isinstance(step, UnmappedAction) and type(step) is not UnmappedAction
+
+
+def _hollow_step(step: Step) -> bool:
+    return _label(step) or _wrapper(step) and all(map(_label, _flat((step,))))
+
+
 def _bare(step: Step) -> bool:
-    return (
-        isinstance(step, Control)
-        and step.kind in _BRANCH_PARENT
-        and not [
-            s for s in step.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)
-        ]
+    if not (isinstance(step, Control) and step.kind in _BRANCH_PARENT):
+        return False
+    # Read through disabled wrappers, as main flattened them. A bare marker there was split
+    # off the marker's own list, so what follows it was never in the marker's body.
+    for inner in _flat(step.body):
+        if _bare(inner):
+            return True
+        if not _label(inner):
+            return False
+    return True
+
+
+def _opened(steps: list[Step]) -> list[Step]:
+    # A marker whose body main flattened bare stands bare here, and what its body holds leads
+    # its branch, after the runs are sealed. Main's own test of a marker then opens it.
+    out: list[Step] = []
+    for step in steps:
+        if _bare(step) and step.body:
+            out.append(replace(step, body=()))
+            out.extend(step.body)
+        else:
+            out.append(step)
+    return out
+
+
+def _taken(previous: Step, branch: Control) -> Control | None:
+    # ``previous`` with ``branch`` adopted. A bare marker main adopted onto a construct it
+    # flattened out of a disabled wrapper goes to that construct still, inside the comment.
+    if isinstance(previous, Control) and previous.kind == _BRANCH_PARENT[branch.kind]:
+        return replace(previous, branches=(*previous.branches, branch))
+    if not (_bare(branch) and _wrapper(previous)):
+        return None
+    kept = [i for i, inner in enumerate(previous.body) if not _hollow_step(inner)]
+    if not kept or (inner := _taken(previous.body[kept[-1]], branch)) is None:
+        return None
+    body = list(previous.body)
+    body[kept[-1]] = inner
+    return replace(previous, body=tuple(body))
+
+
+def _grouped(step: Step, kind: str) -> bool:
+    # A disabled wrapper holding the construct a branch-group wrapper repeats.
+    return _wrapper(step) and any(
+        getattr(s, "was", s.kind) == kind
+        for s in _flat((step,))
+        if isinstance(s, Control)
     )
 
 
 def _left_open(step: Step) -> Control | None:
-    # A disabled wrapper carries no ``args``, where a disabled statement carries its kind. Its
-    # last bare marker, at any depth of disabled wrappers, is the one whose branch the steps
-    # after it ran in.
-    if not (isinstance(step, Control) and step.kind == "disabled" and not step.args):
+    # A wrapper's last bare marker, at any depth of disabled wrappers, is the one whose branch
+    # the steps after it ran in.
+    if not _wrapper(step):
         return None
     for inner in reversed(step.body):
         if _bare(inner):
@@ -385,6 +454,7 @@ _ORPHAN_INLINE = (
     '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
 )
+_GROUP_TEST = "    if not data and any("
 _SCAN_SKIP_PAIR = (_LIVE_SKIP, "        if _is_disabled(elem):\n")
 _DISABLED_RETURN_STEP = '        return [Control("disabled", source, label, body=tuple(body))]\n'
 _STRAY_TAIL = "    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))\n"
@@ -425,17 +495,20 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "                continue\n",
     ),
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
-    # A bare marker switched off in a wrapper leaves the steps after it dead, not live.
-    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_sealed(body, kind))")),
+    # A bare marker switched off in a wrapper leaves the steps after it dead, not live. And a
+    # marker whose body main flattened bare opens its branch.
+    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_opened(_sealed(body, kind)))")),
     (
         _ADOPTED_FROM_LAST,
         "            and (at := _construct_at(steps, produced[0])) >= 0\n"
-        "            and isinstance(steps[at], Control)\n"
-        "            and steps[at].kind == _BRANCH_PARENT[produced[0].kind]\n"
+        "            and (taken := _taken(steps[at], produced[0])) is not None\n"
         "        ):\n"
-        "            previous = steps[at]\n"
-        "            steps[at] = replace(previous, branches=(*previous.branches, produced[0]))\n",
+        "            steps[at] = taken\n",
     ),
+    # Main flattened a disabled wrapper, so a wrapper holding the construct a branch-group
+    # wrapper repeats made that a group. A disjunct ahead of main's test, so the label amendment
+    # still finds that test's text once.
+    (_GROUP_TEST, _GROUP_TEST + "_grouped(s, kind) for s in body) or not data and any("),
 )
 #: Every amendment the baseline carries, in the order it loads them.
 _STEP1_AMENDMENTS = (*_FAIL_CLOSED_AMENDMENTS, *_LABEL_AMENDMENTS)

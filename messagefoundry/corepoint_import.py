@@ -95,6 +95,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
+from itertools import takewhile
 from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
@@ -112,7 +113,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.redaction import codec_safe_str, safe_exc
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Iterator
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -1529,22 +1530,40 @@ def _seal_switched_off_branches(steps: list[Step], kind: str) -> list[Step]:
 _WRAPPER_KIND = "wrapper"
 
 
-def _switched_off_marker(step: Step) -> Control | None:
-    """The bare marker a ``@Disabled`` ``<List>``/``<Actions>`` wrapper leaves open, or ``None``:
-    the last one in its body, a nested disabled wrapper's included, as main flattened them all."""
-    if not (
+def _is_wrapper(step: Step) -> TypeGuard[Control]:
+    """Whether ``step`` is a ``@Disabled`` ``<List>``/``<Actions>`` wrapper, told by its
+    ``disabled_kind``, not by a source verb a statement can share."""
+    return (
         isinstance(step, Control)
         and step.kind == "disabled"
         and step.disabled_kind == _WRAPPER_KIND
-    ):
+    )
+
+
+def _unwrapped(steps: Iterable[Step]) -> Iterator[Step]:
+    """``steps`` as main read them: each ``@Disabled`` wrapper replaced by the steps it holds, at
+    any depth, because main flattened it (BACKLOG #2526).
+
+    The tests of where a live step lands read a wrapper through this view, so a switched-off
+    wrapper never moves one: not into a body that runs more often, and not out of a branch main
+    put it in. At least :func:`_opens_a_branch`, :func:`_switched_off_marker`,
+    :func:`_adopt_branch` and the branch-group test in :func:`_parse_statement` do.
+    :func:`_holds_a_chain` walks a wrapper's whole subtree, which reads the same. The wrapper's
+    own contents stay commented out; only the placement is main's. Main also put a wrapper's
+    own label marker where it stood, and a label marker decides no placement."""
+    for step in steps:
+        if _is_wrapper(step):
+            yield from _unwrapped(step.body)
+        else:
+            yield step
+
+
+def _switched_off_marker(step: Step) -> Control | None:
+    """The bare marker a ``@Disabled`` ``<List>``/``<Actions>`` wrapper leaves open, or ``None``:
+    the last one in its body, a nested disabled wrapper's included, as main flattened them all."""
+    if not _is_wrapper(step):
         return None
-    left: Control | None = None
-    for inner in step.body:
-        if _opens_a_branch(inner):
-            left = inner
-        elif (nested := _switched_off_marker(inner)) is not None:
-            left = nested
-    return left
+    return next((s for s in reversed([*_unwrapped(step.body)]) if _opens_a_branch(s)), None)
 
 
 def _opens_a_branch(step: Step) -> TypeGuard[Control]:
@@ -1552,12 +1571,19 @@ def _opens_a_branch(step: Step) -> TypeGuard[Control]:
     own, so the steps after it in its construct's own list are its branch (:func:`_split_branches`).
 
     A label marker is no statement: a ``<List Data="MsgLog …"/>`` inside a ``Catch`` line leaves
-    it a branch marker, and the label marker leads the branch."""
-    return (
-        isinstance(step, Control)
-        and step.kind in _BRANCH_PARENT
-        and all(isinstance(inner, LabelMarker) for inner in step.body)
-    )
+    it a branch marker, and the label marker leads the branch. Nor is a disabled wrapper that main
+    flattened to label markers, to nothing, or to bare markers its own list split off as its
+    branches (:func:`_unwrapped`): on main such a marker held no statement, so it opened its
+    branch, and the steps after it ran there, not in the construct's own body."""
+    if not (isinstance(step, Control) and step.kind in _BRANCH_PARENT):
+        return False
+    before = takewhile(lambda s: not _opens_a_branch(s), _unwrapped(step.body))
+    return all(isinstance(s, LabelMarker) for s in before)
+
+
+def _hollow(steps: Iterable[Step]) -> bool:
+    """Whether ``steps``, read as main read them, hold label markers at most."""
+    return all(isinstance(s, LabelMarker) for s in _unwrapped(steps))
 
 
 def _structural_kind(step: Step) -> str:
@@ -1680,7 +1706,14 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
       its branch, and adopting it onto a nested construct would leave them in the enclosing
       body, where they run.
     * A branch holding branches of its own, from a bare marker in its own list: no chain renders
-      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead."""
+      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead.
+
+    A disabled wrapper main flattened to label markers or to nothing is no more than they are
+    (:func:`_hollow`). And a bare marker main adopted onto a construct it flattened out of a
+    disabled wrapper is adopted onto that construct still, inside the wrapper's comment: the
+    construct is switched off, so its branch is too, and the steps after the marker stay where
+    main put them. Left an orphan, the marker would open a branch of the construct around it,
+    and in a loop that branch is a stray, inlined live after the loop (BACKLOG #2526)."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1688,15 +1721,39 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
         isinstance(branch, Control)
         and branch.kind in _BRANCH_PARENT
         and isinstance(previous, Control)
-        and previous.kind == _BRANCH_PARENT[branch.kind]
+        and (previous.kind == _BRANCH_PARENT[branch.kind] or _is_wrapper(previous))
     ):
         return False
-    if (_opens_a_branch(branch) or branch.branches) and not all(
-        isinstance(s, LabelMarker) for s in between
-    ):
+    bare = _opens_a_branch(branch)
+    if (bare or branch.branches) and not _hollow(between):
         return False
-    steps[-1] = replace(previous, branches=(*previous.branches, branch))
+    if previous.kind == _BRANCH_PARENT[branch.kind]:
+        steps[-1] = replace(previous, branches=(*previous.branches, branch))
+        return True
+    taken = _adopted_in_wrapper(previous, branch) if bare else None
+    if taken is None:
+        return False
+    steps[-1] = taken
     return True
+
+
+def _adopted_in_wrapper(wrapper: Control, branch: Control) -> Control | None:
+    """``wrapper`` with ``branch`` adopted by the construct main flattened out of it last, or
+    ``None`` when main's last step there is no construct that continues ``branch``."""
+    if not _is_wrapper(wrapper):
+        return None
+    body = wrapper.body
+    at = next((i for i in reversed(range(len(body))) if not _hollow(body[i : i + 1])), None)
+    if at is None:
+        return None
+    inner = body[at]
+    if isinstance(inner, Control) and inner.kind == _BRANCH_PARENT[branch.kind]:
+        taken: Control | None = replace(inner, branches=(*inner.branches, branch))
+    else:
+        taken = _adopted_in_wrapper(inner, branch) if isinstance(inner, Control) else None
+    if taken is None:
+        return None
+    return replace(wrapper, body=(*body[:at], taken, *body[at + 1 :]))
 
 
 def _runs_nothing(step: Step) -> bool:
@@ -1818,7 +1875,7 @@ def _parse_statement(
         # test. (A send off a ``<Line>`` is not demoted. It is refused, in the send arm below.)
         return [Control("block", tag, statement, body=(*marker, *body), demoted_from="call")]
 
-    if not data and any(_structural_kind(s) == kind for s in body):
+    if not data and any(_structural_kind(s) == kind for s in _unwrapped(body)):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a
@@ -1829,6 +1886,11 @@ def _parse_statement(
         # has no ``@Data``: an exporter that puts the condition on the container and the statements
         # directly beneath it (the shape the synthetic fixture models) has no inner construct to
         # inherit, and passing that through would delete the try/except or the if entirely.
+        #
+        # The body is read as main read it (:func:`_unwrapped`). Main flattened a disabled wrapper,
+        # so a construct inside one made this a group, and the branches beside it fell to the list
+        # around. Built as a construct here, a ``Catch`` beside it would run whenever the ``try``
+        # raises, where main put that branch under a dead arm (BACKLOG #2526).
         return list(body)
 
     if kind is None:
