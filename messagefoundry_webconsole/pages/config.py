@@ -20,8 +20,9 @@ __all__ = ["config_page", "reload_pending", "reload_result"]
 
 
 def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
-    """A small 'running commit — clean|DRIFTED' pill (ADR 0041 D1). Empty when the engine hasn't loaded
-    a graph yet or provenance is unavailable, so the page renders unchanged on an older engine."""
+    """A small 'running commit — clean|DRIFTED|NOT COMPARED' pill (ADR 0041 D1). Empty when the
+    engine hasn't loaded a graph yet or provenance is unavailable, so the page renders unchanged on
+    an older engine."""
     if prov is None or not prov.loaded:
         return Markup("")
     if prov.git_head:
@@ -33,24 +34,24 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
     if prov.drift is None:
         # No reading, which must not render as clean (vault BACKLOG #3765).
         label, status = "NOT COMPARED", "filtered"
-        note = " — the config on disk could not be read to compare with the running graph"
+        note = " — the engine could not fingerprint the config on disk, so it compared nothing"
     elif not prov.drift:
         label, status = "clean", "running"
         note = " — the running graph matches the config on disk"
-    elif prov.reload_refused is None:
-        label, status = "DRIFTED", "error"
-        note = " — the config on disk differs from the running graph; reload to apply"
     else:
         label, status = "DRIFTED", "error"
-        # The page says this caller cannot reload, so the badge does not tell them to.
         note = " — the config on disk differs from the running graph"
+        if prov.reload_refused is None:
+            # Otherwise the page says this caller cannot reload, so the badge does not tell them to.
+            note += "; reload to apply"
     pill = el("span", label, class_=f"status status-{status}")
     if prov.left_out_files:
-        # A clean badge must not read as covering a file neither digest saw, and a DRIFTED one may
-        # be a lock alone, since digests that left out different files differ (vault BACKLOG #3765).
+        # A clean badge must not read as covering a file neither digest saw. A DRIFTED one may be a
+        # lock alone, since digests that left out different files differ, or a real change: the
+        # count cannot tell which (vault BACKLOG #3765).
         note += f". Config files or folders not compared, as unreadable: {prov.left_out_files}"
         if prov.drift:
-            note += "; that alone can read as DRIFTED"
+            note += "; a lock can show as DRIFTED, and does not rule out a real change"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 
 
@@ -68,7 +69,8 @@ def _next_step(refused: str) -> str:
 
 def config_page(prov: ConfigProvenance | None = None) -> Markup:
     """The config-deploy page: a single 'Reload configuration' action (server's startup dir only), with
-    a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1).
+    a read-only provenance badge (running commit + clean/DRIFTED/NOT COMPARED) when available (ADR
+    0041 D1).
 
     When the engine says it will refuse this caller's reload (``reload_refused``, BACKLOG #3189),
     the form is replaced by the engine's own reason. Offering it would send the caller through a

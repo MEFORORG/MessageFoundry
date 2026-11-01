@@ -3262,8 +3262,8 @@ class Engine:
         not from these bytes. The directory is read for the advisory VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
-        as it is now, so any covered file can be left out and a later edit can reach it. An
-        unreadable bundle leaves the baseline ``None`` and the start goes on. Returns the failure
+        as it is now, so any covered file can be left out and a later edit can reach it. A digest
+        that cannot be taken leaves the baseline ``None`` and the start goes on. Returns the failure
         reason, or ``None`` when the digest was taken or there is no config dir."""
         if self.config_dir is None:
             return None

@@ -9339,7 +9339,7 @@ def create_app(
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
         compares it to the loaded baseline. It is ``False`` when there is no baseline, with
         ``loaded`` false, and ``None`` when no on-disk digest was taken, so a read that compared
-        nothing never raises and never reads as clean (vault BACKLOG #3765).
+        nothing does not read as clean (vault BACKLOG #3765).
 
         ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
         console's Reload form follows the engine (BACKLOG #3189)."""
@@ -9353,9 +9353,9 @@ def create_app(
         on_disk = None
         target = engine.running_config_dir
         if target is not None:
-            # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
-            # reports no reading, neither a false DRIFT alarm nor a false clean (vault BACKLOG
-            # #3765).
+            # The one best-effort rule every load uses (vault BACKLOG #2597). A digest that could
+            # not be taken reports no reading, which is not clean (vault BACKLOG #3765). What a
+            # digest left out is a reading, and a difference in it is drift.
             current, _reason = await engine.fingerprint_bundle(target)
             if current is not None:
                 # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift,

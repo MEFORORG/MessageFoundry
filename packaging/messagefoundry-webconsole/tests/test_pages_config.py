@@ -57,7 +57,7 @@ def test_config_page_badge_says_a_lock_alone_can_read_as_drifted() -> None:
         )
     )
     assert ">DRIFTED<" in html
-    assert "unreadable: 1; that alone can read as DRIFTED" in html
+    assert "a lock can show as DRIFTED, and does not rule out a real change" in html
 
 
 def test_config_page_badge_does_not_read_clean_on_no_reading() -> None:

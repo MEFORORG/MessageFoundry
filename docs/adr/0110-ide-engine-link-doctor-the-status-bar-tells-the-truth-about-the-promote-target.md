@@ -264,6 +264,14 @@ here — without it, the next reader finds an `authenticated: true` plan for `/a
 whose header forbids a bearer on the poll, and reasonably reads it as the exact bug this ADR exists to
 prevent.
 
+## Amendment — 2026-11-01 (vault BACKLOG #3765)
+
+`GET /config/provenance` can now answer `drift: null`: a graph is loaded and the engine took no on-disk
+fingerprint, so it compared nothing. The union gains **`notCompared`** for it, which Section 1's list
+predates. The 200 proved the session, so this is not `unverified`, and like `drifted` it carries
+`verifiedAt`, survives the tokenless poll and shows the warning background. It offers no promote,
+because nothing says the config differs.
+
 ## Alternatives considered
 
 - **A webview "Engine Doctor" panel** — rejected: opens from the same command dispatch (fixes a missed click no better);

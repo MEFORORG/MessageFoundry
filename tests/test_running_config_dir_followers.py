@@ -156,8 +156,10 @@ async def test_a_lock_the_archive_walk_meets_fails_a_bundled_backup(
         return real_open(name, *args, **kwargs)
 
     monkeypatch.setattr(tarfile, "bltn_open", _open)
-    with pytest.raises(BackupError):
+    with pytest.raises(BackupError) as failed:
         await runner.run_once(now=1.0)
+    assert failed.value.kind == "write"
+    assert "config_unreadable_files" not in await _last_audit(engine.store)
 
 
 async def test_a_folder_the_archive_walk_cannot_list_is_named_and_the_run_succeeds(

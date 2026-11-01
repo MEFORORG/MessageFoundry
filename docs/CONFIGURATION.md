@@ -1865,8 +1865,9 @@ started together, can each raise it; the alert list folds them into one instance
   file both fingerprints cover still alerts. `GET /config/provenance` and a DR activation's
   `disk_config` verdict apply the same rule and name what was left out, as the count
   `left_out_files` and the list `disk_config_left_out`, so a lock alone can read as drift or
-  `differs` on unchanged bytes (vault BACKLOG #3765). `drift` is `null` when the engine took no
-  on-disk fingerprint, since then it compared nothing. A backup compares nothing: it records what
+  `differs` on unchanged bytes (vault BACKLOG #3765). With a graph loaded, `drift` is `null` when the
+  engine took no on-disk fingerprint, since then it compared nothing. With `loaded` false there is
+  no baseline to compare, and `drift` is `false`. A backup compares nothing: it records what
   its `config_fingerprint` left out as `config_unreadable_files`.
 - A start's fingerprint is of the bytes its load read, when the running graph carries the load's
   snapshot. One that carries none is fingerprinted from the directory after the load, so any
