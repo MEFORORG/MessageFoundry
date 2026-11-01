@@ -47,6 +47,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import check_http_sync_reply
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from tests._store_audit import no_operator_audit
 
 #: The ruled default (BACKLOG #1051). Stated once here; every assertion below reads it.
 SHIPPED_CAP = 100
@@ -170,7 +171,7 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
         len(await store.list_dead(channel_id="c1", allowed_channels=None)) == 1
     )  # visible to the operator
 
-    assert await store.replay_dead(channel_id="c1", now=t) == 1
+    assert await store.replay_dead(channel_id="c1", now=t, audit=no_operator_audit) == 1
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value

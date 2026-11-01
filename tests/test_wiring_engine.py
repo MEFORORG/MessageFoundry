@@ -43,6 +43,7 @@ from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stag
 from messagefoundry.transports import DeliveryError, NegativeAckError, SourceConnector
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._content_free import escapes
+from tests._store_audit import no_operator_audit
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -250,7 +251,7 @@ async def test_unrecognised_handler_return_dead_letters_in_the_live_runner(
     assert "DOE" not in errors and "JANE" not in errors  # the message carries no PHI to redact
     # Replayable: the dead row is a routed-stage row, so a fixed Handler re-runs this message rather
     # than the operator re-sending it from the partner.
-    assert await store.replay(mid) == 1
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     fetched = await store.get_message(mid)
     assert fetched is not None
     # ROUTED, not RECEIVED: the router already ran for a routed row (vault BACKLOG #2723).

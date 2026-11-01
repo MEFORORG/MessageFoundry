@@ -22,7 +22,7 @@ import pytest
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.store.store import DbStatus, DiskFreeStatus
-from tests._store_audit import no_purge_audit
+from tests._store_audit import no_operator_audit, no_purge_audit
 
 
 @pytest.fixture
@@ -456,7 +456,7 @@ async def test_replay_requeues_dead_not_done(store: MessageStore) -> None:
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
 
-    requeued = await store.replay(mid, now=2.0)
+    requeued = await store.replay(mid, now=2.0, audit=no_operator_audit)
     assert requeued == 1  # only the DEAD row — the DONE row is left alone (not re-delivered)
     by_id = {r["id"]: r for r in await store.outbox_for(mid)}
     assert by_id[done_item.id]["status"] == OutboxStatus.DONE.value
@@ -477,7 +477,7 @@ async def test_replay_resends_fully_delivered_message(store: MessageStore) -> No
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.PROCESSED.value
-    requeued = await store.replay(mid, now=2.0)
+    requeued = await store.replay(mid, now=2.0, audit=no_operator_audit)
     assert requeued == 1
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value and row["attempts"] == 0
@@ -535,7 +535,7 @@ async def test_replay_dead_requeues_only_dead_rows(store: MessageStore) -> None:
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
 
-    requeued = await store.replay_dead(now=2.0)
+    requeued = await store.replay_dead(now=2.0, audit=no_operator_audit)
     assert requeued == 1  # only the dead delivery, not the delivered one
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["d1"]["status"] == OutboxStatus.DONE.value  # untouched
@@ -550,14 +550,14 @@ async def test_replay_dead_requeues_only_dead_rows(store: MessageStore) -> None:
 async def test_replay_dead_scoped_by_destination(store: MessageStore) -> None:
     await _dead_delivery(store, "c1", "d1", now=0.0)
     await _dead_delivery(store, "c1", "d2", now=0.0)
-    requeued = await store.replay_dead(destination_name="d1", now=5.0)
+    requeued = await store.replay_dead(destination_name="d1", now=5.0, audit=no_operator_audit)
     assert requeued == 1
     assert await store.count_dead(allowed_channels=None) == 1  # d2 left dead
     assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "d2"
 
 
 async def test_replay_dead_none_returns_zero(store: MessageStore) -> None:
-    assert await store.replay_dead(now=0.0) == 0
+    assert await store.replay_dead(now=0.0, audit=no_operator_audit) == 0
 
 
 async def test_replay_dead_rolls_back_on_partial_failure(
@@ -570,7 +570,7 @@ async def test_replay_dead_rolls_back_on_partial_failure(
 
     monkeypatch.setattr(store, "_event", boom)
     with pytest.raises(RuntimeError):
-        await store.replay_dead(now=5.0)
+        await store.replay_dead(now=5.0, audit=no_operator_audit)
 
     # The batch rolled back: the row is still DEAD (not half-flipped to PENDING)...
     assert await store.count_dead(allowed_channels=None) == 1
@@ -1163,7 +1163,7 @@ async def test_replay_resend_is_not_deduped(store: MessageStore) -> None:
     await store.mark_done(item.id, now=101.0)
     assert len(await _ledger_rows(store)) == 1
     # Re-send: nothing stuck, so replay re-pends the DONE row AND drops its ledger entry.
-    requeued = await store.replay(mid, now=200.0)
+    requeued = await store.replay(mid, now=200.0, audit=no_operator_audit)
     assert requeued == 1
     assert await _ledger_rows(store) == []  # ledger cleared for the re-sent row
     # The replayed row is claimed normally (NOT deduped) and re-delivers.

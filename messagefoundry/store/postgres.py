@@ -7275,7 +7275,7 @@ class PostgresStore:
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
@@ -7368,7 +7368,7 @@ class PostgresStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
@@ -7577,7 +7577,7 @@ class PostgresStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
@@ -7735,7 +7735,7 @@ class PostgresStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.

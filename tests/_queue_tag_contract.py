@@ -22,6 +22,7 @@ from typing import Any
 
 from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION
 from messagefoundry.store.store import MessageStatus, OutboxStatus, Stage
+from tests._store_audit import no_operator_audit
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -222,13 +223,21 @@ async def assert_queue_tag_contract(
     assert item is not None
     await store.mark_done(rid)
     outcome = await store.resend_to(
-        message_id=mid, to="OB_QT_N2", from_="OB_QT_N", idempotency_key="qt-resend-ctl"
+        message_id=mid,
+        to="OB_QT_N2",
+        from_="OB_QT_N",
+        idempotency_key="qt-resend-ctl",
+        audit=no_operator_audit,
     )
     assert outcome.status == "resent"  # control: the untouched source resends
     await raw("UPDATE queue SET body_ref=? WHERE id=?", ("2" * 64, rid))
     try:
         await store.resend_to(
-            message_id=mid, to="OB_QT_N3", from_="OB_QT_N", idempotency_key="qt-resend-bent"
+            message_id=mid,
+            to="OB_QT_N3",
+            from_="OB_QT_N",
+            idempotency_key="qt-resend-bent",
+            audit=no_operator_audit,
         )
     except Exception as exc:  # noqa: BLE001 -- the refusal type is the cipher's, asserted below
         assert "integrity" in str(exc), exc
@@ -239,7 +248,11 @@ async def assert_queue_tag_contract(
     await raw("UPDATE queue SET payload='' WHERE id=?", (rid,))
     try:
         await store.resend_to(
-            message_id=mid, to="OB_QT_N4", from_="OB_QT_N", idempotency_key="qt-resend-blank"
+            message_id=mid,
+            to="OB_QT_N4",
+            from_="OB_QT_N",
+            idempotency_key="qt-resend-blank",
+            audit=no_operator_audit,
         )
     except Exception as exc:  # noqa: BLE001 -- the refusal type is the cipher's, asserted below
         assert "integrity" in str(exc), exc
@@ -251,7 +264,7 @@ async def assert_queue_tag_contract(
     item = await store.claim_next_fifo("OB_QT_O")
     assert item is not None
     await store.dead_letter_now(rid, "synthetic permanent reject")
-    assert await store.replay(mid) == 1
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     item = await store.claim_next_fifo("OB_QT_O")
     assert item is not None and item.id == rid and item.payload == "SYNTH-BODY-O"
 

@@ -11447,7 +11447,7 @@ class SqlServerStore:
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
@@ -11553,7 +11553,7 @@ class SqlServerStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
@@ -11846,7 +11846,7 @@ class SqlServerStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
@@ -12021,7 +12021,7 @@ class SqlServerStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue dead-lettered outbound deliveries (optionally scoped), reverting each affected
         message from ``error`` to ``routed``. Mirrors :meth:`MessageStore.replay_dead`.

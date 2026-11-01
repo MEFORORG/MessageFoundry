@@ -37,6 +37,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._admin_account import create_local_user_chosen
+from tests._store_audit import no_operator_audit
 
 
 @pytest.fixture
@@ -125,7 +126,8 @@ async def test_replay_resend_after_capture_appends_response_and_reseeds_ledger(
     # and a fresh ledger row is written for the re-delivery.
     mid, item = await _enqueue_and_claim(store)
     await store.complete_with_response(item.id, body="R1", outcome="accepted", now=101.0)
-    requeued = await store.replay(mid, now=102.0)  # re-send → ledger entry dropped
+    # re-send → ledger entry dropped
+    requeued = await store.replay(mid, now=102.0, audit=no_operator_audit)
     assert requeued == 1
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
     fetched_row = await cur.fetchone()
@@ -148,7 +150,8 @@ async def test_response_seq_is_replay_stable(store: MessageStore) -> None:
     mid, item = await _enqueue_and_claim(store)
     await store.complete_with_response(item.id, body="R1", outcome="accepted", now=101.0)
     assert item.attempts == 1
-    requeued = await store.replay(mid, now=102.0)  # re-send (only done rows) → attempts reset to 0
+    # re-send (only done rows) → attempts reset to 0
+    requeued = await store.replay(mid, now=102.0, audit=no_operator_audit)
     assert requeued == 1
     items2 = await store.claim_ready(destination_name="OB_Q", now=103.0)
     assert items2[0].attempts == 1  # same attempts value as the first delivery
