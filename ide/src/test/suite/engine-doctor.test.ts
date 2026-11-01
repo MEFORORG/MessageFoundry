@@ -208,7 +208,7 @@ suite("engine doctor — the deep probe earns (or refuses) the green check", () 
     assert.strictEqual(link.verifiedAt, NOW);
   });
 
-  test("200 with no drift reading ⇒ not ok (the engine compared nothing, so it earns no green)", () => {
+  test("200 with no drift reading is not ok: the engine compared nothing, so it earns no green", () => {
     const link = classifyDeep({ kind: "ok", body: { loaded: true, drift: null } }, unverified, NOW);
     assert.strictEqual(link.state, "unverified");
     assert.strictEqual(link.verifiedAt, undefined);

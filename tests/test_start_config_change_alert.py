@@ -20,7 +20,6 @@ import copy
 import itertools
 import json
 import logging
-import os
 import shutil
 import textwrap
 from pathlib import Path
@@ -54,7 +53,7 @@ from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
-from tests.test_config_fingerprint import _unreadable
+from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 
 _ACTIONS = ("config_loaded", "config_reload", "connection_flag_set")
@@ -1857,13 +1856,7 @@ async def test_a_directory_lost_after_the_load_pages_on_the_same_bytes(
     """Such a directory still gives a digest, of an empty bundle or with ``.`` left out, so it is
     judged and differs. Only a digest that fails outright costs the second comparison alone."""
     await _start(tmp_path, cfg)
-    real_scandir = os.scandir
     lost = {"on": False}
-
-    def _scandir(path: Any = ".") -> Any:
-        if lost["on"] and Path(path) == cfg:
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_scandir(path)
 
     def _load_then_lose(*args: Any, **kwargs: Any) -> Any:
         registry = load_config(*args, **kwargs)
@@ -1874,7 +1867,7 @@ async def test_a_directory_lost_after_the_load_pages_on_the_same_bytes(
         return registry
 
     with monkeypatch.context() as m:
-        m.setattr(os, "scandir", _scandir)
+        _unlistable(m, cfg, when=lost)
         m.setattr(app_module, "load_config", _load_then_lose)
         await _start(tmp_path, cfg)
     assert len(alerts) == 1

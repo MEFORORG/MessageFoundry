@@ -30,28 +30,26 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
         ident = f"fingerprint {prov.fingerprint[:12]}"
     else:
         ident = "loaded"
-    drifted = bool(prov.drift)
-    # None is no reading, which must not render as clean (vault BACKLOG #3765).
-    unread = prov.drift is None
-    pill = el(
-        "span",
-        "NOT COMPARED" if unread else "DRIFTED" if drifted else "clean",
-        class_=f"status status-{'filtered' if unread else 'error' if drifted else 'running'}",
-    )
-    if unread:
+    if prov.drift is None:
+        # No reading, which must not render as clean (vault BACKLOG #3765).
+        label, status = "NOT COMPARED", "filtered"
         note = " — the config on disk could not be read to compare with the running graph"
-    elif not drifted:
+    elif not prov.drift:
+        label, status = "clean", "running"
         note = " — the running graph matches the config on disk"
     elif prov.reload_refused is None:
+        label, status = "DRIFTED", "error"
         note = " — the config on disk differs from the running graph; reload to apply"
     else:
+        label, status = "DRIFTED", "error"
         # The page says this caller cannot reload, so the badge does not tell them to.
         note = " — the config on disk differs from the running graph"
+    pill = el("span", label, class_=f"status status-{status}")
     if prov.left_out_files:
         # A clean badge must not read as covering a file neither digest saw, and a DRIFTED one may
         # be a lock alone, since digests that left out different files differ (vault BACKLOG #3765).
         note += f". Config files or folders not compared, as unreadable: {prov.left_out_files}"
-        if drifted:
+        if prov.drift:
             note += "; that alone can read as DRIFTED"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 

@@ -2936,11 +2936,11 @@ def _moved_after_load(loaded: DigestCoverage | None, disk: DigestCoverage | None
     )
 
 
-def _shows_no_move(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
-    """Whether the directory's digest shows the load's bytes still there: both were taken, over the
-    same files, and match. Stricter than ``not`` :func:`_moved_after_load`: a digest that was not
-    taken, or that left out other files, shows nothing either way."""
-    return loaded is not None and disk is not None and same_digest(loaded, disk)
+def _may_have_moved(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest fails to show the load's bytes still there. Wider than
+    :func:`_moved_after_load`: a digest that was not taken, or that left out other files, shows
+    nothing either way."""
+    return loaded is None or disk is None or not same_digest(loaded, disk)
 
 
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
@@ -12002,7 +12002,7 @@ def create_managed_app(
                 # row that names no snapshot, or that a reload superseded, is no baseline itself,
                 # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if compared and not _shows_no_move(
+                if compared and _may_have_moved(
                     digest_coverage(compared), digest_coverage(on_disk)
                 ):
                     # The VCS head is read after the load, so unless the directory is shown not to

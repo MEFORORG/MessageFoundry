@@ -41,7 +41,7 @@ from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
 from messagefoundry.pipeline.sharding import DEFAULT_SHARD, filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage, Store
-from tests.test_config_fingerprint import _unreadable
+from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_dr_running_config_dir import _write_graph
 
 RAW = "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|DIR00001|P|2.5\rPID|1||MRN1\r"
@@ -170,14 +170,7 @@ async def test_a_folder_the_archive_walk_cannot_list_is_named_and_the_run_succee
     assert runner is not None
     (live / "environments").mkdir()
     (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
-    real_scandir = os.scandir
-
-    def _scandir(path: Any = ".") -> Any:
-        if Path(path) == live / "environments":
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", _scandir)
+    _unlistable(monkeypatch, live / "environments")
     result = await runner.run_once(now=1.0)
     assert result is not None
     assert result.config_unreadable_files == ("environments",)
