@@ -110,8 +110,10 @@ async def test_a_backup_records_what_its_config_fingerprint_left_out(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vault BACKLOG #3765, item 23: an archive's ``config_fingerprint`` read as the digest of the
-    whole bundle when a file it covers could not be read. ``environments`` holds no file a load
-    needs, and the archive walk, which does not call ``read_bytes``, still takes it."""
+    whole bundle when a file it covers could not be read. The mock fails ``read_bytes`` alone, so
+    it stands for a lock held over the digest's read and gone by the archive walk. A lock that
+    outlasts the walk fails the run:
+    :func:`test_a_lock_the_archive_walk_meets_fails_a_bundled_backup`."""
     engine, live, _staging = backup_engine
     runner = engine._backup_runner
     assert runner is not None
@@ -133,6 +135,55 @@ async def test_a_backup_records_what_its_config_fingerprint_left_out(
     with _archive_tar(partial.archive_path) as tar:
         assert _manifest(tar)["config_unreadable_files"] == left_out
     assert any("left out what it could not read" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_lock_the_archive_walk_meets_fails_a_bundled_backup(
+    backup_engine: tuple[Engine, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tar.add`` opens each file itself, so a file still locked at the walk fails the run, and
+    ``config_unreadable_files`` is never written for it."""
+    engine, live, _staging = backup_engine
+    runner = engine._backup_runner
+    assert runner is not None
+    (live / "environments").mkdir()
+    (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    _unreadable(monkeypatch, "dev.toml")
+    real_open = tarfile.bltn_open  # type: ignore[attr-defined]
+
+    def _open(name: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(name).name == "dev.toml":
+            raise PermissionError(13, "Permission denied", str(name))
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile, "bltn_open", _open)
+    with pytest.raises(BackupError):
+        await runner.run_once(now=1.0)
+
+
+async def test_a_folder_the_archive_walk_cannot_list_is_named_and_the_run_succeeds(
+    backup_engine: tuple[Engine, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rglob`` swallows a listing error, so the walk passes over the folder and the run succeeds
+    with less config than the directory holds. The list is what says so."""
+    engine, live, _staging = backup_engine
+    runner = engine._backup_runner
+    assert runner is not None
+    (live / "environments").mkdir()
+    (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    real_scandir = os.scandir
+
+    def _scandir(path: Any = ".") -> Any:
+        if Path(path) == live / "environments":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    result = await runner.run_once(now=1.0)
+    assert result is not None
+    assert result.config_unreadable_files == ("environments",)
+    with _archive_tar(result.archive_path) as tar:
+        assert "config/environments/dev.toml" not in tar.getnames()
+        assert _manifest(tar)["config_unreadable_files"] == ["environments"]
 
 
 async def test_a_backup_after_a_reload_from_another_root_carries_that_root(

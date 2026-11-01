@@ -212,9 +212,12 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: than this out of an archive. The store member is STREAMED to disk under its own cap; the manifest
 #: is the one member parsed into memory (``json.loads`` holds the decoded object on top of the raw
 #: bytes), so an unbounded read here is the only place a forged archive could balloon the verifying
-#: process's memory. 1 MiB is many times the largest manifest this writer produces — a fixed field
+#: process's memory. 1 MiB is many times the usual manifest this writer produces — a fixed field
 #: set plus one row count per table in the snapshot's own schema (BACKLOG #1722; every table, not a
-#: hand-picked sample — see :func:`_count_tables`).
+#: hand-picked sample — see :func:`_count_tables`). It is not a bound on what the writer can
+#: produce: ``config_unreadable_files`` holds one relative path per file or folder the config
+#: digest left out, uncapped (vault BACKLOG #3765). A list long enough to pass this cap writes an
+#: archive this read refuses, so a verify reports FAIL and a restore refuses it.
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -288,6 +291,8 @@ class BackupResult:
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
+    #: A file the archive walk then cannot open fails the run instead, so on a bundled pass this
+    #: names what the walk passed over; see :meth:`BackupRunner._inspect_config`.
     config_unreadable_files: tuple[str, ...] = ()
 
 
@@ -1277,10 +1282,13 @@ class BackupRunner:
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
-        a load tolerates cannot fail a backup. What it left out as unreadable is recorded beside it,
-        so the record does not read as the digest of the whole bundle (vault BACKLOG #3765), and
-        logged at WARNING when the bundle is being archived. Each warning names the directory and an
-        error class, a scrubbed reason or a relative file name, never config content. With
+        a load tolerates cannot fail a backup, though the archive walk can: ``tar.add`` opens each
+        file itself, so a file still locked there fails the run. What the digest left out as
+        unreadable is recorded beside it, so the record does not read as the digest of the whole
+        bundle (vault BACKLOG #3765), and logged at WARNING when the bundle is being archived. On a
+        bundled pass that list reaches a record only for what the walk passes over, at least a
+        folder it cannot list, and for a lock gone by the walk. Each warning names the directory
+        and an error class, a scrubbed reason or a relative file name, never config content. With
         ``include_config`` off nothing is bundled, so a listing fault is not one the operator needs
         to hear about, and none is recorded; the digest is still taken, so its left-out list is."""
         if config_dir is None:

@@ -208,6 +208,12 @@ suite("engine doctor — the deep probe earns (or refuses) the green check", () 
     assert.strictEqual(link.verifiedAt, NOW);
   });
 
+  test("200 with no drift reading ⇒ not ok (the engine compared nothing, so it earns no green)", () => {
+    const link = classifyDeep({ kind: "ok", body: { loaded: true, drift: null } }, unverified, NOW);
+    assert.strictEqual(link.state, "unverified");
+    assert.strictEqual(link.verifiedAt, undefined);
+  });
+
   test("401 ⇒ signedOut, and the green is revoked", () => {
     const wasOk: EngineLink = { ...unverified, state: "ok", verifiedAt: NOW - 1000 };
     const link = classifyDeep({ kind: "httpError", status: 401, detail: "not authenticated" }, wasOk, NOW);

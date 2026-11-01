@@ -65,7 +65,8 @@ export type ProbeOutcome =
  *  - `unreachable`  — no HTTP answer at all (refused / DNS / hung / TLS); `code` says which
  *  - `foreign`      — something answered, but it is not a MessageFoundry engine (wrong port?)
  *  - `signedOut`    — the engine is up, auth is on, and the IDE has NO session with it  ← the default!
- *  - `unverified`   — a session exists, but it has not been proven able to do anything
+ *  - `unverified`   — a session exists, but it has not been proven able to do anything, or the
+ *                     engine could not say whether its config matches what is on disk
  *  - `blocked`      — authenticated and REFUSED (must-change password / missing permission / MFA / step-up)
  *  - `drifted`      — usable, but the engine's loaded config differs from what is on disk
  *  - `ok`           — verified usable, within the freshness window
@@ -450,6 +451,15 @@ export function classifyDeep(outcome: ProbeOutcome, prior: EngineLink, now: numb
       state: "drifted",
       reason: "the engine's loaded config differs from what is on disk — promote to sync it",
       verifiedAt: now,
+    };
+  }
+  if (body.drift === null) {
+    // The engine took no on-disk digest, so it compared nothing: that earns no green.
+    return {
+      ...base,
+      state: "unverified",
+      blocked: undefined,
+      reason: "the engine could not read its config directory to compare it with what it loaded",
     };
   }
   return { ...base, state: "ok", reason: undefined, blocked: undefined, verifiedAt: now };

@@ -1826,8 +1826,9 @@ new name. The stop waits up to 5 seconds for that write before it closes the sto
 that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
 in the alert list, or pin `[cluster].node_id`.
 
-**`config_changed` says a start loaded different config bytes than the store's baseline** (vault
-BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
+**`config_changed` says a start's config differs from the store's baseline: the bytes it loaded, or
+the directory just after the load** (vault BACKLOG #2597, #3765). At each start the engine compares
+its config fingerprints (ADR 0041 D1) with the
 newest usable `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come
 from any node or engine shard, because they all share one config directory. A start that sees a
 change raises `config_changed` once. Its `config_loaded` row records the outcome as `comparison`
@@ -1861,24 +1862,32 @@ started together, can each raise it; the alert list folds them into one instance
   next raises the alert on the same bytes, at the locked start, and, for a file in `environments/`,
   which no load reads, again at the next whole one. A
   file that stays unreadable compares like for like from the second start on, so an edit to any
-  file both fingerprints cover still alerts. `GET /config/provenance`, a DR activation's
-  `disk_config` verdict and a backup's `config_fingerprint` apply the same rule and name what was
-  left out, as the count `left_out_files`, `disk_config_left_out` and `config_unreadable_files`
-  (vault BACKLOG #3765).
-- A start's fingerprint is of the bytes its load read. A start resolves `env()` values earlier,
-  when the engine is built, so for `environments/` files that means the bytes the load read, not
-  the bytes the values came from. Just after the load it fingerprints
+  file both fingerprints cover still alerts. `GET /config/provenance` and a DR activation's
+  `disk_config` verdict apply the same rule and name what was left out, as the count
+  `left_out_files` and the list `disk_config_left_out`, so a lock alone can read as drift or
+  `differs` on unchanged bytes (vault BACKLOG #3765). `drift` is `null` when the engine took no
+  on-disk fingerprint, since then it compared nothing. A backup compares nothing: it records what
+  its `config_fingerprint` left out as `config_unreadable_files`.
+- A start's fingerprint is of the bytes its load read, when the running graph carries the load's
+  snapshot. One that carries none is fingerprinted from the directory after the load, so any
+  covered file can be left out of it, and a later edit can reach it. A start resolves `env()` values
+  earlier, when the engine is built, so for `environments/` files that means the bytes the load
+  read, not the bytes the values came from. Just after the load it fingerprints
   the directory once more, and compares both with the baseline, so `config_changed` fires when
   either differs. When the two cover the same files and differ, an edit landed after the load read
   that file, and the comparison is `changed_during_load`. The alert then names the directory's
   fingerprint, or the loaded one when only that differs from the baseline. The `config_loaded` row
-  names the bytes that ran as `fingerprint`, with no `git_head`, since the head is read after the
-  load and may be the commit the directory moved to. It names what the alert named as
+  names the bytes that ran as `fingerprint`. It names what the alert named as
   `judged_fingerprint`, and what that left out as `judged_unreadable_files`. So
   the next start, on the edited bytes, raises the alert again, and
-  `GET /config/provenance` reports drift until a reload. A directory that cannot be read just after
-  the load costs that second comparison only. Together the two reads miss at least an edit that
-  lands and is reverted after the load read that file.
+  `GET /config/provenance` reports drift until a reload. A start keeps its `git_head`, in the row
+  and on that route, only when the directory's fingerprint matches the loaded one over the same
+  files, since the head is read after the load and may otherwise be the commit the directory moved
+  to. A directory that
+  is gone or cannot be listed just after the load still gives a fingerprint, of an empty bundle or
+  with `.` left out, so it raises the alert even on unchanged bytes. Only a read that fails outright
+  costs that second comparison alone. Together the two reads miss at least an edit that lands and
+  is reverted after the load read that file.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,
@@ -2922,7 +2931,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
 | `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all, which on an enforcing instance needs `[security].allow_keeping_backup_archives_indefinitely = true` or `serve` refuses (BACKLOG #1967). Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; a defragmented copy) or `online_backup` (a page-for-page copy). Neither holds the store write lock for the copy (BACKLOG #1937). The copy still has costs, so an off-peak `schedule_at` remains sensible; ADR 0049 points to where they are stated |
-| `include_config` | bool | `true` | bundle the running config dir (the last applied reload's root, else `--config`) into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo. The manifest and the `dr_backup` audit row record `config_bundled`, the `config_dir` the pass read, `config_bundle_error`, and `config_unreadable_files`, what `config_fingerprint` left out (vault BACKLOG #3765). When that dir is gone or cannot be listed, a full backup still succeeds with the store snapshot, logs one WARNING naming the directory and the error class, and records `config_bundled: false` with that class; no alert is raised for it. A config-only backup fails instead, as a `snapshot` failure. The `messagefoundry backup` CLI bundles its own `--config` argument instead |
+| `include_config` | bool | `true` | bundle the running config dir (the last applied reload's root, else `--config`) into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo. The manifest and the `dr_backup` audit row record `config_bundled`, the `config_dir` the pass read, `config_bundle_error`, and `config_unreadable_files`, what `config_fingerprint` left out (vault BACKLOG #3765). A file the archive walk cannot open fails the backup, so with this on that list names at least a folder the walk cannot list, whose files the archive then lacks, and a file locked only while the digest read it. When that dir is gone or cannot be listed, a full backup still succeeds with the store snapshot, logs one WARNING naming the directory and the error class, and records `config_bundled: false` with that class; no alert is raised for it. A config-only backup fails instead, as a `snapshot` failure. The `messagefoundry backup` CLI bundles its own `--config` argument instead |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |
 | `full_restore_verify` | bool | `false` | the heavier verify: restore the snapshot to a throwaway temp DB, open it through the real `open_store` path **under this instance's live `[store]` settings** (only the path and the backend substituted), then decrypt and authenticate its cipher-covered cells and report how many were opened. A snapshot holding sealed cells that these settings resolve no key for is reported `KEY_MISMATCH`, not `FAIL` — the archive is fine, the key configuration is not. On-demand / opt-in extra, deliberately **not** the per-backup default |
 | `config_only_on_server_db` | bool | `true` | on a Postgres/SQL Server store the DB backup is DBA-delegated (#52), so back up the **config bundle only**. `false` = skip the backup entirely on a server-DB store (not even a config-only archive) |

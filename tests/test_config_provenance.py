@@ -186,6 +186,24 @@ async def test_provenance_names_a_file_the_on_disk_digest_left_out(
     assert body["left_out_files"] == 1
 
 
+async def test_provenance_does_not_read_clean_on_no_reading(
+    client: httpx.AsyncClient, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that took no on-disk digest compared nothing, so ``drift`` is ``null``: not a false
+    alarm, and not the ``false`` a reader would take for a config that matches."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    assert (await client.get("/config/provenance")).json()["drift"] is False, "control"
+
+    async def _no_digest(_path: Path) -> tuple[None, str]:
+        return None, "synthetic"
+
+    monkeypatch.setattr(engine, "fingerprint_bundle", _no_digest)
+    body = (await client.get("/config/provenance")).json()
+    assert body["loaded"] is True and body["drift"] is None
+
+
 async def test_provenance_requires_auth(engine: Engine) -> None:
     # Gated like every read (require(MONITORING_READ)): with no auth attached and allow_no_auth unset,
     # it is fail-closed 503 "authentication is not configured" (security.py) — never served publicly.

@@ -2936,6 +2936,13 @@ def _moved_after_load(loaded: DigestCoverage | None, disk: DigestCoverage | None
     )
 
 
+def _shows_no_move(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest shows the load's bytes still there: both were taken, over the
+    same files, and match. Stricter than ``not`` :func:`_moved_after_load`: a digest that was not
+    taken, or that left out other files, shows nothing either way."""
+    return loaded is not None and disk is not None and same_digest(loaded, disk)
+
+
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
 # send-back of engine PR 2370): a start pages whenever the directory after its load differs from the
 # baseline, and whenever the bytes it loaded do. A partial digest, a partial
@@ -9330,8 +9337,9 @@ def create_app(
         fingerprint + best-effort git commit captured at load, and whether the on-disk config has since
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
-        compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
-        config dir is unreadable, so a read never raises.
+        compares it to the loaded baseline. It is ``False`` when there is no baseline, with
+        ``loaded`` false, and ``None`` when no on-disk digest was taken, so a read that compared
+        nothing never raises and never reads as clean (vault BACKLOG #3765).
 
         ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
         console's Reload form follows the engine (BACKLOG #3189)."""
@@ -9341,12 +9349,13 @@ def create_app(
         if loaded is None or running is None:
             # No graph loaded yet, or fingerprint unavailable.
             return ConfigProvenance(loaded=False, reload_refused=reload_refused)
-        drift = False
+        drift: bool | None = None
         on_disk = None
         target = engine.running_config_dir
         if target is not None:
             # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
-            # reports clean rather than a false DRIFT alarm.
+            # reports no reading, neither a false DRIFT alarm nor a false clean (vault BACKLOG
+            # #3765).
             current, _reason = await engine.fingerprint_bundle(target)
             if current is not None:
                 # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift,
@@ -11993,12 +12002,13 @@ def create_managed_app(
                 # row that names no snapshot, or that a reload superseded, is no baseline itself,
                 # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if compared and _moved_after_load(
+                if compared and not _shows_no_move(
                     digest_coverage(compared), digest_coverage(on_disk)
                 ):
-                    # The VCS head is read after the load, so here it may be the commit the
-                    # directory moved to, which the digest of the bytes that ran must not be bound
-                    # to (vault BACKLOG #3765). Advisory, so it is dropped.
+                    # The VCS head is read after the load, so unless the directory is shown not to
+                    # have moved it may be the commit it moved to, which the digest of the bytes
+                    # that ran must not be bound to (vault BACKLOG #3765). Advisory, so it is
+                    # dropped.
                     unbound = {k: v for k, v in compared.items() if k != "git_head"}
                     engine.loaded_config_fingerprint = unbound
                     if start_loaded is not None:

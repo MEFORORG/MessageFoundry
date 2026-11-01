@@ -3256,14 +3256,15 @@ class Engine:
         :attr:`loaded_config_fingerprint` stayed ``None`` until the first reload and ``GET
         /config/provenance`` could not see drift after a plain start (vault BACKLOG #2597). The
         digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
-        the load's read cannot reach it (vault BACKLOG #2944, #3765). Only a file the load does not
-        read, in ``environments/``, can be left out of it, and it holds that folder as the load
-        read it: a start resolves its values earlier, when the engine is built, not from these
-        bytes. The
-        directory is read for the advisory VCS head alone, and for the digest only when the running
-        graph carries no snapshot. An unreadable bundle leaves the baseline ``None`` and the start
-        goes on. Returns the failure reason, or ``None`` when the digest was taken or there is no
-        config dir."""
+        the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
+        the load does not read, in ``environments/``, can be left out of it, and it holds that
+        folder as the load read it: a start resolves its values earlier, when the engine is built,
+        not from these bytes. The directory is read for the advisory VCS head alone.
+
+        A running graph that carries no snapshot gets none of that: the digest is of the directory
+        as it is now, so any covered file can be left out and a later edit can reach it. An
+        unreadable bundle leaves the baseline ``None`` and the start goes on. Returns the failure
+        reason, or ``None`` when the digest was taken or there is no config dir."""
         if self.config_dir is None:
             return None
         rr = self._registry_runner

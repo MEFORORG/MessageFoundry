@@ -20,6 +20,8 @@ import copy
 import itertools
 import json
 import logging
+import os
+import shutil
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -1799,6 +1801,83 @@ async def test_a_moved_start_binds_no_later_commit_to_the_bytes_it_ran(
     assert rows[-1]["comparison"] == "changed_during_load"
     assert "git_head" not in rows[-1]
     assert loaded is not None and "git_head" not in loaded and loaded["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("reading", "comparison"),
+    [("not_taken", "compared"), ("other_files", "partial_start_digest")],
+)
+async def test_a_head_needs_a_directory_digest_that_shows_nothing_moved(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reading: str,
+    comparison: str,
+) -> None:
+    """The head stays only beside a directory digest of the same files and bytes. A digest that
+    was not taken, or that left out other files, cannot show that the directory did not move."""
+    _covered_file(cfg, "dev.toml")
+    await _start(tmp_path, cfg)
+    real = Engine.fingerprint_bundle
+    locked = {"on": False}
+
+    async def _no_directory_digest(
+        self: Engine, path: Path, snapshot: Any = None, /
+    ) -> tuple[dict[str, object] | None, str | None]:
+        if snapshot is None:
+            return None, "synthetic"
+        return await real(self, path, snapshot)
+
+    def _load_then_lock_and_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        locked["on"] = True
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "_git_head", lambda _start: "c" * 40)
+        if reading == "not_taken":
+            m.setattr(Engine, "fingerprint_bundle", _no_directory_digest)
+        else:
+            _unreadable(m, "dev.toml", when=locked)
+            m.setattr(app_module, "load_config", _load_then_lock_and_edit)
+        rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == comparison
+    assert "git_head" not in rows[-1]
+
+
+@pytest.mark.parametrize("fault", ["gone", "unlistable"])
+async def test_a_directory_lost_after_the_load_pages_on_the_same_bytes(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    fault: str,
+) -> None:
+    """Such a directory still gives a digest, of an empty bundle or with ``.`` left out, so it is
+    judged and differs. Only a digest that fails outright costs the second comparison alone."""
+    await _start(tmp_path, cfg)
+    real_scandir = os.scandir
+    lost = {"on": False}
+
+    def _scandir(path: Any = ".") -> Any:
+        if lost["on"] and Path(path) == cfg:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    def _load_then_lose(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        if fault == "gone":
+            shutil.rmtree(cfg)
+        else:
+            lost["on"] = True
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "scandir", _scandir)
+        m.setattr(app_module, "load_config", _load_then_lose)
+        await _start(tmp_path, cfg)
+    assert len(alerts) == 1
 
 
 class _OneRowStore:
