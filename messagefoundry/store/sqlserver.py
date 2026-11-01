@@ -15346,7 +15346,7 @@ class SqlServerStore:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`.
 
-        The epoch of each account the first, unlocked read of the account list returns is raised
+        The epoch of each account its one unlocked read of the account list returns is raised
         first, in id order, so those account row locks are taken before any session row's, the
         order ``create_session`` takes them in. docs/SECURITY.md, *Limits of the session sweep*,
         states what that read can miss. The count comes from an ``OUTPUT`` rowset, as

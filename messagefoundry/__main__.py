@@ -904,7 +904,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="end every account's sessions from the host (offline; the API is not needed)",
         description="Revoke every session of every account, directly against the store, on the "
         "same host gate as admin-unlock. Every signed-in user, administrators included, must sign "
-        "in again. Audited. The engine may be running or stopped.",
+        "in again, except for a session docs/SECURITY.md, Limits of the session sweep, says the "
+        "revoke could miss. Audited. The engine may be running or stopped.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",

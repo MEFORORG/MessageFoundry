@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends every account's sessions and keeps the caller's own, so the reply reaches them; their other sessions end with everyone's. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). On both server stores it has limits, which the *Limits of the session sweep* bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states. `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends every account's sessions and keeps the caller's own, so the reply reaches them; their other sessions end with everyone's. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). It has limits, which the *Limits of the session sweep* bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states. `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -4659,24 +4659,25 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   transaction, and a rotation keeps the epoch the session was sealed under. So the gate refuses
   and ends the session, and the user's own session list hides it and ends it the same way.
   **The first exception is the every-account revoke's, and it holds on both server stores.** It
-  raises the epoch only of the accounts that its first read of the account list returns, and
-  that read takes no lock. An account that read did not return keeps its epoch, so a session of
-  it that the sweep does not end has nothing to refuse it afterwards. The sweep would not end one
-  committed after the sweep's statement began and before the revoke commits, so that session
-  would stay live after the revoke. That needs no rotation. A sign-in to an account the read did
-  return does not open this gap: it either commits before the revoke raises that account's epoch,
-  and the sweep then ends it, or it waits for the revoke to commit and is sealed under the raised
-  epoch, as any later sign-in is. That reading does not cover an account whose record fails its
-  seal, whose epoch the revoke leaves as it was; that case was not traced. The SQLite store
-  takes its write lock before it reads the account list, so another writer cannot commit an
-  account or a session between that read and its sweep. All of this was read from the code,
-  assuming each statement reads what had committed when it began (READ COMMITTED on Postgres,
-  READ_COMMITTED_SNAPSHOT on SQL Server); it has not been run. **The second exception,** for the
-  per-account sweeps: a request from a missed session to end the user's other sessions,
-  accepted just before the sweep commits, waits for it and then stamps the session with the new
-  epoch, so it stays usable. Whether the every-account revoke has the same exception, and how
-  wide its window is, was not traced. **At least three things are also wrong about a refused
-  one.** Its ending is reported as a seal failure: a WARNING, an
+  raises the epoch only of the accounts returned by its one read of the account list, which
+  takes no lock. An account that read did not return keeps its epoch, so no epoch check refuses
+  a session of it that the sweep does not end. The sweep can fail to end one committed after the
+  sweep's statement began and before the revoke commits, and that session would then stay live
+  after the revoke. That needs no rotation. On Postgres the statement does not see a row
+  committed after it began; on SQL Server whether it sees one depends on where its scan has
+  reached. A sign-in to an account the read did return does not open this gap: it either commits
+  before the revoke raises that account's epoch, and the sweep then ends it unless the rotation
+  miss above applies, or it waits for the revoke to commit and is sealed under the raised epoch,
+  as any later sign-in is. An account whose record fails its seal keeps its epoch too. On SQL
+  Server the revoke then holds only an update lock on that account's row, which does not hold
+  back a sign-in, so that account would have the same gap; on Postgres a sign-in waits for the
+  revoke. The SQLite store takes its write lock before it reads the account list, so another
+  writer cannot commit an account or a session between that read and its sweep. All of this was
+  read from the code and has not been run. **The second exception,** for every sweep this bullet
+  names, the every-account revoke included: a request from a missed session to end the user's
+  other sessions, accepted just before the sweep commits, waits for it and then stamps the
+  session with the new epoch, so it stays usable. **At least three things are also wrong about a
+  refused one.** Its ending is reported as a seal failure: a WARNING, an
   `integrity.authority_seal_failed` audit row and an `integrity_drift` alert. The report is
   rate-limited per session, and the alert goes through the alert notifier's re-alert throttle, or
   only to the log where no alert notifier is running.
@@ -4689,7 +4690,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
   session, so no rotated session is missed. That would not change the -1 count, or the first
   exception. The Postgres store follows a rotated row and the SQLite store runs one writer at a
-  time, so neither misses a rotated session. All of this was read from the code; the skip has not
+  time, so neither misses a rotated session. The rotation miss was read from the code and has not
   been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
   on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
@@ -5316,8 +5317,8 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   passwordless or smartcard-only account cannot end its other sessions this way;
 - end every account's sessions at once with `DELETE /sessions`, which keeps only the caller's own,
   or from the host with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614).
-  On both server stores either could leave a session live, as the *Limits of the session sweep*
-  bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states.
+  These revokes, and the per-account ones above, have limits that the *Limits of the session
+  sweep* bullet under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) states.
 
 [CONFIGURATION.md](CONFIGURATION.md) documents each setting.
 
