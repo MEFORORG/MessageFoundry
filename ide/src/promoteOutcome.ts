@@ -10,9 +10,9 @@ import { isRecord } from "./engineTrustModel";
 /**
  * The fields of messagefoundry/api/models.py:ReloadResult (the /config/reload response) that the
  * promote reads. The engine also sends `degraded` and `failures`; reporting those is BACKLOG #2259.
- * `restart_required` holds setting names, or null where the engine did not check, as on a dry run,
- * so null is no finding. It is `unknown` here because `isReloadResult` does not check it, so a reader
- * has to go through `reloadShortfall`.
+ * `restart_required` holds setting names on an applied reload, and is null on a dry run, which did
+ * not check. It is `unknown` here because `isReloadResult` does not check it, so a reader has to go
+ * through `reloadShortfall`.
  */
 export interface ReloadResult {
   inbound: number;
@@ -99,11 +99,12 @@ const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
 /**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
  * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, not reported here yet) can sit
- * beside the restart sentence. A list this code cannot read keeps the counts and says so: the swap
- * did happen, and it must not read as a clean promote.
+ * beside the restart sentence. This reads applied replies only, so null or no value is unreadable,
+ * as any other shape is. An unreadable list keeps the counts and says so: the swap did happen, and
+ * it must not read as a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
-  const names = r.restart_required ?? [];
+  const names = r.restart_required;
   if (
     !Array.isArray(names) ||
     !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
@@ -118,16 +119,17 @@ function reloadShortfall(r: ReloadResult): string[] {
   }
   return [
     "Restart the engine to apply a changed trust anchor: this reload checked the new file but " +
-      "does not load it. The names that follow are not a complete set: another engine shard or " +
-      "cluster node reports only in its own log, and a CA a hop loads by path is never named " +
-      `here. The engine still trusts the old CA for: ${names.join(", ")}.`,
+      "does not load it. The names that follow may leave some out. At least these are not " +
+      "listed: anchors on another engine shard or cluster node, which report in their own logs, " +
+      "and the dialling CAs in the settings. The engine still trusts the old CA for: " +
+      `${names.join(", ")}.`,
   ];
 }
 
 /**
  * The message for the apply step's outcome. A held reload is a warning that names the approval and
  * says the config is not live; it never prints graph counts, because no graph was swapped. A live
- * swap with a shortfall is a warning too, after the counts. Held, unreadable and live exclude each
+ * swap with a shortfall is a warning too, after the counts. Held, invalid and live exclude each
  * other, so each is its own branch.
  */
 export function promoteOutcomeMessage(

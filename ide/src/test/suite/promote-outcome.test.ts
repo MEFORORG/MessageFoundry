@@ -37,6 +37,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     handlers: 4,
     running: true,
     dry_run: false,
+    restart_required: [],
   };
 
   setup(async () => {
@@ -81,7 +82,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.ok(!/live graph/.test(msg.text), msg.text);
   });
 
-  test("control: a 200 result still reports success with the live graph counts", async () => {
+  test("control: a 200 result with an empty restart_required reports plain success", async () => {
     replyStatus = 200;
     replyBody = live;
     const msg = promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
@@ -106,26 +107,18 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
       msg.text,
       "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
         "4 handlers, running. Restart the engine to apply a changed trust anchor: this reload " +
-        "checked the new file but does not load it. The names that follow are not a complete " +
-        "set: another engine shard or cluster node reports only in its own log, and a CA a hop " +
-        "loads by path is never named here. The engine still trusts the old CA for: " +
-        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
+        "checked the new file but does not load it. The names that follow may leave some out. " +
+        "At least these are not listed: anchors on another engine shard or cluster node, which " +
+        "report in their own logs, and the dialling CAs in the settings. The engine still trusts " +
+        "the old CA for: [auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
     );
   });
 
   for (const [name, restart] of [
-    ["an empty list", []],
-    ["null, which a reload that did not check sends", null],
-  ] as const) {
-    test(`${name} in restart_required says nothing about a restart`, async () => {
-      const msg = await promoteReplying(restart);
-      assert.strictEqual(msg.level, "info");
-      assert.ok(msg.text.includes("promoted to PROD"), msg.text);
-      assert.ok(!/restart/i.test(msg.text), msg.text);
-    });
-  }
-
-  for (const [name, restart] of [
+    // An applied reload always sends a list; null is a dry run's value, and undefined drops the key
+    // from the reply. On an apply, either says the anchors went unchecked, not that none changed.
+    ["null", null],
+    ["no value at all", undefined],
     ["a bare string", "[auth].ad_tls_ca_cert_file"],
     ["a list holding a non-string", [1]],
     ["a list holding an empty name", [""]],
@@ -137,7 +130,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     ["a good name with a trailing newline", ["[auth].x\n"]],
     ["a name in the wrong case", ["[AUTH].X"]],
     ["a key past the length bound", [`[auth].${"x".repeat(65)}`]],
-    // Falsy values that are not null: `||` in place of `??` would read these as clean.
+    // Falsy values, which a truthiness test would read as clean.
     ["an empty string", ""],
     ["zero", 0],
     ["false", false],
@@ -147,7 +140,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
       const msg = await promoteReplying(restart);
       assert.strictEqual(msg.level, "warning");
       assert.ok(msg.text.includes("promoted to PROD"), msg.text);
-      assert.ok(msg.text.includes("could not be read"), msg.text);
+      assert.ok(msg.text.endsWith("not be read, so check the engine's log for them."), msg.text);
       assert.ok(!msg.text.includes("command:"), msg.text);
       assert.ok(!msg.text.includes("ad_tls_ca_cert_file"), msg.text);
       // The pre-flight prints no restart list, so the same reply must not stop it.
@@ -156,15 +149,13 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
   }
 
   test("the dry-run pre-flight still decodes as a normal result the promote confirms", async () => {
+    const dryRun = { ...live, dry_run: true, restart_required: null };
     replyStatus = 200;
-    replyBody = { ...live, dry_run: true };
+    replyBody = dryRun;
     const outcome = await reloadConfig(url, "/cfg", true, "tok");
     assert.deepStrictEqual(sent, { config_dir: "/cfg", dry_run: true });
-    assert.deepStrictEqual(outcome, { kind: "done", body: { ...live, dry_run: true } });
-    assert.deepStrictEqual(preflightOutcome(outcome), {
-      ok: true,
-      result: { ...live, dry_run: true },
-    });
+    assert.deepStrictEqual(outcome, { kind: "done", body: dryRun });
+    assert.deepStrictEqual(preflightOutcome(outcome), { ok: true, result: dryRun });
   });
 
   test("a held pre-flight stops the promote with an ERROR naming the approval to reject", async () => {
