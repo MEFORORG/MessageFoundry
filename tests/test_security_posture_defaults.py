@@ -3014,6 +3014,10 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
     assert "OB_PG_RESULTS" in risk and "inbound:IB_PG_ORDERS" in risk
     # The DSN credential rides the same hop as the rows; an operator weighing the risk needs both.
     assert "credential" in risk and "plaintext" in risk
+    # Since BACKLOG #1178 these hops are gated. The text must say an enforcing instance refuses them,
+    # or an operator reading it would add an attestation to "fix" a hop the engine already blocks.
+    assert "An enforcing instance refuses each one" in risk
+    assert "the weakened-TLS refusal does not apply" not in risk
 
 
 def test_revocation_attestation_is_a_named_loosening() -> None:
@@ -3248,6 +3252,18 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     )
     reg.add_outbound(
         build_outbound_connection(
+            "OB_PG_CERT_ONLY",
+            Database(
+                server="cert.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"sslcert": "client.pem"},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
             "OB_SQLSERVER",
             Database(
                 server="ss.example",
@@ -3272,11 +3288,202 @@ def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
     hops = dict(unverified_generic_db_hops(reg))
     # The sqlserver dialect is NOT here: it keeps the byte-identical posture-keyed refusal, so it is
     # gated rather than merely reported, and listing it would be noise.
-    assert set(hops) == {"OB_PG_BARE", "inbound:IB_PG_ORDERS"}
+    assert set(hops) == {"OB_PG_BARE", "OB_PG_CERT_ONLY", "inbound:IB_PG_ORDERS"}
     assert "no TLS keyword" in hops["OB_PG_BARE"]
+    # BACKLOG #2483: a certificate path sets no mode, so it is reported beside the bare hop.
+    assert "no TLS mode has a usable value" in hops["OB_PG_CERT_ONLY"]
     # The value-blind detector fixed in step 1 is what makes this arm real: `SSLmode=disable` used to
     # read as "the operator has taken TLS ownership".
     assert "SSLmode=disable" in hops["inbound:IB_PG_ORDERS"]
+
+
+def test_unverified_generic_db_hops_reads_an_env_dialect_as_possibly_generic() -> None:
+    """An ``env()`` dialect is resolved only at build, where a generic value meets the gate. This
+    reader sees the unresolved graph, so it used to compare the reference's text with ``generic``,
+    never match, and leave the hop off ``check`` and the posture while the build refused it, or, on a
+    non-enforcing instance, built it with only a WARNING. It now reads such a dialect as possibly
+    generic and names the reference, never its value."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_BARE",
+            Database(
+                server="bare.example",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV_OK",
+            Database(
+                server="ok.example",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"SSLmode": "verify-full"},
+            ),
+        )
+    )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_ENV_POLL",
+            DatabasePoll(
+                server="poll.example",
+                dialect=env("poll_dialect"),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT 1",
+                odbc_params={"SSLmode": "disable"},
+            ),
+            router="R",
+        )
+    )
+    hops = dict(unverified_generic_db_hops(reg))
+    # A mode the classifier clears is cleared whatever the dialect resolves to.
+    assert set(hops) == {"OB_ENV_BARE", "inbound:IB_ENV_POLL"}
+    assert "env(db_dialect)" in hops["OB_ENV_BARE"]
+    assert "no TLS keyword" in hops["OB_ENV_BARE"]
+    assert "env(poll_dialect)" in hops["inbound:IB_ENV_POLL"]
+    assert "SSLmode=disable" in hops["inbound:IB_ENV_POLL"]
+
+    # The control: the build resolves the same reference, and a generic value meets the gate there.
+    from messagefoundry.config.models import ConnectorType, Destination
+    from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
+    from messagefoundry.config.wiring import resolve_env_settings
+    from messagefoundry.transports.database import DatabaseDestination
+
+    spec = reg.outbound["OB_ENV_BARE"].spec
+    resolved = resolve_env_settings(spec.settings, {"db_dialect": "generic"})
+    built = Destination(name="OB_ENV_BARE", type=ConnectorType.DATABASE, settings=resolved)
+    with active_hop_posture(HopPosture(enforcing=True)), pytest.raises(InsecureHopRefused):
+        DatabaseDestination(built)
+
+
+def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
+    """Both DATABASE inventories read an ``env()`` dialect the way the build does once they are given
+    the values: generic is read as generic, sqlserver as sqlserver. With no value they say the dialect
+    is unresolved rather than guess one arm, and the static-credential reason stays a fixed sentence."""
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        static_credential_db_hops,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV",
+            Database(
+                server="db.example",
+                dialect=env("d"),  # type: ignore[arg-type]
+                auth="integrated",
+                odbc_driver="PostgreSQL Unicode",
+                username="svc",
+                password=env("pw"),
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    # Generic: auth is not read, so the username/password is a static credential, and no mode is set.
+    assert [n for n, _ in static_credential_db_hops(reg, env_values={"d": "generic"})] == ["OB_ENV"]
+    tls = dict(unverified_generic_db_hops(reg, env_values={"d": "generic"}))
+    assert tls["OB_ENV"].startswith("no TLS keyword")
+    # SQL Server: integrated auth is delegated, and the preset is not a generic hop.
+    assert static_credential_db_hops(reg, env_values={"d": "sqlserver"}) == []
+    assert unverified_generic_db_hops(reg, env_values={"d": "sqlserver"}) == []
+    # No value: neither arm is assumed. The generic arm would be static, so the hop is listed, and
+    # the reason is fixed text that names no operator-typed key.
+    unresolved = dict(static_credential_db_hops(reg))
+    assert "unresolved env()" in unresolved["OB_ENV"] and "env(d)" not in unresolved["OB_ENV"]
+    assert "possibly generic" in dict(unverified_generic_db_hops(reg))["OB_ENV"]
+
+
+def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:
+    """ADR 0111 AC-1: a ``deployed=False`` connection's ``env()`` values are never resolved on any
+    path. Both DATABASE readers resolved the dialect before anything skipped the connection, so an
+    operator's ``cast`` ran on a dark connection and the hop was listed as an active loosening of a
+    connection the engine never builds. A deployed twin is the control: same values, resolved, listed."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        env,
+        static_credential_db_hops,
+        unverified_generic_db_hops,
+    )
+
+    cast_ran: list[str] = []
+
+    def dialect_cast(value: object) -> str:
+        cast_ran.append(str(value))
+        return str(value)
+
+    def outbound(name: str, *, deployed: bool) -> None:
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                Database(
+                    server="db.example.invalid",
+                    dialect=env(f"{name.lower()}_dialect", cast=dialect_cast),  # type: ignore[arg-type]
+                    odbc_driver="PostgreSQL Unicode",
+                    username="svc",
+                    password=env("pw"),
+                    statement="INSERT INTO r (a) VALUES (:a)",
+                ),
+                deployed=deployed,
+            )
+        )
+
+    reg = Registry()
+    outbound("OB_DARK", deployed=False)
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_DARK",
+            DatabasePoll(
+                server="poll.example.invalid",
+                dialect=env("ib_dark_dialect", cast=dialect_cast),  # type: ignore[arg-type]
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT 1",
+                username="svc",
+            ),
+            router="r",
+            deployed=False,
+        )
+    )
+    values = {"ob_dark_dialect": "generic", "ib_dark_dialect": "generic", "pw": "x"}
+    assert unverified_generic_db_hops(reg, env_values=values) == []
+    assert static_credential_db_hops(reg, env_values=values) == []
+    assert unverified_generic_db_hops(reg) == []  # nor read as possibly generic with no values
+    assert static_credential_db_hops(reg) == []
+    assert cast_ran == [], "a not-deployed connection's env() cast must never run"
+
+    # The control: a deployed twin with the same kind of value is resolved and listed by both.
+    outbound("OB_LIVE", deployed=True)
+    values["ob_live_dialect"] = "generic"
+    tls = unverified_generic_db_hops(reg, env_values=values)
+    static = static_credential_db_hops(reg, env_values=values)
+    assert [n for n, _ in tls] == ["OB_LIVE"] and [n for n, _ in static] == ["OB_LIVE"]
+    # Resolved, not read as unresolved: the reasons are the generic arm's own.
+    assert tls[0][1].startswith("no TLS keyword")
+    assert static[0][1].startswith("generic-ODBC hop")
+    assert cast_ran and set(cast_ran) == {"generic"}
 
 
 def test_accepted_cleartext_hops_reads_the_graph() -> None:
