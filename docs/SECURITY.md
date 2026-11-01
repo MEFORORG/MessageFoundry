@@ -4119,10 +4119,11 @@ dict. Each model now gets a serializer over its own gated properties only
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
 closed. The published schema of every other gated model is unchanged.
 
-**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves every route
-behind a bearer-token gate to
-the built-in system identity, which holds every role and therefore every permission, so the
-per-property gate withholds nothing there. `serve` never builds that app (vault BACKLOG #2719).
+**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves a caller
+reaching a bearer-token gate to the built-in system identity, which holds every role and therefore
+every permission, so the per-property gate withholds nothing there. A route that needs a service
+still answers 503, at least `/users` and `/audit`. `serve` never builds that app (vault BACKLOG
+#2719).
 
 **Assurance — what CI actually asserts.** Three guards, deliberately covering the three distinct ways
 this gate can be forgotten (the previous claim here was overstated: the old pinning tests iterate the
@@ -6972,7 +6973,7 @@ these sit outside the list:
   of the connections that use it;
 - another engine shard. A reload is per process with no fleet coordination (ADR 0073). An engine
   shard logs a changed anchor with a recorded load at least when a reload or a DR activation on it
-  runs the settings check. Only a reload's response carries the list;
+  runs the settings check and every anchor passes. Only a reload's response carries the list;
 - another cluster node, converging on the reload. It has no response to carry a list, and the
   `auth.trust_anchor` row names no node, so it says so only in its own log, and only once its
   convergence reload reaches this check.
