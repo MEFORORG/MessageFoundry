@@ -275,17 +275,29 @@ async def _last_error(store: Any, message_id: str) -> Any:
     """Through both of its read paths, which decrypt it separately: a delivery row, and the
     dead-letter list's join."""
     delivery = (await store.outbox_for(message_id))[0]["last_error"]
-    dead = (await store.list_dead(allowed_channels=None))[0]["last_error"]
+    # Filtered to the contract's own dead row: a reader that claims a row it cannot open
+    # dead-letters it, so the whole-table listing's first row need not be this one.
+    dead = (await store.list_dead(destination_name=_DEAD, allowed_channels=None))[0]["last_error"]
     return delivery if delivery == dead else (delivery, dead)
 
 
 async def _connection_reason(store: Any) -> Any:
     events = await store.list_connection_events(connection=_CHANNEL, allowed_channels=None)
-    return events[0].reason
+    # Selected by the written row's own identity rather than by list order, so a refusal some other
+    # reader records cannot stand in for it.
+    ours = [e for e in events if (e.transport, e.direction, e.kind) == ("mllp", "inbound", "error")]
+    if not ours:
+        raise LookupError(f"no connection event for {_CHANNEL}")
+    return ours[0].reason
 
 
 async def _alert_reason(store: Any) -> Any:
-    return (await store.list_active_alert_instances(allowed_channels=None))[0].reason
+    alerts = await store.list_active_alert_instances(allowed_channels=None)
+    # By event type, not list order: alerts list newest first, and a refusal can raise one.
+    ours = [a for a in alerts if (a.event_type, a.connection) == ("synth_event", _CHANNEL)]
+    if not ours:
+        raise LookupError("no synth_event alert")
+    return ours[0].reason
 
 
 async def _preset_criteria(store: Any) -> Any:
