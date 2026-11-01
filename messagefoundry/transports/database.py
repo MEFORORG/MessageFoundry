@@ -13,10 +13,12 @@ weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
 any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
-list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), chosen to carry no host, and ``[egress].allowed_db``
-reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers keywords only, and a
-braced password (:func:`_odbc_password`) relies on the driver reading the ``}}`` escape. On the generic
-path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
+list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), and no listed keyword names the connection target.
+``[egress].allowed_db`` reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers
+keywords only, and relies on at least the driver reading the ``}}`` escape in a braced password
+(:func:`_odbc_password`) and reading ``SERVER`` as its target (docs/CONNECTIONS.md, *Accepted
+``odbc_params`` keywords*). On the generic path TLS is the operator's responsibility (configured through
+the driver's own keyword) — MessageFoundry
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
 Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
 :func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
@@ -285,7 +287,7 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # that check means something only while a keyword cannot hand the driver another host. Every ODBC
 # driver has its own keywords for a host, an address, a data source name, a socket or a whole option
 # string, and a new driver release can add another. A list of refused names would always trail the
-# drivers. This list instead names keywords chosen to carry no host, and
+# drivers. Here no listed keyword names the connection target, and
 # :func:`_build_odbc_dsn` refuses everything else when the connection is built.
 #
 # WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
@@ -295,9 +297,10 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # a second copy here would leave the driver to choose between the two. A keyword whose only use is
 # to stop certificate verification is absent too.
 #
-# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords, and a braced password relies on the
-# driver reading the ``}}`` escape. Which driver ``odbc_driver`` names, and what that driver does
-# with the keywords it is sent, are outside it.
+# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords, and relies on at least the driver
+# reading the ``}}`` escape in a braced password and reading ``SERVER`` as its target
+# (docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). Which driver ``odbc_driver`` names,
+# and what that driver does with the keywords it is sent, are outside it.
 #
 # ``port`` is here because the generic dialect has no other way to send one. It moves the port and
 # never the host.
@@ -941,9 +944,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     top-level ``username``/``password`` settings (``env()``-resolved + secret-redacted) under the
     ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``).
 
-    **The keyword lists below check keywords, and a braced password relies on the driver reading the
-    ``}}`` escape** (vault BACKLOG #2577, BACKLOG #2705). An ``odbc_params`` keyword must be on
-    :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
+    **The keyword lists cover keywords only, and rely on at least the driver reading the ``}}``
+    escape in a braced password and reading ``SERVER`` as its target** (vault BACKLOG #2577, BACKLOG
+    #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
+    must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
     twice is refused. A driver that takes its target under a keyword other than ``SERVER`` cannot be
     configured on this path. The egress check runs outside this builder, at least in

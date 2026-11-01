@@ -1801,9 +1801,10 @@ port compared.
 ##### Accepted `odbc_params` keywords
 
 `[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords,
-chosen to carry no host (vault BACKLOG #2577). **The list covers keywords only, and a braced
-password relies on the driver reading the `}}` escape** (*The password*, below). Each keyword
-sets a port, a TLS mode, a local file or a session option:
+and no listed keyword names the connection target (vault BACKLOG #2577). **The list covers
+keywords only, and relies on at least the driver reading the `}}` escape in a braced password
+(*The password*, below) and reading `SERVER` as its target (*This is a rule about keywords*,
+below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
 <!-- odbc-params-allowlist:start -->
 | Group | Keywords |
