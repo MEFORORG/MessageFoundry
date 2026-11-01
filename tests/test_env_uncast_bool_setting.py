@@ -40,6 +40,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.wiring_runner import _dest_config, build_check_registry
 from messagefoundry.transports.http_auth import oauth2_auth_configured
 from messagefoundry.transports.smart import smart_auth_configured
+from tests._ast_sites import calls_to, parse_source
 
 SPELLINGS = [(s, False) for s in ["false", "0", "no", "off", "False", " OFF "]] + [
     (s, True) for s in ["true", "1", "yes", "on", "TRUE"]
@@ -716,12 +717,9 @@ def _functions_building_a_settings_spec() -> set[str]:
         source = path.read_text(encoding="utf-8")
         if not any(f"{spec}(" in source for spec in specs):
             continue
-        for node in ast.parse(source).body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id in specs
-                for call in ast.walk(node)
+        for node in parse_source(source).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and calls_to(
+                node, specs, bare_only=True
             ):
                 found.add(node.name)
     return found

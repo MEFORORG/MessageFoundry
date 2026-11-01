@@ -72,6 +72,7 @@ from messagefoundry.transports.smart import token_provider_from_settings
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
 from messagefoundry.transports.timer import TimerSource
 from messagefoundry.transports.x12 import X12Destination, X12Source
+from tests._ast_sites import callee_name, parse_source
 
 Build = Callable[[dict[str, Any]], Any]
 
@@ -1116,7 +1117,6 @@ def _anon_guard(over: dict[str, Any]) -> Any:
 
 
 #: One builder per ``port`` read in ``transports/``, because each read was its own bare ``int()``.
-#: ``_PORT_REFUSED_ONLY`` holds the two these tables cannot read an attribute back from.
 _PORT_READS = [
     pytest.param(_MLLP_IN, "port", id="mllp-in"),
     pytest.param(_MLLP_OUT, "port", id="mllp-out"),
@@ -1133,8 +1133,10 @@ _PORT_READS = [
     pytest.param(_anon_guard, "port", id="anon-ftp-guard"),
 ]
 
-#: The Direct destination loads key material after the port, and the DSN builder returns text.
-_PORT_REFUSED_ONLY = [
+#: Every read again, with the two that have no attribute to read back: the Direct destination loads
+#: key material after the port, and the DSN builder returns text.
+_PORT_REFUSERS = [
+    *(pytest.param(read.values[0], id=read.id) for read in _PORT_READS),
     pytest.param(_direct, id="direct"),
     pytest.param(_sql_server_dsn, id="sql-server-dsn"),
 ]
@@ -1153,11 +1155,9 @@ _PORT_REFUSALS = [
 ]
 
 
-@pytest.mark.parametrize(("build", "attr"), _PORT_READS)
+@pytest.mark.parametrize("build", _PORT_REFUSERS)
 @pytest.mark.parametrize(("bad", "says"), _PORT_REFUSALS)
-def test_every_port_read_refuses_what_is_not_a_port(
-    build: Build, attr: str, bad: object, says: str
-) -> None:
+def test_every_port_read_refuses_what_is_not_a_port(build: Build, bad: object, says: str) -> None:
     """Each of these is reachable from an uncast ``env()`` on an ``int`` setting. A bare ``int()``
     read ``True`` as port 1, truncated ``2575.9``, quoted bad text in its own message, and left a
     number out of range to fail when the socket opened.
@@ -1169,15 +1169,6 @@ def test_every_port_read_refuses_what_is_not_a_port(
     assert "port" in message and "value withheld" in message
     assert "SENTINEL-1650" not in message
     assert caught.value.__context__ is None
-
-
-@pytest.mark.parametrize("build", _PORT_REFUSED_ONLY)
-@pytest.mark.parametrize(("bad", "says"), _PORT_REFUSALS)
-def test_the_port_reads_with_no_attribute_to_read_back_refuse_too(
-    build: Build, bad: object, says: str
-) -> None:
-    with pytest.raises(ValueError, match=says):
-        build({"port": bad})
 
 
 @pytest.mark.parametrize(("build", "attr"), _PORT_READS)
@@ -1225,10 +1216,9 @@ def _bare_numeric_reads(source: str) -> list[int]:
 
     return [
         node.lineno
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(parse_source(source))
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in ("int", "float")
+        and callee_name(node, bare_only=True) in ("int", "float")
         and node.args
         and any(reads_a_setting(part) for part in ast.walk(node.args[0]))
     ]

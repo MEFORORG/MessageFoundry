@@ -878,10 +878,9 @@ def refuse_capture_conflicts(
                 f"{where}: X12 capture_response=True requires expect_reply=True "
                 "(there is no returned interchange to capture otherwise) (ADR 0016)."
             )
-        if batched and type_ is ConnectorType.MLLP:
+        if batched:
             # One batch-level ACK covers the whole envelope; there is no per-row reply to capture or
             # re-ingress (ADR 0013). Reject the combination rather than silently drop N-1 captures.
-            # Any other type is refused for its batch alone, by build_outbound_connection (ADR 0082).
             reason = "reingress_to" if settings.get("reingress_to") else "capture_response"
             raise WiringError(
                 f"{where}: batch aggregation is incompatible with {reason} "
@@ -7625,15 +7624,21 @@ def build_outbound_connection(
         spec.settings["capture_response"] = True
     # #67 (ADR 0013 amendment): capturing a stored-proc's OUT params + scalar return value IMPLIES
     # capture, so the capture-validity guards (and the connector) treat it as a capturing outbound.
+    # BACKLOG #3724: the flag is copied rather than forced True, so capture follows an env() ref that
+    # resolves False. A capture_response already set stays; the connector and
+    # refuse_capture_conflicts OR the two.
     out_params = spec.settings.get("capture_out_params")
-    if isinstance(out_params, EnvRef):
-        # BACKLOG #3724: a literal True here would keep capture on after the ref resolves False. The
-        # ref is copied rather than read, so capture follows it. A capture_response already set stays;
-        # the connector and refuse_capture_conflicts OR the two.
-        if not spec.settings.get("capture_response"):
-            spec.settings["capture_response"] = out_params
-    elif out_params:
-        spec.settings["capture_response"] = True
+    if out_params and not spec.settings.get("capture_response"):
+        spec.settings["capture_response"] = out_params
+    # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
+    # rejects an unsupportable config before any store is opened.
+    if batch is not None and spec.type is not ConnectorType.MLLP:
+        # BHS/BTS framing is HL7v2-specific; other transports have no batch-envelope analogue. The
+        # outbound has no content_type (inbound-only), so gate on the MLLP connector type itself.
+        raise WiringError(
+            f"outbound connection {name!r}: batch aggregation is MLLP (HL7v2) only, "
+            f"not {spec.type.value.upper()} (ADR 0082)."
+        )
     refuse_capture_conflicts(
         spec.type, spec.settings, f"outbound connection {name!r}", batched=batch is not None
     )
@@ -7687,15 +7692,6 @@ def build_outbound_connection(
                 "(re-ingress would persist a best-effort-scrubbed partner reply as a new message; "
                 "use capture_response for reconciliation instead) (ADR 0015 amendment, #236)."
             )
-    # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
-    # rejects an unsupportable config before any store is opened.
-    if batch is not None and spec.type is not ConnectorType.MLLP:
-        # BHS/BTS framing is HL7v2-specific; other transports have no batch-envelope analogue. The
-        # outbound has no content_type (inbound-only), so gate on the MLLP connector type itself.
-        raise WiringError(
-            f"outbound connection {name!r}: batch aggregation is MLLP (HL7v2) only, "
-            f"not {spec.type.value.upper()} (ADR 0082)."
-        )
     return OutboundConnection(
         name=name,
         spec=spec,
