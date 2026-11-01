@@ -2487,8 +2487,8 @@ it.
 A connection test the store stopped would report `success: false` with one fixed line, and the row
 the route writes to `audit_log.detail` would carry that line and the same `reason`. The
 `connection_control` row of a start or restart answered this way is fail-soft, as is that row for
-any refused inbound start, and so is the `connection_test` row of a test stopped in its CA check
-step, before its connector is built. A store that also refuses the row would leave the answer
+any refused inbound start or restart, and so is the `connection_test` row of a test stopped in its
+CA check step, before its connector is built. A store that also refuses the row would leave the answer
 standing, and the row's loss would be logged at ERROR. Any other test's row stays required.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own

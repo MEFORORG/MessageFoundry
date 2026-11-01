@@ -347,10 +347,7 @@ _CONTROL_NOTICES: dict[str, str] = {
         "connection stopped until its next start, which at least an operator, a schedule or a rule "
         "can make; see the engine log"
     ),
-    "control_refused": (
-        "the engine refused that action, and a restart may have stopped the connection; "
-        "see its status below"
-    ),
+    "control_refused": "the engine refused that action; check the connection's status below",
 }
 
 
