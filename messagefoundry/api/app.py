@@ -12547,8 +12547,8 @@ def create_managed_app(
     )
     if auth_settings is None:
         # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app is in one
-        # of two modes. Said here, once create_app has accepted the build, and not in create_app,
-        # which every managed app calls with auth=None before the lifespan attaches a service.
+        # of two modes. The denied line cannot sit in create_app, which every managed app calls
+        # with auth=None before the lifespan attaches a service, and the open line stays beside it.
         # auth_settings stays an argument because app.state.auth is None at build on every managed
         # app. The mode comes from app.state, the flag the gates read, not from this argument.
         if open_mode(app.state):
@@ -12559,8 +12559,8 @@ def create_managed_app(
             )
         else:
             _log.warning(
-                "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
-                "service attaches and the API's bearer-token gates refuse every caller (%s). "
+                "create_managed_app: built with no auth_settings and without allow_no_auth, so %s: "
+                "no service attaches and the API's bearer-token gates refuse every caller. "
                 "auth_settings attaches sign-in; allow_no_auth=True instead admits any caller as "
                 "the full-access system identity",
                 AUTH_NOT_CONFIGURED,

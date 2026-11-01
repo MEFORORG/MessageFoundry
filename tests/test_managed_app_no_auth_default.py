@@ -168,10 +168,11 @@ def test_a_build_with_no_auth_settings_names_its_mode_once(
 
 
 @pytest.mark.parametrize(
-    ("state", "wording"),
+    ("state", "service", "wording"),
     [
-        pytest.param(True, _OPEN_LINE, id="state-opens"),
-        pytest.param(False, _DENIED_LINE, id="state-closes"),
+        pytest.param(True, None, _OPEN_LINE, id="state-opens"),
+        pytest.param(False, None, _DENIED_LINE, id="state-closes"),
+        pytest.param(True, object(), _DENIED_LINE, id="a-service-beside-the-flag"),
     ],
 )
 def test_the_build_line_reads_the_state_the_gates_read(
@@ -179,16 +180,19 @@ def test_the_build_line_reads_the_state_the_gates_read(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     state: bool,
+    service: object | None,
     wording: str,
 ) -> None:
     """Vault BACKLOG #3746 item 18: the line reads ``open_mode``, as the gates do, and not the
     build argument. ``create_app`` writes the flag from that argument, so the two agree in a real
-    build; the stand-in makes them part, or a test could not tell which one the line read."""
+    build; the stand-in makes them part, or a test could not tell which one the line read. The
+    service row is what tells ``open_mode`` from a plain read of the flag."""
     real_create_app = api_app.create_app
 
     def create_app_setting_the_other_flag(*args: Any, **kwargs: Any) -> FastAPI:
         app = real_create_app(*args, **kwargs)
         app.state.allow_no_auth = state
+        app.state.auth = service
         return app
 
     monkeypatch.setattr(api_app, "create_app", create_app_setting_the_other_flag)

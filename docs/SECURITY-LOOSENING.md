@@ -467,7 +467,7 @@ false premise.
   `allow_no_auth`, with no auth service attached. It is an app opt-in, not a setting, so it is not
   in the registry (`security_loosenings()`) and has no row in the tables on this page. So
   `messagefoundry security show` would never name it: that command reads settings, and no
-  setting holds it.
+  setting holds it. `create_managed_app` also logs one WARNING at build; `create_app` does not.
 
 ### `require_mfa = false` — single-factor sign-in
 - **What you lose:** every account with no second factor enrolled, Administrators included,
