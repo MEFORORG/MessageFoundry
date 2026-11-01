@@ -15,13 +15,13 @@ from collections.abc import Callable
 from functools import wraps
 
 
-def prints_its_refusal[**P, R](read_shape: Callable[P, R]) -> Callable[P, R]:
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
     """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
 
     @wraps(read_shape)
-    def reading(*args: P.args, **kwargs: P.kwargs) -> R:
+    def reading() -> R:
         try:
-            return read_shape(*args, **kwargs)
+            return read_shape()
         except ValueError as exc:
             print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
             raise

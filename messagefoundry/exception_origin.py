@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Which code raised an exception, read from its traceback (vault BACKLOG #3765 item 5).
 
-The config loader, ``messagefoundry check-privileges`` and the CLI each print an exception's text
-only when this package wrote it, so all three share this one rule. A leaf that imports only the
-standard library: ``privilege_probes`` calls it inside exception handlers without loading
-``config.wiring``, and ``__main__`` without loading anything else.
+The config loader, ``messagefoundry check-privileges`` and the CLI each read this to decide whether
+to print an exception's text, so all three share one rule. A leaf that imports only the standard
+library: ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``,
+and ``__main__`` without loading anything else.
 
 The rule reads the innermost frame's module name. A config module and its helpers run as
 ``mefor_config_*``, never under ``messagefoundry``."""
@@ -13,12 +13,29 @@ The rule reads the innermost frame's module name. A config module and its helper
 from __future__ import annotations
 
 import dis
+from collections.abc import Iterator
 from types import TracebackType
 from typing import Final
 
-__all__ = ["raised_by_the_engine", "worded_by_the_engine"]
+__all__ = ["exception_chain", "raised_by_the_engine", "worded_by_the_engine"]
 
 _RAISE_STATEMENT: Final = dis.opmap["RAISE_VARARGS"]
+
+
+def exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and every exception it wraps: its cause and context, and the exceptions urllib3 and
+    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once."""
+    seen: set[int] = set()
+    todo: list[BaseException] = [exc]
+    while todo:
+        e = todo.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        inner: list[object] = [e.__cause__, e.__context__, *e.args]
+        inner += [getattr(e, "reason", None), getattr(e, "original_error", None)]
+        todo += [i for i in inner if isinstance(i, BaseException)]
 
 
 def _engine_frame(exc: BaseException) -> TracebackType | None:

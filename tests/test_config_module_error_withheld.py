@@ -487,6 +487,15 @@ def wraps_author_code(fn):
 def wraps_a_failed_import():
     raise WiringError("an extra is missing") from ModuleNotFoundError("planted")
 
+def wraps_a_held_error(value):
+    try:
+        int(value)
+    except ValueError as exc:
+        held = exc
+    carrier = RuntimeError("dial failed")
+    carrier.reason = held
+    raise WiringError(f"wrapped: {held}") from carrier
+
 def words_its_own():
     raise ValueError("engine wording 3765")
 
@@ -672,47 +681,55 @@ def test_no_factory_refusal_quotes_a_planted_value(factory_name: str) -> None:
             f"Http(port=1, intake_client_subjects={{{NEEDLE!r}: ['x']}})",
             "is not an RFC 4514 distinguished name",
         ),
+        (
+            f"inbound('IB', MLLP(port=1), router='r', source_ip_allowlist=[{NEEDLE!r}])",
+            "source_ip_allowlist entry 0 is not a valid",
+        ),
+        (
+            f"inbound('IB', MLLP(port=1), router='r', content_type={NEEDLE!r})",
+            "invalid content_type, value withheld",
+        ),
+        (
+            f"outbound('OB', Soap(url='https://x.example/', ws_password_type={NEEDLE!r}))",
+            "ws_password_type must be 'text'",
+        ),
     ],
-    ids=["intake-auth", "intake-auth-health", "pin-shape", "pin-digest", "issuer"],
+    ids=[
+        "intake-auth",
+        "intake-auth-health",
+        "pin-shape",
+        "pin-digest",
+        "issuer",
+        "allowlist",
+        "content-type",
+        "ws-password-type",
+    ],
 )
 def test_a_measured_refusal_fires_without_its_value(
     tmp_path: Path, call: str, wording: str
 ) -> None:
-    _write(tmp_path, "feed.py", f"from messagefoundry import Http, Rest\n\n{call}\n")
+    _write(
+        tmp_path,
+        "feed.py",
+        f"from messagefoundry import Http, MLLP, Rest, Soap, inbound, outbound\n\n{call}\n",
+    )
     (msg,) = _messages(tmp_path)
     assert wording in msg and NEEDLE not in msg
 
 
-@pytest.mark.parametrize(
-    ("argument", "wording"),
-    [
-        (f"source_ip_allowlist=[{NEEDLE!r}]", "source_ip_allowlist entry 0 is not a valid"),
-        (f"content_type={NEEDLE!r}", "invalid content_type, value withheld"),
-    ],
-    ids=["allowlist", "content-type"],
-)
-def test_an_inbound_refusal_fires_without_its_value(
-    tmp_path: Path, argument: str, wording: str
+def test_a_missing_code_set_is_named_and_nothing_is_on_the_chain(tmp_path: Path) -> None:
+    # The refusal names the set on purpose, so no lookup's KeyError may sit under it to be replaced.
+    _write(tmp_path, "feed.py", "from messagefoundry import code_set\n\ncode_set('nope')\n")
+    err = _load_error(tmp_path)
+    assert "no such code set 'nope'" in str(err) and "withheld" not in str(err)
+
+
+def test_an_inner_error_a_library_holds_as_an_attribute_is_foreign_too(
+    tmp_path: Path, engine_probe: str
 ) -> None:
-    _write(
-        tmp_path,
-        "feed.py",
-        "from messagefoundry import MLLP, inbound\n\n"
-        f"inbound('IB', MLLP(port=1), router='r', {argument})\n",
-    )
-    (msg,) = _messages(tmp_path)
-    assert wording in msg and NEEDLE not in msg
-
-
-def test_a_soap_password_type_refusal_fires_without_its_value(tmp_path: Path) -> None:
-    _write(
-        tmp_path,
-        "feed.py",
-        "from messagefoundry import Soap, outbound\n\n"
-        f"outbound('OB', Soap(url='https://x.example/', ws_password_type={NEEDLE!r}))\n",
-    )
-    (msg,) = _messages(tmp_path)
-    assert "ws_password_type must be 'text'" in msg and NEEDLE not in msg
+    # urllib3 keeps one in `reason`, where neither __cause__ nor __context__ points at it.
+    _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_held_error({NEEDLE!r})"))
+    assert str(_load_error(tmp_path)) == "wrapped: [ValueError text withheld]"
 
 
 # Item 4: whatever else a config module raises is a failed module, and carries no text.

@@ -103,7 +103,11 @@ from messagefoundry.connection_names import (
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
-from messagefoundry.exception_origin import worded_by_the_engine
+from messagefoundry.exception_origin import (
+    exception_chain,
+    raised_by_the_engine,
+    worded_by_the_engine,
+)
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
@@ -9423,6 +9427,9 @@ _CALL_ARGUMENT_RE: Final = re.compile(r"\bargument '([^']+)'")
 #: The shortest cause text :func:`_engine_wording` replaces. Shorter, it matches the engine's prose.
 _SHORTEST_QUOTATION: Final = 3
 
+#: What the runtime raises at a limit, in the loader's own compile as well as in author code.
+_RUNTIME_LIMITS: Final = (MemoryError, RecursionError)
+
 #: How the loader names a config file's module (:func:`_config_module_name`): the prefix, then the
 #: stem, then ``_`` and 12 hex digits. An ImportError naming a helper carries this mangled name.
 _CONFIG_MODULE_PREFIX: Final = "mefor_config_"
@@ -9434,7 +9441,7 @@ _WITHHELD: Final = "its message is withheld: it can carry a value the module hel
 
 
 def _module_failure(
-    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None] | None = None
+    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
     file and line it was raised from, and for an import or name error the identifier, but never the
@@ -9443,12 +9450,15 @@ def _module_failure(
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
     output (so CI logs), the reload WARNING and the ``POST /connections/{name}/flag`` 409, and a
-    credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary."""
-    return (
-        f"error loading config module {path.name}: "
-        f"{_failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)} "
-        f"({_WITHHELD})"
-    )
+    credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary.
+
+    A fault building the detail leaves the type alone, which is still a withheld diagnostic, so the
+    fault cannot escape with ``exc`` chained as its context."""
+    try:
+        detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
+    except Exception:  # noqa: BLE001 - see the docstring
+        detail = type(exc).__name__
+    return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
 
 def _failure_detail(
@@ -9507,7 +9517,8 @@ def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
         # `from x import y` puts the module in `name` and the symbol in `name_from`.
         return exc.name, getattr(exc, "name_from", None)
     if type(exc) is TypeError and exc.args and isinstance(exc.args[0], str):
-        return tuple(_CALL_ARGUMENT_RE.findall(exc.args[0])[:1])
+        argument = _CALL_ARGUMENT_RE.search(exc.args[0])
+        return (argument[1],) if argument else ()
     return ()
 
 
@@ -9596,39 +9607,33 @@ def _textless_import_error(exc: ImportError) -> ImportError:
     return ModuleNotFoundError() if isinstance(exc, ModuleNotFoundError) else ImportError()
 
 
-def _withheld_failure(
-    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
-) -> str:
-    """:func:`_module_failure`, or the type alone when building that detail faults, so the fault
-    cannot escape with ``exc`` chained as its context."""
-    try:
-        return _module_failure(path, exc, source_of)
-    except Exception:  # noqa: BLE001 - the type alone is still a withheld diagnostic
-        return f"error loading config module {path.name}: {type(exc).__name__} ({_WITHHELD})"
+def _keeps_engine_wording(exc: BaseException) -> bool:
+    """Whether the loader may print ``exc``'s own text: a ``raise`` in this package wrote it.
+
+    An import or name error is judged by its identifier, not its frame: a failed import ends in
+    this package's own helper finder whoever wrote the import. A builtin such as ``int()`` failing
+    in engine code is not engine wording, so it is withheld like a module's own text, except at a
+    runtime limit, whose fixed text quotes nothing: the parser wall in the loader's ``compile``."""
+    if isinstance(exc, _NAMED_EXCEPTIONS):
+        return False
+    return worded_by_the_engine(exc) or (
+        isinstance(exc, _RUNTIME_LIMITS) and raised_by_the_engine(exc)
+    )
 
 
-def _raised_from(exc: BaseException) -> Iterator[BaseException]:
-    """Each exception ``exc`` was raised from, through ``__cause__`` and ``__context__``, once.
-
-    ``from None`` hides a context from the default printer, and it is still there to be read."""
-    seen = {id(exc)}
-    todo = [exc.__cause__, exc.__context__]
-    while todo:
-        link = todo.pop()
-        if link is not None and id(link) not in seen:
-            seen.add(id(link))
-            yield link
-            todo += [link.__cause__, link.__context__]
+def _foreign_links(exc: BaseException) -> list[BaseException]:
+    """What ``exc`` was raised from that the engine did not word, ``from None`` or not: that hides a
+    context from the default printer, and it is still there to be read."""
+    return [
+        link for link in exception_chain(exc) if link is not exc and not worded_by_the_engine(link)
+    ]
 
 
 def _engine_wording(
-    path: Path,
-    exc: BaseException,
-    foreign: list[BaseException],
-    source_of: Callable[[str], bytes | None],
+    path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
-    """The text of ``exc``, an engine refusal, with each ``foreign`` exception's text it quotes
-    replaced by that exception's type name (vault BACKLOG #3765 item 1).
+    """The text of ``exc``, an engine refusal, with the text it quotes from each of its
+    :func:`_foreign_links` replaced by that exception's type name (vault BACKLOG #3765 item 1).
 
     A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
     ``int()`` or a library said, and either can quote the value it was given. A quotation in any
@@ -9636,19 +9641,17 @@ def _engine_wording(
     the place to convert a failure."""
     try:
         quoted = {
-            text: type(link).__name__
-            for link in foreign
-            for text in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
-            if len(text) >= _SHORTEST_QUOTATION
+            quotation: type(link).__name__
+            for link in _foreign_links(exc)
+            for quotation in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
+            if len(quotation) >= _SHORTEST_QUOTATION
         }
         text = str(exc)
-        if quoted:
-            # One pass, longest first, so a repr goes before the str inside it and no replacement
-            # is searched again.
-            pattern = "|".join(re.escape(q) for q in sorted(quoted, key=len, reverse=True))
-            text = re.sub(pattern, lambda m: f"[{quoted[m[0]]} text withheld]", text)
+        # Longest first, so a repr goes before the str inside it.
+        for quotation in sorted(quoted, key=len, reverse=True):
+            text = text.replace(quotation, f"[{quoted[quotation]} text withheld]")
     except Exception:  # noqa: BLE001 - a foreign __str__ runs here, and it can raise
-        return _withheld_failure(path, exc, source_of)
+        return _module_failure(path, exc, source_of)
     return (
         text if isinstance(exc, WiringError) else f"error loading config module {path.name}: {text}"
     )
@@ -9671,7 +9674,7 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except BaseException as exc:
         if type(exc) is KeyboardInterrupt and not exc.args:
             raise
-        refused = WiringError(_withheld_failure(path, exc, helpers.source_of))
+        refused = WiringError(_module_failure(path, exc, helpers.source_of))
     if refused is not None:
         # Raised AFTER the handler, for the reason _exec_module gives.
         raise refused
@@ -9689,31 +9692,22 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         _run_author_code(path, module, helpers)
     except Exception as exc:
         helpers.unregister(mod_name, module)
-        # An import or name error is judged by its identifier, not its frame: a failed import ends
-        # in this package's own helper finder whoever wrote the import. A SyntaxError is the
-        # author's source failing to compile; the loader compiles it, so its innermost frame is
-        # this package's, and it is judged as the author's failure it is. A builtin such as int()
-        # failing in engine code is not engine wording either, so it is withheld with the rest.
-        if (
-            worded_by_the_engine(exc)
-            and not isinstance(exc, _NAMED_EXCEPTIONS)
-            and not isinstance(exc, SyntaxError)
-        ):
+        if _keeps_engine_wording(exc):
             # The engine's own wording -- a factory or registry refusal naming a connection or a
             # setting -- which is the diagnostic an author needs, so it keeps its text. That relies
             # on engine raise sites not quoting a value (tests/test_config_module_error_withheld.py
             # reads every factory for one). Anything it was raised from that the engine did not word
-            # can hold a value: such text is taken out of the refusal, and off the chain.
-            foreign = [link for link in _raised_from(exc) if not worded_by_the_engine(link)]
-            if not foreign:
+            # can hold a value: such text is taken out of the refusal, and off the chain. No local
+            # holds those links, because the frame stays on the raised error's traceback.
+            if not _foreign_links(exc):
                 if isinstance(exc, WiringError):
                     raise
                 raise WiringError(f"error loading config module {path.name}: {exc}") from exc
-            withheld = WiringError(_engine_wording(path, exc, foreign, helpers.source_of))
+            withheld = WiringError(_engine_wording(path, exc, helpers.source_of))
             if isinstance(exc.__cause__, ImportError):
                 cause = _textless_import_error(exc.__cause__)
         else:
-            withheld = WiringError(_withheld_failure(path, exc, helpers.source_of))
+            withheld = WiringError(_module_failure(path, exc, helpers.source_of))
         # An import failure keeps a textless stand-in of its type as the cause, because the
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
