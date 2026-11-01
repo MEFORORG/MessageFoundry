@@ -294,8 +294,8 @@ def test_the_console_matches_an_ipv4_entry_exactly() -> None:
 def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -> None:
     # The console keeps its own stdlib check rather than import the engine module, so the two
     # must not drift. A host that reads as an address can match only if this says it is canonical:
-    # read wider, a spelling settings refuse would cover itself, and read narrower, an address
-    # settings accept would cover nothing.
+    # read wider, _is_one_host would raise on a spelling settings refuse, and read narrower, an
+    # address settings accept would cover nothing.
     assert _external._is_ipv4(value) is is_canonical_ipv4(value)
 
 
@@ -310,8 +310,8 @@ def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
     another way.
 
     Mutation: put ``domain.strip().lower()`` back in ``_matches_domain``. Red: every case.
-    Mutation: ``_entry_key`` lower-cases every entry. Red: the first case.
-    Mutation: ``_entry_key`` calls a plain ``strip()``. Red: the two white space cases."""
+    Mutation: drop the ``isascii()`` test. Red: the first case.
+    Mutation: call a plain ``strip()``. Red: the two white space cases."""
     url = "https://korp.example/"
     assert is_external(url, (entry,))
     assert not is_allowlisted(url, (entry,))
@@ -322,19 +322,16 @@ def test_an_ascii_entry_still_loses_its_padding_and_capitals() -> None:
     assert not is_external("https://korp.example/", (" KORP.example\t",))
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        " Corp.Example\t",
-        chr(0x212A) + "orp.example",
-        chr(0xA0) + "corp.example",
-        "M" + chr(0xDC) + "LLER.example",
-    ],
-)
-def test_the_console_and_the_engine_agree_on_the_compare_form(value: str) -> None:
-    # The console's _entry_key is a copy of upn_suffix_key, kept for the reason _is_ipv4's docstring
-    # gives, so a fix to one must not leave the other behind.
-    assert _external._entry_key(value) == upn_suffix_key(value)
+def test_localhost_loads_as_a_name_and_covers_its_subdomains() -> None:
+    """``docs/CONFIGURATION.md`` says so, against the exact match an address entry gets. Control:
+    the loopback address covers nothing under it.
+
+    Mutation: match a single-label entry exactly in ``_matches_domain``. Red: the second
+    assertion."""
+    assert _load("organization_domains", "localhost") == ["localhost"]
+    assert not is_external("https://foo.localhost/", ("localhost",))
+    loopback = str(ipaddress.IPv4Address(0x7F00_0001))
+    assert is_external(f"https://foo.{loopback}/", (loopback,))
 
 
 def test_the_upn_compare_form_accepts_nothing_that_lowering_both_sides_refused() -> None:

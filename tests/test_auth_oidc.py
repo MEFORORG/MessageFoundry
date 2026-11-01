@@ -364,6 +364,18 @@ def test_a_blank_ad_domain_is_no_suffix_source(blank: str) -> None:
     assert AuthSettings(ad_domain=blank).effective_oidc_username_domains == ()
 
 
+def test_a_list_of_only_blanks_keeps_the_fallback_out_and_its_env_form_does_not() -> None:
+    """A pin of the stated difference, so that changing it is a decision: the TOML form is truthy,
+    so it suppresses ``ad_domain``, and the env string form loses its blanks at the split.
+
+    Mutation: test the stripped entries, not the list, in the property. Red: the first assertion."""
+    fields = {"ad_domain": "corp.example"}
+    toml = AuthSettings.model_validate({**fields, "oidc_allowed_username_domains": ["   "]})
+    assert toml.effective_oidc_username_domains == ()
+    env = AuthSettings.model_validate({**fields, "oidc_allowed_username_domains": "   "})
+    assert env.effective_oidc_username_domains == ("corp.example",)
+
+
 def test_the_ad_domain_fallback_keeps_a_non_ascii_suffix_as_written() -> None:
     """The allow-list's other source goes through the same compare form, or a suffix written with
     a capital non-ASCII letter would stop matching its own spelling and match only its lower-cased

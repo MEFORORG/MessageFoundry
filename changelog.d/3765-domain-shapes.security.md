@@ -10,5 +10,5 @@
   character now matches only as written, on both sides, so this refuses some pairs it accepted
   before and accepts none it refused. (BACKLOG #3765)
 - **A blank `[auth].ad_domain` is not a UPN suffix source.** It produced the empty suffix, which
-  passed the load refusal and let a claim of `jdoe@` through the check. With stripping on and no
-  allow-list, such a config is now refused at load. (BACKLOG #3765)
+  passed the load refusal and let a claim of `jdoe@` through the check. With OIDC enabled, stripping
+  on and no allow-list, such a config is now refused at load. (BACKLOG #3765)

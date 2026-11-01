@@ -4691,7 +4691,7 @@ class AuthSettings(_Section):
 
         Explicit ``oidc_allowed_username_domains`` wins; otherwise fall back to the single
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
-        suffix source is configured at all, which the validator above refuses when stripping is on.
+        suffix source applies, which the validator above refuses with OIDC enabled and stripping on.
         """
         # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
         # compared with the raw suffix an identity provider writes into a claim, not with a DNS
@@ -4699,8 +4699,8 @@ class AuthSettings(_Section):
         # both of which the shared rule refuses. upn_suffix_key is the form the claim is compared
         # in, so a change to one side of this compare cannot stop or start a match on its own.
         # A TOML list of only blanks still takes this arm: it gives () and keeps ad_domain out, so
-        # with stripping on the load refusal above fires even when ad_domain is set. The env string
-        # form lost its blanks at the split, so it falls back to ad_domain instead.
+        # with OIDC enabled and stripping on the load refusal above fires even when ad_domain is
+        # set. The env string form lost its blanks at the split, so it falls back instead.
         if self.oidc_allowed_username_domains:
             return tuple(
                 upn_suffix_key(d.strip()) for d in self.oidc_allowed_username_domains if d.strip()
