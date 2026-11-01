@@ -421,8 +421,8 @@ def _graph_hops(
     }
     # The database arm is the shipped reader, reused rather than restated. compliant_kind is True for
     # every database hop and is not judged per driver: auth='integrated'/'entra' on the SQL Server
-    # preset; on generic, a client certificate on a driver that reads those odbc_params keywords, or
-    # the service's own account.
+    # preset; on generic, which only Database and DatabasePoll take, a client certificate on a driver
+    # that reads those odbc_params keywords, or the service's own account.
     out = [
         StaticCredentialHop(name, "static", reason, True)
         for name, reason in static_credential_db_hops(registry)

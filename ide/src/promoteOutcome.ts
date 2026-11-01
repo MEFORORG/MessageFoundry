@@ -121,12 +121,9 @@ function reloadShortfall(r: ReloadResult): string[] {
   return [
     `restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
       "does not load it, so the engine still trusts the old CA.",
-    "The settings list above is not complete, for at least these reasons: it covers only the " +
-      "engine that answered; another engine shard reports only once a reload reaches its own " +
-      "API; a cluster node reports only in its own log, and only if it converges on the reload; " +
-      'and the dialling CAs are never listed. See the section "Outbound TLS trust anchor — ' +
-      'pinned internal CA" of docs/SECURITY.md in the MessageFoundry repository for which of ' +
-      "those need a restart.",
+    'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
+      "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
+      '"What a reload\'s restart_required list covers".',
   ];
 }
 
