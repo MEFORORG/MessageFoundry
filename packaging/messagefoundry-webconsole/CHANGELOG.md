@@ -44,9 +44,9 @@ this line.**
 - **A failed flag read reads as unknown, not as unflagged.** Until the read recovers, a row offers
   no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
   the table says why. (`BACKLOG #2623`)
-- **The page for a toggle the store did not confirm no longer says the flag did not change.** A
-  commit whose answer was lost still lands, so it sends the operator to read the flag first, and it
-  no longer says to try again. Its heading is now "Flag change not confirmed". (`BACKLOG #2623`)
+- **The page for a toggle the store did not confirm no longer says the flag did not change.** The
+  change may still have landed, so it sends the operator to read the flag first, and it no longer
+  says to try again. Its heading is now "Flag change not confirmed". (`BACKLOG #2623`)
 - **Corrected: the two connection filters are not purely presentational.** Select-all skips a row
   either one hides, so both shape a bulk action's target set. For Flagged only, which reads the
   store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)
@@ -178,8 +178,8 @@ this line.**
 
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
-  handler had no other. No other 503 reaches it today, so nothing an operator sees changes; a 503
-  a later handler change adds is no longer named as the store's refusal. The console now catches
+  handler had no other. The handler raises no other today, so nothing an operator sees changes; a
+  503 a later handler change adds is no longer named as the store's refusal. The console now catches
   the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 

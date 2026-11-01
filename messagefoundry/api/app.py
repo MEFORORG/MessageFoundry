@@ -5496,8 +5496,8 @@ def create_app(
         """Set the object-of-interest flag on a connection in the running graph (#131, BACKLOG
         #2623). The store holds the flag, so a toggle runs no config module and writes no file, and
         the flag and its ``connection_flag_set`` row commit together. A name the graph does not have
-        is refused **409**, and a toggle the store did not confirm **503**: a commit whose answer
-        was lost has landed, so a 503 does not say the flag is unchanged. Paced and audited.
+        is refused **409**, and a toggle the store did not confirm **503**, which does not say the
+        flag is unchanged (:class:`ConnectionFlagNotRecorded`). Paced and audited.
 
         Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:
         the flag marks what an operator should look at, and a change of gate is its own decision

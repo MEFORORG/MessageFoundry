@@ -221,8 +221,9 @@ def test_the_page_says_why_the_flags_are_missing() -> None:
     answers."""
     failed = str(connection_pages.connections_fragment([_row(flagged=None)]))
     assert connection_pages.FLAGS_UNREAD_NOTICE in failed
-    # A failed read leaves select-all with no row to take, so its one click clears (BACKLOG #2623).
-    assert "one click on select-all clears the whole selection" in failed
+    # Under Flagged only a failed read leaves select-all no row to take, so one click clears; the
+    # hidden-row arm of test_a_click_with_no_row_to_take_clears_the_selection runs it (BACKLOG #2623).
+    assert "one click on select-all clears the whole selection, hidden rows included" in failed
     answered = str(connection_pages.connections_fragment([_row(flagged=False)]))
     assert connection_pages.FLAGS_UNREAD_NOTICE not in answered
     assert connection_pages.FLAGS_UNREAD_NOTICE not in str(
@@ -269,8 +270,9 @@ def test_a_select_all_that_took_nothing_leaves_its_box_clear(tmp_path: Path) -> 
     [
         (False, ("1", "0"), ("click", {"query": "no such row"}, "click")),
         (True, ("unknown", "0"), ({"tick": "unknown"}, "click")),
+        (True, ("unknown", "x"), ({"tick": "x"}, {"query": "row unknown"}, "click")),
     ],
-    ids=["every-row-hidden", "no-row-known-flagged"],
+    ids=["every-row-hidden", "no-row-known-flagged", "a-hidden-row-in-a-failed-read"],
 )
 def test_a_click_with_no_row_to_take_clears_the_selection(
     tmp_path: Path,
