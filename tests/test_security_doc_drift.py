@@ -44,6 +44,8 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.config.retention_classification import (
     BODY_ACKNOWLEDGEMENT_SETTING,
+    RetentionGateLine,
+    auto_bounded_windows,
     evaluate_retention_gate,
 )
 from messagefoundry.config.settings import (
@@ -3968,7 +3970,8 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
     """Where a document says the global body-window gate audits at ``warn``, which it does not.
 
     Reads prose: each site's retired words must be gone and its corrected words present. A
-    reworded return of the old claim is not caught."""
+    reworded return of the old claim is not caught, and only the retention entry is sliced: every
+    other phrase is looked for anywhere in its document."""
     entry = _section(loosening, _LOOSENING_RETENTION_ENTRY)
     findings: list[str] = []
     for where, text, retired, corrected in (
@@ -3988,8 +3991,7 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
             "downgrades them all to loud, audited warnings",
             (
                 "at least the global body-window retention gate writes none at `warn`",
-                "whose list the start's `config_loaded` audit row records; at least some of those "
-                "rows record no list",
+                "whose list the start's `config_loaded` audit row records. That row is best-effort",
             ),
         ),
         (
@@ -4009,7 +4011,7 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
             (
                 "Under `warn` the gate writes no `AUDIT:` line for an auto-bounded window at `0`",
                 "the start's `config_loaded` audit row records that list",
-                "The list names no window but the message-body one",
+                "The list names no auto-bounded window but the message-body one",
             ),
         ),
     ):
@@ -4048,37 +4050,36 @@ def test_the_docs_say_the_body_window_gate_audits_only_under_enforce() -> None:
     )
     assert not findings, f"the docs drifted from the retention gate: {findings}"
 
-    def body_lines(*, acknowledged: bool, enforcing: bool) -> list[tuple[bool, str]]:
-        """The gate's lines about the bodies, on a start it lets through."""
+    def gate_lines(*, acknowledged: bool, enforcing: bool) -> tuple[RetentionGateLine, ...]:
+        """The gate's lines on a start it lets through, with only the auto-bounded windows open."""
         settings = ServiceSettings()
         settings.retention.allow_unbounded_phi = acknowledged
         settings.retention.messages_days = 0
         # The tiers with no default of their own, or the enforcing start below would be refused.
-        settings.security.allow_keeping_transform_state_indefinitely = True
-        settings.security.allow_keeping_search_presets_indefinitely = True
+        settings.retention.state_max_age_days = 30
+        settings.retention.search_preset_days = 30
         outcome = evaluate_retention_gate(
             settings, enforcing=enforcing, production=True, env_name="prod"
         )
         assert outcome.refusal is None
-        return [
-            (line.audit, line.text)
-            for line in outcome.lines
-            if _BODY_WINDOW in line.text or "INDEFINITELY" in line.text
-        ]
+        return outcome.lines
 
-    (audit, warning) = body_lines(acknowledged=True, enforcing=True)
-    assert audit[0] and audit[1].startswith("AUDIT:") and not warning[0]
-    # With the switch set under warn the gate says nothing about the bodies.
-    assert body_lines(acknowledged=True, enforcing=False) == []
+    (audit,) = [line for line in gate_lines(acknowledged=True, enforcing=True) if line.audit]
+    assert audit.text.startswith("AUDIT:") and _BODY_WINDOW in audit.text
+    # With the switch set under warn, every auto-bounded window stays at 0 and the gate writes
+    # nothing about any of them.
+    assert gate_lines(acknowledged=True, enforcing=False) == ()
     # Without it, a plain stderr warning and no AUDIT line.
-    (plain,) = body_lines(acknowledged=False, enforcing=False)
-    assert not plain[0] and plain[1].startswith("warning:")
+    unacknowledged = gate_lines(acknowledged=False, enforcing=False)
+    assert not any(line.audit for line in unacknowledged)
+    (plain,) = [line for line in unacknowledged if _BODY_WINDOW in line.text]
+    assert plain.text.startswith("warning:")
 
-    def loosenings(security: SecuritySettings) -> set[str]:
+    def loosenings(security: SecuritySettings) -> list[tuple[str, str]]:
         """What the start's ``config_loaded`` row records: `tests/test_start_config_loaded_row.py`
         pins that row to the posture list this registry feeds."""
         defaults = ServiceSettings()
-        names = security_loosenings(
+        return security_loosenings(
             security,
             defaults.store,
             defaults.auth,
@@ -4104,16 +4105,23 @@ def test_the_docs_say_the_body_window_gate_audits_only_under_enforce() -> None:
             startup=None,
             service_env=None,
         )
-        return {name for name, _risk in names}
 
-    named = loosenings(
-        SecuritySettings(enforcement=SecurityEnforcement.WARN, allow_keeping_phi_indefinitely=True)
+    reported = loosenings(
+        SecuritySettings(
+            enforcement=SecurityEnforcement.WARN,
+            allow_keeping_phi_indefinitely=True,
+            # A warn-only tier's switch does name a window: the docs' "auto-bounded" scopes this.
+            allow_keeping_app_logs_indefinitely=True,
+        )
     )
-    assert {"enforcement", "allow_keeping_phi_indefinitely"} <= named
-    assert "delete_message_bodies_after_days" not in named
-    assert "delete_message_bodies_after_days" in loosenings(
-        SecuritySettings(delete_message_bodies_after_days=0)
-    )
+    assert {"enforcement", "allow_keeping_phi_indefinitely"} <= {name for name, _risk in reported}
+    text = " ".join(f"{name} {risk}" for name, risk in reported)
+    assert "app_log_days" in text
+    assert not [w.field for w in auto_bounded_windows() if w.field in text]
+    assert "delete_message_bodies_after_days" not in text
+    assert "delete_message_bodies_after_days" in {
+        name for name, _risk in loosenings(SecuritySettings(delete_message_bodies_after_days=0))
+    }
 
 
 def test_the_override_prose_readers_detect_a_planted_violation() -> None:
@@ -4203,13 +4211,13 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
         ),
         "row-always-has-a-list": (
             "loosening",
-            "; at least some of those rows record no list, such as a start whose snapshot step",
-            ". A start whose snapshot step",
+            "That row is best-effort: at least some of those rows record no list",
+            "That row always records the list",
         ),
         "other-windows-read-as-shown": ("loosening", "It reads no other window, so", "So"),
         "phi-list-names-every-window": (
             "phi",
-            "The list names no window but the message-body one.",
+            "The list names no auto-bounded window but the message-body one.",
             "The list names every window.",
         ),
     }

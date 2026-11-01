@@ -576,8 +576,8 @@ def _keep_forever_remedy() -> str:
         "AUDIT line naming these connections for each graph its guard passes. That switch covers "
         "the whole instance: it also turns off the default bound on each of these windows that "
         f"is unset: {auto_bounded}. The start gate writes an AUDIT line for such a window at 0 "
-        "only under "
-        "enforcement = enforce, so set each of them to an explicit number of days first"
+        "only under enforcement = enforce, so set each of them to an explicit number of days "
+        "first"
     )
 
 

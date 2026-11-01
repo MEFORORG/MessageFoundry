@@ -2121,7 +2121,7 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   auto-bound **and**, under `enforce`, downgrades the refusal to a loud audited warning. Under `warn`
   the gate writes no `AUDIT:` line for an auto-bounded window at `0`, with the switch or without it.
   `security_loosenings()` names the switch, and the start's `config_loaded` audit row records that
-  list. The list names no window but the message-body one.
+  list. The list names no auto-bounded window but the message-body one.
 - A connection's own override of `0` (`messages_days` on an inbound, `dead_letter_days` on an
   outbound) meets its own gate when `serve` loads the graph. That gate is described under
   *Per-connection overrides* in [CONFIGURATION.md](CONFIGURATION.md#retention).
