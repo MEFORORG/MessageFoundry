@@ -732,16 +732,17 @@ ingress**, after reading it, is never answered `202`. The message is still recor
   with `max_message_bytes`.
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
   body the engine cannot decode, one that does not match the declared `content_type`, or an HL7 parse
-  or strict-validation failure. A strict-validation timeout is one too, deliberately: one caused by
-  load answers `422` and is final, which reclassifies a cause BACKLOG #2105 was filed with as
-  temporary.
+  or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
+  by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
+  reclassified as permanent.
 
 The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
 `422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
 the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
-The owner ruling of 2026-09-30 set a temporary refusal at `503` with `Retry-After` and kept a permanent
-one at `422`; which refusals are temporary, and the one `413` for over-size, are Manager decision
-d20261030T155119571-255c98. The `ERROR` row's error text opens with `[refusal kind: <kind>]`.
+The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
+temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
+temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
+`ERROR` row's error text opens with `[refusal kind: <kind>]`, ahead of any refused-body allowance note.
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**

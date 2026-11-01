@@ -19,8 +19,8 @@
   ruling of 2026-09-30 answers a temporary refusal `503` with `Retry-After` and keeps a permanent one
   at `422`; which refusals are temporary, the one `413` for over-size, and the id in the body are
   Manager decision d20261030T155119571-255c98. A **temporary** refusal is **`503`** with `Retry-After`, an **over-size** one
-  **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row's
-  `message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
+  **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row as
+  `refused_message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
   [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
@@ -1012,7 +1012,7 @@ to skip auth.
   returning `None` after recording `ERROR`, is answered `422` as on the sync path. See the
   [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
   *(Amended 2026-10-30: "the same `InboundHandler` contract" no longer holds for the receipt handler,
-  which returns an `IngressReceipt`. A refused body's answer names its `ERROR` row's `message_id`, and is
+  which returns an `IngressReceipt`. A refused body's answer names its `ERROR` row as `refused_message_id`, and is
   `503` with `Retry-After` for a temporary refusal, `413` for an over-size one, and `422` otherwise. See
   the [amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
   → `tests/test_inbound_http_source.py::test_respond_with_receipt_on_ingress`
@@ -1466,8 +1466,8 @@ refused body is `{"error": "message was not accepted", "refused_message_id": "<i
 the `ERROR` row the runner wrote before it answered. The key is not `message_id`, which on every other
 answer names a committed message, so a refusal cannot be read as an acceptance (Lander decision
 d20261101T013132231-ef9540, under the owner's delegation). An operator can match a refusal to its row
-by id rather than by time and peer, and that row's error text opens with `[refusal kind: <kind>]`, so
-the kind is known before anyone resends the row. The `HL7MessageTooLarge` type the parse raises for an over-size body is
+by id rather than by time and peer, and that row's error text opens with `[refusal kind: <kind>]`,
+ahead of any refused-body allowance note, so the kind is known before anyone resends the row. The `HL7MessageTooLarge` type the parse raises for an over-size body is
 named in that row's stored reason, where `HL7PeekError` was before.
 
 **The strict-validation timeout stays permanent.** The 2026-09-26 amendment named it as possibly
@@ -1477,8 +1477,8 @@ retry would multiply the load the timeout exists to bound. **The cost is real:**
 counts time spent waiting for a worker thread, so under load a valid body can time out, and it is then
 answered `422`, which a sender and the engine's REST outbound treat as final. Nothing here tells the
 two causes apart. **A strict-validation timeout caused by load answers `422` and is final (PERMANENT).**
-That reclassifies a cause BACKLOG #2105 was filed with as temporary: its filing named the
-strict-validation timeout, beside the in-flight budget, as engine-side and possibly clearing on a retry.
+BACKLOG #2105's filing named the strict-validation timeout, beside the in-flight budget, as temporary:
+engine-side and possibly clearing on a retry. This amendment reclassifies it as permanent.
 It may be reclassified only if a discriminator is later measured that tells a body which would pass on
 a retry from one which would time out again.
 
