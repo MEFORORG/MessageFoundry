@@ -14,19 +14,23 @@ The rule reads the innermost frame's module name. A config module and its helper
 
 from __future__ import annotations
 
-import dis
+import opcode
 from collections.abc import Iterator
 from types import TracebackType
-from typing import Final
+from typing import Any, Final
 
 __all__ = ["exception_chain", "raised_by_the_engine", "worded_by_the_engine"]
 
-_RAISE_STATEMENT: Final = dis.opmap["RAISE_VARARGS"]
+_RAISE_STATEMENT: Final = opcode.opmap["RAISE_VARARGS"]
+
+#: The builtin descriptor. A config module's exception class can define its own ``__traceback__``.
+_TRACEBACK_OF: Final[Any] = BaseException.__dict__["__traceback__"]
 
 
 def exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    """``exc`` and every exception it wraps: its cause and context, and the exceptions urllib3 and
-    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once."""
+    """``exc`` and at least these it wraps: its cause and context, and the exceptions urllib3 and
+    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once. An exception
+    group's members are not among them."""
     seen: set[int] = set()
     todo: list[BaseException] = [exc]
     while todo:
@@ -43,7 +47,7 @@ def exception_chain(exc: BaseException) -> Iterator[BaseException]:
 def _engine_frame(exc: BaseException) -> TracebackType | None:
     """The innermost entry of ``exc``'s traceback when it is in a ``messagefoundry`` module. An
     exception that was never raised has no traceback, so it has no such entry."""
-    tb = exc.__traceback__
+    tb: TracebackType | None = _TRACEBACK_OF.__get__(exc)
     if tb is None:
         return None
     while tb.tb_next is not None:

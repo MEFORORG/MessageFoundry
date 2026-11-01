@@ -6964,20 +6964,24 @@ def _check_source_ip_allowlist(
             raise WiringError(
                 f"inbound connection {name!r}: source_ip_allowlist entries must be non-empty strings"
             )
-        try:
-            if "/" in entry:
-                ipaddress.ip_network(entry, strict=False)
-            else:
-                ipaddress.ip_address(entry)
-            continue
-        except ValueError:
-            pass
-        # Raised AFTER the handler: ipaddress's error quotes the entry, so it stays off the chain.
-        raise WiringError(
-            f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
-            "IP address or CIDR network (value withheld)"
-        )
+        if not _is_ip_or_network(entry):
+            raise WiringError(
+                f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
+                "IP address or CIDR network (value withheld)"
+            )
     return tuple(allowlist)
+
+
+def _is_ip_or_network(entry: str) -> bool:
+    """A yes or no, so ipaddress's error, which quotes ``entry``, stays off any refusal's chain."""
+    try:
+        if "/" in entry:
+            ipaddress.ip_network(entry, strict=False)
+        else:
+            ipaddress.ip_address(entry)
+    except ValueError:
+        return False
+    return True
 
 
 def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentType:
@@ -6990,12 +6994,11 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
     failure the ``connections.toml`` loader already gives. A member passed in is returned unchanged."""
     if isinstance(content_type, ContentType):
         return content_type
-    try:
+    # Tested rather than caught: the enum's error quotes the value, and it would ride the chain.
+    values = [member.value for member in ContentType]
+    if content_type in values:
         return ContentType(content_type)
-    except ValueError:
-        pass
-    # Raised AFTER the handler: the enum's error quotes the value, so it stays off the chain.
-    allowed = ", ".join(repr(member.value) for member in ContentType)
+    allowed = ", ".join(repr(value) for value in values)
     raise WiringError(
         f"inbound connection {name!r}: invalid content_type, value withheld (allowed: {allowed})"
     )
@@ -9425,7 +9428,7 @@ _NAMED_EXCEPTIONS: Final = (ImportError, NameError, AttributeError)
 #: a ``name``, because ``factory(**{value: 1})`` puts a RUN-TIME value here (vault BACKLOG #3765).
 _CALL_ARGUMENT_RE: Final = re.compile(r"\bargument '([^']+)'")
 
-#: The shortest cause text :func:`_engine_wording` replaces. Shorter, it matches the engine's prose.
+#: The shortest text :func:`_rewritten_refusal` replaces. Shorter, it matches the engine's prose.
 _SHORTEST_QUOTATION: Final = 3
 
 #: What the runtime raises at a limit, in the loader's own compile as well as in author code.
@@ -9445,19 +9448,21 @@ def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, and for an import or name error the identifier, but never the
-    exception's text (vault BACKLOG #3249).
+    file and line it was raised from, and each identifier :func:`_failure_detail` can vouch for, but
+    never the exception's text (vault BACKLOG #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
     output (so CI logs), the reload WARNING and the ``POST /connections/{name}/flag`` 409, and a
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary.
 
-    A fault building the detail leaves the type alone, which is still a withheld diagnostic, so the
-    fault cannot escape with ``exc`` chained as its context."""
+    Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
+    withheld diagnostic, so the fault cannot escape with ``exc`` chained as its context."""
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
-    except Exception:  # noqa: BLE001 - see the docstring
+    except BaseException as fault:  # noqa: BLE001 - see the docstring
+        if _is_an_interrupt(fault):
+            raise
         detail = type(exc).__name__
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
@@ -9470,7 +9475,7 @@ def _failure_detail(
     source_of: Callable[[str], bytes | None] | None = None,
 ) -> str:
     """``exc``'s TYPE, the config-directory file and line it was raised from (the file only when it
-    is not ``own_file``), and for an import or name error each identifier the source line spells.
+    is not ``own_file``), and each identifier the exception claims that the source line spells.
 
     The file is the deepest frame in the config directory, so a failing helper is named rather than
     the config module's import of it. A file name and a line number are layout, not data."""
@@ -9631,9 +9636,14 @@ def _foreign_links(exc: BaseException) -> list[BaseException]:
 
 
 def _is_an_interrupt(exc: BaseException) -> bool:
-    """Whether ``exc`` is what a real interrupt raises. It has no text, and code that raises one
-    with arguments is not an interrupt."""
-    return type(exc) is KeyboardInterrupt and not exc.args
+    """Whether ``exc`` is what a real interrupt raises: no text, and nothing chained that has any.
+    Code that raises one with either is not an interrupt."""
+    return (
+        type(exc) is KeyboardInterrupt
+        and not exc.args
+        and exc.__cause__ is None
+        and exc.__context__ is None
+    )
 
 
 def _rewritten_refusal(

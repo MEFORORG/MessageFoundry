@@ -8,7 +8,7 @@ text is author code's, and can carry any value the module held, and it reaches a
 ``messagefoundry validate`` and ``check`` output (so CI logs), the reload WARNING and the
 ``POST /connections/{name}/flag`` 409. The loader now names the exception TYPE and the line in the
 config module instead. A ``WiringError`` raised inside ``messagefoundry`` is the engine's own wording
-and still passes through unchanged.
+and keeps its text, less any text it wraps from elsewhere (vault BACKLOG #3765).
 
 Every planted string is assembled at run time, so no committed literal looks like a secret."""
 
@@ -638,6 +638,7 @@ def test_engine_wording_is_kept_with_its_chain(
 
 #: Connection factories, read whole below: a parameter added later is read too.
 _FACTORIES = [
+    "DatabasePoll",
     "MLLP",
     "Tcp",
     "X12",
@@ -668,7 +669,12 @@ _QUOTES_A_NAME: frozenset[tuple[str, str, type]] = frozenset({("Soap", "body_sec
 
 
 def _required_arguments(factory: Callable[..., object]) -> dict[str, object]:
-    samples: dict[str, object] = {"port": 2575, "host": "127.0.0.1"}
+    samples: dict[str, object] = {
+        "port": 2575,
+        "host": "127.0.0.1",
+        "statement": "select 1",
+        "poll_statement": "select a from t",
+    }
     return {
         p.name: samples.get(p.name, "x")
         for p in inspect.signature(factory).parameters.values()
@@ -678,8 +684,11 @@ def _required_arguments(factory: Callable[..., object]) -> dict[str, object]:
 
 @pytest.mark.parametrize("factory_name", _FACTORIES)
 def test_no_factory_refusal_quotes_a_planted_value(factory_name: str) -> None:
+    # A refusal that sits behind another one is not reached here, so the first refusal is the floor
+    # of what this reads, and the control call shows the required arguments raise no refusal of it.
     factory = getattr(messagefoundry, factory_name)
     required = _required_arguments(factory)
+    factory(**required)
     for parameter in inspect.signature(factory).parameters.values():
         if parameter.kind in (parameter.VAR_KEYWORD, parameter.VAR_POSITIONAL):
             continue
@@ -839,6 +848,28 @@ def test_a_base_exception_does_not_stop_validate_reading_the_next_module(tmp_pat
         "error loading config module a_feed.py",
         "error loading config module b_feed.py",
     ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"raise KeyboardInterrupt from ValueError({NEEDLE!r})\n",
+        f"try:\n    raise ValueError({NEEDLE!r})\nexcept ValueError:\n    raise KeyboardInterrupt\n",
+        "class Bad(Exception):\n"
+        f"    def __getattr__(self, name):\n        raise BaseException({NEEDLE!r})\n\n"
+        "raise Bad()\n",
+        "class Bad(Exception):\n"
+        f"    @property\n    def __traceback__(self):\n        raise RuntimeError({NEEDLE!r})\n\n"
+        "raise Bad()\n",
+    ],
+    ids=["interrupt-from", "interrupt-in-handler", "getattr-base-exception", "traceback-property"],
+)
+def test_a_module_cannot_carry_text_out_past_the_loaders_own_reads(
+    tmp_path: Path, body: str
+) -> None:
+    _write(tmp_path, "feed.py", body)
+    (msg,) = _messages(tmp_path)
+    assert NEEDLE not in msg and "withheld" in msg
 
 
 def test_a_real_interrupt_still_propagates(tmp_path: Path) -> None:
